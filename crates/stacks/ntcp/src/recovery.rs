@@ -1753,12 +1753,6 @@ impl Congestion {
 
 // RFC 9937 section 6, byte units; selection is composed by Connection.
 // Sending policy only: data selection is composed separately by Connection.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PrrAlgorithm {
-    #[default]
-    Rfc9937,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Prr {
     recover_fs: u32,
@@ -1774,7 +1768,7 @@ impl Prr {
     //# At the beginning of a congestion control response episode initiated
     //# by the congestion control algorithm, a data sender using PRR MUST
     //# initialize the PRR state.
-    pub(crate) fn new(flight: u32, mss: u32, _algorithm: PrrAlgorithm) -> Self {
+    pub(crate) fn new(flight: u32, mss: u32) -> Self {
         Self {
             recover_fs: flight,
             mss,
@@ -1972,7 +1966,7 @@ mod tests {
             (4750, 5000, 250),
             (2000, 5000, 1000),
         ] {
-            let mut p = Prr::new(9000, 1000, PrrAlgorithm::Rfc9937);
+            let mut p = Prr::new(9000, 1000);
             p.acknowledge(0, pipe, cwnd, false);
             assert_eq!(p.credit(), 0);
             p.admit_timer_repair(pipe, cwnd);
@@ -2011,11 +2005,11 @@ mod tests {
     //#    SndCnt = MIN(ssthresh - inflight, SndCnt)
     //# }
     fn rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit() {
-        let mut empty_after_ack = Prr::new(0, 1000, PrrAlgorithm::Rfc9937);
+        let mut empty_after_ack = Prr::new(0, 1000);
         empty_after_ack.include_entry_delivery(1000);
         assert_eq!(empty_after_ack.counters(), (1000, 0, 0));
         for safe in [false, true] {
-            let mut p = Prr::new(10_000, 1000, PrrAlgorithm::Rfc9937);
+            let mut p = Prr::new(10_000, 1000);
             p.acknowledge(1, 5000, 5000, safe);
             assert_eq!(p.credit(), 1000); // Force only when the computed count is zero.
             let before = p.counters();
@@ -2029,7 +2023,7 @@ mod tests {
             p.acknowledge(1000, 5000, 5000, safe);
             assert_eq!(p.credit(), 0); // No forced SMSS after any committed output.
         }
-        let mut p = Prr::new(u32::MAX, 1000, PrrAlgorithm::Rfc9937);
+        let mut p = Prr::new(u32::MAX, 1000);
         p.acknowledge(u32::MAX, u32::MAX, u32::MAX - 1, false);
         assert_eq!(p.credit(), u32::MAX - 1); // Widen before multiplication / rounding.
     }
@@ -2052,7 +2046,7 @@ mod tests {
     //# full or partial ACK), DeliveredData is the change in SND.UNA, minus 1
     //# SMSS for each preceding duplicate ACK.
     fn rfc9937_non_sack_estimates_cap_delivery_and_deduct_prior_duplicates() {
-        let mut p = Prr::new(5000, 1000, PrrAlgorithm::Rfc9937);
+        let mut p = Prr::new(5000, 1000);
         for i in 1..=2 {
             let d = p.non_sack_delivery(0, true);
             assert_eq!(d, 1000);
@@ -2242,7 +2236,7 @@ mod tests {
     //# confusing the sender's congestion accounting.
     fn rfc9937_zero_entry_and_credit_across_pipe_branches() {
         for threshold in [1000, 5000, 7000, 10_000] {
-            let mut p = Prr::new(10_000, 1000, PrrAlgorithm::Rfc9937);
+            let mut p = Prr::new(10_000, 1000);
             assert_eq!(p.counters(), (10_000, 0, 0));
             assert_eq!(p.credit(), 0);
             assert_eq!(p.credit(), 0);
@@ -2278,7 +2272,7 @@ mod tests {
 
     #[test]
     fn prr_crb_proportional_conservative_bound_and_no_duplicate_credit() {
-        let mut prr = Prr::new(10_000, 1000, PrrAlgorithm::Rfc9937);
+        let mut prr = Prr::new(10_000, 1000);
         prr.acknowledge(3000, 7000, 5000, false);
         assert_eq!(prr.credit(), 1500);
         prr.sent(1000);
@@ -2297,7 +2291,7 @@ mod tests {
     #[test]
     fn prr_duplicate_ack_preserves_banked_credit_without_minting_delivery() {
         for (pipe, expected) in [(7000, 1500), (3000, 2000)] {
-            let mut prr = Prr::new(10_000, 1000, PrrAlgorithm::Rfc9937);
+            let mut prr = Prr::new(10_000, 1000);
             prr.acknowledge(3000, pipe, 5000, false);
             assert_eq!(prr.credit(), expected);
             for _ in 0..4 {

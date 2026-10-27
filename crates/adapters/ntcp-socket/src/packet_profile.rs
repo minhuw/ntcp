@@ -293,7 +293,6 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         c.rack = true;
         c.tlp = true;
         c.prr = true;
-        c.prr_algorithm = ntcp::PrrAlgorithm::Rfc9937;
         c.prr_pacing = o.paced;
         c.rto_min_us = 200_000;
         c.ecn = o.ecn;
@@ -431,7 +430,6 @@ mod setup_profile_tests {
         let c = &base.connection;
         assert_eq!(c.congestion_algorithm, ntcp::CongestionAlgorithm::Cubic);
         assert_eq!(c.pacing, None);
-        assert_eq!(c.prr_algorithm, ntcp::PrrAlgorithm::Rfc9937);
         assert!(!c.prr_pacing);
         assert!(c.timestamps && c.sack && c.rack && c.tlp);
         assert!(!c.fast_open_early_response);

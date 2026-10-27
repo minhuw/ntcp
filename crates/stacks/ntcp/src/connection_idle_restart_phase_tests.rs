@@ -31,7 +31,7 @@ fn advance_to(a: &mut Connection, now: u64) {
 // A queued stream and real bounded ACKs naturally complete initial HyStart++.
 // No congestion state, flight or delivery counters are assigned by the test.
 fn established_ca(iss: u32) -> (Connection, u64) {
-    let mut cfg = profile(PrrAlgorithm::Rfc9937);
+    let mut cfg = profile();
     cfg.send_capacity = 500_000;
     cfg.coalesce_read_window_updates = true;
     cfg.output_group_flush = true;
@@ -140,7 +140,9 @@ fn cancelled_idle_restart_restores_phase_with_the_unsubmitted_window() {
     a.write(&[8; 20_000]).unwrap();
     let before = format!("{:?}", a.congestion);
     let edges = (a.snd_nxt, a.snd_una, a.last_sent);
-    a.transmit_selected(at, &mut [0; 2048], true).unwrap().unwrap();
+    a.transmit_selected(at, &mut [0; 2048], true)
+        .unwrap()
+        .unwrap();
     assert_eq!(a.congestion.cwnd(), a.restart_window());
     assert!(a.cancel_reserved_resource(at).unwrap());
     assert_eq!(format!("{:?}", a.congestion), before);

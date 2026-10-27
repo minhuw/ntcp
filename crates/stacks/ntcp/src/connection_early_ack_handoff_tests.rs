@@ -7,7 +7,6 @@ fn cfg(units: u64, timestamps: bool, rack: bool) -> ConnectionConfig {
         sack: true,
         rack,
         prr: true,
-        prr_algorithm: PrrAlgorithm::Rfc9937,
         rto_min_us: 1,
         pmtud: Some(crate::PmtudConfig::new(1500)),
         ..config(8192, if timestamps { 1012 } else { 1000 })

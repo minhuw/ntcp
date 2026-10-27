@@ -4,7 +4,7 @@ use super::*;
 fn reserved_nonhead_sack_retry_keeps_exhausted_prr_credit_and_recovery_state() {
     use crate::output_reservation::OutputReservation;
     for iss in [0, u32::MAX - 4999] {
-        let mut a = strict_flight(iss);
+        let mut a = rack_flight(iss);
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
         packet(&mut a, 200_000);
         strict_ack(&mut a, 200_001, 1000, &[(7000, 10_000)]);
@@ -251,7 +251,6 @@ fn reserved_probe_pacing_preserves_prior_debt_and_options_ack_costs_nothing() {
             nagle: false,
             prr: !general,
             prr_pacing: true,
-            prr_algorithm: PrrAlgorithm::Rfc9937,
             pacing: general.then_some(PacingConfig {
                 initial_window_burst: false,
                 max_burst_segments: 1,
@@ -390,7 +389,7 @@ fn reserved_fresh_rtt_uses_departure_not_retained_timestamp_selection() {
 #[test]
 fn reserved_nonhead_retry_preserves_advancing_ack_rto_restart() {
     for delay in [0, 50_000, 1_000_000] {
-        let mut a = strict_flight(0);
+        let mut a = rack_flight(0);
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
         packet(&mut a, 200_000);
         strict_ack(&mut a, 200_001, 1000, &[(7000, 10_000)]);
@@ -653,7 +652,7 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
             2 => a.retx_pending = true,
             3 => a.probe_pending = true,
             4 => a.tlp_pending = true,
-            5 => a.prr = Some(Prr::new(100, 100, PrrAlgorithm::Rfc9937)),
+            5 => a.prr = Some(Prr::new(100, 100)),
             6 => a.config.pacing = Some(crate::PacingConfig::default()),
             7 => {
                 a.config.prr = true;
@@ -695,7 +694,7 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
     gso_select(&mut a, 40, &mut [0; 1000], &mut [0; 2048]);
     assert_eq!(a.last_departure.unwrap().segmentation, None);
     // A real SACK loss-recovery selection stays on its existing PRR path.
-    let mut a = strict_flight(0);
+    let mut a = rack_flight(0);
     strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
     gso_select(&mut a, 200_000, &mut [0; 4000], &mut [0; 2048]).unwrap();
     assert_eq!(a.last_departure.unwrap().segmentation, None);
@@ -1012,7 +1011,6 @@ fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
             sack: true,
             rack: true,
             prr: true,
-            prr_algorithm: PrrAlgorithm::Rfc9937,
             congestion_algorithm: CongestionAlgorithm::Cubic,
             cubic_hystart: true,
             initial_window: InitialWindow::Iw10,
@@ -1090,7 +1088,7 @@ fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
         );
         assert_eq!(a.snd_nxt, next.wrapping_add(s.payload_len as u32));
     }
-    let mut a = strict_flight(0);
+    let mut a = rack_flight(0);
     a.config.output_group_flush = true;
     strict_ack(&mut a, 200_000, 0, &[(7000, 10000)]);
     gso_select(&mut a, 200_000, &mut [0; 8000], &mut [0; 2048]).unwrap();

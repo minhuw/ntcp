@@ -65,7 +65,7 @@ pub use endpoint::{
 pub use ipv4_options::{
     Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
 };
-pub use recovery::{CongestionAlgorithm, InitialWindow, PrrAlgorithm, RecoveryAlgorithm};
+pub use recovery::{CongestionAlgorithm, InitialWindow, RecoveryAlgorithm};
 pub use wire::{IpMetadata, WireError};
 
 pub use tx_timestamp::{

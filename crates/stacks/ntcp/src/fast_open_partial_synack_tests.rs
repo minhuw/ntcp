@@ -41,7 +41,6 @@ fn partial_synack_rtt_repair_and_next_service_admission() {
                             sack: true,
                             rack: true,
                             prr: true,
-                            prr_algorithm: PrrAlgorithm::Rfc9937,
                             prr_pacing: false,
                             pacing: None,
                             congestion_algorithm: CongestionAlgorithm::Cubic,

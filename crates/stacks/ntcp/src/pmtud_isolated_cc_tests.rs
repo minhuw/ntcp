@@ -7,7 +7,6 @@ fn isolated_config(mode: u8, prr: bool, cubic: bool, paced: bool) -> ConnectionC
         sack: mode != 0,
         rack: mode == 2,
         prr,
-        prr_algorithm: PrrAlgorithm::Rfc9937,
         prr_pacing: paced,
         pacing: paced.then_some(PacingConfig::default()),
         congestion_algorithm: if cubic {
@@ -647,8 +646,8 @@ fn isolated_probe_cc_replenishment_does_not_extend_recovery_proof() {
                     now += 1;
                     let bytes = packet(&mut a, now);
                     let segment = wire::parse(ip(a.tuple), &bytes).unwrap();
-                    let end = Seq(segment.header.sequence)
-                        .wrapping_add(segment.payload.len() as u32);
+                    let end =
+                        Seq(segment.header.sequence).wrapping_add(segment.payload.len() as u32);
                     if end == probe.end {
                         break bytes;
                     }
@@ -659,7 +658,10 @@ fn isolated_probe_cc_replenishment_does_not_extend_recovery_proof() {
                 now += 1;
                 let outstanding = packet(&mut a, now);
                 assert_eq!(
-                    wire::parse(ip(a.tuple), &outstanding).unwrap().header.sequence,
+                    wire::parse(ip(a.tuple), &outstanding)
+                        .unwrap()
+                        .header
+                        .sequence,
                     proof_end.0
                 ); // Fresh output before the recovery-ending ACK.
                 real_ack(&mut a, &mut b, &ending_repair, now, false);
@@ -698,8 +700,7 @@ fn isolated_probe_cc_replenishment_does_not_extend_recovery_proof() {
                 assert!(p.take_probe_outcome(a.snd_una).is_none()); // Already consumed once.
                 assert!(p.deadline.is_some());
                 assert_eq!(a.congestion.ssthresh(), threshold);
-                let scaled_window =
-                    (u64::from(window) * a.mss as u64 / old_mss as u64) as u32;
+                let scaled_window = (u64::from(window) * a.mss as u64 / old_mss as u64) as u32;
                 assert!(
                     a.congestion.cwnd() > scaled_window,
                     "mode={mode}, prr={prr}, cubic={cubic}: cwnd={} scaled={scaled_window}",

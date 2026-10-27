@@ -50,7 +50,6 @@ fn script_config() -> ConnectionConfig {
         timestamps: true,
         rack: true,
         prr: true,
-        prr_algorithm: PrrAlgorithm::Rfc9937,
         prr_pacing: false,
         tlp: true,
         rto_min_us: 200_000,

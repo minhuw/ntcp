@@ -64,7 +64,7 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
         }
         assert_eq!(prr_packet(&mut a, 53).1, 125);
 
-        let mut a = strict_flight(iss);
+        let mut a = rack_flight(iss);
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
         assert_eq!(prr_packet(&mut a, 200_000).1, 1000);
         let before = a.prr.unwrap();
@@ -81,7 +81,7 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
         assert_eq!(a.prr.unwrap().counters(), (10_000, 4000, 4250));
         assert_eq!(a.prr.unwrap().credit(), 0);
 
-        let mut a = strict_flight(iss);
+        let mut a = rack_flight(iss);
         strict_ack(&mut a, 200_000, 0, &[(7000, 8000)]);
         a.timeout(225_000).unwrap();
         let before = a.prr.unwrap();
@@ -224,7 +224,7 @@ fn selected_recovery_output_policy_matrix() {
         assert_eq!(outputs(&mut a, 211, base), vec![(1536, 128)]);
 
         // RFC8985 modified RACK selection without PRR is still pipe-limited.
-        let mut a = strict_flight(iss);
+        let mut a = rack_flight(iss);
         a.config.prr = false;
         let base = a.snd_una;
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
@@ -242,7 +242,7 @@ fn selected_recovery_output_policy_matrix() {
 
         // Actual ACK-driven PRR entry with RFC6675 candidate selection;
         // credit controls quantity; the forced-first floor is tested separately.
-        let mut a = strict_flight(iss);
+        let mut a = rack_flight(iss);
         a.config.rack = false;
         let base = a.snd_una;
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
@@ -253,8 +253,7 @@ fn selected_recovery_output_policy_matrix() {
         assert_eq!(a.prr.unwrap().counters(), (10_000, 3000, 3000));
 
         // Timer-driven RACK entry admits one repair without inventing ACK delivery.
-        let mut a = strict_flight(iss);
-        assert_eq!(a.config.prr_algorithm, PrrAlgorithm::Rfc9937);
+        let mut a = rack_flight(iss);
         let base = a.snd_una;
         strict_ack(&mut a, 200_000, 0, &[(7000, 8000)]);
         a.timeout(225_000).unwrap();
@@ -456,7 +455,7 @@ fn half_flight_segment_output_observations() {
 fn rfc9937_safe_ack_advancing_new_loss_denies_extra_smss() {
     for iss in [0, u32::MAX - 4999] {
         for rack in [false, true] {
-            let mut a = strict_flight(iss);
+            let mut a = rack_flight(iss);
             a.config.rack = rack;
             let base = a.snd_una;
             assert_eq!(a.rack.counts().lost, 0);
@@ -490,7 +489,7 @@ fn rfc9937_safe_ack_advancing_new_loss_denies_extra_smss() {
 fn rfc9937_safe_ack_advancing_rescue_denies_extra_smss() {
     for iss in [0, u32::MAX - 4999] {
         for new_data in [false, true] {
-            let mut a = strict_flight(iss);
+            let mut a = rack_flight(iss);
             a.config.rack = false;
             let base = a.snd_una;
             let sacks = [(5000, 8000), (9500, 10_000)];
@@ -668,7 +667,7 @@ fn pacing_wire_spacing_units_idle_and_failed_output() {
 #[test]
 fn pacing_recovery_budget_exit_and_control() {
     for rack in [false, true] {
-        let mut a = strict_flight(0);
+        let mut a = rack_flight(0);
         // Flight helper is an equation oracle; enable pacing for every repair
         // and all output after the actual recovery completion below.
         a.config.prr_pacing = true;
@@ -736,14 +735,10 @@ fn pacing_recovery_budget_exit_and_control() {
 
 #[test]
 fn pacing_selection_gates_protocol_probes_and_widened_rate() {
-    for (prr, algorithm, pacing) in [
-        (false, PrrAlgorithm::Rfc9937, true),
-        (true, PrrAlgorithm::Rfc9937, false),
-    ] {
+    for (prr, pacing) in [(false, true), (true, false)] {
         let (mut a, _) = pair(
             ConnectionConfig {
                 prr,
-                prr_algorithm: algorithm,
                 prr_pacing: pacing,
                 nagle: false,
                 ..config(65_536, 1000)
@@ -787,7 +782,6 @@ fn pacing_selection_gates_protocol_probes_and_widened_rate() {
 
     for probe in [false, true] {
         let (mut a, _) = tlp_baseline_pair(0);
-        a.config.prr_algorithm = PrrAlgorithm::Rfc9937;
         a.config.prr_pacing = true;
         a.write(&[0x55; 2000]).unwrap();
         packet(&mut a, 100_000);
@@ -819,7 +813,7 @@ fn pacing_selection_gates_protocol_probes_and_widened_rate() {
         assert_eq!(a.pacing_deadline, Some(expiry + spacing));
     }
     // A due pacer never supplies PRR credit of its own.
-    let mut a = strict_flight(0);
+    let mut a = rack_flight(0);
     a.config.prr_pacing = true;
     strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
     while a.prr.unwrap().credit() != 0 {
@@ -891,7 +885,6 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
                 sack: true,
                 rack: true,
                 prr: true,
-                prr_algorithm: PrrAlgorithm::Rfc9937,
                 congestion_algorithm: CongestionAlgorithm::Cubic,
                 initial_window: InitialWindow::Iw10,
                 ..config(65_536, 1000)
@@ -1005,7 +998,6 @@ fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
             sack: true,
             rack: true,
             prr: true,
-            prr_algorithm: PrrAlgorithm::Rfc9937,
             congestion_algorithm: CongestionAlgorithm::Cubic,
             initial_window: InitialWindow::Iw10,
             ..config(65_536, 1000)
@@ -1344,17 +1336,16 @@ fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
 //# start algorithm [RFC9406] or MAY use the Reno TCP slow start
 //# algorithm [RFC5681] in the rare cases when HyStart++ is not suitable.
 fn hystart_wire_delayed_ack_runtime_pacing_and_opt_out() {
-    for (prr, algorithm, pacing, expected) in [
-        (false, PrrAlgorithm::Rfc9937, true, 16_000),
-        (true, PrrAlgorithm::Rfc9937, false, 16_000),
-        (true, PrrAlgorithm::Rfc9937, true, 20_000),
+    for (prr, pacing, expected) in [
+        (false, true, 16_000),
+        (true, false, 16_000),
+        (true, true, 20_000),
     ] {
         let (mut a, _) = primed_pair(
             ConnectionConfig {
                 congestion_algorithm: CongestionAlgorithm::Cubic,
                 initial_window: InitialWindow::Iw10,
                 prr,
-                prr_algorithm: algorithm,
                 prr_pacing: pacing,
                 nagle: false,
                 ..config(32_000, 1000)
@@ -1380,7 +1371,10 @@ fn hystart_wire_delayed_ack_runtime_pacing_and_opt_out() {
         sent += 100_000;
         for _ in 0..20 {
             let bytes = packet(&mut a, sent);
-            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1000);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+                1000
+            );
             if a.pacing_enabled() {
                 sent = a.pacing_deadline.unwrap();
             }
@@ -1999,7 +1993,7 @@ fn eor_final_payload_fin_respects_window_cwnd_and_prr_admission() {
             assert_eq!(a.congestion.cwnd(), 8);
         }
         if let Some(credit) = prr_credit {
-            let mut prr = Prr::new(a.flight(), a.mss as u32, PrrAlgorithm::Rfc9937);
+            let mut prr = Prr::new(a.flight(), a.mss as u32);
             prr.acknowledge(credit, 0, 8, false);
             assert_eq!(prr.credit(), credit);
             a.prr = Some(prr);
@@ -2466,7 +2460,10 @@ fn general_pacing_wire_fractional_burst_idle_and_failed_encode() {
             let (mut a, _) = pair(
                 ConnectionConfig {
                     // Exercise the ordinary bucket independently of startup.
-                    pacing: Some(PacingConfig { initial_window_burst: false, ..Default::default() }),
+                    pacing: Some(PacingConfig {
+                        initial_window_burst: false,
+                        ..Default::default()
+                    }),
                     prr: false,
                     prr_pacing: false,
                     congestion_algorithm: algorithm,
@@ -2563,7 +2560,7 @@ fn general_pacing_wire_rate_cap_startup_and_rate_changes() {
 #[test]
 fn general_pacing_recovery_control_and_hystart() {
     for rack in [false, true] {
-        let mut a = strict_flight(0);
+        let mut a = rack_flight(0);
         a.config.pacing = Some(PacingConfig {
             max_burst_segments: 1,
             ..PacingConfig::default()

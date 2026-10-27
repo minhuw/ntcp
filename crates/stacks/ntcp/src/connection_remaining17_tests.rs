@@ -18,7 +18,6 @@ fn profile() -> ConnectionConfig {
         rack: true,
         tlp: true,
         prr: true,
-        prr_algorithm: PrrAlgorithm::Rfc9937,
         prr_pacing: false,
         pacing: None,
         rto_min_us: 200000,
@@ -396,7 +395,7 @@ fn no_sack_cubic_cwnd_basis_repair_and_recovery_completion() {
 
 #[test]
 fn prr_fractional_headroom_stays_byte_exact() {
-    let mut p = Prr::new(5840, 1460, PrrAlgorithm::Rfc9937);
+    let mut p = Prr::new(5840, 1460);
     let delivered = p.non_sack_delivery(0, true);
     assert_eq!(delivered, 1460);
     p.acknowledge(delivered, 2920, 4088, false);

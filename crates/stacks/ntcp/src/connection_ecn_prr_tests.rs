@@ -664,139 +664,135 @@ mod retransmit_delay_study {
 
 #[test]
 fn packetdrill_passive_ecn_cwr_prr_characterization() {
-    {
-        let algorithm = crate::PrrAlgorithm::Rfc9937;
-        // Audited upstream,ecn baseline; no congestion/flight state fabrication.
-        let cfg = ConnectionConfig {
-            receive_capacity: 8 * 1024 * 1024,
-            receive_ip_payload_limit: 65515,
-            send_ip_payload_limit: 65515,
-            initial_window: InitialWindow::Iw10,
-            congestion_algorithm: CongestionAlgorithm::Cubic,
-            cubic_hystart: true,
-            cubic_fast_convergence: true,
-            timestamps: true,
-            sack: true,
-            rack: true,
-            tlp: true,
-            prr: true,
-            prr_algorithm: algorithm,
-            prr_pacing: false,
-            pacing: None,
-            rto_min_us: 200_000,
-            adaptive_ack: true,
-            coalesce_read_window_updates: true,
-            ecn: true,
-            ..ConnectionConfig::default()
-        };
-        let metadata = ip(reverse(tuple()));
-        let encode = |flags, seq, ack, window, options: &[u8]| {
-            let mut bytes = vec![0; 60];
-            let n = wire::encode(
-                metadata,
-                Header {
-                    source_port: tuple().remote.port(),
-                    destination_port: tuple().local.port(),
-                    sequence: seq,
-                    acknowledgment: ack,
-                    flags,
-                    window,
-                    urgent_pointer: 0,
-                },
-                options,
-                &[],
-                &mut bytes,
-            )
-            .unwrap();
-            bytes.truncate(n);
-            bytes
-        };
-        let syn = encode(
-            SYN | ECE | CWR,
-            0,
-            0,
-            32792,
-            &[2, 4, 3, 232, 1, 1, 4, 2, 1, 3, 3, 7],
-        );
-        let mut a = Connection::passive(
-            tuple(),
-            cfg,
-            0,
-            100_000,
-            &wire::parse(metadata, &syn).unwrap(),
+    // Audited upstream,ecn baseline; no congestion/flight state fabrication.
+    let cfg = ConnectionConfig {
+        receive_capacity: 8 * 1024 * 1024,
+        receive_ip_payload_limit: 65515,
+        send_ip_payload_limit: 65515,
+        initial_window: InitialWindow::Iw10,
+        congestion_algorithm: CongestionAlgorithm::Cubic,
+        cubic_hystart: true,
+        cubic_fast_convergence: true,
+        timestamps: true,
+        sack: true,
+        rack: true,
+        tlp: true,
+        prr: true,
+        prr_pacing: false,
+        pacing: None,
+        rto_min_us: 200_000,
+        adaptive_ack: true,
+        coalesce_read_window_updates: true,
+        ecn: true,
+        ..ConnectionConfig::default()
+    };
+    let metadata = ip(reverse(tuple()));
+    let encode = |flags, seq, ack, window, options: &[u8]| {
+        let mut bytes = vec![0; 60];
+        let n = wire::encode(
+            metadata,
+            Header {
+                source_port: tuple().remote.port(),
+                destination_port: tuple().local.port(),
+                sequence: seq,
+                acknowledgment: ack,
+                flags,
+                window,
+                urgent_pointer: 0,
+            },
+            options,
+            &[],
+            &mut bytes,
         )
         .unwrap();
-        let bytes = packet(&mut a, 100_000);
-        let synack = wire::parse(ip(tuple()), &bytes).unwrap();
-        assert_eq!(synack.header.flags, SYN | ACK | ECE);
-        assert_eq!(synack.options.mss, Some(1460));
-        assert_eq!(synack.options.window_scale, Some(8));
-        assert!(synack.options.sack_permitted);
-        let final_ack = encode(ACK, 1, 1, 320, &[]);
-        a.input_with_traffic_class(200_000, 1, &wire::parse(metadata, &final_ack).unwrap())
-            .unwrap();
-        assert_eq!(a.state(), State::Established);
-        assert!(a.ecn_send() && a.ecn_feedback() && a.sack_send && a.sack_receive);
-        assert!(!a.timestamps);
-        assert_eq!((a.mss, a.local_scale, a.peer_scale), (1000, 8, 7));
-        assert_eq!((a.snd_wnd, a.ack_ato), (40960, 40_000));
-        a.write(&[1; 4000]).unwrap();
-        for i in 0..4 {
-            let bytes = packet(&mut a, 200_000);
-            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
-            assert_eq!(
-                (seg.header.sequence, seg.payload.len()),
-                (1 + i * 1000, 1000)
-            );
-            assert_eq!(seg.header.flags & CWR, 0);
-        }
-        assert_eq!(a.transport_info_at(205_000).cwnd, 10_000);
-        assert_eq!((a.data_flight(), a.rack.pipe()), (4000, 4000));
-        assert!(a.prr.is_none());
-        inject(&mut a, 300_000, Seq(1), Seq(1001), ACK | ECE, 320, &[]); // Not-ECT.
-        assert_eq!(a.congestion.ssthresh(), 7000);
-        assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
-        assert_eq!((a.data_flight(), a.rack.pipe()), (3000, 3000));
-        assert_eq!(a.rack.counts().lost, 0);
-        assert!(!a.retx_pending && !a.congestion.in_recovery());
-        assert!(a.rack.deadline.is_none());
-        assert!(a.ecn_cwr_pending && a.transport_info_at(305_000).ecn_response);
-        assert!(a.next_deadline().unwrap() > 305_000);
-
-        assert_eq!(a.congestion.ecn_prr_end(), Some(Seq(4001)));
-        assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-        assert_eq!(a.prr.unwrap().credit(), 2000);
+        bytes.truncate(n);
+        bytes
+    };
+    let syn = encode(
+        SYN | ECE | CWR,
+        0,
+        0,
+        32792,
+        &[2, 4, 3, 232, 1, 1, 4, 2, 1, 3, 3, 7],
+    );
+    let mut a = Connection::passive(
+        tuple(),
+        cfg,
+        0,
+        100_000,
+        &wire::parse(metadata, &syn).unwrap(),
+    )
+    .unwrap();
+    let bytes = packet(&mut a, 100_000);
+    let synack = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(synack.header.flags, SYN | ACK | ECE);
+    assert_eq!(synack.options.mss, Some(1460));
+    assert_eq!(synack.options.window_scale, Some(8));
+    assert!(synack.options.sack_permitted);
+    let final_ack = encode(ACK, 1, 1, 320, &[]);
+    a.input_with_traffic_class(200_000, 1, &wire::parse(metadata, &final_ack).unwrap())
+        .unwrap();
+    assert_eq!(a.state(), State::Established);
+    assert!(a.ecn_send() && a.ecn_feedback() && a.sack_send && a.sack_receive);
+    assert!(!a.timestamps);
+    assert_eq!((a.mss, a.local_scale, a.peer_scale), (1000, 8, 7));
+    assert_eq!((a.snd_wnd, a.ack_ato), (40960, 40_000));
+    a.write(&[1; 4000]).unwrap();
+    for i in 0..4 {
+        let bytes = packet(&mut a, 200_000);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(
-            (a.transport_info().cwnd, a.transport_info().mss),
-            (5000, 1000)
+            (seg.header.sequence, seg.payload.len()),
+            (1 + i * 1000, 1000)
         );
-        // Equation-only control with the same inputs: do not mutate the connection.
-        let mut unsafe_equation = Prr::new(4000, 1000, PrrAlgorithm::Rfc9937);
-        unsafe_equation.acknowledge(1000, 3000, 7000, false);
-        assert_eq!(unsafe_equation.credit(), 1000);
-        inject(&mut a, 305_001, Seq(1), Seq(1001), ACK | ECE, 320, &[]);
-        assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-        assert_eq!(a.prr.unwrap().credit(), 2000);
-        assert_eq!(a.congestion.ssthresh(), 7000);
-        assert!(a.transmit(305_001, &mut [0; 1500]).unwrap().is_none());
-        assert!(a.ecn_cwr_pending);
-        // Counterfactual continuation beyond the fixture: test real admission.
-        a.write(&[2; 3000]).unwrap();
-        for i in 0..2 {
-            let bytes = packet(&mut a, 306_000);
-            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
-            assert_eq!(
-                (seg.header.sequence, seg.payload.len()),
-                (4001 + i * 1000, 1000)
-            );
-            assert_eq!(seg.header.flags & CWR != 0, i == 0);
-        }
-        assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 2000));
-        assert_eq!(a.prr.unwrap().credit(), 0);
-        assert_eq!(a.data_flight(), 5000);
-        assert!(!a.ecn_cwr_pending);
-        assert!(a.transmit(306_000, &mut [0; 1500]).unwrap().is_none());
+        assert_eq!(seg.header.flags & CWR, 0);
     }
+    assert_eq!(a.transport_info_at(205_000).cwnd, 10_000);
+    assert_eq!((a.data_flight(), a.rack.pipe()), (4000, 4000));
+    assert!(a.prr.is_none());
+    inject(&mut a, 300_000, Seq(1), Seq(1001), ACK | ECE, 320, &[]); // Not-ECT.
+    assert_eq!(a.congestion.ssthresh(), 7000);
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
+    assert_eq!((a.data_flight(), a.rack.pipe()), (3000, 3000));
+    assert_eq!(a.rack.counts().lost, 0);
+    assert!(!a.retx_pending && !a.congestion.in_recovery());
+    assert!(a.rack.deadline.is_none());
+    assert!(a.ecn_cwr_pending && a.transport_info_at(305_000).ecn_response);
+    assert!(a.next_deadline().unwrap() > 305_000);
+
+    assert_eq!(a.congestion.ecn_prr_end(), Some(Seq(4001)));
+    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
+    assert_eq!(a.prr.unwrap().credit(), 2000);
+    assert_eq!(
+        (a.transport_info().cwnd, a.transport_info().mss),
+        (5000, 1000)
+    );
+    // Equation-only control with the same inputs: do not mutate the connection.
+    let mut unsafe_equation = Prr::new(4000, 1000);
+    unsafe_equation.acknowledge(1000, 3000, 7000, false);
+    assert_eq!(unsafe_equation.credit(), 1000);
+    inject(&mut a, 305_001, Seq(1), Seq(1001), ACK | ECE, 320, &[]);
+    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
+    assert_eq!(a.prr.unwrap().credit(), 2000);
+    assert_eq!(a.congestion.ssthresh(), 7000);
+    assert!(a.transmit(305_001, &mut [0; 1500]).unwrap().is_none());
+    assert!(a.ecn_cwr_pending);
+    // Counterfactual continuation beyond the fixture: test real admission.
+    a.write(&[2; 3000]).unwrap();
+    for i in 0..2 {
+        let bytes = packet(&mut a, 306_000);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(
+            (seg.header.sequence, seg.payload.len()),
+            (4001 + i * 1000, 1000)
+        );
+        assert_eq!(seg.header.flags & CWR != 0, i == 0);
+    }
+    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 2000));
+    assert_eq!(a.prr.unwrap().credit(), 0);
+    assert_eq!(a.data_flight(), 5000);
+    assert!(!a.ecn_cwr_pending);
+    assert!(a.transmit(306_000, &mut [0; 1500]).unwrap().is_none());
 }
 
 mod remaining17_study {

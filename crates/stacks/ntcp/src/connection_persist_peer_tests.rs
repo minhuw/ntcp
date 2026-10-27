@@ -1,6 +1,6 @@
 use crate::{
     CongestionAlgorithm, ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, InitialWindow,
-    IpMetadata, ListenerId, PrrAlgorithm, wire,
+    IpMetadata, ListenerId, wire,
 };
 use alloc::collections::BTreeMap;
 use alloc::{vec, vec::Vec};
@@ -51,7 +51,6 @@ impl Network {
             rack: sack,
             tlp: sack,
             prr: true,
-            prr_algorithm: PrrAlgorithm::Rfc9937,
             prr_pacing: false,
             pacing: None,
             initial_window: InitialWindow::Iw10,

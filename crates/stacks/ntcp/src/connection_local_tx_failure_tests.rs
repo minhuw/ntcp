@@ -3,11 +3,7 @@
 use super::*;
 
 fn local_sender() -> Connection {
-    local_sender_with_algorithm(PrrAlgorithm::Rfc9937)
-}
-
-fn local_sender_with_algorithm(algorithm: PrrAlgorithm) -> Connection {
-    let mut cfg = profile(algorithm);
+    let mut cfg = profile();
     // Remaining common upstream options, audited against packet_profile::config.
     cfg.coalesce_read_window_updates = true;
     cfg.abort_with_ack = true;
@@ -331,7 +327,7 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
 #[test]
 fn transport_info_minimum_rtt_is_optional_scaled_and_retained_when_closed() {
     for scale in [1, 1000] {
-        let mut cfg = profile(PrrAlgorithm::Rfc9937);
+        let mut cfg = profile();
         cfg.timebase.units_per_second = 1_000_000 * scale;
         let mut a = Connection::active(tuple(), cfg, 0, 0).unwrap();
         assert_eq!(a.transport_info().min_rtt_us, None);

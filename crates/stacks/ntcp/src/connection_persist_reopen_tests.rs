@@ -8,7 +8,6 @@ fn sender(iss: u32, scale: u64, nagle: bool) -> Connection {
         sack: true,
         rack: true,
         prr: true,
-        prr_algorithm: PrrAlgorithm::Rfc9937,
         prr_pacing: false,
         pacing: None,
         tlp: true,
@@ -59,7 +58,6 @@ fn sender(iss: u32, scale: u64, nagle: bool) -> Connection {
     a
 }
 
-
 #[test]
 fn empty_probe_reopening_orders_preserve_first_transmission() {
     for order in 0..3 {
@@ -69,7 +67,9 @@ fn empty_probe_reopening_orders_preserve_first_transmission() {
                     let mut a = sender(iss, scale, nagle);
                     let base = Seq(iss.wrapping_add(1));
                     let now = 210_000 * scale;
-                    if order != 0 { a.timeout(now).unwrap(); }
+                    if order != 0 {
+                        a.timeout(now).unwrap();
+                    }
                     if order == 2 {
                         let bytes = packet(&mut a, now);
                         let probe = wire::parse(ip(tuple()), &bytes).unwrap();
@@ -105,14 +105,25 @@ fn empty_probe_cannot_authorize_ack_of_queued_data() {
         let base = a.snd_nxt;
         a.timeout(210_000).unwrap();
         packet(&mut a, 210_000);
-        inject(&mut a, 210_001, Seq(901), base.wrapping_add(1), ACK, 2000, &[]);
+        inject(
+            &mut a,
+            210_001,
+            Seq(901),
+            base.wrapping_add(1),
+            ACK,
+            2000,
+            &[],
+        );
         assert_eq!((a.snd_una, a.snd_nxt, a.snd_wnd), (base, base, 0));
         assert_eq!(a.send.len(), 1000);
         let reply = packet(&mut a, 210_001);
         assert!(wire::parse(ip(tuple()), &reply).unwrap().payload.is_empty());
         inject(&mut a, 210_002, Seq(901), base, ACK, 2000, &[]);
         let before = (a.snd_nxt, a.congestion.cwnd(), a.rto_deadline);
-        assert_eq!(a.transmit(210_002, &mut [0; 19]), Err(Error::OutputTooSmall));
+        assert_eq!(
+            a.transmit(210_002, &mut [0; 19]),
+            Err(Error::OutputTooSmall)
+        );
         assert_eq!((a.snd_nxt, a.congestion.cwnd(), a.rto_deadline), before);
         let data = packet(&mut a, 210_002);
         assert_eq!(wire::parse(ip(tuple()), &data).unwrap().payload.len(), 1000);
@@ -126,14 +137,21 @@ fn empty_probe_backoff_and_history_ignore_closed_window_feedback() {
         let mut a = sender(iss, 1, true);
         let base = a.snd_nxt;
         let baseline = (a.rto(), a.congestion.cwnd(), a.rtt_sample_after);
-        for (now, next) in [(210_000, 610_000), (610_000, 1_410_000), (1_410_000, 3_010_000)] {
+        for (now, next) in [
+            (210_000, 610_000),
+            (610_000, 1_410_000),
+            (1_410_000, 3_010_000),
+        ] {
             a.timeout(now).unwrap();
             let before = (a.persist_interval, a.loss_timer);
             assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
             assert_eq!((a.persist_interval, a.loss_timer), before);
             let bytes = packet(&mut a, now);
             let probe = wire::parse(ip(tuple()), &bytes).unwrap();
-            assert_eq!((probe.header.sequence, probe.payload.len()), (base.wrapping_add(u32::MAX).0, 0));
+            assert_eq!(
+                (probe.header.sequence, probe.payload.len()),
+                (base.wrapping_add(u32::MAX).0, 0)
+            );
             assert_eq!(a.loss_timer, Some((LossTimer::Zwp, next)));
             inject(&mut a, now + 1, Seq(901), base, ACK, 0, &[]);
             assert_eq!(a.loss_timer, Some((LossTimer::Zwp, next)));
@@ -153,7 +171,10 @@ fn reserved_empty_probe_timer_uses_actual_acceptance_and_not_stream_credit() {
             let base = a.snd_nxt;
             a.timeout(210_000).unwrap();
             let mut out = [0; 1500];
-            let n = a.transmit_selected(210_000, &mut out, true).unwrap().unwrap();
+            let n = a
+                .transmit_selected(210_000, &mut out, true)
+                .unwrap()
+                .unwrap();
             let probe = wire::parse(ip(tuple()), &out[..n]).unwrap();
             assert!(probe.payload.is_empty());
             let mut d = a.last_departure.unwrap();
@@ -161,17 +182,38 @@ fn reserved_empty_probe_timer_uses_actual_acceptance_and_not_stream_credit() {
             assert_eq!(a.persist_unanswered_since, None);
             let interval = a.persist_interval;
             assert_eq!(a.snd_nxt, base);
-            if opened { inject(&mut a, 211_000, Seq(901), base, ACK, 2000, &[]); }
-            a.accept_reserved_output(212_000, &mut d, 0, 0, true).unwrap();
+            if opened {
+                inject(&mut a, 211_000, Seq(901), base, ACK, 2000, &[]);
+            }
+            a.accept_reserved_output(212_000, &mut d, 0, 0, true)
+                .unwrap();
             assert!(!d.persist);
             assert_eq!(a.rto_deadline, None);
             assert_eq!(a.snd_nxt, base);
             assert_eq!(a.rack.packet_counts().unacked, 0);
-            assert_eq!(a.persist_unanswered_since, if opened { None } else { Some(212_000) });
-            assert_eq!(a.persist_deadline, if opened { None } else { Some(212_000 + interval) });
+            assert_eq!(
+                a.persist_unanswered_since,
+                if opened { None } else { Some(212_000) }
+            );
+            assert_eq!(
+                a.persist_deadline,
+                if opened {
+                    None
+                } else {
+                    Some(212_000 + interval)
+                }
+            );
             // A repeated acceptance cannot restart the accepted control epoch.
-            a.accept_reserved_output(212_001, &mut d, 0, 0, true).unwrap();
-            assert_eq!(a.persist_deadline, if opened { None } else { Some(212_000 + interval) });
+            a.accept_reserved_output(212_001, &mut d, 0, 0, true)
+                .unwrap();
+            assert_eq!(
+                a.persist_deadline,
+                if opened {
+                    None
+                } else {
+                    Some(212_000 + interval)
+                }
+            );
         }
     }
 }
@@ -196,7 +238,6 @@ fn window_probe_with_real_flight_retransmits_existing_byte() {
         assert_eq!(a.transport_info().notsent_bytes, 0);
     }
 }
-
 
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
@@ -223,7 +264,10 @@ fn empty_probe_preserves_zero_window_urgent_notification() {
     assert!(a.probe_pending);
     let bytes = deliver(&mut a, &mut b, deadline);
     let probe = wire::parse(ip(tuple()), &bytes).unwrap();
-    assert_eq!((probe.header.sequence, probe.payload.len()), (base.wrapping_add(u32::MAX).0, 0));
+    assert_eq!(
+        (probe.header.sequence, probe.payload.len()),
+        (base.wrapping_add(u32::MAX).0, 0)
+    );
     assert!(!a.probe_pending);
     assert_eq!(a.persist_interval, 2 * interval);
     deliver(&mut b, &mut a, deadline + 1);
@@ -240,14 +284,21 @@ fn empty_probe_large_urgent_pointer_is_bounded_without_repeating_notice() {
         a.timeout(210_000).unwrap();
         let mut out = [0; 1500];
         for (index, seq) in [base, base.wrapping_add(u32::MAX)].into_iter().enumerate() {
-            let n = if reserved { a.transmit_selected(210_000, &mut out, true) } else { a.transmit(210_000, &mut out) }.unwrap().unwrap();
+            let n = if reserved {
+                a.transmit_selected(210_000, &mut out, true)
+            } else {
+                a.transmit(210_000, &mut out)
+            }
+            .unwrap()
+            .unwrap();
             let p = wire::parse(ip(tuple()), &out[..n]).unwrap();
             assert_eq!((p.header.sequence, p.payload.len()), (seq.0, 0));
             assert_eq!(p.header.urgent_pointer, u16::MAX);
             if reserved {
                 let mut d = a.last_departure.unwrap();
                 assert_eq!(d.persist, index == 1);
-                a.accept_reserved_output(210_000, &mut d, 0, 0, true).unwrap();
+                a.accept_reserved_output(210_000, &mut d, 0, 0, true)
+                    .unwrap();
             }
         }
         assert!(!a.probe_pending);
@@ -256,4 +307,6 @@ fn empty_probe_large_urgent_pointer_is_bounded_without_repeating_notice() {
     }
 }
 
-mod real_peer { include!("connection_persist_peer_tests.rs"); }
+mod real_peer {
+    include!("connection_persist_peer_tests.rs");
+}

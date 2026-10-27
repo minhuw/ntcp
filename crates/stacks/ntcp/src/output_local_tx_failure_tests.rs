@@ -53,7 +53,6 @@ fn local_failure_endpoint() -> (Endpoint, ConnectionId, u32) {
                 rack: true,
                 tlp: true,
                 prr: true,
-                prr_algorithm: crate::PrrAlgorithm::Rfc9937,
                 prr_pacing: false,
                 pacing: None,
                 rto_min_us: 200_000,

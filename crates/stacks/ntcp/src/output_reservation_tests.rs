@@ -47,7 +47,6 @@ fn configured_pair(
     }
     if let Some(general) = pacing {
         a.config.connection.prr = !general;
-        a.config.connection.prr_algorithm = crate::PrrAlgorithm::Rfc9937;
         if general {
             a.config.connection.pacing = Some(crate::PacingConfig {
                 initial_window_burst: false,
@@ -2495,20 +2494,28 @@ fn shared_reservation_mtu_repair_retains_original_payload_and_rejects_stale_atte
     a.enable_shared_output(4).unwrap();
     let base = crate::Payload::from_vec(alloc::vec![7; 301]);
     let pointer = base.as_slice().as_ptr();
-    a.write_shared(id, base.clone(), false, false, None).unwrap();
+    a.write_shared(id, base.clone(), false, false, None)
+        .unwrap();
     a.shutdown(id).unwrap();
     let mut bytes = [0xa5; 2048];
     let mut parts = Vec::with_capacity(4);
-    let (output, attempt) = a.poll_reserved_transmit_shared_for(2, id, &mut bytes, &mut parts, 16).unwrap();
+    let (output, attempt) = a
+        .poll_reserved_transmit_shared_for(2, id, &mut bytes, &mut parts, 16)
+        .unwrap();
     let original = output.packet.unwrap();
     let attempt = attempt.unwrap();
     assert_eq!(parts[0].as_slice().as_ptr(), pointer);
-    assert_eq!(original.len - parts.iter().map(crate::Payload::len).sum::<usize>(), 20);
+    assert_eq!(
+        original.len - parts.iter().map(crate::Payload::len).sum::<usize>(),
+        20
+    );
     assert!(a.reject_unsubmitted(attempt).unwrap());
     a.set_first_hop_mtu(3, id, 100).unwrap();
     let mut offset = 0;
     while a.is_output_reserved(id) {
-        let (output, token) = a.poll_reserved_transmit_shared_for(3, id, &mut bytes, &mut parts, 16).unwrap();
+        let (output, token) = a
+            .poll_reserved_transmit_shared_for(3, id, &mut bytes, &mut parts, 16)
+            .unwrap();
         let tx = output.packet.unwrap();
         let token = token.unwrap();
         assert_ne!(token, attempt);
@@ -2518,9 +2525,14 @@ fn shared_reservation_mtu_repair_retains_original_payload_and_rejects_stale_atte
         assert_eq!(parts[0].as_slice().as_ptr(), pointer.wrapping_add(offset));
         let n = tx.len - payload_len;
         let mut wire = bytes[..n].to_vec();
-        for part in &parts { wire.extend_from_slice(part.as_slice()); }
+        for part in &parts {
+            wire.extend_from_slice(part.as_slice());
+        }
         let segment = wire::parse(tx.ip, &wire).unwrap();
-        assert_eq!(segment.header.flags & wire::FIN != 0, offset + payload_len == 301);
+        assert_eq!(
+            segment.header.flags & wire::FIN != 0,
+            offset + payload_len == 301
+        );
         b.input(3, tx.ip, &wire).unwrap();
         assert!(a.accept_transmit(3, token).unwrap());
         offset += payload_len;
