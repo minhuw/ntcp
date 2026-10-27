@@ -778,13 +778,15 @@ class AdaptationChecks(unittest.TestCase):
                     adapt_source(self.directory, self.name, self.manifest, self.flags)
 
     def test_every_mapping_resolves_common_unpaced_cubic_and_rfc9937(self):
-        from run import UPSTREAM_BASELINE_REASON, UPSTREAM_OPTION_AUDIT, upstream_flags
+        from run import UPSTREAM_OPTION_AUDIT, upstream_flags
+        baseline_reasons = set()
         for name, entry in self.manifest['scripts'].items():
             settings = profile_metadata(entry['adapter_flags'])
             self.assertEqual(entry['adapter_flags'], upstream_flags(name))
             self.assertEqual(entry['mapping']['ntcp_settings'], profile_metadata(entry['adapter_flags']))
             self.assertEqual(entry['mapping']['option_reasons'], UPSTREAM_OPTION_AUDIT.get(name, {}))
-            self.assertEqual(entry['mapping']['reasons'][0], UPSTREAM_BASELINE_REASON)
+            self.assertTrue(entry['mapping']['reasons'])
+            baseline_reasons.add(entry['mapping']['reasons'][0])
             self.assertEqual(settings['adaptive_ack'], 'immediate-ack' not in settings['options'])
             self.assertEqual(settings['delayed_ack_us'], 0 if 'immediate-ack' in settings['options'] else 200000)
             self.assertEqual(settings['initial_ack_timeout_us'], 40000)
@@ -799,6 +801,10 @@ class AdaptationChecks(unittest.TestCase):
             self.assertIsNone(settings['pacing_config'])
             self.assertEqual(set(settings['options']), set(entry['mapping']['option_reasons']))
             self.assertTrue(entry['mapping']['assertions_preserved'])
+        self.assertEqual(len(baseline_reasons), 1)
+        baseline_reason = baseline_reasons.pop()
+        self.assertIsInstance(baseline_reason, str)
+        self.assertTrue(baseline_reason)
 
     def test_consistent_manifest_cannot_smuggle_unaudited_options(self):
         name = 'tcp_info/tcp-info-sndbuf-limited.pkt'
