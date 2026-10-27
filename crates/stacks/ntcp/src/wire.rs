@@ -128,9 +128,16 @@ fn add_words(mut sum: u32, bytes: &[u8]) -> u32 {
 //# 16-bit words in the header and text.
 pub fn checksum(ip: IpMetadata, segment: &[u8]) -> Result<u16, WireError> {
     let len = checked_length(ip, segment.len())?;
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
-    //# The checksum also covers a pseudo-header (Figure 2) conceptually prefixed to the TCP
-    //# header. The pseudo-header is 96 bits for IPv4 and 320 bits for IPv6.
+    let mut sum = pseudo_header_sum(ip, len)?;
+    // Only the segment's final octet can require virtual zero padding.
+    sum = add_words(sum, segment);
+    Ok(!(sum as u16))
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
+//# The checksum also covers a pseudo-header (Figure 2) conceptually prefixed to the TCP
+//# header. The pseudo-header is 96 bits for IPv4 and 320 bits for IPv6.
+fn pseudo_header_sum(ip: IpMetadata, len: u32) -> Result<u32, WireError> {
     let mut sum = match (ip.source, ip.destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
             add_words(add_words(0, &source.octets()), &destination.octets())
@@ -140,12 +147,11 @@ pub fn checksum(ip: IpMetadata, segment: &[u8]) -> Result<u16, WireError> {
         }
         _ => return Err(WireError::AddressFamily),
     };
-    // Each pseudo-header chunk is even-sized; only the segment's final
-    // octet can require virtual zero padding. The extra IPv4 length word is zero.
+    // Each pseudo-header chunk is even-sized, so none needs virtual zero
+    // padding. The extra IPv4 length word is zero.
     sum = add_words(sum, &len.to_be_bytes());
     sum = add_words(sum, &[0, 6]);
-    sum = add_words(sum, segment);
-    Ok(!(sum as u16))
+    Ok(sum)
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.2
@@ -431,12 +437,7 @@ pub fn encode_shared(
     let len = checked_length(ip, total)?;
     let n = encode(ip, header, options, &[], out)?;
     out[16..18].fill(0);
-    let mut sum = match (ip.source, ip.destination) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => add_words(add_words(0, &src.octets()), &dst.octets()),
-        (IpAddr::V6(src), IpAddr::V6(dst)) => add_words(add_words(0, &src.octets()), &dst.octets()),
-        _ => return Err(WireError::AddressFamily),
-    };
-    sum = add_words(add_words(sum, &len.to_be_bytes()), &[0, 6]);
+    let mut sum = pseudo_header_sum(ip, len)?;
     let mut odd = None;
     for bytes in core::iter::once(&out[..n]).chain(payload.iter().map(|p| p.as_slice())) {
         for &byte in bytes {
