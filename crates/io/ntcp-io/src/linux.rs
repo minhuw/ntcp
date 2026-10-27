@@ -1,6 +1,7 @@
 // Shared read-only rtnetlink queries, keyed by ifindex (not a cached name/MTU).
 // Uses the caller's current network namespace and a fixed response buffer.
 // The response poll is bounded; synchronous kernel request processing is not.
+use crate::TxOutcome;
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -139,4 +140,88 @@ pub fn local_ip_mtu(index: u32) -> io::Result<Option<u32>> {
         }
         Ok(Some(mtu))
     })
+}
+
+/// Maps a packet read/recv result to `PacketIo::receive`: `Ok(None)` when the
+/// call would block, and an error for packets larger than `capacity`.
+pub fn received(count: isize, capacity: usize) -> io::Result<Option<usize>> {
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if count as usize > capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "packet exceeds output buffer; packet discarded",
+        ));
+    }
+    Ok(Some(count as usize))
+}
+
+/// Maps a packet write/send result for a `length`-byte packet to
+/// `PacketIo::transmit`: a short write is an error, never a submission.
+pub fn transmitted(count: isize, length: usize) -> io::Result<TxOutcome> {
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        // Linux packet write/send EINTR occurs before any bytes are submitted.
+        // Certify retry here, not for arbitrary PacketIo errors or cancellation.
+        return if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            Ok(TxOutcome::WouldBlock)
+        } else {
+            Err(error)
+        };
+    }
+    if count as usize != length {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short packet write",
+        ));
+    }
+    Ok(TxOutcome::Submitted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_results_map_errno_and_length() {
+        // SAFETY: errno is thread-local; model each failed syscall result.
+        unsafe { *libc::__errno_location() = libc::EAGAIN };
+        assert_eq!(received(-1, 4).unwrap(), None);
+        assert_eq!(transmitted(-1, 4).unwrap(), TxOutcome::WouldBlock);
+        unsafe { *libc::__errno_location() = libc::EINTR };
+        assert_eq!(transmitted(-1, 4).unwrap(), TxOutcome::WouldBlock);
+        assert_eq!(
+            received(-1, 4).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        unsafe { *libc::__errno_location() = libc::EBADF };
+        assert_eq!(
+            received(-1, 4).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            transmitted(-1, 4).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(received(0, 4).unwrap(), Some(0));
+        assert_eq!(received(4, 4).unwrap(), Some(4));
+        assert_eq!(
+            received(5, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(transmitted(4, 4).unwrap(), TxOutcome::Submitted);
+        assert_eq!(
+            transmitted(1, 4).unwrap_err().kind(),
+            io::ErrorKind::WriteZero
+        );
+    }
 }

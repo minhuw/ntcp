@@ -2,6 +2,7 @@
 
 mod timestamp;
 mod vnet;
+use ntcp_io::linux::{received, transmitted};
 use ntcp_io::{
     PacketIo, PacketLayer, ReceivedPacket, TimestampCapabilities, TxOutcome, TxTimestampCompletion,
     TxTimestampRequest,
@@ -323,47 +324,6 @@ fn socket(domain: i32, kind: i32, protocol: i32) -> io::Result<OwnedFd> {
         // SAFETY: socket returned a new owned descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
-}
-
-pub(crate) fn received(count: isize, capacity: usize) -> io::Result<Option<usize>> {
-    if count < 0 {
-        let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::WouldBlock {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
-    if count as usize > capacity {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "packet exceeds output buffer; packet discarded",
-        ));
-    }
-    Ok(Some(count as usize))
-}
-
-pub(crate) fn transmitted(count: isize, length: usize) -> io::Result<TxOutcome> {
-    if count < 0 {
-        let error = io::Error::last_os_error();
-        // Linux packet write/send EINTR occurs before any bytes are submitted.
-        // Certify retry here, not for arbitrary PacketIo errors or cancellation.
-        return if matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
-            Ok(TxOutcome::WouldBlock)
-        } else {
-            Err(error)
-        };
-    }
-    if count as usize != length {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "short packet write",
-        ));
-    }
-    Ok(TxOutcome::Submitted)
 }
 
 impl PacketIo for AfPacket {
