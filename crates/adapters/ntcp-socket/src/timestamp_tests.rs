@@ -536,7 +536,7 @@ fn timestamp_runtime_pending_and_queued_ids_use_different_option_epochs() {
         .unwrap()
         .packet
         .unwrap();
-    let frame = a.frame(tx, &bytes[..tx.len]).unwrap();
+    let frame = ip_packet(&a, tx, &bytes[..tx.len]);
     a.timestamp_packet(tx.tx_timestamp, &frame);
     a.drain_timestamps(ClockPair::sample(&a));
     assert_eq!(timestamp_records(&a, client)[0].1, 4);
@@ -592,7 +592,7 @@ fn timestamp_runtime_pending_tsonly_toggles_keep_actual_packet_or_drop_honestly(
             .unwrap()
             .packet
             .unwrap();
-        let frame = a.frame(tx, &bytes[..tx.len]).unwrap();
+        let frame = ip_packet(&a, tx, &bytes[..tx.len]);
         let capacity = a.sockets[&client].receive_capacity;
         if starve {
             a.sockets.get_mut(&client).unwrap().receive_capacity = 1;
@@ -788,7 +788,7 @@ fn timestamp_runtime_packet_allocation_failure_preserves_tsonly_completion() {
         .unwrap()
         .packet
         .unwrap();
-    let frame = a.frame(tx, &bytes[..tx.len]).unwrap();
+    let frame = ip_packet(&a, tx, &bytes[..tx.len]);
     // No bytes are copied if the fallible packet reservation fails.
     let before = a.timestamp_charge();
     timestamp_allocator::failing(|| a.timestamp_packet(tx.tx_timestamp, &frame));

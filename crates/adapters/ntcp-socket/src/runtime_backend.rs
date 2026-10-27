@@ -135,7 +135,6 @@ impl Owner {
             pending: Vec::with_capacity(timestamps::PHASES),
         });
         owner.enable_egress(config.io.egress_capacity, config.io.gso)?;
-        owner.reservations = true;
         owner.reservation_timeout_us = u64::from(config.io.output_reservation_timeout_ms) * 1000;
         Ok(owner)
     }
@@ -290,10 +289,6 @@ impl Owner {
         if self.egress.is_some() {
             return self.receive_scheduled(input);
         }
-        // Keep RX in the backend's bounded queue while the endpoint is reserved.
-        if self.reservation.is_some() {
-            return Ok(());
-        }
         for _ in 0..BUDGET {
             match self.receive_backend(input) {
                 Ok(Some(received)) => {
@@ -392,21 +387,6 @@ impl Owner {
         }
     }
 
-    pub(super) fn transmit_ethernet(&mut self) -> std::io::Result<TxOutcome> {
-        let sources = self
-            .pending_token
-            .map(|token| self.backend_sources(token))
-            .unwrap_or_default();
-        let result = self.ethernet.as_mut().unwrap().transmit(
-            &mut self.endpoint,
-            self.pending_token,
-            sources,
-            self.pending_packet.as_ref().unwrap(),
-        );
-        // Cancellation frees adapter reservations exactly once, via native events.
-        self.drain_timestamps(ClockPair::sample(self));
-        result
-    }
     pub(super) fn poll_backend_timestamps(&mut self) -> std::io::Result<()> {
         if let Some(backend) = &mut self.ethernet {
             for _ in 0..BUDGET {
@@ -493,28 +473,6 @@ impl EthernetBackend {
         self.pending.remove(0);
         Self::cancel_sources(endpoint, token, sw, hw);
         Ok(())
-    }
-    fn transmit(
-        &mut self,
-        endpoint: &mut Endpoint,
-        token: Option<ntcp::TxTimestampToken>,
-        sources: (bool, bool),
-        packet: &[u8],
-    ) -> std::io::Result<TxOutcome> {
-        let mut frame = vec![0; (packet.len() + 14).max(60)];
-        let n = ntcp_ethernet::encode_ethernet(
-            &mut frame,
-            self.local,
-            self.next_hop,
-            if packet.first().is_some_and(|b| b >> 4 == 6) {
-                ntcp_ethernet::ETHERTYPE_IPV6
-            } else {
-                ntcp_ethernet::ETHERTYPE_IPV4
-            },
-            packet,
-        )
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-        self.transmit_frame(endpoint, token, sources, &frame[..n])
     }
     pub(super) fn transmit_frame(
         &mut self,

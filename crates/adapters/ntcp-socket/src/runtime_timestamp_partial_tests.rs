@@ -114,7 +114,7 @@ fn drain(f: &mut Fixture) -> Vec<(u32, usize, bool)> {
                 p.header.flags & PSH != 0,
             ));
         }
-        let frame = f.owner.frame(tx, &bytes[..tx.len]).unwrap();
+        let frame = ip_packet(&f.owner, tx, &bytes[..tx.len]);
         f.owner.timestamp_packet(tx.tx_timestamp, &frame);
         f.owner.drain_timestamps(pair);
         f.owner

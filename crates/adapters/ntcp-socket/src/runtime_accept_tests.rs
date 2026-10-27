@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-use super::super::tests::{new, pair, pump};
+use super::super::tests::{new, pair, poll_packet, pump};
 use super::*;
 use std::sync::{Arc, Mutex};
 
@@ -65,8 +65,7 @@ fn held_child(siblings: usize, flags: i32) -> (Owner, u64, ConnectionId, Arc<Mut
     });
     b.enable_egress(4, None).unwrap();
     a.execute(clients[0], Op::Write(vec![7; 10])).unwrap();
-    assert!(a.prepare_packet(None).unwrap());
-    let bytes = a.pending_packet.take().unwrap();
+    let bytes = poll_packet(&mut a).unwrap();
     let ip = ntcp_ip::parse(&bytes, false).unwrap();
     b.input(b.now(), ip.ip, ip.traffic_class, ip.payload)
         .unwrap();

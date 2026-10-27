@@ -62,14 +62,17 @@ fn full_native_accept_queue_admits_close() {
     let local = Ipv4Addr::new(10, 73, 0, 2);
     close_full_listener(
         move || {
-            Owner::with_config(
+            let mut owner = Owner::with_config(
                 local,
                 (local, 32),
                 [2; 32],
                 None,
                 SocketConfig::new("test", local).tcp,
             )
-            .unwrap()
+            .unwrap();
+            // run() requires the Egress every runtime constructor enables.
+            owner.enable_egress(1, None).unwrap();
+            owner
         },
         false,
     );

@@ -288,6 +288,8 @@ fn logical_owner_stop_returns_accepted_prefix() {
     );
     assert!(!a.service(&mut request));
     a.pending.push_back(request);
+    // run() requires the Egress every runtime constructor enables.
+    a.enable_egress(1, None).unwrap();
     let (_tx, rx) = mpsc::sync_channel(1);
     a.run(rx, -1, &std::sync::atomic::AtomicBool::new(true));
     assert_eq!(result.recv().unwrap().unwrap().value, BYTES as i32);

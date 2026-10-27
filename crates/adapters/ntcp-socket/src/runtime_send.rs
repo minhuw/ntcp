@@ -42,9 +42,6 @@ impl Owner {
     // A nonblocking caller may return while output owns an immutable plan.
     // Apply only its boundary metadata once that generation is mutable again.
     pub(super) fn finish_retained_sends(&mut self) {
-        if self.reservation.is_some() {
-            return;
-        }
         for socket in self.sockets.values_mut() {
             if let Some(finish) = socket.send_finish
                 && !self.endpoint.is_output_reserved(finish.connection)

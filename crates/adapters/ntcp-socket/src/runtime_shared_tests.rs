@@ -68,7 +68,6 @@ fn attach_limit(owner: &mut Owner, packet_limit: usize) -> Arc<Mutex<SharedState
         pending: Vec::with_capacity(timestamps::PHASES),
     });
     owner.enable_egress(4, None).unwrap();
-    owner.reservations = true;
     state
 }
 fn drain_wire(state: &Arc<Mutex<SharedState>>, to: &mut Owner) {

@@ -2,7 +2,7 @@
 use super::*;
 use crate::packet_profile::Profile;
 use crate::packet_test::Options;
-use crate::runtime::tests::new;
+use crate::runtime::tests::{ip_packet, new};
 
 fn owner(last: u8, profile: Profile, capacity: usize) -> Owner {
     let mut owner = Owner::packet_with_options(
@@ -15,7 +15,7 @@ fn owner(last: u8, profile: Profile, capacity: usize) -> Owner {
     .unwrap();
     owner.test_now = Some(1000);
     assert!(owner.egress.is_some());
-    assert!(owner.pending_packet.is_none());
+    assert!(!owner.egress.as_ref().unwrap().has_held());
     assert_eq!(
         owner.packets.as_ref().unwrap().layer(),
         ntcp_io::PacketLayer::Ip
@@ -561,21 +561,20 @@ fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
             &mut tcp,
         )
         .unwrap();
-        let frame = a
-            .frame(
-                ntcp::Transmit {
-                    tx_timestamp: None,
-                    connection: None,
-                    ip: incoming,
-                    len: size,
-                    hop_limit: 64,
-                    dscp: 0,
-                    ecn: 0,
-                    ipv4_options: Default::default(),
-                },
-                &tcp[..size],
-            )
-            .unwrap();
+        let frame = ip_packet(
+            &a,
+            ntcp::Transmit {
+                tx_timestamp: None,
+                connection: None,
+                ip: incoming,
+                len: size,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..size],
+        );
         tfo_deliver(&mut a, frame);
         let synack = tfo_capture(&mut a);
         let sent = segment(&synack);
@@ -686,21 +685,20 @@ fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
             &mut tcp,
         )
         .unwrap();
-        let ack = a
-            .frame(
-                ntcp::Transmit {
-                    tx_timestamp: None,
-                    connection: None,
-                    ip: incoming,
-                    len: size,
-                    hop_limit: 64,
-                    dscp: 0,
-                    ecn: 0,
-                    ipv4_options: Default::default(),
-                },
-                &tcp[..size],
-            )
-            .unwrap();
+        let ack = ip_packet(
+            &a,
+            ntcp::Transmit {
+                tx_timestamp: None,
+                connection: None,
+                ip: incoming,
+                len: size,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..size],
+        );
         tfo_deliver(&mut a, ack);
         if hard {
             let reset = tfo_capture(&mut a);

@@ -19,7 +19,7 @@ fn paced_owner(last: u8) -> Owner {
     owner
 }
 
-fn paced_pair() -> (Owner, Owner, u64, u64, u64) {
+pub(super) fn paced_pair() -> (Owner, Owner, u64, u64, u64) {
     let mut a = paced_owner(2);
     let mut b = paced_owner(3);
     let listener = new(&mut b, SOCK_NONBLOCK);
@@ -41,7 +41,7 @@ fn paced_pair() -> (Owner, Owner, u64, u64, u64) {
 }
 
 // Advance only to real core deadlines: no wall-clock sleeps or invented delay.
-fn pacing_tick(a: &mut Owner, b: &mut Owner) {
+pub(super) fn pacing_tick(a: &mut Owner, b: &mut Owner) {
     let now = [a.endpoint.next_deadline(), b.endpoint.next_deadline()]
         .into_iter()
         .flatten()
@@ -139,90 +139,6 @@ fn pacing_production_config_transfers_idles_and_half_closes_without_prr() {
     a.execute(client, Op::Close).unwrap();
     b.execute(server, Op::Close).unwrap();
     b.execute(listener, Op::Close).unwrap();
-}
-
-#[test]
-fn pacing_blocked_backend_retains_one_commit_and_resumes_at_core_deadline() {
-    struct BlockedIo {
-        blocked: bool,
-        calls: usize,
-        sent: Vec<Vec<u8>>,
-    }
-    impl PacketIo for BlockedIo {
-        fn layer(&self) -> ntcp_io::PacketLayer {
-            ntcp_io::PacketLayer::Ip
-        }
-        fn receive(&mut self, _: &mut [u8]) -> std::io::Result<Option<usize>> {
-            Ok(None)
-        }
-        fn transmit(&mut self, packet: &[u8]) -> std::io::Result<TxOutcome> {
-            self.calls += 1;
-            if self.blocked {
-                return Ok(TxOutcome::WouldBlock);
-            }
-            self.sent.push(packet.to_vec());
-            Ok(TxOutcome::Submitted)
-        }
-    }
-    let (mut a, mut b, client, server, _) = paced_pair();
-    a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
-        .unwrap();
-    a.execute(client, Op::Write(vec![9; 12000])).unwrap();
-    let Handle::Connection(cid) = a.sockets[&client].handle else {
-        panic!()
-    };
-    let mut io = BlockedIo {
-        blocked: true,
-        calls: 0,
-        sent: Vec::new(),
-    };
-    assert!(a.prepare_packet(None).unwrap());
-    let pending = a.pending_packet.clone();
-    let unsent = a.endpoint.transport_info(cid).unwrap().notsent_bytes;
-    for _ in 0..3 {
-        // The same production prepare/submit path must not re-encode while blocked.
-        assert!(a.prepare_packet(None).unwrap());
-        assert_eq!(
-            submit_packet(&mut io, &mut a.pending_packet).unwrap(),
-            TxOutcome::WouldBlock
-        );
-        assert_eq!(a.pending_packet, pending);
-        assert_eq!(
-            a.endpoint.transport_info(cid).unwrap().notsent_bytes,
-            unsent
-        );
-    }
-    assert_eq!(io.calls, 3);
-    assert!(io.sent.is_empty());
-    io.blocked = false;
-    assert_eq!(
-        submit_packet(&mut io, &mut a.pending_packet).unwrap(),
-        TxOutcome::Submitted
-    );
-    assert!(a.pending_packet.is_none());
-    assert_eq!(io.sent, vec![pending.unwrap()]);
-    let ip = ntcp_ip::parse(&io.sent[0], false).unwrap();
-    b.input(b.now(), ip.ip, ip.traffic_class, ip.payload)
-        .unwrap();
-    pump(&mut a, &mut b);
-    let mut received = b.execute(server, Op::Read(BYTES)).unwrap().bytes;
-    assert!(received.len() <= 2 * 1460);
-    assert!(
-        !a.prepare_packet(None).unwrap(),
-        "must wait for pacing, not encode ahead"
-    );
-    for _ in 0..128 {
-        if received.len() == 12000 {
-            break;
-        }
-        pacing_tick(&mut a, &mut b);
-        match b.execute(server, Op::Read(BYTES)) {
-            Ok(reply) => received.extend(reply.bytes),
-            Err(EAGAIN) => (),
-            Err(error) => panic!("read: {error}"),
-        }
-    }
-    assert_eq!(received, vec![9; 12000]);
 }
 
 #[test]

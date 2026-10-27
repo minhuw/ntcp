@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Legacy packet assertions retargeted to the real socket Owner. Numeric request
 // translation is test-only; no Endpoint or socket semantics live in this harness.
+use super::tests::ip_packet;
 use super::{Owner as SocketOwner, *};
 use crate::packet_profile::{Profile, parse_frame as parse_ip, profile};
 use crate::transport::transport_option;
@@ -457,7 +458,7 @@ fn poll_frame(owner: &mut Owner) -> Option<(ntcp::Transmit, Vec<u8>)> {
         .poll_transmit(owner.inner.now(), &mut tcp, BUDGET)
         .unwrap()
         .packet?;
-    Some((tx, owner.frame(tx, &tcp[..tx.len]).unwrap()))
+    Some((tx, ip_packet(owner, tx, &tcp[..tx.len])))
 }
 
 fn packet_header(bytes: &[u8]) -> ntcp::wire::Header {
@@ -1422,7 +1423,7 @@ fn ip_options_pending_connect_updates_and_engine_owned_ecn() {
         ecn: 2,
         ..tx
     };
-    check_ip(&owner.frame(engine_tx, &tcp[..len]).unwrap(), 254, true);
+    check_ip(&ip_packet(&owner, engine_tx, &tcp[..len]), 254, true);
     let id = owner.connection(fd).unwrap();
     for mode in [IP_PMTUDISC_WANT, IP_PMTUDISC_DONT, IP_PMTUDISC_DO] {
         execute_value(&mut owner, 11, fd, 7, mode).unwrap();

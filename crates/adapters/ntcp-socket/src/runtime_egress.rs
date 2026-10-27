@@ -213,9 +213,6 @@ impl Owner {
         if matches!(op, Op::ListenerPresent(_)) {
             return false;
         }
-        if self.reservation.is_some() {
-            return true;
-        } // Explicit legacy test path only.
         let op = if let Op::Wait(op, _) = op { &**op } else { op };
         // poll/epoll query sockets serially. Never park their read-only probe
         // behind one held owner; readiness_bits masks that owner's I/O instead.
@@ -276,6 +273,19 @@ impl Owner {
         })();
         self.egress = Some(egress);
         result
+    }
+    // IP_PMTUDISC_DONT sends without DF; the IPv4 codec always sets it.
+    pub(super) fn apply_pmtudisc_dont(&self, owner: Option<ConnectionId>, ip: &mut [u8]) {
+        if self.local.is_ipv4()
+            && owner
+                .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
+                .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
+        {
+            ip[6] = 0;
+            ip[10..12].fill(0);
+            let checksum = ntcp_ip_common::checksum(&ip[..20]);
+            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        }
     }
     // No TCP pacer here: core selected polling returns only currently eligible
     // packets. The scheduler's EDT is selection time, or a backend retry time.
@@ -364,17 +374,7 @@ impl Owner {
             tx.len - shared_len,
         )
         .map_err(|_| EIO)?;
-        if self.local.is_ipv4()
-            && owner
-                .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
-                .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
-        {
-            let ip = &mut bytes[offset..];
-            ip[6] = 0;
-            ip[10..12].fill(0);
-            let checksum = ntcp_ip_common::checksum(&ip[..20]);
-            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-        }
+        self.apply_pmtudisc_dont(owner, &mut bytes[offset..]);
         if shared_len == 0 {
             self.timestamp_packet(tx.tx_timestamp, &bytes[offset..offset + ip_len]);
         }

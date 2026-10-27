@@ -64,82 +64,7 @@ impl Owner {
         self.mtu_refresh = Some(MtuRefresh::spawn(move || {
             ntcp_io::linux::local_ip_mtu(index)
         })?);
-        self.reservations = true;
         self.reservation_timeout_us = u64::from(config.output_reservation_timeout_ms) * 1000;
-        Ok(())
-    }
-
-    fn clear_reservation(&mut self) {
-        self.reservation = None;
-        self.reservation_owner = None;
-        self.reservation_deadline = None;
-        self.waiting_mtu = false;
-    }
-
-    // Legacy single-slot fixtures still use this path; native owners use Egress.
-    fn completed_reservation(&mut self) -> Result<()> {
-        if self
-            .reservation_owner
-            .is_none_or(|id| !self.endpoint.is_output_reserved(id))
-        {
-            self.clear_reservation();
-        }
-        Ok(())
-    }
-
-    fn start_reservation_deadline(&mut self) {
-        if self.reservation.is_some() && self.reservation_deadline.is_none() {
-            self.reservation_deadline =
-                Some(self.now().saturating_add(self.reservation_timeout_us));
-        }
-    }
-
-    pub(super) fn abandon_reservation(&mut self) -> Result<()> {
-        if let Some(attempt) = self.reservation {
-            // Only called for bytes certainly not submitted. Accepted prefixes
-            // are committed already; the core discards only the remaining owner.
-            if !self.endpoint.abandon_transmit(attempt).map_err(engine)? {
-                return Err(EIO);
-            }
-        }
-        self.pending_packet = None;
-        self.pending_token = None;
-        self.clear_reservation();
-        self.drain_timestamps(ClockPair::sample(self));
-        self.cancel_unused_backend_timestamps();
-        Ok(())
-    }
-
-    pub(super) fn expire_reservation(&mut self, now: u64) -> Result<()> {
-        if self.egress.is_some() {
-            return self.expire_egress(now);
-        }
-        let application = self
-            .reservation
-            .map(|attempt| self.endpoint.reserved_application_deadline(attempt))
-            .transpose()
-            .map_err(engine)?
-            .flatten();
-        if application
-            .is_some_and(|at| at <= now && self.reservation_deadline.is_none_or(|io| at <= io))
-        {
-            let attempt = self.reservation.ok_or(EIO)?;
-            if !self
-                .endpoint
-                .expire_reserved_application(now, attempt)
-                .map_err(engine)?
-            {
-                return Err(EIO);
-            }
-            self.pending_packet = None;
-            self.pending_token = None;
-            self.clear_reservation();
-        } else if self
-            .reservation_deadline
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.abandon_reservation()?;
-        }
         Ok(())
     }
 
@@ -170,105 +95,15 @@ impl Owner {
                 .is_ok()
         {
             self.defaults.connection.pmtud = Some(ntcp::PmtudConfig::new(mtu));
-            self.waiting_mtu = false;
             if let Some(egress) = &mut self.egress {
                 egress.mtu_refreshed();
             }
         }
     }
 
-    pub(super) fn submit_reserved_packet(&mut self) -> Result<TxOutcome> {
-        self.set_backend_mark(self.output_mark(self.reservation_owner))
-            .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
-        let result = if let Some(tun) = &mut self.tun {
-            submit_packet(tun, &mut self.pending_packet)
-        } else {
-            self.transmit_ethernet()
-        };
-        match result {
-            Ok(TxOutcome::Submitted) => {
-                if let Some(attempt) = self.reservation {
-                    if !self
-                        .endpoint
-                        .accept_transmit(self.now(), attempt)
-                        .map_err(engine)?
-                    {
-                        return Err(EIO);
-                    }
-                    self.completed_reservation()?;
-                }
-                if self.tun.is_some() {
-                    let token = self.pending_token.take();
-                    self.software_transmitted(token, timestamps::realtime());
-                }
-                self.pending_packet = None;
-                self.pending_token = None;
-                Ok(TxOutcome::Submitted)
-            }
-            Ok(TxOutcome::Rejected) => {
-                if let Some(attempt) = self.reservation
-                    && self
-                        .endpoint
-                        .reject_local_output(self.now(), attempt)
-                        .map_err(engine)?
-                {
-                    self.pending_packet = None;
-                    self.pending_token = None;
-                    self.completed_reservation()?;
-                    self.cancel_unused_backend_timestamps();
-                } else {
-                    self.start_reservation_deadline();
-                }
-                Ok(TxOutcome::WouldBlock)
-            }
-            Ok(TxOutcome::WouldBlock) => {
-                self.start_reservation_deadline();
-                Ok(TxOutcome::WouldBlock)
-            }
-            Err(e) if e.raw_os_error() == Some(EMSGSIZE) && self.reservation.is_some() => {
-                self.start_reservation_deadline();
-                if !self
-                    .endpoint
-                    .reject_unsubmitted(self.reservation.unwrap())
-                    .map_err(engine)?
-                {
-                    return Err(EIO);
-                }
-                self.pending_packet = None;
-                self.pending_token = None;
-                self.waiting_mtu = true;
-                if let Some(refresh) = &mut self.mtu_refresh {
-                    refresh.request();
-                }
-                self.completed_reservation()?; // Stateless output is best-effort discard.
-                self.drain_timestamps(ClockPair::sample(self));
-                self.cancel_unused_backend_timestamps();
-                Ok(TxOutcome::WouldBlock)
-            }
-            // Native packet syscalls certify EINTR as WouldBlock at the IO
-            // boundary. Generic/wrapped errors do not certify non-submission.
-            Err(e) => Err(e.raw_os_error().unwrap_or(EIO)),
-        }
-    }
-
     pub(super) fn output_wait(&self) -> std::time::Duration {
-        let now = self.now();
-        if let Some(egress) = &self.egress {
-            return egress.wait(now, self.endpoint.next_deadline());
-        }
-        // A parked MTU query has no useful pacing deadline; a pending backend
-        // packet must be retried at a bounded cadence, not an overdue TCP timer.
-        let core = if self.waiting_mtu || self.pending_packet.is_some() {
-            None
-        } else {
-            self.endpoint.next_deadline()
-        };
-        core.into_iter()
-            .chain(self.reservation_deadline)
-            .min()
-            .map(|d| std::time::Duration::from_micros(d.saturating_sub(now)))
-            .unwrap_or(std::time::Duration::from_millis(1))
-            .min(std::time::Duration::from_millis(1))
+        let egress = self.egress.as_ref().unwrap();
+        egress.wait(self.now(), self.endpoint.next_deadline())
     }
 }
 

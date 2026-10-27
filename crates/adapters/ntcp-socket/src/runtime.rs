@@ -526,16 +526,6 @@ impl Socket {
         })
     }
 }
-fn submit_packet(
-    io: &mut impl PacketIo,
-    packet: &mut Option<Vec<u8>>,
-) -> std::io::Result<TxOutcome> {
-    let outcome = io.transmit(packet.as_ref().unwrap())?;
-    if outcome == TxOutcome::Submitted {
-        *packet = None;
-    }
-    Ok(outcome)
-}
 fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
     let ms = u64::try_from(milliseconds).map_err(|_| EINVAL)?;
     Ok((ms != 0).then_some(ms * 1000))
@@ -576,15 +566,7 @@ struct Owner {
     next_id: u64,
     detached: Vec<ConnectionId>,
     egress: Option<egress::Egress>,
-    // Legacy direct-poll fixtures only; native Egress never fills this carrier.
-    pending_packet: Option<Vec<u8>>,
-    pending_token: Option<ntcp::TxTimestampToken>,
-    reservations: bool,
-    reservation: Option<ntcp::TransmitAttempt>,
-    reservation_owner: Option<ConnectionId>,
-    reservation_deadline: Option<u64>,
     reservation_timeout_us: u64,
-    waiting_mtu: bool,
     mtu_refresh: Option<output::MtuRefresh>,
     timestamp_cookie: u64,
     child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
@@ -790,14 +772,7 @@ impl Owner {
             next_id: 1,
             detached: Vec::new(),
             egress: None,
-            pending_packet: None,
-            pending_token: None,
-            reservations: false,
-            reservation: None,
-            reservation_owner: None,
-            reservation_deadline: None,
             reservation_timeout_us: 1_000_000,
-            waiting_mtu: false,
             mtu_refresh: None,
             timestamp_cookie: 1,
             child_timestamps: Vec::new(),
@@ -960,26 +935,6 @@ impl Owner {
             .count()
             >= self.socket_limit()
     }
-    fn frame(&self, tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
-        let header = crate::ip::header_len(tx.ip.source);
-        let mut packet = vec![0; header + tcp.len()];
-        packet[header..].copy_from_slice(tcp);
-        let n = crate::ip::encode(&mut packet, tx, (self.now() / 1000) as u32, tx.len)
-            .map_err(|_| EIO)?;
-        packet.truncate(n);
-        if tx.ip.source.is_ipv4()
-            && tx
-                .connection
-                .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
-                .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
-        {
-            packet[6] = 0;
-            packet[10..12].fill(0);
-            let checksum = ntcp_ip_common::checksum(&packet[..20]);
-            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
-        }
-        Ok(packet)
-    }
     fn now(&self) -> u64 {
         #[cfg(test)]
         if let Some(now) = self.test_now {
@@ -1094,55 +1049,6 @@ impl Owner {
                 .min(usize::from(self.defaults.connection.mss) + 60)
                 .min(65515)
     }
-    // Select at current time, never at a future pacing deadline. Reserved departure
-    // commits only at backend acceptance; retain the same bytes through WouldBlock.
-    fn prepare_packet(&mut self, transmit_now: Option<u64>) -> Result<bool> {
-        if self.pending_packet.is_some() {
-            return Ok(true);
-        }
-        if self.waiting_mtu {
-            return Ok(false);
-        }
-        let header = crate::ip::header_len(self.local);
-        let mut packet = vec![0; self.output_packet_len()];
-        let pair = ClockPair::sample(self);
-        let now = transmit_now.unwrap_or_else(|| self.now());
-        let tx = if self.reservations {
-            match self
-                .endpoint
-                .poll_reserved_transmit(now, &mut packet[header..], BUDGET)
-            {
-                Ok((output, attempt)) => {
-                    if let Some(attempt) = attempt {
-                        self.reservation = Some(attempt);
-                    }
-                    output.packet
-                }
-                Err(EndpointError::ReservationMtuTooSmall) => {
-                    self.abandon_reservation()?;
-                    return Ok(false);
-                }
-                Err(e) => return Err(engine(e)),
-            }
-        } else {
-            self.endpoint
-                .poll_transmit(now, &mut packet[header..], BUDGET)
-                .map_err(engine)?
-                .packet
-        };
-        let Some(tx) = tx else {
-            return Ok(false);
-        };
-        if self.reservations {
-            self.reservation_owner = tx.connection;
-        }
-        packet = self.frame(tx, &packet[header..header + tx.len])?;
-        self.timestamp_packet(tx.tx_timestamp, &packet);
-        self.drain_timestamps(pair);
-        self.pending_token = tx.tx_timestamp;
-        self.pending_packet = Some(packet);
-        Ok(true)
-    }
     fn service_before_output(&mut self, after_output: &mut Vec<(Request, bool)>) {
         for _ in 0..self.pending.len().min(BUDGET) {
             let mut request = self.pending.pop_front().unwrap();
@@ -1160,16 +1066,18 @@ impl Owner {
         }
     }
     fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
+        // Every runtime constructor enables Egress, the only output path.
+        assert!(self.egress.is_some());
         let mut input = vec![0; 65535 + if self.ethernet.is_some() { 14 } else { 0 }];
         // Keep in-flight batches owned through every output/backend exit.
         let mut after_output = Vec::with_capacity(BUDGET);
         'run: while !stop.load(Ordering::Acquire) {
             self.poll_mtu_refresh();
-            if self.expire_reservation(self.now()).is_err() {
+            if self.expire_egress(self.now()).is_err() {
                 break;
             }
             let now = self.now();
-            if self.reservation.is_none() && self.endpoint.on_timeout(now, BUDGET).is_err() {
+            if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
             if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
@@ -1185,26 +1093,8 @@ impl Owner {
             self.events();
             self.collect_zero_copy();
             self.service_before_output(&mut after_output);
-            if self.egress.is_some() {
-                if self.service_egress().is_err() {
-                    break 'run;
-                }
-            } else {
-                for _ in 0..BUDGET {
-                    match self.prepare_packet(None) {
-                        Ok(true) => (),
-                        Ok(false) => break,
-                        Err(_) => break 'run,
-                    }
-                    // Backend acceptance is the only success boundary, including late accepts.
-                    if self.tun.is_some() || self.ethernet.is_some() {
-                        match self.submit_reserved_packet() {
-                            Ok(TxOutcome::Submitted) => (),
-                            Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => break,
-                            Err(_) => break 'run,
-                        }
-                    }
-                }
+            if self.service_egress().is_err() {
+                break 'run;
             }
             self.events();
             self.collect_zero_copy();
@@ -1215,26 +1105,23 @@ impl Owner {
             }
             self.connection_options
                 .retain(|p| self.endpoint.connection_exists(p.0));
-            if self.reservation.is_none() {
-                self.detached.retain(|&id| {
-                    if !self.endpoint.is_output_reserved(id)
-                        && matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait))
-                    {
-                        let _ = self.endpoint.release(id);
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
+            self.detached.retain(|&id| {
+                if !self.endpoint.is_output_reserved(id)
+                    && matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait))
+                {
+                    let _ = self.endpoint.release(id);
+                    false
+                } else {
+                    true
+                }
+            });
             // Bounded owner work and a 1ms ceiling also cover shared wakefd consumers.
             let wait = self.output_wait();
             // Keep admission open while teardown has room; packet capture must
             // always remain reachable to free held output.
             if !self.packet_backend()
                 && self.pending.len() >= 2 * self.socket_limit()
-                && (self.reservation.is_some()
-                    || self.egress.as_ref().is_some_and(|e| e.has_held()))
+                && self.egress.as_ref().is_some_and(|e| e.has_held())
             {
                 std::thread::sleep(wait);
                 continue;
@@ -1455,9 +1342,6 @@ impl Owner {
     }
     fn events(&mut self) {
         self.finish_retained_sends();
-        if self.reservation.is_some() {
-            return;
-        }
         for _ in 0..BUDGET {
             let Some(event) = self.endpoint.next_event() else {
                 break;
@@ -3015,6 +2899,31 @@ mod tests {
     pub(super) fn new(o: &mut Owner, flags: i32) -> u64 {
         o.execute(0, Op::New(flags)).unwrap().value as u64
     }
+    // Test transport: IP-encode one directly polled segment as egress does.
+    pub(super) fn ip_packet(owner: &Owner, tx: ntcp::Transmit, tcp: &[u8]) -> Vec<u8> {
+        let header = crate::ip::header_len(tx.ip.source);
+        let mut packet = vec![0; header + tcp.len()];
+        packet[header..].copy_from_slice(tcp);
+        let n = crate::ip::encode(&mut packet, tx, (owner.now() / 1000) as u32, tx.len).unwrap();
+        packet.truncate(n);
+        owner.apply_pmtudisc_dont(tx.connection, &mut packet);
+        packet
+    }
+    // Test transport: one IP packet directly polled from a backend-less peer.
+    pub(super) fn poll_packet(owner: &mut Owner) -> Option<Vec<u8>> {
+        let header = crate::ip::header_len(owner.local);
+        let mut tcp = vec![0; owner.output_packet_len() - header];
+        let pair = ClockPair::sample(owner);
+        let tx = owner
+            .endpoint
+            .poll_transmit(owner.now(), &mut tcp, BUDGET)
+            .unwrap()
+            .packet?;
+        let packet = ip_packet(owner, tx, &tcp[..tx.len]);
+        owner.timestamp_packet(tx.tx_timestamp, &packet);
+        owner.drain_timestamps(pair);
+        Some(packet)
+    }
     pub(super) fn pump(a: &mut Owner, b: &mut Owner) {
         for _ in 0..32 {
             let mut progress = false;
@@ -3034,7 +2943,7 @@ mod tests {
                     let Some(p) = p.packet else {
                         break;
                     };
-                    let frame = from.frame(p, &bytes[..p.len]).unwrap();
+                    let frame = ip_packet(from, p, &bytes[..p.len]);
                     from.timestamp_packet(p.tx_timestamp, &frame);
                     from.drain_timestamps(pair);
                     from.software_transmitted(p.tx_timestamp, timestamps::realtime());

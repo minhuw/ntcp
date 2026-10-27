@@ -37,21 +37,20 @@ fn pmtud_peer_reply(a: &mut Owner, packet: &[u8], syn: bool) {
         &mut tcp,
     )
     .unwrap();
-    let reply = a
-        .frame(
-            ntcp::Transmit {
-                tx_timestamp: None,
-                connection: None,
-                ip,
-                len: n,
-                hop_limit: 64,
-                dscp: 0,
-                ecn: 0,
-                ipv4_options: Default::default(),
-            },
-            &tcp[..n],
-        )
-        .unwrap();
+    let reply = ip_packet(
+        a,
+        ntcp::Transmit {
+            tx_timestamp: None,
+            connection: None,
+            ip,
+            len: n,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+        },
+        &tcp[..n],
+    );
     tfo_deliver(a, reply);
 }
 

@@ -35,21 +35,20 @@ fn adaptive_peer(a: &mut Owner, packet: &[u8], syn: bool, mss: u16, payload: &[u
         &mut tcp,
     )
     .unwrap();
-    let reply = a
-        .frame(
-            ntcp::Transmit {
-                tx_timestamp: None,
-                connection: None,
-                ip,
-                len: n,
-                hop_limit: 64,
-                dscp: 0,
-                ecn: 0,
-                ipv4_options: Default::default(),
-            },
-            &tcp[..n],
-        )
-        .unwrap();
+    let reply = ip_packet(
+        a,
+        ntcp::Transmit {
+            tx_timestamp: None,
+            connection: None,
+            ip,
+            len: n,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+        },
+        &tcp[..n],
+    );
     tfo_deliver(a, reply);
 }
 
@@ -183,9 +182,7 @@ fn upstream_runtime_adaptive_ack_profile_tests(options: &str) -> crate::packet_p
 
 // Bounded owner-loop slice using the same pre-output admission as run().
 fn adaptive_tfo_owner_turn(a: &mut Owner) -> Vec<Vec<u8>> {
-    if a.reservation.is_none() {
-        a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
-    }
+    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
     receive(a);
     a.events();
     let mut after_output = Vec::new();
@@ -495,21 +492,20 @@ fn upstream_inq_server_read_window_ack_and_fin_schedules() {
         };
         let mut tcp = vec![0; 60 + payload.len()];
         let len = ntcp::wire::encode(ip, h, options, payload, &mut tcp).unwrap();
-        let bytes = a
-            .frame(
-                ntcp::Transmit {
-                    tx_timestamp: None,
-                    connection: None,
-                    ip,
-                    len,
-                    hop_limit: 64,
-                    dscp: 0,
-                    ecn: 0,
-                    ipv4_options: Default::default(),
-                },
-                &tcp[..len],
-            )
-            .unwrap();
+        let bytes = ip_packet(
+            a,
+            ntcp::Transmit {
+                tx_timestamp: None,
+                connection: None,
+                ip,
+                len,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..len],
+        );
         tfo_deliver(a, bytes);
     }
     fn snapshot(a: &Owner, server: u64, coalesce: bool, schedule: &str, stage: &str) {
