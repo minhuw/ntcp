@@ -14,7 +14,8 @@ fn small_pair(timestamps: bool, iss: u32) -> (Connection, Connection) {
     assert_eq!(wire::parse(ip(t), &syn).unwrap().options.mss, Some(600));
     c.pmtud = None;
     c.advertised_mss = None;
-    let mut b = Connection::passive(reverse(t), c, 900, 10, &wire::parse(ip(t), &syn).unwrap()).unwrap();
+    let mut b =
+        Connection::passive(reverse(t), c, 900, 10, &wire::parse(ip(t), &syn).unwrap()).unwrap();
     deliver(&mut b, &mut a, 20);
     deliver(&mut a, &mut b, 30);
     (a, b)
@@ -65,9 +66,24 @@ fn ipv6_small_packetization_promotes_only_on_real_probe_ack() {
         for reserved in [false, true] {
             for iss in [10, u32::MAX - 500] {
                 let (mut a, mut b) = small_pair(timestamps, iss);
-                let before = (a.mss, a.congestion.cwnd(), a.receive_mss(), a.snd_una, a.snd_nxt);
+                let before = (
+                    a.mss,
+                    a.congestion.cwnd(),
+                    a.receive_mss(),
+                    a.snd_una,
+                    a.snd_nxt,
+                );
                 a.set_route_mtu(40, Some(1520)).unwrap();
-                assert_eq!((a.mss, a.congestion.cwnd(), a.receive_mss(), a.snd_una, a.snd_nxt), before);
+                assert_eq!(
+                    (
+                        a.mss,
+                        a.congestion.cwnd(),
+                        a.receive_mss(),
+                        a.snd_una,
+                        a.snd_nxt
+                    ),
+                    before
+                );
                 assert_eq!(a.path_mtu_info().unwrap().current_mtu, 660);
                 a.write(&[7; 20_000]).unwrap();
                 let bytes = packetization_output(&mut a, 50, reserved);
@@ -76,7 +92,10 @@ fn ipv6_small_packetization_promotes_only_on_real_probe_ack() {
                 assert_eq!(segment.payload.len(), if timestamps { 974 } else { 986 });
                 let snapshot = a.path_mtu_info();
                 for invalid in [660, 1045, 1279] {
-                    assert!(!a.pmtu_feedback(51, segment.header.sequence, 1046, 40, invalid).unwrap());
+                    assert!(
+                        !a.pmtu_feedback(51, segment.header.sequence, 1046, 40, invalid)
+                            .unwrap()
+                    );
                     assert_eq!(a.path_mtu_info(), snapshot);
                 }
                 b.input(52, &segment).unwrap();
@@ -141,6 +160,9 @@ fn ipv6_consecutive_timeouts_never_increase_small_packets_or_exceed_route() {
             previous = current;
         }
         assert_eq!(previous, 572);
-        assert_eq!(a.set_first_hop_mtu(a.now + 1, 1279), Err(Error::InvalidArgument));
+        assert_eq!(
+            a.set_first_hop_mtu(a.now + 1, 1279),
+            Err(Error::InvalidArgument)
+        );
     }
 }

@@ -22,7 +22,9 @@ fn startup_packets(a: &mut Connection, now: u64) -> Vec<(u32, usize)> {
     let mut result = Vec::new();
     while let Some(n) = a.transmit(now, &mut bytes).unwrap() {
         let p = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
-        if !p.payload.is_empty() { result.push((p.header.sequence, p.payload.len())); }
+        if !p.payload.is_empty() {
+            result.push((p.header.sequence, p.payload.len()));
+        }
         assert!(result.len() < 100);
     }
     result
@@ -34,11 +36,18 @@ fn initial_pacing_burst_uses_negotiated_iw_and_never_grants_extra_window() {
         for policy in [InitialWindow::Rfc5681, InitialWindow::Iw10] {
             for mss in [500, 1000, 1460, 9000] {
                 for scale in [1, 1000] {
-                    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-                        congestion_algorithm: algorithm, initial_window: policy,
-                        timebase: CallerTimebase { units_per_second: 1_000_000 * scale, ..Default::default() },
-                        ..config(131072, mss)
-                    }, u32::MAX - 4999);
+                    let (mut a, _) = startup_paced_pair(
+                        ConnectionConfig {
+                            congestion_algorithm: algorithm,
+                            initial_window: policy,
+                            timebase: CallerTimebase {
+                                units_per_second: 1_000_000 * scale,
+                                ..Default::default()
+                            },
+                            ..config(131072, mss)
+                        },
+                        u32::MAX - 4999,
+                    );
                     let start = 100_001 * scale;
                     let iw = a.initial_window();
                     let base = a.snd_nxt;
@@ -49,7 +58,10 @@ fn initial_pacing_burst_uses_negotiated_iw_and_never_grants_extra_window() {
                     let sent = startup_packets(&mut a, start);
                     assert_eq!(sent.iter().map(|p| p.1).sum::<usize>(), iw as usize);
                     let mut end = base;
-                    for (seq, bytes) in sent { assert_eq!(seq, end.0); end = end.wrapping_add(bytes as u32); }
+                    for (seq, bytes) in sent {
+                        assert_eq!(seq, end.0);
+                        end = end.wrapping_add(bytes as u32);
+                    }
                     assert_eq!(end, base.wrapping_add(iw));
                     assert!(startup_packets(&mut a, start).is_empty());
                     assert_eq!(a.congestion.cwnd(), iw);
@@ -62,17 +74,29 @@ fn initial_pacing_burst_uses_negotiated_iw_and_never_grants_extra_window() {
 
 #[test]
 fn initial_pacing_burst_ack_closes_allowance_and_preserves_hystart_provenance() {
-    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-        congestion_algorithm: CongestionAlgorithm::Cubic, initial_window: InitialWindow::Iw10,
-        ..config(65536, 1000)
-    }, 100);
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            initial_window: InitialWindow::Iw10,
+            ..config(65536, 1000)
+        },
+        100,
+    );
     let base = a.snd_una;
     let start = 100_001;
     a.write(&[7; 30000]).unwrap();
     assert_eq!(startup_packets(&mut a, start).len(), 10);
     let next = a.receive.next();
     let window = (a.snd_wnd >> a.peer_scale) as u16;
-    inject(&mut a, start + 100000, next, base.wrapping_add(10000), ACK, window, &[]);
+    inject(
+        &mut a,
+        start + 100000,
+        next,
+        base.wrapping_add(10000),
+        ACK,
+        window,
+        &[],
+    );
     assert!(!a.initial_pacing_open);
     // A bypassed flight uses the finite tuned L16; ten MSS fit within it.
     assert_eq!(a.congestion.cwnd(), 20000);
@@ -86,10 +110,16 @@ fn initial_pacing_burst_ack_closes_allowance_and_preserves_hystart_provenance() 
 
 #[test]
 fn initial_pacing_burst_partial_writes_window_reopen_and_explicit_caps() {
-    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-        initial_window: InitialWindow::Iw10, ..config(65536, 1000)
-    }, 100);
-    let start = 100001; let seq = a.receive.next(); let base = a.snd_una;
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            ..config(65536, 1000)
+        },
+        100,
+    );
+    let start = 100001;
+    let seq = a.receive.next();
+    let base = a.snd_una;
     let small = (3000u32 >> a.peer_scale) as u16;
     inject(&mut a, start, seq, base, ACK, small, &[]);
     a.write(&[7; 2000]).unwrap();
@@ -106,11 +136,18 @@ fn initial_pacing_burst_partial_writes_window_reopen_and_explicit_caps() {
     assert_eq!(a.snd_nxt.distance_from(base), 10000);
 
     for capped in [false, true] {
-        let (mut a, _) = startup_paced_pair(ConnectionConfig {
-            initial_window: InitialWindow::Iw10, ..config(65536, 1000)
-        }, 100);
-        if capped { a.config.pacing.as_mut().unwrap().max_bytes_per_second = Some(10000); }
-        else { a.config.pacing.as_mut().unwrap().initial_window_burst = false; }
+        let (mut a, _) = startup_paced_pair(
+            ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                ..config(65536, 1000)
+            },
+            100,
+        );
+        if capped {
+            a.config.pacing.as_mut().unwrap().max_bytes_per_second = Some(10000);
+        } else {
+            a.config.pacing.as_mut().unwrap().initial_window_burst = false;
+        }
         a.write(&[7; 20000]).unwrap();
         assert_eq!(startup_packets(&mut a, start).len(), 2);
         assert!(a.general_pacing_deadline(start).is_some());
@@ -119,36 +156,60 @@ fn initial_pacing_burst_partial_writes_window_reopen_and_explicit_caps() {
 
 #[test]
 fn initial_pacing_burst_is_not_refilled_after_idle_or_rto() {
-    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-        initial_window: InitialWindow::Iw10, ..config(65536, 1000)
-    }, 100);
-    let start = 100001; let seq = a.receive.next(); let window = (a.snd_wnd >> a.peer_scale) as u16;
-    a.write(&[7; 2000]).unwrap(); startup_packets(&mut a, start);
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            ..config(65536, 1000)
+        },
+        100,
+    );
+    let start = 100001;
+    let seq = a.receive.next();
+    let window = (a.snd_wnd >> a.peer_scale) as u16;
+    a.write(&[7; 2000]).unwrap();
+    startup_packets(&mut a, start);
     let end = a.snd_nxt;
     inject(&mut a, start + 100000, seq, end, ACK, window, &[]);
     a.write(&[7; 20000]).unwrap();
     assert_eq!(startup_packets(&mut a, start + 2000000).len(), 2);
     assert!(!a.initial_pacing_open);
 
-    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-        initial_window: InitialWindow::Iw10, ..config(65536, 1000)
-    }, 100);
-    a.write(&[7; 20000]).unwrap();startup_packets(&mut a, start);
-    let due = a.rto_deadline.unwrap();a.timeout(due).unwrap();
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            ..config(65536, 1000)
+        },
+        100,
+    );
+    a.write(&[7; 20000]).unwrap();
+    startup_packets(&mut a, start);
+    let due = a.rto_deadline.unwrap();
+    a.timeout(due).unwrap();
     assert!(!a.initial_pacing_open);
-    let old = a.snd_nxt;let repaired = startup_packets(&mut a, due);
-    assert_eq!(repaired.len(), 1); assert_eq!(a.snd_nxt, old);
+    let old = a.snd_nxt;
+    let repaired = startup_packets(&mut a, due);
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(a.snd_nxt, old);
 }
 
 #[test]
 fn initial_pacing_burst_reserved_output_uses_physical_time_and_no_new_credit() {
-    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-        initial_window: InitialWindow::Iw10, ..config(65536, 1000)
-    }, u32::MAX - 4999);
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            ..config(65536, 1000)
+        },
+        u32::MAX - 4999,
+    );
     a.write(&[7; 20000]).unwrap();
-    let mut bytes = [0; 1500]; let now = 100001; let base = a.snd_nxt;
+    let mut bytes = [0; 1500];
+    let now = 100001;
+    let base = a.snd_nxt;
     for i in 0..10 {
-        let n = a.transmit_selected(if i == 0 { now } else { now + 500000 }, &mut bytes, true).unwrap().unwrap();
+        let n = a
+            .transmit_selected(if i == 0 { now } else { now + 500000 }, &mut bytes, true)
+            .unwrap()
+            .unwrap();
         let p = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
         assert_eq!(p.header.sequence, base.wrapping_add(i * 1000).0);
         let mut d = a.last_departure.unwrap();
@@ -156,7 +217,8 @@ fn initial_pacing_burst_reserved_output_uses_physical_time_and_no_new_credit() {
         let before = a.pacer;
         assert_eq!(a.reserved_pacing_deadline(now + 500000, &d), None);
         assert_eq!(a.pacer, before); // selection and checking consume no physical rate debt
-        a.accept_reserved_output(now + 500000, &mut d, 0, 1000, true).unwrap();
+        a.accept_reserved_output(now + 500000, &mut d, 0, 1000, true)
+            .unwrap();
     }
     assert_eq!(a.snd_nxt.distance_from(base), 10000);
     assert!(a.general_pacing_deadline(now + 500000).is_some());
@@ -165,10 +227,13 @@ fn initial_pacing_burst_reserved_output_uses_physical_time_and_no_new_credit() {
 
 #[test]
 fn initial_pacing_burst_path_mss_change_does_not_add_an_ordinary_burst() {
-    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-        initial_window: InitialWindow::Iw10,
-        ..config(65536, 1000)
-    }, 100);
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            ..config(65536, 1000)
+        },
+        100,
+    );
     let now = 100001;
     a.write(&[7; 4000]).unwrap();
     assert_eq!(startup_packets(&mut a, now).len(), 4);
@@ -190,25 +255,38 @@ fn initial_pacing_burst_path_mss_change_does_not_add_an_ordinary_burst() {
 
 #[test]
 fn initial_pacing_burst_syn_timeout_and_persist_probe_do_not_rearm_it() {
-    let cfg = ConnectionConfig { pacing: Some(PacingConfig::default()),
-        initial_window: InitialWindow::Iw10, nagle: false, ..config(65536, 1000) };
+    let cfg = ConnectionConfig {
+        pacing: Some(PacingConfig::default()),
+        initial_window: InitialWindow::Iw10,
+        nagle: false,
+        ..config(65536, 1000)
+    };
     let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
     packet(&mut a, 0);
-    let due = a.rto_deadline.unwrap(); a.timeout(due).unwrap();
+    let due = a.rto_deadline.unwrap();
+    a.timeout(due).unwrap();
     assert!(!a.initial_pacing_open);
     let syn = packet(&mut a, due);
     let syn = wire::parse(ip(tuple()), &syn).unwrap();
     let mut b = Connection::passive(reverse(tuple()), cfg, 900, due + 1, &syn).unwrap();
-    deliver(&mut b, &mut a, due + 100000); deliver(&mut a, &mut b, due + 100001);
+    deliver(&mut b, &mut a, due + 100000);
+    deliver(&mut a, &mut b, due + 100001);
     a.write(&[7; 20000]).unwrap();
     assert_eq!(startup_packets(&mut a, due + 100002).len(), 2);
 
-    let (mut a, _) = startup_paced_pair(ConnectionConfig { initial_window: InitialWindow::Iw10,
-        ..config(65536, 1000) }, 100);
-    let seq = a.receive.next(); let base = a.snd_una;
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            ..config(65536, 1000)
+        },
+        100,
+    );
+    let seq = a.receive.next();
+    let base = a.snd_una;
     inject(&mut a, 100001, seq, base, ACK, 0, &[]);
     a.write(&[7; 20000]).unwrap();
-    let due = a.persist_deadline.unwrap();a.timeout(due).unwrap();
+    let due = a.persist_deadline.unwrap();
+    a.timeout(due).unwrap();
     let probe = startup_packets(&mut a, due);
     assert_eq!(probe.iter().map(|p| p.1).sum::<usize>(), 0);
     assert!(a.initial_pacing_open);
@@ -218,18 +296,22 @@ fn initial_pacing_burst_syn_timeout_and_persist_probe_do_not_rearm_it() {
 
 #[test]
 fn initial_pacing_burst_ecn_feedback_reinstates_ordinary_rate_without_prr() {
-    let (mut a, _) = startup_paced_pair(ConnectionConfig {
-        congestion_algorithm: CongestionAlgorithm::Cubic,
-        initial_window: InitialWindow::Iw10,
-        ecn: true,
-        ..config(65536, 1000)
-    }, 100);
+    let (mut a, _) = startup_paced_pair(
+        ConnectionConfig {
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            initial_window: InitialWindow::Iw10,
+            ecn: true,
+            ..config(65536, 1000)
+        },
+        100,
+    );
     assert!(a.transport_info().ecn_negotiated);
     let now = 100001;
     a.write(&[7; 2000]).unwrap();
     assert_eq!(startup_packets(&mut a, now).len(), 2);
     a.write(&[7; 18000]).unwrap();
-    let seq = a.receive.next(); let ack = a.snd_una;
+    let seq = a.receive.next();
+    let ack = a.snd_una;
     let window = (a.snd_wnd >> a.peer_scale) as u16;
     inject(&mut a, now, seq, ack, ACK | ECE, window, &[]);
     assert!(a.congestion.in_ecn_response(a.snd_una));

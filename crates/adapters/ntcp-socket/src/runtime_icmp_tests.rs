@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Included by runtime_memory_tests: actual packet admission and shared egress.
+// Child module of runtime_memory_tests: actual packet admission and shared egress.
+use super::fast_open_tests::{tfo_capture, tfo_deliver};
+use super::*;
+
 fn icmp_error_frame(packet: &[u8], kind: u8, code: u8) -> Vec<u8> {
     let mut bytes = ptb_frame(packet);
     bytes[20] = kind;
@@ -34,12 +37,35 @@ fn packet_icmp_error_codes_notify_without_soft_abort_and_isolate_connections() {
         let packet = tfo_capture(&mut a);
         let before = a.endpoint.transport_info(id).unwrap();
         let feedback = icmp_error_frame(&packet, kind, code);
-        assert_eq!(ntcp_icmp::decode_icmp(&feedback).unwrap().ipv4_network_error(), Some(error));
+        assert_eq!(
+            ntcp_icmp::decode_icmp(&feedback)
+                .unwrap()
+                .ipv4_network_error(),
+            Some(error)
+        );
         tfo_deliver(&mut a, feedback.clone());
-        assert_ne!(a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR, 0);
-        assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, errno);
-        assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
-        assert_eq!(a.execute(clients[1], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
+        assert_ne!(
+            a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR,
+            0
+        );
+        assert_eq!(
+            a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            errno
+        );
+        assert_eq!(
+            a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
+        assert_eq!(
+            a.execute(clients[1], Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
         assert_eq!(a.endpoint.state(other).unwrap(), State::Established);
         assert_eq!(path_mtu(&a, clients[1]), 1500);
         if error == ntcp::NetworkError::HardUnreachable {
@@ -51,13 +77,26 @@ fn packet_icmp_error_codes_notify_without_soft_abort_and_isolate_connections() {
             let after = a.endpoint.transport_info(id).unwrap();
             assert_eq!(after.cwnd, before.cwnd);
             assert_eq!(path_mtu(&a, clients[0]), 1500);
-            assert_eq!(a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR, 0);
+            assert_eq!(
+                a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR,
+                0
+            );
             // A repeated report is a new notification while the connection
             // stays writable; SO_ERROR is not the send_state fatal channel.
             tfo_deliver(&mut a, feedback);
-            assert_eq!(a.execute(clients[0], Op::Write(vec![8; 1460])).unwrap().value, 1460);
+            assert_eq!(
+                a.execute(clients[0], Op::Write(vec![8; 1460]))
+                    .unwrap()
+                    .value,
+                1460
+            );
             assert_eq!(segment(&tfo_capture(&mut a)).payload, [8; 1460]);
-            assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, errno);
+            assert_eq!(
+                a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+                    .unwrap()
+                    .value,
+                errno
+            );
         }
     }
 }
@@ -77,21 +116,40 @@ fn packet_icmp_source_quench_and_bad_correlation_do_not_change_transport() {
     let quench = icmp_error_frame(&packet, 4, 0);
     tfo_deliver(&mut a, quench);
     assert_eq!(a.endpoint.transport_info(id).unwrap(), snapshot);
-    assert_eq!(a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR, 0);
-    assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
+    assert_eq!(
+        a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR,
+        0
+    );
+    assert_eq!(
+        a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+            .unwrap()
+            .value,
+        0
+    );
     let valid = icmp_error_frame(&packet, 3, 3);
     for index in [16, 44, 48, 50, 52] {
         let mut wrong = valid.clone();
         wrong[index] ^= 0x40;
-        if index == 16 { wrong[40] = wrong[16]; }
+        if index == 16 {
+            wrong[40] = wrong[16];
+        }
         wrong[38..40].fill(0);
         let checksum = ntcp_ip::checksum(&wrong[28..48]);
         wrong[38..40].copy_from_slice(&checksum.to_be_bytes());
         ptb_checksums(&mut wrong);
         ntcp_icmp::decode_icmp(&wrong).unwrap();
         tfo_deliver(&mut a, wrong);
-        assert_eq!(a.endpoint.state(id).unwrap(), State::Established, "index {index}");
-        assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
+        assert_eq!(
+            a.endpoint.state(id).unwrap(),
+            State::Established,
+            "index {index}"
+        );
+        assert_eq!(
+            a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
     }
     // All these errors share the existing checksum/quote admission checks.
     for (kind, code) in [(3, 1), (3, 3), (4, 0), (11, 0), (12, 0)] {
@@ -99,7 +157,9 @@ fn packet_icmp_source_quench_and_bad_correlation_do_not_change_transport() {
         for offset in [10, 22, 38] {
             let mut corrupt = valid.clone();
             corrupt[offset] ^= 1;
-            if offset == 38 { ptb_checksums(&mut corrupt); }
+            if offset == 38 {
+                ptb_checksums(&mut corrupt);
+            }
             assert_eq!(a.execute(0, Op::Inject(corrupt)).unwrap_err(), EINVAL);
             assert!(a.packets.as_ref().unwrap().input.is_empty());
         }
@@ -115,16 +175,21 @@ fn packet_icmp_non_pmtu_waits_for_reserved_owner_without_blocking_other_flow() {
         a.service_egress().unwrap();
         assert!(a.endpoint.is_output_reserved(held));
         let packet = a.execute(0, Op::Capture(65535)).unwrap().bytes;
-        a.execute(0, Op::Inject(icmp_error_frame(&packet, kind, code))).unwrap();
+        a.execute(0, Op::Inject(icmp_error_frame(&packet, kind, code)))
+            .unwrap();
         receive(&mut a);
         assert!(a.egress.as_ref().unwrap().retained_rx(held));
         assert_eq!(a.endpoint.state(held).unwrap(), State::Established);
         assert_eq!(a.sockets[&clients[0]].soft_error, 0);
         assert_eq!(a.sockets[&clients[0]].error, 0);
-        b.execute(servers[1], Op::Write(b"other flow".to_vec())).unwrap();
+        b.execute(servers[1], Op::Write(b"other flow".to_vec()))
+            .unwrap();
         let other = tfo_capture(&mut b);
         tfo_deliver(&mut a, other);
-        assert_eq!(a.execute(clients[1], Op::Read(64)).unwrap().bytes, b"other flow");
+        assert_eq!(
+            a.execute(clients[1], Op::Read(64)).unwrap().bytes,
+            b"other flow"
+        );
         for _ in 0..2 {
             a.test_now = Some(a.now() + 1000);
             assert_eq!(segment(&tfo_capture(&mut a)).payload, [7; 1460]);
@@ -132,9 +197,26 @@ fn packet_icmp_non_pmtu_waits_for_reserved_owner_without_blocking_other_flow() {
         assert!(!a.endpoint.is_output_reserved(held));
         receive(&mut a);
         assert!(!a.egress.as_ref().unwrap().retained_rx(held));
-        assert_eq!(a.endpoint.state(held).unwrap(), if hard { State::Closed } else { State::Established });
-        assert_ne!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
-        assert_eq!(a.execute(clients[1], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
+        assert_eq!(
+            a.endpoint.state(held).unwrap(),
+            if hard {
+                State::Closed
+            } else {
+                State::Established
+            }
+        );
+        assert_ne!(
+            a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
+        assert_eq!(
+            a.execute(clients[1], Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
     }
 }
 
@@ -145,7 +227,8 @@ fn packet_icmp_source_quench_is_not_retained_behind_a_reserved_owner() {
     a.execute(clients[0], Op::Write(vec![7; 4380])).unwrap();
     let packet = tfo_capture(&mut a);
     assert!(a.endpoint.is_output_reserved(held));
-    a.execute(0, Op::Inject(icmp_error_frame(&packet, 4, 0))).unwrap();
+    a.execute(0, Op::Inject(icmp_error_frame(&packet, 4, 0)))
+        .unwrap();
     receive(&mut a);
     assert!(!a.egress.as_ref().unwrap().retained_rx(held));
     assert_eq!(a.endpoint.state(held).unwrap(), State::Established);
@@ -163,18 +246,44 @@ fn packet_icmp_notifications_are_consumable_edges_and_fatal_error_takes_preceden
     let first = a.execute(clients[0], Op::Ready).unwrap();
     tfo_deliver(&mut a, icmp_error_frame(&packet, 11, 0));
     let second = a.execute(clients[0], Op::Ready).unwrap();
-    assert_ne!(first.readiness_generations[2], second.readiness_generations[2]);
+    assert_ne!(
+        first.readiness_generations[2],
+        second.readiness_generations[2]
+    );
     tfo_deliver(&mut a, icmp_error_frame(&packet, 4, 0));
-    assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, ETIMEDOUT);
-    assert_eq!(a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR, 0);
+    assert_eq!(
+        a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+            .unwrap()
+            .value,
+        ETIMEDOUT
+    );
+    assert_eq!(
+        a.execute(clients[0], Op::Ready).unwrap().value & EPOLLERR,
+        0
+    );
     // Receive and transmit operations do not consume a nonterminal report.
     tfo_deliver(&mut a, icmp_error_frame(&packet, 11, 0));
     assert_eq!(a.execute(clients[0], Op::Read(1)).unwrap_err(), EAGAIN);
-    assert_eq!(a.execute(clients[0], Op::Write(vec![9; 1460])).unwrap().value, 1460);
+    assert_eq!(
+        a.execute(clients[0], Op::Write(vec![9; 1460]))
+            .unwrap()
+            .value,
+        1460
+    );
     tfo_capture(&mut a);
     tfo_deliver(&mut a, icmp_error_frame(&packet, 3, 3));
-    assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, EHOSTUNREACH);
-    assert_eq!(a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
+    assert_eq!(
+        a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+            .unwrap()
+            .value,
+        EHOSTUNREACH
+    );
+    assert_eq!(
+        a.execute(clients[0], Op::Get(SOL_SOCKET, SO_ERROR))
+            .unwrap()
+            .value,
+        0
+    );
 }
 
 #[test]
@@ -183,33 +292,60 @@ fn packet_icmp_passive_reports_do_not_fail_accept_or_close_listener() {
         let mut a = owner(1, Profile::Pipeline, 8);
         let mut b = owner(2, Profile::Pipeline, 8);
         let listener = new(&mut b, SOCK_NONBLOCK);
-        b.execute(listener, Op::Bind("192.0.2.2:8080".parse().unwrap())).unwrap();
+        b.execute(listener, Op::Bind("192.0.2.2:8080".parse().unwrap()))
+            .unwrap();
         b.execute(listener, Op::Listen(1)).unwrap();
         let client = new(&mut a, SOCK_NONBLOCK);
-        assert_eq!(a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap())).unwrap_err(), EINPROGRESS);
+        assert_eq!(
+            a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
         let syn = tfo_capture(&mut a);
         tfo_deliver(&mut b, syn);
         let synack = tfo_capture(&mut b);
         tfo_deliver(&mut b, icmp_error_frame(&synack, 3, code));
         assert_ne!(b.execute(listener, Op::Ready).unwrap().value & EPOLLERR, 0);
-        assert_eq!(b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(), EAGAIN);
-        assert_eq!(b.execute(listener, Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, EHOSTUNREACH);
+        assert_eq!(
+            b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+            EAGAIN
+        );
+        assert_eq!(
+            b.execute(listener, Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            EHOSTUNREACH
+        );
         assert_eq!(b.execute(listener, Op::Transport(1)).unwrap().bytes[0], 10);
         tfo_deliver(&mut a, synack);
         let ack = tfo_capture(&mut a);
         tfo_deliver(&mut b, ack);
         if code == 1 {
-            let accepted = b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
-            assert_eq!(b.endpoint.state(cid(&b, accepted)).unwrap(), State::Established);
+            let accepted = b
+                .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                .unwrap()
+                .value as u64;
+            assert_eq!(
+                b.endpoint.state(cid(&b, accepted)).unwrap(),
+                State::Established
+            );
             a.execute(client, Op::Write(b"ok".to_vec())).unwrap();
             let data = tfo_capture(&mut a);
             tfo_deliver(&mut b, data);
             assert_eq!(b.execute(accepted, Op::Read(2)).unwrap().bytes, b"ok");
         } else {
             assert_eq!(segment(&tfo_capture(&mut b)).header.flags, ntcp::wire::RST);
-            assert_eq!(b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(), EAGAIN);
+            assert_eq!(
+                b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+                EAGAIN
+            );
         }
-        assert_eq!(b.execute(listener, Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
+        assert_eq!(
+            b.execute(listener, Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
     }
 }
 
@@ -241,12 +377,25 @@ fn packet_icmp_retained_generation_cannot_migrate_to_a_reused_tuple() {
     // commands are themselves held behind RX; the direct core fixture is
     // intentional so this tests the independent generation guard as well.
     let sequence = segment(&packet).header.sequence;
-    assert!(a.endpoint.network_error(a.now(), tuple, sequence, ntcp::NetworkError::HardUnreachable).unwrap());
+    assert!(
+        a.endpoint
+            .network_error(
+                a.now(),
+                tuple,
+                sequence,
+                ntcp::NetworkError::HardUnreachable
+            )
+            .unwrap()
+    );
     a.endpoint.release(old).unwrap();
     a.sockets.remove(&clients[0]);
     let replacement = new(&mut a, SOCK_NONBLOCK);
     a.execute(replacement, Op::Bind(tuple.local)).unwrap();
-    assert_eq!(a.execute(replacement, Op::Connect(tuple.remote)).unwrap_err(), EINPROGRESS);
+    assert_eq!(
+        a.execute(replacement, Op::Connect(tuple.remote))
+            .unwrap_err(),
+        EINPROGRESS
+    );
     let id = cid(&a, replacement);
     assert_ne!(id, old);
     let syn = tfo_capture(&mut a);
@@ -255,5 +404,10 @@ fn packet_icmp_retained_generation_cannot_migrate_to_a_reused_tuple() {
     receive(&mut a);
     assert!(!a.egress.as_ref().unwrap().retained_rx(old));
     assert_eq!(a.endpoint.state(id).unwrap(), State::SynSent);
-    assert_eq!(a.execute(replacement, Op::Get(SOL_SOCKET, SO_ERROR)).unwrap().value, 0);
+    assert_eq!(
+        a.execute(replacement, Op::Get(SOL_SOCKET, SO_ERROR))
+            .unwrap()
+            .value,
+        0
+    );
 }

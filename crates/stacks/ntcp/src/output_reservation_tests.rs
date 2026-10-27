@@ -2483,10 +2483,8 @@ fn initial_newreno_heuristic_reserved_repair_rejection_preserves_credit() {
     );
 }
 
-mod local_tx_failure {
-    use super::*;
-    include!("output_local_tx_failure_tests.rs");
-}
+#[path = "output_local_tx_failure_tests.rs"]
+mod local_tx_failure;
 
 #[test]
 fn shared_reservation_mtu_repair_retains_original_payload_and_rejects_stale_attempts() {

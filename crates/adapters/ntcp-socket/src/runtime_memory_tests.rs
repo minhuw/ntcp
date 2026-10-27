@@ -3,6 +3,8 @@ use super::*;
 use crate::packet_profile::Profile;
 use crate::packet_test::Options;
 use crate::runtime::tests::{ip_packet, new};
+use fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output};
+use pmtud_profile_tests::upstream_runtime_pmtud_profile_tests;
 
 fn owner(last: u8, profile: Profile, capacity: usize) -> Owner {
     let mut owner = Owner::packet_with_options(
@@ -345,7 +347,8 @@ fn last_close_retries_full_admission_instead_of_leaking_removed_fd() {
     worker.join().unwrap();
 }
 
-include!("runtime_fast_open_tests.rs");
+#[path = "runtime_fast_open_tests.rs"]
+mod fast_open_tests;
 
 // PMTUD is opt-in independently of packet admission; keep profile defaults intact.
 fn ptb_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
@@ -520,8 +523,10 @@ fn packet_ptb_queued_feedback_still_checks_target_tuple_and_sequence() {
     assert_eq!(path_mtu(&a, clients[1]), 1500);
 }
 
-include!("runtime_pmtud_profile_tests.rs");
-include!("runtime_adaptive_ack_profile_tests.rs");
+#[path = "runtime_adaptive_ack_profile_tests.rs"]
+mod adaptive_ack_profile_tests;
+#[path = "runtime_pmtud_profile_tests.rs"]
+mod pmtud_profile_tests;
 
 #[test]
 fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
@@ -736,24 +741,20 @@ fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
     }
 }
 
-include!("runtime_icmp_tests.rs");
+#[path = "runtime_icmp_tests.rs"]
+mod icmp_tests;
 
-mod fast_open_mss {
-    include!("runtime_fast_open_mss_tests.rs");
-}
+#[path = "runtime_fast_open_mss_tests.rs"]
+mod fast_open_mss;
 
-mod accept_reset {
-    include!("runtime_accept_reset_tests.rs");
-}
+#[path = "runtime_accept_reset_tests.rs"]
+mod accept_reset;
 
-mod tfo_copied_completion {
-    include!("runtime_tfo_copied_completion_tests.rs");
-}
+#[path = "runtime_tfo_copied_completion_tests.rs"]
+mod tfo_copied_completion;
 
-mod client_tfo_permission {
-    include!("runtime_tfo_permission_tests.rs");
-}
+#[path = "runtime_tfo_permission_tests.rs"]
+mod client_tfo_permission;
 
-mod listener_query {
-    include!("runtime_listener_query_tests.rs");
-}
+#[path = "runtime_listener_query_tests.rs"]
+mod listener_query;

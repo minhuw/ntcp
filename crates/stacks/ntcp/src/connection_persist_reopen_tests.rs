@@ -307,6 +307,5 @@ fn empty_probe_large_urgent_pointer_is_bounded_without_repeating_notice() {
     }
 }
 
-mod real_peer {
-    include!("connection_persist_peer_tests.rs");
-}
+#[path = "connection_persist_peer_tests.rs"]
+mod real_peer;

@@ -22,10 +22,16 @@ fn sender(timestamps: bool, user_mss: Option<u16>) -> (Endpoint, EndpointConfig)
 
 fn learn_cookie(endpoint: &mut Endpoint, v6: bool) {
     let (local, remote) = addresses(v6, 49000);
-    let (_, accepted) = endpoint.connect_fast_open(0, local, remote, b"miss").unwrap();
+    let (_, accepted) = endpoint
+        .connect_fast_open(0, local, remote, b"miss")
+        .unwrap();
     assert_eq!(accepted, 0);
     let syn = packet(endpoint, 0);
-    deliver(endpoint, 1, &cache_reply(&syn, 1460, Some(&[0xab, 0xcd, 0x12, 0x34])));
+    deliver(
+        endpoint,
+        1,
+        &cache_reply(&syn, 1460, Some(&[0xab, 0xcd, 0x12, 0x34])),
+    );
     packet(endpoint, 1);
 }
 
@@ -38,23 +44,40 @@ fn invalid_active_options_preserve_tuple_budget_clock_and_defaults() {
             let defaults = ActiveOpenOptions::from(&config.connection);
             let charge = endpoint.buffer_bytes();
             for invalid in [
-                ActiveOpenOptions { user_mss: Some(0), ..defaults },
-                ActiveOpenOptions { send_capacity: 0, ..defaults },
-                ActiveOpenOptions { receive_capacity: 0, ..defaults },
+                ActiveOpenOptions {
+                    user_mss: Some(0),
+                    ..defaults
+                },
+                ActiveOpenOptions {
+                    send_capacity: 0,
+                    ..defaults
+                },
+                ActiveOpenOptions {
+                    receive_capacity: 0,
+                    ..defaults
+                },
             ] {
                 let result = if fast_open {
-                    endpoint.connect_fast_open_with_options(100, local, remote, b"x", invalid).map(|p| p.0)
+                    endpoint
+                        .connect_fast_open_with_options(100, local, remote, b"x", invalid)
+                        .map(|p| p.0)
                 } else {
                     endpoint.connect_with_options(100, local, remote, invalid)
                 };
-                assert_eq!(result, Err(EndpointError::Connection(Error::InvalidArgument)));
+                assert_eq!(
+                    result,
+                    Err(EndpointError::Connection(Error::InvalidArgument))
+                );
                 assert_eq!(endpoint.buffer_bytes(), charge);
                 assert!(endpoint.connection_id(Tuple { local, remote }).is_none());
             }
             // A failed request at100 did not advance the endpoint's clock or
             // publish the tuple. Legacy opens retain endpoint defaults.
             let id = if fast_open {
-                endpoint.connect_fast_open(0, local, remote, b"x").unwrap().0
+                endpoint
+                    .connect_fast_open(0, local, remote, b"x")
+                    .unwrap()
+                    .0
             } else {
                 endpoint.connect(0, local, remote).unwrap()
             };
@@ -63,11 +86,19 @@ fn invalid_active_options_preserve_tuple_budget_clock_and_defaults() {
             assert_eq!(wire::parse(syn.0, &syn.1).unwrap().options.mss, Some(400));
 
             let (local, remote) = addresses(v6, 49001);
-            let explicit = ActiveOpenOptions { user_mss: None, ..defaults };
+            let explicit = ActiveOpenOptions {
+                user_mss: None,
+                ..defaults
+            };
             let id = if fast_open {
-                endpoint.connect_fast_open_with_options(0, local, remote, b"x", explicit).unwrap().0
+                endpoint
+                    .connect_fast_open_with_options(0, local, remote, b"x", explicit)
+                    .unwrap()
+                    .0
             } else {
-                endpoint.connect_with_options(0, local, remote, explicit).unwrap()
+                endpoint
+                    .connect_with_options(0, local, remote, explicit)
+                    .unwrap()
             };
             assert_eq!(endpoint.transport_info(id).unwrap().advertised_mss, 1460);
         }
@@ -81,10 +112,15 @@ fn fast_open_active_options_bound_copy_and_preserve_raw_peer_mss() {
             let (mut endpoint, config) = sender(timestamps, None);
             learn_cookie(&mut endpoint, v6);
             let (local, remote) = addresses(v6, 49001);
-            let options = ActiveOpenOptions { user_mss: Some(1040), ..ActiveOpenOptions::from(&config.connection) };
+            let options = ActiveOpenOptions {
+                user_mss: Some(1040),
+                ..ActiveOpenOptions::from(&config.connection)
+            };
             let expected: Vec<u8> = (0..2000).map(|n| (n % 251) as u8).collect();
             let mut source = expected.clone();
-            let (id, accepted) = endpoint.connect_fast_open_with_options(2, local, remote, &source, options).unwrap();
+            let (id, accepted) = endpoint
+                .connect_fast_open_with_options(2, local, remote, &source, options)
+                .unwrap();
             assert_eq!(accepted, 1000);
             source.fill(0); // Admission owns its copy before publishing the ID.
             let syn = packet(&mut endpoint, 2);
@@ -102,7 +138,15 @@ fn fast_open_active_options_bound_copy_and_preserve_raw_peer_mss() {
 
             // Per-open user MSS does not overwrite the raw peer-MSS cache.
             let (local, remote) = addresses(v6, 49002);
-            let (_, accepted) = endpoint.connect_fast_open_with_options(4, local, remote, &expected, ActiveOpenOptions::from(&config.connection)).unwrap();
+            let (_, accepted) = endpoint
+                .connect_fast_open_with_options(
+                    4,
+                    local,
+                    remote,
+                    &expected,
+                    ActiveOpenOptions::from(&config.connection),
+                )
+                .unwrap();
             assert_eq!(accepted, 1300);
             let syn = packet(&mut endpoint, 4);
             let segment = wire::parse(syn.0, &syn.1).unwrap();
@@ -118,9 +162,14 @@ fn fast_open_active_options_retain_owned_tail_after_later_mtu_reduction() {
         let (mut endpoint, config) = sender(false, None);
         learn_cookie(&mut endpoint, v6);
         let (local, remote) = addresses(v6, 49001);
-        let options = ActiveOpenOptions { user_mss: Some(1440), ..ActiveOpenOptions::from(&config.connection) };
+        let options = ActiveOpenOptions {
+            user_mss: Some(1440),
+            ..ActiveOpenOptions::from(&config.connection)
+        };
         let data: Vec<u8> = (0..2000).map(|n| (n % 251) as u8).collect();
-        let (id, accepted) = endpoint.connect_fast_open_with_options(2, local, remote, &data, options).unwrap();
+        let (id, accepted) = endpoint
+            .connect_fast_open_with_options(2, local, remote, &data, options)
+            .unwrap();
         assert_eq!(accepted, 1400);
         let mtu = if v6 { 1280 } else { 800 };
         endpoint.set_first_hop_mtu(3, id, mtu).unwrap();
@@ -132,12 +181,17 @@ fn fast_open_active_options_retain_owned_tail_after_later_mtu_reduction() {
         assert_eq!(parsed.options.mss, Some(1440));
         assert!(syn.1.len() + if v6 { 40 } else { 20 } <= mtu as usize);
         let info = endpoint.transport_info(id).unwrap();
-        assert_eq!((info.send_used, info.notsent_bytes), (accepted, accepted - sent));
+        assert_eq!(
+            (info.send_used, info.notsent_bytes),
+            (accepted, accepted - sent)
+        );
         deliver(&mut endpoint, 4, &cache_reply(&syn, 1460, None));
         let mut tail = Vec::new();
         for _ in 0..16 {
             let mut bytes = [0; 2048];
-            let Some(tx) = endpoint.poll_transmit(4, &mut bytes, 16).unwrap().packet else { break };
+            let Some(tx) = endpoint.poll_transmit(4, &mut bytes, 16).unwrap().packet else {
+                break;
+            };
             let parsed = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
             tail.extend_from_slice(parsed.payload);
         }
@@ -168,24 +222,47 @@ fn packet_test_timestamp_default_preserves_established_state_and_cached_mss() {
         reply.1 = bytes;
         deliver(&mut endpoint, 1000, &reply);
         let ack = packet(&mut endpoint, 1000);
-        assert!(wire::parse(ack.0, &ack.1).unwrap().options.timestamps.is_some());
+        assert!(
+            wire::parse(ack.0, &ack.1)
+                .unwrap()
+                .options
+                .timestamps
+                .is_some()
+        );
         endpoint.packet_test_timestamp_default(false);
         endpoint.write(old, b"old").unwrap();
         let old_data = packet(&mut endpoint, 1001);
-        assert!(wire::parse(old_data.0, &old_data.1).unwrap().options.timestamps.is_some());
+        assert!(
+            wire::parse(old_data.0, &old_data.1)
+                .unwrap()
+                .options
+                .timestamps
+                .is_some()
+        );
         let (local2, _) = addresses(v6, 49201);
-        let (_, accepted) = endpoint.connect_fast_open(1002, local2, remote, &[7; 2000]).unwrap();
+        let (_, accepted) = endpoint
+            .connect_fast_open(1002, local2, remote, &[7; 2000])
+            .unwrap();
         assert_eq!(accepted, 900);
         let syn = packet(&mut endpoint, 1002);
         let syn = wire::parse(syn.0, &syn.1).unwrap();
         assert!(syn.options.timestamps.is_none());
         assert_eq!(syn.payload.len(), 900);
-        assert_eq!(syn.options.fast_open.unwrap().as_bytes(), &[0xab, 0xcd, 0x12, 0x34]);
+        assert_eq!(
+            syn.options.fast_open.unwrap().as_bytes(),
+            &[0xab, 0xcd, 0x12, 0x34]
+        );
         endpoint.packet_test_timestamp_default(true);
         let (local3, _) = addresses(v6, 49202);
         endpoint.connect(1003, local3, remote).unwrap();
         let syn = packet(&mut endpoint, 1003);
-        assert!(wire::parse(syn.0, &syn.1).unwrap().options.timestamps.is_some());
+        assert!(
+            wire::parse(syn.0, &syn.1)
+                .unwrap()
+                .options
+                .timestamps
+                .is_some()
+        );
     }
 }
 
@@ -200,23 +277,47 @@ fn packet_test_timestamp_default_applies_to_new_passive_connections() {
         server.packet_test_timestamp_default(false);
         client.connect(0, local, remote).unwrap();
         let syn = packet(&mut client, 0);
-        assert!(wire::parse(syn.0, &syn.1).unwrap().options.timestamps.is_some());
+        assert!(
+            wire::parse(syn.0, &syn.1)
+                .unwrap()
+                .options
+                .timestamps
+                .is_some()
+        );
         deliver(&mut server, 1, &syn);
         let reply = packet(&mut server, 1);
-        assert!(wire::parse(reply.0, &reply.1).unwrap().options.timestamps.is_none());
+        assert!(
+            wire::parse(reply.0, &reply.1)
+                .unwrap()
+                .options
+                .timestamps
+                .is_none()
+        );
         deliver(&mut client, 2, &reply);
         deliver(&mut server, 3, &packet(&mut client, 2));
         let first = server.accept(listener).unwrap();
         server.packet_test_timestamp_default(true);
         server.write(first, b"first").unwrap();
         let data = packet(&mut server, 4);
-        assert!(wire::parse(data.0, &data.1).unwrap().options.timestamps.is_none());
+        assert!(
+            wire::parse(data.0, &data.1)
+                .unwrap()
+                .options
+                .timestamps
+                .is_none()
+        );
         let (local2, _) = addresses(v6, 49301);
         client.connect(5, local2, remote).unwrap();
         let syn = packet(&mut client, 5);
         deliver(&mut server, 6, &syn);
         let reply = packet(&mut server, 6);
-        assert!(wire::parse(reply.0, &reply.1).unwrap().options.timestamps.is_some());
+        assert!(
+            wire::parse(reply.0, &reply.1)
+                .unwrap()
+                .options
+                .timestamps
+                .is_some()
+        );
     }
 }
 
@@ -248,27 +349,50 @@ fn packet_test_timestamp_default_controls_time_wait_reuse_without_changing_old_s
         assert_eq!(server.state(child), Ok(State::TimeWait));
         server.release(child).unwrap();
         let old_expiry = server.next_deadline();
-        let tuple = Tuple { local: remote, remote: local };
+        let tuple = Tuple {
+            local: remote,
+            remote: local,
+        };
         let mut options = vec![1, 1, 8, 10];
         options.extend_from_slice(&newer_timestamp.to_be_bytes());
         options.extend_from_slice(&0u32.to_be_bytes());
         let mut syn = vec![0; 64];
-        let n = wire::encode(first_syn.0, wire::Header {
-            source_port: local.port(), destination_port: remote.port(),
-            sequence: original_sequence, acknowledgment: 0,
-            flags: wire::SYN, window: 8192, urgent_pointer: 0,
-        }, &options, &[], &mut syn).unwrap();
+        let n = wire::encode(
+            first_syn.0,
+            wire::Header {
+                source_port: local.port(),
+                destination_port: remote.port(),
+                sequence: original_sequence,
+                acknowledgment: 0,
+                flags: wire::SYN,
+                window: 8192,
+                urgent_pointer: 0,
+            },
+            &options,
+            &[],
+            &mut syn,
+        )
+        .unwrap();
         syn.truncate(n);
         server.packet_test_timestamp_default(false);
-        assert_eq!(server.input(300, first_syn.0, &syn), Ok(InputDisposition::Dropped));
+        assert_eq!(
+            server.input(300, first_syn.0, &syn),
+            Ok(InputDisposition::Dropped)
+        );
         assert_eq!(server.connection_id(tuple), Some(child));
         assert_eq!(server.next_deadline(), old_expiry);
         server.packet_test_timestamp_default(true);
-        assert_eq!(server.input(301, first_syn.0, &syn), Ok(InputDisposition::Processed));
+        assert_eq!(
+            server.input(301, first_syn.0, &syn),
+            Ok(InputDisposition::Processed)
+        );
         assert_ne!(server.connection_id(tuple), Some(child));
         let reply = packet(&mut server, 301);
         let reply = wire::parse(reply.0, &reply.1).unwrap();
-        assert_eq!(reply.header.flags & (wire::SYN | wire::ACK), wire::SYN | wire::ACK);
+        assert_eq!(
+            reply.header.flags & (wire::SYN | wire::ACK),
+            wire::SYN | wire::ACK
+        );
         assert!(reply.options.timestamps.is_some());
     }
 }

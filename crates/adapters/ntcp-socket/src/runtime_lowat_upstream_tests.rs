@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use super::timestamp_tests::timestamp_set;
 use super::*;
+use crate::timestamping as ts;
 use ntcp::wire::{self, ACK, PSH, SYN};
 
 fn established(

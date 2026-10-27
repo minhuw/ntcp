@@ -6173,14 +6173,12 @@ mod endpoint_mtu_update_tests {
 }
 
 #[cfg(test)]
-mod output_reservation_tests {
-    include!("output_reservation_tests.rs");
-}
+#[path = "output_reservation_tests.rs"]
+mod output_reservation_tests;
 
 #[cfg(test)]
-mod reset_defense_tests {
-    include!("endpoint_reset_defense_tests.rs");
-}
+#[path = "endpoint_reset_defense_tests.rs"]
+mod reset_defense_tests;
 
 #[cfg(all(test, feature = "packet-test-controls"))]
 mod timestamp_default_control_tests {

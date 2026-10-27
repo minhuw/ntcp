@@ -1,5 +1,8 @@
 use super::*;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 fn connected() -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     let (mut a, mut b, listener, client) = endpoints();
@@ -10,10 +13,16 @@ fn connected() -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     (a, b, client, server)
 }
 
-fn loan(a: &mut Endpoint, id: ConnectionId, now: u64) -> (Transmit, TransmitAttempt, Vec<u8>, Vec<Payload>) {
+fn loan(
+    a: &mut Endpoint,
+    id: ConnectionId,
+    now: u64,
+) -> (Transmit, TransmitAttempt, Vec<u8>, Vec<Payload>) {
     let mut header = vec![0xa5; 2048];
     let mut payload = Vec::with_capacity(8);
-    let (out, token) = a.poll_reserved_transmit_shared_for(now, id, &mut header, &mut payload, 32).unwrap();
+    let (out, token) = a
+        .poll_reserved_transmit_shared_for(now, id, &mut header, &mut payload, 32)
+        .unwrap();
     let packet = out.packet.unwrap();
     let n = packet.len - payload.iter().map(Payload::len).sum::<usize>();
     assert!(header[n..].iter().all(|&v| v == 0xa5));
@@ -22,7 +31,9 @@ fn loan(a: &mut Endpoint, id: ConnectionId, now: u64) -> (Transmit, TransmitAtte
 }
 fn wire_bytes(header: &[u8], payload: &[Payload]) -> Vec<u8> {
     let mut bytes = header.to_vec();
-    for p in payload { bytes.extend_from_slice(p.as_slice()); }
+    for p in payload {
+        bytes.extend_from_slice(p.as_slice());
+    }
     bytes
 }
 
@@ -34,7 +45,18 @@ fn shared_payload_ack_and_backend_release_are_independent() {
     let base = Payload::from_vec(data);
     let done = Arc::new(AtomicUsize::new(0));
     let state = done.clone();
-    assert_eq!(a.write_shared(client, base.clone().with_release(move || { state.fetch_add(1, Ordering::SeqCst); }), false, false, None), Ok(130));
+    assert_eq!(
+        a.write_shared(
+            client,
+            base.clone().with_release(move || {
+                state.fetch_add(1, Ordering::SeqCst);
+            }),
+            false,
+            false,
+            None
+        ),
+        Ok(130)
+    );
     let mut held = Vec::new();
     let mut total = 0;
     for now in 101..104 {
@@ -65,16 +87,31 @@ fn shared_payload_rto_reuses_original_storage_and_abort_waits_for_backend() {
     let state = done.clone();
     let base = Payload::from_vec(vec![7; 64]);
     let pointer = base.as_slice().as_ptr();
-    a.write_shared(client, base.with_release(move || { state.fetch_add(1, Ordering::SeqCst); }), false, false, None).unwrap();
+    a.write_shared(
+        client,
+        base.with_release(move || {
+            state.fetch_add(1, Ordering::SeqCst);
+        }),
+        false,
+        false,
+        None,
+    )
+    .unwrap();
     let (first, token, header, old_backend) = loan(&mut a, client, 101);
     a.accept_transmit(101, token).unwrap();
-    let sequence = wire::parse(first.ip, &wire_bytes(&header, &old_backend)).unwrap().header.sequence;
+    let sequence = wire::parse(first.ip, &wire_bytes(&header, &old_backend))
+        .unwrap()
+        .header
+        .sequence;
     let expiry = a.next_deadline().unwrap();
     a.on_timeout(expiry, 32).unwrap();
     let (retry, token, header, new_backend) = loan(&mut a, client, expiry);
     assert_eq!(new_backend[0].as_slice().as_ptr(), pointer);
     let bytes = wire_bytes(&header, &new_backend);
-    assert_eq!(wire::parse(retry.ip, &bytes).unwrap().header.sequence, sequence);
+    assert_eq!(
+        wire::parse(retry.ip, &bytes).unwrap().header.sequence,
+        sequence
+    );
     a.accept_transmit(expiry, token).unwrap();
     a.abort(client).unwrap();
     drop(old_backend);
@@ -86,9 +123,11 @@ fn shared_payload_rto_reuses_original_storage_and_abort_waits_for_backend() {
 #[test]
 fn shared_ranges_can_be_copied_by_legacy_output_without_corruption() {
     let (mut a, mut b, client, server) = connected();
-    a.write_shared(client, Payload::from_vec(vec![3; 11]), true, false, None).unwrap();
+    a.write_shared(client, Payload::from_vec(vec![3; 11]), true, false, None)
+        .unwrap();
     a.write(client, &[5; 13]).unwrap();
-    a.write_shared(client, Payload::from_vec(vec![7; 17]), false, false, None).unwrap();
+    a.write_shared(client, Payload::from_vec(vec![7; 17]), false, false, None)
+        .unwrap();
     pump(&mut a, &mut b, 200);
     b.on_timeout(210_200, 32).unwrap();
     pump(&mut a, &mut b, 210_200);
@@ -107,7 +146,9 @@ fn shared_metadata_partial_ack_resize_and_fragment_limits_preserve_bytes() {
     let count = Arc::new(AtomicUsize::new(0));
     let state = count.clone();
     let base = Payload::from_vec(vec![2; 13]);
-    buffer.write_shared(base.clone().with_release(move || { state.fetch_add(1, Ordering::SeqCst); }));
+    buffer.write_shared(base.clone().with_release(move || {
+        state.fetch_add(1, Ordering::SeqCst);
+    }));
     buffer.write(&[3; 7]);
     buffer.prepare_shared(4096).unwrap();
     buffer.write_shared(Payload::from_vec(vec![4; 11]));
@@ -129,5 +170,5 @@ fn shared_metadata_partial_ack_resize_and_fragment_limits_preserve_bytes() {
     buffer.truncate(10);
     buffer.set_shared_output(None);
     assert_eq!(buffer.copy(0, &mut out), 10);
-    assert_eq!(&out[..10], &[3,3,3,3,3,3,3,4,4,4]);
+    assert_eq!(&out[..10], &[3, 3, 3, 3, 3, 3, 3, 4, 4, 4]);
 }

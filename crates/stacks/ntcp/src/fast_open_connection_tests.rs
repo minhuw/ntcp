@@ -1507,14 +1507,33 @@ fn authenticated_empty_syn_constructor_allows_server_first_only_after_synack() {
         cfg.fast_open_early_response = true;
         let syn = wire::Segment {
             header: wire::Header {
-                source_port: tuple().remote.port(), destination_port: tuple().local.port(),
-                sequence: 100, acknowledgment: 0, flags: SYN, window: 8192, urgent_pointer: 0,
+                source_port: tuple().remote.port(),
+                destination_port: tuple().local.port(),
+                sequence: 100,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 8192,
+                urgent_pointer: 0,
             },
-            options: wire::Options { fast_open: Some(wire::FastOpenCookie::new(&[7; 8]).unwrap()), ..Default::default() },
-            raw_options: &[], payload: &[],
+            options: wire::Options {
+                fast_open: Some(wire::FastOpenCookie::new(&[7; 8]).unwrap()),
+                ..Default::default()
+            },
+            raw_options: &[],
+            payload: &[],
         };
-        let mut connection = Connection::passive_with_receive(tuple(), cfg, 900, 0, &syn,
-            authenticated, &mut None, RxTimestamps::default(), RxPacketTimestamps::default()).unwrap();
+        let mut connection = Connection::passive_with_receive(
+            tuple(),
+            cfg,
+            900,
+            0,
+            &syn,
+            authenticated,
+            &mut None,
+            RxTimestamps::default(),
+            RxPacketTimestamps::default(),
+        )
+        .unwrap();
         assert_eq!(connection.write(b"hello").unwrap(), 5);
         let first = packet(&mut connection, 0);
         let first = wire::parse(ip(tuple()), &first).unwrap();
@@ -1523,7 +1542,10 @@ fn authenticated_empty_syn_constructor_allows_server_first_only_after_synack() {
         assert!(!connection.transport_info().syn_data_fully_acked);
         if authenticated {
             let response = packet(&mut connection, 1);
-            assert_eq!(wire::parse(ip(tuple()), &response).unwrap().payload, b"hello");
+            assert_eq!(
+                wire::parse(ip(tuple()), &response).unwrap().payload,
+                b"hello"
+            );
         } else {
             assert_eq!(connection.transmit(1, &mut [0; 2048]).unwrap(), None);
         }

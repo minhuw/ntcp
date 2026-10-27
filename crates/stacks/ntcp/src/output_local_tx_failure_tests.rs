@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Endpoint contract checks for a real RACK-timer repair and local rejection.
+use super::*;
 use alloc::vec;
 fn local_failure_input(
     a: &mut Endpoint,

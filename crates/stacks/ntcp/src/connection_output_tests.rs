@@ -2686,6 +2686,5 @@ fn general_pacing_saturated_clock_preserves_burst_bound_and_actual_send_time() {
     assert_eq!(a.pacer, debt);
 }
 
-mod initial_burst {
-    include!("connection_initial_burst_tests.rs");
-}
+#[path = "connection_initial_burst_tests.rs"]
+mod initial_burst;

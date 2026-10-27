@@ -857,3 +857,6 @@ fn unsupported_bulk_prefix_enters_rfc9406_css_before_legacy_hystart_exit() {
 
 #[path = "connection_idle_restart_phase_tests.rs"]
 mod idle_restart_phase;
+
+#[path = "connection_local_tx_failure_tests.rs"]
+mod local_tx_failure;

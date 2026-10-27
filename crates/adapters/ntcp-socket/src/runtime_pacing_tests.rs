@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use super::*;
+
 fn paced_owner(last: u8) -> Owner {
     let local = Ipv4Addr::new(10, 73, 0, last);
     let mut config = SocketConfig::new("test", local);
     // These rate/deadline tests explicitly select the ordinary bucket.
     // Default startup bursts are covered by the common-profile wire test.
     config.tcp.connection.pacing = Some(ntcp::PacingConfig {
-        initial_window_burst: false, ..Default::default()
+        initial_window_burst: false,
+        ..Default::default()
     });
     let mut owner = Owner::with_config(
         local,
@@ -19,7 +22,7 @@ fn paced_owner(last: u8) -> Owner {
     owner
 }
 
-pub(super) fn paced_pair() -> (Owner, Owner, u64, u64, u64) {
+pub(crate) fn paced_pair() -> (Owner, Owner, u64, u64, u64) {
     let mut a = paced_owner(2);
     let mut b = paced_owner(3);
     let listener = new(&mut b, SOCK_NONBLOCK);
@@ -41,7 +44,7 @@ pub(super) fn paced_pair() -> (Owner, Owner, u64, u64, u64) {
 }
 
 // Advance only to real core deadlines: no wall-clock sleeps or invented delay.
-pub(super) fn pacing_tick(a: &mut Owner, b: &mut Owner) {
+pub(crate) fn pacing_tick(a: &mut Owner, b: &mut Owner) {
     let now = [a.endpoint.next_deadline(), b.endpoint.next_deadline()]
         .into_iter()
         .flatten()

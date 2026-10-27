@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Included by runtime_memory_tests: actual profile, IP admission and production egress.
+// Child module of runtime_memory_tests: actual profile, IP admission and production egress.
+use super::fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output, tfo_send};
+use super::*;
+
 fn pmtud_peer_reply(a: &mut Owner, packet: &[u8], syn: bool) {
     let incoming = ntcp_ip::parse(packet, false).unwrap().ip;
     let ip = ntcp::IpMetadata {
@@ -221,7 +224,9 @@ fn fast_open_pmtud_profile_exact_quote_fallback_and_bounded_retry() {
     }
 }
 
-fn upstream_runtime_pmtud_profile_tests(options: &str) -> crate::packet_profile::Profile {
+pub(super) fn upstream_runtime_pmtud_profile_tests(
+    options: &str,
+) -> crate::packet_profile::Profile {
     crate::packet_profile::profile(&format!(
         "upstream,local=192.0.2.1{}{}",
         if options.is_empty() { "" } else { "," },
@@ -234,14 +239,26 @@ fn upstream_runtime_pmtud_profile_tests(options: &str) -> crate::packet_profile:
 #[test]
 fn fast_open_pmtud_delivery_counts_syn_repair_and_fin_once() {
     for mtu in [800u16, 840] {
-        let mut a = owner(1, upstream_runtime_pmtud_profile_tests("no-timestamps,budget224m,prealloc3,pmtud1500"), 8);
+        let mut a = owner(
+            1,
+            upstream_runtime_pmtud_profile_tests("no-timestamps,budget224m,prealloc3,pmtud1500"),
+            8,
+        );
         let warm = new(&mut a, SOCK_NONBLOCK);
-        assert_eq!(a.execute(warm, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(), EINPROGRESS);
+        assert_eq!(
+            a.execute(warm, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(),
+            EINPROGRESS
+        );
         let request = tfo_capture(&mut a);
         pmtud_peer_reply(&mut a, &request, true);
         assert!(segment(&tfo_capture(&mut a)).payload.is_empty());
         let client = new(&mut a, SOCK_NONBLOCK);
-        assert_eq!(a.execute(client, tfo_send(&[0x42; 1000], MSG_FASTOPEN)).unwrap().value, 1000);
+        assert_eq!(
+            a.execute(client, tfo_send(&[0x42; 1000], MSG_FASTOPEN))
+                .unwrap()
+                .value,
+            1000
+        );
         let syn = tfo_capture(&mut a);
         let mut feedback = ptb_frame(&syn);
         feedback[26..28].copy_from_slice(&mtu.to_be_bytes());
@@ -263,7 +280,10 @@ fn fast_open_pmtud_delivery_counts_syn_repair_and_fin_once() {
         assert_ne!(segment(&fin).header.flags & ntcp::wire::FIN, 0);
         pmtud_peer_reply(&mut a, &fin, false);
         pmtud_metric_probe(&mut a, client, "native-control-fin-acked", 4);
-        assert_eq!(a.endpoint.transport_info(cid(&a, client)).unwrap().state, State::FinWait2);
+        assert_eq!(
+            a.endpoint.transport_info(cid(&a, client)).unwrap().state,
+            State::FinWait2
+        );
         pmtud_peer_reply(&mut a, &fin, false);
         pmtud_metric_probe(&mut a, client, "native-control-duplicate-fin-ack", 4);
     }

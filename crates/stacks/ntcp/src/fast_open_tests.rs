@@ -1541,13 +1541,11 @@ fn ordinary_and_foexp_syn_text_ack_only_syn_then_deliver_once() {
     }
 }
 
-mod cookie_timeout_study {
-    include!("fast_open_cookie_timeout_tests.rs");
-}
+#[path = "fast_open_cookie_timeout_tests.rs"]
+mod cookie_timeout_study;
 
-mod partial_synack_study {
-    include!("fast_open_partial_synack_tests.rs");
-}
+#[path = "fast_open_partial_synack_tests.rs"]
+mod partial_synack_study;
 
 #[test]
 fn fast_open_negative_synack_suppresses_next_service_attempt() {
@@ -1838,13 +1836,11 @@ fn inventory_tfo_syn_only_rejection_keeps_cookie_but_suppresses_after_data_ack()
     }
 }
 
-mod active_open_options {
-    include!("fast_open_active_options_tests.rs");
-}
+#[path = "fast_open_active_options_tests.rs"]
+mod active_open_options;
 
-mod empty_syn {
-    include!("fast_open_empty_syn_tests.rs");
-}
+#[path = "fast_open_empty_syn_tests.rs"]
+mod empty_syn;
 
 #[test]
 fn clear_client_cache_preserves_reserved_open_server_keys_and_live_connection() {
@@ -1966,6 +1962,5 @@ fn clear_client_cache_explicitly_discards_service_failure_and_does_not_enable_se
 #[path = "fast_open_server_cookie_tests.rs"]
 mod server_cookie;
 
-mod client_policy {
-    include!("fast_open_client_policy_tests.rs");
-}
+#[path = "fast_open_client_policy_tests.rs"]
+mod client_policy;

@@ -1363,6 +1363,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod route_tests {
-    include!("pmtud_route_tests.rs");
-}
+#[path = "pmtud_route_tests.rs"]
+mod route_tests;

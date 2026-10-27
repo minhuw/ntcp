@@ -654,13 +654,8 @@ fn cubic_ecn_prr_loss_exit_below_threshold_preserves_direct_target() {
     }
 }
 
-mod retransmit_delay_study {
-    include!("connection_recovery_timing_tests.rs");
-
-    mod local_tx_failure {
-        include!("connection_local_tx_failure_tests.rs");
-    }
-}
+#[path = "connection_recovery_timing_tests.rs"]
+mod retransmit_delay_study;
 
 #[test]
 fn packetdrill_passive_ecn_cwr_prr_characterization() {
@@ -795,6 +790,5 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
     assert!(a.transmit(306_000, &mut [0; 1500]).unwrap().is_none());
 }
 
-mod remaining17_study {
-    include!("connection_remaining17_tests.rs");
-}
+#[path = "connection_remaining17_tests.rs"]
+mod remaining17_study;

@@ -373,8 +373,13 @@ fn packetization_pair(
     c.pmtud = None;
     c.advertised_mss = None;
     let mut b = Connection::passive(
-        reverse(t), c, 900, 10 * scale, &wire::parse(ip(t), &syn).unwrap(),
-    ).unwrap();
+        reverse(t),
+        c,
+        900,
+        10 * scale,
+        &wire::parse(ip(t), &syn).unwrap(),
+    )
+    .unwrap();
     deliver(&mut b, &mut a, 20 * scale);
     deliver(&mut a, &mut b, 30 * scale);
     a.set_route_mtu(40 * scale, Some(1500)).unwrap();
@@ -383,11 +388,15 @@ fn packetization_pair(
 
 fn packetization_output(a: &mut Connection, now: u64, reserved: bool) -> Vec<u8> {
     let mut bytes = vec![0; 2048];
-    let n = a.transmit_selected(now, &mut bytes, reserved).unwrap().unwrap();
+    let n = a
+        .transmit_selected(now, &mut bytes, reserved)
+        .unwrap()
+        .unwrap();
     if reserved {
         let mut d = a.last_departure.unwrap();
         let payload = d.payload;
-        a.accept_reserved_output(now, &mut d, 0, payload, true).unwrap();
+        a.accept_reserved_output(now, &mut d, 0, payload, true)
+            .unwrap();
     }
     bytes.truncate(n);
     bytes
@@ -408,7 +417,8 @@ fn upward_probe_keeps_current_mss_for_fresh_data_until_real_ack() {
                 for reserved in [false, true] {
                     for iss in [10, u32::MAX - 1500] {
                         let scale = units / 1_000_000;
-                        let (mut a, mut b) = packetization_pair(ipv4, timestamps, units, iss, current);
+                        let (mut a, mut b) =
+                            packetization_pair(ipv4, timestamps, units, iss, current);
                         let mss = a.mss;
                         a.write(&[7; 20_000]).unwrap();
                         let probe = packetization_output(&mut a, 50 * scale, reserved);
@@ -416,7 +426,10 @@ fn upward_probe_keeps_current_mss_for_fresh_data_until_real_ack() {
                         assert!(p.size > current);
                         assert_eq!(probe.len() as u32 + ip_header, p.size);
                         let state = (a.snd_nxt, a.rto_deadline, a.path_mtu_info());
-                        assert_eq!(a.transmit_selected(51 * scale, &mut [0; 19], reserved), Err(Error::OutputTooSmall));
+                        assert_eq!(
+                            a.transmit_selected(51 * scale, &mut [0; 19], reserved),
+                            Err(Error::OutputTooSmall)
+                        );
                         assert_eq!((a.snd_nxt, a.rto_deadline, a.path_mtu_info()), state);
                         let tail = packetization_output(&mut a, 52 * scale, reserved);
                         let tail = wire::parse(ip(a.tuple), &tail).unwrap();
@@ -424,7 +437,8 @@ fn upward_probe_keeps_current_mss_for_fresh_data_until_real_ack() {
                         assert_eq!(tail.payload.len(), mss);
                         assert_eq!(a.mss, mss);
                         assert_eq!(a.path_mtu_info().unwrap().current_mtu, current);
-                        b.input(53 * scale, &wire::parse(ip(a.tuple), &probe).unwrap()).unwrap();
+                        b.input(53 * scale, &wire::parse(ip(a.tuple), &probe).unwrap())
+                            .unwrap();
                         deliver(&mut b, &mut a, 54 * scale);
                         assert_eq!(a.path_mtu_info().unwrap().current_mtu, p.size);
                         assert!(a.mss > mss);
@@ -443,7 +457,8 @@ fn upward_probe_loss_keeps_repairs_at_lower_bound() {
         let ip_header = if ipv4 { 20 } else { 40 };
         for timestamps in [false, true] {
             for reserved in [false, true] {
-                let (mut a, mut b) = packetization_pair(ipv4, timestamps, 1_000_000, u32::MAX - 1500, current);
+                let (mut a, mut b) =
+                    packetization_pair(ipv4, timestamps, 1_000_000, u32::MAX - 1500, current);
                 a.write(&[7; 20_000]).unwrap();
                 packetization_output(&mut a, 50, reserved); // Lose only the larger probe.
                 let p = a.pmtud.as_ref().unwrap().probe.unwrap();
@@ -454,7 +469,8 @@ fn upward_probe_loss_keeps_repairs_at_lower_bound() {
                     .collect();
                 for (n, tail) in trailing.iter().enumerate() {
                     assert_eq!(wire::parse(ip(a.tuple), tail).unwrap().payload.len(), mss);
-                    b.input(60 + n as u64, &wire::parse(ip(a.tuple), tail).unwrap()).unwrap();
+                    b.input(60 + n as u64, &wire::parse(ip(a.tuple), tail).unwrap())
+                        .unwrap();
                     deliver(&mut b, &mut a, 60 + n as u64);
                 }
                 assert!(a.retx_pending);
@@ -483,8 +499,14 @@ fn below_estimate_probe_keeps_small_surrounding_packets() {
             let before = a.path_mtu_info().unwrap();
             assert!(p.size < before.current_mtu);
             let tail = packetization_output(&mut a, 51, false);
-            assert_eq!(tail.len() as u32 + if ipv4 { 20 } else { 40 }, before.search_low);
+            assert_eq!(
+                tail.len() as u32 + if ipv4 { 20 } else { 40 },
+                before.search_low
+            );
             assert_eq!(a.path_mtu_info().unwrap(), before);
         }
     }
 }
+
+#[path = "connection_ipv6_packetization_tests.rs"]
+mod conservative_ipv6;

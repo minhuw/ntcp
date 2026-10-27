@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use super::*;
+
 fn syncnt(o: &mut Owner, id: u64) -> i32 {
     o.execute(id, Op::Get(IPPROTO_TCP, TCP_SYNCNT))
         .unwrap()

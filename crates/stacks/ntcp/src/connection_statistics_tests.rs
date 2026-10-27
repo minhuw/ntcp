@@ -448,7 +448,10 @@ fn statistics_fin_payload_credit_distinguishes_combined_from_separate_fin() {
             timestamp_input(&mut a, timeout + 200, next, end, ACK, None, b"");
             // Previously credited data supplies no new data credit; a FIN
             // first attached to that credited data still needs control credit.
-            assert_eq!(a.transport_info().delivered_segments, if initially_combined { 2 } else { 3 });
+            assert_eq!(
+                a.transport_info().delivered_segments,
+                if initially_combined { 2 } else { 3 }
+            );
             assert!(a.transport_info().delivered_segments_valid);
             assert!(a.transport_info().ledger_valid);
         }

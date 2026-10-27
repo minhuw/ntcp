@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-use super::super::tests::{ip_packet, new, paced_pair, pacing_tick, pair, poll_packet, pump};
+use super::super::tests::pacing_tests::{paced_pair, pacing_tick};
+use super::super::tests::{ip_packet, new, pair, poll_packet, pump};
 use super::*;
 use crate::timestamping as ts;
 use ntcp_io::{TimestampCapabilities, TxTimestampCompletion, TxTimestampRequest};
@@ -2622,9 +2623,8 @@ fn software_gso_cpu_sample() {
     }
 }
 
-mod local_repair {
-    include!("runtime_local_repair_tests.rs");
-}
+#[path = "runtime_local_repair_tests.rs"]
+mod local_repair;
 
 #[test]
 fn backend_first_hop_refresh_preserves_configured_path_policy() {

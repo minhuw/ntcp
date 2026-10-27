@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-fn logical_request(a: &mut Owner, id: u64, op: Op) -> (Request, Receiver<Result<Reply>>) {
+use super::timestamp_tests::{timestamp_allocator, timestamp_records, timestamp_set};
+use super::*;
+use crate::timestamping as ts;
+
+pub(super) fn logical_request(
+    a: &mut Owner,
+    id: u64,
+    op: Op,
+) -> (Request, Receiver<Result<Reply>>) {
     a.execute(id, Op::Flags(F_SETFL, 0)).unwrap();
     let (reply, rx) = mpsc::sync_channel(1);
     (
@@ -14,7 +22,7 @@ fn logical_request(a: &mut Owner, id: u64, op: Op) -> (Request, Receiver<Result<
         rx,
     )
 }
-fn advance(a: &mut Owner, b: &mut Owner) {
+pub(super) fn advance(a: &mut Owner, b: &mut Owner) {
     pump(a, b);
     b.epoch -= std::time::Duration::from_millis(210);
     b.endpoint.on_timeout(b.now(), BUDGET).unwrap();

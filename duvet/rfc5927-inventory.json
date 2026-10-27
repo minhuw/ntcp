@@ -558,7 +558,7 @@
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-5.2",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn network_error(",
-        "crates/stacks/ntcp/src/connection.rs::    fn network_errors_validate_quote_and_mss_reduction_repacketizes()"
+        "crates/stacks/ntcp/src/connection_tests.rs::fn network_errors_validate_quote_and_mss_reduction_repacketizes()"
       ]
     },
     {

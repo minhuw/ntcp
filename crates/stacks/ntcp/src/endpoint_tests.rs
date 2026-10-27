@@ -5524,13 +5524,11 @@ fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
     assert_eq!(a.path_mtu_info(id).unwrap(), None);
 }
 
-mod handshake_limit {
-    include!("endpoint_handshake_limit_tests.rs");
-}
+#[path = "endpoint_handshake_limit_tests.rs"]
+mod handshake_limit;
 
 #[path = "endpoint_accept_reset_tests.rs"]
 mod accept_reset;
 
-mod shared_payload {
-    include!("shared_payload_tests.rs");
-}
+#[path = "shared_payload_tests.rs"]
+mod shared_payload;

@@ -1252,3 +1252,6 @@ fn parse_ip_test(
         ntcp_ip::parse(bytes, source_routes)
     }
 }
+
+#[path = "pmtud_ipv6_evidence_tests.rs"]
+mod ipv6_evidence;

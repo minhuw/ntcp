@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 // Exact-clock counterpart to the realtime ntcp-accounting packetdrill fixture.
+use super::large_write_tests::logical_request;
+use super::*;
+
 #[cfg(feature = "packet-test")]
 #[test]
 fn sndbuf_accounting_fixture_has_exact_positive_interval_and_valid_acks() {

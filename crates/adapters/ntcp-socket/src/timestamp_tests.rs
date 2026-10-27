@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use super::*;
 use crate::timestamping as ts;
 
-fn timestamp_set(o: &mut Owner, id: u64, flags: u32) {
+pub(super) fn timestamp_set(o: &mut Owner, id: u64, flags: u32) {
     o.execute(id, Op::Set(SOL_SOCKET, ts::OLD, flags as i32))
         .unwrap();
 }
-fn timestamp_records(o: &Owner, id: u64) -> Vec<(u32, u32, u64, u64, usize)> {
+pub(super) fn timestamp_records(o: &Owner, id: u64) -> Vec<(u32, u32, u64, u64, usize)> {
     o.sockets[&id]
         .completions
         .iter()
@@ -463,7 +464,7 @@ fn timestamp_runtime_generation_reporting_and_syn_id_bases() {
 }
 
 // Thread-local fault injection does not disturb parallel tests or the harness.
-mod timestamp_allocator {
+pub(super) mod timestamp_allocator {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     std::thread_local! { static FAIL: Cell<Option<usize>> = const { Cell::new(None) }; }
@@ -500,10 +501,10 @@ mod timestamp_allocator {
         })
         .unwrap_or(false)
     }
-    pub(super) fn failing<T>(f: impl FnOnce() -> T) -> T {
+    pub(crate) fn failing<T>(f: impl FnOnce() -> T) -> T {
         fail_after(0, f)
     }
-    pub(super) fn fail_after<T>(count: usize, f: impl FnOnce() -> T) -> T {
+    pub(crate) fn fail_after<T>(count: usize, f: impl FnOnce() -> T) -> T {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {

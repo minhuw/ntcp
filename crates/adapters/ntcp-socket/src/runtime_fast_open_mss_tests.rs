@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use super::fast_open_tests::{
+    tfo_capture, tfo_client_synack, tfo_deliver, tfo_no_output, tfo_send, tfo_setup,
+};
 use super::*;
 
 #[test]
 fn fast_open_socket_mss_limits_initial_copy_in_explicit_and_deferred_opens() {
     for deferred in [false, true] {
-        for (cached_mss, cap, expected) in [(940, None, 900), (1460, Some(1040), 1000), (1340, None, 1300), (10000, None, 1420)] {
+        for (cached_mss, cap, expected) in [
+            (940, None, 900),
+            (1460, Some(1040), 1000),
+            (1340, None, 1300),
+            (10000, None, 1420),
+        ] {
             let profile = Profile::Upstream(crate::packet_profile::UpstreamOptions {
                 no_timestamps: true,
                 budget128m: true,
@@ -12,7 +20,10 @@ fn fast_open_socket_mss_limits_initial_copy_in_explicit_and_deferred_opens() {
             });
             let mut a = owner(1, profile, 16);
             let warm = new(&mut a, SOCK_NONBLOCK);
-            assert_eq!(a.execute(warm, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(), EINPROGRESS);
+            assert_eq!(
+                a.execute(warm, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(),
+                EINPROGRESS
+            );
             let syn = tfo_capture(&mut a);
             tfo_client_synack(&mut a, &syn, cached_mss);
             a.execute(warm, Op::Close).unwrap();
@@ -20,16 +31,26 @@ fn fast_open_socket_mss_limits_initial_copy_in_explicit_and_deferred_opens() {
 
             let client = new(&mut a, SOCK_NONBLOCK);
             if let Some(cap) = cap {
-                a.execute(client, Op::Set(IPPROTO_TCP, TCP_MAXSEG, cap)).unwrap();
+                a.execute(client, Op::Set(IPPROTO_TCP, TCP_MAXSEG, cap))
+                    .unwrap();
             }
             if deferred {
-                a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1)).unwrap();
-                assert_eq!(a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap())).unwrap().value, 0);
+                a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                    .unwrap();
+                assert_eq!(
+                    a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                        .unwrap()
+                        .value,
+                    0
+                );
                 tfo_no_output(&mut a);
             }
             let data: Vec<u8> = (0..2000).map(|n| (n % 251) as u8).collect();
             let flags = MSG_DONTWAIT | if deferred { 0 } else { MSG_FASTOPEN };
-            assert_eq!(a.execute(client, tfo_send(&data, flags)).unwrap().value, expected);
+            assert_eq!(
+                a.execute(client, tfo_send(&data, flags)).unwrap().value,
+                expected
+            );
             let syn = tfo_capture(&mut a);
             let segment = segment(&syn);
             assert_eq!(segment.options.mss, Some(cap.map_or(1460, |n| n as u16)));
@@ -50,17 +71,24 @@ fn fast_open_blocking_mss_limit_keeps_remainder_in_the_waiting_writer() {
     for deferred in [false, true] {
         let (mut a, mut b, listener) = tfo_setup(true);
         let client = new(&mut a, 0);
-        a.execute(client, Op::Set(IPPROTO_TCP, TCP_MAXSEG, 1040)).unwrap();
-        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1)).unwrap();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_MAXSEG, 1040))
+            .unwrap();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
         if deferred {
-            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1)).unwrap();
-            a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap())).unwrap();
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap();
+            a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                .unwrap();
         }
         let data: Vec<u8> = (0..2000).map(|n| (n % 251) as u8).collect();
         let (reply, rx) = mpsc::sync_channel(1);
         let mut request = Request {
             id: client,
-            op: Op::Wait(Box::new(tfo_send(&data, if deferred { 0 } else { MSG_FASTOPEN })), None),
+            op: Op::Wait(
+                Box::new(tfo_send(&data, if deferred { 0 } else { MSG_FASTOPEN })),
+                None,
+            ),
             reply,
             deadline: None,
             send: None,
@@ -77,7 +105,10 @@ fn fast_open_blocking_mss_limit_keeps_remainder_in_the_waiting_writer() {
         assert!(a.service(&mut request));
         assert_eq!(rx.recv().unwrap().unwrap().value, 2000);
         exchange(&mut a, &mut b);
-        let server = b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
         assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, data);
     }
 }

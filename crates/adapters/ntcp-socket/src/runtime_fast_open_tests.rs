@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Included by runtime_memory_tests: bounded PacketIo and production Egress only.
+// Child module of runtime_memory_tests: bounded PacketIo and production Egress only.
+use super::*;
+
 fn tfo_listener(b: &mut Owner) -> u64 {
     let listener = new(b, SOCK_NONBLOCK);
     b.execute(listener, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 4))
@@ -9,7 +11,7 @@ fn tfo_listener(b: &mut Owner) -> u64 {
     b.execute(listener, Op::Listen(4)).unwrap();
     listener
 }
-fn tfo_send(bytes: &[u8], flags: i32) -> Op {
+pub(super) fn tfo_send(bytes: &[u8], flags: i32) -> Op {
     Op::SendTo(
         vec![(bytes.as_ptr() as usize, bytes.len())],
         flags,
@@ -17,7 +19,7 @@ fn tfo_send(bytes: &[u8], flags: i32) -> Op {
         None,
     )
 }
-fn tfo_setup(warm: bool) -> (Owner, Owner, u64) {
+pub(super) fn tfo_setup(warm: bool) -> (Owner, Owner, u64) {
     let mut a = owner(1, Profile::Pipeline, 8);
     let mut b = owner(2, Profile::Pipeline, 8);
     let listener = tfo_listener(&mut b);
@@ -47,15 +49,15 @@ fn tfo_setup(warm: bool) -> (Owner, Owner, u64) {
     }
     (a, b, listener)
 }
-fn tfo_capture(a: &mut Owner) -> Vec<u8> {
+pub(super) fn tfo_capture(a: &mut Owner) -> Vec<u8> {
     a.service_egress().unwrap();
     a.execute(0, Op::Capture(65535)).unwrap().bytes
 }
-fn tfo_deliver(b: &mut Owner, bytes: Vec<u8>) {
+pub(super) fn tfo_deliver(b: &mut Owner, bytes: Vec<u8>) {
     b.execute(0, Op::Inject(bytes)).unwrap();
     receive(b);
 }
-fn tfo_no_output(a: &mut Owner) {
+pub(super) fn tfo_no_output(a: &mut Owner) {
     a.service_egress().unwrap();
     assert_eq!(a.execute(0, Op::Capture(65535)).unwrap_err(), EAGAIN);
 }
@@ -1069,7 +1071,7 @@ fn passive_repair_socket_stat_commit_and_listener_cleanup() {
 }
 
 // Synthetic peer keeps the cached MSS and handshake boundary deterministic.
-fn tfo_client_synack(a: &mut Owner, syn: &[u8], mss: u16) {
+pub(super) fn tfo_client_synack(a: &mut Owner, syn: &[u8], mss: u16) {
     let incoming = ntcp_ip::parse(syn, false).unwrap().ip;
     let ip = ntcp::IpMetadata {
         source: incoming.destination,
@@ -1872,19 +1874,38 @@ fn upstream_implicit_fast_open_listener_and_explicit_disable() {
 fn fast_open_authenticated_empty_syn_accepts_without_false_readability() {
     let (mut a, mut b, listener) = tfo_setup(true);
     let client = new(&mut a, SOCK_NONBLOCK);
-    assert_eq!(a.execute(client, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(), EINPROGRESS);
+    assert_eq!(
+        a.execute(client, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(),
+        EINPROGRESS
+    );
     let syn = tfo_capture(&mut a);
     assert!(segment(&syn).payload.is_empty());
-    assert!(!segment(&syn).options.fast_open.unwrap().as_bytes().is_empty());
+    assert!(
+        !segment(&syn)
+            .options
+            .fast_open
+            .unwrap()
+            .as_bytes()
+            .is_empty()
+    );
     tfo_deliver(&mut b, syn);
-    let server = b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
-    assert_eq!(b.endpoint.state(cid(&b, server)).unwrap(), State::SynReceived);
+    let server = b
+        .execute(listener, Op::Accept(SOCK_NONBLOCK))
+        .unwrap()
+        .value as u64;
+    assert_eq!(
+        b.endpoint.state(cid(&b, server)).unwrap(),
+        State::SynReceived
+    );
     let ready = b.execute(server, Op::Ready).unwrap().value;
     assert_eq!(ready & EPOLLIN, 0);
     assert_ne!(ready & EPOLLOUT, 0);
     assert_eq!(b.execute(server, Op::Read(32)).unwrap_err(), EAGAIN);
     let synack = tfo_capture(&mut b);
-    assert_eq!(b.execute(server, Op::Write(vec![9; 100])).unwrap().value, 100);
+    assert_eq!(
+        b.execute(server, Op::Write(vec![9; 100])).unwrap().value,
+        100
+    );
     tfo_no_output(&mut b); // The ordinary Pipeline policy holds early responses.
     tfo_deliver(&mut a, synack);
     tfo_deliver(&mut b, tfo_capture(&mut a));
@@ -1894,7 +1915,12 @@ fn fast_open_authenticated_empty_syn_accepts_without_false_readability() {
     exchange(&mut a, &mut b);
     assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLIN, 0);
     assert_eq!(b.execute(server, Op::Read(32)).unwrap().bytes, b"request");
-    assert!(!b.endpoint.transport_info(cid(&b, server)).unwrap().syn_data_fully_acked);
+    assert!(
+        !b.endpoint
+            .transport_info(cid(&b, server))
+            .unwrap()
+            .syn_data_fully_acked
+    );
 }
 
 #[test]
@@ -1902,37 +1928,76 @@ fn server_cookie_blocking_iov_and_deferred_calls_retain_tail_until_handshake() {
     for deferred in [false, true] {
         let (mut a, mut b, listener) = tfo_setup(false);
         let remote = "192.0.2.2:8080".parse().unwrap();
-        b.execute(listener, Op::SetListenerFastOpenEarlyDataPolicy(FastOpenEarlyDataPolicy::ApplicationProtected)).unwrap();
+        b.execute(
+            listener,
+            Op::SetListenerFastOpenEarlyDataPolicy(FastOpenEarlyDataPolicy::ApplicationProtected),
+        )
+        .unwrap();
         let client = new(&mut a, 0);
-        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1)).unwrap();
-        a.execute(client, Op::SetFastOpenServerCookie(Some((remote, FastOpenCookie::request())))).unwrap();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
+        a.execute(
+            client,
+            Op::SetFastOpenServerCookie(Some((remote, FastOpenCookie::request()))),
+        )
+        .unwrap();
         if deferred {
-            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1)).unwrap();
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap();
             a.execute(client, Op::Connect(remote)).unwrap();
             tfo_no_output(&mut a);
-            assert_eq!(a.execute(client, Op::SetFastOpenServerCookie(None)).unwrap_err(), EINVAL);
+            assert_eq!(
+                a.execute(client, Op::SetFastOpenServerCookie(None))
+                    .unwrap_err(),
+                EINVAL
+            );
         }
         let first = vec![1; 1000];
         let second = vec![2; 1000];
         let (reply, rx) = mpsc::sync_channel(1);
         let mut request = Request {
             id: client,
-            op: Op::Wait(Box::new(Op::SendTo(vec![(first.as_ptr() as usize, first.len()), (second.as_ptr() as usize, second.len())],
-                if deferred {0} else {MSG_FASTOPEN}, Some(remote), None)), None),
-            reply, deadline: None, send: None, closing: None,
+            op: Op::Wait(
+                Box::new(Op::SendTo(
+                    vec![
+                        (first.as_ptr() as usize, first.len()),
+                        (second.as_ptr() as usize, second.len()),
+                    ],
+                    if deferred { 0 } else { MSG_FASTOPEN },
+                    Some(remote),
+                    None,
+                )),
+                None,
+            ),
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
         };
         assert!(!a.service(&mut request));
         let syn = tfo_capture(&mut a);
         assert_eq!(segment(&syn).payload, &first[..496]);
-        assert_eq!(segment(&syn).options.fast_open, Some(FastOpenCookie::request()));
+        assert_eq!(
+            segment(&syn).options.fast_open,
+            Some(FastOpenCookie::request())
+        );
         assert!(rx.try_recv().is_err());
         tfo_deliver(&mut b, syn);
-        let server = b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
-        assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, first[..496]);
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        assert_eq!(
+            b.execute(server, Op::Read(BYTES)).unwrap().bytes,
+            first[..496]
+        );
         exchange(&mut a, &mut b);
         assert!(a.service(&mut request));
         assert_eq!(rx.recv().unwrap().unwrap().value, 2000);
         exchange(&mut a, &mut b);
-        assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, [first[496..].to_vec(), second].concat());
+        assert_eq!(
+            b.execute(server, Op::Read(BYTES)).unwrap().bytes,
+            [first[496..].to_vec(), second].concat()
+        );
     }
 }

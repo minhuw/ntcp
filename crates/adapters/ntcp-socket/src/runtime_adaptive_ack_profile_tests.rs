@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Included by runtime_memory_tests: configured production PacketIo and reservations.
+// Child module of runtime_memory_tests: configured production PacketIo and reservations.
+use super::fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output, tfo_send};
+use super::*;
+
 fn adaptive_peer(a: &mut Owner, packet: &[u8], syn: bool, mss: u16, payload: &[u8]) {
     let incoming = ntcp_ip::parse(packet, false).unwrap().ip;
     let ip = ntcp::IpMetadata {
@@ -429,7 +432,9 @@ fn adaptive_ack_cancelled_fast_open_waiter_does_not_initialize_later_handshake()
     for error in [ECANCELED, EAGAIN, EFAULT] {
         let mut a = owner(
             1,
-            upstream_runtime_adaptive_ack_profile_tests("no-timestamps,budget224m,prealloc3,adaptive-ack"),
+            upstream_runtime_adaptive_ack_profile_tests(
+                "no-timestamps,budget224m,prealloc3,adaptive-ack",
+            ),
             8,
         );
         let warm = new(&mut a, SOCK_NONBLOCK);
@@ -615,7 +620,8 @@ fn upstream_inq_server_read_window_ack_and_fin_schedules() {
             if !coalesce {
                 a.defaults = cfg.clone();
                 a.endpoint = Endpoint::new(cfg, [42; 32], 0, |_| true).unwrap();
-                a.enable_egress(2, crate::packet_profile::gso(profile)).unwrap();
+                a.enable_egress(2, crate::packet_profile::gso(profile))
+                    .unwrap();
             }
             a.test_now = Some(0);
             let listener = new(&mut a, SOCK_NONBLOCK);
