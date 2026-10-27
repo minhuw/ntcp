@@ -72,7 +72,7 @@ pub use tx_timestamp::{
 
 pub use rx_timestamp::{
     RxPacketTimestamps, RxReadTimestamps, RxTimestamp, RxTimestampStatus, SendProgress,
-    TimestampClock, TimestampSource,
+    TimestampClock,
 };
 
 #[cfg(test)]

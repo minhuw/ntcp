@@ -1,10 +1,9 @@
 extern crate alloc;
 
-use crate::{CallerTimebase, Error, TxTimestampClock, TxTimestampSource};
+use crate::{CallerTimebase, Error, TxTimestampClock};
 use alloc::vec::Vec;
 
 pub type TimestampClock = TxTimestampClock;
-pub type TimestampSource = TxTimestampSource;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SendProgress {

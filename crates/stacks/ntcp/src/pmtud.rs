@@ -1,5 +1,5 @@
 use crate::{
-    Instant, Ipv4Plateaus, PmtudConfig, PmtudPolicy,
+    Error, Instant, Ipv4Plateaus, PmtudConfig, PmtudPolicy,
     pmtud_config::{default_search_low, min_mtu},
     seq::Seq,
 };
@@ -116,11 +116,9 @@ impl Pmtud {
     //# Initially, the PMTU value for a path is assumed to be the (known) MTU of the
     //# first-hop link.
 
-    pub fn new(config: PmtudConfig, bound: u32, ipv4: bool, hold: u64) -> Self {
-        let (mtu, low, high) = config
-            .initial_values(bound, ipv4)
-            .expect("validated PMTUD bounds");
-        Self {
+    pub fn new(config: PmtudConfig, bound: u32, ipv4: bool, hold: u64) -> Result<Self, Error> {
+        let (mtu, low, high) = config.initial_values(bound, ipv4)?;
+        Ok(Self {
             info: PathMtuInfo {
                 first_hop_mtu: config.first_hop_mtu,
                 route_mtu: config.route_mtu,
@@ -132,11 +130,7 @@ impl Pmtud {
             ipv4,
             initial_low: low,
             hold,
-            aging: config
-                .policy
-                .search_aging
-                .ticks(hold / 600)
-                .expect("validated PMTUD aging"),
+            aging: config.policy.search_aging.ticks(hold / 600)?,
             periodic_deadline: None,
             high_limit: config.initial_search_high,
             discovered_high: None,
@@ -154,7 +148,7 @@ impl Pmtud {
             sent: [None; 64],
             next: 0,
             verification: None,
-        }
+        })
     }
 
     pub fn constrain(&mut self, bound: u32) {
@@ -1096,7 +1090,7 @@ mod tests {
     use super::*;
 
     fn state(ipv4: bool) -> Pmtud {
-        Pmtud::new(PmtudConfig::new(1500), 1500, ipv4, 600_000_000)
+        Pmtud::new(PmtudConfig::new(1500), 1500, ipv4, 600_000_000).unwrap()
     }
 
     #[test]

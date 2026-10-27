@@ -1,7 +1,7 @@
 use super::*;
 
 fn state() -> Pmtud {
-    Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000)
+    Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap()
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn route_increase_keeps_inflight_probe_valid_on_same_path() {
     let mut c = PmtudConfig::new(1500);
     c.route_mtu = Some(1300);
     c.initial_mtu = Some(1100);
-    let mut p = Pmtud::new(c, 1500, true, 600_000_000);
+    let mut p = Pmtud::new(c, 1500, true, 600_000_000).unwrap();
     p.start_probe(Seq(1), 1160, 3000, 1200);
     p.sent(Seq(1), Seq(1161), 1200, 20, false);
     p.set_route_mtu(None);
@@ -123,7 +123,7 @@ fn route_increase_keeps_inflight_probe_valid_on_same_path() {
 fn route_ceiling_never_overrides_interface_or_creation_ceiling() {
     let mut c = PmtudConfig::new(1500);
     c.initial_search_high = Some(1400);
-    let mut p = Pmtud::new(c, 1500, true, 600_000_000);
+    let mut p = Pmtud::new(c, 1500, true, 600_000_000).unwrap();
     p.set_route_mtu(Some(700));
     p.set_route_mtu(Some(9000));
     assert_eq!(p.info.search_high, 1400);
@@ -155,7 +155,7 @@ fn route_policy_decrease_does_not_turn_verification_into_network_loss() {
 fn route_unclipping_restores_work_without_resetting_network_evidence() {
     let mut c = PmtudConfig::new(1500);
     c.route_mtu = Some(640);
-    let mut p = Pmtud::new(c, 1500, true, 600_000_000);
+    let mut p = Pmtud::new(c, 1500, true, 600_000_000).unwrap();
     p.ack(Seq(0), 10, 1000, 1000); // Converged solely at the route ceiling.
     assert!(p.periodic_deadline.is_some());
     p.set_route_mtu(None);
@@ -167,7 +167,7 @@ fn route_unclipping_restores_work_without_resetting_network_evidence() {
 
 #[test]
 fn route_ceiling_preserves_ipv6_ptb_hold_and_family_floor() {
-    let mut p = Pmtud::new(PmtudConfig::new(1500), 1500, false, 600_000_000);
+    let mut p = Pmtud::new(PmtudConfig::new(1500), 1500, false, 600_000_000).unwrap();
     p.sent(Seq(1), Seq(1441), 1500, 40, false);
     assert!(p.feedback(10, Seq(1), 1500, 40, 1400));
     let deadline = p.deadline.unwrap();

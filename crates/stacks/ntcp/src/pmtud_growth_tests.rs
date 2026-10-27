@@ -205,7 +205,7 @@ fn pmtud_growth_evidence_security_bounds_holdoff_and_probe_timeout() {
     for iss in [100, u32::MAX - 500] {
         let start = Seq(iss);
         let end = start.wrapping_add(1360);
-        let state = || Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+        let state = || Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap();
         for kind in 0..6 {
             let mut p = state();
             p.sent(start, end, 1400, 20, false);

@@ -455,7 +455,8 @@ fn pending_verification_rollback(a: &mut Connection, baseline_mss: u32) -> u64 {
     assert!(!a.timestamps);
     let headers = u32::from(a.ip_header_len) + 20;
     let mtu = a.mss as u32 + headers;
-    let mut p = crate::pmtud::Pmtud::new(crate::PmtudConfig::new(mtu), mtu, true, 600_000_000);
+    let mut p =
+        crate::pmtud::Pmtud::new(crate::PmtudConfig::new(mtu), mtu, true, 600_000_000).unwrap();
     p.info.current_mtu = baseline_mss + headers;
     let start = Seq(a.snd_una.0.wrapping_sub(a.mss as u32));
     p.start_probe(start, a.mss as u32, 0, mtu);
@@ -547,12 +548,9 @@ fn cubic_ecn_prr_mss_divergence_drops_admission_without_inflation() {
     a.set_path_mss(500);
     a.congestion.prr_window(2000);
     // Enabled path growth preserves byte windows, even below the new MSS floors.
-    a.pmtud = Some(crate::pmtud::Pmtud::new(
-        crate::PmtudConfig::new(1040),
-        1040,
-        true,
-        600_000_000,
-    ));
+    a.pmtud = Some(
+        crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1040), 1040, true, 600_000_000).unwrap(),
+    );
     a.pmtud.as_mut().unwrap().info.current_mtu = 540;
     let base = a.snd_una;
     ack(&mut a, 50, base.wrapping_add(250), true, &[]);
@@ -582,7 +580,8 @@ fn cubic_ecn_prr_entry_ack_pmtu_growth_does_not_inflate_target() {
         a.set_path_mss(500);
         a.congestion.prr_window(basis);
         let mut p =
-            crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1040), 1040, true, 600_000_000);
+            crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1040), 1040, true, 600_000_000)
+                .unwrap();
         p.info.current_mtu = 540;
         p.start_probe(a.snd_una, 1000, 0, 1040);
         p.sent(a.snd_una, a.snd_nxt, 1040, 20, false);

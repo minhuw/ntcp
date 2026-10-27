@@ -420,7 +420,8 @@ fn isolated_probe_cc_terminal_proof_once_and_only_after_extended_tail() {
     for start in [Seq(100), Seq(u32::MAX - 500)] {
         for disqualifier in 0..4 {
             let mut p =
-                crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1500), 1500, true, 600_000_000);
+                crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1500), 1500, true, 600_000_000)
+                    .unwrap();
             p.start_probe(start, 1200, 3000, 1240);
             p.sent(start, start.wrapping_add(1200), 1240, 20, false);
             p.sent(
@@ -715,7 +716,8 @@ fn isolated_probe_cc_replenishment_does_not_extend_recovery_proof() {
 fn isolated_probe_cc_loss_freezes_original_minimum_tail() {
     for cause in 0..3 {
         let mut p =
-            crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1500), 1500, true, 600_000_000);
+            crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1500), 1500, true, 600_000_000)
+                .unwrap();
         let start = Seq(u32::MAX - 500);
         let end = start.wrapping_add(1200);
         let tail = end.wrapping_add(3000);

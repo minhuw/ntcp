@@ -42,6 +42,9 @@ pub type Instant = u64;
 // retaining the same conservative bound, not identical quantized deadlines.
 const PAWS_RECENT_EXPIRY_US: u64 = 2_147_000_000;
 
+// Adaptive ACK timeout floor (Linux TCP_ATO_MIN); a shorter delayed_ack_us lowers it.
+const ACK_TIMEOUT_FLOOR_US: u64 = 40_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallerTimebase {
     // Supported caller units: 1_000_000 (microseconds, default) or
@@ -321,6 +324,11 @@ impl ConnectionConfig {
             .min(self.user_mss.unwrap_or(u16::MAX))
             .min(self.advertised_mss.unwrap_or(u16::MAX))
             .min(self.receive_ip_payload_limit - 20)
+    }
+
+    fn ack_timeout_floor(&self) -> u64 {
+        self.timebase
+            .ticks_from_us(self.delayed_ack_us.min(ACK_TIMEOUT_FLOOR_US))
     }
 
     fn initial_path_bound(&self, mtu: u32, ipv4: bool) -> u32 {
@@ -888,14 +896,17 @@ impl Connection {
             .unwrap_or(14);
         let syn_window = config.receive_capacity.min(65535) as u16;
         let ip_header_len = if tuple.local.is_ipv4() { 20 } else { 40 };
-        let pmtud = config.pmtud.map(|p| {
-            crate::pmtud::Pmtud::new(
-                p,
-                config.initial_path_bound(p.first_hop_mtu, tuple.local.is_ipv4()),
-                tuple.local.is_ipv4(),
-                config.timebase.ticks_from_us(600_000_000),
-            )
-        });
+        let pmtud = config
+            .pmtud
+            .map(|p| {
+                crate::pmtud::Pmtud::new(
+                    p,
+                    config.initial_path_bound(p.first_hop_mtu, tuple.local.is_ipv4()),
+                    tuple.local.is_ipv4(),
+                    config.timebase.ticks_from_us(600_000_000),
+                )
+            })
+            .transpose()?;
         let mss = config
             .mss
             .min(config.user_mss.unwrap_or(u16::MAX))
@@ -935,9 +946,7 @@ impl Connection {
             }
         };
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
-        let ack_ato = config
-            .timebase
-            .ticks_from_us(config.delayed_ack_us.min(40_000));
+        let ack_ato = config.ack_timeout_floor();
         Ok(Self {
             tuple,
             peer_mss: config.mss,
@@ -3343,11 +3352,8 @@ impl Connection {
         self.advertised_edge = start.wrapping_add(self.syn_window as u32);
         self.last_ack_sent = start;
         self.scaling = syn.options.window_scale.is_some();
-        self.peer_scale = syn.options.window_scale.unwrap_or(0).min(14);
-        if let Some(scale) = syn
-            .options
-            .invalid_window_scale
-            .or_else(|| syn.options.window_scale.filter(|&scale| scale > 14))
+        self.peer_scale = syn.options.window_scale.unwrap_or(0);
+        if let Some(scale) = syn.options.invalid_window_scale
             && !self.invalid_scale_reported
         {
             self.events.invalid_window_scale = Some(scale);
@@ -3549,10 +3555,7 @@ impl Connection {
         if self.config.adaptive_ack {
             self.ack_receive = Some((self.now, false));
             if self.ack_engine_initialized {
-                self.ack_ato = self
-                    .config
-                    .timebase
-                    .ticks_from_us(self.config.delayed_ack_us.min(40_000));
+                self.ack_ato = self.config.ack_timeout_floor();
                 self.ack_quick = self.adaptive_quick_budget();
             }
         }
@@ -3655,10 +3658,7 @@ impl Connection {
         self.fast_open_write_pending = false;
         self.ack_interactive = false;
         self.ack_quick = 0;
-        self.ack_ato = self
-            .config
-            .timebase
-            .ticks_from_us(self.config.delayed_ack_us.min(40_000));
+        self.ack_ato = self.config.ack_timeout_floor();
         self.challenge_ack_pending = false;
         self.retx_pending = false;
         self.probe_pending = false;
@@ -6592,10 +6592,7 @@ impl Connection {
     }
 
     fn adaptive_receive(&mut self) {
-        let min = self
-            .config
-            .timebase
-            .ticks_from_us(self.config.delayed_ack_us.min(40_000));
+        let min = self.config.ack_timeout_floor();
         let max = self
             .config
             .timebase

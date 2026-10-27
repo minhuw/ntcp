@@ -183,7 +183,7 @@ fn spacing_bounds_long_idle_and_terminal_history() {
         let mut cfg = adaptive_config();
         cfg.delayed_ack_us = max;
         let (mut a, _) = pair(cfg, 100);
-        let min = max.min(40_000);
+        let min = max.min(ACK_TIMEOUT_FLOOR_US);
         data(&mut a, 100, b"x");
         assert_eq!(a.ack_ato, min);
         packet(&mut a, 100);

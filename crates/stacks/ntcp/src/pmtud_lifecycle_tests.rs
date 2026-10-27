@@ -191,7 +191,7 @@ fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss() {
 //# Packetization Layer SHOULD conduct MTU verification as described in Section 7.8.
 
 fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence() {
-    let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+    let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap();
     p.info.current_mtu = 1024;
     let mut seq = Seq(u32::MAX - 1000);
     for (now, size) in [(100, 1240), (1000, 1380), (2000, 1440)] {
@@ -221,7 +221,8 @@ fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence(
 #[test]
 fn pmtud_lifecycle_increase_on_verification_expiry_requires_new_observation_interval() {
     for prior_loss in [false, true] {
-        let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+        let mut p =
+            crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap();
         p.info.current_mtu = 1024;
         p.start_probe(Seq(0), 1200, 3000, 1240);
         p.sent(Seq(0), Seq(1200), 1240, 20, false);
@@ -337,7 +338,7 @@ fn pmtud_lifecycle_saturated_deadline_is_consumed_once() {
 
 #[test]
 fn pmtud_lifecycle_detected_trailing_loss_survives_delivery_without_retry() {
-    let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+    let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap();
     p.start_probe(Seq(0), 1200, 3000, 1240);
     p.sent(Seq(0), Seq(1200), 1240, 20, false);
     for n in 0..5 {
@@ -361,7 +362,7 @@ fn pmtud_lifecycle_detected_trailing_loss_survives_delivery_without_retry() {
 
 #[test]
 fn pmtud_lifecycle_local_rejection_invalidates_only_latest_evidence_without_loss() {
-    let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+    let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap();
     p.sent(Seq(0), Seq(1460), 1500, 20, false);
     p.start_probe(Seq(1460), 1200, 3000, 1240);
     p.sent(Seq(1460), Seq(2660), 1240, 20, false);
@@ -377,7 +378,8 @@ fn pmtud_lifecycle_local_rejection_invalidates_only_latest_evidence_without_loss
     assert!(p.feedback(10, Seq(0), 1500, 20, 1006)); // earlier real output survives
 
     for rejected_retry in [false, true] {
-        let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+        let mut p =
+            crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap();
         p.info.current_mtu = 1024;
         p.start_probe(Seq(0), 1200, 3000, 1240);
         p.sent(Seq(0), Seq(1200), 1240, 20, false);

@@ -20,14 +20,17 @@ pub(crate) struct Growth {
     blocks: Vec<Vec<Interval>>,
     capacity: usize,
 }
+// Takes the Vec itself because its own capacity is part of the allocation.
+fn blocks_allocation_bytes(blocks: &Vec<Vec<Interval>>) -> usize {
+    blocks.capacity() * size_of::<Vec<Interval>>()
+        + blocks
+            .iter()
+            .map(|b| b.capacity() * size_of::<Interval>())
+            .sum::<usize>()
+}
 impl Growth {
     pub(crate) fn allocation_bytes(&self) -> usize {
-        self.blocks.capacity() * size_of::<Vec<Interval>>()
-            + self
-                .blocks
-                .iter()
-                .map(|b| b.capacity() * size_of::<Interval>())
-                .sum::<usize>()
+        blocks_allocation_bytes(&self.blocks)
     }
 }
 impl Intervals {
@@ -49,12 +52,7 @@ impl Intervals {
         )
     }
     pub(super) fn allocation_bytes(&self) -> usize {
-        self.blocks.capacity() * size_of::<Vec<Interval>>()
-            + self
-                .blocks
-                .iter()
-                .map(|b| b.capacity() * size_of::<Interval>())
-                .sum::<usize>()
+        blocks_allocation_bytes(&self.blocks)
     }
     pub(super) fn growth_bytes(&self, capacity: usize) -> Option<usize> {
         if capacity < self.capacity {

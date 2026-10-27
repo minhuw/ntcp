@@ -236,7 +236,7 @@ fn pmtud_config_checked_aging_timebases_and_live_rearming() {
         for seconds in [300, 600, 1200] {
             let mut cfg = PmtudConfig::new(1500);
             cfg.policy = policy(SearchAging::Seconds(seconds));
-            let mut p = Pmtud::new(cfg, 1500, true, 600 * units);
+            let mut p = Pmtud::new(cfg, 1500, true, 600 * units).unwrap();
             p.info.search_low = 1500;
             p.ack(Seq(0), 10, units, units);
             assert_eq!(p.next_deadline(), Some(10 + seconds * units));
@@ -298,7 +298,7 @@ fn pmtud_config_infinity_keeps_ptb_hold_and_failure_retry() {
         for units in [1_000_000, 1_000_000_000] {
             let mut cfg = PmtudConfig::new(1500);
             cfg.policy = policy(SearchAging::Infinity);
-            let mut p = Pmtud::new(cfg, 1500, ipv4, 600 * units);
+            let mut p = Pmtud::new(cfg, 1500, ipv4, 600 * units).unwrap();
             p.sent(Seq(0), Seq(1400), 1500, header, false);
             assert!(p.feedback(10, Seq(0), 1500, header, 1300));
             p.set_policy(11, policy(SearchAging::Seconds(300)), Some(300 * units));
@@ -312,7 +312,7 @@ fn pmtud_config_infinity_keeps_ptb_hold_and_failure_retry() {
             assert_eq!(p.info.current_mtu, 1300);
             // Both isolated and timed-out failure suppressions remain finite.
             for timeout in [false, true] {
-                let mut p = Pmtud::new(cfg, 1500, ipv4, 600 * units);
+                let mut p = Pmtud::new(cfg, 1500, ipv4, 600 * units).unwrap();
                 p.start_probe(Seq(0), 1300, 3000, 1360);
                 p.sent(Seq(0), Seq(1300), 1360, header, false);
                 if timeout {
@@ -362,7 +362,7 @@ fn pmtud_config_plateaus_bounded_validated_and_strictly_decreasing_feedback() {
     let mut cfg = copy(PmtudConfig::new(1500));
     cfg.policy.ipv4_plateaus = custom;
     for (size, expected) in [(1500, 1400), (1520, 1480)] {
-        let mut p = Pmtud::new(cfg, 1500, true, 600_000_000);
+        let mut p = Pmtud::new(cfg, 1500, true, 600_000_000).unwrap();
         p.sent(Seq(0), Seq(1460), 1500, 20, false);
         assert!(p.feedback(1, Seq(0), size, 20, 0));
         assert_eq!(p.info.current_mtu, expected);
@@ -376,7 +376,7 @@ fn pmtud_config_plateaus_bounded_validated_and_strictly_decreasing_feedback() {
         for size in [68, 80] {
             let mut cfg = PmtudConfig::new(size);
             cfg.policy.ipv4_plateaus = plateaus;
-            let mut p = Pmtud::new(cfg, size, true, 600_000_000);
+            let mut p = Pmtud::new(cfg, size, true, 600_000_000).unwrap();
             p.sent(Seq(0), Seq(size - 40), size, 20, false);
             // Exact quotes correct below 68; only 80 can legally decrease to 68.
             assert_eq!(p.feedback(1, Seq(0), size, 20, 0), size > 68);
@@ -553,7 +553,7 @@ fn pmtud_config_endpoint_template_link_update_preserves_creation_policy() {
 
 #[test]
 fn pmtud_config_converged_failure_rearms_finite_aging_after_cooldown() {
-    let mut p = Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+    let mut p = Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000).unwrap();
     p.info.current_mtu = 1024;
     p.start_probe(Seq(0), 985, 3000, 1025);
     p.sent(Seq(0), Seq(985), 1025, 20, false);
