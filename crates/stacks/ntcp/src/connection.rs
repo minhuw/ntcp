@@ -9,6 +9,7 @@ use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
     output_reservation::Departure,
     pacing::Pacer,
+    pmtud_config::min_mtu,
     rack::Rack,
     recovery::{
         Congestion, CongestionAlgorithm, InitialWindow, Prr, PrrAlgorithm, RecoveryAlgorithm,
@@ -327,7 +328,7 @@ impl ConnectionConfig {
 
     fn initial_path_bound(&self, mtu: u32, ipv4: bool) -> u32 {
         let header = if ipv4 { 20 } else { 40 };
-        let floor = if ipv4 { 68 } else { 1280 };
+        let floor = min_mtu(ipv4);
         mtu.min((u32::from(self.send_ip_payload_limit) + header).max(floor))
             .min((u32::from(self.mss) + header + 20).max(floor))
     }
@@ -2436,7 +2437,7 @@ impl Connection {
 
     fn path_bound(&self, link: u32) -> u32 {
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
-        let floor = if self.tuple.local.is_ipv4() { 68 } else { 1280 };
+        let floor = min_mtu(self.tuple.local.is_ipv4());
         // A tiny peer/allocation ceiling limits packetization, not the IP
         // family's minimum legal path estimate. Such flows cannot size-probe.
         link.min(

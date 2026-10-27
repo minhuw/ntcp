@@ -1,5 +1,20 @@
 use crate::Error;
 
+// Minimum legal path MTU of each family: 68 octets for IPv4 (RFC 1191) and
+// the IPv6 minimum link MTU (RFC 8200, RFC 8201).
+const IPV4_MIN_MTU: u32 = 68;
+const IPV6_MIN_MTU: u32 = 1280;
+
+pub(crate) fn min_mtu(ipv4: bool) -> u32 {
+    if ipv4 { IPV4_MIN_MTU } else { IPV6_MIN_MTU }
+}
+
+// Default initial search_low: RFC 4821's widely safe 1024 bytes for IPv4,
+// the IPv6 minimum link MTU for IPv6.
+pub(crate) fn default_search_low(ipv4: bool) -> u32 {
+    if ipv4 { 1024 } else { IPV6_MIN_MTU }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchAging {
     Seconds(u64),
@@ -114,7 +129,7 @@ impl PmtudConfig {
     //# SHOULD be configurable.
 
     pub(crate) fn initial_values(self, bound: u32, ipv4: bool) -> Result<(u32, u32, u32), Error> {
-        let floor = if ipv4 { 68 } else { 1280 };
+        let floor = min_mtu(ipv4);
         // Preserve the physical link minimum. Explicit transport bounds only
         // need space for base headers and the existing eight-byte data minimum;
         // ConnectionConfig additionally reserves its enabled TCP options.
@@ -142,7 +157,7 @@ impl PmtudConfig {
         let mtu = self.initial_mtu.unwrap_or(high);
         let low = self
             .initial_search_low
-            .unwrap_or(mtu.min(if ipv4 { 1024 } else { 1280 }));
+            .unwrap_or(mtu.min(default_search_low(ipv4)));
         if low > mtu || mtu > high {
             return Err(Error::InvalidArgument);
         }

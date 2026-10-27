@@ -1,4 +1,8 @@
-use crate::{Instant, Ipv4Plateaus, PmtudConfig, PmtudPolicy, seq::Seq};
+use crate::{
+    Instant, Ipv4Plateaus, PmtudConfig, PmtudPolicy,
+    pmtud_config::{default_search_low, min_mtu},
+    seq::Seq,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathMtuInfo {
@@ -42,7 +46,7 @@ pub(crate) struct ProbeOutcome {
 pub(crate) struct Pmtud {
     pub info: PathMtuInfo,
     pub bound: u32,
-    floor: u32,
+    ipv4: bool,
     initial_low: u32,
     // Fixed 600-second PTB hold in caller ticks, independent of periodic aging.
     hold: u64,
@@ -128,7 +132,7 @@ impl Pmtud {
                 search_high: high,
             },
             bound,
-            floor: if ipv4 { 68 } else { 1280 },
+            ipv4,
             initial_low: low,
             hold,
             aging: config
@@ -159,11 +163,7 @@ impl Pmtud {
     pub fn constrain(&mut self, bound: u32) {
         self.bound = bound;
         let bound = self.route_bound();
-        self.initial_low =
-            bound.min(
-                self.low_limit
-                    .unwrap_or(if self.floor == 68 { 1024 } else { 1280 }),
-            );
+        self.initial_low = bound.min(self.low_limit.unwrap_or(default_search_low(self.ipv4)));
         if self.info.current_mtu > bound {
             // A local limit decrease is not failure of the previously verified
             // larger size; its loss ratio cannot classify this smaller MTU.
@@ -619,9 +619,8 @@ impl Pmtud {
         header: u16,
         candidate: u32,
     ) -> bool {
-        let ipv4 = self.floor == 68;
-        if (ipv4 && (!(20..=60).contains(&header) || !header.is_multiple_of(4)))
-            || (!ipv4 && header != 40)
+        if (self.ipv4 && (!(20..=60).contains(&header) || !header.is_multiple_of(4)))
+            || (!self.ipv4 && header != 40)
             || size < u32::from(header) + 20
         {
             return false;
@@ -630,7 +629,7 @@ impl Pmtud {
             p.start == seq
                 && p.header == header
                 && (p.size == size
-                    || ipv4
+                    || self.ipv4
                         && candidate == 0
                         && p.size.checked_add(u32::from(header)) == Some(size))
         });
@@ -641,10 +640,10 @@ impl Pmtud {
         //= https://www.rfc-editor.org/rfc/rfc8201#section-4
         //# If a node receives a Packet Too Big message reporting a next-hop MTU
         //# that is less than the IPv6 minimum link MTU, it must discard it.
-        if !ipv4 && candidate < 1280 {
+        if !self.ipv4 && candidate < 1280 {
             return false;
         }
-        let mtu = if ipv4 && candidate == 0 {
+        let mtu = if self.ipv4 && candidate == 0 {
             //= https://www.rfc-editor.org/rfc/rfc1191#section-5
             //# If the Total Length field returned is
             //# not less than the current PMTU estimate, it must be reduced by
@@ -665,7 +664,7 @@ impl Pmtud {
             //= https://www.rfc-editor.org/rfc/rfc1191#section-3
             //# A host MUST never reduce its estimate of the Path MTU below 68
             //# octets.
-            candidate.max(self.floor)
+            candidate.max(min_mtu(self.ipv4))
         };
         //= https://www.rfc-editor.org/rfc/rfc1191#section-3
         //# A host MUST not increase its estimate of the Path MTU in response to
@@ -1071,7 +1070,7 @@ impl Pmtud {
             // exceed a current administrative ceiling. Unconfigured IPv6
             // still retains the normal 1280-byte blackhole fallback floor.
             let ceiling = self.route_bound().min(self.info.current_mtu);
-            let floor = self.floor.min(self.initial_low).min(ceiling);
+            let floor = min_mtu(self.ipv4).min(self.initial_low).min(ceiling);
             let low = if consecutive == 3 {
                 if self.info.current_mtu > self.info.search_low {
                     self.info.search_low
