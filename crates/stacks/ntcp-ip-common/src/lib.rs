@@ -1,5 +1,4 @@
 #![no_std]
-pub mod path_mtu;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
