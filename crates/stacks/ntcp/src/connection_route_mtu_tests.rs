@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::select_and_commit;
 use crate::{Endpoint, EndpointConfig, EndpointError, GsoLimits, PmtudConfig};
 
 fn settings(ipv4: bool, route: Option<u32>) -> ConnectionConfig {
@@ -388,16 +389,7 @@ fn packetization_pair(
 
 fn packetization_output(a: &mut Connection, now: u64, reserved: bool) -> Vec<u8> {
     let mut bytes = vec![0; 2048];
-    let n = a
-        .transmit_selected(now, &mut bytes, reserved)
-        .unwrap()
-        .unwrap();
-    if reserved {
-        let mut d = a.last_departure.unwrap();
-        let payload = d.payload;
-        a.accept_reserved_output(now, &mut d, 0, payload, true)
-            .unwrap();
-    }
+    let n = select_and_commit(a, now, &mut bytes, reserved).unwrap();
     bytes.truncate(n);
     bytes
 }

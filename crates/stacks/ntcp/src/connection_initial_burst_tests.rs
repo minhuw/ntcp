@@ -19,7 +19,7 @@ fn startup_paced_pair(mut cfg: ConnectionConfig, iss: u32) -> (Connection, Conne
 }
 
 fn startup_packets(a: &mut Connection, now: u64) -> Vec<(u32, usize)> {
-    drain_wire(a, now, 100)
+    drain_wire(a, now, 65535, 100)
         .into_iter()
         .filter(|&(_, len, _)| len != 0)
         .map(|(sequence, len, _)| (sequence, len))

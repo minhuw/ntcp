@@ -12,7 +12,7 @@ fn profile() -> ConnectionConfig {
 }
 
 fn output(a: &mut Connection, now: u64) -> Vec<(u64, u32, usize)> {
-    drain_wire(a, now, 32)
+    drain_wire(a, now, 65535, 32)
         .into_iter()
         .map(|(sequence, len, _)| (now, sequence, len))
         .collect()

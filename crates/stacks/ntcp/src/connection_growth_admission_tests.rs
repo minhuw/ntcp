@@ -76,7 +76,7 @@ fn setup_sequence(
 }
 
 fn drain(a: &mut Connection, now: u64) -> Vec<(u32, usize, bool)> {
-    drain_wire(a, now, 64)
+    drain_wire(a, now, 2048, 64)
         .into_iter()
         .filter(|&(_, len, _)| len != 0)
         .collect()

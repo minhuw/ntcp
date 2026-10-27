@@ -52,13 +52,15 @@ pub(crate) fn select_and_commit(
     Some(n)
 }
 
-// Transmits at `now` until nothing is ready and returns (sequence, payload
-// length, PSH) for every packet, pure ACKs included; panics after `limit`
-// packets. The buffer size cannot change the wire: a packet that does not fit
-// fails with OutputTooSmall rather than being shortened.
+// Transmits at `now` into a `buffer`-byte output until nothing is ready and
+// returns (sequence, payload length, PSH) for every packet, pure ACKs included;
+// panics after `limit` packets. `buffer` is not a wire policy: it does not size
+// segments, it bounds the packet size the caller accepts, since a packet that
+// does not fit fails with OutputTooSmall rather than being shortened.
 pub(crate) fn drain_wire(
     a: &mut Connection,
     now: Instant,
+    buffer: usize,
     limit: usize,
 ) -> Vec<(u32, usize, bool)> {
     let tuple = a.tuple();
@@ -66,7 +68,7 @@ pub(crate) fn drain_wire(
         source: tuple.local.ip(),
         destination: tuple.remote.ip(),
     };
-    let mut out = vec![0; 65535];
+    let mut out = vec![0; buffer];
     let mut sent = Vec::new();
     for _ in 0..limit {
         let Some(n) = a.transmit(now, &mut out).unwrap() else {

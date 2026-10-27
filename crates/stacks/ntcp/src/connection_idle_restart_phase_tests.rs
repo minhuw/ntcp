@@ -3,7 +3,7 @@ use super::*;
 use crate::connection::test_support::drain_wire;
 
 fn drain(a: &mut Connection, now: u64) -> usize {
-    drain_wire(a, now, 1024).iter().map(|p| p.1).sum()
+    drain_wire(a, now, 2048, 1024).iter().map(|p| p.1).sum()
 }
 
 fn advance_to(a: &mut Connection, now: u64) {

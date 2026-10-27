@@ -3,7 +3,7 @@ use crate::connection::test_support::drain_wire;
 
 // Actual wire ranges, not a cwnd/pipe-only assertion. Ignore independent pure ACKs.
 fn outputs(a: &mut Connection, now: u64, base: Seq) -> Vec<(u32, usize)> {
-    drain_wire(a, now, 2000)
+    drain_wire(a, now, 1500, 2000)
         .into_iter()
         .filter(|&(_, len, _)| len != 0)
         .map(|(sequence, len, _)| (Seq(sequence).distance_from(base), len))

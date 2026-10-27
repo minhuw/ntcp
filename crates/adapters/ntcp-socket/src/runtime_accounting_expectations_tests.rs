@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 // Exact-clock counterpart to the realtime ntcp-accounting packetdrill fixture.
+#[cfg(feature = "packet-test")]
 use super::large_write_tests::logical_request;
+#[cfg(feature = "packet-test")]
 use super::*;
 
 #[cfg(feature = "packet-test")]
