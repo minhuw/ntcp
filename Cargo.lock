@@ -185,7 +185,6 @@ version = "0.0.1"
 dependencies = [
  "ntcp",
  "ntcp-ip-common",
- "ntcp-ip6",
 ]
 
 [[package]]
