@@ -1238,16 +1238,14 @@ impl Owner {
         });
         // Reserve only for checked passive SYNs: LISTEN ACKs need stateless
         // resets, and existing TIME-WAIT traffic still needs core processing.
-        // TIME-WAIT reopening accepts only a pure SYN (plus ECN), no payload.
+        // TIME-WAIT requests use the same flag eligibility as passive opens;
+        // SYN data still needs a bounded metadata slot before core admission.
         if listener_options.is_some()
             && before
                 .is_none_or(|id| matches!(self.endpoint.state(id), Ok(State::TimeWait) | Err(_)))
             && ntcp::wire::parse(ip, bytes).is_ok_and(|segment| {
                 let flags = segment.header.flags;
                 flags & (ntcp::wire::SYN | ntcp::wire::ACK | ntcp::wire::RST) == ntcp::wire::SYN
-                    && (before.is_none()
-                        || (flags & !(ntcp::wire::ECE | ntcp::wire::CWR) == ntcp::wire::SYN
-                            && segment.payload.is_empty()))
             })
         {
             self.connection_options
@@ -1271,9 +1269,16 @@ impl Owner {
         );
         self.drain_timestamps(pair);
         self.prune_child_timeouts();
+        // A failed TIME-WAIT candidate can restore an existing tuple owner.
+        // Its generation-aware metadata already exists and must not be
+        // duplicated or replaced with the listener's current policy.
+        let new_child = tuple
+            .and_then(|tuple| self.endpoint.connection_id(tuple))
+            .filter(|cid| {
+                Some(*cid) != before && !self.connection_options.iter().any(|p| p.0 == *cid)
+            });
         if let Some(tuple) = tuple
-            && let Some(cid) = self.endpoint.connection_id(tuple)
-            && Some(cid) != before
+            && let Some(cid) = new_child
             && let Some((&listener, s)) = self.sockets.iter().find(|(_, s)| {
                 matches!(s.handle, Handle::Listener(_))
                     && s.local
@@ -1318,7 +1323,7 @@ impl Owner {
                 // is also a Linux ET wake even while the accept queue is ready.
                 s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
             }
-            if Some(cid) != before
+            if Some(cid) == new_child
                 && let Some((tos, discover, _, mark)) = listener_options
             {
                 self.endpoint.set_dscp(cid, tos >> 2)?;

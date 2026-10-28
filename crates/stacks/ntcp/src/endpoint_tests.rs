@@ -2859,7 +2859,12 @@ fn time_wait_reuse_timestamp_and_sequence_freshness() {
 //#      duplicate.
 #[test]
 fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles() {
-    for released in [false, true] {
+    for (released, payload) in [
+        (false, b"".as_slice()),
+        (true, b"".as_slice()),
+        (false, b"data".as_slice()),
+        (true, b"data".as_slice()),
+    ] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
@@ -2868,7 +2873,7 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
             b.release(old).unwrap();
         }
         let seq = h.acknowledgment.wrapping_add(100);
-        let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)));
+        let syn = tw_segment_with_payload(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)), payload);
         b.input(4_000, ip, &syn).unwrap();
         assert_eq!(b.buffer_bytes(), baseline * 2);
         let output = packets(&mut b, 4_000);
@@ -2913,7 +2918,7 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
 
 //= https://www.rfc-editor.org/rfc/rfc6191#section-2
 //= type=test
-//= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. A data-bearing SYN with bilateral newer timestamps receives a challenge ACK from the old TIME-WAIT connection instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+//= reason=Freshness applies to passive SYN requests with or without payload; the ordinary factory independently enforces early-data authorization and resource admission.
 //# * If TCP Timestamps would be enabled for the new incarnation of the
 //# connection, and the timestamp contained in the incoming SYN segment is
 //# greater than the last timestamp seen on the previous incarnation of the
@@ -2921,12 +2926,12 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
 //# connection request (creating a connection in the SYN-RECEIVED state).
 //= https://www.rfc-editor.org/rfc/rfc6191#section-2
 //= type=test
-//= reason=Endpoint input bypasses reopen_time_wait for data-bearing SYNs. Rejected freshness cases receive a challenge ACK instead of a silent drop, while the old TIME-WAIT record survives. Empty-payload silent rejection is tested; the complete clause remains TODO.
+//= reason=Rejected freshness leaves the old TIME-WAIT owner and metadata untouched and emits no output, including for payload-bearing requests.
 //# * Otherwise, silently drop the incoming SYN segment, thus leaving the
 //# previous incarnation of the connection in the TIME-WAIT state.
 //= https://www.rfc-editor.org/rfc/rfc6191#section-2
 //= type=test
-//= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. When the old connection did not use timestamps, a data-bearing SYN with new bilateral timestamps receives a challenge ACK instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+//= reason=New bilateral timestamps admit the request independently of sequence when the old incarnation did not negotiate timestamps.
 //# * If TCP Timestamps would be enabled for the new incarnation of the
 //# connection, honor the incoming connection request (creating a connection
 //# in the SYN-RECEIVED state).
@@ -2941,7 +2946,7 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
 //# enabled for the new incarnation of the connection.
 //= https://www.rfc-editor.org/rfc/rfc6191#section-3
 //= type=test
-//= reason=A stale-timestamp SYN without payload is silently rejected and can be retried with a fresh timestamp. A data-bearing stale SYN bypasses reopen_time_wait and receives a challenge ACK, contrary to the stated ignored-SYN behavior; the complete clause remains TODO.
+//= reason=Stale timestamps silently reject the entire SYN request; a later fresh retransmission can still create a child from the unchanged old record.
 //# In the worst-case scenario, an incoming SYN corresponding to a new
 //# incarnation of a connection in the TIME-WAIT contains a timestamp that
 //# is smaller than the last timestamp seen on the previous incarnation of
@@ -2951,7 +2956,7 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
 //# is accepted after future retransmissions of the SYN.
 //= https://www.rfc-editor.org/rfc/rfc6191#section-4
 //= type=test
-//= reason=Newer timestamps admit older SYN sequences only for SYNs without payload. Data-bearing SYNs bypass reopen_time_wait and receive a challenge ACK instead of recycling TIME-WAIT, including with newer timestamps and older ISNs. The complete clause remains TODO; equal-timestamp FIN+1 admission is separately TODO.
+//= reason=Newer bilateral timestamps admit older ISNs for empty and data-bearing requests; equal timestamps still require a sequence strictly after the peer FIN.
 //# An implementation of the mechanism proposed in this document would
 //# enable recycling of the TIME-WAIT state even in the presence of ISNs
 //# that are not monotonically increasing across connections, except when
@@ -2976,7 +2981,8 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
                         let sequence = h.acknowledgment.wrapping_add(sequence_delta);
                         let timestamp = last_ts.wrapping_add(timestamp_delta);
                         let enabled = server_timestamps && client_timestamps;
-                        let newer_sequence = sequence_delta == 1 || sequence_delta == 100;
+                        let newer_sequence =
+                            sequence_delta == 0 || sequence_delta == 1 || sequence_delta == 100;
                         let expected = if old_timestamps && enabled {
                             timestamp_delta == 1 || timestamp_delta == 0 && newer_sequence
                         } else {
@@ -3063,92 +3069,206 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
     }
 }
 
-// The RFC6191 annotations on the matrix above also describe these partial
-// assertions: SYN payload bypasses reuse regardless of timestamp freshness.
+// Payload and auxiliary flags follow the ordinary passive factory after freshness.
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//# * If TCP Timestamps would be enabled for the new incarnation of the
+//# connection, and the timestamp contained in the incoming SYN segment is
+//# greater than the last timestamp seen on the previous incarnation of the
+//# connection (for that direction of the data transfer), honor the
+//# connection request (creating a connection in the SYN-RECEIVED state).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//# * If TCP Timestamps would be enabled for the new incarnation of the
+//# connection, the timestamp contained in the incoming SYN segment is equal
+//# to the last timestamp seen on the previous incarnation of the connection
+//# (for that direction of the data transfer), and the Sequence Number of
+//# the incoming SYN segment is greater than the last sequence number seen
+//# on the previous incarnation of the connection (for that direction of the
+//# data transfer), honor the connection request (creating a connection in
+//# the SYN-RECEIVED state).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//# * If TCP Timestamps would not be enabled for the new incarnation of the
+//# connection, but the Sequence Number of the incoming SYN segment is
+//# greater than the last sequence number seen on the previous incarnation
+//# of the connection (for the same direction of the data transfer), honor
+//# the connection request (creating a connection in the SYN-RECEIVED
+//# state).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//# * Otherwise, silently drop the incoming SYN segment, thus leaving the
+//# previous incarnation of the connection in the TIME-WAIT state.
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//# * If TCP Timestamps would be enabled for the new incarnation of the
+//# connection, honor the incoming connection request (creating a connection
+//# in the SYN-RECEIVED state).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//# * If TCP Timestamps would not be enabled for the new incarnation of the
+//# connection, but the Sequence Number of the incoming SYN segment is
+//# greater than the last sequence number seen on the previous incarnation
+//# of the connection (for the same direction of the data transfer), honor
+//# the incoming connection request (creating a connection in the
+//# SYN-RECEIVED state).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-3
+//= type=test
+//# In the worst-case scenario, an incoming SYN corresponding to a new
+//# incarnation of a connection in the TIME-WAIT contains a timestamp that
+//# is smaller than the last timestamp seen on the previous incarnation of
+//# the connection, the heuristics fail, and the result is no worse than the
+//# current state of affairs. That is, the SYN segment is ignored (as
+//# specified in [RFC1337]), and thus the connection request times out, or
+//# is accepted after future retransmissions of the SYN.
+//= https://www.rfc-editor.org/rfc/rfc6191#section-4
+//= type=test
+//# An implementation of the mechanism proposed in this document would
+//# enable recycling of the TIME-WAIT state even in the presence of ISNs
+//# that are not monotonically increasing across connections, except when
+//# the timestamp contained in the incoming SYN is equal to the last
+//# timestamp seen on the connection in the TIME-WAIT state (for that
+//# direction of the data transfer).
 #[cfg(feature = "packet-test-controls")]
 #[test]
-fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait() {
+fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization() {
     for old_timestamps in [false, true] {
         for server_timestamps in [false, true] {
             for client_timestamps in [false, true] {
-                for timestamp_delta in [u32::MAX, 0, 1] {
-                    for newer_sequence in [false, true] {
-                        let mut cfg = config();
-                        cfg.connection.timestamps = old_timestamps;
-                        let (mut b, listener, old, ip, h, last_ts) = time_wait_endpoint(cfg);
-                        b.packet_test_timestamp_default(server_timestamps);
-                        let baseline = b.buffer_bytes();
-                        let deadline = b.next_deadline();
-                        let tuple = Tuple {
-                            local: addresses().1,
-                            remote: addresses().0,
-                        };
-                        let sequence = if newer_sequence {
-                            h.acknowledgment.wrapping_add(100)
-                        } else {
-                            h.acknowledgment.wrapping_sub(100)
-                        };
-                        let timestamp = last_ts.wrapping_add(timestamp_delta);
-                        let ts = client_timestamps.then_some((timestamp, 0));
-                        let syn =
-                            tw_segment_with_payload(ip, h, sequence, 0, wire::SYN, ts, b"data");
-                        let segment = wire::parse(ip, &syn).unwrap();
-                        assert_eq!(segment.payload, b"data");
-                        assert_eq!(segment.options.timestamps, ts);
-                        assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
-                        assert_eq!(b.connection_id(tuple), Some(old));
-                        assert_eq!(b.state(old), Ok(State::TimeWait));
-                        assert_eq!(b.readable_bytes(old), Ok(0));
-                        assert_eq!(b.buffer_bytes(), baseline);
-                        assert_eq!(
-                            b.accept(listener),
-                            Err(EndpointError::Connection(Error::WouldBlock))
-                        );
-                        let output = packets(&mut b, 4_000);
-                        assert_eq!(output.len(), 1);
-                        let challenge = wire::parse(output[0].0, &output[0].1).unwrap();
-                        assert_eq!(challenge.header.flags, wire::ACK);
-                        assert_eq!(challenge.header.sequence, h.sequence);
-                        assert_eq!(challenge.header.acknowledgment, h.acknowledgment);
-                        assert!(challenge.payload.is_empty());
-                        assert_eq!(b.next_deadline(), deadline);
-
-                        // Removing only payload reaches the reuse decision. This
-                        // also checks that the challenge did not update the old
-                        // timestamp baseline or prevent a later admissible SYN.
-                        let enabled = server_timestamps && client_timestamps;
-                        let expected = if old_timestamps && enabled {
-                            timestamp_delta == 1 || timestamp_delta == 0 && newer_sequence
-                        } else {
-                            enabled || newer_sequence
-                        };
-                        let retry = tw_segment(ip, h, sequence, 0, wire::SYN, ts);
-                        assert_eq!(
-                            b.input(5_000, ip, &retry).unwrap(),
-                            if expected {
-                                InputDisposition::Processed
+                for timestamp_delta in [u32::MAX, 0, 1, 0x7fff_ffff, 0x8000_0000, 0x8000_0001] {
+                    for (sequence_delta, newer_sequence) in [
+                        (u32::MAX, false),
+                        (0, false),
+                        (1, true),
+                        (2, true),
+                        (0x7fff_ffff, true),
+                        (0x8000_0000, false),
+                        (0x8000_0001, false),
+                    ] {
+                        for auxiliary in [
+                            0,
+                            wire::PSH,
+                            wire::URG,
+                            wire::FIN,
+                            wire::ECE | wire::CWR,
+                            wire::PSH | wire::URG | wire::FIN,
+                        ] {
+                            let mut cfg = config();
+                            cfg.connection.timestamps = old_timestamps;
+                            let (mut b, listener, old, ip, h, last_ts) = time_wait_endpoint(cfg);
+                            b.packet_test_timestamp_default(server_timestamps);
+                            let baseline = b.buffer_bytes();
+                            let deadline = b.next_deadline();
+                            let old_options = b.received_ipv4_options(old).unwrap();
+                            let tuple = Tuple {
+                                local: addresses().1,
+                                remote: addresses().0,
+                            };
+                            let sequence = h
+                                .acknowledgment
+                                .wrapping_sub(1)
+                                .wrapping_add(sequence_delta);
+                            let timestamp = last_ts.wrapping_add(timestamp_delta);
+                            let enabled = server_timestamps && client_timestamps;
+                            let expected = if old_timestamps && enabled {
+                                matches!(timestamp_delta, 1 | 0x7fff_ffff)
+                                    || timestamp_delta == 0 && newer_sequence
                             } else {
-                                InputDisposition::Dropped
-                            }
-                        );
-                        let current = b.connection_id(tuple).unwrap();
-                        let output = packets(&mut b, 5_000);
-                        assert_eq!(output.len(), usize::from(expected));
-                        assert_eq!(b.state(old), Ok(State::TimeWait));
-                        if expected {
-                            assert_ne!(current, old);
-                            assert_eq!(b.state(current), Ok(State::SynReceived));
-                            let synack = wire::parse(output[0].0, &output[0].1).unwrap();
-                            assert_eq!(
-                                synack.header.flags & (wire::SYN | wire::ACK),
-                                wire::SYN | wire::ACK
+                                enabled || newer_sequence
+                            };
+                            let syn = tw_segment_with_payload(
+                                ip,
+                                h,
+                                sequence,
+                                0,
+                                wire::SYN | auxiliary,
+                                client_timestamps.then_some((timestamp, 0)),
+                                b"data",
                             );
-                            assert_eq!(synack.header.acknowledgment, sequence.wrapping_add(1));
-                            assert_eq!(synack.options.timestamps.is_some(), enabled);
-                        } else {
-                            assert_eq!(current, old);
-                            assert_eq!(b.buffer_bytes(), baseline);
-                            assert_eq!(b.next_deadline(), deadline);
+                            assert_eq!(wire::parse(ip, &syn).unwrap().payload, b"data");
+                            assert_eq!(
+                                b.input(4_000, ip, &syn).unwrap(),
+                                if expected {
+                                    InputDisposition::Processed
+                                } else {
+                                    InputDisposition::Dropped
+                                },
+                                "old={old_timestamps} local={server_timestamps} peer={client_timestamps} ts={timestamp_delta} seq={sequence_delta} flags={auxiliary}"
+                            );
+                            assert_eq!(b.state(old), Ok(State::TimeWait));
+                            assert_eq!(b.received_ipv4_options(old).unwrap(), old_options);
+                            assert_eq!(b.readable_bytes(old), Ok(0));
+                            let current = b.connection_id(tuple).unwrap();
+                            let output = packets(&mut b, 4_000);
+                            assert_eq!(output.len(), usize::from(expected));
+                            assert_eq!(
+                                b.accept(listener),
+                                Err(EndpointError::Connection(Error::WouldBlock))
+                            );
+                            if expected {
+                                assert_ne!(current, old);
+                                assert_eq!(b.state(current), Ok(State::SynReceived));
+                                assert_eq!(b.readable_bytes(current), Ok(0));
+                                let synack = wire::parse(output[0].0, &output[0].1).unwrap();
+                                assert_eq!(
+                                    synack.header.flags & (wire::SYN | wire::ACK),
+                                    wire::SYN | wire::ACK
+                                );
+                                assert_eq!(synack.header.acknowledgment, sequence.wrapping_add(1));
+                                assert_eq!(synack.options.timestamps.is_some(), enabled);
+                                if enabled {
+                                    assert_eq!(synack.options.timestamps.unwrap().1, timestamp);
+                                }
+                                assert!(
+                                    crate::seq::Seq(synack.header.sequence)
+                                        .after(crate::seq::Seq(h.sequence))
+                                );
+                                let ack = tw_segment(
+                                    ip,
+                                    h,
+                                    sequence.wrapping_add(1),
+                                    synack.header.sequence.wrapping_add(1),
+                                    wire::ACK,
+                                    enabled.then_some((
+                                        timestamp,
+                                        synack.options.timestamps.unwrap_or_default().0,
+                                    )),
+                                );
+                                b.input(5_000, ip, &ack).unwrap();
+                                assert_eq!(b.accept(listener), Ok(current));
+                                assert_eq!(
+                                    b.state(current),
+                                    Ok(if auxiliary & wire::FIN != 0 {
+                                        State::CloseWait
+                                    } else {
+                                        State::Established
+                                    })
+                                );
+                                let mut read = [0; 4];
+                                assert_eq!(b.read(current, &mut read), Ok(4));
+                                assert_eq!(&read, b"data");
+                                assert_eq!(b.readable_bytes(current), Ok(0));
+                            } else {
+                                assert_eq!(current, old);
+                                assert_eq!(b.buffer_bytes(), baseline);
+                                assert_eq!(b.next_deadline(), deadline);
+                                // Rejected payload never updates the old timestamp baseline.
+                                let retry = tw_segment_with_payload(
+                                    ip,
+                                    h,
+                                    h.acknowledgment,
+                                    0,
+                                    wire::SYN | auxiliary,
+                                    client_timestamps.then_some((last_ts.wrapping_add(1), 0)),
+                                    b"data",
+                                );
+                                assert_eq!(
+                                    b.input(5_000, ip, &retry),
+                                    Ok(InputDisposition::Processed)
+                                );
+                                assert_ne!(b.connection_id(tuple), Some(old));
+                                assert_eq!(packets(&mut b, 5_000).len(), 1);
+                            }
                         }
                     }
                 }
@@ -3159,7 +3279,7 @@ fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait() {
 
 //= https://www.rfc-editor.org/rfc/rfc6191#section-2
 //= type=test
-//= reason=The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy; the complete RFC clause remains unresolved.
+//= reason=Wire-established FIN frontiers at zero and wrap admit FIN+1/FIN+2, reject FIN, and reject the exact serial half-space from FIN for payload and empty SYNs.
 //# The "last sequence number seen on the previous incarnation of the
 //# connection (for the same direction of the data transfer)" refers to the
 //# last sequence number used by the previous incarnation of the connection
@@ -3169,42 +3289,137 @@ fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait() {
 //# of the previous incarnation of the connection, for that direction of
 //# the data transfer.
 #[test]
-fn rfc6191_sequence_reuse_rejects_fin_plus_one_boundary() {
+fn rfc6191_sequence_reuse_uses_peer_fin_serial_frontier() {
     for old_timestamps in [false, true] {
         for incoming_timestamps in [false, true] {
-            for offset_from_fin in [0u32, 1, 2] {
-                let mut cfg = config();
-                cfg.connection.timestamps = old_timestamps;
-                let (mut b, _, old, ip, h, last_ts) = time_wait_endpoint(cfg);
-                let fin = h.acknowledgment.wrapping_sub(1);
-                let syn = tw_segment(
-                    ip,
-                    h,
-                    fin.wrapping_add(offset_from_fin),
-                    0,
-                    wire::SYN,
-                    incoming_timestamps.then_some((last_ts, 0)),
-                );
-                let baseline = b.buffer_bytes();
-                let deadline = b.next_deadline();
-                // All combinations here use the sequence-dependent predicate:
-                // equal timestamps, no new timestamps, or neither incarnation's TS.
-                assert_eq!(
-                    b.input(4_000, ip, &syn).unwrap(),
-                    if offset_from_fin == 2 {
-                        InputDisposition::Processed
-                    } else {
-                        InputDisposition::Dropped
+            for fin in [0, u32::MAX - 1, u32::MAX] {
+                for payload in [b"".as_slice(), b"data".as_slice()] {
+                    for (offset, accepted) in [
+                        (u32::MAX, false),
+                        (0, false),
+                        (1, true),
+                        (2, true),
+                        (0x7fff_ffff, true),
+                        (0x8000_0000, false),
+                        (0x8000_0001, false),
+                    ] {
+                        let mut cfg = config();
+                        cfg.connection.timestamps = old_timestamps;
+                        cfg.reuse_time_wait = true;
+                        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+                        let (local, remote) = addresses();
+                        let ip = IpMetadata {
+                            source: local.ip(),
+                            destination: remote.ip(),
+                        };
+                        let listener = b.listen(remote, 4).unwrap();
+                        let mut h = wire::Header {
+                            source_port: remote.port(),
+                            destination_port: local.port(),
+                            sequence: 0,
+                            acknowledgment: 0,
+                            flags: 0,
+                            window: 1024,
+                            urgent_pointer: 0,
+                        };
+                        // Establish and close on the wire with FIN at the selected wrap frontier.
+                        let syn = tw_segment(
+                            ip,
+                            h,
+                            fin.wrapping_sub(1),
+                            0,
+                            wire::SYN,
+                            old_timestamps.then_some((1, 0)),
+                        );
+                        b.input(1_000, ip, &syn).unwrap();
+                        let output = packets(&mut b, 1_000);
+                        let iss = wire::parse(output[0].0, &output[0].1)
+                            .unwrap()
+                            .header
+                            .sequence;
+                        let ack = tw_segment(
+                            ip,
+                            h,
+                            fin,
+                            iss.wrapping_add(1),
+                            wire::ACK,
+                            old_timestamps.then_some((2, 1)),
+                        );
+                        b.input(2_000, ip, &ack).unwrap();
+                        let old = b.accept(listener).unwrap();
+                        b.shutdown(old).unwrap();
+                        let output = packets(&mut b, 2_000);
+                        let local_fin = wire::parse(output[0].0, &output[0].1)
+                            .unwrap()
+                            .header
+                            .sequence;
+                        let close = tw_segment(
+                            ip,
+                            h,
+                            fin,
+                            local_fin.wrapping_add(1),
+                            wire::ACK | wire::FIN,
+                            old_timestamps.then_some((3, 2)),
+                        );
+                        b.input(3_000, ip, &close).unwrap();
+                        let output = packets(&mut b, 3_000);
+                        h = wire::parse(output[0].0, &output[0].1).unwrap().header;
+                        assert_eq!(h.acknowledgment, fin.wrapping_add(1));
+                        assert_eq!(b.state(old), Ok(State::TimeWait));
+                        let baseline = b.buffer_bytes();
+                        let deadline = b.next_deadline();
+                        let syn = tw_segment_with_payload(
+                            ip,
+                            h,
+                            fin.wrapping_add(offset),
+                            0,
+                            wire::SYN,
+                            incoming_timestamps.then_some((3, 0)),
+                            payload,
+                        );
+                        assert_eq!(
+                            b.input(4_000, ip, &syn).unwrap(),
+                            if accepted {
+                                InputDisposition::Processed
+                            } else {
+                                InputDisposition::Dropped
+                            },
+                            "fin={fin} offset={offset} old_ts={old_timestamps} incoming_ts={incoming_timestamps}"
+                        );
+                        assert_eq!(b.state(old), Ok(State::TimeWait));
+                        let output = packets(&mut b, 4_000);
+                        assert_eq!(output.len(), usize::from(accepted));
+                        if accepted {
+                            let synack = wire::parse(output[0].0, &output[0].1).unwrap();
+                            assert_eq!(
+                                synack.header.acknowledgment,
+                                fin.wrapping_add(offset).wrapping_add(1)
+                            );
+                            assert!(
+                                crate::seq::Seq(synack.header.sequence)
+                                    .after(crate::seq::Seq(h.sequence))
+                            );
+                            let child = b
+                                .connection_id(Tuple {
+                                    local: remote,
+                                    remote: local,
+                                })
+                                .unwrap();
+                            assert_ne!(child, old);
+                            assert_eq!(b.state(child), Ok(State::SynReceived));
+                            assert_eq!(b.readable_bytes(child), Ok(0));
+                        } else {
+                            assert_eq!(
+                                b.connection_id(Tuple {
+                                    local: remote,
+                                    remote: local
+                                }),
+                                Some(old)
+                            );
+                            assert_eq!(b.buffer_bytes(), baseline);
+                            assert_eq!(b.next_deadline(), deadline);
+                        }
                     }
-                );
-                assert_eq!(b.state(old), Ok(State::TimeWait));
-                assert_eq!(
-                    packets(&mut b, 4_000).len(),
-                    usize::from(offset_from_fin == 2)
-                );
-                if offset_from_fin < 2 {
-                    assert_eq!(b.buffer_bytes(), baseline);
-                    assert_eq!(b.next_deadline(), deadline);
                 }
             }
         }
@@ -3287,14 +3502,19 @@ fn rfc6429_explicit_abort_of_responsive_zero_window_connection() {
 
 #[test]
 fn time_wait_old_expiry_and_slot_generation_do_not_remove_or_restore_replacement() {
-    for establish in [false, true] {
+    for (establish, payload) in [
+        (false, b"".as_slice()),
+        (true, b"".as_slice()),
+        (false, b"data".as_slice()),
+        (true, b"data".as_slice()),
+    ] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
         let baseline = b.buffer_bytes();
         b.release(old).unwrap();
         let seq = h.acknowledgment.wrapping_add(100);
-        let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)));
+        let syn = tw_segment_with_payload(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)), payload);
         b.input(240_002_000, ip, &syn).unwrap();
         let output = packets(&mut b, 240_002_000);
         let new_iss = wire::parse(output[0].0, &output[0].1)
@@ -3344,7 +3564,16 @@ fn time_wait_old_expiry_and_slot_generation_do_not_remove_or_restore_replacement
 
 #[test]
 fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
-    for pressure in 0..4 {
+    for (pressure, payload) in [
+        (0, b"".as_slice()),
+        (1, b"".as_slice()),
+        (2, b"".as_slice()),
+        (3, b"".as_slice()),
+        (0, b"data".as_slice()),
+        (1, b"data".as_slice()),
+        (2, b"data".as_slice()),
+        (3, b"data".as_slice()),
+    ] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
         if pressure == 0 {
@@ -3377,13 +3606,14 @@ fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
         }
         packets(&mut b, 3_000);
         let bytes = b.buffer_bytes();
-        let syn = tw_segment(
+        let syn = tw_segment_with_payload(
             ip,
             h,
             h.acknowledgment + 100,
             0,
             wire::SYN,
             Some((ts + 1, 0)),
+            payload,
         );
         assert_eq!(b.input(4_000, ip, &syn).unwrap(), InputDisposition::Dropped);
         assert_eq!(b.buffer_bytes(), bytes);
@@ -4440,7 +4670,12 @@ fn reset_failed_child_unlinks_backlog_before_output_and_quarantine_expiry() {
 
 #[test]
 fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
-    for release_old in [false, true] {
+    for (release_old, payload) in [
+        (false, b"".as_slice()),
+        (true, b"".as_slice()),
+        (false, b"data".as_slice()),
+        (true, b"data".as_slice()),
+    ] {
         let (mut b, listener, old, ip, h, _) = time_wait_endpoint(config());
         if release_old {
             b.release(old).unwrap();
@@ -4449,7 +4684,8 @@ fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
             local: addresses().1,
             remote: addresses().0,
         };
-        let syn = tw_segment(ip, h, h.acknowledgment + 100, 0, wire::SYN, None);
+        let syn =
+            tw_segment_with_payload(ip, h, h.acknowledgment + 100, 0, wire::SYN, None, payload);
         b.input(4_000, ip, &syn).unwrap();
         let candidate = b.connection_id(tuple).unwrap();
         b.abort(candidate).unwrap();
@@ -4771,9 +5007,17 @@ fn timestamp_privacy_echo_rtt_and_reactive_reset_without_local_enable() {
 
 #[test]
 fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
-    for granularity in [
-        crate::TimestampGranularity::Milliseconds,
-        crate::TimestampGranularity::Microseconds,
+    for (granularity, payload) in [
+        (crate::TimestampGranularity::Milliseconds, b"".as_slice()),
+        (crate::TimestampGranularity::Microseconds, b"".as_slice()),
+        (
+            crate::TimestampGranularity::Milliseconds,
+            b"data".as_slice(),
+        ),
+        (
+            crate::TimestampGranularity::Microseconds,
+            b"data".as_slice(),
+        ),
     ] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
@@ -4796,7 +5040,15 @@ fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
             .unwrap()
             .0;
         let seq = h.acknowledgment.wrapping_add(100);
-        let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts.wrapping_add(1), 0)));
+        let syn = tw_segment_with_payload(
+            ip,
+            h,
+            seq,
+            0,
+            wire::SYN,
+            Some((ts.wrapping_add(1), 0)),
+            payload,
+        );
         b.input(5_000, ip, &syn).unwrap();
         assert_eq!(
             b.poll_transmit(5_000, &mut [0; 19], 16),
@@ -5982,6 +6234,9 @@ fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
     let (a, _, _, id) = endpoints();
     assert_eq!(a.path_mtu_info(id).unwrap(), None);
 }
+
+#[path = "endpoint_time_wait_tests.rs"]
+mod time_wait;
 
 #[path = "endpoint_handshake_limit_tests.rs"]
 mod handshake_limit;

@@ -2469,15 +2469,20 @@ impl Endpoint {
             if slot.connection.reset_pending() || slot.reset_deadline.is_some() {
                 return Ok(InputDisposition::Dropped);
             }
-            // RFC6191 inventory gap: payload-bearing SYNs retain the old
-            // TIME-WAIT owner and take its challenge-ACK path, bypassing both
-            // freshness admission and the reuse path's silent rejection.
+            // Apply freshness to the same connection requests accepted by the
+            // passive factory, including SYN data and auxiliary control flags.
             if self.config.reuse_time_wait
-                && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
-                && segment.header.flags & !(wire::ECE | wire::CWR) == SYN
-                && segment.payload.is_empty()
+                && slot.connection.state() == State::TimeWait
+                && segment.header.flags & (SYN | ACK | RST) == SYN
             {
-                return self.reopen_time_wait(index, tuple, traffic_class, options, &segment);
+                return self.reopen_time_wait(
+                    index,
+                    tuple,
+                    traffic_class,
+                    options,
+                    &segment,
+                    timestamps,
+                );
             }
             let slot = self.slots[index].as_mut().unwrap();
             slot.received_dscp = Some(traffic_class >> 2);
@@ -2569,23 +2574,23 @@ impl Endpoint {
     //# are commonly used, and using them to reduce TIME-WAIT provides
     //# benefits for busy Internet servers (SHLD-4).
     //= https://www.rfc-editor.org/rfc/rfc6191#section-2
-    //= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. A data-bearing SYN with bilateral newer timestamps receives a challenge ACK from the old TIME-WAIT connection instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+    //= reason=Freshness applies to passive SYN requests with or without payload; the ordinary factory independently enforces early-data authorization and resource admission.
     //# * If TCP Timestamps would be enabled for the new incarnation of the
     //# connection, and the timestamp contained in the incoming SYN segment is
     //# greater than the last timestamp seen on the previous incarnation of the
     //# connection (for that direction of the data transfer), honor the
     //# connection request (creating a connection in the SYN-RECEIVED state).
     //= https://www.rfc-editor.org/rfc/rfc6191#section-2
-    //= reason=Endpoint input bypasses reopen_time_wait for data-bearing SYNs. Rejected freshness cases receive a challenge ACK instead of a silent drop, while the old TIME-WAIT record survives. Empty-payload silent rejection is tested; the complete clause remains TODO.
+    //= reason=Rejected freshness leaves the old TIME-WAIT owner and metadata untouched and emits no output, including for payload-bearing requests.
     //# * Otherwise, silently drop the incoming SYN segment, thus leaving the
     //# previous incarnation of the connection in the TIME-WAIT state.
     //= https://www.rfc-editor.org/rfc/rfc6191#section-2
-    //= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. When the old connection did not use timestamps, a data-bearing SYN with new bilateral timestamps receives a challenge ACK instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+    //= reason=New bilateral timestamps admit the request independently of sequence when the old incarnation did not negotiate timestamps.
     //# * If TCP Timestamps would be enabled for the new incarnation of the
     //# connection, honor the incoming connection request (creating a connection
     //# in the SYN-RECEIVED state).
     //= https://www.rfc-editor.org/rfc/rfc6191#section-3
-    //= reason=A stale-timestamp SYN without payload is silently rejected and can be retried with a fresh timestamp. A data-bearing stale SYN bypasses reopen_time_wait and receives a challenge ACK, contrary to the stated ignored-SYN behavior; the complete clause remains TODO.
+    //= reason=Stale timestamps silently reject the entire SYN request; a later fresh retransmission can still create a child from the unchanged old record.
     //# In the worst-case scenario, an incoming SYN corresponding to a new
     //# incarnation of a connection in the TIME-WAIT contains a timestamp that
     //# is smaller than the last timestamp seen on the previous incarnation of
@@ -2594,7 +2599,7 @@ impl Endpoint {
     //# specified in [RFC1337]), and thus the connection request times out, or
     //# is accepted after future retransmissions of the SYN.
     //= https://www.rfc-editor.org/rfc/rfc6191#section-4
-    //= reason=Newer timestamps admit older SYN sequences only for SYNs without payload. Data-bearing SYNs bypass reopen_time_wait and receive a challenge ACK instead of recycling TIME-WAIT, including with newer timestamps and older ISNs. The complete clause remains TODO; equal-timestamp FIN+1 admission is separately TODO.
+    //= reason=Newer bilateral timestamps admit older ISNs for empty and data-bearing requests; equal timestamps still require a sequence strictly after the peer FIN.
     //# An implementation of the mechanism proposed in this document would
     //# enable recycling of the TIME-WAIT state even in the presence of ISNs
     //# that are not monotonically increasing across connections, except when
@@ -2608,6 +2613,7 @@ impl Endpoint {
         traffic_class: u8,
         options: Ipv4Options,
         syn: &wire::Segment<'_>,
+        timestamps: RxPacketTimestamps,
     ) -> Result<InputDisposition, EndpointError> {
         let Some(listener) = self.match_listener(tuple.local) else {
             return Ok(InputDisposition::Dropped);
@@ -2641,7 +2647,7 @@ impl Endpoint {
             Some(syn),
             buffer_capacities,
             rx_ranges,
-            RxPacketTimestamps::default(),
+            timestamps,
         ) {
             Ok(connection) => connection,
             Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),

@@ -18,11 +18,14 @@ pub(super) mod pacing_tests;
 mod route_policy;
 #[path = "runtime_syncnt_tests.rs"]
 mod syncnt_tests;
+#[path = "runtime_time_wait_tests.rs"]
+mod time_wait_tests;
 #[cfg(feature = "packet-test")]
 #[path = "runtime_timestamp_partial_tests.rs"]
 mod timestamp_partial;
 #[path = "timestamp_tests.rs"]
 mod timestamp_tests;
+
 #[test]
 fn sender_metadata_failure_does_not_consume_external_producer() {
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;

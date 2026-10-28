@@ -84,32 +84,45 @@ class TimeWaitPersistInventories(unittest.TestCase):
     def test_all_seven_reuse_branches_and_literal_gaps_remain_explicit(self):
         rows = {r["id"].removeprefix("6191-"): r for r in ledger(6191)["paragraphs"]}
         expected = {
-            "old-ts-newer-ts": "TODO", "old-ts-equal-ts": "TODO",
-            "old-ts-no-new-ts": "TODO", "otherwise-drop": "TODO",
-            "no-old-ts-new-ts": "TODO", "no-old-ts-no-new-ts": "TODO",
-            "bilateral-definition": "covered", "fin-definition": "TODO",
+            "old-ts-newer-ts": "covered", "old-ts-equal-ts": "covered",
+            "old-ts-no-new-ts": "covered", "otherwise-drop": "covered",
+            "no-old-ts-new-ts": "covered", "no-old-ts-no-new-ts": "covered",
+            "bilateral-definition": "covered", "fin-definition": "covered",
             "paws-monotonic": "TODO", "processing-boundary": "TODO",
-            "stale-ts-fallback": "TODO", "isn-independence": "TODO",
+            "stale-ts-fallback": "covered", "isn-independence": "covered",
             "boot-quiet-time": "TODO",
         }
         self.assertEqual({key: r["status"] for key, r in rows.items() if r["status"] != "context"}, expected)
         self.assertEqual(rows["otherwise-drop"]["branches"],
                          ["old-timestamps-otherwise", "no-old-timestamps-otherwise"])
-        for key in ("old-ts-equal-ts", "old-ts-no-new-ts", "no-old-ts-no-new-ts", "fin-definition"):
-            self.assertIn("rejecting FIN+1", rows[key]["reason"])
-        payload_gaps = ("old-ts-newer-ts", "otherwise-drop", "no-old-ts-new-ts",
-                        "stale-ts-fallback", "isn-independence")
-        for key in payload_gaps:
+        self.assertEqual(rows["otherwise-drop"]["occurrences"], 2)
+        branches = ("old-ts-newer-ts", "old-ts-equal-ts", "old-ts-no-new-ts",
+                    "otherwise-drop", "no-old-ts-new-ts", "no-old-ts-no-new-ts",
+                    "stale-ts-fallback", "isn-independence")
+        for key in branches:
             with self.subTest(clause=key):
-                self.assertIn("payload", rows[key]["reason"])
-                self.assertIn("challenge ACK", rows[key]["reason"])
                 self.assertEqual(rows[key]["evidence"][1],
-                                 "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait()")
-        for key in ("old-ts-equal-ts", "old-ts-no-new-ts", "no-old-ts-no-new-ts"):
-            self.assertIn("Data-bearing SYNs", rows[key]["reason"])
-        self.assertIn("2*MSL", rows["boot-quiet-time"]["quote"])
-        self.assertTrue(any("rfc6191_sequence_reuse_rejects_fin_plus_one_boundary" in e
+                                 "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization()")
+        self.assertIn("strict serial comparison is against FIN itself", rows["fin-definition"]["reason"])
+        self.assertTrue(any("rfc6191_sequence_reuse_uses_peer_fin_serial_frontier" in e
                             for e in rows["fin-definition"]["evidence"]))
+        for key, reason in {
+            "paws-monotonic": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks. Dedicated complete source/test evidence remains missing.",
+            "processing-boundary": "TIME-WAIT reuse is gated in Endpoint input and reuse_syn, but no complete source/test annotation pair establishes the entire unchanged-processing obligation for SYNs in every other TCP state.",
+            "boot-quiet-time": "No host-boot quiet-time enforcement or executable embedding evidence establishes the stated 2*MSL prohibition. Endpoint construction accepts an initial clock and can immediately open connections; reboot safety cannot be exempted merely because this is an embeddable stack.",
+        }.items():
+            self.assertEqual(rows[key]["reason"], reason)
+        self.assertIn("2*MSL", rows["boot-quiet-time"]["quote"])
+        # Check every full-quote copy, including annotations not selected as the
+        # ledger's primary evidence. Repaired behavior must not retain old gaps.
+        closed = {audit.clause_key(rows[key]) for key, status in expected.items() if status == "covered"}
+        for path in (ROOT / "crates/stacks/ntcp/src").glob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                if audit.clause_key(annotation) in closed:
+                    reason = annotation.get("reason", "")
+                    for obsolete in ("rejecting FIN+1", "bypasses reopen_time_wait",
+                                     "SYNs without payload", "complete clause remains TODO"):
+                        self.assertNotIn(obsolete, reason, str(path))
         persist = ledger(6429)["paragraphs"]
         self.assertEqual(Counter(r["status"] for r in persist),
                          Counter(context=16, covered=9, exception=2))

@@ -1523,7 +1523,7 @@ impl Connection {
     //# has enabled TCP Timestamps). In such a scenario, TCP Timestamps would be
     //# enabled for the new incarnation of the connection.
     //= https://www.rfc-editor.org/rfc/rfc6191#section-2
-    //= reason=The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy; the complete RFC clause remains unresolved.
+    //= reason=The receive frontier acknowledges FIN+1; strict serial comparison is against FIN itself, preserving undefined half-space rejection.
     //# The "last sequence number seen on the previous incarnation of the
     //# connection (for the same direction of the data transfer)" refers to the
     //# last sequence number used by the previous incarnation of the connection
@@ -1532,13 +1532,38 @@ impl Connection {
     //# That is, it refers to the sequence number corresponding to the FIN flag
     //# of the previous incarnation of the connection, for that direction of
     //# the data transfer.
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //# * If TCP Timestamps would be enabled for the new incarnation of the
+    //# connection, the timestamp contained in the incoming SYN segment is equal
+    //# to the last timestamp seen on the previous incarnation of the connection
+    //# (for that direction of the data transfer), and the Sequence Number of
+    //# the incoming SYN segment is greater than the last sequence number seen
+    //# on the previous incarnation of the connection (for that direction of the
+    //# data transfer), honor the connection request (creating a connection in
+    //# the SYN-RECEIVED state).
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //# * If TCP Timestamps would not be enabled for the new incarnation of the
+    //# connection, but the Sequence Number of the incoming SYN segment is
+    //# greater than the last sequence number seen on the previous incarnation
+    //# of the connection (for the same direction of the data transfer), honor
+    //# the connection request (creating a connection in the SYN-RECEIVED
+    //# state).
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //# * If TCP Timestamps would not be enabled for the new incarnation of the
+    //# connection, but the Sequence Number of the incoming SYN segment is
+    //# greater than the last sequence number seen on the previous incarnation
+    //# of the connection (for the same direction of the data transfer), honor
+    //# the incoming connection request (creating a connection in the
+    //# SYN-RECEIVED state).
     pub(crate) fn reuse_syn(&self, now: Instant, syn: &Segment<'_>, timestamps: bool) -> bool {
         if !self.time_wait_valid(now) {
             return false;
         }
-        // RFC 6191 section 2: receive.next() is one beyond the peer's FIN.
-        // Conservatively require strictly beyond that frontier for sequence reuse.
-        let newer_sequence = Seq(syn.header.sequence).after(self.receive.next());
+        // receive.next() acknowledges the peer FIN. Compare strictly after
+        // FIN itself so FIN+1 is fresh and the exact serial half-space from FIN
+        // remains unordered.
+        let peer_fin = self.receive.next().wrapping_add(u32::MAX);
+        let newer_sequence = Seq(syn.header.sequence).after(peer_fin);
         match (
             self.timestamps,
             timestamps.then_some(syn.options.timestamps).flatten(),
