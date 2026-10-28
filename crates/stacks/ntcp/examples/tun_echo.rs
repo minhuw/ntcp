@@ -1,13 +1,13 @@
 // Run as: tun_echo TUN_NAME LOCAL_IP TCP_PORT [PEER_SOCKET_ADDR].
 // The caller must configure the TUN interface (MTU 1500) and routes beforehand.
 // This adapter exchanges IP packets, not Ethernet frames; it does not configure
-// the host or implement ARP, routing, IP fragmentation, or ICMP.
+// the host or implement ARP, routing, IP fragmentation, or general ICMP services.
 
 #[cfg(target_os = "linux")]
 mod linux {
     use ntcp::{
         AddressValidation, ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError,
-        Error, Event, IpMetadata, Ipv4Options, State,
+        Error, Event, IpMetadata, Ipv4Options, PmtudConfig, State, Tuple,
     };
     use ntcp_io::{PacketIo, TxOutcome};
     use ntcp_io_tun::Tun;
@@ -253,11 +253,10 @@ mod linux {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
-    //= reason=Enabled core implements PMTUD/PLPMTUD and native IPv4 socket integration is tested. The concrete remaining embedding gap is crates/stacks/ntcp/examples/tun_echo.rs: NTCP_TIMESTAMPS=1 enables timestamps/PAWS, IPv4 encoding sets DF, ConnectionConfig retains default pmtud=None, and input_frame dispatches TCP only rather than ICMP PTB. This supplied example therefore lacks discovery in its PAWS/DF profile. Optional disabled configuration alone, unknown external embeddings, and absence of native IPv6 sockets are not evidence that the TCP implementation lacks PMTUD.
+    //= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
     //# Setting the DF bit implies the use of Path MTU Discovery as described
     //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
     //# that implements PAWS MUST also implement Path MTU Discovery.
-    // Partial evidence: both parsers admit protocol 6 only; no ICMP PTB dispatch.
     fn input_frame(
         endpoint: &mut Endpoint,
         time: u64,
@@ -266,6 +265,28 @@ mod linux {
         options_enabled: bool,
         timestamp: u32,
     ) -> io::Result<()> {
+        // Decode complete outer frames. The router source need not be the peer;
+        // the endpoint validates the quoted tuple, live sequence and exact send.
+        if let Ok(feedback) = ntcp_icmp::decode_icmp(packet)
+            && feedback.outer.destination == local
+            && feedback.kind == ntcp_icmp::FeedbackKind::PacketTooBig
+        {
+            let quote = feedback.quoted;
+            endpoint
+                .pmtu_feedback(
+                    time,
+                    Tuple {
+                        local: SocketAddr::new(quote.ip.source, quote.source_port),
+                        remote: SocketAddr::new(quote.ip.destination, quote.destination_port),
+                    },
+                    quote.sequence,
+                    quote.ip_packet_len,
+                    quote.ip_header_len,
+                    feedback.candidate_mtu.unwrap_or(0),
+                )
+                .map_err(engine)?;
+            return Ok(());
+        }
         match local {
             IpAddr::V4(local) => {
                 if let Some((ip, tcp, options)) =
@@ -640,6 +661,62 @@ mod linux {
         Ok(())
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
+    //= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+    //# Setting the DF bit implies the use of Path MTU Discovery as described
+    //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
+    //# that implements PAWS MUST also implement Path MTU Discovery.
+    fn runtime_config(
+        backend: &impl PacketIo,
+        local: IpAddr,
+        timestamps: bool,
+        sack: bool,
+        ipv4_options_enabled: bool,
+    ) -> io::Result<EndpointConfig> {
+        // Fixed builders and output storage require exactly this link MTU. Do
+        // not substitute an invented first hop when the backend cannot query it.
+        let first_hop_mtu = backend
+            .local_ip_mtu()?
+            .ok_or_else(|| invalid("TUN MTU is unavailable; expected 1500"))?;
+        if first_hop_mtu != MTU as u32 {
+            return Err(invalid("TUN MTU must be exactly 1500"));
+        }
+        let header_len = if local.is_ipv4() {
+            IP_HEADER
+        } else {
+            IPV6_HEADER
+        };
+        Ok(EndpointConfig {
+            max_connections: MAX_FLOWS,
+            preallocate_connections: 0,
+            max_listeners: 1,
+            max_control_packets: BUDGET,
+            max_setup_cache_entries: 64,
+            max_route_policies: 64,
+            max_buffer_bytes: MAX_FLOWS * (5 * 65536 + 1460),
+            hop_limit: 64,
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+            //# Generally, an application SHOULD NOT change the Diffserv field value
+            //# during the course of a connection (SHLD-23).
+            dscp: 0,
+            ipv4_options_enabled,
+            error_reports: true,
+            reuse_time_wait: false,
+            connection: ConnectionConfig {
+                timestamps,
+                sack,
+                // IPv4 always emits DF, including without TCP timestamps.
+                pmtud: Some(PmtudConfig::new(first_hop_mtu)),
+                send_capacity: 65536,
+                receive_capacity: 65536,
+                mss: (MTU - header_len - 20) as u16,
+                receive_ip_payload_limit: (MTU - header_len) as u16,
+                send_ip_payload_limit: (MTU - header_len) as u16,
+                ..ConnectionConfig::default()
+            },
+        })
+    }
+
     pub fn run() -> io::Result<()> {
         let args: Vec<_> = std::env::args().collect();
         if !matches!(args.len(), 4 | 5) {
@@ -697,40 +774,7 @@ mod linux {
                 Box::new(tun_v6_policy(ip))
             }
         };
-        let config = EndpointConfig {
-            max_connections: MAX_FLOWS,
-            preallocate_connections: 0,
-            max_listeners: 1,
-            max_control_packets: BUDGET,
-            max_setup_cache_entries: 64,
-            max_route_policies: 64,
-            max_buffer_bytes: MAX_FLOWS * (5 * 65536 + 1460),
-            hop_limit: 64,
-            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
-            //# Generally, an application SHOULD NOT change the Diffserv field value
-            //# during the course of a connection (SHLD-23).
-            dscp: 0,
-            ipv4_options_enabled,
-            error_reports: true,
-            reuse_time_wait: false,
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
-            //= reason=Enabled core implements PMTUD/PLPMTUD and native IPv4 socket integration is tested. The concrete remaining embedding gap is crates/stacks/ntcp/examples/tun_echo.rs: NTCP_TIMESTAMPS=1 enables timestamps/PAWS, IPv4 encoding sets DF, ConnectionConfig retains default pmtud=None, and input_frame dispatches TCP only rather than ICMP PTB. This supplied example therefore lacks discovery in its PAWS/DF profile. Optional disabled configuration alone, unknown external embeddings, and absence of native IPv6 sockets are not evidence that the TCP implementation lacks PMTUD.
-            //# Setting the DF bit implies the use of Path MTU Discovery as described
-            //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
-            //# that implements PAWS MUST also implement Path MTU Discovery.
-            // Partial evidence: run's actual timestamp configuration inherits
-            // pmtud=None; core PMTUD tests do not establish this embedding.
-            connection: ConnectionConfig {
-                timestamps,
-                sack,
-                send_capacity: 65536,
-                receive_capacity: 65536,
-                mss: (MTU - header_len - 20) as u16,
-                receive_ip_payload_limit: (MTU - header_len) as u16,
-                send_ip_payload_limit: (MTU - header_len) as u16,
-                ..ConnectionConfig::default()
-            },
-        };
+        let config = runtime_config(&tun, local, timestamps, sack, ipv4_options_enabled)?;
         let mut endpoint =
             Endpoint::new(config, secret, now(start), address_policy).map_err(engine)?;
         let listener = endpoint
@@ -846,6 +890,11 @@ mod linux {
             };
             wait(&tun, timeout_ms, pending != 0)?;
         }
+    }
+
+    #[cfg(test)]
+    mod pmtu_tests {
+        include!("support/tun_echo_pmtu_tests.rs");
     }
 
     #[cfg(test)]

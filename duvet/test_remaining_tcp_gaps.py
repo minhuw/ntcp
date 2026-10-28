@@ -1,4 +1,4 @@
-"""Retained original TCP gaps and their partial annotation links.
+"""Original TCP gap identities, retained gaps and complete closure evidence.
 
 These are inventory regressions, not whole-clause conformance tests. The keys
 pin the original target + newline + whitespace-normalized complete quotation.
@@ -56,17 +56,24 @@ OBLIGATIONS = (
         "original_key": "c337fd1595ffe79ed8d458c6811337919922c1a3592b455096360e166bbb1834",
         "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.7",
         "quote": "Setting the DF bit implies the use of Path MTU Discovery as described\nin [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation\nthat implements PAWS MUST also implement Path MTU Discovery.",
-        # The missing example integration has honest source-only partial evidence.
+        "closed": True,
         "links": (
-            (TCP + "examples/tun_echo.rs", "CITATION", "connection: ConnectionConfig {"),
+            (TCP + "examples/tun_echo.rs", "CITATION", "fn runtime_config("),
             (TCP + "examples/tun_echo.rs", "CITATION", "fn input_frame("),
+            (TCP + "examples/support/tun_echo_pmtu_tests.rs", "TEST", "fn runtime_mtu_and_option_selection()"),
+            (TCP + "examples/support/tun_echo_pmtu_tests.rs", "TEST", "fn runtime_ptb_repairs_and_receiver_ack_progress()"),
+            (TCP + "examples/support/tun_echo_pmtu_tests.rs", "TEST", "fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response()"),
+            (TCP + "examples/support/tun_echo_pmtu_tests.rs", "TEST", "fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback()"),
+            (TCP + "examples/support/tun_echo_pmtu_tests.rs", "TEST", "fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame()"),
         ),
         "reason_fragments": (
-            "Enabled core implements PMTUD/PLPMTUD", "native IPv4 socket integration is tested",
-            "NTCP_TIMESTAMPS=1 enables timestamps/PAWS", "IPv4 encoding sets DF",
-            "ConnectionConfig retains default pmtud=None", "input_frame dispatches TCP only rather than ICMP PTB",
-            "supplied example therefore lacks discovery in its PAWS/DF profile",
-            "absence of native IPv6 sockets are not evidence",
+            "queries and validates the real backend MTU", "enables PMTUD with or without PAWS",
+            "dispatches checksummed ICMP PTB", "live tuple/sequence/exact-packet validation",
+            "timestamp negotiation, IPv4 DF", "bounded IPv4/IPv6 repairs",
+            "receiver/ACK byte progress", "rejected feedback", "committed-output retention",
+            "ICMP-blackhole R1 fallback with ordinary congestion response",
+            "subsequent ACK-confirmed probing", "not arbitrary external embeddings",
+            "native IPv6 sockets or a full host ICMP service",
         ),
     },
 )
@@ -105,8 +112,11 @@ class RemainingTcpGaps(unittest.TestCase):
             todos = [r for r in records if r["kind"] == "TODO"
                      and r["path"] == f"duvet/rfc{obligation['rfc']}-todos.toml"
                      and audit.clause_key(r) == key]
-            self.assertEqual(len(todos), 1, f"{obligation['original_key']}: original TODO missing or narrowed")
-            reason = todos[0]["reason"]
+            closed = obligation.get("closed", False)
+            self.assertEqual(len(todos), 0 if closed else 1,
+                             f"{obligation['original_key']}: original disposition changed")
+            citations = [r for r in records if r["kind"] == "CITATION" and audit.clause_key(r) == key]
+            reason = citations[0].get("reason", "") if closed else todos[0]["reason"]
             for fragment in obligation["reason_fragments"]:
                 self.assertIn(fragment, reason)
             spec_path = ("duvet/rfc3168-additions.toml" if obligation["rfc"] == 3168
@@ -116,6 +126,14 @@ class RemainingTcpGaps(unittest.TestCase):
             self.assertEqual(len(specs), 1, "original complete SPEC must survive")
             # Match on the full quote even if somebody changes its target.
             copies = [r for r in records if audit.norm(r["quote"]) == key[1]]
+            if closed:
+                self.assertEqual([r["path"] for r in copies if r["kind"] == "SPEC"], [spec_path],
+                                 "closure must preserve exactly the original SPEC location")
+                self.assertTrue(all(r["kind"] in ("SPEC", "CITATION", "TEST") for r in copies),
+                                "complete closure cannot retain TODO or introduce an exception")
+                for stale in ("ConnectionConfig retains default pmtud=None",
+                              "input_frame dispatches TCP only", "lacks discovery in its PAWS/DF profile"):
+                    self.assertNotIn(stale, reason)
             for row in copies:
                 self.assertEqual(row.get("target"), key[0], row["path"])
                 self.assertNotEqual(row["kind"], "EXCEPTION", "retained gap cannot become an exception")
@@ -126,12 +144,14 @@ class RemainingTcpGaps(unittest.TestCase):
                                     and anchor in r["attached"] for r in copies),
                                 f"missing complete-quote partial {kind}: {path}::{anchor}")
 
-    def test_three_original_keys_todos_and_all_partial_reason_copies(self):
+    def test_three_original_keys_dispositions_and_all_reason_copies(self):
         self.assertEqual({o["rfc"] for o in OBLIGATIONS}, {3168, 5681, 7323})
         self.assert_retained_contract(self.records)
 
     def test_removed_narrowed_or_excepted_todo_is_rejected(self):
         for obligation in OBLIGATIONS:
+            if obligation.get("closed"):
+                continue
             key = audit.clause_key(obligation)
             for mutation in ("remove", "narrow", "exception"):
                 with self.subTest(rfc=obligation["rfc"], mutation=mutation):
@@ -145,6 +165,30 @@ class RemainingTcpGaps(unittest.TestCase):
                         row["kind"] = "EXCEPTION"
                     with self.assertRaises(AssertionError):
                         self.assert_retained_contract(records)
+
+    def test_closed_original_spec_and_complete_evidence_are_required(self):
+        obligation = next(o for o in OBLIGATIONS if o.get("closed"))
+        key = audit.clause_key(obligation)
+        for mutation in ("remove SPEC", "narrow SPEC", "move SPEC", "duplicate SPEC", "TODO", "stale reason"):
+            with self.subTest(mutation=mutation):
+                records = deepcopy(self.records)
+                spec = next(r for r in records if r["kind"] == "SPEC" and audit.clause_key(r) == key)
+                if mutation == "remove SPEC":
+                    records.remove(spec)
+                elif mutation == "narrow SPEC":
+                    spec["quote"] = spec["quote"].split(";", 1)[0]
+                elif mutation == "move SPEC":
+                    spec["path"] = "duvet/rfc7323-additions.toml"
+                elif mutation == "duplicate SPEC":
+                    records.append(dict(spec))
+                elif mutation == "TODO":
+                    records.append({**spec, "kind": "TODO", "path": "duvet/rfc7323-todos.toml"})
+                else:
+                    for row in records:
+                        if row["kind"] != "SPEC" and row.get("target") == key[0] and audit.norm(row["quote"]) == key[1]:
+                            row["reason"] = "ConnectionConfig retains default pmtud=None"
+                with self.assertRaises(AssertionError):
+                    self.assert_retained_contract(records)
 
     def test_missing_or_narrowed_partial_link_is_rejected(self):
         for obligation in OBLIGATIONS:
