@@ -200,6 +200,50 @@ class PmtudInventory(unittest.TestCase):
             row = next(p for p in self.inventory(n)["paragraphs"] if p["id"] == key)
             self.assertEqual(row["status"], "TODO", key)
 
+    def test_final_bounded_evidence_keeps_full_keys_and_partial_dispositions(self):
+        # Hash the full original target + quote, not a narrowed test assertion.
+        # Locality closes only023; topology, fragmentation, detector robustness
+        # and literal unchanged-cwnd obligations retain their separate identity.
+        expected = {
+            "1191-023": ("covered", "b707ab63ef804beb967fd98fc590e0fb3d32b388bd1714383cd69ed4b81b7540"),
+            "1191-024": ("TODO", "aa85eaa493b1e0f480f7bdc7bc423f41afc5aac20a1993d6803b519bab927308"),
+            "1191-025": ("TODO", "54660db94e505f213213e1d4b163e451f8089853f3b60ffc06d70dd157593f11"),
+            "4821-062": ("TODO", "e4351333b58527eb5fcd9a6fc58a08ba600816aeada37c9cb0fc871163134f55"),
+            "4821-090": ("TODO", "a0cad509ac88cfb5c86207ba33c9b552ef2d4edfbc4e442ac29f4020a6ae980e"),
+            "8201-076": ("TODO", "1c249737ce83c551636bf21eea5e111f11011d4cd800c80e2f2d05e4f08effc0"),
+        }
+        rows = {p["id"]: p for n in (1191, 8201, 4821)
+                for p in self.inventory(n)["paragraphs"] if p["id"] in expected}
+        for key, (status, full_key_hash) in expected.items():
+            row = rows[key]
+            full_key = row["target"] + "\n" + " ".join(row["quote"].split())
+            self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(), full_key_hash, key)
+            self.assertEqual(row["status"], status, key)
+            if key != "1191-025":
+                self.assertEqual(len(row["evidence"]), 2, key)
+        self.assertIn("MMS_R-40", rows["1191-024"]["reason"])
+        self.assertIn("topology contract", rows["1191-024"]["reason"])
+        self.assertIn("Host source fragmentation/reassembly", rows["4821-062"]["reason"])
+        self.assertIn("beyond these detector conditions", rows["4821-090"]["reason"])
+        self.assertIn("rescaling the byte congestion window", rows["8201-076"]["reason"])
+        self.assertIn("receive_mss_locality.rs::", rows["1191-023"]["evidence"][1])
+        self.assertIn("reordered_leading_receiver_delivery_and_loss", rows["4821-090"]["evidence"][1])
+        self.assertIn("tun_echo_pmtu_tests.rs::", rows["4821-062"]["evidence"][1])
+        # Include ordinary Rust copies outside the core's src directory, even
+        # ones omitted from the ledger's two preferred evidence links.
+        canonical = {(p["target"], normalize(p["quote"])): p for p in rows.values()}
+        counts = {key: 0 for key in canonical}
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in source_annotations(path.read_text()):
+                key = (annotation["target"], normalize(annotation["quote"]))
+                if key in canonical:
+                    self.assertEqual(annotation["reason"], canonical[key]["reason"],
+                                     (canonical[key]["id"], str(path), annotation["line"]))
+                    counts[key] += 1
+        for key, row in canonical.items():
+            if row["id"] != "1191-025":
+                self.assertGreaterEqual(counts[key], 2, row["id"])
+
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:
             with self.subTest(rfc=n):

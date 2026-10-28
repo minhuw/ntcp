@@ -171,7 +171,7 @@ It is important to understand that the notification of the packetization layer i
 # 8201-076
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
-reason = "Accepted PTB calls refresh_path_mss and Congestion::set_mss, rescaling cwnd down on a decreased MSS. There is no distinct PTB-probe-loss branch proving unchanged congestion window; the IPv6 wire-floor test instead asserts the changed byte ratio. Do not falsely close the literal clause."
+reason = "Matching PTB now preserves finite isolated-probe proof and suppresses a congestion-loss response only after receiver delivery and recovery exit. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Thus the literal unchanged-cwnd obligation remains TODO despite the separate RFC4821 congestion-classification closure; required MSS rescaling is preserved."
 quote = '''
 A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.
 '''

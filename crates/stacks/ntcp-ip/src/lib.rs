@@ -176,6 +176,9 @@ pub fn encode_shared_header(
 //= https://www.rfc-editor.org/rfc/rfc6864#section-4.1
 //# Originating sources MAY set the IPv4 ID field of atomic datagrams to any
 //# value.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-4
+//= reason=The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence.
+//# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 fn encode_present(
     packet: &mut [u8],
     transmit: ntcp::Transmit,

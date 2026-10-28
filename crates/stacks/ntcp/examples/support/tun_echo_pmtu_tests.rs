@@ -207,7 +207,16 @@ impl Pair {
             assert_eq!(syn.options.timestamps.is_some(), timestamps);
             input_frame(to, time, &frames[0], destination, false, 0).unwrap();
         }
-        for frame in emit(&mut a, 3000, local.ip()) {
+        let final_ack = emit(&mut a, 3000, local.ip());
+        assert_eq!(final_ack.len(), 1);
+        let ack = segment(&final_ack[0]);
+        assert_eq!(
+            ack.header.flags & (ntcp::wire::SYN | ntcp::wire::ACK),
+            ntcp::wire::ACK
+        );
+        assert!(ack.payload.is_empty());
+        assert_eq!(ack.options.timestamps.is_some(), timestamps);
+        for frame in final_ack {
             input_frame(&mut b, 3000, &frame, remote.ip(), false, 0).unwrap();
         }
         let bid = b.accept(listener).unwrap();
@@ -359,6 +368,10 @@ fn runtime_active_passive_without_timestamps_still_discovers() {
 //# Setting the DF bit implies the use of Path MTU Discovery as described
 //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 //# that implements PAWS MUST also implement Path MTU Discovery.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-4
+//= type=test
+//= reason=The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence.
+//# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 #[test]
 fn runtime_ptb_repairs_and_receiver_ack_progress() {
     for v6 in [false, true] {
@@ -386,11 +399,10 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
             repairs.iter().all(|frame| frame.len() <= path),
             "full IP budget including timestamp overhead"
         );
-        assert!(
-            repairs
-                .iter()
-                .any(|f| segment(f).header.sequence == segment(original).header.sequence)
-        );
+        assert!(repairs.iter().any(|f| {
+            segment(f).header.sequence == segment(original).header.sequence
+                && f.len() < original.len()
+        }));
         let before = p.a.path_mtu_info(p.aid).unwrap();
         // An acknowledged original quote is stale, even with a lower candidate.
         let stale = ptb(original, if v6 { 1280 } else { 508 });
@@ -405,6 +417,10 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
 //# Setting the DF bit implies the use of Path MTU Discovery as described
 //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 //# that implements PAWS MUST also implement Path MTU Discovery.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-4
+//= type=test
+//= reason=The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence.
+//# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 #[test]
 fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
     for v6 in [false, true] {

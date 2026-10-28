@@ -275,6 +275,10 @@ impl Pmtud {
         });
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
+    //= reason=Real receiver NewReno/SACK/RACK traces in both families across serial wrap contrast leading-original delivery before DupThresh/RACK settling, actual leading-plus-probe loss, late leading delivery after detection, and reorder without probe loss. Finite tail/recovery proof gates isolation; other detected loss commits congestion response with unchanged MTU bounds and eventual stream progress. Existing trailing-hole, repair-copy, ECN, matching-PTB and inconclusive-RTO controls remain complementary. Full timing/reordering robustness beyond these detector conditions remains unestablished; sufficiently late leading originals are conservatively treated as other loss, not magically identified as reorder. Retain the whole timely/robust loss-reporting advice as TODO for that evidence/interpretation boundary.
+    //# It is important that the Packetization Layer has a timely and robust mechanism for detecting and reporting losses. PLPMTUD makes MTU adjustments on the basis of detected losses. Any delays or inaccuracy in loss notification is likely to result in incorrect MTU decisions or slow convergence. It is important that the mechanism can robustly distinguish between the isolated loss of just a probe and other losses in the probe's leading and trailing windows.
+
     //= https://www.rfc-editor.org/rfc/rfc4821#section-4
     //= reason=TCP duplicate-ACK recovery reports probe loss; real receiver ACKs distinguish an isolated loss from a second hole beyond the minimum trailing window. This covers a loss-reporting mechanism, not suppression of congestion control.
     //# To use PLPMTUD, a Packetization Layer MUST have a loss reporting mechanism that

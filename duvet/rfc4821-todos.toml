@@ -35,7 +35,7 @@ All links MUST enforce their MTU: links that might non- deterministically delive
 # 4821-062
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "The IPv4 codec encode_present sets DF and never emits fragments; ipv4_bounds rejects fragment input. TCP avoids source fragmentation. Full host-fragmentation advice and actual-codec control/probe/repair DF integration are not established by the hand-built wire_packet test wrapper. Preserve the whole host/IP recommendation as TODO; absence of a fragmentation API is not a scope exception."
+reason = "The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence."
 quote = '''
 All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 '''
@@ -148,7 +148,7 @@ If the application using multicast gets complete delivery reports (unlikely sinc
 # 4821-090
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.1"
-reason = "Evidence gap: actual receiver tests cover isolated and second trailing holes, and loss() tracks other loss reports. Reordered leading-window losses versus isolated loss are not explicitly exercised here; congestion suppression is a separate clause."
+reason = "Real receiver NewReno/SACK/RACK traces in both families across serial wrap contrast leading-original delivery before DupThresh/RACK settling, actual leading-plus-probe loss, late leading delivery after detection, and reorder without probe loss. Finite tail/recovery proof gates isolation; other detected loss commits congestion response with unchanged MTU bounds and eventual stream progress. Existing trailing-hole, repair-copy, ECN, matching-PTB and inconclusive-RTO controls remain complementary. Full timing/reordering robustness beyond these detector conditions remains unestablished; sufficiently late leading originals are conservatively treated as other loss, not magically identified as reorder. Retain the whole timely/robust loss-reporting advice as TODO for that evidence/interpretation boundary."
 quote = '''
 It is important that the Packetization Layer has a timely and robust mechanism for detecting and reporting losses. PLPMTUD makes MTU adjustments on the basis of detected losses. Any delays or inaccuracy in loss notification is likely to result in incorrect MTU decisions or slow convergence. It is important that the mechanism can robustly distinguish between the isolated loss of just a probe and other losses in the probe's leading and trailing windows.
 '''

@@ -72,18 +72,10 @@ quote = '''
 Some TCP implementations send an MSS option only if the destination host is on a non-connected network. However, in general the TCP layer may not have the appropriate information to make this decision, so it is preferable to leave to the IP layer the task of determining a suitable MTU for the Internet path.
 '''
 
-# 1191-023
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
-reason = "Nonlocal peers must not receive an artificially lowered MSS offer. Configuration-based MSS does not branch on locality, but no exact local-versus-nonlocal SYN-offer comparison is recorded. The sentence continues in 1191-024; this is an evidence gap, not missing PMTUD."
-quote = '''
-Moreover, doing this prevents PMTU Discovery from discovering PMTUs larger than 576, so hosts SHOULD no longer lower the value they send
-'''
-
 # 1191-024
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
-reason = "Continuation of 1191-023 plus receive-MSS sizing advice. The receive offer stays independent of discovered send PMTU, but the configured MSS is not proven to represent MMS_R-40 or the permitted maximum connected-link MTU in multi-homed configurations. The optional link-derived choice itself is not a required feature."
+reason = "Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. This does not establish that configured receive sizing represents host MMS_R-40 or the permitted maximum connected-link MTU across multiple interfaces; a host receive/reassembly and topology contract remains necessary. The optional link-derived choice is not itself a required feature."
 quote = '''
 in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.
 '''

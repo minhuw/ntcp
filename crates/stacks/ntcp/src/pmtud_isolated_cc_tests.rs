@@ -106,6 +106,10 @@ fn original_probe_ptb(a: &mut Connection, bytes: &[u8], now: u64, ip_header: u16
 //= type=test
 //= reason=Isolated original-probe loss with or without exact matching PTB suppresses only the logical congestion response after finite cumulative delivery and recovery/PRR exit. Dual-family receiver traces assert conservative split repairs, unchanged threshold, independently MSS-scaled window and mandatory headway; all other loss and timeout responses remain active. Literal unchanged-cwnd conflicts at1191-082/8201-076 remain TODO.
 //# The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+//= type=test
+//= reason=Matching PTB now preserves finite isolated-probe proof and suppresses a congestion-loss response only after receiver delivery and recovery exit. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Thus the literal unchanged-cwnd obligation remains TODO despite the separate RFC4821 congestion-classification closure; required MSS rescaling is preserved.
+//# A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.
 fn isolated_probe_cc_real_receiver_recovery_matrix() {
     for mode in 0..3 {
         for prr in [false, true] {
@@ -563,6 +567,187 @@ fn probe_admission_ordinary_loss_without_active_probe() {
                     real_ack(&mut a, &mut b, &bytes, now, false);
                 }
                 assert!(resumed, "mode={mode}, prr={prr}, rto={rto}");
+            }
+        }
+    }
+}
+
+// Delay is bounded by the selected detector, not by an oracle about the path:
+// release the leading original after one out-of-order ACK, before DupThresh or
+// the RACK settling deadline. The lost-leading control crosses that boundary.
+// A third control delivers the probe too, proving reorder alone need not fail it.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
+//= type=test
+//= reason=Real receiver NewReno/SACK/RACK traces in both families across serial wrap contrast leading-original delivery before DupThresh/RACK settling, actual leading-plus-probe loss, late leading delivery after detection, and reorder without probe loss. Finite tail/recovery proof gates isolation; other detected loss commits congestion response with unchanged MTU bounds and eventual stream progress. Existing trailing-hole, repair-copy, ECN, matching-PTB and inconclusive-RTO controls remain complementary. Full timing/reordering robustness beyond these detector conditions remains unestablished; sufficiently late leading originals are conservatively treated as other loss, not magically identified as reorder. Retain the whole timely/robust loss-reporting advice as TODO for that evidence/interpretation boundary.
+//# It is important that the Packetization Layer has a timely and robust mechanism for detecting and reporting losses. PLPMTUD makes MTU adjustments on the basis of detected losses. Any delays or inaccuracy in loss notification is likely to result in incorrect MTU decisions or slow convergence. It is important that the mechanism can robustly distinguish between the isolated loss of just a probe and other losses in the probe's leading and trailing windows.
+#[test]
+fn isolated_probe_cc_reordered_leading_receiver_delivery_and_loss() {
+    for ipv4 in [true, false] {
+        for iss in [0, u32::MAX - 4000] {
+            for mode in 0..3 {
+                // NewReno, RFC6675 SACK, RACK.
+                for prr in [false, true] {
+                    for outcome in 0..4 {
+                        // Isolated, other loss, no loss, late leading original.
+                        let low = if ipv4 { 1024 } else { 1280 };
+                        let ip_header = if ipv4 { 20 } else { 40 };
+                        let mut cfg = isolated_config(mode, prr, false, false);
+                        cfg.pmtud.as_mut().unwrap().initial_mtu = Some(low);
+                        let (mut a, mut b) = super::pmtud_policy::family_pair(cfg, ipv4, iss);
+                        let warmup = vec![0x11; low as usize - ip_header - 20];
+                        // Earn ordinary flight credit with a real ACK. Its RTT
+                        // must not collapse RACK's settling window to zero via
+                        // sub-tick rounding before the reordering experiment.
+                        a.write(&warmup).unwrap();
+                        deliver(&mut a, &mut b, 32);
+                        deliver(&mut b, &mut a, 1033);
+                        let leading_data = vec![0x31; 800];
+                        a.write(&leading_data).unwrap();
+                        let leading = packet(&mut a, 1039);
+                        assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+                        let payload = vec![0x72; 20000];
+                        a.write(&payload).unwrap();
+                        let original = packet(&mut a, 1040);
+                        let probe = a.pmtud.as_ref().unwrap().probe.unwrap();
+                        assert!(probe.size > low);
+                        let before = a.path_mtu_info().unwrap();
+                        let (mut window, threshold) = (a.congestion.cwnd(), a.congestion.ssthresh());
+                        let mut trailing = Vec::new();
+                        for _ in 0..8 {
+                            trailing.push(packet(&mut a, 1041));
+                        }
+                        let tail_end = a.snd_nxt;
+                        assert!(tail_end.after(probe.trailing_end));
+                        if iss != 0 {
+                            assert!(tail_end.0 < probe.start.0, "proof crosses serial wrap");
+                        }
+                        let mut now = 1140;
+                        let segment = wire::parse(ip(a.tuple), &trailing[0]).unwrap();
+                        b.input(now, &segment).unwrap();
+                        let ack = deliver(&mut b, &mut a, now);
+                        let ack = wire::parse(ip(b.tuple), &ack).unwrap();
+                        assert_eq!(ack.header.acknowledgment, probe.start.0.wrapping_sub(800));
+                        assert_eq!(ack.options.sack_blocks[0].is_some(), mode != 0);
+                        assert!(!a.congestion.in_recovery());
+                        assert_eq!(a.path_mtu_info().unwrap(), before);
+                        if let Some(deadline) = a.rack.deadline {
+                            assert!(deadline > now);
+                        }
+                        if outcome == 0 || outcome == 2 {
+                            real_ack(&mut a, &mut b, &leading, now, false);
+                            assert!(!a.congestion.in_recovery());
+                            assert_eq!(a.snd_una, probe.start);
+                            // Ordinary leading delivery earns normal ACK growth.
+                            window = a.congestion.cwnd();
+                        }
+                        if outcome == 2 {
+                            real_ack(&mut a, &mut b, &original, now, false);
+                            assert!(!a.congestion.in_recovery());
+                        }
+                        // Deliver disjoint then gap-filling tail packets, so both
+                        // cumulative ACK and (when negotiated) real SACK matter.
+                        for n in [2, 1, 4, 3, 6, 5, 7] {
+                            real_ack(&mut a, &mut b, &trailing[n], now, false);
+                        }
+                        if outcome != 2 {
+                            if !a.congestion.in_recovery() {
+                                now = a.rack.deadline.expect("RACK must detect the remaining gap");
+                                a.timeout(now).unwrap();
+                            }
+                            assert!(a.congestion.in_recovery());
+                            assert_eq!(a.path_mtu_info().unwrap(), before);
+                            if outcome == 0 {
+                                assert_eq!(a.congestion.pending_probe_response(), Some(probe.start));
+                                assert_eq!(a.congestion.ssthresh(), threshold);
+                            } else {
+                                assert!(a.congestion.pending_probe_response().is_none());
+                                assert!(a.congestion.ssthresh() < threshold);
+                                if outcome == 3 {
+                                    // An original arriving after the detector's
+                                    // decision cannot retroactively establish
+                                    // isolated loss or justify an MTU shrink.
+                                    real_ack(&mut a, &mut b, &leading, now, false);
+                                    assert!(a.congestion.pending_probe_response().is_none());
+                                }
+                            }
+                            for _ in 0..64 {
+                                now += 1;
+                                let mut bytes = vec![0; 2000];
+                                let Some(len) = a.transmit(now, &mut bytes).unwrap() else {
+                                    now = a.next_deadline().expect("unrepaired gap needs a timer");
+                                    a.timeout(now).unwrap();
+                                    continue;
+                                };
+                                assert!(len + ip_header <= low as usize);
+                                // Isolation is provisional until the finite tail
+                                // is cumulatively proven and recovery exits.
+                                if outcome == 0 && tail_end.after(a.snd_una) {
+                                    assert_eq!(
+                                        a.congestion.pending_probe_response(),
+                                        Some(probe.start),
+                                        "ipv4={ipv4}, iss={iss}, mode={mode}, prr={prr}, now={now}, timeouts={}",
+                                        a.consecutive_timeouts
+                                    );
+                                    assert_eq!(a.path_mtu_info().unwrap(), before);
+                                }
+                                real_ack(&mut a, &mut b, &bytes[..len], now, false);
+                                if a.pmtud.as_ref().unwrap().probe.is_none() {
+                                    break;
+                                }
+                            }
+                        }
+                        assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+                        assert!(!a.congestion.in_recovery());
+                        assert!(a.prr.is_none());
+                        assert!(a.congestion.pending_probe_response().is_none());
+                        assert!(a.snd_una.at_or_after(tail_end));
+                        let after = a.path_mtu_info().unwrap();
+                        if outcome == 0 {
+                            assert_eq!(after.current_mtu, before.current_mtu);
+                            assert_eq!(after.search_high, probe.size - 1);
+                            assert_eq!(a.congestion.ssthresh(), threshold);
+                            assert_eq!(a.congestion.cwnd(), window);
+                            let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
+                            assert!(
+                                deadline - now
+                                    > (u64::from(window) / a.mss as u64) * a.rtt.srtt().unwrap()
+                            );
+                            assert!(a.pmtud.as_ref().unwrap().target().is_none());
+                        } else if outcome == 1 || outcome == 3 {
+                            assert_eq!(after, before, "other loss supplies no MTU ceiling");
+                            assert!(a.congestion.ssthresh() < threshold);
+                            assert!(a.congestion.cwnd() < window);
+                        } else {
+                            assert_eq!(after.current_mtu, probe.size);
+                            assert_eq!(a.congestion.ssthresh(), threshold);
+                        }
+                        // Finish the whole stream, rather than stopping at a
+                        // classifier flag. Keep later probes out of this flight
+                        // by staying within the existing failure headway.
+                        for _ in 0..64 {
+                            if a.acknowledged()
+                                == (warmup.len() + leading_data.len() + payload.len()) as u64
+                            {
+                                break;
+                            }
+                            now += 1;
+                            let bytes = packet(&mut a, now);
+                            real_ack(&mut a, &mut b, &bytes, now, false);
+                        }
+                        let mut received = vec![0; 30000];
+                        let n = b.read(&mut received).unwrap();
+                        let mut expected = warmup;
+                        expected.extend_from_slice(&leading_data);
+                        expected.extend_from_slice(&payload);
+                        assert_eq!(&received[..n], expected);
+                        assert_eq!(a.acknowledged(), expected.len() as u64);
+                        if outcome == 0 {
+                            let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
+                            a.timeout(deadline - 1).unwrap();
+                            assert!(a.pmtud.as_ref().unwrap().target().is_none());
+                        }
+                    }
+                }
             }
         }
     }

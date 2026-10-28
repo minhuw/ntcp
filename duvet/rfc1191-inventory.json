@@ -366,17 +366,25 @@
       "id": "1191-023",
       "section": "3.1",
       "quote": "Moreover, doing this prevents PMTU Discovery from discovering PMTUs larger than 576, so hosts SHOULD no longer lower the value they send",
-      "status": "TODO",
-      "reason": "Nonlocal peers must not receive an artificially lowered MSS offer. Configuration-based MSS does not branch on locality, but no exact local-versus-nonlocal SYN-offer comparison is recorded. The sentence continues in 1191-024; this is an evidence gap, not missing PMTUD.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
+      "status": "covered",
+      "reason": "The receive offer is captured from configured receive/user/advertised ceilings without routing-locality input. Public Endpoint tests use authoritative single-address policies and equivalent /24 local/routed topologies, compare actual codec SYN/SYNACK offers above536 under four identical configurations, and retain receive capability after validated lower send-PMTU feedback in both directions. The continuation and host receive-sizing advice remain separately TODO at1191-024/025.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::    fn receive_mss_offer(",
+        "crates/stacks/ntcp-ip/tests/receive_mss_locality.rs::fn equivalent_local_and_routed_peers_keep_active_and_passive_receive_mss()"
+      ]
     },
     {
       "id": "1191-024",
       "section": "3.1",
       "quote": "in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.",
       "status": "TODO",
-      "reason": "Continuation of 1191-023 plus receive-MSS sizing advice. The receive offer stays independent of discovered send PMTU, but the configured MSS is not proven to represent MMS_R-40 or the permitted maximum connected-link MTU in multi-homed configurations. The optional link-derived choice itself is not a required feature.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
+      "reason": "Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. This does not establish that configured receive sizing represents host MMS_R-40 or the permitted maximum connected-link MTU across multiple interfaces; a host receive/reassembly and topology contract remains necessary. The optional link-derived choice is not itself a required feature.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::    fn receive_mss_offer(",
+        "crates/stacks/ntcp-ip/tests/receive_mss_locality.rs::fn equivalent_local_and_routed_peers_keep_active_and_passive_receive_mss()"
+      ]
     },
     {
       "id": "1191-025",

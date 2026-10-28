@@ -319,6 +319,13 @@ impl ConnectionConfig {
         Ok(())
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+    //= reason=The receive offer is captured from configured receive/user/advertised ceilings without routing-locality input. Public Endpoint tests use authoritative single-address policies and equivalent /24 local/routed topologies, compare actual codec SYN/SYNACK offers above536 under four identical configurations, and retain receive capability after validated lower send-PMTU feedback in both directions. The continuation and host receive-sizing advice remain separately TODO at1191-024/025.
+    //# Moreover, doing this prevents PMTU Discovery from discovering PMTUs larger than 576, so hosts SHOULD no longer lower the value they send
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+    //= reason=Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. This does not establish that configured receive sizing represents host MMS_R-40 or the permitted maximum connected-link MTU across multiple interfaces; a host receive/reassembly and topology contract remains necessary. The optional link-derived choice is not itself a required feature.
+    //# in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.
     fn receive_mss_offer(&self) -> u16 {
         self.mss
             .min(self.user_mss.unwrap_or(u16::MAX))
@@ -2563,6 +2570,9 @@ impl Connection {
     //# segments (except probes) conform to the Path MTU, including supporting PMTU
     //# Discovery probe transmissions as needed.
 
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+    //= reason=Matching PTB now preserves finite isolated-probe proof and suppresses a congestion-loss response only after receiver delivery and recovery exit. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Thus the literal unchanged-cwnd obligation remains TODO despite the separate RFC4821 congestion-classification closure; required MSS rescaling is preserved.
+    //# A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.
     fn refresh_path_mss(&mut self) {
         let Some(link) = self.pmtud.as_ref().map(|p| p.info.first_hop_mtu) else {
             return;
