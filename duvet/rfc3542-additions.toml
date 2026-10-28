@@ -1,0 +1,27 @@
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-6.5"
+quote = "The outgoing traffic class is normally set to 0."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-6.5"
+quote = "To specify the outgoing traffic class value, just specify the control information as ancillary data for sendmsg() or using setsockopt(). Just like the hop limit value, the interpretation of the integer traffic class value is x < -1: return an error of EINVAL x == -1: use kernel default 0 <= x <= 255: use x x >= 256: return an error of EINVAL"
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-6.5"
+quote = "In order to clear a sticky IPV6_TCLASS option the application can specify -1 as the value."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-6.5"
+quote = "There are cases where the kernel needs to control the traffic class value and conflicts with the user-specified value on the outgoing traffic. An example is an implementation of ECN in the kernel, setting 2 bits of the traffic class value. In such cases, the kernel should override the user-specified value."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-4.1"
+quote = "When the application uses setsockopt to specify the above options it is expected that TCP will start using the new information when sending segments. However, TCP may or may not use the new information when retransmitting segments that were originally sent when the old sticky options were in effect."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-4"
+quote = "Issuing getsockopt() for the above options will return the sticky option value i.e., the value set with setsockopt()."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-4"
+quote = "For the IPV6_TCLASS option, it will return the kernel default value."

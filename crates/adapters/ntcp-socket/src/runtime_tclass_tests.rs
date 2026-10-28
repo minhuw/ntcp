@@ -1,6 +1,24 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use super::*;
 
+//= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+//= type=test
+//# In order to clear a sticky IPV6_TCLASS option the application can
+//# specify -1 as the value.
+//= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+//= type=test
+//# There are cases where the kernel needs to control the traffic class
+//# value and conflicts with the user-specified value on the outgoing
+//# traffic. An example is an implementation of ECN in the kernel,
+//# setting 2 bits of the traffic class value. In such cases, the kernel
+//# should override the user-specified value.
+//= https://www.rfc-editor.org/rfc/rfc3542#section-4.1
+//= type=test
+//# When the application uses setsockopt to specify the above options it
+//# is expected that TCP will start using the new information when
+//# sending segments. However, TCP may or may not use the new information
+//# when retransmitting segments that were originally sent when the old
+//# sticky options were in effect.
 #[test]
 fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn() {
     for ecn in [false, true] {
@@ -8,7 +26,13 @@ fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn() {
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
             .unwrap();
         let connection = cid(&a, client);
-        for (value, expected) in [(43, 40), (-1, 0), (255, 252), (3, 0)] {
+        assert_eq!(
+            a.execute(client, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+                .unwrap()
+                .value,
+            0
+        );
+        for (value, expected) in [(43, 40), (-1, 0), (255, 252), (0, 0), (3, 0)] {
             a.execute(client, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, value))
                 .unwrap();
             assert_eq!(
@@ -33,20 +57,23 @@ fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn() {
                 );
                 assert_eq!(a.endpoint.transport_info(connection).unwrap(), before);
             }
-            a.execute(client, Op::Write(vec![7; 100])).unwrap();
-            a.service_egress().unwrap();
-            let frame = sa.lock().unwrap().sent.pop_front().unwrap();
-            let ip = ntcp_ip6::parse(&frame[14..]).unwrap();
-            let tcp = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
-            assert_eq!(tcp.payload, [7; 100]);
-            assert_eq!(ip.traffic_class >> 2, (expected >> 2) as u8);
-            assert_eq!(ip.traffic_class & 3, if ecn { 2 } else { 0 });
-            b.input_ip_metadata(&frame[14..], Default::default(), None);
-            exchange(&mut a, &mut b, &sa, &sb);
-            assert_eq!(
-                b.execute(server, Op::Read(100)).unwrap().bytes,
-                vec![7; 100]
-            );
+            // A second segment without another setsockopt proves persistence.
+            for _ in 0..2 {
+                a.execute(client, Op::Write(vec![7; 100])).unwrap();
+                a.service_egress().unwrap();
+                let frame = sa.lock().unwrap().sent.pop_front().unwrap();
+                let ip = ntcp_ip6::parse(&frame[14..]).unwrap();
+                let tcp = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
+                assert_eq!(tcp.payload, [7; 100]);
+                assert_eq!(ip.traffic_class >> 2, (expected >> 2) as u8);
+                assert_eq!(ip.traffic_class & 3, if ecn { 2 } else { 0 });
+                b.input_ip_metadata(&frame[14..], Default::default(), None);
+                exchange(&mut a, &mut b, &sa, &sb);
+                assert_eq!(
+                    b.execute(server, Op::Read(100)).unwrap().bytes,
+                    vec![7; 100]
+                );
+            }
         }
     }
 }
@@ -112,6 +139,11 @@ fn ipv6_tclass_fresh_syn_reset_and_ipv4_tos_remain_distinct() {
             ENOPROTOOPT
         );
         assert_eq!(
+            a.execute(id, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+                .unwrap_err(),
+            ENOPROTOOPT
+        );
+        assert_eq!(
             a.execute(id, Op::Connect("192.0.2.2:8080".parse().unwrap()))
                 .unwrap_err(),
             EINPROGRESS
@@ -120,6 +152,80 @@ fn ipv6_tclass_fresh_syn_reset_and_ipv4_tos_remain_distinct() {
         let frame = state.lock().unwrap().sent.pop_front().unwrap();
         let ip = ntcp_ip::parse(&frame[14..], false).unwrap();
         assert_eq!(ip.traffic_class, expected as u8);
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+//= type=test
+//# The outgoing traffic class is normally set to 0.
+//= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+//= type=test
+//# To specify the outgoing traffic class value, just specify the control
+//# information as ancillary data for sendmsg() or using setsockopt().
+//# Just like the hop limit value, the interpretation of the integer
+//# traffic class value is
+//# x < -1: return an error of EINVAL
+//# x == -1: use kernel default
+//# 0 <= x <= 255: use x
+//# x >= 256: return an error of EINVAL
+//= https://www.rfc-editor.org/rfc/rfc3542#section-4
+//= type=test
+//= reason=For selected IPV6_TCLASS, readback returns the stored DSCP bits with the two ECN bits cleared, not the exact integer supplied when user ECN bits are nonzero. Section 6.5 expressly permits overriding outgoing ECN bits, but does not expressly permit changing this sticky readback contract. Preserve the full readback obligation as TODO; tests pin exact masked readback for all values. Other advanced options are outside the selected capability.
+//# Issuing getsockopt() for the above options will return the sticky
+//# option value i.e., the value set with setsockopt().
+//= https://www.rfc-editor.org/rfc/rfc3542#section-4
+//= type=test
+//# For the IPV6_TCLASS option, it will return the kernel default value.
+#[test]
+fn ipv6_tclass_default_zero_and_all_sticky_values() {
+    // Include a socket that never sets the option to observe the normal default
+    // on the wire, then exercise the entire valid integer range and reset.
+    for value in std::iter::once(None).chain((-1..=255).map(Some)) {
+        let (mut a, state) = owner(1);
+        let id = new(&mut a);
+        assert_eq!(
+            a.execute(id, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+                .unwrap()
+                .value,
+            0
+        );
+        if let Some(value) = value {
+            a.execute(id, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, value))
+                .unwrap();
+        }
+        let expected = value.unwrap_or(0).max(0) & !3;
+        assert_eq!(
+            a.execute(id, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+                .unwrap()
+                .value,
+            expected
+        );
+        for invalid in [-2, 256, i32::MIN, i32::MAX] {
+            assert_eq!(
+                a.execute(id, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, invalid))
+                    .unwrap_err(),
+                EINVAL
+            );
+            assert_eq!(
+                a.execute(id, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+                    .unwrap()
+                    .value,
+                expected
+            );
+        }
+        assert_eq!(
+            a.execute(id, Op::Connect("[2001:db8::2]:8080".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        a.service_egress().unwrap();
+        let frame = state.lock().unwrap().sent.pop_front().unwrap();
+        let ip = ntcp_ip6::parse(&frame[14..]).unwrap();
+        assert_eq!(ip.traffic_class, expected as u8);
+        assert_ne!(
+            ntcp::wire::parse(ip.ip, ip.payload).unwrap().header.flags & ntcp::wire::SYN,
+            0
+        );
     }
 }
 

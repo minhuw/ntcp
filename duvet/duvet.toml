@@ -181,6 +181,15 @@ format = "ietf"
 source = "https://www.rfc-editor.org/rfc/rfc6864"
 format = "ietf"
 
+# Scoped base IPv6 codec and sticky TCP traffic-class API; not full host/API conformance.
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc8200"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc3542"
+format = "ietf"
+
 [report.html]
 enabled = false
 

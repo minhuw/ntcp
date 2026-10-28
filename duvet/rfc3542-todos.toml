@@ -1,0 +1,4 @@
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc3542#section-4"
+quote = "Issuing getsockopt() for the above options will return the sticky option value i.e., the value set with setsockopt()."
+reason = "For selected IPV6_TCLASS, readback returns the stored DSCP bits with the two ECN bits cleared, not the exact integer supplied when user ECN bits are nonzero. Section 6.5 expressly permits overriding outgoing ECN bits, but does not expressly permit changing this sticky readback contract. Preserve the full readback obligation as TODO; tests pin exact masked readback for all values. Other advanced options are outside the selected capability."

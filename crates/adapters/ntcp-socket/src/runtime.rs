@@ -443,6 +443,8 @@ impl Socket {
             domain: AF_INET,
             v6only: false,
             bound_addr: None,
+            //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+            //# The outgoing traffic class is normally set to 0.
             ipv6_tclass: 0,
             ipv6_discover: IP_PMTUDISC_WANT,
             send_capacity: BYTES,
@@ -2402,6 +2404,18 @@ impl Owner {
             Op::Set(level, name, value) => {
                 // RFC3542 section6.5: -1 clears the sticky IPv6 class to0;
                 // validate before cloning options or touching live TCP policy.
+                //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+                //# To specify the outgoing traffic class value, just specify
+                //# the control information as ancillary data for sendmsg() or
+                //# using setsockopt(). Just like the hop limit value, the
+                //# interpretation of the integer traffic class value is
+                //# x < -1: return an error of EINVAL
+                //# x == -1: use kernel default
+                //# 0 <= x <= 255: use x
+                //# x >= 256: return an error of EINVAL
+                //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+                //# In order to clear a sticky IPV6_TCLASS option the application
+                //# can specify -1 as the value.
                 let value = if (level, name) == (IPPROTO_IPV6, IPV6_TCLASS) {
                     if !(-1..=255).contains(&value) {
                         return Err(EINVAL);
@@ -2476,6 +2490,13 @@ impl Owner {
                         s.freebind = value != 0
                     }
                     (IPPROTO_IP, IP_TOS) => s.tos = value as u8 & !3,
+                    //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+                    //# There are cases where the kernel needs to control the
+                    //# traffic class value and conflicts with the user-specified
+                    //# value on the outgoing traffic. An example is an
+                    //# implementation of ECN in the kernel, setting 2 bits of the
+                    //# traffic class value. In such cases, the kernel should
+                    //# override the user-specified value.
                     (IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass = value as u8 & !3,
                     (IPPROTO_IP, IP_MTU_DISCOVER) | (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => {
                         match value {
@@ -2599,6 +2620,13 @@ impl Owner {
                             .endpoint
                             .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
                             .map_err(engine)?,
+                        //= https://www.rfc-editor.org/rfc/rfc3542#section-4.1
+                        //# When the application uses setsockopt to specify the
+                        //# above options it is expected that TCP will start using
+                        //# the new information when sending segments. However,
+                        //# TCP may or may not use the new information when
+                        //# retransmitting segments that were originally sent
+                        //# when the old sticky options were in effect.
                         (IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self
                             .endpoint
                             .set_dscp(cid, s.wire_tos(self.local) >> 2)
@@ -2706,6 +2734,13 @@ impl Owner {
                     (IPPROTO_TCP, TCP_USER_TIMEOUT) => s.user_timeout_ms,
                     (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IPV6, IPV6_FREEBIND) => s.freebind as i32,
                     (IPPROTO_IP, IP_TOS) => s.tos as i32,
+                    //= https://www.rfc-editor.org/rfc/rfc3542#section-4
+                    //= reason=For selected IPV6_TCLASS, readback returns the stored DSCP bits with the two ECN bits cleared, not the exact integer supplied when user ECN bits are nonzero. Section 6.5 expressly permits overriding outgoing ECN bits, but does not expressly permit changing this sticky readback contract. Preserve the full readback obligation as TODO; tests pin exact masked readback for all values. Other advanced options are outside the selected capability.
+                    //# Issuing getsockopt() for the above options will return the
+                    //# sticky option value i.e., the value set with setsockopt().
+                    //= https://www.rfc-editor.org/rfc/rfc3542#section-4
+                    //# For the IPV6_TCLASS option, it will return the kernel default
+                    //# value.
                     (IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass as i32,
                     (IPPROTO_IP, IP_MTU_DISCOVER) => s.discover,
                     (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => s.ipv6_discover,

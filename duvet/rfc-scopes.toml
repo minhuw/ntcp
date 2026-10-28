@@ -213,3 +213,19 @@ scope_kind = "scoped-operative"
 scope = "SCOPED: atomic IPv4 datagram definition, arbitrary sender Identification and receiver ignoring Identification in the unfragmented IPv4 codec/quoted-header decoder. Updates RFC791 and RFC1122 Identification semantics. No full-document or full IPv4 host conformance: non-atomic datagrams, fragmentation/reassembly, non-atomic ID allocation/rate limits, forwarding, NAT and tunnel behavior are outside this inventory."
 extraction = "manual"
 inventory = "duvet/rfc6864-inventory.json"
+
+[[rfc]]
+id = 8200
+document_status = "Standards Track"
+scope_kind = "scoped-operative"
+scope = "SCOPED: RFC8200 (STD 86) base IPv6 header encoder, parser and checked quoted-header codec: field widths, lengths, addresses and protocol selector, including Hop Limit zero and zero Payload Length differences. No full-document or full IPv6 host conformance: extension headers, fragmentation/reassembly, jumbograms, routing/forwarding, flow assignment, address administration and other full-host facilities are outside this inventory."
+extraction = "manual"
+inventory = "duvet/rfc8200-inventory.json"
+
+[[rfc]]
+id = 3542
+document_status = "Informational"
+scope_kind = "scoped-operative"
+scope = "SCOPED: sticky outgoing IPV6_TCLASS on AF_INET6 TCP sockets: normal default zero, integer range validation, reset, readback and live outgoing traffic-class policy with transport-controlled ECN override. No full-document or full advanced IPv6 socket API conformance: ancillary sendmsg overrides, received traffic class/IPV6_RECVTCLASS, UDP/raw sockets, extension headers, multicast policy and other advanced APIs are outside this inventory."
+extraction = "manual"
+inventory = "duvet/rfc3542-inventory.json"

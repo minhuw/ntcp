@@ -1,0 +1,35 @@
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Version 4-bit Internet Protocol version number = 6."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Traffic Class 8-bit Traffic Class field. See Section 7."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Flow Label 20-bit flow label. See Section 6."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Payload Length 16-bit unsigned integer. Length of the IPv6 payload, i.e., the rest of the packet following this IPv6 header, in octets. (Note that any extension headers (see Section 4) present are considered part of the payload, i.e., included in the length count.)"
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Next Header 8-bit selector. Identifies the type of header immediately following the IPv6 header. Uses the same values as the IPv4 Protocol field [IANA-PN]."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Hop Limit 8-bit unsigned integer. Decremented by 1 by each node that forwards the packet. When forwarding, the packet is discarded if Hop Limit was zero when received or is decremented to zero. A node that is the destination of a packet should not discard a packet with Hop Limit equal to zero; it should process the packet normally."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Source Address 128-bit address of the originator of the packet. See [RFC4291]."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-3"
+quote = "Destination Address 128-bit address of the intended recipient of the packet (possibly not the ultimate recipient, if a Routing header is present). See [RFC4291] and Section 4.4."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8200#section-4.7"
+quote = "The value 59 in the Next Header field of an IPv6 header or any extension header indicates that there is nothing following that header. If the Payload Length field of the IPv6 header indicates the presence of octets past the end of a header whose Next Header field contains 59, those octets must be ignored and passed on unchanged if the packet is forwarded."

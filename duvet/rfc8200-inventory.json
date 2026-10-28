@@ -1,0 +1,100 @@
+{
+  "rfc": 8200,
+  "document_status": "Standards Track",
+  "scope_kind": "scoped-operative",
+  "extraction": "manual",
+  "scope": "SCOPED: RFC8200 (STD 86) base IPv6 header encoder, parser and checked quoted-header codec: field widths, lengths, addresses and protocol selector, including Hop Limit zero and zero Payload Length differences. No full-document or full IPv6 host conformance: extension headers, fragmentation/reassembly, jumbograms, routing/forwarding, flow assignment, address administration and other full-host facilities are outside this inventory.",
+  "text_sha256": "371ae3f133d562db5d6385e6def4ca9914c4f831be228ea7779fd28799c2f490",
+  "paragraphs": [
+    {
+      "id": "8200-version", "section": "3",
+      "quote": "Version 4-bit Internet Protocol version number = 6.",
+      "status": "covered",
+      "reason": "The encoder writes version 6; live and checked quote parsers reject every other four-bit version, independently of traffic-class bits.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn ipv6_bounds(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
+    },
+    {
+      "id": "8200-class", "section": "3",
+      "quote": "Traffic Class 8-bit Traffic Class field. See Section 7.",
+      "status": "covered",
+      "reason": "All 256 wire values round-trip without affecting version or flow-label bits. This traces field transport, not a complete traffic-management or DiffServ policy.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::fn encode_present(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
+    },
+    {
+      "id": "8200-flow", "section": "3",
+      "quote": "Flow Label 20-bit flow label. See Section 6.",
+      "status": "covered",
+      "reason": "The encoder initializes the 20-bit field to zero and the parser ignores it without contaminating the adjacent traffic-class field. Flow-label assignment and network flow treatment are not selected capabilities.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::fn encode_present(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
+    },
+    {
+      "id": "8200-length", "section": "3",
+      "quote": "Payload Length 16-bit unsigned integer. Length of the IPv6 payload, i.e., the rest of the packet following this IPv6 header, in octets. (Note that any extension headers (see Section 4) present are considered part of the payload, i.e., included in the length count.)",
+      "status": "TODO",
+      "reason": "Positive lengths through 65535 and checked truncated quotes are implemented, but ipv6_bounds rejects every zero Payload Length as JumbogramsUnsupported, including a bare No Next Header packet without a Jumbo Payload option. Zero alone is not evidence of a jumbogram. Preserve the entire field definition including its extension-header qualification; extension processing remains an explicit unsupported boundary, not a justification for rejecting legal empty base packets.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn ipv6_bounds(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn payload_length_zero_and_no_next_header_boundaries()"]
+    },
+    {
+      "id": "8200-next", "section": "3",
+      "quote": "Next Header 8-bit selector. Identifies the type of header immediately following the IPv6 header. Uses the same values as the IPv4 Protocol field [IANA-PN].",
+      "status": "covered",
+      "reason": "Encoder emits TCP protocol 6; parser and checked quotes expose the exact selector for non-extension protocols. Known extension/fragment selectors are rejected explicitly. This field-format evidence does not claim extension traversal, unknown-protocol ICMP generation or full host demultiplexing; No Next Header processing is separately TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn quote_header(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
+    },
+    {
+      "id": "8200-hop", "section": "3",
+      "quote": "Hop Limit 8-bit unsigned integer. Decremented by 1 by each node that forwards the packet. When forwarding, the packet is discarded if Hop Limit was zero when received or is decremented to zero. A node that is the destination of a packet should not discard a packet with Hop Limit equal to zero; it should process the packet normally.",
+      "status": "TODO",
+      "reason": "Live parse rejects Hop Limit zero as Invalid although the destination rule says to process it normally; checked quote parsing accepts zero. Tests pin zero rejection and positive 1/64/255 preservation. The whole receive obligation remains unresolved; forwarding/decrement behavior is outside the base endpoint codec and does not excuse the destination difference. Encoding also rejects zero; no production fix is authorized.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn parse(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn destination_hop_limit_zero_remains_rejected()"]
+    },
+    {
+      "id": "8200-source", "section": "3",
+      "quote": "Source Address 128-bit address of the originator of the packet. See [RFC4291].",
+      "status": "covered",
+      "reason": "Distinct full-width address octets are encoded and decoded in network order, including checked quotes. Address assignment and RFC4291 host semantics are not claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::fn encode_present(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
+    },
+    {
+      "id": "8200-destination", "section": "3",
+      "quote": "Destination Address 128-bit address of the intended recipient of the packet (possibly not the ultimate recipient, if a Routing header is present). See [RFC4291] and Section 4.4.",
+      "status": "covered",
+      "reason": "The complete base-header address field is preserved by encode, parse and checked quotes. The routing qualification is retained in the quotation: routing-header processing and ultimate-destination derivation are unsupported, not claimed by this direct base-field codec evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::fn encode_present(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
+    },
+    {
+      "id": "8200-no-next", "section": "4.7",
+      "quote": "The value 59 in the Next Header field of an IPv6 header or any extension header indicates that there is nothing following that header. If the Payload Length field of the IPv6 header indicates the presence of octets past the end of a header whose Next Header field contains 59, those octets must be ignored and passed on unchanged if the packet is forwarded.",
+      "status": "TODO",
+      "reason": "A zero-length base packet with selector 59 is rejected as JumbogramsUnsupported. With a positive length, the codec exposes selector 59 and uninterpreted trailing bytes; this alone does not establish the entire ignore obligation. Tests pin both boundaries. Extension-header traversal and forwarding are outside this endpoint codec, but legal empty base packets remain a selected-scope gap.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8200#section-4.7",
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn ipv6_bounds(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn payload_length_zero_and_no_next_header_boundaries()"]
+    },
+    {
+      "id": "8200-extension-boundary", "section": "4",
+      "quote": "A full implementation of IPv6 includes implementation of the following extension headers: Hop-by-Hop Options Fragment Destination Options Routing Authentication Encapsulating Security Payload",
+      "status": "context",
+      "reason": "Explicit full-host boundary: the selected codec rejects these headers and does not claim a full IPv6 implementation. This context is not an exception closing a selected base-header defect. Fragmentation/reassembly, routing, security headers and jumbograms remain unsupported."
+    },
+    {
+      "id": "8200-traffic-context", "section": "7",
+      "quote": "The current use of the Traffic Class field for Differentiated Services and Explicit Congestion Notification is specified in [RFC2474] and [RFC3168].",
+      "status": "context",
+      "reason": "Section 3's field-format evidence does not establish these complete external policies; the selected sticky TCP ECN override is traced under RFC3542."
+    },
+    {
+      "id": "8200-flow-context", "section": "6",
+      "quote": "The current definition of the IPv6 Flow Label can be found in [RFC6437].",
+      "status": "context",
+      "reason": "Only the base field's width, zero emission and isolation are selected; flow-label assignment and network treatment are outside this inventory."
+    }
+  ]
+}
