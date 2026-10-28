@@ -2496,14 +2496,9 @@ impl Owner {
                         s.freebind = value != 0
                     }
                     (IPPROTO_IP, IP_TOS) => s.tos = value as u8 & !3,
-                    //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
-                    //# There are cases where the kernel needs to control the
-                    //# traffic class value and conflicts with the user-specified
-                    //# value on the outgoing traffic. An example is an
-                    //# implementation of ECN in the kernel, setting 2 bits of the
-                    //# traffic class value. In such cases, the kernel should
-                    //# override the user-specified value.
-                    (IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass = value as u8 & !3,
+                    // Keep the accepted sticky byte for getsockopt and child
+                    // snapshots; only DSCP is passed to TCP's outgoing policy.
+                    (IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass = value as u8,
                     (IPPROTO_IP, IP_MTU_DISCOVER) | (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => {
                         match value {
                             IP_PMTUDISC_DONT | IP_PMTUDISC_WANT | IP_PMTUDISC_DO => (),
@@ -2626,6 +2621,13 @@ impl Owner {
                             .endpoint
                             .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
                             .map_err(engine)?,
+                        //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
+                        //# There are cases where the kernel needs to control the
+                        //# traffic class value and conflicts with the user-specified
+                        //# value on the outgoing traffic. An example is an
+                        //# implementation of ECN in the kernel, setting 2 bits of the
+                        //# traffic class value. In such cases, the kernel should
+                        //# override the user-specified value.
                         //= https://www.rfc-editor.org/rfc/rfc3542#section-4.1
                         //# When the application uses setsockopt to specify the
                         //# above options it is expected that TCP will start using
@@ -2741,7 +2743,6 @@ impl Owner {
                     (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IPV6, IPV6_FREEBIND) => s.freebind as i32,
                     (IPPROTO_IP, IP_TOS) => s.tos as i32,
                     //= https://www.rfc-editor.org/rfc/rfc3542#section-4
-                    //= reason=For selected IPV6_TCLASS, readback returns the stored DSCP bits with the two ECN bits cleared, not the exact integer supplied when user ECN bits are nonzero. Section 6.5 expressly permits overriding outgoing ECN bits, but does not expressly permit changing this sticky readback contract. Preserve the full readback obligation as TODO; tests pin exact masked readback for all values. Other advanced options are outside the selected capability.
                     //# Issuing getsockopt() for the above options will return the
                     //# sticky option value i.e., the value set with setsockopt().
                     //= https://www.rfc-editor.org/rfc/rfc3542#section-4

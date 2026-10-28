@@ -24,7 +24,7 @@
       "id": "3542-range", "section": "6.5",
       "quote": "To specify the outgoing traffic class value, just specify the control information as ancillary data for sendmsg() or using setsockopt(). Just like the hop limit value, the interpretation of the integer traffic class value is x < -1: return an error of EINVAL x == -1: use kernel default 0 <= x <= 255: use x x >= 256: return an error of EINVAL",
       "status": "covered",
-      "reason": "The selected setsockopt alternative validates -1..255 before transaction cloning or live policy changes, maps -1 to zero and applies all six DSCP bits. All 256 values and both invalid boundaries/extremes are asserted; the two ECN bits are transport-controlled under the explicit outgoing override permission. The sendmsg ancillary alternative is outside this sticky TCP capability.",
+      "reason": "The selected setsockopt alternative validates -1..255 before transaction cloning or live policy changes, maps -1 to zero and stores the exact accepted byte. All 256 values and both invalid boundaries/extremes are asserted in readback and on SYN egress; only DSCP reaches TCP, which independently controls outgoing ECN. The sendmsg ancillary alternative is outside this sticky TCP capability.",
       "target": "https://www.rfc-editor.org/rfc/rfc3542#section-6.5",
       "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::let value = if (level, name) == (IPPROTO_IPV6, IPV6_TCLASS)", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_default_zero_and_all_sticky_values()"]
     },
@@ -46,9 +46,9 @@
       "id": "3542-ecn", "section": "6.5", "parent": "3542-ecn-parent",
       "quote": "There are cases where the kernel needs to control the traffic class value and conflicts with the user-specified value on the outgoing traffic. An example is an implementation of ECN in the kernel, setting 2 bits of the traffic class value. In such cases, the kernel should override the user-specified value.",
       "status": "covered",
-      "reason": "Sticky storage removes user ECN bits and live endpoint updates set DSCP only, preserving TCP's independent ECN policy. Wire tests compare both ECN-disabled data (Not-ECT) and negotiated ECN data (ECT(0)) against conflicting user low bits, and verify the remaining six bits and delivered payload.",
+      "reason": "Sticky storage retains the exact accepted byte while live endpoint updates pass only its six DSCP bits, preserving TCP's independent outgoing ECN policy. Wire tests compare both ECN-disabled data (Not-ECT) and negotiated ECN data (ECT(0)) against conflicting user low bits, and verify DSCP, delivered payload, persistence and inherited-child live updates.",
       "target": "https://www.rfc-editor.org/rfc/rfc3542#section-6.5",
-      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::(IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass = value as u8 & !3,", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn()"]
+      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn()"]
     },
     {
       "id": "3542-live", "section": "4.1",
@@ -61,8 +61,8 @@
     {
       "id": "3542-get-sticky", "section": "4",
       "quote": "Issuing getsockopt() for the above options will return the sticky option value i.e., the value set with setsockopt().",
-      "status": "TODO",
-      "reason": "For selected IPV6_TCLASS, readback returns the stored DSCP bits with the two ECN bits cleared, not the exact integer supplied when user ECN bits are nonzero. Section 6.5 expressly permits overriding outgoing ECN bits, but does not expressly permit changing this sticky readback contract. Preserve the full readback obligation as TODO; tests pin exact masked readback for all values. Other advanced options are outside the selected capability.",
+      "status": "covered",
+      "reason": "For selected IPV6_TCLASS, getsockopt returns the exact accepted sticky integer including both user ECN bits; -1 clears to the existing zero default. All 256 values, invalid boundaries/extremes, native signed ABI and descriptor aliases, transactional resource/handle/output-reservation failures, live updates, creation-time listener snapshots and independent mapped-family settings are asserted. TCP separately controls outgoing ECN. Other advanced options are outside the selected capability.",
       "target": "https://www.rfc-editor.org/rfc/rfc3542#section-4",
       "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::(IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass as i32,", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_default_zero_and_all_sticky_values()"]
     },

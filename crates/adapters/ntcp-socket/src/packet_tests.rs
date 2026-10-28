@@ -572,6 +572,10 @@ fn ipv4_validation_and_address_roundtrip() {
     malformed[0] = 0x46;
     assert_eq!(parse_frame(&malformed).unwrap_err(), ENOSYS);
     malformed[0] = 0x60;
+    // Reinterpreted as IPv6, this is an empty packet with Next Header 0:
+    // its length is valid, but Hop-by-Hop processing remains unsupported.
+    assert_eq!(parse_frame(&malformed).unwrap_err(), ENOSYS);
+    malformed[0] = 0x70;
     assert_eq!(parse_frame(&malformed).unwrap_err(), EINVAL);
     let address = SocketAddr::new(local().into(), 8080);
     assert_eq!(decode_addr(&encode_addr(address)).unwrap(), address);

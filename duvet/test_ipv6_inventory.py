@@ -20,7 +20,7 @@ CONTRACT = {
     8200: (9, 9, 0, "Standards Track",
            "371ae3f133d562db5d6385e6def4ca9914c4f831be228ea7779fd28799c2f490",
            "c042188ee7e4e094dae253dc1d3ae8bcf239720d40c070ca0251986c2eba4d34"),
-    3542: (7, 6, 1, "Informational",
+    3542: (7, 7, 0, "Informational",
            "c2b3296882ca580c21a96b3b93dd0a2972809db0ebdf9ec7f55a13602e729ce6",
            "8358cf0828d97e106629cfdb5fec64d8c52e44417ee3bf82695e1308ecfe0cef"),
 }
@@ -107,8 +107,20 @@ class Ipv6Inventory(unittest.TestCase):
         self.assertIn("On the incoming traffic", parent["quote"])
         self.assertNotIn("On the incoming traffic", outgoing["quote"])
         self.assertIn("should override the user-specified value", outgoing["quote"])
-        self.assertEqual(socket["3542-get-sticky"]["status"], "TODO")
-        self.assertIn("does not expressly permit", socket["3542-get-sticky"]["reason"])
+        sticky = socket["3542-get-sticky"]
+        self.assertEqual(sticky["status"], "covered")
+        self.assertEqual(sticky["quote"], "Issuing getsockopt() for the above options will return the sticky option value i.e., the value set with setsockopt().")
+        self.assertIn("exact accepted sticky integer including both user ECN bits", sticky["reason"])
+        self.assertIn("six DSCP bits", outgoing["reason"])
+        self.assertIn("runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self", outgoing["evidence"][0])
+        # Every complete source/test quotation must shed the obsolete TODO reason,
+        # even when the ledger does not select that particular copy as evidence.
+        for path in (ROOT / "crates/adapters/ntcp-socket/src").glob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                if audit.clause_key(annotation) == audit.clause_key(sticky):
+                    self.assertFalse(annotation["reason"], path)
+        for name in ("3542-range", "3542-reset", "3542-live", "3542-default", "3542-get-default"):
+            self.assertEqual(socket[name]["status"], "covered")
         self.assertIn("ancillary sendmsg overrides", ledger(3542)["scope"])
         self.assertIn("jumbograms", ledger(8200)["scope"])
 

@@ -224,7 +224,7 @@ fn mapped_options_keep_independent_ip_classes_and_pmtu_settings() {
         a.execute(client, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
             .unwrap()
             .value,
-        40
+        43
     );
     assert_eq!(
         a.execute(client, Op::Get(IPPROTO_IP, IP_TOS))
@@ -244,8 +244,21 @@ fn mapped_options_keep_independent_ip_classes_and_pmtu_settings() {
             .value,
         2
     );
+    // An inactive-family reset cannot change the active IPv4 class.
     a.execute(client, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, -1))
         .unwrap();
+    assert_eq!(
+        a.execute(client, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+            .unwrap()
+            .value,
+        0
+    );
+    assert_eq!(
+        a.execute(client, Op::Get(IPPROTO_IP, IP_TOS))
+            .unwrap()
+            .value,
+        16
+    );
     a.execute(client, Op::Write(vec![3; 100])).unwrap();
     a.service_egress().unwrap();
     let frame = sa.lock().unwrap().sent.pop_front().unwrap();
@@ -267,7 +280,7 @@ fn mapped_child_inherits_both_family_settings_at_handshake() {
     let listener = socket(&mut b, AF_INET6);
     b.execute(listener, Op::Set(IPPROTO_IP, IP_TOS, 16))
         .unwrap();
-    b.execute(listener, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, 40))
+    b.execute(listener, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, 43))
         .unwrap();
     b.execute(listener, Op::Bind("[::]:8080".parse().unwrap()))
         .unwrap();
@@ -279,7 +292,7 @@ fn mapped_child_inherits_both_family_settings_at_handshake() {
         EINPROGRESS
     );
     exchange4(&mut a, &mut b, &sa, &sb);
-    b.execute(listener, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, 80))
+    b.execute(listener, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, 83))
         .unwrap();
     b.execute(listener, Op::Set(IPPROTO_IP, IP_TOS, 32))
         .unwrap();
@@ -295,8 +308,53 @@ fn mapped_child_inherits_both_family_settings_at_handshake() {
         b.execute(child, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
             .unwrap()
             .value,
-        40
+        43
     );
+    b.execute(child, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+        .unwrap();
+    for (tos, tclass) in [(16, 43), (16, 171), (48, 171)] {
+        b.execute(child, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, tclass))
+            .unwrap();
+        b.execute(child, Op::Set(IPPROTO_IP, IP_TOS, tos)).unwrap();
+        assert_eq!(
+            b.execute(child, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+                .unwrap()
+                .value,
+            tclass
+        );
+        assert_eq!(
+            b.execute(child, Op::Get(IPPROTO_IP, IP_TOS)).unwrap().value,
+            tos
+        );
+        assert_eq!(
+            b.execute(listener, Op::Get(IPPROTO_IPV6, IPV6_TCLASS))
+                .unwrap()
+                .value,
+            83
+        );
+        assert_eq!(
+            b.execute(listener, Op::Get(IPPROTO_IP, IP_TOS))
+                .unwrap()
+                .value,
+            32
+        );
+        b.execute(child, Op::Write(vec![9; 100])).unwrap();
+        b.service_egress().unwrap();
+        let frame = sb.lock().unwrap().sent.pop_front().unwrap();
+        let ip = ntcp_ip::parse(&frame[14..], false).unwrap();
+        assert_eq!(ip.traffic_class >> 2, (tos >> 2) as u8);
+        assert_eq!(ip.traffic_class & 3, 2);
+        assert_eq!(
+            ntcp::wire::parse(ip.ip, ip.payload).unwrap().payload,
+            [9; 100]
+        );
+        a.input_ip_metadata(&frame[14..], Default::default(), None);
+        exchange4(&mut a, &mut b, &sa, &sb);
+        assert_eq!(
+            a.execute(client, Op::Read(100)).unwrap().bytes,
+            vec![9; 100]
+        );
+    }
 }
 #[test]
 fn mapped_registered_zero_copy_keeps_ipv4_wire_and_ipv6_completion() {
