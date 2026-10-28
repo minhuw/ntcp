@@ -863,6 +863,14 @@ impl Connection {
         Self::active_with_receive(tuple, config, iss, now, &mut None)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-1
+    //= reason=Shared active/passive construction caps only the disabled IPv6 send IP-payload budget at the minimum link MTU minus the supported base header, preserving smaller caller limits, receive capability and configured storage. Actual codec/peer tests cover boundary-sized scalar, reserved, shared and coalesced output, options, RTO repair, Fast Open, live MSS updates and TIME-WAIT reopening; enabled discovery retains larger packets and validated growth. Smaller packets can cost throughput; discovery defaults are unchanged.
+    //# Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU
+    //# defined in [RFC8200] as the maximum packet size. In most cases, this will result
+    //# in the use of smaller packets than necessary, because most paths have a PMTU
+    //# greater than the IPv6 minimum link MTU. A node sending packets much smaller than
+    //# the Path MTU allows is wasting network resources and probably getting
+    //# suboptimal throughput.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
     //= reason=Constructor rejects TLP unless both RACK and SACK are configured; runtime additionally requires negotiated SACK.
     //# TLP requires RACK.
@@ -881,6 +889,14 @@ impl Connection {
         let family_limit = if tuple.local.is_ipv4() { 65515 } else { 65535 };
         config.receive_ip_payload_limit = config.receive_ip_payload_limit.min(family_limit);
         config.send_ip_payload_limit = config.send_ip_payload_limit.min(family_limit);
+        if !tuple.local.is_ipv4() && config.pmtud.is_none() {
+            // Without discovery, a legal minimum-MTU path must carry every
+            // packet. This send budget includes TCP options, but excludes the
+            // supported base IPv6 header; receive offers and storage stay independent.
+            config.send_ip_payload_limit = config
+                .send_ip_payload_limit
+                .min((min_mtu(false) - 40) as u16);
+        }
         let send = SendBuffer::new(config.send_capacity).map_err(|_| Error::NoMemory)?;
         let mut scratch = Vec::new();
         scratch

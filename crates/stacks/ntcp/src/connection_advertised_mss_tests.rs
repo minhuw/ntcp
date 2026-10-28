@@ -86,7 +86,8 @@ fn receive_offer_does_not_cap_own_sends_or_actual_reassembly() {
                 (&mut b, &mut a)
             };
             assert_eq!(capped.transport_info().advertised_mss, 600);
-            assert_eq!(capped.mss, 1460);
+            let send_mss = if ipv4 { 1460 } else { 1220 };
+            assert_eq!(capped.mss, send_mss);
             assert_eq!(peer.mss, 600); // Only the peer's sender sees the smaller offer.
             assert_eq!(capped.config.receive_capacity, 65_536);
             assert_eq!(
@@ -100,7 +101,7 @@ fn receive_offer_does_not_cap_own_sends_or_actual_reassembly() {
                     .unwrap()
                     .payload
                     .len(),
-                1460
+                send_mss
             );
             // A receive offer cap is not a new raw-input rejection boundary.
             let incoming = Segment {

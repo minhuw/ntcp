@@ -34,9 +34,13 @@
       "id": "8201-004",
       "section": "1",
       "quote": "Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.",
-      "status": "TODO",
-      "reason": "The PMTUD-disabled core configuration does not itself cap IPv6 sends to the 1280-byte minimum. This disabled-profile obligation is separate from enabled-core discovery evidence; absence of native IPv6 sockets is not the reason.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1"
+      "status": "covered",
+      "reason": "Shared active/passive construction caps only the disabled IPv6 send IP-payload budget at the minimum link MTU minus the supported base header, preserving smaller caller limits, receive capability and configured storage. Actual codec/peer tests cover boundary-sized scalar, reserved, shared and coalesced output, options, RTO repair, Fast Open, live MSS updates and TIME-WAIT reopening; enabled discovery retains larger packets and validated growth. Smaller packets can cost throughput; discovery defaults are unchanged.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive(",
+        "crates/stacks/ntcp-ip6/tests/disabled_pmtud.rs::fn disabled_ipv6_codec_peer_boundaries_options_loss_and_output_modes()"
+      ]
     },
     {
       "id": "8201-005",
@@ -232,7 +236,7 @@
       "section": "3",
       "quote": "Alternatively, the node may elect to end the discovery process by ceasing to send packets larger than the IPv6 minimum link MTU.",
       "status": "exception",
-      "reason": "Optional terminate-discovery-at-minimum mode is not selected in enabled PMTUD; selected TCP PLPMTUD continues ACK-confirmed search. Disabled-mode limit remains TODO.",
+      "reason": "Optional terminate-discovery-at-minimum mode is not selected in enabled PMTUD; selected TCP PLPMTUD continues ACK-confirmed search. Connections configured without discovery independently enforce the IPv6 minimum-MTU send ceiling.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
     },
     {
@@ -293,7 +297,7 @@
       "section": "4",
       "quote": "As discussed in Section 1, IPv6 nodes are not required to implement Path MTU Discovery. The requirements in this section apply only to those implementations that include Path MTU Discovery.",
       "status": "context",
-      "reason": "Applicability note, not a waiver for enabled PMTUD. Disabled IPv6 default-size obligation remains8201-004 TODO."
+      "reason": "Applicability note, not a waiver for enabled PMTUD. The disabled IPv6 maximum-packet-size obligation is covered separately by 8201-004."
     },
     {
       "id": "8201-033",
@@ -770,7 +774,7 @@
       "section": "5.6",
       "quote": "The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.",
       "status": "TODO",
-      "reason": "No per-path disable flag enforces a 1280-byte ceiling; a PMTUD-disabled core connection does not automatically use that IPv6 minimum.",
+      "reason": "Connections configured with PMTUD disabled enforce the IPv6 minimum-MTU send ceiling, including options and retries. No administrative per-path discovery-disable flag or IP-layer path utility interface exists; the connection creation profile does not provide that missing path control.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {

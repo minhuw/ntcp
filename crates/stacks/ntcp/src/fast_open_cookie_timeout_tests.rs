@@ -73,7 +73,8 @@ fn cookie_request_first_timeout_success_preserves_next_attempt() {
                         // One ambiguous request-only timeout stays connection-local;
                         // a successful fallback permits another request or cached TFO.
                         assert!(next.options.fast_open.is_some());
-                        assert_eq!(next_accepted, if returned_cookie { 1200 } else { 0 });
+                        let expected = if !returned_cookie { 0 } else if v6 { 1180 } else { 1200 };
+                        assert_eq!(next_accepted, expected);
                         assert_eq!(next.payload.len(), next_accepted);
                         let other_service = SocketAddr::new(remote.ip(), remote.port() + 1);
                         let (other_local, _) = addresses(v6, 40002);
@@ -84,7 +85,7 @@ fn cookie_request_first_timeout_success_preserves_next_attempt() {
                         let other = emit(&mut a, other_at, other_id, reserved);
                         let other = wire::parse(other.0, &other.1).unwrap();
                         assert!(other.options.fast_open.is_some());
-                        assert_eq!(other_accepted, if returned_cookie { 1200 } else { 0 });
+                        assert_eq!(other_accepted, expected);
                     }
                 }
             }

@@ -148,6 +148,24 @@ class PmtudInventory(unittest.TestCase):
             self.assertIn("Selected Informational policy deviation:", row["reason"])
             self.assertIn("historical algorithm is deliberately not selected", row["reason"])
 
+    def test_disabled_ipv6_safety_does_not_close_the_administrative_path_interface(self):
+        rows = {p["id"]: p for p in self.inventory(8201)["paragraphs"]}
+        disabled = rows["8201-004"]
+        self.assertEqual(disabled["status"], "covered")
+        self.assertEqual(disabled["quote"],
+                         "Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.")
+        self.assertEqual(disabled["evidence"], [
+            "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive(",
+            "crates/stacks/ntcp-ip6/tests/disabled_pmtud.rs::fn disabled_ipv6_codec_peer_boundaries_options_loss_and_output_modes()",
+        ])
+        path = rows["8201-082"]
+        self.assertEqual(path["status"], "TODO")
+        self.assertEqual(path["quote"],
+                         "The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.")
+        self.assertIn("No administrative per-path discovery-disable flag", path["reason"])
+        self.assertIn("Connections configured with PMTUD disabled enforce", path["reason"])
+        self.assertEqual(rows["8201-080"]["status"], "TODO")
+
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:
             with self.subTest(rfc=n):

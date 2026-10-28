@@ -13141,7 +13141,11 @@ fn mss_offers_and_asymmetric_send_limits_for_both_address_families() {
             let synack = wire::parse(ip(reverse(tuple)), &bytes).unwrap();
             assert_eq!(synack.options.mss, Some(peer_mss));
             deliver(&mut a, &mut b, 30);
-            let effective = usize::from(local_mss.min(peer_mss));
+            let effective = usize::from(local_mss.min(peer_mss).min(if tuple.local.is_ipv4() {
+                u16::MAX
+            } else {
+                1220 // Disabled discovery constrains sends independently of the SYN offer.
+            }));
             assert_eq!(a.mss, effective);
             assert_eq!(b.mss, effective);
             for sender in [&mut a, &mut b] {
@@ -13436,7 +13440,8 @@ fn ip_limits_bound_receive_offer_send_payload_options_and_allocations() {
             deliver(&mut b, &mut a, 20);
             let ack = deliver(&mut a, &mut b, 30);
             assert_eq!(ack.len(), 20);
-            let effective = configured.min(peer).min(send.min(family_limit) - 20) as usize;
+            let send_limit = send.min(if tuple.local.is_ipv4() { family_limit } else { 1240 });
+            let effective = configured.min(peer).min(send_limit - 20) as usize;
             assert_eq!(a.mss, effective);
             a.write(&vec![42; effective + 1]).unwrap();
             let before = (a.snd_nxt, a.now, a.next_deadline());
@@ -13447,7 +13452,7 @@ fn ip_limits_bound_receive_offer_send_payload_options_and_allocations() {
             assert_eq!((a.snd_nxt, a.now, a.next_deadline()), before);
             let bytes = packet(&mut a, 40);
             assert_eq!(bytes.len(), 20 + effective);
-            assert!(bytes.len() <= send.min(family_limit) as usize);
+            assert!(bytes.len() <= send_limit as usize);
             assert_eq!(
                 wire::parse(ip(tuple), &bytes).unwrap().payload.len(),
                 effective
