@@ -1,0 +1,19 @@
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7"
+quote = "A host MUST NOT discard a datagram just because it was received with TTL less than 2."
+reason = "Live parse accepts TTL one but rejects TTL zero even with a correct checksum; structural ICMP quote parsing accepts both. Preserve the complete host receive obligation and observed codec difference."
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "All IP options (except NOP or END-OF-LIST) received in datagrams MUST be passed to the transport layer (or to ICMP processing when the datagram is an ICMP message). The IP and transport layer MUST each interpret those IP options that they understand and silently ignore the others."
+reason = "Ipv4Options retains only supported source-route, Record Route and Timestamp options; unknown options are ignored before transport handoff rather than passed intact. This selected option-processing gap is not an exception."
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "The destination host MUST (if possible) add the current timestamp to a Timestamp option before passing the option to the transport layer or to ICMP for processing."
+reason = "The record helper can add a destination timestamp, but IPv4 parse returns options without recording one and complete host handoff evidence is outside these helper assertions. The selected capability retains this integration obligation."
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "A timestamp value MUST follow the rules given in Section 3.2.2.8 for the ICMP Timestamp message."
+reason = "Caller-provided timestamp values are not validated as milliseconds since midnight UT or explicitly marked nonstandard. No complete timebase evidence is available."

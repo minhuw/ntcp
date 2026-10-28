@@ -168,6 +168,19 @@ format = "ietf"
 source = "https://www.rfc-editor.org/rfc/rfc6429"
 format = "ietf"
 
+# Scoped IPv4 codec/options and atomic Identification inventories.
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc791"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc1122"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6864"
+format = "ietf"
+
 [report.html]
 enabled = false
 

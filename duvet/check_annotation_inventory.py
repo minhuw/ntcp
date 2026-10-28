@@ -19,6 +19,10 @@ appropriate. This mechanical completeness check cannot judge a clause's meaning
 or whether a test proves it: independent operative/evidence review is required.
 
 Only whitespace and explicit RFC page furniture are removed for provenance.
+Legacy book/indented headings are prepared for pinned Duvet with the same text
+retention policy; raw downloads and official publication metadata remain bound
+by hashes. Category-less legacy Internet Standards require validated RFC Editor
+JSON identity, title, publication date, status and source, not an invented header.
 --generate always fetches official inputs, deletes the previous report/extracted
 requirements, and invokes pinned Duvet without CI abort. A generator failure is
 never a coverage verdict. Without --generate an input/report hash receipt from a
@@ -40,6 +44,7 @@ from urllib.request import Request, urlopen
 
 from check_rfc_coverage import check
 from rfc_scopes import PREFIX, ROOT, check_registration
+from historical_rfc import identity, legacy_layout, prepare
 
 ARTIFACTS = Path("workbench/rfc-annotation-gap")
 REPORT = Path("workbench/duvet/report.json")
@@ -68,7 +73,7 @@ def require(condition, message):
 def official_lines(raw):
     # Match Duvet's RFC furniture policy explicitly. Do not remove arbitrary
     # author names, rejoin hyphenated words, fix errata, or change punctuation.
-    for line in raw.decode("utf-8-sig").splitlines():
+    for line in prepare(raw).decode("utf-8-sig").splitlines():
         if (re.match(r"^RFC [1-9][0-9]*  ", line)
                 or re.match(r"^\[Page [1-9][0-9]*\]", line)
                 or re.search(r" \[Page [1-9][0-9]*\]$", line)):
@@ -80,15 +85,15 @@ def official_sections(raw):
     sections = defaultdict(list)
     current = "preamble"
     for line in official_lines(raw):
-        heading = re.match(r"^(?:(Appendix )([A-Z](?:\.[0-9]+)*)\.?|([0-9]+(?:\.[0-9]+)*\.?|[A-Z](?:\.[0-9]+)*\.))\s+\S.*$", line)
-        if heading:
+        heading = re.match(r"^(?:((?:Appendix|APPENDIX) )([A-Z](?:\.[0-9]+)*)[.:]?|([0-9]+(?:\.[0-9]+)*\.?|[A-Z](?:\.[0-9]+)*\.))\s+\S.*$", line)
+        if heading and "..." not in line:
             number = (heading[2] or heading[3]).rstrip(".")
             current = ("appendix-" if heading[1] or number[0].isalpha() else "section-") + number
             continue
         if line in ("Abstract", "Status of This Memo", "Status of this Memo", "Copyright Notice",
                     "Acknowledgement", "Acknowledgements", "Acknowledgments", "Author's Address",
                     "Authors' Addresses", "Full Copyright Statement", "Intellectual Property",
-                    "References", "Table of Contents"):
+                    "References", "REFERENCES", "Security Considerations", "Table of Contents"):
             current = "name-" + line.lower().replace(" ", "-")
             continue
         sections[current].append(line)
@@ -104,19 +109,49 @@ def fetch_official(n, directory, opener=urlopen):
                 require(response.geturl() == url, f"RFC{n}: unexpected official URL")
                 raw = response.read(MAX_TEXT + 1)
                 require(len(raw) <= MAX_TEXT, f"RFC{n}: specification too large")
-                require(re.search(rb"Request for Comments:\s*" + str(n).encode() + rb"\b", raw[:4000]),
-                        f"RFC{n}: response is not the requested official text")
+                require(identity(raw, n), f"RFC{n}: response is not the requested official text")
                 metadata = {"url": url, "sha256": digest(raw), "bytes": len(raw),
                             "fetched_ns": time.time_ns(),
                             "etag": response.headers.get("ETag"),
                             "last_modified": response.headers.get("Last-Modified")}
             directory.mkdir(parents=True, exist_ok=True)
             (directory / f"rfc{n}.txt").write_bytes(raw)
+            if legacy_layout(raw) and not re.search(rb"^Category:", raw, re.M):
+                metadata_url = f"{PREFIX}{n}.json"
+                with opener(Request(metadata_url, headers={"User-Agent": "ntcp-annotation-inventory/1"}), timeout=30) as response:
+                    require(response.geturl() == metadata_url, f"RFC{n}: unexpected official metadata URL")
+                    metadata_raw = response.read(MAX_TEXT + 1)
+                    require(len(metadata_raw) <= MAX_TEXT, f"RFC{n}: metadata too large")
+                validate_legacy_metadata(n, raw, json.loads(metadata_raw))
+                (directory / f"rfc{n}.json").write_bytes(metadata_raw)
+                metadata["publication_metadata"] = {"url": metadata_url, "sha256": digest(metadata_raw),
+                                                     "bytes": len(metadata_raw)}
             (directory / f"rfc{n}.provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
             return n, raw
         except (OSError, ValueError) as exc:
             error = exc
     raise ValueError(f"RFC{n}: official fetch failed after 3 bounded requests: {error}")
+
+
+def validate_legacy_metadata(n, raw, metadata):
+    require(identity(raw, n) and metadata.get("doc_id") == f"RFC{n}"
+            and metadata.get("source") == "Legacy"
+            and metadata.get("doi") == f"10.17487/RFC{n}"
+            and metadata.get("pub_status") == "INTERNET STANDARD"
+            and metadata.get("status") == "INTERNET STANDARD"
+            and bool(metadata.get("pub_date"))
+            and metadata["pub_date"] in raw.decode("utf-8-sig")[:4000],
+            f"RFC{n}: invalid official legacy publication metadata")
+    # Match words, allowing historical title line breaks and double hyphens.
+    title = re.sub(r"[^a-z0-9]+", " ", metadata.get("title", "").lower()).strip()
+    preamble = re.sub(r"[^a-z0-9]+", " ", raw.decode("utf-8-sig")[:4000].lower())
+    require(title and title in preamble, f"RFC{n}: official metadata title mismatch")
+    return "Internet Standard"
+
+
+def publication_metadata(root, texts):
+    return {n: json.loads((root / ARTIFACTS / "official" / f"rfc{n}.json").read_text())
+            for n, raw in texts.items() if legacy_layout(raw) and not re.search(rb"^Category:", raw, re.M)}
 
 
 def local_path(root, relative):
@@ -172,7 +207,7 @@ def source_annotations(text):
     return rows
 
 
-def validate_inventories(root, scopes, texts):
+def validate_inventories(root, scopes, texts, metadata=None):
     entries = []
     source_cache = {}
     for n, scope in scopes.items():
@@ -183,6 +218,9 @@ def validate_inventories(root, scopes, texts):
         if n == 1191:
             require(scope["document_status"] == "Standards Track" and "IAB Standards Track" in raw.decode(),
                     "RFC1191: official document status mismatch")
+        elif legacy_layout(raw) and not re.search(rb"^Category:", raw, re.M):
+            require(scope["document_status"] == validate_legacy_metadata(n, raw, (metadata or {}).get(n, {})),
+                    f"RFC{n}: official document status mismatch")
         else:
             require(re.search(r"^Category:\s*" + re.escape(scope["document_status"]) + r"\b", raw.decode("utf-8-sig"), re.M),
                     f"RFC{n}: official document status mismatch")
@@ -549,7 +587,7 @@ def generate(root, texts, runner=subprocess.run):
     cache = root / "workbench/duvet/specifications/www.rfc-editor.org/rfc"
     cache.mkdir(parents=True, exist_ok=True)
     for n, raw in texts.items():
-        (cache / f"rfc{n}.txt").write_bytes(raw)
+        (cache / f"rfc{n}.txt").write_bytes(prepare(raw))
     output = root / ARTIFACTS / "current"
     output.mkdir(parents=True, exist_ok=True)
     started = time.time_ns()
@@ -602,7 +640,11 @@ def audit(root=ROOT, generate_report=False):
                 "stale report/inputs; run --generate")
         texts = {n: (root / ARTIFACTS / "official" / f"rfc{n}.txt").read_bytes() for n in scopes}
         require(receipt["official"] == {str(n): digest(raw) for n, raw in texts.items()}, "stale official provenance")
-    entries = validate_inventories(root, scopes, texts)
+    metadata = publication_metadata(root, texts)
+    metadata_hashes = {str(n): digest((root / ARTIFACTS / "official" / f"rfc{n}.json").read_bytes()) for n in metadata}
+    if not generate_report:
+        require(receipt.get("publication_metadata", {}) == metadata_hashes, "stale official publication metadata")
+    entries = validate_inventories(root, scopes, texts, metadata)
     report = generate(root, texts) if generate_report else json.loads((root / REPORT).read_text())
     entries.extend(extraction_entries(root))
     summaries, errors, singleton_omissions = validate_report(report, scopes, entries, texts, root=root)
@@ -623,11 +665,17 @@ def audit(root=ROOT, generate_report=False):
     outcome = {"verdict": "inventory completeness", "complete": True,
                "strict_coverage": "FAIL" if errors else "PASS", "strict_exit": strict.returncode,
                "totals": totals, "rfcs": summaries,
+               "legacy_publications": {str(n): {
+                   "text_sha256": digest(texts[n]), "metadata_sha256": metadata_hashes[str(n)],
+                   "prepared_text_sha256": digest(prepare(texts[n])),
+                   "normalization": "Legacy book page-edge title/date/section headers, numeric/Roman footers and heading indentation; substantive text retained"
+               } for n in metadata},
                "duvet_single_character_omissions": singleton_omissions,
                "unmapped_source_annotations": unmapped_sources,
                "limitations": "Duvet 0.4.3 leaves singleton lines in specifications or annotations unmapped; full original quotes are independently validated and retained. Unmapped source annotations contribute no closure. Scope labels describe actual inventory boundaries. Exact quotation and annotation links do not prove semantic conformance or full operative review."}
     (output / "outcome.json").write_text(json.dumps(outcome, indent=2) + "\n")
     receipt_path.write_text(json.dumps({"inputs": hashes, "official": {str(n): digest(raw) for n, raw in texts.items()},
+                                        "publication_metadata": metadata_hashes,
                                         "report_sha256": digest((root / REPORT).read_bytes()),
                                         "generated_ns": time.time_ns()}, indent=2) + "\n")
     return outcome

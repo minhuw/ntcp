@@ -1,0 +1,63 @@
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.1"
+quote = "A datagram whose version number is not 4 MUST be silently discarded."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.2"
+quote = "A host MUST verify the IP header checksum on every received datagram and silently discard every datagram that has a bad checksum."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7"
+quote = "A host MUST NOT send a datagram with a Time-to-Live (TTL) value of zero."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7"
+quote = "A host MUST NOT discard a datagram just because it was received with TTL less than 2."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7"
+quote = "The IP layer MUST provide a means for the transport layer to set the TTL field of every datagram that is sent. When a fixed TTL value is used, it MUST be configurable. The current suggested value will be published in the \"Assigned Numbers\" RFC."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "There MUST be a means for the transport layer to specify IP options to be included in transmitted IP datagrams (see Section 3.4)."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "All IP options (except NOP or END-OF-LIST) received in datagrams MUST be passed to the transport layer (or to ICMP processing when the datagram is an ICMP message). The IP and transport layer MUST each interpret those IP options that they understand and silently ignore the others."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "The IP layer must not crash as the result of an option length that is outside the possible range. For example, erroneous option lengths have been observed to put some IP implementations into infinite loops."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "A host MUST support originating a source route and MUST be able to act as the final destination of a source route."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "If host receives a datagram containing a completed source route (i.e., the pointer points beyond the last field), the datagram has reached its final destination; the option as received (the recorded route) MUST be passed up to the transport layer (or to ICMP message processing). This recorded route will be reversed and used to form a return source route for reply datagrams (see discussion of IP Options in Section 4). When a return source route is built, it MUST be correctly formed even if the recorded route included the source host (see case (B) in the discussion below)."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "An IP header containing more than one Source Route option MUST NOT be sent; the effect on routing of multiple Source Route options is implementation-specific."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "Implementation of originating and processing the Record Route option is OPTIONAL."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "Implementation of originating and processing the Timestamp option is OPTIONAL. If it is implemented, the following rules apply:"
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "The originating host MUST record a timestamp in a Timestamp option whose Internet address fields are not pre-specified or whose first pre-specified address is the host's interface address."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "The destination host MUST (if possible) add the current timestamp to a Timestamp option before passing the option to the transport layer or to ICMP for processing."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+quote = "A timestamp value MUST follow the rules given in Section 3.2.2.8 for the ICMP Timestamp message."

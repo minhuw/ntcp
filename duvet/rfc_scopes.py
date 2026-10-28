@@ -22,7 +22,7 @@ def load_scopes(root=ROOT):
     for r in rows:
         if (type(r["id"]) is not int or r["scope_kind"] not in KINDS
                 or r["extraction"] not in ("all", "section-3", "manual")
-                or r["document_status"] not in ("Standards Track", "Informational", "Experimental", "Historic", "Best Current Practice")
+                or r["document_status"] not in ("Standards Track", "Informational", "Experimental", "Historic", "Best Current Practice", "Internet Standard")
                 or not r["scope"].strip() or not r["inventory"].strip()):
             raise ValueError(f"invalid RFC metadata: {r}")
         if r["scope_kind"].endswith("operative") and not r["inventory"].endswith(".json"):

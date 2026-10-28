@@ -1,0 +1,15 @@
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6864#section-4"
+quote = "Atomic datagrams: (DF==1)&&(MF==0)&&(frag_offset==0)"
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6864#section-4.1"
+quote = "The IPv4 ID field MUST NOT be used for purposes other than fragmentation and reassembly."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6864#section-4.1"
+quote = "Originating sources MAY set the IPv4 ID field of atomic datagrams to any value."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6864#section-4.1"
+quote = "All devices that examine IPv4 headers MUST ignore the IPv4 ID field of atomic datagrams."

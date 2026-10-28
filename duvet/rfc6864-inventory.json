@@ -1,0 +1,64 @@
+{
+  "rfc": 6864,
+  "document_status": "Standards Track",
+  "scope_kind": "scoped-operative",
+  "scope": "SCOPED: atomic IPv4 datagram definition, arbitrary sender Identification and receiver ignoring Identification in the unfragmented IPv4 codec/quoted-header decoder. Updates RFC791 and RFC1122 Identification semantics. No full-document or full IPv4 host conformance: non-atomic datagrams, fragmentation/reassembly, non-atomic ID allocation/rate limits, forwarding, NAT and tunnel behavior are outside this inventory.",
+  "text_sha256": "e00ff443857166e5b26deecfdc77a0a1c5ff17fc87a6a8c50b020ce7f4d516d9",
+  "paragraphs": [
+    {
+      "id": "6864-atomic-definition",
+      "section": "4",
+      "quote": "Atomic datagrams: (DF==1)&&(MF==0)&&(frag_offset==0)",
+      "status": "covered",
+      "reason": "Encoder emits exactly DF=1, MF=0 and zero fragment offset. Assertions inspect all 16 flag/offset bits, not just DF.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6864#section-4",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn atomic_identification_is_arbitrary_and_ignored()"
+      ]
+    },
+    {
+      "id": "6864-id-purpose",
+      "section": "4.1",
+      "quote": "The IPv4 ID field MUST NOT be used for purposes other than fragmentation and reassembly.",
+      "status": "covered",
+      "reason": "In the selected unfragmented codec, no packet metadata, option handling or payload result depends on ID. Checksum-correct distinct-ID packets have equal parse and quote results; non-atomic reassembly is unsupported.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6864#section-4.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn parse(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn atomic_identification_is_arbitrary_and_ignored()"
+      ]
+    },
+    {
+      "id": "6864-arbitrary-id",
+      "section": "4.1",
+      "quote": "Originating sources MAY set the IPv4 ID field of atomic datagrams to any value.",
+      "status": "covered",
+      "reason": "The selected sender chooses zero for every atomic datagram, including different payloads; no per-flow ID uniqueness mechanism is needed or claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6864#section-4.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn atomic_identification_is_arbitrary_and_ignored()"
+      ]
+    },
+    {
+      "id": "6864-ignore-id",
+      "section": "4.1",
+      "quote": "All devices that examine IPv4 headers MUST ignore the IPv4 ID field of atomic datagrams.",
+      "status": "covered",
+      "reason": "Both live and quoted-header decoders ignore ID semantically while still verifying the header checksum. The test reseals the checksum for multiple ID values and compares every exposed field, options and payload.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6864#section-4.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn parse(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn atomic_identification_is_arbitrary_and_ignored()"
+      ]
+    },
+    {
+      "id": "6864-nonatomic-boundary",
+      "section": "4.3",
+      "quote": "Sources emitting non-atomic datagrams MUST NOT repeat IPv4 ID values within one MDL for a given source address/destination address/protocol tuple.",
+      "status": "context",
+      "reason": "This remaining uniqueness rule is retained as an explicit unsupported capability boundary. The encoder only emits atomic datagrams; no non-atomic ID allocator or reassembly support is claimed."
+    }
+  ]
+}

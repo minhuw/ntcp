@@ -1,0 +1,247 @@
+{
+  "rfc": 791,
+  "document_status": "Internet Standard",
+  "scope_kind": "scoped-operative",
+  "scope": "SCOPED: supported unfragmented IPv4 header framing, header checksum, DF emission, END/NOP, source-route endpoint wire formats, Record Route and Timestamp option helpers. Identification is amended by RFC6864 for atomic datagrams. No full-document or full IPv4 host conformance: fragmentation/reassembly, forwarding/routing, security/stream options, legacy ToS service policy, address administration and host APIs are outside this inventory.",
+  "text_sha256": "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
+  "paragraphs": [
+    {
+      "id": "791-version",
+      "section": "3.1",
+      "quote": "The Version field indicates the format of the internet header. This document describes version 4.",
+      "status": "covered",
+      "reason": "The IPv4 codec emits version 4 and rejects every other version before decoding fields.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn ipv4_bounds(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_header_fields_lengths_and_checksum()"
+      ]
+    },
+    {
+      "id": "791-ihl",
+      "section": "3.1",
+      "quote": "Internet Header Length is the length of the internet header in 32 bit words, and thus points to the beginning of the data. Note that the minimum value for a correct header is 5.",
+      "status": "covered",
+      "reason": "Bounds multiply IHL by four, reject values below five and locate payload after the complete options header.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn ipv4_bounds(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_header_fields_lengths_and_checksum()"
+      ]
+    },
+    {
+      "id": "791-total-context",
+      "section": "3.1",
+      "quote": "Total Length is the length of the datagram, measured in octets, including internet header and data. This field allows the length of a datagram to be up to 65,535 octets. Such long datagrams are impractical for most hosts and networks. All hosts must be prepared to accept datagrams of up to 576 octets (whether they arrive whole or in fragments). It is recommended that hosts only send datagrams larger than 576 octets if they have assurance that the destination is prepared to accept the larger datagrams.",
+      "status": "context",
+      "reason": "Parent preserves the compound paragraph. Selected codec field semantics are the first two sentences; the separate host receive/reassembly and destination-size policy obligations are explicit scope boundaries, not codec closure."
+    },
+    {
+      "id": "791-total",
+      "section": "3.1",
+      "parent": "791-total-context",
+      "quote": "Total Length is the length of the datagram, measured in octets, including internet header and data. This field allows the length of a datagram to be up to 65,535 octets.",
+      "status": "covered",
+      "reason": "Selected wire-field definition: encoder includes options and payload, checks the 16-bit limit, and decoder rejects inconsistent frame lengths. The parent retains distinct host/reassembly obligations.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn fullwidth_and_malformed_frames()"
+      ]
+    },
+    {
+      "id": "791-flags",
+      "section": "3.1",
+      "quote": "Bit 0: reserved, must be zero Bit 1: (DF) 0 = May Fragment, 1 = Don't Fragment. Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments.",
+      "status": "covered",
+      "reason": "Selected atomic sender emits only DF, with reserved/MF/offset zero; decoder explicitly rejects fragments and the reserved flag. This does not claim fragment handling.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn atomic_identification_is_arbitrary_and_ignored()"
+      ]
+    },
+    {
+      "id": "791-protocol",
+      "section": "3.1",
+      "quote": "This field indicates the next level protocol used in the data portion of the internet datagram. The values for various protocols are specified in \"Assigned Numbers\" [9].",
+      "status": "covered",
+      "reason": "The selected TCP encoder emits protocol 6; the decoder exposes the received protocol without changing the payload.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_header_fields_lengths_and_checksum()"
+      ]
+    },
+    {
+      "id": "791-checksum",
+      "section": "3.1",
+      "quote": "The checksum field is the 16 bit one's complement of the one's complement sum of all 16 bit words in the header. For purposes of computing the checksum, the value of the checksum field is zero.",
+      "status": "covered",
+      "reason": "The common checksum folds one's-complement words; IPv4 encoding zeros the header before summation. An independent word-sum assertion covers emitted headers with options and verifies the checksum field itself.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip-common/src/lib.rs::pub fn checksum(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_header_fields_lengths_and_checksum()"
+      ]
+    },
+    {
+      "id": "791-checksum-discard",
+      "section": "1.4",
+      "quote": "The Header Checksum provides a verification that the information used in processing internet datagram has been transmitted correctly. The data may contain errors. If the header checksum fails, the internet datagram is discarded at once by the entity which detects the error.",
+      "status": "covered",
+      "reason": "Decoder rejects header corruption, including options, before exposing a packet, while payload changes alone do not invalidate the IPv4 header checksum.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-1.4",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn ipv4_bounds(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_header_fields_lengths_and_checksum()"
+      ]
+    },
+    {
+      "id": "791-option-length",
+      "section": "3.1",
+      "quote": "The option-length octet counts the option-type octet and the option-length octet as well as the option-data octets.",
+      "status": "covered",
+      "reason": "Parser includes type/length in bounds and rejects truncated or undersized options; encoder uses complete option sizes.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn combined_bounds_atomic_output_and_malformed_options()"
+      ]
+    },
+    {
+      "id": "791-end",
+      "section": "3.1",
+      "quote": "This option indicates the end of the option list. This might not coincide with the end of the internet header according to the internet header length. This is used at the end of all options, not the end of each option, and need only be used if the end of the options would not otherwise coincide with the end of the internet header.",
+      "status": "covered",
+      "reason": "END stops option interpretation even before the header ends; emitted trailing zeros supply END/padding only when needed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn end_nop_and_padding_preserve_option_boundaries()"
+      ]
+    },
+    {
+      "id": "791-nop",
+      "section": "3.1",
+      "quote": "This option may be used between options, for example, to align the beginning of a subsequent option on a 32 bit boundary.",
+      "status": "covered",
+      "reason": "NOP consumes exactly one octet, including between two supported options.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn end_nop_and_padding_preserve_option_boundaries()"
+      ]
+    },
+    {
+      "id": "791-source-format",
+      "section": "3.1",
+      "quote": "The option begins with the option type code. The second octet is the option length which includes the option type code and the length octet, the pointer octet, and length-3 octets of route data. The third octet is the pointer into the route data indicating the octet which begins the next source address to be processed. The pointer is relative to this option, and the smallest legal value for the pointer is 4.",
+      "status": "covered",
+      "reason": "This identical paragraph occurs in both LSRR and SSRR. Both types use the same checked length/pointer wire format; endpoint processing rejects unfinished routes rather than forwarding them.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn source_route_wire_format_and_pointer_bounds()"
+      ]
+    },
+    {
+      "id": "791-record-format",
+      "section": "3.1",
+      "quote": "The option begins with the option type code. The second octet is the option length which includes the option type code and the length octet, the pointer octet, and length-3 octets of route data. The third octet is the pointer into the route data indicating the octet which begins the next area to store a route address. The pointer is relative to this option, and the smallest legal value for the pointer is 4.",
+      "status": "covered",
+      "reason": "Record Route uses complete four-octet address slots and validates the relative pointer before recording.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn source_route_wire_format_and_pointer_bounds()"
+      ]
+    },
+    {
+      "id": "791-record-capacity",
+      "section": "3.1",
+      "quote": "A recorded route is composed of a series of internet addresses. Each internet address is 32 bits or 4 octets. If the pointer is greater than the length, the recorded route data area is full. The originating host must compose this option with a large enough route data area to hold all the address expected. The size of the option does not change due to adding addresses. The intitial contents of the route data area must be zero.",
+      "status": "TODO",
+      "reason": "Helpers implement address slots, full pointers, zero initialization and fixed option size, but expected route capacity is a caller responsibility without a checked expectation contract or complete evidence for this compound obligation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+    },
+    {
+      "id": "791-timestamp-length",
+      "section": "3.1",
+      "quote": "The Option Length is the number of octets in the option counting the type, length, pointer, and overflow/flag octets (maximum length 40).",
+      "status": "covered",
+      "reason": "Timestamp header and stride are counted in the bounded 40-byte option buffer for all three supported flags.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn record_route_and_timestamp_slots_flags_and_overflow()"
+      ]
+    },
+    {
+      "id": "791-timestamp-pointer",
+      "section": "3.1",
+      "quote": "The Pointer is the number of octets from the beginning of this option to the end of timestamps plus one (i.e., it points to the octet beginning the space for next timestamp). The smallest legal value is 5. The timestamp area is full when the pointer is greater than the length.",
+      "status": "covered",
+      "reason": "Timestamp pointers are one-based and point at complete slots; any pointer beyond length is full, including nonaligned completed pointers.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn completed_option_pointers_need_not_be_slot_aligned()"
+      ]
+    },
+    {
+      "id": "791-timestamp-flags",
+      "section": "3.1",
+      "quote": "The Flag (flg) [4 bits] values are 0 -- time stamps only, stored in consecutive 32-bit words, 1 -- each timestamp is preceded with internet address of the registering entity, 3 -- the internet address fields are prespecified. An IP module only registers its timestamp if it matches its own address with the next specified internet address.",
+      "status": "covered",
+      "reason": "Tests assert consecutive timestamps, address/time pairs, and both matching and nonmatching prespecified addresses.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn record(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn record_route_and_timestamp_slots_flags_and_overflow()"
+      ]
+    },
+    {
+      "id": "791-timestamp-timebase",
+      "section": "3.1",
+      "quote": "The Timestamp is a right-justified, 32-bit timestamp in milliseconds since midnight UT. If the time is not available in milliseconds or cannot be provided with respect to midnight UT then any time may be inserted as a timestamp provided the high order bit of the timestamp field is set to one to indicate the use of a non-standard value.",
+      "status": "TODO",
+      "reason": "Timestamp helpers copy a caller-provided u32; they neither establish milliseconds since midnight UT nor enforce the high bit for a nonstandard timebase.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+    },
+    {
+      "id": "791-timestamp-capacity",
+      "section": "3.1",
+      "quote": "The originating host must compose this option with a large enough timestamp data area to hold all the timestamp information expected. The size of the option does not change due to adding timestamps. The intitial contents of the timestamp data area must be zero or internet address/zero pairs.",
+      "status": "TODO",
+      "reason": "Helpers initialize zero or address/zero slots and preserve option size, but expected timestamp capacity is a caller responsibility without a checked expectation contract or complete evidence for this compound obligation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+    },
+    {
+      "id": "791-padding",
+      "section": "3.1",
+      "quote": "The internet header padding is used to ensure that the internet header ends on a 32 bit boundary. The padding is zero.",
+      "status": "covered",
+      "reason": "Outgoing options round to four octets with zero padding, included in IHL and checksum.",
+      "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn encode(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn end_nop_and_padding_preserve_option_boundaries()"
+      ]
+    },
+    {
+      "id": "791-id-amendment",
+      "section": "3.2",
+      "quote": "The choice of the Identifier for a datagram is based on the need to provide a way to uniquely identify the fragments of a particular datagram. The protocol module assembling fragments judges fragments to belong to the same datagram if they have the same source, destination, protocol, and Identifier. Thus, the sender must choose the Identifier to be unique for this source, destination pair and protocol for the time the datagram (or any fragment of it) could be alive in the internet.",
+      "status": "context",
+      "reason": "RFC6864 updates this uniqueness rule: selected emitted packets are atomic (DF=1, MF=0, offset=0), so ID zero is permitted and ignored on receipt. Non-atomic ID allocation and reassembly are unsupported boundaries; no superseded uniqueness closure is claimed."
+    },
+    {
+      "id": "791-options-boundary",
+      "section": "3.1",
+      "quote": "The options may appear or not in datagrams. They must be implemented by all IP modules (host and gateways). What is optional is their transmission in any particular datagram, not their implementation.",
+      "status": "context",
+      "reason": "The inventory selects specific codec/options helpers, not all host/gateway option facilities. Security, stream ID and forwarding behavior are not claimed; RFC1122 additionally amends option requirements."
+    }
+  ]
+}

@@ -75,6 +75,53 @@ impl Ipv4Options {
         self.len == 0
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The option-length octet counts the option-type octet and the
+    //# option-length octet as well as the option-data octets.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# This option indicates the end of the option list. This might not
+    //# coincide with the end of the internet header according to the internet
+    //# header length. This is used at the end of all options, not the end of
+    //# each option, and need only be used if the end of the options would not
+    //# otherwise coincide with the end of the internet header.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# This option may be used between options, for example, to align the
+    //# beginning of a subsequent option on a 32 bit boundary.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The option begins with the option type code. The second octet is the
+    //# option length which includes the option type code and the length
+    //# octet, the pointer octet, and length-3 octets of route data. The third
+    //# octet is the pointer into the route data indicating the octet which
+    //# begins the next source address to be processed. The pointer is
+    //# relative to this option, and the smallest legal value for the pointer
+    //# is 4.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The option begins with the option type code. The second octet is the
+    //# option length which includes the option type code and the length
+    //# octet, the pointer octet, and length-3 octets of route data. The third
+    //# octet is the pointer into the route data indicating the octet which
+    //# begins the next area to store a route address. The pointer is relative
+    //# to this option, and the smallest legal value for the pointer is 4.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The Option Length is the number of octets in the option counting the
+    //# type, length, pointer, and overflow/flag octets (maximum length 40).
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The Pointer is the number of octets from the beginning of this option
+    //# to the end of timestamps plus one (i.e., it points to the octet
+    //# beginning the space for next timestamp). The smallest legal value is
+    //# 5. The timestamp area is full when the pointer is greater than the
+    //# length.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //# The IP layer must not crash as the result of an option length that is
+    //# outside the possible range. For example, erroneous option lengths
+    //# have been observed to put some IP implementations into infinite loops.
     pub fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Self, Ipv4OptionsError> {
         use Ipv4OptionsError::*;
         if bytes.len() > 40 {
@@ -151,6 +198,16 @@ impl Ipv4Options {
         Ok(result)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //# If host receives a datagram containing a completed source route (i.e.,
+    //# the pointer points beyond the last field), the datagram has reached
+    //# its final destination; the option as received (the recorded route)
+    //# MUST be passed up to the transport layer (or to ICMP message
+    //# processing). This recorded route will be reversed and used to form a
+    //# return source route for reply datagrams (see discussion of IP Options
+    //# in Section 4). When a return source route is built, it MUST be
+    //# correctly formed even if the recorded route included the source host
+    //# (see case (B) in the discussion below).
     pub fn return_route(&self, source: Ipv4Addr) -> Option<SourceRoute> {
         let mut offset = 0;
         while offset < usize::from(self.len) {
@@ -175,6 +232,22 @@ impl Ipv4Options {
         None
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The Flag (flg) [4 bits] values are
+    //# 0 -- time stamps only, stored in consecutive 32-bit words,
+    //# 1 -- each timestamp is preceded with internet address of the
+    //# registering entity,
+    //# 3 -- the internet address fields are prespecified. An IP module only
+    //# registers its timestamp if it matches its own address with the next
+    //# specified internet address.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //# Implementation of originating and processing the Record Route option
+    //# is OPTIONAL.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //# Implementation of originating and processing the Timestamp option is
+    //# OPTIONAL. If it is implemented, the following rules apply:
     pub fn record(mut self, local: Ipv4Addr, timestamp: u32) -> Result<Self, Ipv4OptionsError> {
         use Ipv4OptionsError::*;
         if !unicast(local) {
@@ -221,6 +294,19 @@ fn address(bytes: &[u8]) -> Ipv4Addr {
 //# A TCP implementation MAY support the Timestamp (MAY-10) and Record
 //# Route (MAY-11) Options.
 impl OutgoingIpv4Options {
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The internet header padding is used to ensure that the internet
+    //# header ends on a 32 bit boundary. The padding is zero.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //# An IP header containing more than one Source Route option MUST NOT be
+    //# sent; the effect on routing of multiple Source Route options is
+    //# implementation-specific.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //# The originating host MUST record a timestamp in a Timestamp option
+    //# whose Internet address fields are not pre-specified or whose first
+    //# pre-specified address is the host's interface address.
     pub fn encode(
         &self,
         source: Ipv4Addr,
@@ -308,6 +394,13 @@ mod tests {
         Ipv4Addr::new(192, 0, 2, n)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The Pointer is the number of octets from the beginning of this option
+    //# to the end of timestamps plus one (i.e., it points to the octet
+    //# beginning the space for next timestamp). The smallest legal value is
+    //# 5. The timestamp area is full when the pointer is greater than the
+    //# length.
     #[test]
     fn completed_option_pointers_need_not_be_slot_aligned() {
         for pointer in [8, 9, 255] {
@@ -335,11 +428,133 @@ mod tests {
                 assert_eq!(full.record(ip(2), 42), Err(Ipv4OptionsError::Malformed));
             }
         }
+        for flag in [0, 1, 3] {
+            for pointer in 0..5 {
+                assert_eq!(
+                    Ipv4Options::parse(&[68, 4, pointer, flag], true),
+                    Err(Ipv4OptionsError::Malformed)
+                );
+            }
+        }
         // A pointer into data still needs to identify the beginning of a slot.
         assert_eq!(
             Ipv4Options::parse(&[7, 7, 5, 0, 0, 0, 0], true),
             Err(Ipv4OptionsError::Malformed)
         );
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# This option indicates the end of the option list. This might not
+    //# coincide with the end of the internet header according to the internet
+    //# header length. This is used at the end of all options, not the end of
+    //# each option, and need only be used if the end of the options would not
+    //# otherwise coincide with the end of the internet header.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# This option may be used between options, for example, to align the
+    //# beginning of a subsequent option on a 32 bit boundary.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The internet header padding is used to ensure that the internet
+    //# header ends on a 32 bit boundary. The padding is zero.
+    #[test]
+    fn end_nop_and_padding_preserve_option_boundaries() {
+        let raw = [1, 7, 7, 4, 0, 0, 0, 0, 1, 68, 8, 5, 0, 0, 0, 0, 0, 0, 255];
+        let options = Ipv4Options::parse(&raw, false).unwrap();
+        assert_eq!(
+            options.as_bytes(),
+            &[7, 7, 4, 0, 0, 0, 0, 68, 8, 5, 0, 0, 0, 0, 0]
+        );
+        assert!(Ipv4Options::parse(&[0, 255], false).unwrap().is_empty());
+        for slots in 0..=9 {
+            let request = OutgoingIpv4Options {
+                record_route_slots: Some(slots),
+                ..Default::default()
+            };
+            let mut out = [0xa5; 40];
+            let (_, padded) = request.encode(ip(1), ip(2), 0, &mut out).unwrap();
+            let option_len = 3 + usize::from(slots) * 4;
+            assert_eq!(padded % 4, 0);
+            assert_eq!(padded, option_len + 1);
+            assert_eq!(out[1], option_len as u8);
+            assert_eq!(out[option_len], 0);
+            assert!(out[padded..].iter().all(|&b| b == 0xa5));
+            assert_eq!(
+                Ipv4Options::parse(&out[..padded], false)
+                    .unwrap()
+                    .as_bytes(),
+                &out[..option_len]
+            );
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The option begins with the option type code. The second octet is the
+    //# option length which includes the option type code and the length
+    //# octet, the pointer octet, and length-3 octets of route data. The third
+    //# octet is the pointer into the route data indicating the octet which
+    //# begins the next source address to be processed. The pointer is
+    //# relative to this option, and the smallest legal value for the pointer
+    //# is 4.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The option begins with the option type code. The second octet is the
+    //# option length which includes the option type code and the length
+    //# octet, the pointer octet, and length-3 octets of route data. The third
+    //# octet is the pointer into the route data indicating the octet which
+    //# begins the next area to store a route address. The pointer is relative
+    //# to this option, and the smallest legal value for the pointer is 4.
+    #[test]
+    fn source_route_wire_format_and_pointer_bounds() {
+        for kind in [7, 131, 137] {
+            for slots in 0..=9 {
+                let len = 3 + slots * 4;
+                let mut bytes = [0; 40];
+                bytes[..3].copy_from_slice(&[kind, len as u8, 4]);
+                for i in 0..slots {
+                    bytes[3 + i * 4..7 + i * 4].copy_from_slice(&ip(i as u8 + 3).octets());
+                }
+                for pointer in 0..4 {
+                    bytes[2] = pointer;
+                    assert_eq!(
+                        Ipv4Options::parse(&bytes[..len], true),
+                        Err(Ipv4OptionsError::Malformed)
+                    );
+                }
+                bytes[2] = 4;
+                if kind == 7 {
+                    let parsed = Ipv4Options::parse(&bytes[..len], true).unwrap();
+                    let recorded = parsed.record(ip(1), 0).unwrap();
+                    assert_eq!(recorded.as_bytes().len(), len);
+                    if slots > 0 {
+                        assert_eq!(recorded.as_bytes()[2], 8);
+                        assert_eq!(&recorded.as_bytes()[3..7], &ip(1).octets());
+                    }
+                } else if slots > 0 {
+                    assert_eq!(
+                        Ipv4Options::parse(&bytes[..len], true),
+                        Err(Ipv4OptionsError::IncompleteRoute)
+                    );
+                }
+                bytes[2] = (len + 1) as u8;
+                assert_eq!(
+                    Ipv4Options::parse(&bytes[..len], true).unwrap().as_bytes(),
+                    &bytes[..len]
+                );
+                if slots > 0 {
+                    bytes[2] = 5;
+                    assert_eq!(
+                        Ipv4Options::parse(&bytes[..len], true),
+                        Err(Ipv4OptionsError::Malformed)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -401,6 +616,36 @@ mod tests {
     //= type=test
     //# A TCP implementation MAY support the Timestamp (MAY-10) and Record
     //# Route (MAY-11) Options.
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The Option Length is the number of octets in the option counting the
+    //# type, length, pointer, and overflow/flag octets (maximum length 40).
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The Flag (flg) [4 bits] values are
+    //# 0 -- time stamps only, stored in consecutive 32-bit words,
+    //# 1 -- each timestamp is preceded with internet address of the
+    //# registering entity,
+    //# 3 -- the internet address fields are prespecified. An IP module only
+    //# registers its timestamp if it matches its own address with the next
+    //# specified internet address.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= type=test
+    //# Implementation of originating and processing the Record Route option
+    //# is OPTIONAL.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= type=test
+    //# Implementation of originating and processing the Timestamp option is
+    //# OPTIONAL. If it is implemented, the following rules apply:
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= type=test
+    //# The originating host MUST record a timestamp in a Timestamp option
+    //# whose Internet address fields are not pre-specified or whose first
+    //# pre-specified address is the host's interface address.
     #[test]
     fn record_route_and_timestamp_slots_flags_and_overflow() {
         let mut out = [0; 40];
@@ -459,8 +704,42 @@ mod tests {
         let received = parsed.record(ip(2), 456).unwrap();
         assert_eq!(received.as_bytes()[2], 13);
         assert_eq!(&received.as_bytes()[8..12], &456u32.to_be_bytes());
+        // Matching prespecified address must also record at origination.
+        let requests = OutgoingIpv4Options {
+            timestamp: Some(TimestampRequest::Prespecified {
+                addresses: [ip(1); 4],
+                len: 1,
+            }),
+            ..Default::default()
+        };
+        let (_, len) = requests.encode(ip(1), ip(2), 789, &mut out).unwrap();
+        assert_eq!(len, 12);
+        assert_eq!(&out[..4], &[68, 12, 13, 3]);
+        assert_eq!(&out[4..8], &ip(1).octets());
+        assert_eq!(&out[8..12], &789u32.to_be_bytes());
+        for slots in 1..=9 {
+            let requests = OutgoingIpv4Options {
+                timestamp: Some(TimestampRequest::Times(slots)),
+                ..Default::default()
+            };
+            let (_, len) = requests.encode(ip(1), ip(2), 123, &mut out).unwrap();
+            assert_eq!(len, 4 + usize::from(slots) * 4);
+            assert_eq!(out[1], len as u8);
+            assert_eq!(out[2], 9);
+            assert!(out[8..len].iter().all(|&b| b == 0));
+        }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The option-length octet counts the option-type octet and the
+    //# option-length octet as well as the option-data octets.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= type=test
+    //# The IP layer must not crash as the result of an option length that is
+    //# outside the possible range. For example, erroneous option lengths
+    //# have been observed to put some IP implementations into infinite loops.
     #[test]
     fn combined_bounds_atomic_output_and_malformed_options() {
         let mut options = OutgoingIpv4Options {

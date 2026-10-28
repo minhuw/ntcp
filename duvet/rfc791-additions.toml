@@ -1,0 +1,75 @@
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The Version field indicates the format of the internet header. This document describes version 4."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "Internet Header Length is the length of the internet header in 32 bit words, and thus points to the beginning of the data. Note that the minimum value for a correct header is 5."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "Total Length is the length of the datagram, measured in octets, including internet header and data. This field allows the length of a datagram to be up to 65,535 octets."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "Bit 0: reserved, must be zero Bit 1: (DF) 0 = May Fragment, 1 = Don't Fragment. Bit 2: (MF) 0 = Last Fragment, 1 = More Fragments."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "This field indicates the next level protocol used in the data portion of the internet datagram. The values for various protocols are specified in \"Assigned Numbers\" [9]."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The checksum field is the 16 bit one's complement of the one's complement sum of all 16 bit words in the header. For purposes of computing the checksum, the value of the checksum field is zero."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-1.4"
+quote = "The Header Checksum provides a verification that the information used in processing internet datagram has been transmitted correctly. The data may contain errors. If the header checksum fails, the internet datagram is discarded at once by the entity which detects the error."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The option-length octet counts the option-type octet and the option-length octet as well as the option-data octets."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "This option indicates the end of the option list. This might not coincide with the end of the internet header according to the internet header length. This is used at the end of all options, not the end of each option, and need only be used if the end of the options would not otherwise coincide with the end of the internet header."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "This option may be used between options, for example, to align the beginning of a subsequent option on a 32 bit boundary."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The option begins with the option type code. The second octet is the option length which includes the option type code and the length octet, the pointer octet, and length-3 octets of route data. The third octet is the pointer into the route data indicating the octet which begins the next source address to be processed. The pointer is relative to this option, and the smallest legal value for the pointer is 4."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The option begins with the option type code. The second octet is the option length which includes the option type code and the length octet, the pointer octet, and length-3 octets of route data. The third octet is the pointer into the route data indicating the octet which begins the next area to store a route address. The pointer is relative to this option, and the smallest legal value for the pointer is 4."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "A recorded route is composed of a series of internet addresses. Each internet address is 32 bits or 4 octets. If the pointer is greater than the length, the recorded route data area is full. The originating host must compose this option with a large enough route data area to hold all the address expected. The size of the option does not change due to adding addresses. The intitial contents of the route data area must be zero."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The Option Length is the number of octets in the option counting the type, length, pointer, and overflow/flag octets (maximum length 40)."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The Pointer is the number of octets from the beginning of this option to the end of timestamps plus one (i.e., it points to the octet beginning the space for next timestamp). The smallest legal value is 5. The timestamp area is full when the pointer is greater than the length."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The Flag (flg) [4 bits] values are 0 -- time stamps only, stored in consecutive 32-bit words, 1 -- each timestamp is preceded with internet address of the registering entity, 3 -- the internet address fields are prespecified. An IP module only registers its timestamp if it matches its own address with the next specified internet address."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The Timestamp is a right-justified, 32-bit timestamp in milliseconds since midnight UT. If the time is not available in milliseconds or cannot be provided with respect to midnight UT then any time may be inserted as a timestamp provided the high order bit of the timestamp field is set to one to indicate the use of a non-standard value."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The originating host must compose this option with a large enough timestamp data area to hold all the timestamp information expected. The size of the option does not change due to adding timestamps. The intitial contents of the timestamp data area must be zero or internet address/zero pairs."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
+quote = "The internet header padding is used to ensure that the internet header ends on a 32 bit boundary. The padding is zero."

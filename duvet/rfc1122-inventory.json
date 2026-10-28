@@ -1,0 +1,196 @@
+{
+  "rfc": 1122,
+  "document_status": "Internet Standard",
+  "scope_kind": "scoped-operative",
+  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy and general host/socket APIs are outside this inventory.",
+  "text_sha256": "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
+  "paragraphs": [
+    {
+      "id": "1122-version",
+      "section": "3.2.1.1",
+      "quote": "A datagram whose version number is not 4 MUST be silently discarded.",
+      "status": "covered",
+      "reason": "The codec returns Version without exposing a decoded packet or generating a response; all non-4 version nibbles are asserted.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.1",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn ipv4_bounds(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_header_fields_lengths_and_checksum()"
+      ]
+    },
+    {
+      "id": "1122-checksum",
+      "section": "3.2.1.2",
+      "quote": "A host MUST verify the IP header checksum on every received datagram and silently discard every datagram that has a bad checksum.",
+      "status": "covered",
+      "reason": "Every parse and quoted-header bounds check verifies the full header checksum, including options, before returning metadata; the codec has no response side effect.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.2",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn ipv4_bounds(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_header_fields_lengths_and_checksum()"
+      ]
+    },
+    {
+      "id": "1122-ttl-send",
+      "section": "3.2.1.7",
+      "quote": "A host MUST NOT send a datagram with a Time-to-Live (TTL) value of zero.",
+      "status": "covered",
+      "reason": "Encoder rejects zero TTL without modifying the output buffer.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_ttl_parameters_and_receive_zero_boundary()"
+      ]
+    },
+    {
+      "id": "1122-ttl-receive",
+      "section": "3.2.1.7",
+      "quote": "A host MUST NOT discard a datagram just because it was received with TTL less than 2.",
+      "status": "TODO",
+      "reason": "Live parse accepts TTL one but rejects TTL zero even with a correct checksum; structural ICMP quote parsing accepts both. Preserve the complete host receive obligation and observed codec difference.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn parse(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_ttl_parameters_and_receive_zero_boundary()"
+      ]
+    },
+    {
+      "id": "1122-ttl-parameter",
+      "section": "3.2.1.7",
+      "quote": "The IP layer MUST provide a means for the transport layer to set the TTL field of every datagram that is sent. When a fixed TTL value is used, it MUST be configurable. The current suggested value will be published in the \"Assigned Numbers\" RFC.",
+      "status": "covered",
+      "reason": "Transmit.hop_limit is a per-datagram transport parameter; codec assertions use 1, 64 and 255. This selected codec interface does not claim a complete host configuration API.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn ipv4_ttl_parameters_and_receive_zero_boundary()"
+      ]
+    },
+    {
+      "id": "1122-options-send",
+      "section": "3.2.1.8",
+      "quote": "There MUST be a means for the transport layer to specify IP options to be included in transmitted IP datagrams (see Section 3.4).",
+      "status": "covered",
+      "reason": "Transmit.ipv4_options configures the supported options, which encode emits in the IPv4 header; full and shared headers agree with full wire lengths.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::fn encode_present(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn shared_headers_preserve_ip_options_and_full_wire_lengths_without_payload_copy()"
+      ]
+    },
+    {
+      "id": "1122-options-pass",
+      "section": "3.2.1.8",
+      "quote": "All IP options (except NOP or END-OF-LIST) received in datagrams MUST be passed to the transport layer (or to ICMP processing when the datagram is an ICMP message). The IP and transport layer MUST each interpret those IP options that they understand and silently ignore the others.",
+      "status": "TODO",
+      "reason": "Ipv4Options retains only supported source-route, Record Route and Timestamp options; unknown options are ignored before transport handoff rather than passed intact. This selected option-processing gap is not an exception.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+    },
+    {
+      "id": "1122-options-length",
+      "section": "3.2.1.8",
+      "quote": "The IP layer must not crash as the result of an option length that is outside the possible range. For example, erroneous option lengths have been observed to put some IP implementations into infinite loops.",
+      "status": "covered",
+      "reason": "Lengths are bounds checked before advancing or slicing; malformed examples and exhaustive one-byte length/pointer combinations terminate safely.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn parse(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn combined_bounds_atomic_output_and_malformed_options()"
+      ]
+    },
+    {
+      "id": "1122-source-support",
+      "section": "3.2.1.8",
+      "quote": "A host MUST support originating a source route and MUST be able to act as the final destination of a source route.",
+      "status": "covered",
+      "reason": "Selected source-route-enabled codec profile originates strict/loose wire routes and accepts completed routes at the final endpoint. Intermediate-hop forwarding and fragmentation remain outside scope.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn parse(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn completed_source_routes_and_old_encoding_form_return_headers()"
+      ]
+    },
+    {
+      "id": "1122-source-return",
+      "section": "3.2.1.8",
+      "quote": "If host receives a datagram containing a completed source route (i.e., the pointer points beyond the last field), the datagram has reached its final destination; the option as received (the recorded route) MUST be passed up to the transport layer (or to ICMP message processing). This recorded route will be reversed and used to form a return source route for reply datagrams (see discussion of IP Options in Section 4). When a return source route is built, it MUST be correctly formed even if the recorded route included the source host (see case (B) in the discussion below).",
+      "status": "covered",
+      "reason": "The selected codec returns the completed route unchanged in Packet.ipv4_options. Its return_route helper reverses the recorded hops and removes a legacy first source-host entry; reply header assertions cover both encodings and strict/loose routes.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn return_route(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn completed_source_routes_and_old_encoding_form_return_headers()"
+      ]
+    },
+    {
+      "id": "1122-source-single",
+      "section": "3.2.1.8",
+      "quote": "An IP header containing more than one Source Route option MUST NOT be sent; the effect on routing of multiple Source Route options is implementation-specific.",
+      "status": "covered",
+      "reason": "OutgoingIpv4Options has a single source_route field; all strict/loose output assertions decode exactly one source-route option.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn encode(",
+        "crates/stacks/ntcp-ip/tests/codec.rs::fn completed_source_routes_and_old_encoding_form_return_headers()"
+      ]
+    },
+    {
+      "id": "1122-record-optional",
+      "section": "3.2.1.8",
+      "quote": "Implementation of originating and processing the Record Route option is OPTIONAL.",
+      "status": "covered",
+      "reason": "This optional capability is selected: tests originate zero slots, then record source/destination addresses with fixed option length and bounded pointers.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn record(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn record_route_and_timestamp_slots_flags_and_overflow()"
+      ]
+    },
+    {
+      "id": "1122-timestamp-optional",
+      "section": "3.2.1.8",
+      "quote": "Implementation of originating and processing the Timestamp option is OPTIONAL. If it is implemented, the following rules apply:",
+      "status": "covered",
+      "reason": "This optional capability is selected, with its following origin/destination/value rules inventoried separately and gaps retained as TODOs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn record(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn record_route_and_timestamp_slots_flags_and_overflow()"
+      ]
+    },
+    {
+      "id": "1122-timestamp-origin",
+      "section": "3.2.1.8",
+      "quote": "The originating host MUST record a timestamp in a Timestamp option whose Internet address fields are not pre-specified or whose first pre-specified address is the host's interface address.",
+      "status": "covered",
+      "reason": "Encoding records the source for flags 0/1 and for a matching first prespecified address; nonmatching prespecified addresses remain unrecorded.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn encode(",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn record_route_and_timestamp_slots_flags_and_overflow()"
+      ]
+    },
+    {
+      "id": "1122-timestamp-destination",
+      "section": "3.2.1.8",
+      "quote": "The destination host MUST (if possible) add the current timestamp to a Timestamp option before passing the option to the transport layer or to ICMP for processing.",
+      "status": "TODO",
+      "reason": "The record helper can add a destination timestamp, but IPv4 parse returns options without recording one and complete host handoff evidence is outside these helper assertions. The selected capability retains this integration obligation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+    },
+    {
+      "id": "1122-timestamp-value",
+      "section": "3.2.1.8",
+      "quote": "A timestamp value MUST follow the rules given in Section 3.2.2.8 for the ICMP Timestamp message.",
+      "status": "TODO",
+      "reason": "Caller-provided timestamp values are not validated as milliseconds since midnight UT or explicitly marked nonstandard. No complete timebase evidence is available.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+    },
+    {
+      "id": "1122-id-amendment",
+      "section": "3.2.1.5",
+      "quote": "When sending an identical copy of an earlier datagram, a host MAY optionally retain the same Identification field in the copy.",
+      "status": "context",
+      "reason": "RFC6864 amends Identification semantics. Selected atomic datagrams may use arbitrary IDs, including repeated zero; non-atomic copies, allocation and reassembly are outside this scoped inventory."
+    }
+  ]
+}
