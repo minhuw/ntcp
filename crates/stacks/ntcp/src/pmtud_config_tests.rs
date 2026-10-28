@@ -310,9 +310,11 @@ fn pmtud_config_infinity_keeps_ptb_hold_and_failure_retry() {
             p.tick(10 + 600 * units);
             assert!(p.target().is_some());
             assert_eq!(p.info.current_mtu, 1300);
-            // Both isolated and timed-out failure suppressions remain finite.
+            // Isolated failure and inconclusive timeout cooldowns remain finite.
             for timeout in [false, true] {
                 let mut p = Pmtud::new(cfg, 1500, ipv4, 600 * units).unwrap();
+                let before = p.info;
+                let target = p.target();
                 p.start_probe(Seq(0), 1300, 3000, 1360);
                 p.sent(Seq(0), Seq(1300), 1360, header, false);
                 if timeout {
@@ -326,8 +328,13 @@ fn pmtud_config_infinity_keeps_ptb_hold_and_failure_retry() {
                 p.tick(deadline - 1);
                 assert_eq!(p.target(), None);
                 p.tick(deadline);
-                assert!(p.target().unwrap() < 1360);
-                assert_eq!(p.info.search_high, 1359);
+                if timeout {
+                    assert_eq!(p.info, before);
+                    assert_eq!(p.target(), target);
+                } else {
+                    assert!(p.target().unwrap() < 1360);
+                    assert_eq!(p.info.search_high, 1359);
+                }
             }
         }
     }

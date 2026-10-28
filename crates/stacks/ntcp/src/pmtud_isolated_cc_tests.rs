@@ -203,27 +203,44 @@ fn isolated_probe_cc_real_receiver_recovery_matrix() {
 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.4
 //= type=test
 //# The presence of other losses near the loss of the probe may indicate that the probe was lost due to congestion rather than due to an MTU limitation. In this case, the state variables eff_pmtu, search_low, and search_high SHOULD NOT be updated, and the same-sized probe SHOULD be attempted again as soon as the probing preconditions are met (i.e., once the packetization layer has no outstanding unrecovered losses). At this point, it is particularly appropriate to re-probe since the flow's congestion window will be at its lowest point, minimizing the probability of congestive losses.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-2
+//= type=test
+//= reason=Timeout/additional-loss completion supplies no failed-size ceiling and marks the outcome non-isolated, retaining normal congestion recovery. Receiver-driven IPv4/IPv6 NewReno/SACK/RACK with PRR on/off assert reduced window/threshold, one-MSS RTO response, unchanged bounds, repair-only output, cooldown exclusion and same-sized re-probing with available credit. Exact deadline tests retain the fivefold timeout hold and longer PTB holds; independent delivery, PTB, verification and black-hole evidence remain operative.
+//# If there is a timeout or additional packets are lost during the probing process,
+//# the probe is considered to be inconclusive (e.g., the lost probe does not
+//# necessarily indicate that the probe exceeded the Path MTU). Furthermore, the
+//# losses are treated like any other congestion indication: window or rate
+//# adjustments are mandatory per the relevant congestion control standards
+//# [RFC2914]. Probing can resume after a delay that is determined by the nature
+//# of the detected failure.
 fn probe_admission_real_loss_recovery_and_cooldown_output() {
-    for mode in 0..3 {
+    for (ipv4, mode) in [true, false]
+        .into_iter()
+        .flat_map(|ipv4| (0..3).map(move |mode| (ipv4, mode)))
+    {
         for prr in [false, true] {
-            for failure in 0..3 {
+            for failure in 0..4 {
                 let second_hole = failure == 1;
+                let low = if ipv4 { 1024 } else { 1280 };
+                let ip_header = if ipv4 { 20 } else { 40 };
+                let header = ip_header as u32 + 20;
                 let mut cfg = isolated_config(mode, prr, false, false);
-                cfg.pmtud.as_mut().unwrap().initial_mtu = Some(1024);
-                let (mut a, mut b) = pair(cfg, u32::MAX - 4000);
+                cfg.pmtud.as_mut().unwrap().initial_mtu = Some(low);
+                let (mut a, mut b) = super::pmtud_policy::family_pair(cfg, ipv4, u32::MAX - 4000);
                 a.write(b"x").unwrap();
                 deliver(&mut a, &mut b, 32);
                 deliver(&mut b, &mut a, 33);
                 a.write(&[7; 30_000]).unwrap();
                 let first = packet(&mut a, 40); // Drop just the probe, or a second trailing hole too.
                 let probe = a.pmtud.as_ref().unwrap().probe.unwrap();
-                assert_eq!(first.len() + 20, probe.size as usize);
-                assert!(probe.size > 1024);
+                assert_eq!(first.len() + ip_header, probe.size as usize);
+                assert!(probe.size > low);
                 let before = a.path_mtu_info().unwrap();
+                let (window, threshold) = (a.congestion.cwnd(), a.congestion.ssthresh());
                 let mut trailing = Vec::new();
                 for _ in 0..8 {
                     let bytes = packet(&mut a, 41);
-                    assert!(bytes.len() + 20 <= 1024);
+                    assert!(bytes.len() + ip_header <= low as usize);
                     assert_eq!(a.pmtud.as_ref().unwrap().probe.unwrap().start, probe.start);
                     trailing.push(bytes);
                 }
@@ -239,16 +256,23 @@ fn probe_admission_real_loss_recovery_and_cooldown_output() {
                     a.timeout(now).unwrap();
                 }
                 assert!(a.congestion.in_recovery());
-                let timeout_deadline = if failure == 2 {
-                    // Drop the first repair too, then let the actual data RTO fire.
-                    let bytes = packet(&mut a, now + 1);
-                    assert!(bytes.len() + 20 <= 1024);
+                let timeout_deadline = if failure >= 2 {
+                    if failure == 2 {
+                        // Drop the first repair too. Its second copy provides
+                        // additional-loss evidence independent of the timeout.
+                        let bytes = packet(&mut a, now + 1);
+                        assert!(bytes.len() + ip_header <= low as usize);
+                    }
+                    // Also exercise timeout without a prior repair: its first
+                    // repair ACK must not turn the timeout into MTU evidence.
                     now = a.rto_deadline.unwrap();
                     a.timeout(now).unwrap();
                     assert_eq!(a.consecutive_timeouts, 1);
                     let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
                     assert!(deadline >= now + 5 * a.rto());
                     assert_eq!(a.congestion.cwnd(), a.mss as u32);
+                    assert!(a.congestion.ssthresh() < threshold);
+                    assert!(a.congestion.pending_probe_response().is_none());
                     Some(deadline)
                 } else {
                     None
@@ -262,10 +286,14 @@ fn probe_admission_real_loss_recovery_and_cooldown_output() {
                         continue;
                     };
                     // OUTPUT, not merely target(): recovery never emits a new oversized probe.
-                    assert!(len + 20 <= 1024);
+                    assert!(len + ip_header <= low as usize);
                     real_ack(&mut a, &mut b, &out[..len], now, false);
-                    if second_hole {
+                    if failure != 0 {
                         assert_eq!(a.path_mtu_info().unwrap(), before);
+                    }
+                    if timeout_deadline.is_some() {
+                        assert!(a.congestion.pending_probe_response().is_none());
+                        assert!(a.congestion.ssthresh() < threshold);
                     }
                     if a.pmtud.as_ref().unwrap().probe.is_none() {
                         break;
@@ -278,6 +306,11 @@ fn probe_admission_real_loss_recovery_and_cooldown_output() {
                 let info = a.path_mtu_info().unwrap();
                 assert_eq!(info.current_mtu, before.current_mtu);
                 assert_eq!(info.search_low, before.search_low);
+                if failure != 0 {
+                    assert_eq!(info.search_high, before.search_high);
+                    assert!(a.congestion.cwnd() < window);
+                    assert!(a.congestion.ssthresh() < threshold);
+                }
                 if second_hole {
                     assert_eq!(info.search_high, before.search_high);
                     assert!(a.pmtud.as_ref().unwrap().deadline.is_none());
@@ -289,8 +322,8 @@ fn probe_admission_real_loss_recovery_and_cooldown_output() {
                     if let Some(timeout_deadline) = timeout_deadline {
                         assert!(deadline >= timeout_deadline);
                     }
-                    let needed =
-                        ((info.search_low + info.search_high).div_ceil(2) - 40) + 3 * a.mss as u32;
+                    let needed = ((info.search_low + info.search_high).div_ceil(2) - header)
+                        + 3 * a.mss as u32;
                     for _ in 0..16 {
                         if a.congestion.cwnd() >= needed {
                             break;
@@ -298,7 +331,7 @@ fn probe_admission_real_loss_recovery_and_cooldown_output() {
                         now += 1;
                         assert!(now < deadline - 1);
                         let bytes = packet(&mut a, now);
-                        assert!(bytes.len() + 20 <= 1024);
+                        assert!(bytes.len() + ip_header <= low as usize);
                         assert!(a.pmtud.as_ref().unwrap().probe.is_none());
                         real_ack(&mut a, &mut b, &bytes, now, false);
                     }
@@ -306,7 +339,7 @@ fn probe_admission_real_loss_recovery_and_cooldown_output() {
                     assert!(a.snd_wnd >= needed);
                     a.timeout(deadline - 1).unwrap();
                     let bytes = packet(&mut a, deadline - 1);
-                    assert!(bytes.len() + 20 <= 1024);
+                    assert!(bytes.len() + ip_header <= low as usize);
                     assert!(a.pmtud.as_ref().unwrap().probe.is_none());
                     real_ack(&mut a, &mut b, &bytes, deadline - 1, false);
                     a.timeout(deadline).unwrap();
@@ -323,26 +356,27 @@ fn probe_admission_real_loss_recovery_and_cooldown_output() {
                         .saturating_sub(a.flight());
                     let bytes = packet(&mut a, now);
                     if let Some(probe) = a.pmtud.as_ref().unwrap().probe {
-                        assert_eq!(bytes.len() + 20, probe.size as usize);
+                        assert_eq!(bytes.len() + ip_header, probe.size as usize);
                         next = Some(probe);
                         break;
                     }
-                    if second_hole {
+                    if failure != 0 {
                         assert!(
-                            probe_room < probe.size - 40 + 3 * a.mss as u32,
+                            probe_room < probe.size - header + 3 * a.mss as u32,
                             "same-size retry must occur as soon as congestion credit permits"
                         );
                     }
                     assert!(
-                        failure != 0,
-                        "isolated failure must re-probe at the expiry boundary"
+                        second_hole,
+                        "failed probe must re-probe at the expiry boundary with available credit"
                     );
-                    assert!(bytes.len() + 20 <= 1024);
+                    assert!(bytes.len() + ip_header <= low as usize);
                     real_ack(&mut a, &mut b, &bytes, now, false);
                 }
                 let next = next.expect("probe admission must resume after recovery and cooldown");
-                assert!(next.size > 1024);
-                if second_hole {
+                assert!(next.size > low);
+                if failure != 0 {
+                    assert_eq!(a.path_mtu_info().unwrap(), before);
                     assert_eq!(next.size, probe.size);
                 }
             }

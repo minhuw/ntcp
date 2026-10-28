@@ -819,6 +819,15 @@ impl Pmtud {
     //# The most likely (and least serious) probe failure is due to the link experiencing congestion-related losses while probing. In this case, it is appropriate to retry a probe of the same size as soon as the Packetization Layer has fully adapted to the congestion and recovered from the losses. In other cases, additional losses or timeouts indicate problems with the link or Packetization Layer. In these situations, it is desirable to use longer delays depending on the severity of the error.
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.4
     //# The presence of other losses near the loss of the probe may indicate that the probe was lost due to congestion rather than due to an MTU limitation. In this case, the state variables eff_pmtu, search_low, and search_high SHOULD NOT be updated, and the same-sized probe SHOULD be attempted again as soon as the probing preconditions are met (i.e., once the packetization layer has no outstanding unrecovered losses). At this point, it is particularly appropriate to re-probe since the flow's congestion window will be at its lowest point, minimizing the probability of congestive losses.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-2
+    //= reason=Timeout/additional-loss completion supplies no failed-size ceiling and marks the outcome non-isolated, retaining normal congestion recovery. Receiver-driven IPv4/IPv6 NewReno/SACK/RACK with PRR on/off assert reduced window/threshold, one-MSS RTO response, unchanged bounds, repair-only output, cooldown exclusion and same-sized re-probing with available credit. Exact deadline tests retain the fivefold timeout hold and longer PTB holds; independent delivery, PTB, verification and black-hole evidence remain operative.
+    //# If there is a timeout or additional packets are lost during the probing process,
+    //# the probe is considered to be inconclusive (e.g., the lost probe does not
+    //# necessarily indicate that the probe exceeded the Path MTU). Furthermore, the
+    //# losses are treated like any other congestion indication: window or rate
+    //# adjustments are mandatory per the relevant congestion control standards
+    //# [RFC2914]. Probing can resume after a delay that is determined by the nature
+    //# of the detected failure.
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
         if self
             .repair_range
@@ -879,9 +888,9 @@ impl Pmtud {
                     end: p.trailing_end,
                     isolated: p.retried && !p.other_loss && !p.timeout,
                 });
-                if p.retried && !p.other_loss {
+                if p.retried && !p.other_loss && !p.timeout {
                     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
-                    //= reason=Wait for cumulative delivery of the trailing window and exclude every observed nearby retransmission. This bound update is independent of the one-shot congestion outcome.
+                    //= reason=Wait for cumulative delivery of the trailing window and exclude timeout or nearby loss. Only conclusive size evidence narrows this bound; congestion outcome consumption is separate.
                     //# In the absence of other indications, set search_high to the probe
                     //# size minus one.
                     self.record_upper_limit(p.size - 1);
@@ -889,11 +898,16 @@ impl Pmtud {
                     if self.info.current_mtu >= p.size {
                         self.info.current_mtu = self.info.search_low;
                     }
+                }
+                if p.retried && !p.other_loss {
+                    // Preserve the conservative finishing-ACK timeout hold even
+                    // when the probe supplies no conclusive size evidence.
                     self.delay(now, cooldown.saturating_mul(if p.timeout { 5 } else { 1 }));
                 } else if p.other_loss && !p.timeout && !self.reset_search {
                     self.deadline = None;
                 }
-                // Multiple/nearby losses are inconclusive; retain search bounds.
+                // Timeout and multiple/nearby loss are inconclusive; they supply
+                // no MTU ceiling. Independent delivery/verification still applies.
                 // Only the one-shot non-timeout isolated result may waive CC.
                 self.probe = None;
             }
@@ -1267,16 +1281,23 @@ mod tests {
             p.ack(end, 110, 1000, 1000);
             assert_eq!(p.info, before); // retry ACK cannot prove probe success
             p.ack(tail, 120, 1000, 1000);
-            if multiple {
-                assert_eq!(p.info, before);
-                assert_eq!(p.deadline, Some(5100)); // timeout retains its fivefold hold
-            } else {
-                assert_eq!(p.info.search_high, 1239);
-                assert_eq!(p.deadline, Some(5120));
-                p.tick(5120);
-                assert_eq!(p.info.search_high, 1239);
-                assert!(p.target().unwrap() < 1240);
-            }
+            assert_eq!(p.info, before);
+            assert!(!p.take_probe_outcome(tail).unwrap().isolated);
+            let deadline = if multiple { 5100 } else { 5120 };
+            assert_eq!(p.deadline, Some(deadline));
+            p.tick(deadline - 1);
+            assert!(p.target().is_none());
+            p.tick(deadline);
+            assert_eq!(p.info, before);
+            assert_eq!(p.target(), Some(1262));
+            // Independent, unambiguous ordinary delivery can still prove a
+            // larger lower bound after the inconclusive probe has completed.
+            let delivered = tail.wrapping_add(1360);
+            p.sent(tail, delivered, 1400, 20, false);
+            p.ack(delivered, deadline + 1, 1000, 1000);
+            assert_eq!(p.info.search_low, 1400);
+            assert_eq!(p.info.search_high, before.search_high);
+            assert_eq!(p.info.current_mtu, before.current_mtu);
         }
     }
 

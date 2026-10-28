@@ -92,9 +92,13 @@
       "id": "4821-012",
       "section": "2",
       "quote": "If there is a timeout or additional packets are lost during the probing process, the probe is considered to be inconclusive (e.g., the lost probe does not necessarily indicate that the probe exceeded the Path MTU). Furthermore, the losses are treated like any other congestion indication: window or rate adjustments are mandatory per the relevant congestion control standards [RFC2914]. Probing can resume after a delay that is determined by the nature of the detected failure.",
-      "status": "TODO",
-      "reason": "Mixed behavior/evidence gap: real receiver loss and repair-RTO traces now reach a subsequent emitted probe after normal congestion response and the longer timeout cooldown. Multiple-loss recovery preserves bounds, but timeout-only repair can still narrow search_high after trailing delivery in Pmtud::ack; pmtud_probe_timeout_cooldown_inconclusive_and_unambiguous_ack asserts that concrete difference from an inconclusive result. Retain the entire timeout-or-additional-loss obligation.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+      "status": "covered",
+      "reason": "Timeout/additional-loss completion supplies no failed-size ceiling and marks the outcome non-isolated, retaining normal congestion recovery. Receiver-driven IPv4/IPv6 NewReno/SACK/RACK with PRR on/off assert reduced window/threshold, one-MSS RTO response, unchanged bounds, repair-only output, cooldown exclusion and same-sized re-probing with available credit. Exact deadline tests retain the fivefold timeout hold and longer PTB holds; independent delivery, PTB, verification and black-hole evidence remain operative.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn probe_admission_real_loss_recovery_and_cooldown_output()"
+      ]
     },
     {
       "id": "4821-013",
@@ -1159,7 +1163,7 @@
       "section": "7.6",
       "quote": "When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.",
       "status": "TODO",
-      "reason": "Mixed full-list gap: real receiver traces now assert same-sized re-probing after multiple-loss recovery, failed/timeout cooldown output exclusion and subsequent admission. Matching-PTB isolated loss still commits normal congestion response at 139/142, and timeout-only repair can narrow search_high despite its inconclusive classification at 012. Those categorized-result differences keep the complete umbrella TODO.",
+      "reason": "Partial full-list gap: receiver-driven timeout and multiple-loss recovery preserve probe bounds, retain normal congestion response and emit same-sized re-probes after recovery, available credit and any cooldown. Matching-PTB isolated loss still commits normal congestion response at 139/142 because apply_ptb cancels probe classification. Retain the complete umbrella TODO until matching-PTB isolation is implemented and proven with finite delivery evidence and all congestion disqualifiers.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
     },
     {

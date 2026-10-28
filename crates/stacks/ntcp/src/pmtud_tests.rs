@@ -12,7 +12,11 @@ fn cfg(mtu: u32) -> ConnectionConfig {
     }
 }
 
-fn family_pair(mut cfg: ConnectionConfig, ipv4: bool, iss: u32) -> (Connection, Connection) {
+pub(super) fn family_pair(
+    mut cfg: ConnectionConfig,
+    ipv4: bool,
+    iss: u32,
+) -> (Connection, Connection) {
     let tuple = if ipv4 {
         tuple()
     } else {

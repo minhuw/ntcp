@@ -16,14 +16,6 @@ quote = '''
 The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.
 '''
 
-# 4821-012
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "Mixed behavior/evidence gap: real receiver loss and repair-RTO traces now reach a subsequent emitted probe after normal congestion response and the longer timeout cooldown. Multiple-loss recovery preserves bounds, but timeout-only repair can still narrow search_high after trailing delivery in Pmtud::ack; pmtud_probe_timeout_cooldown_inconclusive_and_unambiguous_ack asserts that concrete difference from an inconclusive result. Retain the entire timeout-or-additional-loss obligation."
-quote = '''
-If there is a timeout or additional packets are lost during the probing process, the probe is considered to be inconclusive (e.g., the lost probe does not necessarily indicate that the probe exceeded the Path MTU). Furthermore, the losses are treated like any other congestion indication: window or rate adjustments are mandatory per the relevant congestion control standards [RFC2914]. Probing can resume after a delay that is determined by the nature of the detected failure.
-'''
-
 # 4821-018
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
@@ -253,7 +245,7 @@ Protocols MAY delay sending non-probes in order to accumulate enough data to mee
 # 4821-136
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
-reason = "Mixed full-list gap: real receiver traces now assert same-sized re-probing after multiple-loss recovery, failed/timeout cooldown output exclusion and subsequent admission. Matching-PTB isolated loss still commits normal congestion response at 139/142, and timeout-only repair can narrow search_high despite its inconclusive classification at 012. Those categorized-result differences keep the complete umbrella TODO."
+reason = "Partial full-list gap: receiver-driven timeout and multiple-loss recovery preserve probe bounds, retain normal congestion response and emit same-sized re-probes after recovery, available credit and any cooldown. Matching-PTB isolated loss still commits normal congestion response at 139/142 because apply_ptb cancels probe classification. Retain the complete umbrella TODO until matching-PTB isolation is implemented and proven with finite delivery evidence and all congestion disqualifiers."
 quote = '''
 When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.
 '''
