@@ -1594,6 +1594,13 @@ impl Owner {
         s.readiness = bits;
         Ok(bits)
     }
+    //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2
+    //# The application only needs to enable the reception of Fast Open requests via a new TCP_FASTOPEN
+    //# setsockopt() socket option before listen().
+    //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2
+    //# Traditionally, accept() returns only after a socket is connected. But, for a Fast Open connection,
+    //# accept() returns upon receiving a SYN with a valid Fast Open cookie and data, and the data is
+    //# available to be read through, e.g., recvmsg(), read().
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
         if let Op::SetDestinationRoute(destination, policy) = op {
             if !unicast(destination) || destination.is_ipv4() != self.local.is_ipv4() {

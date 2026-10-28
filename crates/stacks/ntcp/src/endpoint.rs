@@ -1026,6 +1026,41 @@ impl Endpoint {
         )
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+    //# 2. The server generates a cookie and sends it through the Fast Open option of a SYN-ACK packet.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+    //# 2. The server validates the cookie: a. If the cookie is valid, the server sends a SYN-ACK
+    //# acknowledging both the SYN and the data. The server then delivers the data to the application. b.
+    //# Otherwise, the server drops the data and sends a SYN-ACK acknowledging only the SYN sequence number.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+    //# The Fast Open option is used to request or to send a Fast Open Cookie. When a cookie is not present
+    //# or is empty, the option is used by the client to request a cookie from the server. When the cookie
+    //# is present, the option is used to pass the cookie from the server to the client or from the client
+    //# back to the server (to perform a Fast Open).
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
+    //# PendingFastOpenRequests: tracks the number of TFO connections in SYN-RCVD state.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+    //# This SYN-ACK may contain a Fast Open option if the server currently supports TFO for this listener
+    //# port.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 1. Initialize and reset a local FastOpened flag. If FastOpenEnabled is false, go to step 5.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 2. If PendingFastOpenRequests is over the system limit, go to step 5.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 3. If IsCookieValid() (in Section 4.1.2) returns false, go to step 5.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 4. Buffer the data and notify the application. Set the FastOpened flag and increment
+    //# PendingFastOpenRequests.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 5. Send the SYN-ACK packet. The packet MAY include a Fast Open option. If the FastOpened flag is
+    //# set, the packet acknowledges the SYN and data sequence. Otherwise, it acknowledges only the SYN
+    //# sequence.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-5.1
+    //# To protect the server, it is important to limit the maximum number of total pending TFO connection
+    //# requests, i.e., PendingFastOpenRequests (Section 4.2). When the limit is exceeded, the server
+    //# temporarily disables TFO entirely as described in "Server Cookie Handling" (Section 4.1.2). Then,
+    //# subsequent TFO requests will be downgraded to regular connection requests, i.e., with the data
+    //# dropped and only SYNs acknowledged.
     fn new_connection_with_options(
         &mut self,
         tuple: Tuple,
@@ -1942,6 +1977,30 @@ impl Endpoint {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+    //# 3. The client caches the cookie for future TCP Fast Open connections (see below).
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
+    //# When caching cookies, we recommend that the client also cache the Maximum Segment Size (MSS)
+    //# advertised by the server. The client can cache the MSS advertised by the server in order to
+    //# determine the maximum amount of data that the client can fit in the SYN packet in subsequent TFO
+    //# connections.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
+    //# The client MUST cache negative responses from the server in order to avoid potential connection
+    //# failures.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 1. If the SYN-ACK has a Fast Open option, an MSS option, or both, update the corresponding cookie
+    //# and MSS information in the cookie cache.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# Upon receiving an ACK acknowledging the SYN sequence, the server decrements PendingFastOpenRequests
+    //# and advances to the ESTABLISHED state. No special handling is required further.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-5.1
+    //# For this reason, a TFO server needs to monitor the connections in SYN-RCVD being reset in addition
+    //# to imposing a reasonable max queue length. Implementations may combine the two, e.g., by continuing
+    //# to account for those connection requests that have just been reset against the listener's
+    //# PendingFastOpenRequests until a timeout period has passed.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-7.1
+    //# Moreover, the implementation is recommended to negatively cache such incidents to avoid recurring
+    //# timeouts.
     fn refresh(&mut self, index: usize) {
         // RFC 7413 §5.1: retain recent remote resets in admission accounting.
         // Sixty seconds and latest-reset batch retention are local policy.

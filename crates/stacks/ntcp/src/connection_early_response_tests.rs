@@ -96,6 +96,18 @@ fn acknowledge(a: &mut Connection, us: u64, count: u32, sacks: &[(u32, u32)]) {
     .unwrap();
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//# If the server accepts the data in the SYN packet, it may send the response data before the handshake
+//# finishes.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
+//= type=test
+//# The server keeps a FastOpened flag per connection to mark if a connection has successfully performed
+//# a TFO.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-5.2
+//= type=test
+//= reason=Default withholding is asserted alongside explicit opt-in early response; rejected erratum 6239 is not applied.
+//# The best defense is for the server not to respond with data until the handshake finishes.
 #[test]
 fn early_response_actual_gate_and_committed_synack() {
     assert!(!ConnectionConfig::default().fast_open_early_response);
@@ -305,6 +317,10 @@ fn early_response_window_boundary_small_windows_and_wrapped_iss() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# If the SYN-ACK timer fires, the server SHOULD retransmit a SYN-ACK segment with neither data nor
+//# Fast Open options for compatibility reasons.
 #[test]
 fn early_response_actual_syn_retry_anchor_and_ack_handoff() {
     for units in [1_000_000, 1_000_000_000] {
@@ -316,8 +332,26 @@ fn early_response_actual_syn_retry_anchor_and_ack_handoff() {
                     c.mss = 1012;
                     c.rto_min_us = 1;
                     let (_, mut a, syn) = opening(c, iss, true, b"request");
+                    let cookie = wire::FastOpenCookie::new(&[8; 8]).unwrap();
+                    a.passive_fast_open(Some(cookie), true);
+                    assert_eq!(a.state(), State::SynReceived);
+                    assert!(a.handshake_pending());
+                    assert_eq!(a.readable_bytes(), b"request".len());
                     a.write(&[42; 4000]).unwrap();
-                    emit_at_us(&mut a, 20_000, reserved);
+                    let first_bytes = emit_at_us(&mut a, 20_000, reserved);
+                    let first = wire::parse(ip(a.tuple()), &first_bytes).unwrap();
+                    let request = wire::parse(ip(reverse(tuple())), &syn).unwrap();
+                    assert_eq!(first.header.flags & (SYN | ACK), SYN | ACK);
+                    assert_eq!(first.header.sequence, iss);
+                    assert_eq!(
+                        first.header.acknowledgment,
+                        request
+                            .header
+                            .sequence
+                            .wrapping_add(1 + request.payload.len() as u32)
+                    );
+                    assert_eq!(first.options.fast_open, Some(cookie));
+                    assert!(first.payload.is_empty());
                     let anchor = a.rto_deadline.unwrap();
                     for us in [40_000, 50_000, 60_000, 70_000] {
                         emit_at_us(&mut a, us, reserved);
@@ -344,6 +378,9 @@ fn early_response_actual_syn_retry_anchor_and_ack_handoff() {
                     let us = a.config.timebase.us_from_ticks(deadline);
                     let retry = emit_at_us(&mut a, us, reserved);
                     let retry = wire::parse(ip(a.tuple()), &retry).unwrap();
+                    assert_eq!(retry.header.flags & (SYN | ACK), SYN | ACK);
+                    assert_eq!(retry.header.sequence, first.header.sequence);
+                    assert_eq!(retry.header.acknowledgment, first.header.acknowledgment);
                     assert!(retry.payload.is_empty() && retry.options.fast_open.is_none());
                     assert_eq!(a.rack.head_transmission(a.iss.wrapping_add(1)), head);
                     assert!(a.sack_post_rto.is_none());

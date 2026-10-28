@@ -44,6 +44,12 @@ pub struct FastOpenCookie {
 }
 
 impl FastOpenCookie {
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+    //= reason=Original published table interpreted with verified erratum 4238: Length 2 requests an empty cookie; nonempty cookies have even Length 6..18.
+    //# Kind 1 byte: value = 34 Length 1 byte: range 6 to 18 (bytes); limited by remaining space in the
+    //# options field. The number MUST be even. Cookie 0, or 4 to 16 bytes (Length - 2)
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+    //# The minimum cookie size is 4 bytes.
     pub fn new(bytes: &[u8]) -> Result<Self, WireError> {
         // RFC 7413 section 4.1.1, with verified errata 4238/4239:
         // length 2 requests a cookie; cookie-bearing lengths are even 6..=18.
@@ -181,6 +187,12 @@ fn pseudo_header_sum(ip: IpMetadata, len: u32) -> Result<u32, WireError> {
 //= https://www.rfc-editor.org/rfc/rfc2018#section-3
 //= reason=Wire codec recognizes the specified option kind; tests parse literal raw kind bytes and round-trip them.
 //# Kind: 5
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+//= reason=Verified erratum 4238 permits the empty Length 2 request; this published table is retained for provenance.
+//# Kind 1 byte: value = 34 Length 1 byte: range 6 to 18 (bytes); limited by remaining space in the
+//# options field. The number MUST be even. Cookie 0, or 4 to 16 bytes (Length - 2)
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+//# Although the diagram shows a cookie aligned on 32-bit boundaries, alignment is not required.
 fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
     let mut options = Options::default();
     let mut fast_open_seen = false;
@@ -1213,6 +1225,9 @@ mod tests {
         bytes
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+    //= type=test
+    //# The minimum cookie size is 4 bytes.
     #[test]
     fn fast_open_cookie_checked_value() {
         fn assert_value_traits<T: Copy + Eq + core::fmt::Debug>() {}
@@ -1233,6 +1248,14 @@ mod tests {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+    //= type=test
+    //= reason=Verified erratum 4238 permits empty requests of Length 2; the original table is retained and the corrected behavior is asserted.
+    //# Kind 1 byte: value = 34 Length 1 byte: range 6 to 18 (bytes); limited by remaining space in the
+    //# options field. The number MUST be even. Cookie 0, or 4 to 16 bytes (Length - 2)
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+    //= type=test
+    //# Although the diagram shows a cookie aligned on 32-bit boundaries, alignment is not required.
     #[test]
     fn fast_open_ipv4_ipv6_round_trip_and_syn_only() {
         for ip in ips() {

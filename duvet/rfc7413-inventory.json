@@ -1,0 +1,1767 @@
+{
+  "rfc": 7413,
+  "document_status": "Experimental",
+  "scope": "Full operative document: Fast Open wire formats, cookie policies/caches, endpoint procedures, fallback, admission/security, application/deployment actors and selected example socket APIs; verified errata are explicit interpretations of original published quotes",
+  "scope_kind": "full-operative",
+  "text_sha256": "ea094553d58f53df919071b597d3dd0ac1ab512e297271a89463101f8bf6eb16",
+  "errata_review": {
+    "authority": "https://errata.rfc-editor.org/rfc7413",
+    "verified": [
+      4238,
+      4239,
+      5373,
+      8013,
+      8016
+    ],
+    "held_for_document_update": [
+      8014,
+      8015,
+      8017
+    ],
+    "rejected": [
+      6239
+    ],
+    "policy": "Original published quotes are immutable. Verified technical corrections 4238/4239/5373 are explicit corrected-behavior interpretations; editorial corrections are recorded without changing quotes. Held and rejected errata are not silently applied. Held 8017 adds an optional SYN-ACK-data diagram; that coalescing alternative is unselected."
+  },
+  "section_sha256": {
+    "section-1": "845398ee759bf3203f591428cec15be0421cf37f2595c96eedb8f86abd44f39e",
+    "section-1.1": "93f55e382ddcb43e46fda8eb3b2faa7a85412baa4e0bcd86bc940a15a5791a9a",
+    "section-2": "0f8f9c762fb9a3840d65826eae657e65313a0c2bdeea41fa39718bfbc325de97",
+    "section-2.1": "18848f28758413ccbc157b3484e408f450cbda38412835d486814bc8d8dc8691",
+    "section-2.2": "a21357cf07cac9cd8f186a6548d6e4f60d36d2b05c0c3d2fc68049e30a427d86",
+    "section-3": "6e4370de9238fddc57cb6a2892a3de314f5750f12283321d6f2352f9c2c16eb7",
+    "section-4.1": "07f60e2d488dd746d61e685dd3b88a2ab599740c163e74ac2113512d4186b1b8",
+    "section-4.1.1": "4256d46ae3417bf408a0d1bc1cc9c9764a2b4a6a43faac0a5ba45cabbc0ead92",
+    "section-4.1.2": "7413b103a65d091c2a043cad0b9fdbd7749fa26f05e8928a726c58664995df35",
+    "section-4.1.3": "78e795d62e5f7a7b31a88845448d42ab5492b3ec1d3fe018cc9a524ece635551",
+    "section-4.1.3.1": "3c4b6469af12495206c0ac992bef486dd990bf2fc1368839c76277e785115e9d",
+    "section-4.2": "cbc00c7a54863412575f6726590cfdc3f4601c4bf3e89d654b417f6748869387",
+    "section-4.2.1": "2330be260ae0d83129b22f14d47728505bdbc329d151c7e91d0d3cb306827fc6",
+    "section-4.2.2": "0d6a4e1201aba371c1e84101b749f44bc3dc9756b168027a9b0742f077cebd8a",
+    "section-5": "7adc44bf0583a73ebb73a34acd754c764448b513ddab2b791a8ad418ffb062e9",
+    "section-5.1": "7f22da06cebd91608a2e4362dcbabf9d955067338777092c3e75e6d16ac22657",
+    "section-5.1.1": "cf0cf4df810f6fa5fe9adf9298e687eb37abac205cb2df8c6be9fc0e849ffbe3",
+    "section-5.2": "533984ee00b4459f9a7272f1a8f7f1f2f93028b700da34e51a6e3695cd79026d",
+    "section-6": "311a4b6aa07e93aeae285f04b93d1ee85497edab10836e281a2e7aa5a985c09f",
+    "section-6.1": "95faacf8de395b15e827f8fa06aaa010752869d95bb357015ce7f1baa45ccfab",
+    "section-6.2": "58feb0ee105b3ebdc704f2868c62145f15947feb8e52b30d6e8619d56a96c24d",
+    "section-6.3.1": "d5a00d5bf945f2949176ec2cad7cf4a5797cd2b7ba62582e480c6fa4e0ee08af",
+    "section-6.3.2": "bf1016a0d63255fb19fd1dda61995333273b3ba2882caa1a1f29df6559cefcf9",
+    "section-6.3.3": "3a0813881db0565e004ade3411a00b7b6c2be1fd727eff910608d109d0415ae1",
+    "section-6.3.4": "886e5b552ff240a110216f69ec0e80df8c11c389dc6ec3abcdc3d541de4173ad",
+    "section-7": "cc96ac995798f02cfd4470681a230e90d623c534c769b478be3e144d69cdb9d9",
+    "section-7.1": "b6b349182396ab3e86d1c36ec06492541e4d4dbff688e80f2d3f39f5b30e3542",
+    "section-7.2": "7d23a9eaa3d07e5e9d81925de2043f455b1610a928348062f8a0db076f835e71",
+    "section-7.3": "aa3907081f8eef5d58ef3ed52f8205d43c929f72f9ac4ae058840dc0c7e0f631",
+    "section-8.1": "20472c073e4813578e02baa45f369c730283faf103acf043ca0b02e87358c570",
+    "section-8.2": "681a63073c8d9bac259ddb9b07140471f5c8dd16a2dd057c5fee2e82502a86af",
+    "section-8.3": "1ed562ff477f4a3a3d31eb778761769b4a4c3b5c03146f8bb23ca533dedccde6",
+    "section-8.4": "86b23dcb82d8aaa4186c12e4ab04e49ab7c3d807026fac921f0dd68c1b6c8e2b",
+    "section-8.5": "b1424fedfe1699385df9c195e97c92bac7fa9407a034241a43b86b84930f9b0d",
+    "section-9": "18916504bfddbd5ba4be92de3b8b213f55c7a93e4a4f3d4c136628dc381c9832",
+    "section-10.1": "b59d99ff5ba55fbc88068bab4b5b405eaf507410a4bef0ffeabd079e60a53cb0",
+    "section-10.2": "c03f05f6af0901a02da0ca5c0a5cdc8c831fd3780f3661d2a863955d556e0c45",
+    "appendix-A.1": "8f5625ed68d871dfba784c1677936ac772dc2ba34f562676833ae13753a3986a",
+    "appendix-A.2": "b0b000045d431132da9be151f6b8dad00624120ee76ece219afa54920ffd4c69"
+  },
+  "paragraphs": [
+    {
+      "id": "7413-1-context-1",
+      "section": "1",
+      "quote": "TCP Fast Open (TFO) is an experimental update to TCP that enables data to be exchanged safely during TCP's connection handshake. This document describes a design that enables applications to save a round trip while avoiding severe security ramifications. At the core of TFO is a security cookie used by the server side to authenticate a client initiating a TFO connection. This document covers the details of exchanging data during TCP's initial handshake, the protocol for TFO cookies, potential new security vulnerabilities and their mitigation, and the new socket API. TFO is motivated by the performance needs of today's Web applications. Current TCP only permits data exchange after the three-way handshake (3WHS) [RFC793], which adds one RTT to network latency. For short Web transfers this additional RTT is a significant portion of overall network latency, even when HTTP persistent connection is widely used. For example, the Chrome browser [Chrome] keeps TCP connections idle for up to 5 minutes, but 35% of HTTP requests are made on new TCP connections [RCCJR11]. For such Web and Web-like applications, placing data in the SYN can yield significant latency improvements. Next we describe how we resolve the challenges that arise upon doing so.",
+      "status": "context",
+      "reason": "Introduction and performance motivation; operative exchange and security clauses are separately inventoried.",
+      "offset": 0
+    },
+    {
+      "id": "7413-1.1-context-1",
+      "section": "1.1",
+      "quote": "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL\", \"SHALL NOT\", \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in this document are to be interpreted as described in RFC 2119 [RFC2119]. \"TFO\" refers to TCP Fast Open. \"Client\" refers to TCP's active open side, and \"server\" refers to TCP's passive open side.",
+      "status": "context",
+      "reason": "BCP14 vocabulary and active/passive role definitions.",
+      "offset": 0
+    },
+    {
+      "id": "7413-2-context-1",
+      "section": "2",
+      "quote": "Standard TCP already allows data to be carried in SYN packets ([RFC793], Section 3.4) but forbids the receiver from delivering it to the application until the 3WHS is completed. This is because TCP's initial handshake serves to capture old or duplicate SYNs.",
+      "status": "context",
+      "reason": "TCP background, explanatory transition and applicability linkage; early-delivery permission, default-off and application evaluation have operative rows.",
+      "offset": 0
+    },
+    {
+      "id": "7413-early-delivery",
+      "section": "2",
+      "quote": "To enable applications to exchange data in a TCP handshake, TFO removes the constraint and allows data in SYN packets to be delivered to the application.",
+      "status": "covered",
+      "reason": "Selected TFO early receive permission: an authenticated SYN is readable while the child remains SYN-RECEIVED.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-2",
+      "offset": 259,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_fast_open(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-2-context-2",
+      "section": "2",
+      "quote": "This change to TCP semantic raises two issues (discussed in the following subsections) that make TFO unsuitable for certain applications. Therefore,",
+      "status": "context",
+      "reason": "TCP background, explanatory transition and applicability linkage; early-delivery permission, default-off and application evaluation have operative rows.",
+      "offset": 413
+    },
+    {
+      "id": "7413-original-1",
+      "section": "2",
+      "quote": "TCP implementations MUST NOT use TFO by default, but only use TFO if requested explicitly by the application on a per-service-port basis.",
+      "status": "covered",
+      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-2",
+      "offset": 562,
+      "original": true,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn set_listener_fast_open_early_data_policy(",
+        "crates/stacks/ntcp/src/fast_open_early_data_policy_tests.rs::fn cookie_less_authorization_matrix_ipv4_ipv6() {"
+      ]
+    },
+    {
+      "id": "7413-app-evaluate",
+      "section": "2",
+      "quote": "Applications need to evaluate TFO applicability as described in Section 6 before using TFO.",
+      "status": "exception",
+      "reason": "Application actor: replay tolerance and service suitability must be evaluated by the embedding application, which explicitly opts in; TCP cannot infer request idempotency.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-2",
+      "offset": 700
+    },
+    {
+      "id": "7413-2.1-context-1",
+      "section": "2.1",
+      "quote": "TFO allows data to be delivered to the application before the 3WHS is completed, thus opening itself to a data integrity issue in either of the two cases below: a) the receiver host receives data in a duplicate SYN after it has forgotten it received the original SYN (e.g., due to a reboot); b) the duplicate is received after the connection created by the original SYN has been closed and the close was initiated by the sender (so the receiver will not be protected by the TIME-WAIT 2 MSL state). The now obsoleted T/TCP [RFC1644] (obsoleted by [RFC6247]) attempted to address these issues. It was not successful and not deployed due to various vulnerabilities as described in Section 8, \"Related Work\". Rather than trying to capture all dubious SYN packets to make TFO 100% compatible with TCP semantics, we made a design decision early on to accept old SYN packets with data, i.e., to restrict TFO use to a class of applications (Section 6) that are tolerant of duplicate SYN packets with data. We believe this is the right design trade-off: balancing complexity with usefulness.",
+      "status": "context",
+      "reason": "Replay scenarios and explicit design rationale accepting duplicate SYN data; no transport replay-deduplication promise. Application opt-in/tolerance obligations appear in sections 2 and 6.1.",
+      "offset": 0
+    },
+    {
+      "id": "7413-2.2-context-1",
+      "section": "2.2",
+      "quote": "Standard TCP suffers from the SYN flood attack [RFC4987] because SYN packets with spoofed source IP addresses can easily fill up a listener's small queue, causing a service port to be blocked completely. TFO goes one step further to allow server-side TCP to send up data to the application layer before the 3WHS is completed. This opens up serious new vulnerabilities. Applications serving ports that have TFO enabled may waste lots of CPU and memory resources processing the requests and producing the responses. If the response is much larger than the request, the attacker can further mount an amplified reflection attack against victims of choice beyond the TFO server itself. Numerous mitigation techniques against regular SYN flood attacks exist and have been well documented [RFC4987]. Unfortunately, none are applicable to TFO. We propose a server-supplied cookie to mitigate these new vulnerabilities in Section 3 and evaluate the effectiveness of the defense in Section 7.",
+      "status": "context",
+      "reason": "Threat explanation and mitigation roadmap; not an additional prescribed SYN-flood algorithm.",
+      "offset": 0
+    },
+    {
+      "id": "7413-3-context-1",
+      "section": "3",
+      "quote": "The key component of TFO is the Fast Open Cookie (cookie), a message authentication code (MAC) tag generated by the server. The client requests a cookie in one regular TCP connection, then uses it for future TCP connections to exchange data during the 3WHS: Requesting a Fast Open Cookie:",
+      "status": "context",
+      "reason": "Exchange labels, explanatory temporal-locality rationale and illustrative sequence diagram. Every prose procedure step has an operative disposition.",
+      "offset": 0
+    },
+    {
+      "id": "7413-request-empty",
+      "section": "3",
+      "quote": "1. The client sends a SYN with a Fast Open option with an empty cookie field to request a cookie.",
+      "status": "covered",
+      "reason": "The cold active open emits a SYN with an empty Kind 34 Length 2 request (verified erratum 4239); the test examines actual endpoint bytes.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 289,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_cookie_request_length_and_both_timeout_fallbacks()"
+      ]
+    },
+    {
+      "id": "7413-request-server",
+      "section": "3",
+      "quote": "2. The server generates a cookie and sends it through the Fast Open option of a SYN-ACK packet.",
+      "status": "covered",
+      "reason": "An enabled authenticated listener issues a cookie in the SYN-ACK; the test inspects both directions of the actual request exchange.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 387,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_cookie_request_length_and_both_timeout_fallbacks()"
+      ]
+    },
+    {
+      "id": "7413-request-cache",
+      "section": "3",
+      "quote": "3. The client caches the cookie for future TCP Fast Open connections (see below).",
+      "status": "covered",
+      "reason": "The paired endpoint setup asserts the learned cache and its subsequent use for SYN data.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 483,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-3-context-2",
+      "section": "3",
+      "quote": "Performing TCP Fast Open:",
+      "status": "context",
+      "reason": "Exchange labels, explanatory temporal-locality rationale and illustrative sequence diagram. Every prose procedure step has an operative disposition.",
+      "offset": 565
+    },
+    {
+      "id": "7413-perform-syn",
+      "section": "3",
+      "quote": "1. The client sends a SYN with data and the cookie in the Fast Open option.",
+      "status": "covered",
+      "reason": "Warm endpoint emits a cookie-bearing SYN and early data; cold misses are separately audited.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 591,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-perform-validation",
+      "section": "3",
+      "quote": "2. The server validates the cookie: a. If the cookie is valid, the server sends a SYN-ACK acknowledging both the SYN and the data. The server then delivers the data to the application. b. Otherwise, the server drops the data and sends a SYN-ACK acknowledging only the SYN sequence number.",
+      "status": "covered",
+      "reason": "Both configured authentication policies, both IP families, invalid/request/valid cookies and exhausted quota assert early data admission and exact SYN-ACK acknowledgment.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 667,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn response_cookie_does_not_change_authentication_or_quota()"
+      ]
+    },
+    {
+      "id": "7413-3-context-3",
+      "section": "3",
+      "quote": "3.",
+      "status": "context",
+      "reason": "Exchange labels, explanatory temporal-locality rationale and illustrative sequence diagram. Every prose procedure step has an operative disposition.",
+      "offset": 956
+    },
+    {
+      "id": "7413-perform-response",
+      "section": "3",
+      "quote": "If the server accepts the data in the SYN packet, it may send the response data before the handshake finishes.",
+      "status": "covered",
+      "reason": "Selected optional early responses require explicit configuration and authenticated early receive; tests assert the gate and on-wire response before handshake completion.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 959,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn early_response_eligible(",
+        "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_actual_gate_and_committed_synack()"
+      ]
+    },
+    {
+      "id": "7413-perform-cc",
+      "section": "3",
+      "quote": "The maximum amount is governed by TCP's congestion control [RFC5681].",
+      "status": "TODO",
+      "reason": "Early response cap tests cover selected IW10 settings and source applies min(initial_window, cwnd, peer window). Complete evidence across all supported initial-window/congestion-controller configurations for this reference is not attached; no universal RFC5681 closure is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 1070
+    },
+    {
+      "id": "7413-perform-ack-repair",
+      "section": "3",
+      "quote": "4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not acknowledged, the client retransmits the data in the ACK packet.",
+      "status": "TODO",
+      "reason": "Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 1140,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn establish(",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn syn_data_ack_bounds_wrap_partial_retry_and_flush()",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn scalar_fast_open_repair_stops_at_negotiated_cwnd()",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn reserved_fast_open_repair_stops_at_negotiated_cwnd()"
+      ]
+    },
+    {
+      "id": "7413-perform-normal-and-expiry",
+      "section": "3",
+      "quote": "5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).",
+      "status": "TODO",
+      "reason": "Ordinary TCP tests and repeated Fast Open are present, but the whole quoted lifecycle includes server expiration. LinuxSipHash24 intentionally ignores epoch and has no built-in expiry or enforced key-rotation contract. Default HMAC expires after current/previous epochs; that does not establish this clause for Linux mode.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
+      "offset": 1303
+    },
+    {
+      "id": "7413-3-context-4",
+      "section": "3",
+      "quote": "Thus, TFO is useful for applications that have temporal locality on client and server connections. Requesting Fast Open Cookie in connection 1: TCP A (Client) TCP B (Server) ______________ ______________ CLOSED LISTEN #1 SYN-SENT ----- <SYN,CookieOpt=NIL> ----------> SYN-RCVD #2 ESTABLISHED <---- <SYN,ACK,CookieOpt=C> ---------- SYN-RCVD (caches cookie C) Performing TCP Fast Open in connection 2: TCP A (Client) TCP B (Server) ______________ ______________ CLOSED LISTEN #1 SYN-SENT ----- <SYN=x,CookieOpt=C,DATA_A> ----> SYN-RCVD #2 ESTABLISHED <---- <SYN=y,ACK=x+len(DATA_A)+1> ---- SYN-RCVD #3 ESTABLISHED <---- <ACK=x+len(DATA_A)+1,DATA_B>---- SYN-RCVD #4 ESTABLISHED ----- <ACK=y+1>--------------------> ESTABLISHED #5 ESTABLISHED --- <ACK=y+len(DATA_B)+1>----------> ESTABLISHED",
+      "status": "context",
+      "reason": "Exchange labels, explanatory temporal-locality rationale and illustrative sequence diagram. Every prose procedure step has an operative disposition.",
+      "offset": 1491
+    },
+    {
+      "id": "7413-4.1-context-1",
+      "section": "4.1",
+      "quote": "The Fast Open Cookie is designed to mitigate new security vulnerabilities in order to enable data exchange during a handshake.",
+      "status": "context",
+      "reason": "Cookie security purpose; the opaque-MAC/cache and revocation statements have operative rows.",
+      "offset": 0
+    },
+    {
+      "id": "7413-opaque-mac-cache",
+      "section": "4.1",
+      "quote": "The cookie is a MAC tag generated by the server and is opaque to the client; the client simply caches the cookie and passes it back on subsequent SYN packets to open new connections.",
+      "status": "TODO",
+      "reason": "Source implements opaque address MACs and client round trips, but no single attached source/test evidence pair establishes this entire compound design statement for both supported server policies and learned/supplied client paths.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1",
+      "offset": 127
+    },
+    {
+      "id": "7413-expire-any-time",
+      "section": "4.1",
+      "quote": "The server can expire the cookie at any time to enhance security.",
+      "status": "TODO",
+      "reason": "Key-policy replacement can revoke Linux cookies and HMAC advances epochs, but there is no attached complete test of arbitrary server revocation for every supported configuration. This permission is selected through policy setters; it is not an external-rotation closure.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1",
+      "offset": 310
+    },
+    {
+      "id": "7413-4.1.1-context-1",
+      "section": "4.1.1",
+      "quote": "+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ | Kind | Length | +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ | | ~ Cookie ~ | | +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+",
+      "status": "context",
+      "reason": "Option diagram; option format, request/echo semantics, alignment and invalid-option obligations have operative rows.",
+      "offset": 0
+    },
+    {
+      "id": "7413-option-layout",
+      "section": "4.1.1",
+      "quote": "Kind 1 byte: value = 34 Length 1 byte: range 6 to 18 (bytes); limited by remaining space in the options field. The number MUST be even. Cookie 0, or 4 to 16 bytes (Length - 2)",
+      "status": "covered",
+      "reason": "Interpreted with verified Technical erratum 4238 (2015-11-02): published range 6..18 excludes the empty request; corrected range 2..18 still permits only 0 or even 4..16 cookie bytes. The original published table is retained. Tests assert exact Kind/Length, all valid lengths and all alignments for IPv4/IPv6 SYN and SYN-ACK. This is corrected-wire evidence, not literal satisfaction of the unmodified range.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1",
+      "offset": 203,
+      "errata": [
+        4238
+      ],
+      "interpretation": "Verified erratum 4238: Length 2 for an empty request; cookie-bearing lengths even 6..18.",
+      "evidence": [
+        "crates/stacks/ntcp/src/wire.rs::fn read_options(",
+        "crates/stacks/ntcp/src/wire.rs::fn fast_open_ipv4_ipv6_round_trip_and_syn_only()"
+      ]
+    },
+    {
+      "id": "7413-option-purpose",
+      "section": "4.1.1",
+      "quote": "The Fast Open option is used to request or to send a Fast Open Cookie. When a cookie is not present or is empty, the option is used by the client to request a cookie from the server. When the cookie is present, the option is used to pass the cookie from the server to the client or from the client back to the server (to perform a Fast Open).",
+      "status": "covered",
+      "reason": "The paired exchange requests, issues, caches and echoes an opaque cookie; assertions cover the initial empty request, server cookie and subsequent client data admission.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1",
+      "offset": 379,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-minimum-nonempty-cookie",
+      "section": "4.1.1",
+      "quote": "The minimum cookie size is 4 bytes.",
+      "status": "covered",
+      "reason": "Nonempty cookies have at least four bytes; the zero-byte request is the explicit empty alternative clarified by verified erratum 4238. Tests reject sizes 1..3 and all odd/nonrepresentable lengths.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1",
+      "offset": 722,
+      "errata": [
+        4238
+      ],
+      "evidence": [
+        "crates/stacks/ntcp/src/wire.rs::pub fn new(bytes: &[u8])",
+        "crates/stacks/ntcp/src/wire.rs::fn fast_open_cookie_checked_value()"
+      ]
+    },
+    {
+      "id": "7413-unaligned-cookie",
+      "section": "4.1.1",
+      "quote": "Although the diagram shows a cookie aligned on 32-bit boundaries, alignment is not required.",
+      "status": "covered",
+      "reason": "Wire tests round-trip every valid cookie length at each of the four byte alignments, for both IP families.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1",
+      "offset": 758,
+      "evidence": [
+        "crates/stacks/ntcp/src/wire.rs::fn read_options(",
+        "crates/stacks/ntcp/src/wire.rs::fn fast_open_ipv4_ipv6_round_trip_and_syn_only()"
+      ]
+    },
+    {
+      "id": "7413-ignore-invalid-and-nonsyn",
+      "section": "4.1.1",
+      "quote": "Options with invalid Length values or without the SYN flag set MUST be ignored.",
+      "status": "TODO",
+      "reason": "Bounded invalid Kind 34 lengths and all non-SYN cookie metadata are ignored. Structurally malformed TLVs (Length 0/1, missing length or overrun) reject the entire TCP segment with InvalidOption rather than literally ignoring the option; existing wire boundary tests assert that behavior. Full published wording is retained, with no blanket closure from the bounded cases.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1",
+      "offset": 851
+    },
+    {
+      "id": "7413-server-mac-properties",
+      "section": "4.1.2",
+      "quote": "The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use \"SHOULD\" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.",
+      "status": "TODO",
+      "reason": "Server-selected HMAC/SipHash authenticate addresses and protected services explicitly bypass cookies. The complete SHOULD property set additionally includes relative generation/verification cost and timed expiration, neither established for all supported policies; individual properties are separately dispositioned.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 0
+    },
+    {
+      "id": "7413-mac-address",
+      "section": "4.1.2",
+      "quote": "1. The cookie authenticates the client's (source) IP address of the SYN packet. The IP address may be an IPv4 or IPv6 address.",
+      "status": "covered",
+      "reason": "Both server authentication policies bind the client IP (and server IP), tested with changed addresses in both families.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 234,
+      "evidence": [
+        "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn valid(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn rfc7413_cookie_policies_authenticate_addresses_and_secret()"
+      ]
+    },
+    {
+      "id": "7413-mac-secret",
+      "section": "4.1.2",
+      "quote": "2. The cookie can only be generated by the server and cannot be fabricated by any other parties, including the client.",
+      "status": "covered",
+      "reason": "HMAC-SHA256 and SipHash-2-4 require the server secret/key; tests reject a changed key and bit-flipped cookie for each policy and IP family. This is algorithm/key-boundary evidence, not a claim that finite tests prove cryptographic unforgeability.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 361,
+      "evidence": [
+        "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn valid(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn rfc7413_cookie_policies_authenticate_addresses_and_secret()"
+      ]
+    },
+    {
+      "id": "7413-mac-cost",
+      "section": "4.1.2",
+      "quote": "3. The generation and verification are fast relative to the rest of SYN and SYN-ACK processing.",
+      "status": "TODO",
+      "reason": "No executable benchmark establishes relative MAC generation/verification cost against the rest of SYN/SYN-ACK processing for either policy; functional tests cannot prove this performance property.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 480
+    },
+    {
+      "id": "7413-mac-extra-multiple",
+      "section": "4.1.2",
+      "quote": "4. A server may encode other information in the cookie and accept more than one valid cookie per client at any given time. But this is server-implementation dependent and transparent to the client.",
+      "status": "TODO",
+      "reason": "HMAC accepts current and previous epoch cookies; Linux accepts one address/key cookie. Optional extra metadata is unselected, but no complete attached assertion establishes multi-cookie acceptance and client transparency for the selected HMAC alternative together. This optional selected capability remains an evidence TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 576
+    },
+    {
+      "id": "7413-mac-expiration",
+      "section": "4.1.2",
+      "quote": "5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the \"Security Considerations\" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.",
+      "status": "TODO",
+      "reason": "Default HMAC authenticates current/previous time epochs and rejects older cookies (default_policy_preserves_hmac_epochs_and_addresses). Opt-in LinuxSipHash24 uses one fixed key and ignores epoch (openssl_linux_vectors_and_validation_boundaries explicitly accepts u64::MAX). There is no enforced timed rotation/expiration for that supported mode. External rotation is available but cannot close timed expiration without an independently established policy.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 774,
+      "evidence": [
+        "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn valid(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn openssl_linux_vectors_and_validation_boundaries()"
+      ]
+    },
+    {
+      "id": "7413-rolling-keys",
+      "section": "4.1.2",
+      "quote": "To gradually invalidate cookies over time, the server can implement key rotation to generate and verify cookies using multiple keys. This approach is useful for large-scale servers to retain Fast Open rolling key updates. We do not specify a particular mechanism because the implementation is server specific.",
+      "status": "exception",
+      "reason": "Unselected optional rolling multiple-key mechanism: HMAC versions the MAC input with time epochs using one secret; LinuxSipHash24 has one replaceable key. This paragraph permits a deployment-specific alternative and prescribes no particular rotation mechanism. Timed expiration itself remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 1069
+    },
+    {
+      "id": "7413-4.1.2-context-1",
+      "section": "4.1.2",
+      "quote": "The server supports the cookie-generation and verification operations:",
+      "status": "context",
+      "reason": "Procedure introduction; all MAC properties, operations, expiry and optional implementation choices have operative rows.",
+      "offset": 1379
+    },
+    {
+      "id": "7413-get-cookie",
+      "section": "4.1.2",
+      "quote": "- GetCookie(IP_Address): returns a (new) cookie.",
+      "status": "covered",
+      "reason": "Both authentication policies generate opaque cookies for IPv4 and IPv6; the authentication boundary test issues them and verifies the independently changed inputs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 1450,
+      "evidence": [
+        "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn issue(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn rfc7413_cookie_policies_authenticate_addresses_and_secret()"
+      ]
+    },
+    {
+      "id": "7413-is-cookie-valid",
+      "section": "4.1.2",
+      "quote": "- IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.",
+      "status": "TODO",
+      "reason": "Address authentication is implemented for both MAC policies, but unexpired validity is not assured by LinuxSipHash24: it has no timed expiry. HMAC current/previous epoch validity does not close this compound operation for all selected policies.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 1499
+    },
+    {
+      "id": "7413-aes-example",
+      "section": "4.1.2",
+      "quote": "Example Implementation: a simple implementation is to use AES_128 to encrypt the IPv4 (with padding) or IPv6 address and truncate to 64 bits. The server can periodically update the key to expire the cookies. AES encryption on recent processors is fast and takes only a few hundred nanoseconds [RCCJR11].",
+      "status": "exception",
+      "reason": "Unselected example algorithm: the implementation deliberately uses HMAC-SHA256 or opt-in Linux SipHash-2-4, not AES_128 address encryption. The example is not a mandatory cipher choice; expiration is audited independently.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 1644
+    },
+    {
+      "id": "7413-single-cookie-compare",
+      "section": "4.1.2",
+      "quote": "If only one valid cookie is allowed per IP, and the server can regenerate the cookie independently, the best validation process is to simply regenerate a valid cookie and compare it against the incoming cookie. In that case, if the incoming cookie fails the check, a valid cookie is readily available to be sent to the client.",
+      "status": "covered",
+      "reason": "Conditional single-cookie implementation applies to LinuxSipHash24: it regenerates and constant-time compares the address cookie. The policy matrix checks that an invalid cookie receives the expected generated replacement while valid Linux cookies omit refresh. HMAC multiple epochs do not meet this conditional antecedent.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
+      "offset": 1948,
+      "evidence": [
+        "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn valid(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn response_cookie_does_not_change_authentication_or_quota()"
+      ]
+    },
+    {
+      "id": "7413-cookie-cache-pair",
+      "section": "4.1.3",
+      "quote": "The client MUST cache cookies from servers for later Fast Open connections. For a multihomed client, the cookies are dependent on the client and server IP addresses. Hence, the client should cache at most one (most recently received) cookie per client and server IP address pair.",
+      "status": "covered",
+      "reason": "Cache learn replaces the address-pair entry with the newest observation; tests exercise both IP families, separate local/remote pairs, replacement and independent MSS/credential age.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3",
+      "offset": 0,
+      "evidence": [
+        "crates/stacks/ntcp/src/fast_open.rs::pub fn learn(",
+        "crates/stacks/ntcp/src/fast_open.rs::fn mss_only_update_preserves_credential_age_and_address_scope()"
+      ]
+    },
+    {
+      "id": "7413-mss-cache",
+      "section": "4.1.3",
+      "quote": "When caching cookies, we recommend that the client also cache the Maximum Segment Size (MSS) advertised by the server. The client can cache the MSS advertised by the server in order to determine the maximum amount of data that the client can fit in the SYN packet in subsequent TFO connections.",
+      "status": "covered",
+      "reason": "Validated SYN-ACK cookies and MSS are cached independently; subsequent SYN admission changes from learned 1460 to 940 minus the reserved option budget without inventing a credential from invalid/empty options. Tests cover IPv4/IPv6.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3",
+      "offset": 280,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_validated_mss_without_cookie_replacement()"
+      ]
+    },
+    {
+      "id": "7413-4.1.3-context-1",
+      "section": "4.1.3",
+      "quote": "Caching the server MSS is useful because, with Fast Open, a client sends data in the SYN packet before the server announces its MSS in the SYN-ACK packet. If the client sends more data in the SYN packet than the server will accept, this will likely require the client to retransmit some or all of the data. Hence, caching the server MSS can enhance performance.",
+      "status": "context",
+      "reason": "MSS caching performance rationale, known small-MSS receiver caveat and large SYN/middlebox/fragmentation risks. Cache limits and optional typical-size clamp have operative rows.",
+      "offset": 575
+    },
+    {
+      "id": "7413-original-6",
+      "section": "4.1.3",
+      "quote": "Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].",
+      "status": "covered",
+      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3",
+      "offset": 937,
+      "original": true,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn prepare_fast_open_with_server_cookie(",
+        "crates/stacks/ntcp/src/fast_open_server_cookie_tests.rs::fn supplied_cookie_cold_limits_options_and_real_mss_learning() {"
+      ]
+    },
+    {
+      "id": "7413-4.1.3-context-2",
+      "section": "4.1.3",
+      "quote": "Even if the client complies with this limit when sending the SYN, it is known that an IPv4 receiver advertising an MSS less than 536 bytes can receive a segment larger than it is expecting. If the cached MSS is larger than the typical size (1460 bytes for IPv4 or 1440 bytes for IPv6), then the excess data in the SYN packet may cause problems that offset the performance benefit of Fast Open. For example, the unusually large SYN may trigger IP fragmentation and may confuse firewalls or middleboxes, causing SYN retransmission and other side effects.",
+      "status": "context",
+      "reason": "MSS caching performance rationale, known small-MSS receiver caveat and large SYN/middlebox/fragmentation risks. Cache limits and optional typical-size clamp have operative rows.",
+      "offset": 1100
+    },
+    {
+      "id": "7413-typical-mss-cap",
+      "section": "4.1.3",
+      "quote": "Therefore, the client MAY limit the cached MSS to 1460 bytes for IPv4 or 1440 for IPv6.",
+      "status": "exception",
+      "reason": "Unselected optional fixed typical-MSS clamp. The implementation instead uses configured local/user/path limits and the cached peer MSS. This permission does not require a universal 1460/1440 cap.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3",
+      "offset": 1653
+    },
+    {
+      "id": "7413-negative-cache",
+      "section": "4.1.3.1",
+      "quote": "The client MUST cache negative responses from the server in order to avoid potential connection failures.",
+      "status": "covered",
+      "reason": "Actual unacknowledged SYN data, ICMP error and SYN timeout each suppress subsequent attempts without erasing the positive cookie; one common boundary test asserts all three causes in both IP families.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1",
+      "offset": 0,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_negative_causes_keep_cookie_and_suppress_service()"
+      ]
+    },
+    {
+      "id": "7413-negative-causes",
+      "section": "4.1.3.1",
+      "quote": "Negative responses include the server not acknowledging the data in the SYN, ICMP error messages, and (most importantly) no response (SYN-ACK) from the server at all, i.e., connection timeout.",
+      "status": "covered",
+      "reason": "The test injects SYN-only ACK, validated ICMP and committed SYN-data timeout, then checks ordinary retry admission for the failed service with a changed client port.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1",
+      "offset": 106,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn report_fast_open_failure(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_negative_causes_keep_cookie_and_suppress_service()"
+      ]
+    },
+    {
+      "id": "7413-4.1.3.1-context-1",
+      "section": "4.1.3.1",
+      "quote": "The last case is likely due to incompatible middleboxes or firewall blocking the connection completely after processing the SYN packet with data. If the client does not react to these negative responses and continues to retry Fast Open, the client may never be able to connect to the specific server.",
+      "status": "context",
+      "reason": "Negative-response failure motivation; all specified causes, cache and path-suppression advice have operative rows.",
+      "offset": 299
+    },
+    {
+      "id": "7413-negative-scope",
+      "section": "4.1.3.1",
+      "quote": "For any negative responses, the client SHOULD disable Fast Open on the specific path (the source and destination IP addresses and ports) at least temporarily. Since TFO is enabled on a per-service-port basis, but cookies are independent of service ports, the client's cache should include remote port numbers, too.",
+      "status": "covered",
+      "reason": "Interpreted with verified Technical erratum 5373 (2018-06-14): source IP, destination IP and destination port key the failure, independent of client source port. Tests change the source port for retry and keep another remote service eligible; positive cookie caching remains IP-pair scoped. Original published quote is retained; literal source-port matching is not claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1",
+      "offset": 600,
+      "errata": [
+        5373
+      ],
+      "interpretation": "Verified erratum 5373 removes the source port from negative-path cache matching.",
+      "evidence": [
+        "crates/stacks/ntcp/src/fast_open.rs::pub fn suppressed(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_negative_causes_keep_cookie_and_suppress_service()"
+      ]
+    },
+    {
+      "id": "7413-compatibility",
+      "section": "4.2",
+      "quote": "One predominant requirement of TFO is to be fully compatible with existing TCP implementations, on both the client and server sides.",
+      "status": "TODO",
+      "reason": "Ordinary TCP fallback and selected peer encodings are tested, but no complete interoperability evidence establishes compatibility with every existing client/server TCP implementation. This broad goal is not closed by a few successful handshakes.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2",
+      "offset": 0
+    },
+    {
+      "id": "7413-4.2-context-1",
+      "section": "4.2",
+      "quote": "The server keeps two variables per listening socket (IP address and port):",
+      "status": "context",
+      "reason": "Variable introduction and security rationale. Per-listener enablement/pending accounting and per-connection flag have operative rows. Verified editorial erratum 8013 adds \"against\" without changing obligations.",
+      "offset": 133
+    },
+    {
+      "id": "7413-original-2",
+      "section": "4.2",
+      "quote": "FastOpenEnabled: default is off. It MUST be turned on explicitly by the application. When this flag is off, the server does not perform any TFO-related operations and MUST ignore all cookie options.",
+      "status": "covered",
+      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2",
+      "offset": 208,
+      "original": true,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn set_listener_fast_open_early_data_policy(",
+        "crates/stacks/ntcp/src/fast_open_early_data_policy_tests.rs::fn cookie_less_authorization_matrix_ipv4_ipv6() {"
+      ]
+    },
+    {
+      "id": "7413-pending-tracking",
+      "section": "4.2",
+      "quote": "PendingFastOpenRequests: tracks the number of TFO connections in SYN-RCVD state.",
+      "status": "covered",
+      "reason": "Generation-bound early ownership is counted until handshake completion; accepting and reading do not release quota, while the final ACK admits the next early child.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2",
+      "offset": 407,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-original-3",
+      "section": "4.2",
+      "quote": "If this variable goes over a preset system limit, the server MUST disable TFO for all new connection requests until PendingFastOpenRequests drops below the system limit.",
+      "status": "covered",
+      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2",
+      "offset": 488,
+      "original": true,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::accept_syn_data =",
+        "crates/stacks/ntcp/src/fast_open_early_data_policy_tests.rs::fn cookieless_accept_and_read_do_not_release_pending_quota_or_reset_debt() {"
+      ]
+    },
+    {
+      "id": "7413-4.2-context-2",
+      "section": "4.2",
+      "quote": "This variable is used for defending some vulnerabilities discussed in the \"Security Considerations\" section (Section 5).",
+      "status": "context",
+      "reason": "Variable introduction and security rationale. Per-listener enablement/pending accounting and per-connection flag have operative rows. Verified editorial erratum 8013 adds \"against\" without changing obligations.",
+      "offset": 658
+    },
+    {
+      "id": "7413-connection-flag",
+      "section": "4.2",
+      "quote": "The server keeps a FastOpened flag per connection to mark if a connection has successfully performed a TFO.",
+      "status": "covered",
+      "reason": "passive_fast_open stores early authorization per connection; the gate test distinguishes authenticated/unauthorized and enabled/disabled early responses while the handshake is pending.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2",
+      "offset": 779,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_fast_open(",
+        "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_actual_gate_and_committed_synack()"
+      ]
+    },
+    {
+      "id": "7413-first-request",
+      "section": "4.2.1",
+      "quote": "Any client attempting TFO MUST first request a cookie from the server with the following steps:",
+      "status": "exception",
+      "reason": "Ordinary cookie clients request or explicitly supply a cookie obtained from the target server. Explicit ApplicationProtected selects the independently protected service alternative in section 7.3, so that selected optional mode does not first acquire a cookie. This exception does not excuse missing ordinary-path procedure evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
+      "offset": 0
+    },
+    {
+      "id": "7413-length-erratum",
+      "section": "4.2.1",
+      "quote": "1. The client sends a SYN packet with a Fast Open option with a Length field of 0 (empty cookie field).",
+      "status": "covered",
+      "reason": "Published Length 0 is invalid; verified Technical erratum 4239 (2015-10-31) corrects it to Length 2. Original text is preserved for provenance. The actual cold endpoint SYN and wire tests assert Kind 34 Length 2; no literal implementation of or evidence for Length 0 is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
+      "offset": 96,
+      "errata": [
+        4239
+      ],
+      "interpretation": "Verified erratum 4239: replace Length 0 with Length 2 for an empty-cookie request.",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_cookie_request_length_and_both_timeout_fallbacks()"
+      ]
+    },
+    {
+      "id": "7413-request-server-properties",
+      "section": "4.2.1",
+      "quote": "2. The server responds with a SYN-ACK based on the procedures in the \"Server Cookie Handling\" section (Section 4.1.2).",
+      "status": "TODO",
+      "reason": "Request/response cookies are implemented and tested, but the reference imports section 4.1.2 properties, including expiration absent from Linux single-key policy and unmeasured relative generation cost. This compound cross-reference remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
+      "offset": 200
+    },
+    {
+      "id": "7413-request-listener-option",
+      "section": "4.2.1",
+      "quote": "This SYN-ACK may contain a Fast Open option if the server currently supports TFO for this listener port.",
+      "status": "covered",
+      "reason": "Enabled listeners issue replacement cookies for empty/invalid requests; default/disabled listeners emit none. The request test examines the selected enabled optional response.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
+      "offset": 319,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_cookie_request_length_and_both_timeout_fallbacks()"
+      ]
+    },
+    {
+      "id": "7413-request-cache-spurious",
+      "section": "4.2.1",
+      "quote": "3. If the SYN-ACK has a Fast Open option with a cookie, the client replaces the cookie and other information as described in the \"Client Cookie Handling\" section (Section 4.1.3). Otherwise, if the SYN-ACK is first seen and not a (spurious) retransmission, the client MAY remove the server information from the cookie cache. If the SYN-ACK is a spurious retransmission, the client does nothing to the cookie cache for the reasons below.",
+      "status": "TODO",
+      "reason": "Positive/absent/malformed cookie and MSS updates are tested; the unselected MAY deletion is not required. No complete test asserts that a spurious retransmitted SYN-ACK leaves all cookie/MSS cache information unchanged, including while a different connection updates the same address pair. Calling normal SYN-ACK processing is insufficient evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
+      "offset": 424
+    },
+    {
+      "id": "7413-4.2.1-context-1",
+      "section": "4.2.1",
+      "quote": "The network or servers may drop the SYN or SYN-ACK packets with the new cookie options, which will cause SYN or SYN-ACK timeouts.",
+      "status": "context",
+      "reason": "Loss/timeout rationale and heuristic roadmap. Held editorial erratum 8014 is not applied; fallback can complete an ordinary connection without obtaining a cookie. All request steps and retransmission/retry advice have operative rows.",
+      "offset": 860
+    },
+    {
+      "id": "7413-request-timeout-fallback",
+      "section": "4.2.1",
+      "quote": "We RECOMMEND both the client and the server to retransmit SYN and SYN-ACK packets without the cookie options on timeouts.",
+      "status": "covered",
+      "reason": "Actual request SYN timeout and cookie-bearing server SYN-ACK timeout each emit their original sequence/ACK with no cookie or data. Verified erratum 8014 is not claimed: it is Held for Document Update and only concerns the explanatory outcome wording.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
+      "offset": 990,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_cookie_request_length_and_both_timeout_fallbacks()"
+      ]
+    },
+    {
+      "id": "7413-4.2.1-context-2",
+      "section": "4.2.1",
+      "quote": "This ensures the connections of cookie requests will go through and lowers the latency penalty (of dropped SYN/SYN-ACK packets). The obvious downside for maximum compatibility is that any regular SYN drop will fail the cookie (although one can argue the delay in the data transmission until after the 3WHS is justified if the SYN drop is due to network congestion). The next section describes a heuristic to detect such drops when the client receives the SYN-ACK.",
+      "status": "context",
+      "reason": "Loss/timeout rationale and heuristic roadmap. Held editorial erratum 8014 is not applied; fallback can complete an ordinary connection without obtaining a cookie. All request steps and retransmission/retry advice have operative rows.",
+      "offset": 1112
+    },
+    {
+      "id": "7413-request-retry-period",
+      "section": "4.2.1",
+      "quote": "We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.",
+      "status": "TODO",
+      "reason": "Request-only first RTO falls back locally and a successful bare-SYN fallback permits an immediate new request (cookie_request_first_timeout_success_preserves_next_attempt). Only another committed timeout, ICMP or terminal timeout suppresses the service. That deliberate ambiguity policy is not literal suppression after every failed cookie request; retain the recommendation as unresolved.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
+      "offset": 1576
+    },
+    {
+      "id": "7413-reuse-until-expired",
+      "section": "4.2.2",
+      "quote": "Once the client obtains the cookie from the target server, it can perform subsequent TFO connections until the cookie is expired by the server.",
+      "status": "TODO",
+      "reason": "Repeated ordinary Fast Open is implemented, but the complete quoted reuse lifetime depends on server expiration. HMAC current/previous epochs expire credentials; LinuxSipHash24 has no enforced timed expiration or independent rotation contract, so the full selected-policy obligation remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 0
+    },
+    {
+      "id": "7413-4.2.2-context-1",
+      "section": "4.2.2",
+      "quote": "Client: Sending SYN",
+      "status": "context",
+      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "offset": 144
+    },
+    {
+      "id": "7413-original-5",
+      "section": "4.2.2",
+      "quote": "To open a TFO connection, the client MUST have obtained a cookie from the server:",
+      "status": "exception",
+      "reason": "Scope exception only for explicit FastOpenClientPolicy::ApplicationProtected with independent target-service agreement under section7.3. This user-selected Linux-compatible alternative sends SYN data with no FO option; it does not claim acquisition of a cookie. RequireCookie remains the default and existing supplied/learned credential APIs retain ordinary exchange. Cold536/1220 peer MSS, actual SYN departure/ACK validation, memory limits, retries and negative-response suppression remain authoritative. Native paired-endpoint, mode/default/peer-scoped socket and reserved-departure tests cover the alternative.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 164,
+      "original": true
+    },
+    {
+      "id": "7413-send-syn",
+      "section": "4.2.2",
+      "quote": "1. Send a SYN packet.",
+      "status": "covered",
+      "reason": "Actual packet sequence/flags and data span are asserted for a prepared Fast Open open, including sequence wrap.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 246,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn syn_data_ack_bounds_wrap_partial_retry_and_flush()"
+      ]
+    },
+    {
+      "id": "7413-option-space-fallback",
+      "section": "4.2.2",
+      "quote": "a. If the SYN packet does not have enough option space for the Fast Open option, abort TFO and fall back to the regular 3WHS.",
+      "status": "covered",
+      "reason": "The output path omits the cookie and data when the option cannot fit the available path/header budget; the test checks the bare SYN and retained data.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 268,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn option_lengths_small_path_and_timestamp_credit()"
+      ]
+    },
+    {
+      "id": "7413-4.2.2-context-2",
+      "section": "4.2.2",
+      "quote": "b.",
+      "status": "context",
+      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "offset": 394
+    },
+    {
+      "id": "7413-original-7",
+      "section": "4.2.2",
+      "quote": "Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.",
+      "status": "TODO",
+      "reason": "Published section 4.2.2 says default 536 bytes without the IPv6 qualifier. The implementation follows section 4.1.3 and permits cold IPv6 SYN data up to 1220 minus options. Erratum 8015 proposes that clarification but is Held for Document Update, not Verified; this literal obligation is retained unresolved. Explicit ApplicationProtected also selects omitted-option SYN data under section 7.3. Existing ordinary-path evidence is retained and does not establish literal closure across these choices.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 397,
+      "original": true,
+      "errata": [
+        8015
+      ],
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::if let Some(cookie) = fast_open_option {",
+        "crates/stacks/ntcp/src/fast_open_server_cookie_tests.rs::fn supplied_cookie_cold_limits_options_and_real_mss_learning()"
+      ]
+    },
+    {
+      "id": "7413-send-state-sequence",
+      "section": "4.2.2",
+      "quote": "2. Advance to SYN-SENT state and update SND.NXT to include the data accordingly.",
+      "status": "covered",
+      "reason": "The test asserts SYN-SENT before reply and exact SND.NXT = ISS+1+data only after a successful packet encoding, including wrap and too-small output rollback.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 535,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let length = count as u32",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn syn_data_ack_bounds_wrap_partial_retry_and_flush()"
+      ]
+    },
+    {
+      "id": "7413-original-8",
+      "section": "4.2.2",
+      "quote": "To deal with network or servers dropping SYN packets with payload or unknown options, when the SYN timer fires, the client SHOULD retransmit a SYN packet without data and Fast Open options.",
+      "status": "covered",
+      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 616,
+      "original": true,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option = if syn && self.snd_nxt == self.iss && !self.syn_timed_out {",
+        "crates/stacks/ntcp/src/fast_open_server_cookie_tests.rs::fn supplied_cookie_timeout_retries_without_option_or_data_and_keeps_negative_cache() {"
+      ]
+    },
+    {
+      "id": "7413-4.2.2-context-3",
+      "section": "4.2.2",
+      "quote": "Server: Receiving SYN and responding with SYN-ACK Upon receiving the SYN packet with Fast Open option:",
+      "status": "context",
+      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "offset": 806
+    },
+    {
+      "id": "7413-server-disabled",
+      "section": "4.2.2",
+      "quote": "1. Initialize and reset a local FastOpened flag. If FastOpenEnabled is false, go to step 5.",
+      "status": "covered",
+      "reason": "Each construction starts early=false; disabled service/listener or invalid cookie yields no early data and SYN-only ACK. Test matrix includes both endpoint and listener opt-in boundaries.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 909,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_default_off_invalid_cookie_and_endpoint_opt_in()"
+      ]
+    },
+    {
+      "id": "7413-server-limit",
+      "section": "4.2.2",
+      "quote": "2. If PendingFastOpenRequests is over the system limit, go to step 5.",
+      "status": "covered",
+      "reason": "Quota blocks admission before data delivery; the policy matrix fills the quota then checks SYN-only ACK and no early accept for both authentication policies.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1001,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn response_cookie_does_not_change_authentication_or_quota()"
+      ]
+    },
+    {
+      "id": "7413-server-invalid",
+      "section": "4.2.2",
+      "quote": "3. If IsCookieValid() (in Section 4.1.2) returns false, go to step 5.",
+      "status": "covered",
+      "reason": "Invalid ordinary credentials do not authorize early payload under either MAC policy; protected service authorization is an explicit alternative, not a claim of cookie validity.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1071,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn response_cookie_does_not_change_authentication_or_quota()"
+      ]
+    },
+    {
+      "id": "7413-server-notify-pending",
+      "section": "4.2.2",
+      "quote": "4. Buffer the data and notify the application. Set the FastOpened flag and increment PendingFastOpenRequests.",
+      "status": "covered",
+      "reason": "Paired test reads the authenticated bytes in SYN-RECEIVED, then proves quota remains occupied until final ACK, even after early accept/read.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1141,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-server-synack-ack",
+      "section": "4.2.2",
+      "quote": "5. Send the SYN-ACK packet. The packet MAY include a Fast Open option. If the FastOpened flag is set, the packet acknowledges the SYN and data sequence. Otherwise, it acknowledges only the SYN sequence.",
+      "status": "covered",
+      "reason": "Policy matrix asserts exact SYN vs SYN+data acknowledgment under valid/invalid/missing/empty cookies, quota full/free and both IP families; cookie refresh is independently optional.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1251,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn response_cookie_does_not_change_authentication_or_quota()"
+      ]
+    },
+    {
+      "id": "7413-synack-payload-delay",
+      "section": "4.2.2",
+      "quote": "The server MAY include data in the SYN-ACK packet if the response data is readily available. Some applications may favor delaying the SYN-ACK, allowing the application to process the request in order to produce a response, but this is left up to the implementation.",
+      "status": "exception",
+      "reason": "Unselected optional coalesced SYN-ACK data/delayed SYN-ACK mechanism. The implementation always sends a data-free SYN-ACK, and optionally sends congestion/window-limited separate data packets after committed SYN-ACK and before final ACK. No mandatory coalescing/delay is inferred.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1454
+    },
+    {
+      "id": "7413-server-synreceived",
+      "section": "4.2.2",
+      "quote": "6. Advance to the SYN-RCVD state.",
+      "status": "covered",
+      "reason": "Early accept returns a SYN-RECEIVED child with payload readable before the final ACK.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1720,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_fast_open(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-server-iw",
+      "section": "4.2.2",
+      "quote": "If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.",
+      "status": "TODO",
+      "reason": "Configured Rfc5681 or optional RFC6928 IW10 is retained. Early response tests establish the selected configuration cap, but do not prove the literal RFC5681/RFC3390 initial-window clause across all supported congestion configurations. Production behavior is frozen; a referenced RFC permission or one IW test cannot close the full clause.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1754
+    },
+    {
+      "id": "7413-synack-timeout",
+      "section": "4.2.2",
+      "quote": "If the SYN-ACK timer fires, the server SHOULD retransmit a SYN-ACK segment with neither data nor Fast Open options for compatibility reasons.",
+      "status": "covered",
+      "reason": "Cold cookie-request and authorized Fast Open timeout tests assert a data-free cookie-free SYN-ACK with unchanged sequence and acknowledgment. The attached Fast Open test retains outstanding pre-handshake response data across timeout in scalar/reserved output, both timebases and sequence wrap.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 1907,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_actual_syn_retry_anchor_and_ack_handoff()"
+      ]
+    },
+    {
+      "id": "7413-simultaneous",
+      "section": "4.2.2",
+      "quote": "A special case is simultaneous open where the SYN receiver is a client in SYN-SENT state. The protocol remains the same because [RFC793] already supports both data in the SYN and simultaneous open.",
+      "status": "TODO",
+      "reason": "Outgoing cookie possession does not authorize receiving a recognized crossing SYN payload. The implementation rejects such data until ordinary retransmission (simultaneous_open_rejects_recognized_syn_data_until_retransmitted). A complete symmetric Fast Open receive procedure for active sockets is not established; the RFC explicitly leaves the associated API change outside scope.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 2049
+    },
+    {
+      "id": "7413-4.2.2-context-4",
+      "section": "4.2.2",
+      "quote": "But the client's socket may have data available to read before it's connected. This document does not cover the corresponding API change. Client: Receiving SYN-ACK The client SHOULD perform the following steps upon receiving the SYN-ACK:",
+      "status": "context",
+      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "offset": 2247
+    },
+    {
+      "id": "7413-client-cache-update",
+      "section": "4.2.2",
+      "quote": "1. If the SYN-ACK has a Fast Open option, an MSS option, or both, update the corresponding cookie and MSS information in the cookie cache.",
+      "status": "covered",
+      "reason": "Validated SYN-ACK cookie and/or MSS updates drive subsequent SYN cookie bytes and admission budget. Tests exercise present, absent, empty and invalid cookie metadata with MSS updates for both IP families.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 2485,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_validated_mss_without_cookie_replacement()"
+      ]
+    },
+    {
+      "id": "7413-client-ack",
+      "section": "4.2.2",
+      "quote": "2. Send an ACK packet. Set acknowledgment number to RCV.NXT and include the data after SND.UNA if data is available.",
+      "status": "covered",
+      "reason": "ACK flag, exact RCV.NXT and data starting at SND.UNA are asserted after partial, zero and full SYN-data acknowledgment including wrap.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 2624,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn establish(",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn syn_data_ack_bounds_wrap_partial_retry_and_flush()"
+      ]
+    },
+    {
+      "id": "7413-client-established",
+      "section": "4.2.2",
+      "quote": "3. Advance to the ESTABLISHED state.",
+      "status": "covered",
+      "reason": "The test asserts ESTABLISHED for valid SYN-ACK acknowledgments and rejects an acknowledgment beyond all transmitted data.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 2741,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn establish(",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn syn_data_ack_bounds_wrap_partial_retry_and_flush()"
+      ]
+    },
+    {
+      "id": "7413-4.2.2-context-5",
+      "section": "4.2.2",
+      "quote": "Note there is no latency penalty if the server does not acknowledge the data in the original SYN packet.",
+      "status": "context",
+      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "offset": 2778
+    },
+    {
+      "id": "7413-first-ack-all-repair",
+      "section": "4.2.2",
+      "quote": "The client SHOULD retransmit any unacknowledged data in the first ACK packet in step 2.",
+      "status": "TODO",
+      "reason": "Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 2883
+    },
+    {
+      "id": "7413-4.2.2-context-6",
+      "section": "4.2.2",
+      "quote": "The data exchange will start after the handshake like a regular TCP connection.",
+      "status": "context",
+      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "offset": 2971
+    },
+    {
+      "id": "7413-lost-syn-heuristic",
+      "section": "4.2.2",
+      "quote": "If the client has timed out and retransmitted only regular SYN packets, it can heuristically detect paths that intentionally drop SYNs with the Fast Open option or data. If the SYN-ACK acknowledges only the initial sequence and does not carry a Fast Open cookie option, presumably it is triggered by a retransmitted (regular) SYN and the original SYN or the corresponding SYN-ACK was lost.",
+      "status": "TODO",
+      "reason": "The implementation records committed timeout and unacknowledged-data negatives, but no complete attached test establishes this whole conjunction (only regular retransmissions, SYN-only ACK, absent cookie) and its cache interpretation, including spurious replies. It is a heuristic explanation, not proof of actual middlebox loss.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 3051
+    },
+    {
+      "id": "7413-4.2.2-context-7",
+      "section": "4.2.2",
+      "quote": "Server: Receiving ACK",
+      "status": "context",
+      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "offset": 3441
+    },
+    {
+      "id": "7413-server-final-ack",
+      "section": "4.2.2",
+      "quote": "Upon receiving an ACK acknowledging the SYN sequence, the server decrements PendingFastOpenRequests and advances to the ESTABLISHED state. No special handling is required further.",
+      "status": "covered",
+      "reason": "A valid final ACK establishes the early child and releases pending ownership; the test proves the next connection can deliver early after quota was blocked before that ACK.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
+      "offset": 3463,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_positive_early_read_delayed_write_quota_survives_accept()"
+      ]
+    },
+    {
+      "id": "7413-5-context-1",
+      "section": "5",
+      "quote": "The Fast Open Cookie stops an attacker from trivially flooding spoofed SYN packets with data to burn server resources or to mount an amplified reflection attack on random hosts. The server can defend against spoofed SYN floods with invalid cookies using existing techniques [RFC4987]. We note that although generating bogus cookies is cost free, the cost of validating the cookies, inherent to any authentication scheme, may be substantial compared to processing a regular SYN packet. We describe these new vulnerabilities of TFO and the countermeasures in detail below.",
+      "status": "context",
+      "reason": "Security threat/cost motivation and roadmap; operational protections appear in sections 4.2 and 5.1.",
+      "offset": 0
+    },
+    {
+      "id": "7413-5.1-context-1",
+      "section": "5.1",
+      "quote": "An attacker may still obtain cookies from some compromised hosts, then flood spoofed SYN packets with data and \"valid\" cookies (from these hosts or other vantage points). Like regular TCP handshakes, TFO is vulnerable to such an attack. But the potential damage can be much more severe. Besides causing temporary disruption to service ports under attack, it may exhaust server CPU and memory resources. Such an attack will show up on application server logs as an application-level DoS from botnets, triggering other defenses and alerts.",
+      "status": "context",
+      "reason": "Attacker capabilities, regular SYN-flood comparison and limited impact of disabling TFO. Pending and reset-monitoring controls have operative rows; SYN-cookie defense is enabled as an opportunity, not a requirement to implement that particular mechanism.",
+      "offset": 0
+    },
+    {
+      "id": "7413-pending-protection",
+      "section": "5.1",
+      "quote": "To protect the server, it is important to limit the maximum number of total pending TFO connection requests, i.e., PendingFastOpenRequests (Section 4.2). When the limit is exceeded, the server temporarily disables TFO entirely as described in \"Server Cookie Handling\" (Section 4.1.2). Then, subsequent TFO requests will be downgraded to regular connection requests, i.e., with the data dropped and only SYNs acknowledged.",
+      "status": "covered",
+      "reason": "The per-listener preset limit includes pending early children and recent reset debt; at capacity requests get ordinary SYN-only ACKs and no early reads/accept. Tests cover valid/invalid credentials and both MAC policies.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-5.1",
+      "offset": 538,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn new_connection_with_options(",
+        "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn response_cookie_does_not_change_authentication_or_quota()"
+      ]
+    },
+    {
+      "id": "7413-5.1-context-2",
+      "section": "5.1",
+      "quote": "This allows regular SYN flood defense techniques [RFC4987] like SYN cookies to kick in and prevent further service disruption. The main impact of SYN floods against the standard TCP stack is not directly from the floods themselves costing TCP processing overhead or host memory, but rather from the spoofed SYN packets filling up the often small listener's queue. On the other hand, TFO SYN floods can cause damage directly if admitted without limit into the stack. The reset (RST) packets from the spoofed host will fuel rather than defeat the SYN floods as compared to the non-TFO case, because the attacker can flood more SYNs with data and incur more cost in terms of data processing resources.",
+      "status": "context",
+      "reason": "Attacker capabilities, regular SYN-flood comparison and limited impact of disabling TFO. Pending and reset-monitoring controls have operative rows; SYN-cookie defense is enabled as an opportunity, not a requirement to implement that particular mechanism.",
+      "offset": 960
+    },
+    {
+      "id": "7413-reset-monitor",
+      "section": "5.1",
+      "quote": "For this reason, a TFO server needs to monitor the connections in SYN-RCVD being reset in addition to imposing a reasonable max queue length. Implementations may combine the two, e.g., by continuing to account for those connection requests that have just been reset against the listener's PendingFastOpenRequests until a timeout period has passed.",
+      "status": "covered",
+      "reason": "Validated remote RST leaves generation-scoped admission debt until cooldown; challenges do not create debt. The test checks rejection immediately after reset and exact admission restoration at the cooldown boundary. This is the selected optional accounting example, not an invented mandatory detector.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-5.1",
+      "offset": 1659,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn fast_open_early_terminal_reset_event_and_quota()"
+      ]
+    },
+    {
+      "id": "7413-5.1-context-3",
+      "section": "5.1",
+      "quote": "Limiting the maximum number of pending TFO connection requests does make it easy for an attacker to overflow the queue, causing TFO to be disabled. We argue that causing TFO to be disabled is unlikely to be of interest to attackers because the service will remain intact without TFO; hence, there is hardly any real damage.",
+      "status": "context",
+      "reason": "Attacker capabilities, regular SYN-flood comparison and limited impact of disabling TFO. Pending and reset-monitoring controls have operative rows; SYN-cookie defense is enabled as an opportunity, not a requirement to implement that particular mechanism.",
+      "offset": 2007
+    },
+    {
+      "id": "7413-5.1.1-context-1",
+      "section": "5.1.1",
+      "quote": "An attacker behind a NAT can easily obtain valid cookies to launch the above attack to hurt other clients that share the path.",
+      "status": "context",
+      "reason": "NAT attack example and explicit rejection of the timestamp-cookie proposal on cost/firewall grounds. The optional proposal has an exception row.",
+      "offset": 0
+    },
+    {
+      "id": "7413-nat-timestamp-cookie",
+      "section": "5.1.1",
+      "quote": "[BRISCOE12] suggested that the server can extend cookie generation to include the TCP timestamp -- GetCookie(IP_Address, Timestamp) -- and implement it by encrypting the concatenation of the two values to generate the cookie. The client stores both the cookie and its corresponding timestamp, and it echoes both in the SYN. The server then implements IsCookieValid(IP_Address, Timestamp, Cookie) by encrypting the IP and timestamp data and comparing it with the cookie value.",
+      "status": "exception",
+      "reason": "Unselected experimental timestamp-bound NAT cookie alternative, explicitly evaluated unfavorably in this section. Address MAC cookies are selected; no nonzero SYN timestamp-echo or modified RFC7323 mechanism is required.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-5.1.1",
+      "offset": 127
+    },
+    {
+      "id": "7413-5.1.1-context-2",
+      "section": "5.1.1",
+      "quote": "This enables the server to issue different cookies to clients that share the same IP address; hence, it can selectively discard those misused cookies from the attacker. However, the attacker can simply repeat the attack with new cookies.",
+      "status": "context",
+      "reason": "NAT attack example and explicit rejection of the timestamp-cookie proposal on cost/firewall grounds. The optional proposal has an exception row.",
+      "offset": 603
+    },
+    {
+      "id": "7413-nat-throttle-alternative",
+      "section": "5.1.1",
+      "quote": "The server would eventually need to throttle all requests from the IP address just like the current approach.",
+      "status": "exception",
+      "reason": "Conditional requirement within the unselected timestamp-bound NAT-cookie proposal: the preceding attack can repeat with newly issued timestamp cookies. This is rationale for declining that optional proposal, not a mandatory per-IP throttle for the selected MAC/pending-limit mechanism.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-5.1.1",
+      "offset": 841
+    },
+    {
+      "id": "7413-5.1.1-context-3",
+      "section": "5.1.1",
+      "quote": "Moreover, this approach requires modifying [RFC1323] (obsoleted by [RFC7323]) to send a non-zero Timestamp Echo Reply in the SYN, potentially causing firewall issues. Therefore, we believe the benefit does not outweigh the drawbacks.",
+      "status": "context",
+      "reason": "NAT attack example and explicit rejection of the timestamp-cookie proposal on cost/firewall grounds. The optional proposal has an exception row.",
+      "offset": 951
+    },
+    {
+      "id": "7413-5.2-context-1",
+      "section": "5.2",
+      "quote": "Limiting PendingFastOpenRequests with a system limit can be done without Fast Open cookies and would protect the server from resource exhaustion. It would also limit how much damage an attacker can cause through an amplified reflection attack from that server. However, it would still be vulnerable to an amplified reflection attack from a large number of servers. An attacker can easily cause damage by tricking many servers to respond with data packets at once to any spoofed victim IP address of choice. With the use of Fast Open cookies, the attacker would first have to steal a valid cookie from its target victim. This likely requires the attacker to compromise the victim host or network first. But, in some cases, it may be relatively easy. The attacker here has little interest in mounting an attack on the victim host that has already been compromised. But it may be motivated to disrupt the victim's network. Since a stolen cookie is only valid for a single server, it has to steal valid cookies from a large number of servers and use them before they expire to cause sufficient damage without triggering the defense. One can argue that if the attacker has compromised the target network or hosts, it could perform a similar but simpler attack by injecting bits directly. The degree of damage will be identical, but a TFO-specific attack allows the attacker to remain anonymous and disguises the attack as from other servers. For example, with DHCP, an attacker can obtain cookies when he (or the host he has compromised) owns a particular IP address by performing regular Fast Open to servers supporting TFO and he can collect valid cookies. Then, the attacker actively or passively releases his IP address. When the IP address is reassigned to another host (victim) via DHCP, the attacker then floods spoofed Fast Open requests with valid cookies to the servers. Since the cookies are valid, these servers accept the requests and respond with a SYN-ACK plus data packets to the victim instead of the attacker. Thus, the attacker is able to launch amplified reflection attacks to other hosts that share IP addresses.",
+      "status": "context",
+      "reason": "Reflection attack and DHCP examples, security/latency tradeoff rationale. Default response withholding has an operative row. Rejected erratum 6239 is not applied: response availability before handshake differs from transmission time.",
+      "offset": 0
+    },
+    {
+      "id": "7413-withhold-response-defense",
+      "section": "5.2",
+      "quote": "The best defense is for the server not to respond with data until the handshake finishes.",
+      "status": "covered",
+      "reason": "Selected default defense withholds response data until handshake completion. Explicit early-response opt-in selects the documented latency/security tradeoff; the gate test checks both settings and authorization, rather than claiming the defense for opt-in early responses. Rejected erratum 6239 is not applied.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-5.2",
+      "offset": 2129,
+      "errata": [
+        6239
+      ],
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn early_response_eligible(",
+        "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_actual_gate_and_committed_synack()"
+      ]
+    },
+    {
+      "id": "7413-5.2-context-2",
+      "section": "5.2",
+      "quote": "In this case, the risk of an amplification reflection attack is completely eliminated. But the potential latency saving from TFO may diminish if the server application produces responses earlier before the handshake completes.",
+      "status": "context",
+      "reason": "Reflection attack and DHCP examples, security/latency tradeoff rationale. Default response withholding has an operative row. Rejected erratum 6239 is not applied: response availability before handshake differs from transmission time.",
+      "offset": 2219
+    },
+    {
+      "id": "7413-6-context-1",
+      "section": "6",
+      "quote": "This section is to help applications considering TFO to evaluate TFO's benefits and drawbacks using the Web client and server applications as an example throughout. Applications here refer specifically to the process that writes data into the socket -- for example, a JavaScript process that sends data to the server. A proposed socket API change is provided in the Appendix.",
+      "status": "context",
+      "reason": "Application-actor definition, applicability purpose and example-API pointer.",
+      "offset": 0
+    },
+    {
+      "id": "7413-6.1-context-1",
+      "section": "6.1",
+      "quote": "It is possible that using TFO results in the first data written to a socket to be delivered more than once to the application on the remote host (Section 2.1). This replay potential only applies to data in the SYN but not subsequent data exchanges. Empirically, [JIDKT07] showed the packet duplication on a Tier-1 network is rare. Since the replay only happens specifically when the SYN data packet is duplicated and also the duplicate arrives after the receiver has cleared the original SYN's connection state, the replay is thought to be uncommon in practice.",
+      "status": "context",
+      "reason": "Replay scope and empirical duplication-frequency discussion; client/server application tolerance has an operative actor disposition.",
+      "offset": 0
+    },
+    {
+      "id": "7413-replay-app",
+      "section": "6.1",
+      "quote": "Nevertheless, a client that cannot handle receiving the same SYN data more than once MUST NOT enable TFO to send data in a SYN. Similarly, a server that cannot accept receiving the same SYN data more than once MUST NOT enable TFO to receive data in a SYN.",
+      "status": "exception",
+      "reason": "Application actor: a client/server must determine whether its operations tolerate SYN-data replay before enabling TFO. The stack exposes opt-in and does not promise durable replay deduplication or infer application transaction semantics.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-6.1",
+      "offset": 562
+    },
+    {
+      "id": "7413-6.1-context-2",
+      "section": "6.1",
+      "quote": "Further investigation is needed to judge the probability of receiving duplicated SYN or SYN-ACK packets with data in networks that are not Tier 1.",
+      "status": "context",
+      "reason": "Replay scope and empirical duplication-frequency discussion; client/server application tolerance has an operative actor disposition.",
+      "offset": 818
+    },
+    {
+      "id": "7413-6.2-context-1",
+      "section": "6.2",
+      "quote": "TFO is designed for latency-conscious applications that are sensitive to TCP's initial connection setup delay.",
+      "status": "context",
+      "reason": "Latency motivation, incomplete-request performance explanation and connection-churn network-stability rationale; application message sizing/reuse advice has actor dispositions.",
+      "offset": 0
+    },
+    {
+      "id": "7413-app-data-unit",
+      "section": "6.2",
+      "quote": "To benefit from TFO, the first application data unit (e.g., an HTTP request) needs to be no more than TCP's maximum segment size (minus options used in the SYN).",
+      "status": "exception",
+      "reason": "Application actor/performance condition: choosing the initial application data unit and making it processable within one SYN belongs to the application protocol. TCP clips early payload to the peer/path/option budget and does not manufacture application-message boundaries.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-6.2",
+      "offset": 111
+    },
+    {
+      "id": "7413-6.2-context-2",
+      "section": "6.2",
+      "quote": "Otherwise, the remote server can only process the client's application data unit once the rest of it is delivered after the initial handshake, diminishing TFO's benefit.",
+      "status": "context",
+      "reason": "Latency motivation, incomplete-request performance explanation and connection-churn network-stability rationale; application message sizing/reuse advice has actor dispositions.",
+      "offset": 273
+    },
+    {
+      "id": "7413-app-reuse",
+      "section": "6.2",
+      "quote": "To the extent possible, applications SHOULD reuse the connection to take advantage of TCP's built-in congestion control and reduce connection setup overhead.",
+      "status": "exception",
+      "reason": "Application actor: connection pooling/reuse belongs to the caller, not a transport obligation to merge independent sockets.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-6.2",
+      "offset": 443
+    },
+    {
+      "id": "7413-6.2-context-3",
+      "section": "6.2",
+      "quote": "An application that employs too many short-lived connections will negatively impact network stability, as these connections often exit before TCP's congestion control algorithm takes effect.",
+      "status": "context",
+      "reason": "Latency motivation, incomplete-request performance explanation and connection-churn network-stability rationale; application message sizing/reuse advice has actor dispositions.",
+      "offset": 601
+    },
+    {
+      "id": "7413-browser-replay",
+      "section": "6.3.1",
+      "quote": "While TFO is motivated by Web applications, the browser should not use TFO to send requests in SYNs if those requests cannot tolerate replays.",
+      "status": "exception",
+      "reason": "Browser/application actor: deciding whether HTTP requests (including POST without transaction protection) are replay-safe is outside the TCP stack. This does not excuse transport opt-in/admission requirements.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-6.3.1",
+      "offset": 0
+    },
+    {
+      "id": "7413-6.3.1-context-1",
+      "section": "6.3.1",
+      "quote": "One example is POST requests without application-layer transaction protection (e.g., a unique identifier in the request header). On the other hand, TFO is particularly useful for GET requests. GET request replay could happen across striped TCP connections: after a server receives an HTTP request but before the ACKs of the requests reach the browser, the browser may time out and retry the same request on another (possibly new) TCP connection. This differs from a TFO replay only in that the replay is initiated by the browser, not by the TCP stack.",
+      "status": "context",
+      "reason": "HTTP replay examples and explanation, including POST transaction protection and GET replay across connections; browser replay-safety advice has an actor disposition.",
+      "offset": 143
+    },
+    {
+      "id": "7413-tls-client-hello",
+      "section": "6.3.2",
+      "quote": "For Transport Layer Security (TLS) over TCP, it is safe and useful to include a TLS client_hello in the SYN packet to save one RTT in the TLS handshake. There is no concern about violating idempotency. In particular, it can be used alone with the speculative connection above.",
+      "status": "exception",
+      "reason": "Application/TLS actor example: selecting a replay-safe client_hello as SYN data and speculative connection policy belongs to TLS/browser code; ntcp implements no TLS handshake.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-6.3.2",
+      "offset": 0
+    },
+    {
+      "id": "7413-6.3.3-context-1",
+      "section": "6.3.3",
+      "quote": "Is TFO useful given the wide deployment of HTTP persistent connections? The short answer is yes. Studies ([RCCJR11] [AERG11]) show that the average number of transactions per connection is between 2 and 4, based on large-scale measurements from both servers and clients. In these studies, the servers and clients both kept idle connections up to several minutes, well into \"human think\" time. Keeping connections open and idle even longer risks a greater performance penalty. [HNESSK10] and [MQXMZ11] show that the majority of home routers and ISPs fail to meet the 124-minute idle timeout mandated in [RFC5382]. In [MQXMZ11], 35% of mobile ISPs silently time out idle connections within 30 minutes. End hosts, unaware of silent middlebox timeouts, suffer multi-minute TCP timeouts upon using those long-idle connections. To circumvent this problem, some applications send frequent TCP keep-alive probes. However, this technique drains power on mobile devices [MQXMZ11]. In fact, power has become such a prominent issue in modern Long Term Evolution (LTE) devices that mobile browsers close HTTP connections within seconds or even immediately [SOUDERS11]. [RCCJR11] studied the performance of the Chrome browser [Chrome] based on 28 days of global statistics. The Chrome browser keeps idle HTTP persistent connections for 5 to 10 minutes. However, the average number of the transactions per connection is only 3.3, and the TCP 3WHS accounts for up to 25% of the HTTP transaction network latency. The authors estimated that TFO improves page load time by 10% to 40% on selected popular Web sites.",
+      "status": "context",
+      "reason": "Empirical HTTP persistence/mobile/keepalive/latency discussion. Verified editorial erratum 8016 replaces the LTE attribution with 3G mobile devices; published wording is retained and creates no new TCP mechanism.",
+      "offset": 0
+    },
+    {
+      "id": "7413-farm-key",
+      "section": "6.3.4",
+      "quote": "Servers behind load balancers that accept connection requests to the same server IP address should use the same key such that they generate identical Fast Open cookies for a particular client IP address.",
+      "status": "exception",
+      "reason": "Deployment actor: distributing a shared secret among servers for a common service IP belongs to the server farm operator. Endpoint policy setters can accept shared keys, but do not establish or test an actual farm-wide key agreement.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-6.3.4",
+      "offset": 0
+    },
+    {
+      "id": "7413-6.3.4-context-1",
+      "section": "6.3.4",
+      "quote": "Otherwise, a client may get different cookies across connections; its Fast Open attempts would fall back to the regular 3WHS.",
+      "status": "context",
+      "reason": "Explanation of fallback on unshared farm keys; shared-key deployment advice has an actor disposition.",
+      "offset": 204
+    },
+    {
+      "id": "7413-7-context-1",
+      "section": "7",
+      "quote": "We now outline some areas that need experimentation in the Internet and under different network scenarios. These experiments should help evaluate Fast Open benefits and risks and its related protocols.",
+      "status": "context",
+      "reason": "Experimental research roadmap, not an implementation requirement to conduct an Internet measurement campaign.",
+      "offset": 0
+    },
+    {
+      "id": "7413-7.1-context-1",
+      "section": "7.1",
+      "quote": "[MAF04] found that some middleboxes and end hosts may drop packets with unknown TCP options. Studies ([LANGLEY06] [HNRGHT11]) have found that 6% of the probed paths on the Internet drop SYN packets with data or with unknown TCP options.",
+      "status": "context",
+      "reason": "Middlebox measurements and CGN address-changing performance explanation, with explicit call for further study. Actual timeout fallback and negative caching advice have operative rows.",
+      "offset": 0
+    },
+    {
+      "id": "7413-middlebox-fallback",
+      "section": "7.1",
+      "quote": "The TFO protocol deals with this problem by falling back to the regular TCP handshake and retransmitting the SYN without data or cookie options after the initial SYN timeout.",
+      "status": "covered",
+      "reason": "SYN-data RTO produces a bare SYN without options or data and retains queued bytes for post-handshake repair, including sequence wrap.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-7.1",
+      "offset": 237,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn timeout_bare_syn_retains_data_and_karn()"
+      ]
+    },
+    {
+      "id": "7413-middlebox-negative",
+      "section": "7.1",
+      "quote": "Moreover, the implementation is recommended to negatively cache such incidents to avoid recurring timeouts.",
+      "status": "covered",
+      "reason": "Committed SYN-data timeout suppresses the next attempt on that service while preserving the IP-pair credential; the boundary test covers timeout alongside other negative causes.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-7.1",
+      "offset": 412,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_negative_causes_keep_cookie_and_suppress_service()"
+      ]
+    },
+    {
+      "id": "7413-7.1-context-2",
+      "section": "7.1",
+      "quote": "Further study is required to evaluate the performance impact of these drop behaviors. Another interesting study is the loss of TFO performance benefit behind certain Carrier-Grade NAT (CGN). Typically, hosts behind a NAT sharing the same IP address will get the same cookie for the same server. This will not prevent TFO from working. But, on some CGN configurations where every new TCP connection from the same physical host uses a different public IP address, TFO does not provide latency benefits. However, there is no performance penalty either, as described in the \"Client: Receiving SYN-ACK\" text in Section 4.2.2.",
+      "status": "context",
+      "reason": "Middlebox measurements and CGN address-changing performance explanation, with explicit call for further study. Actual timeout fallback and negative caching advice have operative rows.",
+      "offset": 520
+    },
+    {
+      "id": "7413-7.2-context-1",
+      "section": "7.2",
+      "quote": "Although TFO does not directly change TCP's congestion control, there are subtle cases where it could do so. When a SYN-ACK times out, regular TCP reduces the initial congestion window before sending any data [RFC5681]. However, in TFO, the server may have already sent up to an initial window of data. If the server serves mostly short connections, then the losses of SYN-ACKs are not as effective as regular TCP on reducing the congestion window. This could result in an unstable network condition. The connections that experience losses may attempt again and add more load under congestion.",
+      "status": "context",
+      "reason": "Congestion risks/research rationale and call for experiments. Cross-connection disablement is a potential optional solution with its own disposition, not a prescribed state machine.",
+      "offset": 0
+    },
+    {
+      "id": "7413-cross-connection-cc-disable",
+      "section": "7.2",
+      "quote": "A potential solution is to temporarily disable Fast Open if the server observes many SYN-ACK or data losses during the handshake across connections.",
+      "status": "exception",
+      "reason": "Unselected potential experimental congestion response. This paragraph calls for further experimentation; it does not mandate a server-wide loss state machine or numeric disable threshold. Existing per-connection CC/fallback remains independently audited.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-7.2",
+      "offset": 594
+    },
+    {
+      "id": "7413-7.2-context-2",
+      "section": "7.2",
+      "quote": "Further experimentation regarding the congestion control impact will be useful.",
+      "status": "context",
+      "reason": "Congestion risks/research rationale and call for experiments. Cross-connection disablement is a potential optional solution with its own disposition, not a prescribed state machine.",
+      "offset": 743
+    },
+    {
+      "id": "7413-7.3-context-1",
+      "section": "7.3",
+      "quote": "The cookie mechanism mitigates resource exhaustion and amplification attacks. However,",
+      "status": "context",
+      "reason": "Protected-service rationale/example; cookie bypass and fallback-to-authenticated mode have operative rows.",
+      "offset": 0
+    },
+    {
+      "id": "7413-original-4",
+      "section": "7.3",
+      "quote": "cookies are not necessary if the server has application-level protection or is immune to these attacks.",
+      "status": "covered",
+      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-7.3",
+      "offset": 87,
+      "original": true,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn set_listener_fast_open_early_data_policy(",
+        "crates/stacks/ntcp/src/fast_open_client_policy_tests.rs::fn explicit_client_policy_separates_wire_option_and_cold_mss() {"
+      ]
+    },
+    {
+      "id": "7413-7.3-context-2",
+      "section": "7.3",
+      "quote": "For example, a Web server that only replies with a simple HTTP redirect response that fits in the SYN-ACK packet may not care about resource exhaustion.",
+      "status": "context",
+      "reason": "Protected-service rationale/example; cookie bypass and fallback-to-authenticated mode have operative rows.",
+      "offset": 191
+    },
+    {
+      "id": "7413-original-9",
+      "section": "7.3",
+      "quote": "For such applications the server may choose to generate a trivial or even a zero-length cookie to improve performance by avoiding the cookie generation and verification.",
+      "status": "covered",
+      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-7.3",
+      "offset": 344,
+      "original": true,
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn connect_fast_open_with_server_cookie(",
+        "crates/stacks/ntcp/src/fast_open_server_cookie_tests.rs::fn supplied_zero_cookie_interoperates_with_protected_server_and_delivers_once() {"
+      ]
+    },
+    {
+      "id": "7413-protected-switch",
+      "section": "7.3",
+      "quote": "If the server believes it's under a DoS attack through other defense mechanisms, it can switch to regular Fast Open for listener sockets.",
+      "status": "TODO",
+      "reason": "Explicit listener policy setters permit switching back to cookie authentication, but there is no attached traffic test proving a live ApplicationProtected-to-RequireCookie transition and its effect on subsequent requests. The RFC does not prescribe a DoS detector; this is an evidence gap for the selected administrative capability.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-7.3",
+      "offset": 514
+    },
+    {
+      "id": "7413-8.1-context-1",
+      "section": "8.1",
+      "quote": "TCP Extensions for Transactions [RFC1644] attempted to bypass the 3WHS, among other things; hence, it shared the same goal but also the same set of issues as TFO. It focused most of its effort battling old or duplicate SYNs, but paid no attention to security vulnerabilities it introduced when bypassing the 3WHS [PHRACK98]. As stated earlier, we take a practical approach to focus TFO on the security aspect, while allowing old, duplicate SYN packets with data after recognizing that 100% TCP semantics is likely infeasible. We believe this approach strikes the right trade-off and makes TFO much simpler and more appealing to TCP implementers and users.",
+      "status": "context",
+      "reason": "Related-work history and design rationale accepting replay rather than promising complete old-SYN suppression.",
+      "offset": 0
+    },
+    {
+      "id": "7413-8.2-context-1",
+      "section": "8.2",
+      "quote": "[RFC4987] studies the mitigation of attacks from regular SYN floods, i.e., SYNs without data. But from the stateless SYN cookies to the stateful SYN Cache, none can preserve data sent with SYNs safely while still providing an effective defense.",
+      "status": "context",
+      "reason": "Related-work comparison of ordinary SYN-flood defenses and security-section pointer; optional disable-on-suspicion advice has a disposition.",
+      "offset": 0
+    },
+    {
+      "id": "7413-suspected-flood-disable",
+      "section": "8.2",
+      "quote": "The best defense may be simply to disable TFO when a host is suspected to be under a SYN flood attack, e.g., the SYN backlog is filled. Once TFO is disabled, normal SYN flood defenses can be applied.",
+      "status": "exception",
+      "reason": "Unselected optional host-suspicion/backlog heuristic beyond the selected pending/reset quota. No specific SYN flood detector or SYN-cookie implementation is mandated by this related-work advice. The operative pending/reset controls in sections 4.2 and 5.1 remain audited.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-8.2",
+      "offset": 245
+    },
+    {
+      "id": "7413-8.2-context-2",
+      "section": "8.2",
+      "quote": "The \"Security Considerations\" section (Section 5) contains a thorough discussion on this topic.",
+      "status": "context",
+      "reason": "Related-work comparison of ordinary SYN-flood defenses and security-section pointer; optional disable-on-suspicion advice has a disposition.",
+      "offset": 445
+    },
+    {
+      "id": "7413-8.3-context-1",
+      "section": "8.3",
+      "quote": "Some Web browsers maintain a history of the domains for frequently visited Web pages. The browsers then speculatively pre-open TCP connections to these domains before the user initiates any requests for them [BELSHE11]. While this technique also saves the handshake latency, it wastes server and network resources by initiating and maintaining idle connections.",
+      "status": "context",
+      "reason": "Historical application speculative-connect technique and resource-cost comparison; no new transport requirement.",
+      "offset": 0
+    },
+    {
+      "id": "7413-8.4-context-1",
+      "section": "8.4",
+      "quote": "An alternate proposal is to request a TFO cookie in the FIN instead, since FIN-drop by incompatible middleboxes does not affect latency. However, paths that block SYN cookies may be more likely to drop a later SYN packet with data, and many applications close a connection with RST instead anyway. Although cookie-in-FIN may not improve robustness, it would give clients using a single connection a latency advantage over clients opening multiple parallel connections. If experiments with TFO find that it leads to increased connection-sharding, cookie-in-FIN may prove to be a useful alternative.",
+      "status": "context",
+      "reason": "Related-work alternate cookie-in-FIN proposal, tradeoffs and contingent future experimentation. This is neither selected cookie signaling nor a mandatory current protocol operation.",
+      "offset": 0
+    },
+    {
+      "id": "7413-8.5-context-1",
+      "section": "8.5",
+      "quote": "TCPCT [RFC6013] eliminates server state during the initial handshake and defends spoofing DoS attacks. Like TFO, TCPCT allows SYN and SYN-ACK packets to carry data. But the server can only send up to MSS bytes of data during the handshake instead of the initial congestion window, unlike TFO. Therefore, the latency of applications (e.g., Web applications) may be worse than with TFO.",
+      "status": "context",
+      "reason": "Related-work TCPCT comparison, not adoption of TCPCT mechanisms.",
+      "offset": 0
+    },
+    {
+      "id": "7413-9-context-1",
+      "section": "9",
+      "quote": "IANA has allocated one value, 34, in the \"TCP Option Kind Numbers\" registry. See Section 4.1.1. The length of this new TCP option is variable, and the Meaning as shown in the \"TCP Option Kind Numbers\" registry is set to \"TCP Fast Open Cookie\".",
+      "status": "context",
+      "reason": "IANA allocation/registry description, including legacy experimental 254 ExID 0xF989. Current Kind 34 usage and conditional migration advice have operative dispositions.",
+      "offset": 0
+    },
+    {
+      "id": "7413-iana-kind",
+      "section": "9",
+      "quote": "Current and new implementations SHOULD use option (34).",
+      "status": "covered",
+      "reason": "The actual cold request and issued SYN-ACK carry the allocated Kind 34; the endpoint output path has no legacy-option emission mode.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-9",
+      "offset": 244,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option =",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn rfc7413_cookie_request_length_and_both_timeout_fallbacks()"
+      ]
+    },
+    {
+      "id": "7413-iana-migrate",
+      "section": "9",
+      "quote": "Existing implementations that are using experimental option 254 per [RFC6994] with magic number 0xF989 (16 bits) as allocated in the IANA \"TCP Experimental Option Experiment Identifiers (TCP ExIDs)\" registry by this document, SHOULD migrate to use this new option (34) by default.",
+      "status": "exception",
+      "reason": "Conditional legacy-implementation actor is absent: ntcp has no previous experimental-254 sender to migrate and emits Kind 34 by default. Experimental 254/0xF989 input is ignored as unknown TCP metadata (ordinary_and_foexp_syn_text_ack_only_syn_then_deliver_once); this is not claimed as experimental Fast Open support.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#section-9",
+      "offset": 300
+    },
+    {
+      "id": "7413-10.1-context-1",
+      "section": "10.1",
+      "quote": "[RFC793] Postel, J., \"Transmission Control Protocol\", STD 7, RFC 793, September 1981, <http://www.rfc-editor.org/info/rfc793>. [RFC1122] Braden, R., Ed., \"Requirements for Internet Hosts - Communication Layers\", STD 3, RFC 1122, October 1989, <http://www.rfc-editor.org/info/rfc1122>. [RFC2119] Bradner, S., \"Key words for use in RFCs to Indicate Requirement Levels\", BCP 14, RFC 2119, March 1997, <http://www.rfc-editor.org/info/rfc2119>. [RFC3390] Allman, M., Floyd, S., and C. Partridge, \"Increasing TCP's Initial Window\", RFC 3390, October 2002, <http://www.rfc-editor.org/info/rfc3390>. [RFC5382] Guha, S., Ed., Biswas, K., Ford, B., Sivakumar, S., and P. Srisuresh, \"NAT Behavioral Requirements for TCP\", BCP 142, RFC 5382, October 2008, <http://www.rfc-editor.org/info/rfc5382>. [RFC5681] Allman, M., Paxson, V., and E. Blanton, \"TCP Congestion Control\", RFC 5681, September 2009, <http://www.rfc-editor.org/info/rfc5681>. [RFC6994] Touch, J., \"Shared Use of Experimental TCP Options\", RFC 6994, August 2013, <http://www.rfc-editor.org/info/rfc6994>.",
+      "status": "context",
+      "reason": "Normative bibliography; references are not separate implemented capabilities.",
+      "offset": 0
+    },
+    {
+      "id": "7413-10.2-context-1",
+      "section": "10.2",
+      "quote": "[AERG11] Al-Fares, M., Elmeleegy, K., Reed, B., and I. Gashinsky, \"Overclocking the Yahoo! CDN for Faster Web Page Loads\", in Proceedings of Internet Measurement Conference, November 2011. [BELSHE11] Belshe, M., \"The Era of Browser Preconnect\", February 2011, <http://www.belshe.com/2011/02/10/ the-era-of-browser-preconnect/>. [BRISCOE12] Briscoe, B., \"Some ideas building on draft-ietf-tcpm-fastopen-01\", message to the tcpm mailing list, July 2012, <http://www.ietf.org/mail-archive/ web/tcpm/current/msg07192.html>. [Chrome] Google Chrome, <https://www.google.com/intl/en-US/chrome/browser/>. [HNESSK10] Haetoenen, S., Nyrhinen, A., Eggert, L., Strowes, S., Sarolahti, P., and M. Kojo, \"An Experimental Study of Home Gateway Characteristics\", in Proceedings of Internet Measurement Conference, October 2010. [HNRGHT11] Honda, M., Nishida, Y., Raiciu, C., Greenhalgh, A., Handley, M., and H. Tokuda, \"Is it Still Possible to Extend TCP?\", in Proceedings of Internet Measurement Conference, November 2011. [JIDKT07] Jaiswal, S., Iannaccone, G., Diot, C., Kurose, J., and D. Towsley, \"Measurement and Classification of Out-of-Sequence Packets in a Tier-1 IP Backbone\" IEEE/ACM Transactions on Networking (TON), Volume 15, Issue 1, pp 54-66. [LANGLEY06] Langley, A., \"Probing the viability of TCP extensions\", <http://www.imperialviolet.org/binary/ecntest.pdf>. [MAF04] Medina, A., Allman, M., and S. Floyd, \"Measuring Interactions Between Transport Protocols and Middleboxes\", in Proceedings of Internet Measurement Conference, October 2004. [MQXMZ11] Wang, Z., Qian, Z., Xu, Q., Mao, Z., and M. Zhang, \"An Untold Story of Middleboxes in Cellular Networks\", in Proceedings of SIGCOMM, August 2011. [PHRACK98] \"T/TCP vulnerabilities\", Phrack Magazine, Volume 8, Issue 53, Article 6, July 8, 1998, <http://www.phrack.com/issues.html?issue=53&id=6>. [RCCJR11] Radhakrishnan, S., Cheng, Y., Chu, J., Jain, A., and B. Raghavan, \"TCP Fast Open\", in Proceedings of the 7th ACM CoNEXT Conference, December 2011. [RFC1323] Jacobson, V., Braden, R., and D. Borman, \"TCP Extensions for High Performance\", RFC 1323, May 1992, <http://www.rfc-editor.org/info/rfc1323>. [RFC1644] Braden, R., \"T/TCP -- TCP Extensions for Transactions Functional Specification\", RFC 1644, July 1994, <http://www.rfc-editor.org/info/rfc1644>. [RFC2460] Deering, S. and R. Hinden, \"Internet Protocol, Version 6 (IPv6) Specification\", RFC 2460, December 1998, <http://www.rfc-editor.org/info/rfc2460>. [RFC4987] Eddy, W., \"TCP SYN Flooding Attacks and Common Mitigations\", RFC 4987, August 2007, <http://www.rfc-editor.org/info/rfc4987>. [RFC6013] Simpson, W., \"TCP Cookie Transactions (TCPCT)\", RFC 6013, January 2011, <http://www.rfc-editor.org/info/rfc6013>. [RFC6247] Eggert, L., \"Moving the Undeployed TCP Extensions RFC 1072, RFC 1106, RFC 1110, RFC 1145, RFC 1146, RFC 1379, RFC 1644, and RFC 1693 to Historic Status\", RFC 6247, May 2011, <http://www.rfc-editor.org/info/rfc6247>. [RFC7323] Borman, D., Braden, B., Jacobson, V., and R. Scheffenegger, Ed., \"TCP Extensions for High Performance\", RFC 7323, September 2014, <http://www.rfc-editor.org/info/rfc7323>. [SOUDERS11] Souders, S., \"Making A Mobile Connection\", <http://www.stevesouders.com/blog/2011/09/21/ making-a-mobile-connection/>.",
+      "status": "context",
+      "reason": "Informative bibliography; references are not separate implemented capabilities.",
+      "offset": 0
+    },
+    {
+      "id": "7413-api-replace-connect",
+      "section": "A.1",
+      "quote": "The active open side involves changing or replacing the connect() call, which does not take a user data buffer argument. We recommend replacing the connect() call to minimize API changes, and, hence, applications to reduce the deployment hurdle.",
+      "status": "exception",
+      "reason": "Unselected API alternative: preserve connect() and select MSG_FASTOPEN plus a separate TCP_FASTOPEN_CONNECT option, rather than replacing connect() with a user-buffer signature. This example recommendation does not mandate one ABI.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
+      "offset": 0
+    },
+    {
+      "id": "7413-A.1-context-1",
+      "section": "A.1",
+      "quote": "One solution implemented in Linux 3.7 is introducing a new flag, MSG_FASTOPEN, for sendto() or sendmsg().",
+      "status": "context",
+      "reason": "Example-API solution introduction; every selected MSG_FASTOPEN behavior and optional alternative has an operative disposition.",
+      "offset": 246
+    },
+    {
+      "id": "7413-api-implicit-connect",
+      "section": "A.1",
+      "quote": "MSG_FASTOPEN marks the attempt to send data in the SYN like a combination of connect() and sendto(), by performing an implicit connect() operation.",
+      "status": "covered",
+      "reason": "Selected MSG_FASTOPEN sendto/sendmsg path starts a connection with initial data; the runtime test checks deferred/cold/warm behavior and complete data transfer across multiple iovecs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
+      "offset": 352,
+      "evidence": [
+        "crates/adapters/ntcp-socket/src/runtime_send.rs::fn send_step(",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs()"
+      ]
+    },
+    {
+      "id": "7413-api-blocking",
+      "section": "A.1",
+      "quote": "It blocks until the handshake has completed and the data is buffered.",
+      "status": "covered",
+      "reason": "Blocking requests remain pending before the handshake even on cache hits, then complete with all iovec bytes buffered; both cold and warm flows are asserted.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
+      "offset": 500,
+      "evidence": [
+        "crates/adapters/ntcp-socket/src/runtime_send.rs::fn send_step(",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs()"
+      ]
+    },
+    {
+      "id": "7413-api-nonblock-hit",
+      "section": "A.1",
+      "quote": "For a non-blocking socket, it returns the number of bytes buffered and sent in the SYN packet.",
+      "status": "covered",
+      "reason": "Selected nonblocking warm path returns a bounded accepted prefix whose bytes are compared against the actual SYN payload, then accepts/reads those bytes before final ACK.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
+      "offset": 570,
+      "evidence": [
+        "crates/adapters/ntcp-socket/src/runtime_send.rs::fn send_step(",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn fast_open_deferred_fault_retry_partial_and_server_early_response_barrier()"
+      ]
+    },
+    {
+      "id": "7413-api-nonblock-miss",
+      "section": "A.1",
+      "quote": "If the cookie is not available locally, it returns -1 with errno EINPROGRESS, and sends a SYN with a TFO cookie request automatically. The caller needs to write the data again when the socket is connected.",
+      "status": "covered",
+      "reason": "Cold nonblocking and MSG_DONTWAIT sends return EINPROGRESS without buffering initial bytes, emit an empty-cookie SYN and require an explicit data write after connection establishment.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
+      "offset": 665,
+      "evidence": [
+        "crates/adapters/ntcp-socket/src/runtime_send.rs::fn send_step(",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn fast_open_miss_nonblocking_and_dontwait_retries_do_not_accept_payload()"
+      ]
+    },
+    {
+      "id": "7413-api-connect-errno",
+      "section": "A.1",
+      "quote": "On errors, it returns the same errno as connect() if the handshake fails.",
+      "status": "TODO",
+      "reason": "Reset and timeout Fast Open tests assert ECONNREFUSED/ETIMEDOUT and preserve terminal query state, but no full paired comparison against connect() covers every handshake failure/error mapping. Those two cases alone cannot prove the entire same-errno obligation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
+      "offset": 871
+    },
+    {
+      "id": "7413-api-active-option-alternative",
+      "section": "A.1",
+      "quote": "An implementation may prefer not to change the sendmsg() call because TFO is a TCP-specific feature. A solution is to add a new socket option, TCP_FASTOPEN, for TCP sockets. When the option is enabled before a connect() operation, sendmsg() or sendto() will perform a Fast Open operation similar to the MSG_FASTOPEN flag described above. This approach, however, requires an extra setsockopt() system call.",
+      "status": "exception",
+      "reason": "Unselected exact alternative: active deferred opens use Linux TCP_FASTOPEN_CONNECT, while TCP_FASTOPEN controls listener admission. The document presents this TCP_FASTOPEN active API as an optional alternative to the selected MSG_FASTOPEN interface; it is not a mandatory alias.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
+      "offset": 945
+    },
+    {
+      "id": "7413-A.2-context-1",
+      "section": "A.2",
+      "quote": "The passive open side change is simpler compared to the active open side.",
+      "status": "context",
+      "reason": "Passive-open introductory comparison; enablement, threshold/cookie response and early accept/read behavior have operative rows.",
+      "offset": 0
+    },
+    {
+      "id": "7413-api-passive-enable",
+      "section": "A.2",
+      "quote": "The application only needs to enable the reception of Fast Open requests via a new TCP_FASTOPEN setsockopt() socket option before listen().",
+      "status": "covered",
+      "reason": "Selected passive TCP_FASTOPEN option is set before bind/listen in the runtime setup; the early-read test demonstrates resulting early accept/data access.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2",
+      "offset": 74,
+      "evidence": [
+        "crates/adapters/ntcp-socket/src/runtime.rs::fn execute(",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn fast_open_deferred_fault_retry_partial_and_server_early_response_barrier()"
+      ]
+    },
+    {
+      "id": "7413-api-threshold-cookie",
+      "section": "A.2",
+      "quote": "The option enables Fast Open on the listener socket. The option value specifies the PendingFastOpenRequests threshold, i.e., the maximum length of pending SYNs with data payload. Once enabled, the TCP implementation will respond with TFO cookies per request.",
+      "status": "TODO",
+      "reason": "Runtime maps the selected TCP_FASTOPEN option to the pending threshold, and core admission/cookie tests exercise quotas. No one attached API test proves both exact threshold enforcement and per-request cookie responses through setsockopt/listen for all selected cookie policies. Retain the complete compound example behavior as evidence TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2",
+      "offset": 214
+    },
+    {
+      "id": "7413-api-early-accept",
+      "section": "A.2",
+      "quote": "Traditionally, accept() returns only after a socket is connected. But, for a Fast Open connection, accept() returns upon receiving a SYN with a valid Fast Open cookie and data, and the data is available to be read through, e.g., recvmsg(), read().",
+      "status": "covered",
+      "reason": "Selected socket API returns an early SYN-RECEIVED child after authenticated SYN data and reads exactly that payload before delivering the final ACK.",
+      "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2",
+      "offset": 473,
+      "evidence": [
+        "crates/adapters/ntcp-socket/src/runtime.rs::fn execute(",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn fast_open_deferred_fault_retry_partial_and_server_early_response_barrier()"
+      ]
+    }
+  ]
+}

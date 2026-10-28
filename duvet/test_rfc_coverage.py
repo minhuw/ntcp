@@ -47,11 +47,16 @@ class CoverageGate(unittest.TestCase):
                 continue
             sections = "section-3*" if scope["extraction"] == "section-3" else "*"
             self.assertIn(f"workbench/duvet/requirements/**/rfc{rfc}/{sections}.toml", patterns)
-        # TFO has a scoped manual inventory, not full-document extraction.
+        # TFO uses manual extraction for a full operative ledger, including
+        # algorithmic prose and appendix API clauses without BCP14 keywords.
         self.assertFalse(any("rfc7413/" in pattern for pattern in patterns))
+        scope = load_scopes()[7413]
+        self.assertEqual(scope["scope_kind"], "full-operative")
+        self.assertEqual(scope["inventory"], "duvet/rfc7413-inventory.json")
         inventory = tomllib.loads((Path(__file__).parent / "rfc7413-additions.toml").read_text())
         self.assertTrue(inventory["spec"])
-        self.assertTrue(all(s["target"].startswith(f"{PREFIX}7413#section-")
+        self.assertTrue(all(s["target"].startswith((f"{PREFIX}7413#section-",
+                                                   f"{PREFIX}7413#appendix-"))
                             for s in inventory["spec"]))
         self.assertIn("duvet/rfc*-additions.toml", patterns)
         self.assertIn("duvet/rfc*-todos.toml", patterns)

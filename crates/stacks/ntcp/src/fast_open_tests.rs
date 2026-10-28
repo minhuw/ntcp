@@ -106,6 +106,212 @@ fn warm(v6: bool) -> (Endpoint, Endpoint, ListenerId) {
     (a, b, listener)
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//# 1. The client sends a SYN with a Fast Open option with an empty cookie field to request a cookie.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//# 2. The server generates a cookie and sends it through the Fast Open option of a SYN-ACK packet.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+//= type=test
+//= reason=Verified erratum 4239 corrects published Length 0 to Length 2; assertions check corrected endpoint bytes.
+//# 1. The client sends a SYN packet with a Fast Open option with a Length field of 0 (empty cookie
+//# field).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+//= type=test
+//# This SYN-ACK may contain a Fast Open option if the server currently supports TFO for this listener
+//# port.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+//= type=test
+//# We RECOMMEND both the client and the server to retransmit SYN and SYN-ACK packets without the cookie
+//# options on timeouts.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# If the SYN-ACK timer fires, the server SHOULD retransmit a SYN-ACK segment with neither data nor
+//# Fast Open options for compatibility reasons.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-9
+//= type=test
+//# Current and new implementations SHOULD use option (34).
+#[test]
+fn rfc7413_cookie_request_length_and_both_timeout_fallbacks() {
+    for v6 in [false, true] {
+        let (local, remote) = addresses(v6, 40000);
+        let mut a = endpoint(1, v6);
+        let mut b = endpoint(2, v6);
+        a.enable_fast_open().unwrap();
+        b.enable_fast_open().unwrap();
+        let listener = b.listen(remote, 8).unwrap();
+        b.set_listener_fast_open(listener, 1).unwrap();
+        let (id, accepted) = a.connect_fast_open(0, local, remote, b"cold").unwrap();
+        assert_eq!(accepted, 0);
+        let request = packet(&mut a, 0);
+        let syn = wire::parse(request.0, &request.1).unwrap();
+        assert_eq!(syn.header.flags & wire::SYN, wire::SYN);
+        assert!(syn.payload.is_empty());
+        // Published Length 0 is corrected to 2 by verified erratum 4239.
+        assert!(syn.raw_options.windows(2).any(|bytes| bytes == [34, 2]));
+        assert_eq!(syn.options.fast_open, Some(wire::FastOpenCookie::request()));
+        deliver(&mut b, 10, &request);
+        let response = packet(&mut b, 20);
+        let first = wire::parse(response.0, &response.1).unwrap();
+        assert_eq!(
+            first.header.flags & (wire::SYN | wire::ACK),
+            wire::SYN | wire::ACK
+        );
+        assert!(first.raw_options.windows(2).any(|bytes| bytes == [34, 10]));
+        assert_eq!(first.options.fast_open.unwrap().as_bytes().len(), 8);
+        assert_eq!(
+            first.header.acknowledgment,
+            syn.header.sequence.wrapping_add(1)
+        );
+        assert!(first.payload.is_empty());
+        let server_deadline = b.next_deadline().unwrap();
+        b.on_timeout(server_deadline, 64).unwrap();
+        let response = packet(&mut b, server_deadline);
+        let retry = wire::parse(response.0, &response.1).unwrap();
+        assert_eq!(
+            retry.header.flags & (wire::SYN | wire::ACK),
+            wire::SYN | wire::ACK
+        );
+        assert_eq!(retry.header.sequence, first.header.sequence);
+        assert_eq!(retry.header.acknowledgment, first.header.acknowledgment);
+        assert!(retry.options.fast_open.is_none());
+        assert!(retry.payload.is_empty());
+        let client_deadline = a.next_deadline().unwrap();
+        a.on_timeout(client_deadline, 64).unwrap();
+        let request = packet(&mut a, client_deadline);
+        let retry = wire::parse(request.0, &request.1).unwrap();
+        assert_eq!(retry.header.flags & wire::SYN, wire::SYN);
+        assert_eq!(retry.header.sequence, syn.header.sequence);
+        assert!(retry.options.fast_open.is_none());
+        assert!(retry.payload.is_empty());
+        assert_eq!(a.state(id).unwrap(), State::SynSent);
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
+//= type=test
+//# The client MUST cache negative responses from the server in order to avoid potential connection
+//# failures.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
+//= type=test
+//# Negative responses include the server not acknowledging the data in the SYN, ICMP error messages,
+//# and (most importantly) no response (SYN-ACK) from the server at all, i.e., connection timeout.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
+//= type=test
+//= reason=Verified erratum 5373 excludes the source port; subsequent requests change that port and remain suppressed.
+//# For any negative responses, the client SHOULD disable Fast Open on the specific path (the source and
+//# destination IP addresses and ports) at least temporarily. Since TFO is enabled on a per-service-port
+//# basis, but cookies are independent of service ports, the client's cache should include remote port
+//# numbers, too.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-7.1
+//= type=test
+//# Moreover, the implementation is recommended to negatively cache such incidents to avoid recurring
+//# timeouts.
+#[test]
+fn rfc7413_negative_causes_keep_cookie_and_suppress_service() {
+    for v6 in [false, true] {
+        for cause in 0..3 {
+            let (mut a, _, _) = warm(v6);
+            let (local, remote) = addresses(v6, 40001);
+            let (id, accepted) = a.connect_fast_open(100, local, remote, b"hello").unwrap();
+            assert_eq!(accepted, 5);
+            let syn = packet(&mut a, 100);
+            let sequence = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
+            let failed_at = match cause {
+                0 => {
+                    let mut response = cache_reply(&syn, 536, Some(&[9; 8]));
+                    response.1[8..12].copy_from_slice(&sequence.wrapping_add(1).to_be_bytes());
+                    repair_cache_checksum(response.0, &mut response.1);
+                    deliver(&mut a, 110, &response);
+                    packet(&mut a, 110);
+                    assert_eq!(a.acknowledged(id).unwrap(), 0);
+                    110
+                }
+                1 => {
+                    assert!(
+                        a.network_error(
+                            110,
+                            Tuple { local, remote },
+                            sequence,
+                            NetworkError::SoftUnreachable
+                        )
+                        .unwrap()
+                    );
+                    110
+                }
+                _ => {
+                    let deadline = a.next_deadline().unwrap();
+                    a.on_timeout(deadline, 64).unwrap();
+                    let retry = packet(&mut a, deadline);
+                    let retry = wire::parse(retry.0, &retry.1).unwrap();
+                    assert!(retry.options.fast_open.is_none());
+                    assert!(retry.payload.is_empty());
+                    deadline
+                }
+            };
+            assert!(
+                a.has_fast_open_cookie(failed_at, local.ip(), remote.ip())
+                    .unwrap()
+            );
+            assert!(
+                !a.can_defer_fast_open(failed_at, local.ip(), remote)
+                    .unwrap()
+            );
+            let other_service = SocketAddr::new(remote.ip(), remote.port() + 1);
+            assert!(
+                a.can_defer_fast_open(failed_at, local.ip(), other_service)
+                    .unwrap()
+            );
+            let (next_local, _) = addresses(v6, 40002);
+            let (_, accepted) = a
+                .connect_fast_open(failed_at, next_local, remote, b"retry")
+                .unwrap();
+            assert_eq!(accepted, 0); // Verified erratum 5373: source port is not a cache key.
+            let retry = packet(&mut a, failed_at);
+            let retry = wire::parse(retry.0, &retry.1).unwrap();
+            assert!(retry.options.fast_open.is_none());
+            assert!(retry.payload.is_empty());
+            let expires = failed_at + crate::fast_open::NEGATIVE_LIFETIME_US;
+            assert!(
+                !a.can_defer_fast_open(expires - 1, local.ip(), remote)
+                    .unwrap()
+            );
+            assert!(a.can_defer_fast_open(expires, local.ip(), remote).unwrap());
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-2
+//= type=test
+//# To enable applications to exchange data in a TCP handshake, TFO removes the constraint and allows
+//# data in SYN packets to be delivered to the application.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//# 3. The client caches the cookie for future TCP Fast Open connections (see below).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//# 1. The client sends a SYN with data and the cookie in the Fast Open option.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+//= type=test
+//# The Fast Open option is used to request or to send a Fast Open Cookie. When a cookie is not present
+//# or is empty, the option is used by the client to request a cookie from the server. When the cookie
+//# is present, the option is used to pass the cookie from the server to the client or from the client
+//# back to the server (to perform a Fast Open).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
+//= type=test
+//# PendingFastOpenRequests: tracks the number of TFO connections in SYN-RCVD state.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 4. Buffer the data and notify the application. Set the FastOpened flag and increment
+//# PendingFastOpenRequests.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 6. Advance to the SYN-RCVD state.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# Upon receiving an ACK acknowledging the SYN sequence, the server decrements PendingFastOpenRequests
+//# and advances to the ESTABLISHED state. No special handling is required further.
 #[test]
 fn fast_open_positive_early_read_delayed_write_quota_survives_accept() {
     for v6 in [false, true] {
@@ -166,6 +372,9 @@ fn fast_open_positive_early_read_delayed_write_quota_survives_accept() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 1. Initialize and reset a local FastOpened flag. If FastOpenEnabled is false, go to step 5.
 #[test]
 fn fast_open_default_off_invalid_cookie_and_endpoint_opt_in() {
     for (service, enabled) in [(false, false), (true, false), (true, true)] {
@@ -912,6 +1121,12 @@ fn early_terminal_child(
     (b, listener, child, ip, header)
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-5.1
+//= type=test
+//# For this reason, a TFO server needs to monitor the connections in SYN-RCVD being reset in addition
+//# to imposing a reasonable max queue length. Implementations may combine the two, e.g., by continuing
+//# to account for those connection requests that have just been reset against the listener's
+//# PendingFastOpenRequests until a timeout period has passed.
 #[test]
 fn fast_open_early_terminal_reset_event_and_quota() {
     for flags in [wire::RST, wire::SYN] {
@@ -1166,6 +1381,16 @@ fn repair_cache_checksum(ip: IpMetadata, bytes: &mut [u8]) {
     bytes[16..18].copy_from_slice(&sum.to_be_bytes());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
+//= type=test
+//# When caching cookies, we recommend that the client also cache the Maximum Segment Size (MSS)
+//# advertised by the server. The client can cache the MSS advertised by the server in order to
+//# determine the maximum amount of data that the client can fit in the SYN packet in subsequent TFO
+//# connections.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 1. If the SYN-ACK has a Fast Open option, an MSS option, or both, update the corresponding cookie
+//# and MSS information in the cookie cache.
 #[test]
 fn fast_open_validated_mss_without_cookie_replacement() {
     for v6 in [false, true] {

@@ -169,10 +169,10 @@ inventory = "duvet/rfc5927-inventory.json"
 [[rfc]]
 id = 7413
 document_status = "Experimental"
-scope_kind = "selected-requirements"
-scope = "server admission and explicit client credential/MSS boundaries; not full RFC7413 coverage"
+scope_kind = "full-operative"
+scope = "Full operative document: Fast Open wire formats, cookie policies/caches, endpoint procedures, fallback, admission/security, application/deployment actors and selected example socket APIs; verified errata are explicit interpretations of original published quotes"
 extraction = "manual"
-inventory = "duvet/rfc7413-additions.toml"
+inventory = "duvet/rfc7413-inventory.json"
 
 [[rfc]]
 id = 6191

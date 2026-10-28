@@ -124,6 +124,18 @@ fn fast_open_options_default_off_and_listener_updates() {
     );
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+//= type=test
+//# For a non-blocking socket, it returns the number of bytes buffered and sent in the SYN packet.
+//= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2
+//= type=test
+//# The application only needs to enable the reception of Fast Open requests via a new TCP_FASTOPEN
+//# setsockopt() socket option before listen().
+//= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2
+//= type=test
+//# Traditionally, accept() returns only after a socket is connected. But, for a Fast Open connection,
+//# accept() returns upon receiving a SYN with a valid Fast Open cookie and data, and the data is
+//# available to be read through, e.g., recvmsg(), read().
 #[test]
 fn fast_open_deferred_fault_retry_partial_and_server_early_response_barrier() {
     let (mut a, mut b, listener) = tfo_setup(true);
@@ -250,6 +262,11 @@ fn fast_open_deferred_fault_retry_partial_and_server_early_response_barrier() {
     );
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+//= type=test
+//# If the cookie is not available locally, it returns -1 with errno EINPROGRESS, and sends a SYN with a
+//# TFO cookie request automatically. The caller needs to write the data again when the socket is
+//# connected.
 #[test]
 fn fast_open_miss_nonblocking_and_dontwait_retries_do_not_accept_payload() {
     for flags in [0, MSG_DONTWAIT] {
@@ -323,6 +340,13 @@ fn fast_open_miss_nonblocking_and_dontwait_retries_do_not_accept_payload() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+//= type=test
+//# MSG_FASTOPEN marks the attempt to send data in the SYN like a combination of connect() and sendto(),
+//# by performing an implicit connect() operation.
+//= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+//= type=test
+//# It blocks until the handshake has completed and the data is buffered.
 #[test]
 fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs() {
     for (warm, deferred, first_len) in [
@@ -369,6 +393,19 @@ fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs() {
         assert!(!a.service(&mut request));
         assert!(rx.try_recv().is_err());
         assert!(!a.service(&mut request));
+        let syn = tfo_capture(&mut a);
+        let parsed = segment(&syn);
+        assert_ne!(parsed.header.flags & ntcp::wire::SYN, 0);
+        if warm {
+            assert!(!parsed.payload.is_empty());
+            let expected = [first.as_slice(), second.as_slice()].concat();
+            assert_eq!(parsed.payload, &expected[..parsed.payload.len()]);
+            assert!(!parsed.options.fast_open.unwrap().as_bytes().is_empty());
+        } else {
+            assert!(parsed.payload.is_empty());
+            assert!(parsed.options.fast_open.unwrap().as_bytes().is_empty());
+        }
+        tfo_deliver(&mut b, syn);
         exchange(&mut a, &mut b);
         assert!(a.service(&mut request));
         assert_eq!(rx.recv().unwrap().unwrap().value as usize, first_len + 1000);

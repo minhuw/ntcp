@@ -26,7 +26,7 @@ fn client() -> (Endpoint, ActiveOpenOptions) {
 //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=Early-send credentials remain serialized in a kind34 option; output selects SYN data only when the option fits, and admission applies known-peer or conservative default MSS.
+//= reason=Published section 4.2.2 says default 536 bytes without the IPv6 qualifier. The implementation follows section 4.1.3 and permits cold IPv6 SYN data up to 1220 minus options. Erratum 8015 proposes that clarification but is Held for Document Update, not Verified; this literal obligation is retained unresolved. Explicit ApplicationProtected also selects omitted-option SYN data under section 7.3. Existing ordinary-path evidence is retained and does not establish literal closure across these choices.
 //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
 #[test]
 fn supplied_cookie_cold_limits_options_and_real_mss_learning() {

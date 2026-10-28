@@ -259,6 +259,17 @@ impl Owner {
     }
     // One bounded copy/admission per service turn. No foreign data survives a
     // turn except bytes already owned by TCP; the cursor advances only on write.
+    //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+    //# MSG_FASTOPEN marks the attempt to send data in the SYN like a combination of connect() and sendto(),
+    //# by performing an implicit connect() operation.
+    //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+    //# It blocks until the handshake has completed and the data is buffered.
+    //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+    //# For a non-blocking socket, it returns the number of bytes buffered and sent in the SYN packet.
+    //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+    //# If the cookie is not available locally, it returns -1 with errno EINPROGRESS, and sends a SYN with a
+    //# TFO cookie request automatically. The caller needs to write the data again when the socket is
+    //# connected.
     fn send_step(&mut self, id: u64, send: &mut LogicalSend, blocking: bool) -> Result<()> {
         let deferred = self.sockets.get(&id).ok_or(EBADF)?.deferred_peer.is_some();
         // Permission belongs to the logical call. A call already admitted

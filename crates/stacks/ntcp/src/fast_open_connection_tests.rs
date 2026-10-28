@@ -20,6 +20,10 @@ fn client(iss: u32, size: usize) -> Connection {
 }
 
 fn synack(a: &mut Connection, acked: u32, now: u64) {
+    synack_with_payload(a, acked, now, &[]);
+}
+
+fn synack_with_payload(a: &mut Connection, acked: u32, now: u64, payload: &[u8]) {
     let options = wire::Options {
         mss: Some(536),
         sack_permitted: true,
@@ -39,11 +43,29 @@ fn synack(a: &mut Connection, acked: u32, now: u64) {
         },
         options,
         raw_options: &[],
-        payload: &[],
+        payload,
     };
     a.input(now, &segment).unwrap();
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.
+//# 4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not
+//# acknowledged, the client retransmits the data in the ACK packet.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 1. Send a SYN packet.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 2. Advance to SYN-SENT state and update SND.NXT to include the data accordingly.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 2. Send an ACK packet. Set acknowledgment number to RCV.NXT and include the data after SND.UNA if
+//# data is available.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# 3. Advance to the ESTABLISHED state.
 #[test]
 fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
     for iss in [100, u32::MAX - 4] {
@@ -54,16 +76,22 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
             let bytes = packet(&mut a, 0);
             let syn = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(syn.header.sequence, iss);
+            assert_eq!(syn.header.flags & (SYN | ACK), SYN);
             assert_eq!(syn.payload, &[42; 12]);
             assert_eq!(syn.header.flags & PSH, 0);
             assert_eq!(a.flight(), 13);
+            assert_eq!(a.state(), State::SynSent);
+            assert_eq!(a.snd_nxt, Seq(iss.wrapping_add(13)));
             assert_eq!(a.data_flight(), 12);
             assert_eq!(
                 a.last_output_range,
                 Some(TxStreamRange { start: 0, end: 12 })
             );
             assert_eq!(a.flush().unwrap(), 0); // On-wire bytes cannot be discarded.
-            synack(&mut a, acked, 1000);
+            synack_with_payload(&mut a, acked, 1000, b"response");
+            let mut response = [0; 8];
+            assert_eq!(a.read(&mut response), Ok(8));
+            assert_eq!(&response, b"response");
             assert_eq!(
                 a.congestion.ack_history(),
                 Some((Seq(iss), Seq(iss).wrapping_add(1 + acked)))
@@ -77,6 +105,8 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
             let bytes = packet(&mut a, 1000);
             let repair = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(repair.header.flags & SYN, 0);
+            assert_ne!(repair.header.flags & ACK, 0);
+            assert_eq!(repair.header.acknowledgment, 1008); // RCV.NXT includes SYN and response.
             assert_eq!(repair.payload.len(), 12 - acked as usize);
             assert_eq!(repair.header.flags & PSH != 0, acked != 12);
             if acked != 12 {
@@ -104,6 +134,10 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-7.1
+//= type=test
+//# The TFO protocol deals with this problem by falling back to the regular TCP handshake and
+//# retransmitting the SYN without data or cookie options after the initial SYN timeout.
 #[test]
 fn timeout_bare_syn_retains_data_and_karn() {
     let mut a = client(u32::MAX - 2, 12);
@@ -141,6 +175,10 @@ fn reserved_syn_exact_range_and_acceptance_rtt() {
     assert_eq!(a.acknowledged, 12);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//# a. If the SYN packet does not have enough option space for the Fast Open option, abort TFO and fall
+//# back to the regular 3WHS.
 #[test]
 fn option_lengths_small_path_and_timestamp_credit() {
     for len in [4, 6, 8, 10, 12, 14, 16] {
@@ -175,9 +213,18 @@ fn option_lengths_small_path_and_timestamp_credit() {
     let bytes = packet(&mut a, 0);
     let syn = wire::parse(ip(tuple()), &bytes).unwrap();
     assert!(syn.payload.is_empty());
+    assert_eq!(syn.header.flags & (SYN | ACK), SYN);
     assert!(syn.options.fast_open.is_none()); // Never emit cookieless early data.
     assert!(bytes.len() <= 44);
     assert_eq!(a.send.len(), 12);
+    synack(&mut a, 0, 1000);
+    assert_eq!(a.state(), State::Established);
+    let bytes = packet(&mut a, 1000);
+    let ack = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(ack.header.flags & (SYN | ACK), ACK);
+    assert_eq!(ack.header.acknowledgment, 1000);
+    assert_eq!(ack.header.sequence, a.iss.wrapping_add(1).0);
+    assert_eq!(ack.payload, &[42; 12]);
 }
 
 #[test]
@@ -239,6 +286,11 @@ fn selected_packet(a: &mut Connection, now: &mut u64, reserved: bool) -> Option<
     Some(bytes)
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.
+//# 4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not
+//# acknowledged, the client retransmits the data in the ACK packet.
 fn repair_obeys_negotiated_window(reserved: bool) {
     for iss in [100, u32::MAX - 100] {
         for acked in [0, 13] {

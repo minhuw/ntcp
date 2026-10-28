@@ -74,7 +74,8 @@ class InventoryAudit(unittest.TestCase):
         for changed in (original.replace("id = 7413", "id = 6191"),
                         original.replace("id = 7413", "id = 9293"),
                         original.replace('extraction = "section-3"', 'extraction = "all"'),
-                        original.replace('scope_kind = "selected-requirements"', 'scope_kind = "full-operative"'),
+                        original.replace('inventory = "duvet/rfc7413-inventory.json"',
+                                         'inventory = "duvet/rfc7413-additions.toml"'),
                         original.replace('document_status = "Experimental"', 'document_status = "Conformant"')):
             with self.subTest(change=changed[-200:]):
                 path.write_text(changed)
@@ -88,7 +89,7 @@ class InventoryAudit(unittest.TestCase):
 
     def test_missing_inventory_and_wrong_extraction_fail(self):
         self.copy_registry()
-        inv = self.root / "duvet/rfc7413-additions.toml"
+        inv = self.root / load_scopes()[7413]["inventory"]
         original = inv.read_text()
         inv.unlink()
         with self.assertRaisesRegex(ValueError, "missing or invalid inventory"):
@@ -349,6 +350,11 @@ class InventoryAudit(unittest.TestCase):
     def test_toml_source_and_test_quotes_reject_fuzzy_matches_and_partial_spans(self):
         report, entries, texts = report_fixture(self.root)
         scopes = report_scopes()
+        # Retain the TOML-only negative regression even though RFC7413's real
+        # registration now uses a full operative JSON ledger. The report-level
+        # source scanner must validate every inventory format equally.
+        scopes[7413].update(inventory="duvet/rfc7413-additions.toml",
+                            scope_kind="selected-requirements")
         self.assertTrue(scopes[7413]["inventory"].endswith(".toml"))
         with patch.object(audit, "source_annotations", wraps=audit.source_annotations) as parser:
             self.validate_report(report, scopes, entries, texts)

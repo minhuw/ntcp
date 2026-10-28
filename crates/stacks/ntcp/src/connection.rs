@@ -1465,6 +1465,14 @@ impl Connection {
         Ok(())
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-2
+    //# To enable applications to exchange data in a TCP handshake, TFO removes the constraint and allows
+    //# data in SYN packets to be delivered to the application.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
+    //# The server keeps a FastOpened flag per connection to mark if a connection has successfully performed
+    //# a TFO.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 6. Advance to the SYN-RCVD state.
     pub(crate) fn passive_fast_open(&mut self, cookie: Option<wire::FastOpenCookie>, early: bool) {
         self.fast_open = cookie;
         self.fast_open_early = early;
@@ -1488,6 +1496,12 @@ impl Connection {
             )
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+    //# If the server accepts the data in the SYN packet, it may send the response data before the handshake
+    //# finishes.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-5.2
+    //= reason=Selected default withholding defense; explicit early-response opt-in accepts the described security tradeoff. Rejected erratum 6239 is not applied.
+    //# The best defense is for the server not to respond with data until the handshake finishes.
     fn early_response_eligible(&self) -> bool {
         self.passive_open
             && self.fast_open_early
@@ -2334,6 +2348,9 @@ impl Connection {
         self.handshake_retransmission_limit
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
+    //# Negative responses include the server not acknowledging the data in the SYN, ICMP error messages,
+    //# and (most importantly) no response (SYN-ACK) from the server at all, i.e., connection timeout.
     fn report_fast_open_failure(&mut self) {
         if self.handshake_pending() && core::mem::take(&mut self.fast_open_attempt) {
             self.fast_open_negative = true;
@@ -3553,6 +3570,15 @@ impl Connection {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+    //= reason=Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.
+    //# 4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not
+    //# acknowledged, the client retransmits the data in the ACK packet.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 2. Send an ACK packet. Set acknowledgment number to RCV.NXT and include the data after SND.UNA if
+    //# data is available.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //# 3. Advance to the ESTABLISHED state.
     fn establish(&mut self) {
         self.fast_open_attempt = false;
         if self.deferred_tfo_push {
@@ -7413,6 +7439,34 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
         //= reason=Supplied cookies use the existing first-SYN-only data/option selection; actual timer retry drops both and preserves service failure evidence.
         //# To deal with network or servers dropping SYN packets with payload or unknown options, when the SYN timer fires, the client SHOULD retransmit a SYN packet without data and Fast Open options.
+        // Original Length 0 below is interpreted using verified erratum 4239:
+        // the empty request emitted here has Length 2, never Length 0.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+        //# 1. The client sends a SYN with a Fast Open option with an empty cookie field to request a cookie.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+        //# 1. The client sends a SYN with data and the cookie in the Fast Open option.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+        //= reason=Verified erratum 4239 corrects the original published Length 0 to Length 2; corrected wire behavior is cited, not literal Length 0.
+        //# 1. The client sends a SYN packet with a Fast Open option with a Length field of 0 (empty cookie
+        //# field).
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+        //# We RECOMMEND both the client and the server to retransmit SYN and SYN-ACK packets without the cookie
+        //# options on timeouts.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+        //# 1. Send a SYN packet.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+        //# a. If the SYN packet does not have enough option space for the Fast Open option, abort TFO and fall
+        //# back to the regular 3WHS.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+        //# 2. Advance to SYN-SENT state and update SND.NXT to include the data accordingly.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+        //# If the SYN-ACK timer fires, the server SHOULD retransmit a SYN-ACK segment with neither data nor
+        //# Fast Open options for compatibility reasons.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-7.1
+        //# The TFO protocol deals with this problem by falling back to the regular TCP handshake and
+        //# retransmitting the SYN without data or cookie options after the initial SYN timeout.
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-9
+        //# Current and new implementations SHOULD use option (34).
         let fast_open_option = if syn && self.snd_nxt == self.iss && !self.syn_timed_out {
             self.fast_open.filter(|cookie| {
                 let padded = (option_len + cookie.as_bytes().len() + 2 + 3) & !3;
@@ -7422,7 +7476,7 @@ impl Connection {
             None
         };
         //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-        //= reason=Early-send credentials remain serialized in a kind34 option; output selects SYN data only when the option fits, and admission applies known-peer or conservative default MSS.
+        //= reason=Published section 4.2.2 says default 536 bytes without the IPv6 qualifier. The implementation follows section 4.1.3 and permits cold IPv6 SYN data up to 1220 minus options. Erratum 8015 proposes that clarification but is Held for Document Update, not Verified; this literal obligation is retained unresolved. Explicit ApplicationProtected also selects omitted-option SYN data under section 7.3. Existing ordinary-path evidence is retained and does not establish literal closure across these choices.
         //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
         if let Some(cookie) = fast_open_option {
             let bytes = cookie.as_bytes();
@@ -9022,6 +9076,8 @@ impl Connection {
             // or otherwise perturb sender work or any protocol timer.
             return Ok(Some(size));
         }
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+        //# 2. Advance to SYN-SENT state and update SND.NXT to include the data accordingly.
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if syn && !reserve {
             self.fast_open_attempt |= !self.passive_open
