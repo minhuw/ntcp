@@ -1,0 +1,175 @@
+# Schema 1: each registration states its actual audit boundary, not conformance.
+# extraction: all = Duvet keyword extraction; section-3 = RFC9293 policy;
+# manual = selected/additional quotations only. inventory is a required tracked
+# additions TOML or paragraph JSON ledger. Operative scopes require JSON.
+# full-operative additionally requires every non-furniture document span to be
+# represented (context is allowed); human review still decides operative meaning.
+schema_version = 1
+
+[[rfc]]
+id = 9293
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Section 3 keyword requirements plus manual supplements; no full operative audit"
+extraction = "section-3"
+inventory = "duvet/rfc9293-additions.toml"
+
+[[rfc]]
+id = 2018
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc2018-additions.toml"
+
+[[rfc]]
+id = 6675
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc6675-additions.toml"
+
+[[rfc]]
+id = 8985
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc8985-additions.toml"
+
+[[rfc]]
+id = 9937
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc9937-additions.toml"
+
+[[rfc]]
+id = 6298
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc6298-additions.toml"
+
+[[rfc]]
+id = 5681
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc5681-additions.toml"
+
+[[rfc]]
+id = 6582
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc6582-additions.toml"
+
+[[rfc]]
+id = 6928
+document_status = "Experimental"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc6928-additions.toml"
+
+[[rfc]]
+id = 7323
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc7323-additions.toml"
+
+[[rfc]]
+id = 2883
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc2883-additions.toml"
+
+[[rfc]]
+id = 3168
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc3168-additions.toml"
+
+[[rfc]]
+id = 5961
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc5961-additions.toml"
+
+[[rfc]]
+id = 3042
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc3042-additions.toml"
+
+[[rfc]]
+id = 9406
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc9406-additions.toml"
+
+[[rfc]]
+id = 9438
+document_status = "Standards Track"
+scope_kind = "extracted-requirements"
+scope = "Document keyword requirements plus manual supplements; no full operative audit"
+extraction = "all"
+inventory = "duvet/rfc9438-additions.toml"
+
+[[rfc]]
+id = 1191
+document_status = "Standards Track"
+scope_kind = "scoped-operative"
+scope = "IPv4 enabled unicast TCP core/codec PMTUD; disabled/example gaps separately identified"
+extraction = "all"
+inventory = "duvet/rfc1191-inventory.json"
+
+[[rfc]]
+id = 8201
+document_status = "Standards Track"
+scope_kind = "scoped-operative"
+scope = "IPv6 enabled unicast TCP core/base-header codec PMTUD; disabled-profile and extension-header gaps separately identified; obsoletes RFC1981"
+extraction = "all"
+inventory = "duvet/rfc8201-inventory.json"
+
+[[rfc]]
+id = 4821
+document_status = "Standards Track"
+scope_kind = "scoped-operative"
+scope = "TCP PLPMTUD; not RFC8899 DPLPMTUD"
+extraction = "all"
+inventory = "duvet/rfc4821-inventory.json"
+
+[[rfc]]
+id = 5927
+document_status = "Informational"
+scope_kind = "scoped-operative"
+scope = "Nonstandard security-policy guidance; not mandatory TCP norms"
+extraction = "all"
+inventory = "duvet/rfc5927-inventory.json"
+
+[[rfc]]
+id = 7413
+document_status = "Experimental"
+scope_kind = "selected-requirements"
+scope = "server admission and explicit client credential/MSS boundaries; not full RFC7413 coverage"
+extraction = "manual"
+inventory = "duvet/rfc7413-additions.toml"

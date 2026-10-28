@@ -4,8 +4,10 @@ import json
 import sys
 from pathlib import Path
 
-RFCS = (9293, 2018, 6675, 8985, 9937, 6298, 5681, 6582, 6928, 7323, 2883, 3168, 5961, 3042, 9406, 9438, 1191, 8201, 4821, 5927, 7413)
-PREFIX = "https://www.rfc-editor.org/rfc/rfc"
+from rfc_scopes import PREFIX, load_scopes
+
+SCOPES = load_scopes()
+RFCS = tuple(SCOPES)
 
 
 def check(report):
@@ -53,12 +55,11 @@ def check(report):
             "untracked": len(missing - todo_requirements),
             "todos": len(todos),
         }
-        if rfc == 5927:
-            # Counts are audit spans, not Standards Track mandatory TCP norms.
-            summaries[str(rfc)]["document_status"] = "Informational"
-        if rfc == 7413:
-            summaries[str(rfc)]["document_status"] = "Experimental"
-            summaries[str(rfc)]["inventory_scope"] = "server admission and explicit client credential/MSS boundaries; not full RFC7413 coverage"
+        summaries[str(rfc)].update({
+            "document_status": SCOPES[rfc]["document_status"],
+            "scope_kind": SCOPES[rfc]["scope_kind"],
+            "inventory_scope": SCOPES[rfc]["scope"],
+        })
         for index in sorted(missing):
             a = annotations[index]
             errors.append(f"RFC {rfc}: incomplete requirement at {a['source']}:{a['line']}")

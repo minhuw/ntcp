@@ -1,0 +1,2382 @@
+{
+  "schema_version": 1,
+  "base_commit": "5817f38acc6b351525a167e72de90eb38294d881",
+  "rfcs": {
+    "9293": {
+      "text_sha256": "6d9ac8be4b0286f8c3d337addf442b2eb6a9b14e1366594ea7fbc273f93dc2d9",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "The window size MUST be treated as an unsigned number, or else\nlarge window sizes will appear like negative windows and TCP will\nnot work (MUST-1).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "It is RECOMMENDED that implementations will\nreserve 32-bit fields for the send and receive window sizes in the\nconnection record and do all window computations with 32 bits (REC-\n1).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "The sender MUST generate it\n(MUST-2) and the receiver MUST check it (MUST-3).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "The content of the header beyond the End of\nOption List Option MUST be header padding of zeros (MUST-69).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "A given TCP implementation can support any currently defined\noptions, but the following options MUST be supported (MUST-4 --\nnote Maximum Segment Size Option support is also part of MUST-14 in\nSection 3.7.1):\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "A TCP implementation MUST be able to receive a TCP Option in any\nsegment (MUST-5).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "A TCP implementation MUST (MUST-6) ignore without error any TCP\nOption it does not implement, assuming that the option has a length\nfield.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "All TCP Options except End of Option List Option (EOL) and\nNo-Operation (NOP) MUST have length fields, including all future\noptions (MUST-68).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.1",
+          "quote": "TCP implementations MUST be prepared to handle\nan illegal option length (e.g., zero); a suggested procedure is to\nreset the connection and log the error cause (MUST-7).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3",
+          "quote": "A TCP\nimplementation that supports the mitigation described in RFC\n5961 SHOULD first check that the sequence number exactly\nmatches RCV.NXT prior to executing the action in the next\nparagraph.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3",
+          "quote": "Data or controls that were queued for\ntransmission MAY be included.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "o  In general, the processing of received segments MUST be\nimplemented to aggregate ACK segments whenever possible\n(MUST-58).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "For example, if the TCP endpoint is processing a\nseries of queued segments, it MUST process them all before\nsending any ACK segments (MUST-59).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "Segments with higher\nbeginning sequence numbers SHOULD be held for later\nprocessing (SHLD-31).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "2)  If the RST bit is set and the sequence number exactly\nmatches the next expected sequence number (RCV.NXT), then\nTCP endpoints MUST reset the connection in the manner\nprescribed below according to the connection state.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "3)  If the RST bit is set and the sequence number does not\nexactly match the next expected sequence value, yet is\nwithin the current receive window, TCP endpoints MUST send\nan acknowledgment (challenge ACK):\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "After sending the challenge ACK, TCP endpoints MUST drop\nthe unacceptable segment and stop processing the incoming\npacket further.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "RFC 5961 recommends that in\nthese synchronized states, if the SYN bit is set,\nirrespective of the sequence number, TCP endpoints MUST send\na \"challenge ACK\" to the remote peer:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "o  After sending the acknowledgment, TCP implementations MUST\ndrop the unacceptable segment and stop processing further.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "o  RFC 5961 [9], Section 5 describes a potential blind data\ninjection attack, and mitigation that implementations MAY\nchoose to include (MAY-12).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "TCP stacks that implement RFC\n5961 MUST add an input check that the ACK value is\nacceptable only if it is in the range of ((SND.UNA -\nMAX.SND.WND) =< SEG.ACK =< SND.NXT).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "All incoming segments\nwhose ACK value doesn't satisfy the above condition MUST be\ndiscarded and an ACK sent back.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4",
+          "quote": "o  A TCP implementation MAY send an ACK segment acknowledging\nRCV.NXT when a valid segment arrives that is in the window\nbut not at the left window edge (MAY-13).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.2",
+          "quote": "There is\nno guarantee that senders will use this option, so receivers MUST\nbe prepared to process options even if they do not begin on a word\nboundary (MUST-64).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.2",
+          "quote": "This field may be\nsent in the initial connection request (i.e., in segments with the\nSYN control bit set) and MUST NOT be sent in other segments (MUST-\n65).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1",
+          "quote": "A TCP implementation MUST use the above type of \"clock\" for clock-\ndriven selection of initial sequence numbers (MUST-8), and SHOULD\ngenerate its initial sequence numbers with the expression:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1",
+          "quote": "F() MUST NOT be computable from the outside (MUST-9), or\nan attacker could still guess at sequence numbers from the ISN used\nfor some other connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.4",
+          "quote": "A TCP receiver MUST process the RST and URG\nfields of all incoming segments, even when the receive window is zero\n(MUST-66).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.5.3",
+          "quote": "TCP implementations SHOULD allow a received RST segment to include\ndata (SHLD-2).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.5",
+          "quote": "A TCP implementation MUST support simultaneous open attempts (MUST-\n10).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.5",
+          "quote": "Note that a TCP implementation MUST keep track of whether a\nconnection has reached SYN-RECEIVED state as the result of a passive\nOPEN or an active OPEN (MUST-11).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1",
+          "quote": "A host MAY implement a \"half-duplex\" TCP close sequence, so that an\napplication that has called CLOSE cannot continue to read data from\nthe connection (MAY-1).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1",
+          "quote": "If such a host issues a CLOSE call while\nreceived data is still pending in the TCP connection, or if new data\nis received after CLOSE is called, its TCP implementation SHOULD send\na RST to show that data was lost (SHLD-3).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1",
+          "quote": "When a connection is closed actively, it MUST linger in the TIME-WAIT\nstate for a time 2xMSL (Maximum Segment Lifetime) (MUST-13).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1",
+          "quote": "However, it MAY accept a new SYN from the remote TCP endpoint to\nreopen the connection directly from TIME-WAIT state (MAY-2), if it:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1",
+          "quote": "This algorithm for reducing TIME-WAIT is a Best\nCurrent Practice that SHOULD be implemented since Timestamp Options\nare commonly used, and using them to reduce TIME-WAIT provides\nbenefits for busy Internet servers (SHLD-4).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.6",
+          "quote": "If the local TCP connection is closed by the\nremote side due to a FIN or RST received from the remote side, then\nthe local application MUST be informed whether it closed normally or\nwas aborted (MUST-12).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1",
+          "quote": "TCP endpoints MUST implement both sending and receiving the MSS\nOption (MUST-14).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1",
+          "quote": "TCP implementations SHOULD send an MSS Option in every SYN segment\nwhen its receive MSS differs from the default 536 for IPv4 or 1220\nfor IPv6 (SHLD-5), and MAY send it always (MAY-3).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1",
+          "quote": "If an MSS Option is not received at connection setup, TCP\nimplementations MUST assume a default send MSS of 536 (576 - 40) for\nIPv4 or 1220 (1280 - 60) for IPv6 (MUST-15).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1",
+          "quote": "The maximum size of a segment that a TCP endpoint really sends, the\n\"effective send MSS\", MUST be the smaller (MUST-16) of the send MSS\n(that reflects the available reassembly buffer size at the remote\nhost, the EMTU_R [19]) and the largest transmission size permitted by\nthe IP layer (EMTU_S [19]):\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1",
+          "quote": "where MMS_R is the maximum size for a transport-layer message that\ncan be received (and reassembled at the IP layer) (MUST-67).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.3",
+          "quote": "As a result, when the effective MTU of an interface varies packet-to-\npacket, TCP implementations SHOULD use the smallest effective MTU of\nthe interface to calculate the value to advertise in the MSS Option\n(SHLD-6).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4",
+          "quote": "A TCP implementation SHOULD implement the Nagle algorithm to coalesce\nshort segments (SHLD-7).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4",
+          "quote": "However, there MUST be a way for an\napplication to disable the Nagle algorithm on an individual\nconnection (MUST-17).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1",
+          "quote": "The RTO MUST be computed according to the algorithm in [10],\nincluding Karn's algorithm for taking RTT samples (MUST-18).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1",
+          "quote": "RFC 1122 allows that if a retransmitted packet is identical to the\noriginal packet (which implies not only that the data boundaries have\nnot changed, but also that none of the headers have changed), then\nthe same IPv4 Identification field MAY be used (see Section 3.2.1.5\nof RFC 1122) (MAY-4).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2",
+          "quote": "A TCP endpoint MUST implement the basic congestion control algorithms\nslow start, congestion avoidance, and exponential backoff of RTO to\navoid creating congestion collapse conditions (MUST-19).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2",
+          "quote": "An endpoint MAY implement such alternative\nalgorithms provided that the algorithms are conformant with the TCP\nspecifications from the IETF Standards Track as described in RFC\n2914, RFC 5033 [7], and RFC 8961 [15] (MAY-18).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2",
+          "quote": "A TCP endpoint SHOULD implement ECN as described in RFC 3168 (SHLD-\n8).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3",
+          "quote": "The following\nprocedure MUST be used to handle excessive retransmissions of data\nsegments (MUST-20):\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3",
+          "quote": "(d)  An application MUST (MUST-21) be able to set the value for R2\nfor a particular connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3",
+          "quote": "(e)  TCP implementations SHOULD inform the application of the\ndelivery problem (unless such information has been disabled by\nthe application; see the \"Asynchronous Reports\" section\n(Section 3.9.1.8)), when R1 is reached and before R2 (SHLD-9).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3",
+          "quote": "The value of R1 SHOULD correspond to at least 3 retransmissions, at\nthe current RTO (SHLD-10).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3",
+          "quote": "The value of R2 SHOULD correspond to at\nleast 100 seconds (SHLD-11).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3",
+          "quote": "SYN retransmissions MUST be handled in the\ngeneral way just described for data retransmissions, including\nnotification of the application layer.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3",
+          "quote": "In particular, R2 for a SYN segment MUST be set large\nenough to provide retransmission of the segment for at least 3\nminutes (MUST-23).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4",
+          "quote": "Implementers MAY include \"keep-alives\" in their TCP implementations\n(MAY-5), although this practice is not universally accepted.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4",
+          "quote": "If\nkeep-alives are included, the application MUST be able to turn them\non or off for each TCP connection (MUST-24), and they MUST default to\noff (MUST-25).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4",
+          "quote": "Keep-alive packets MUST only be sent when no sent data is\noutstanding, and no data or acknowledgment packets have been received\nfor the connection within an interval (MUST-26).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4",
+          "quote": "This interval MUST\nbe configurable (MUST-27) and MUST default to no less than two hours\n(MUST-28).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4",
+          "quote": "Consequently, if a\nkeep-alive mechanism is implemented it MUST NOT interpret failure to\nrespond to any specific probe as a dead connection (MUST-29).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4",
+          "quote": "An implementation SHOULD send a keep-alive segment with no data\n(SHLD-12); however, it MAY be configurable to send a keep-alive\nsegment containing one garbage octet (MAY-6), for compatibility with\nerroneous TCP implementations.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5",
+          "quote": "As a result of implementation differences and middlebox interactions,\nnew applications SHOULD NOT employ the TCP urgent mechanism (SHLD-\n13).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5",
+          "quote": "However, TCP implementations MUST still include support for the\nurgent mechanism (MUST-30).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5",
+          "quote": "A TCP implementation MUST support a sequence of urgent data of any\nlength (MUST-31) [19].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5",
+          "quote": "The urgent pointer MUST point to the sequence number of the octet\nfollowing the urgent data (MUST-62).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5",
+          "quote": "A TCP implementation MUST (MUST-32) inform the application layer\nasynchronously whenever it receives an urgent pointer and there was\npreviously no pending urgent data, or whenever the urgent pointer\nadvances in the data stream.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5",
+          "quote": "The TCP implementation MUST (MUST-33)\nprovide a way for the application to learn how much urgent data\nremains to be read from the connection, or at least to determine\nwhether more urgent data remains to be read [19].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1",
+          "quote": "Probing of zero (offered) windows MUST be supported (MUST-36).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1",
+          "quote": "A TCP implementation MAY keep its offered receive window closed\nindefinitely (MAY-8).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1",
+          "quote": "As long as the receiving TCP peer continues to\nsend acknowledgments in response to the probe segments, the sending\nTCP peer MUST allow the connection to stay open (MUST-37).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1",
+          "quote": "The transmitting host SHOULD send the first zero-window probe when a\nzero window has existed for the retransmission timeout period (SHLD-\n29) (Section 3.8.1), and SHOULD increase exponentially the interval\nbetween successive probes (SHLD-30).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1",
+          "quote": "A TCP implementation MUST include a SWS avoidance algorithm in the\nsender (MUST-38).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.2",
+          "quote": "A TCP implementation MUST include a SWS avoidance algorithm in the\nreceiver (MUST-39).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3",
+          "quote": "A TCP endpoint SHOULD implement a delayed ACK (SHLD-18), but an ACK\nshould not be excessively delayed; in particular, the delay MUST be\nless than 0.5 seconds (MUST-40).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3",
+          "quote": "An ACK SHOULD be generated for at\nleast every second full-sized segment or 2*RMSS bytes of new data\n(where RMSS is the MSS specified by the TCP endpoint receiving the\nsegments to be acknowledged, or the default value if not specified)\n(SHLD-19).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6",
+          "quote": "A TCP receiver SHOULD NOT shrink the window, i.e., move the right\nwindow edge to the left (SHLD-14).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6",
+          "quote": "However, a sending TCP peer MUST\nbe robust against window shrinking, which may cause the \"usable\nwindow\" (see Section 3.8.6.2.1) to become negative (MUST-34).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6",
+          "quote": "If this happens, the sender SHOULD NOT send new data (SHLD-15), but\nSHOULD retransmit normally the old unacknowledged data between\nSND.UNA and SND.UNA+SND.WND (SHLD-16).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6",
+          "quote": "The sender MAY also\nretransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT\ntime out the connection if data beyond the right window edge is not\nacknowledged (SHLD-17).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6",
+          "quote": "If the window shrinks to zero, the TCP\nimplementation MUST probe it in the standard way (described below)\n(MUST-35).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1",
+          "quote": "Every passive OPEN call either creates a new connection record in\nLISTEN state, or it returns an error; it MUST NOT affect any\npreviously created connection record (MUST-41).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1",
+          "quote": "A TCP implementation that supports multiple concurrent connections\nMUST provide an OPEN call that will functionally allow an application\nto LISTEN on a port while a connection block with the same local port\nis in SYN-SENT or SYN-RECEIVED state (MUST-42).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1",
+          "quote": "The optional \"local IP address\" parameter MUST be supported to allow\nthe specification of the local IP address (MUST-43).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1",
+          "quote": "If an application on a multihomed host does not specify the local IP\naddress when actively opening a TCP connection, then the TCP\nimplementation MUST ask the IP layer to select a local IP address\nbefore sending the (first) SYN (MUST-44).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1",
+          "quote": "At all other times, a previous segment has either been sent or\nreceived on this connection, and TCP implementations MUST use the\nsame local address that was used in those previous segments (MUST-\n45).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1",
+          "quote": "A TCP implementation MUST reject as an error a local OPEN call for an\ninvalid remote IP address (e.g., a broadcast or multicast address)\n(MUST-46).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2",
+          "quote": "A TCP endpoint MAY implement PUSH flags on SEND calls (MAY-15).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2",
+          "quote": "If\nPUSH flags are not implemented, then the sending TCP peer: (1) MUST\nNOT buffer data indefinitely (MUST-60), and (2) MUST set the PSH bit\nin the last buffered segment (i.e., when there is no more queued data\nto be sent) (MUST-61).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2",
+          "quote": "The transmitter SHOULD collapse successive bits when it\npacketizes data, to send the largest possible segment (SHLD-27).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2",
+          "quote": "When an application\nissues a series of SEND calls without setting the PUSH flag, the TCP\nimplementation MAY aggregate the data internally without sending it\n(MAY-16).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2",
+          "quote": "However, a TCP implementation SHOULD send\na maximum-sized segment whenever possible (SHLD-28) to improve\nperformance (see Section 3.8.6.2.1).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2",
+          "quote": "New applications SHOULD NOT set the URGENT flag [39] due to\nimplementation differences and middlebox issues (SHLD-13).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3",
+          "quote": "A TCP receiver MAY pass a received PSH bit to the application layer\nvia the PUSH flag in the interface (MAY-17), but it is not required\n(this was clarified in RFC 1122, Section 4.2.2.2).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7",
+          "quote": "The FLUSH call MAY be implemented\n(MAY-14).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8",
+          "quote": "There MUST be a mechanism for reporting soft TCP error conditions to\nthe application (MUST-47).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8",
+          "quote": "However, the conditions that are reported\nasynchronously to the application MUST include:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8",
+          "quote": "However, an application program that does not want to receive such\nERROR_REPORT calls SHOULD be able to effectively disable these calls\n(SHLD-20).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9",
+          "quote": "The application layer MUST be able to specify the Differentiated\nServices field for segments that are sent on a connection (MUST-48).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9",
+          "quote": "It is not required, but the\napplication SHOULD be able to change the Differentiated Services\nfield during the connection lifetime (SHLD-21).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9",
+          "quote": "TCP implementations\nSHOULD pass the current Differentiated Services field value without\nchange to the IP layer, when it sends segments on the connection\n(SHLD-22).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9",
+          "quote": "TCP implementations MAY pass the most recently received\nDifferentiated Services field up to the application (MAY-9).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1",
+          "quote": "An application MUST be able to specify a source route when it\nactively opens a TCP connection (MUST-51), and this MUST take\nprecedence over a source route received in a datagram (MUST-52).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1",
+          "quote": "When a TCP connection is OPENed passively and a packet arrives with a\ncompleted IP Source Route Option (containing a return route), TCP\nimplementations MUST save the return route and use it for all\nsegments sent on this connection (MUST-53).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1",
+          "quote": "If a different source\nroute arrives in a later segment, the later definition SHOULD\noverride the earlier one (SHLD-24).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2",
+          "quote": "TCP implementations MUST act on an ICMP error message passed up from\nthe IP layer, directing it to the connection that created the error\n(MUST-54).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2",
+          "quote": "Source Quench\nTCP implementations MUST silently discard any received ICMP Source\nQuench messages (MUST-55).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2",
+          "quote": "Since these Unreachable messages indicate soft error conditions, a\nTCP implementation MUST NOT abort the connection (MUST-56), and it\nSHOULD make the information available to the application (SHLD-25).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2",
+          "quote": "These are hard error conditions, so TCP implementations SHOULD\nabort the connection (SHLD-26).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3",
+          "quote": "|  An incoming SYN with an invalid source address MUST be ignored\n|  either by TCP or by the IP layer [(MUST-63)] (see\n|  Section 3.2.1.3).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3",
+          "quote": "|\n|  A TCP implementation MUST silently discard an incoming SYN segment\n|  that is addressed to a broadcast or multicast address [(MUST-57)].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2",
+          "quote": "Time to Live (TTL):  The TTL value used to send TCP segments MUST be\nconfigurable (MUST-49).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2",
+          "quote": "Generally, an application\nSHOULD NOT change the Diffserv field value during the course of\na connection (SHLD-23).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2",
+          "quote": "When received options are passed up to TCP from the IP layer, a TCP\nimplementation MUST ignore options that it does not understand (MUST-\n50).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2",
+          "quote": "A TCP implementation MAY support the Timestamp (MAY-10) and Record\nRoute (MAY-11) Options.\n"
+        }
+      ]
+    },
+    "2018": {
+      "text_sha256": "0cc70b98e47b37c1b88f1f31237a580afa2283c7b79714fcf81da6e9772a9b97",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-2",
+          "quote": "It MUST NOT be sent on non-SYN segments.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "If the data receiver has received a SACK-Permitted option on the SYN\nfor this connection, the data receiver MAY elect to generate SACK\noptions as described below.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "If the data receiver generates SACK\noptions under any circumstance, it SHOULD generate them under all\npermitted circumstances.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "If the data receiver has not received a\nSACK-Permitted option for a given connection, it MUST NOT send SACK\noptions on that connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "If sent at all, SACK options SHOULD be included in all ACKs which do\nnot ACK the highest sequence number in the data receiver's queue.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "The\nreceiver SHOULD send an ACK for every valid segment that arrives\ncontaining new data, and each of these \"duplicate\" ACKs SHOULD bear a\nSACK option.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "* The first SACK block (i.e., the one immediately following the\nkind and length fields in the option) MUST specify the contiguous\nblock of data containing the segment which triggered this ACK,\nunless that segment advanced the Acknowledgment Number field in\nthe header.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "* The data receiver SHOULD include as many distinct SACK blocks as\npossible in the SACK option.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-4",
+          "quote": "* The SACK option SHOULD be filled out by repeating the most\nrecently reported SACK blocks (based on first SACK blocks in\nprevious SACK options) that are not subsets of a SACK block\nalready included in the SACK option being constructed.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-5.1",
+          "quote": "However,\nthe congestion control algorithms present in the de facto standard\nTCP implementations MUST be preserved [Stevens94].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-5.1",
+          "quote": "Because the data receiver\nis allowed to discard SACKed data, when a retransmit timeout occurs\nthe data sender MUST ignore prior SACK information in determining\nwhich data to retransmit.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-5",
+          "quote": "When receiving an ACK containing a SACK option, the data sender\nSHOULD record the selective acknowledgment for future reference.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-5",
+          "quote": "After a retransmit timeout the data sender SHOULD turn off all of the\nSACKed bits, since the timeout might indicate that the data receiver\nhas reneged.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-5",
+          "quote": "The data sender MUST retransmit the segment at the left\nedge of the window after a retransmit timeout, whether or not the\nSACKed bit is on for that segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-8",
+          "quote": "The data receiver MAY elect not to keep data which it has reported in\na SACK option.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-8",
+          "quote": "* The first SACK block MUST reflect the newest segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-8",
+          "quote": "Even if\nthe newest segment is going to be discarded and the receiver has\nalready discarded adjacent segments, the first SACK block MUST\nreport, at a minimum, the left and right edges of the newest\nsegment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-8",
+          "quote": "* Except for the newest segment, all SACK blocks MUST NOT report\nany old data which is no longer actually held by the receiver.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2018#section-8",
+          "quote": "Since the data receiver may later discard data reported in a SACK\noption, the sender MUST NOT discard data before it is acknowledged by\nthe Acknowledgment Number field in the TCP header.\n"
+        }
+      ]
+    },
+    "6675": {
+      "text_sha256": "ffe2625e663954fa45cde28ee971e5190b01b98b3ddc1e742c18bdab36396a8c",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "For the purposes of the algorithm defined in this document, the\nscoreboard SHOULD implement the following functions:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "Note: SACK information is advisory and therefore SACKed data MUST\nNOT be removed from the TCP's retransmission buffer until the data\nis cumulatively acknowledged [RFC2018].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "This routine traverses the sequence space from HighACK to HighData\nand MUST set the \"pipe\" variable to an estimate of the number of\noctets that are currently in transit between the TCP sender and\nthe TCP receiver.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "NextSeg () MUST return the\nsequence number range of the next segment that is to be\ntransmitted, per the following rules:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "(1) If there exists a smallest unSACKed sequence number 'S2' that\nmeets the following three criteria for determining loss, the\nsequence range of one segment of up to SMSS octets starting\nwith S2 MUST be returned.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "(2) If no sequence number 'S2' per rule (1) exists but there\nexists available unsent data and the receiver's advertised\nwindow allows, the sequence range of one segment of up to SMSS\noctets of previously unsent data starting with sequence number\nHighData+1 MUST be returned.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "(3) If the conditions for rules (1) and (2) fail, but there exists\nan unSACKed sequence number 'S3' that meets the criteria for\ndetecting loss given in steps (1.a) and (1.b) above\n(specifically excluding step (1.c)), then one segment of up to\nSMSS octets starting with S3 SHOULD be returned.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "If HighACK is greater than RescueRxt (or RescueRxt is\nundefined), then one segment of up to SMSS octets that MUST\ninclude the highest outstanding unSACKed sequence number\nSHOULD be returned, and RescueRxt set to RecoveryPoint.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "HighRxt MUST NOT be updated.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-4",
+          "quote": "(5) If the conditions for each of (1), (2), (3), and (4) are not\nmet, then NextSeg () MUST indicate failure, and no segment is\nreturned.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5.1",
+          "quote": "As a\nresult, [RFC2018] suggests that a TCP sender SHOULD expunge the SACK\ninformation gathered from a receiver upon a retransmission timeout\n(RTO) \"since the timeout might indicate that the data receiver has\nreneged.\"  Additionally, a TCP sender MUST \"ignore prior SACK\ninformation in determining which data to retransmit.\"  However, since\nthe publication of [RFC2018], this has come to be viewed by some as\ntoo strong.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5.1",
+          "quote": "Further, a SACK TCP sender SHOULD utilize all SACK information made\navailable during the loss recovery following an RTO.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5.1",
+          "quote": "If an RTO occurs during loss recovery as specified in this document,\nRecoveryPoint MUST be set to HighData.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5.1",
+          "quote": "Further, the new value of\nRecoveryPoint MUST be preserved and the loss recovery algorithm\noutlined in this document MUST be terminated.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5.1",
+          "quote": "In addition, a new\nrecovery phase (as described in Section 5) MUST NOT be initiated\nuntil HighACK is greater than or equal to the new value of\nRecoveryPoint.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5.1",
+          "quote": "As described in Sections 4 and 5, Update () SHOULD continue to be\nused appropriately upon receipt of ACKs.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5.1",
+          "quote": "In this case, a TCP sender SHOULD use this\nSACK information when determining what data should be sent in each\nsegment following an RTO.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "Upon the receipt of any ACK containing SACK information, the\nscoreboard MUST be updated via the Update () routine.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "If the incoming ACK is a cumulative acknowledgment, the TCP MUST\nreset DupAcks to zero.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "If the incoming ACK is a duplicate acknowledgment per the definition\nin Section 2 (regardless of its status as a cumulative\nacknowledgment), and the TCP is not currently in loss recovery, the\nTCP MUST increase DupAcks by one and take the following steps:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "(3) The TCP MAY transmit previously unsent data segments as per\nLimited Transmit [RFC5681], except that the number of octets\nwhich may be sent is governed by pipe and cwnd as follows:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "Once a TCP is in the loss recovery phase, the following procedure\nMUST be used for each arriving ACK:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "(A) An incoming cumulative ACK for a sequence number greater than\nRecoveryPoint signals the end of loss recovery, and the loss\nrecovery phase MUST be terminated.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "Any information contained in\nthe scoreboard for sequence numbers greater than the new value of\nHighACK SHOULD NOT be cleared when leaving the loss recovery\nphase.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "(B) Upon receipt of an ACK that does not cover RecoveryPoint, the\nfollowing actions MUST be taken:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "(C) If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more\nsegments as follows:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "(C.1) The scoreboard MUST be queried via NextSeg () for the\nsequence number range of the next segment to transmit (if\nany), and the given segment sent.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-5",
+          "quote": "(C.2) If any of the data octets sent in (C.1) are below HighData,\nHighRxt MUST be set to the highest sequence number of the\nretransmitted segment unless NextSeg () rule (4) was\ninvoked for this retransmission.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-6",
+          "quote": "Therefore, we give implementers the latitude to use the standard\n[RFC6298]-style RTO management or, optionally, a more careful variant\nthat re-arms the RTO timer on each retransmission that is sent during\nrecovery MAY be used.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6675#section-9",
+          "quote": "Rule (3) of NextSeg() has been changed from MAY to SHOULD, to\nappropriately reflect the opinion of the authors and working group\nthat it should be left in, rather than out, if an implementor does\nnot have a compelling reason to do otherwise.\n"
+        }
+      ]
+    },
+    "8985": {
+      "text_sha256": "5b947b1dad18d60ed4550e36e0f474d1678412a413b4664feb5d1428e27d7c5f",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-1",
+          "quote": "This document presents RACK-TLP, a TCP loss detection algorithm that\nimproves upon the widely implemented duplicate acknowledgment\n(DupAck) counting approach described in [RFC5681] and [RFC6675]; it\nis RECOMMENDED as an alternative to that earlier approach.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2",
+          "quote": "The reordering window SHOULD be set to zero if no reordering has\nbeen observed on the connection so far, and either (a) three\nsegments have been SACKed since the last recovery or (b) the\nsender is already in fast or RTO recovery.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2",
+          "quote": "Otherwise, the\nreordering window SHOULD start from a small fraction of the\nround-trip time or zero if no round-trip time estimate is\navailable.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2",
+          "quote": "The RACK reordering window SHOULD adaptively increase (using the\nalgorithm in \"Step 4: Update RACK reordering window\" below) if\nthe sender receives a Duplicate Selective Acknowledgment (DSACK)\noption [RFC2883].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2",
+          "quote": "The RACK reordering window MUST be bounded, and this bound SHOULD\nbe SRTT.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-4",
+          "quote": "The connection MUST use selective acknowledgment (SACK) options\n[RFC2018], and the sender MUST keep SACK scoreboard information\non a per-connection basis (\"SACK scoreboard\" has the same meaning\nhere as in [RFC6675], Section 3).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-4",
+          "quote": "For each data segment sent, the sender MUST store its most recent\ntransmission time with a timestamp whose granularity is finer\nthan 1/4 of the minimum RTT of the connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-4",
+          "quote": "RACK DSACK-based reordering window adaptation is RECOMMENDED but\nis not required.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-6.2",
+          "quote": "The sender SHOULD\ntrack a windowed min-filtered estimate of recent RTT measurements\nthat can adapt when migrating to significantly longer paths rather\nthan tracking a simple global minimum of all RTT measurements.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-6.2",
+          "quote": "For timely loss detection, it is RECOMMENDED that the\nsender install a reordering timer.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.2",
+          "quote": "The sender SHOULD start or\nrestart a loss probe PTO timer after transmitting new data (that was\nnot itself a loss probe) or upon receiving an ACK that cumulatively\nacknowledges new data unless it is already in fast recovery, RTO\nrecovery, or segments have been SACKed (i.e., RACK.segs_sacked is not\nzero).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.2",
+          "quote": "Second, when there is no SRTT estimate available, the PTO SHOULD be 1\nsecond.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.2",
+          "quote": "Third, when the FlightSize is one segment, the sender MAY inflate the\nPTO by TLP.max_ack_delay to accommodate a potentially delayed\nacknowledgment and reduce the risk of spurious retransmissions.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.2",
+          "quote": "Summarizing these considerations in pseudocode form, a sender SHOULD\nuse the following logic to select the duration of a PTO:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.3",
+          "quote": "When the PTO timer expires, the sender MUST check whether both of the\nfollowing conditions are met before sending a loss probe:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.3",
+          "quote": "If either one of these two conditions is not met, then the sender\nMUST skip sending a loss probe and MUST proceed to re-arm the RTO\ntimer, as specified at the end of this section.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.3",
+          "quote": "If both conditions are met, then the sender SHOULD transmit a\npreviously unsent data segment, if one exists and the receive window\nallows, and increment the FlightSize accordingly.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.3",
+          "quote": "If such an unsent segment is not available, then the sender SHOULD\nretransmit the highest-sequence segment sent so far and set\nTLP.is_retrans to true.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.3",
+          "quote": "The sender MUST follow the RACK transmission procedures in the \"Upon\nTransmitting a Data Segment\" section upon sending either a\nretransmission or a new data loss probe.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.3",
+          "quote": "After attempting to send a loss probe, regardless of whether a loss\nprobe was sent, the sender MUST re-arm the RTO timer, not the PTO\ntimer, if the FlightSize is not zero.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2",
+          "quote": "If the TLP\nsender does not receive such an indication, then it MUST assume that\nthe original data segment, the TLP retransmission, or a corresponding\nACK was lost for congestion control purposes.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2",
+          "quote": "The sender then\nSHOULD invoke a congestion control response equivalent to a fast\nrecovery.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-8",
+          "quote": "When arming a RACK reordering timer or TLP\nPTO timer, the sender SHOULD cancel any other pending timers.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-9.2",
+          "quote": "Therefore, the algorithm [RFC6675]\nMUST NOT be used with RACK-TLP; instead, a modified recovery\nalgorithm that carefully addresses such a case is needed.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-9.3",
+          "quote": "A segment marked\nas lost by RACK-TLP MUST NOT be retransmitted until congestion\ncontrol deems this appropriate.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-9.3",
+          "quote": "The Proportional Rate\nReduction (PRR) algorithm [RFC6937] is RECOMMENDED for the specific\ncongestion control actions taken upon the losses detected by RACK-\nTLP.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc8985#section-9.3",
+          "quote": "In the absence of PRR [RFC6937], when RACK-TLP detects a lost\nretransmission, the congestion control MUST trigger an additional\ncongestion response per the aforementioned principle in [RFC5681].\n"
+        }
+      ]
+    },
+    "9937": {
+      "text_sha256": "1cd891940face56aeee131f6e348af78c06488203f0440d75f81fb5ceee41bbc",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-3",
+          "quote": "At any given time, a connection MUST\nNOT send data with a sequence number higher than the sum of\nSND.UNA and rwnd.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-3",
+          "quote": "At any given time, a connection MUST\nNOT send data if inflight (see below) matches or exceeds cwnd.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-5",
+          "quote": "PRR MAY be used in conjunction with any congestion control algorithm\nthat intends to make a multiplicative decrease in its sending rate\nover approximately the time scale of one round-trip time, as long as\nthe current volume of in-flight data is limited by a congestion\nwindow (cwnd) and the target volume of in-flight data during that\nreduction is a fixed value given by ssthresh.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-5",
+          "quote": "Thus, PRR MAY be used in\nconjunction with the loss detection algorithms specified or described\nin the following documents: Reno [RFC5681], NewReno [RFC6582], SACK\n[RFC6675], Forward Acknowledgment (FACK) [FACK], and Recent\nAcknowledgment Tail Loss Probe (RACK-TLP) [RFC8985].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-5",
+          "quote": "Because of the\nperformance properties of RACK-TLP, including resilience to tail\nloss, reordering, and lost retransmissions, it is RECOMMENDED that\nPRR is implemented together with RACK-TLP loss recovery [RFC8985].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-6.1",
+          "quote": "At the beginning of a congestion control response episode initiated\nby the congestion control algorithm, a data sender using PRR MUST\ninitialize the PRR state.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-6.2",
+          "quote": "To\ncalculate inflight, connections with SACK enabled and using [RFC6675]\nloss detection MAY use the \"pipe\" algorithm as specified in\n[RFC6675].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-6.2",
+          "quote": "SACK-enabled connections using RACK-TLP loss detection\n[RFC8985] or other loss detection algorithms MUST calculate inflight\nby starting with SND.NXT - SND.UNA, subtracting out bytes SACKed in\nthe scoreboard, subtracting out bytes marked lost in the scoreboard,\nand adding bytes in the scoreboard that have been retransmitted since\nthey were last marked lost.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-6.2",
+          "quote": "For non-SACK-enabled connections,\ninstead of subtracting out bytes SACKed in the SACK scoreboard,\nsenders MUST subtract out: min(RecoverFS, 1 SMSS for each preceding\nduplicate ACK in the fast recovery episode); the min() with RecoverFS\nis to protect against misbehaving receivers [Savage99].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9937#section-6.4",
+          "quote": "It is RECOMMENDED that implementations use pacing to reduce the\nburstiness of data traffic.\n"
+        }
+      ]
+    },
+    "6298": {
+      "text_sha256": "f3a6d937c0a7653bd431fdbbdcd7920f4e9d9cdb6134fa9db7a74b90d215edf6",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#name-abstract",
+          "quote": "It expands on the discussion in\nSection 4.2.3.1 of RFC 1122 and upgrades the requirement of\nsupporting the algorithm from a SHOULD to a MUST.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-1",
+          "quote": "In\naddition, this document expands on the discussion in Section 4.2.3.1\nof RFC 1122 and upgrades the requirement of supporting the algorithm\nfrom a SHOULD to a MUST.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-1",
+          "quote": "However, a TCP MUST NOT be more aggressive than the following\nalgorithms allow.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "(2.1) Until a round-trip time (RTT) measurement has been made for a\nsegment sent between the sender and receiver, the sender SHOULD\nset RTO <- 1 second, though the \"backing off\" on repeated\nretransmission discussed in (5.5) still applies.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "A TCP implementation MAY still use\nthis value (or any other value > 1 second).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "(2.2) When the first RTT measurement R is made, the host MUST set\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "(2.3) When a subsequent RTT measurement R' is made, a host MUST set\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "That\nis, updating RTTVAR and SRTT MUST be computed in the above\norder.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "The above SHOULD be computed using alpha=1/8 and beta=1/4 (as\nsuggested in [JK88]).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "After the computation, a host MUST update\nRTO <- SRTT + max (G, K*RTTVAR)\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "(2.4) Whenever RTO is computed, if it is less than 1 second, then the\nRTO SHOULD be rounded up to 1 second.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-2",
+          "quote": "(2.5) A maximum value MAY be placed on RTO provided it is at least 60\nseconds.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-3",
+          "quote": "TCP MUST use Karn's algorithm [KP87] for taking RTT samples.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-3",
+          "quote": "That\nis, RTT samples MUST NOT be made using segments that were\nretransmitted (and thus for which it is ambiguous whether the reply\nwas for the first instance of the packet or a later instance).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-3",
+          "quote": "A TCP implementation MUST take at\nleast one RTT measurement per RTT (unless that is not possible per\nKarn's algorithm).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-4",
+          "quote": "However, if the K*RTTVAR term in the RTO calculation equals zero, the\nvariance term MUST be rounded to G seconds (i.e., use the equation\ngiven in step 2.3).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-5",
+          "quote": "An implementation MUST manage the retransmission timer(s) in such a\nway that a segment is never retransmitted too early, i.e., less than\none RTO after the previous transmission of that segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-5",
+          "quote": "The following is the RECOMMENDED algorithm for managing the\nretransmission timer:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-5",
+          "quote": "(5.5) The host MUST set RTO <- RTO * 2 (\"back off the timer\").\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-5",
+          "quote": "(5.7) If the timer expires awaiting the ACK of a SYN segment and the\nTCP implementation is using an RTO less than 3 seconds, the RTO\nMUST be re-initialized to 3 seconds when data transmission\nbegins (i.e., after the three-way handshake completes).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6298#section-5",
+          "quote": "Note that a TCP implementation MAY clear SRTT and RTTVAR after\nbacking off the timer multiple times as it is likely that the current\nSRTT and RTTVAR are bogus in this situation.\n"
+        }
+      ]
+    },
+    "5681": {
+      "text_sha256": "a2d99a2421d5c57b248394f26ba44fc364aa546680fbf10ff0aa7034dad8b87d",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-2",
+          "quote": "At any given time, a TCP MUST NOT send\ndata with a sequence number higher than the sum of the highest\nacknowledged sequence number and the minimum of cwnd and rwnd.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "The slow start and congestion avoidance algorithms MUST be used by a\nTCP sender to control the amount of outstanding data being injected\ninto the network.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "IW, the initial value of cwnd, MUST be set using the following\nguidelines as an upper bound.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "If SMSS > 2190 bytes:\nIW = 2 * SMSS bytes and MUST NOT be more than 2 segments\nIf (SMSS > 1095 bytes) and (SMSS <= 2190 bytes):\nIW = 3 * SMSS bytes and MUST NOT be more than 3 segments\nif SMSS <= 1095 bytes:\nIW = 4 * SMSS bytes and MUST NOT be more than 4 segments\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "As specified in [RFC3390], the SYN/ACK and the acknowledgment of the\nSYN/ACK MUST NOT increase the size of the congestion window.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "Further, if the SYN or SYN/ACK is lost, the initial window used by a\nsender after a correctly transmitted SYN MUST be one segment\nconsisting of at most SMSS bytes.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "When initial congestion windows of more than one segment are\nimplemented along with Path MTU Discovery [RFC1191], and the MSS\nbeing used is found to be too large, the congestion window cwnd\nSHOULD be reduced to prevent large bursts of smaller segments.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "Specifically, cwnd SHOULD be reduced by the ratio of the old segment\nsize to the new segment size.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "The initial value of ssthresh SHOULD be set arbitrarily high (e.g.,\nto the size of the largest possible advertised window), but ssthresh\nMUST be reduced in response to congestion.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "* MAY increment cwnd by SMSS bytes\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "* SHOULD increment cwnd per equation (2) once per RTT\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "* MUST NOT increment cwnd by more than SMSS bytes\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "The RECOMMENDED way to increase cwnd during congestion avoidance is\nto count the number of bytes that have been acknowledged by ACKs for\nnew data.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "Note that during congestion avoidance, cwnd MUST NOT be\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "Another common formula that a TCP MAY use to update cwnd during\ncongestion avoidance is given in equation (3):\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "If the above formula yields 0, the result SHOULD be rounded up to 1\nbyte.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "When a TCP sender detects segment loss using the retransmission timer\nand the given segment has not yet been resent by way of the\nretransmission timer, the value of ssthresh MUST be set to no more\nthan the value given in equation (4):\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.1",
+          "quote": "Furthermore, upon a timeout (as specified in [RFC2988]) cwnd MUST be\nset to no more than the loss window, LW, which equals 1 full-sized\nsegment (regardless of the value of IW).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "A TCP receiver SHOULD send an immediate duplicate ACK when an out-\nof-order segment arrives.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "In addition, a TCP receiver\nSHOULD send an immediate ACK when the incoming segment fills in all\nor part of a gap in the sequence space.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "The TCP sender SHOULD use the \"fast retransmit\" algorithm to detect\nand repair loss, based on incoming duplicate ACKs.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "On the first and second duplicate ACKs received at a sender, a\nTCP SHOULD send a segment of previously unsent data per [RFC3042]\nprovided that the receiver's advertised window allows, the total\nFlightSize would remain less than or equal to cwnd plus 2*SMSS,\nand that new data is available for transmission.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "Further, the\nTCP sender MUST NOT change cwnd to reflect these two segments\n[RFC3042].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "Note that a sender using SACK [RFC2018] MUST NOT send\nnew data unless the incoming duplicate acknowledgment contains\nnew SACK information.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "When the third duplicate ACK is received, a TCP MUST set ssthresh\nto no more than the value given in equation (4).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "When [RFC3042]\nis in use, additional data sent in limited transmit MUST NOT be\nincluded in this calculation.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "The lost segment starting at SND.UNA MUST be retransmitted and\ncwnd set to ssthresh plus 3*SMSS.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "For each additional duplicate ACK received (after the third),\ncwnd MUST be incremented by SMSS.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "A TCP MAY therefore limit the number of\ntimes cwnd is artificially inflated during loss recovery to the\nnumber of outstanding segments (or, an approximation thereof).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "When previously unsent data is available and the new value of\ncwnd and the receiver's advertised window allow, a TCP SHOULD\nsend 1*SMSS bytes of previously unsent data.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3.2",
+          "quote": "When the next ACK arrives that acknowledges previously\nunacknowledged data, a TCP MUST set cwnd to ssthresh (the value\nset in step 2).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-3",
+          "quote": "In some situations, it may be\nbeneficial for a TCP sender to be more conservative than the\nalgorithms allow; however, a TCP MUST NOT be more aggressive than the\nfollowing algorithms allow (that is, MUST NOT send data when the\nvalue of cwnd computed by the following algorithms would not allow\nthe data to be sent).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.1",
+          "quote": "Therefore, a TCP SHOULD set cwnd to no more than RW before beginning\ntransmission if the TCP has not sent data in an interval exceeding\nthe retransmission timeout.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "The delayed ACK algorithm specified in [RFC1122] SHOULD be used by a\nTCP receiver.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "When using delayed ACKs, a TCP receiver MUST NOT\nexcessively delay acknowledgments.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "Specifically, an ACK SHOULD be\ngenerated for at least every second full-sized segment, and MUST be\ngenerated within 500 ms of the arrival of the first unacknowledged\npacket.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "The requirement that an ACK \"SHOULD\" be generated for at least every\nsecond full-sized segment is listed in [RFC1122] in one place as a\nSHOULD and another as a MUST.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "Here we unambiguously state it is a\nSHOULD.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "We also emphasize that this is a SHOULD, meaning that an\nimplementor should indeed only deviate from this requirement after\ncareful consideration of the implications.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "Finally, we repeat that an ACK MUST NOT be delayed for more than 500\nms waiting on a second full-sized segment to arrive.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "Out-of-order data segments SHOULD be acknowledged immediately, in\norder to accelerate loss recovery.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "To trigger the fast retransmit\nalgorithm, the receiver SHOULD send an immediate duplicate ACK when\nit receives a data segment above a gap in the sequence space.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "To\nprovide feedback to senders recovering from losses, the receiver\nSHOULD send an immediate ACK when it receives a data segment that\nfills in all or part of a gap in the sequence space.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.2",
+          "quote": "A TCP receiver MUST NOT generate more than one ACK for every incoming\nsegment, other than to update the offered window as the receiving\napplication consumes new data (see [RFC813] and page 42 of [RFC793]).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.3",
+          "quote": "That is, when the first loss in a window of data is detected,\nssthresh MUST be set to no more than the value given by equation (4).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.3",
+          "quote": "Second, until all lost segments in the window of data in question are\nrepaired, the number of segments transmitted in each RTT MUST be no\nmore than half the number of outstanding segments when the loss was\ndetected.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.3",
+          "quote": "has been successfully retransmitted, cwnd MUST be set to no more than\nssthresh and congestion avoidance MUST be used to further increase\ncwnd.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-4.3",
+          "quote": "Loss in two successive windows of data, or the loss of a\nretransmission, should be taken as two indications of congestion and,\ntherefore, cwnd (and ssthresh) MUST be lowered twice in this case.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-7",
+          "quote": "The recommended initial value for ssthresh has been changed to say\nthat it SHOULD be arbitrarily high, where it was previously MAY.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5681#section-7",
+          "quote": "TCPs now MAY limit the number of duplicate ACKs that artificially\ninflate cwnd during loss recovery to the number of segments\noutstanding to avoid the duplicate ACK spoofing attack described in\n[SCWA99].\n"
+        }
+      ]
+    },
+    "6582": {
+      "text_sha256": "98e24aa8b48d4c8b17b4f51ef7126dae030943cd6e15b658ca99f6c6958650eb",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6582#section-5",
+          "quote": "[RFC5681] specifies that \"Out-of-order data segments SHOULD be\nacknowledged immediately, in order to accelerate loss recovery\".\n"
+        }
+      ]
+    },
+    "6928": {
+      "text_sha256": "375392b72f6800dbe6a945def04cfbace0875dc8f2835d8dbc8a73f6089bca52",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-12",
+          "quote": "Anyone (stack vendors, network administrators, etc.) turning on a\nlarger initial window SHOULD ensure that the performance is monitored\nbefore and after that change.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-12",
+          "quote": "The sender SHOULD cache such information about\nconnection setups using an initial window larger than allowed by RFC\n3390, and new connections SHOULD fall back to the initial window\nallowed by RFC 3390 if there is evidence of performance issues.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-12",
+          "quote": "If users observe any significant deterioration of\nperformance, they SHOULD fall back to an initial window as allowed by\nRFC 3390 for safety reasons.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-12",
+          "quote": "An increased initial window MUST NOT be\nturned on by default on systems without such monitoring capabilities.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-2",
+          "quote": "This increase is optional: a TCP MAY start with\nan initial window that is smaller than 10 segments.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-2",
+          "quote": "If the SYN or SYN/ACK is lost, the initial window used by a sender\nafter a correctly transmitted SYN MUST be one segment consisting\nof MSS bytes.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-2",
+          "quote": "For this reason, it is RECOMMENDED that implementations refrain from\nresetting the initial window to 1 segment, unless there have been\nmore than one SYN or SYN/ACK retransmissions or true loss detection\nhas been made.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-2",
+          "quote": "Optionally, a TCP MAY set the restart window to\nthe minimum of the value used for the initial window and the current\nvalue of cwnd (in other words, using a larger value for the restart\nwindow should never increase the size of cwnd).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-2",
+          "quote": "Furthermore, to limit any negative effect that a larger initial\nwindow may have on links with limited bandwidth or buffer space,\nimplementations SHOULD fall back to RFC 3390 for the restart window\n(RW) if any packet loss is detected during either the initial window\nor a restart window, and more than 4 KB of data is sent.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc6928#section-9",
+          "quote": "To minimize spurious retransmissions,\nimplementations MUST follow RFC 6298 [RFC6298] to restart the\nretransmission timer with the current value of RTO for each ACK\nreceived that acknowledges new data.\n"
+        }
+      ]
+    },
+    "7323": {
+      "text_sha256": "29e07732ea23f4d3e41371be55b767d774b718f054ade161b71f48864f7c2d48",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "The three-byte Window Scale option MAY be sent in a <SYN> segment by\na TCP.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "Thus, a TCP that is prepared to scale windows SHOULD send the option,\neven if its own scale factor is 1 and the exponent 0.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "This option is an offer, not a promise; both sides MUST send Window\nScale options in their <SYN> segments to enable window scaling in\neither direction.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "MAY be zero (offering to scale, while applying a scale factor of 1 to\nthe receive window).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "This option MAY be sent in an initial <SYN> segment (i.e., a segment\nwith the SYN bit on and the ACK bit off).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "If a Window Scale option\nwas received in the initial <SYN> segment, then this option MAY be\nsent in the <SYN,ACK> segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "A Window Scale option in a segment\nwithout a SYN bit MUST be ignored.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.2",
+          "quote": "The window field in a segment where the SYN bit is set (i.e., a <SYN>\nor <SYN,ACK>) MUST NOT be scaled.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.3",
+          "quote": "o  If a TCP receives a <SYN> segment containing a Window Scale\noption, it SHOULD send its own Window Scale option in the\n<SYN,ACK> segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.3",
+          "quote": "o  The Window Scale option MUST be sent with shift.cnt = R, where R\nis the value that the TCP would like to use for its receive\nwindow.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.3",
+          "quote": "o  Upon receiving a <SYN> segment with a Window Scale option\ncontaining shift.cnt = S, a TCP MUST set Snd.Wind.Shift to S and\nMUST set Rcv.Wind.Shift to R; otherwise, it MUST set both\nSnd.Wind.Shift and Rcv.Wind.Shift to zero.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.3",
+          "quote": "o  The window field (SEG.WND) in the header of every incoming\nsegment, with the exception of <SYN> segments, MUST be left-\nshifted by Snd.Wind.Shift bits before updating SND.WND:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.3",
+          "quote": "o  The window field (SEG.WND) of every outgoing segment, with the\nexception of <SYN> segments, MUST be right-shifted by\nRcv.Wind.Shift bits:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.3",
+          "quote": "Thus, the shift count\nMUST be limited to 14 (which allows windows of 2^30 = 1 GiB).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.3",
+          "quote": "If a\nWindow Scale option is received with a shift.cnt value larger than\n14, the TCP SHOULD log the error but MUST use 14 instead of the\nspecified value.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.4",
+          "quote": "Implementations MUST ensure that they handle a shrinking\nwindow, as specified in Section 4.2.2.16 of [RFC1122].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.4",
+          "quote": "1)  The receiver MUST honor, as in window, any segment that would\nhave been in window for any <ACK> sent by the receiver.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.4",
+          "quote": "2)  When window scaling is in effect, the receiver SHOULD track the\nactual maximum window sequence number (which is likely to be\ngreater than the window announced by the most recent <ACK>, if\nmore than one segment has arrived since the application consumed\nany data in the receive buffer).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.4",
+          "quote": "3)  The initial transmission MUST be within the window announced by\nthe most recent <ACK>.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-2.4",
+          "quote": "5)  Subsequent retransmissions MAY only be sent if they are within\nthe window announced by the most recent <ACK>.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "If\nthe ACK bit is not set in the outgoing TCP header, the sender of that\nsegment SHOULD set the TSecr field to zero.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "When the ACK bit is set\nin an outgoing segment, the sender MUST echo a recently received\nTSval sent by the remote TCP in the TSval field of a Timestamps\noption.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "The exact rules on which TSval MUST be echoed are given in\nSection 4.3.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "When the ACK bit is not set, the receiver MUST ignore\nthe value of the TSecr field.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "A TCP MAY send the TSopt in an initial <SYN> segment (i.e., segment\ncontaining a SYN bit and no ACK bit), and MAY send a TSopt in\n<SYN,ACK> only if it received a TSopt in the initial <SYN> segment\nfor the connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "Once TSopt has been successfully negotiated, that is both <SYN> and\n<SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>\nsegment for the duration of the connection, and SHOULD be sent in an\n<RST> segment (see Section 5.2 for details).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "The TCP SHOULD remember\nthis state by setting a flag, referred to as Snd.TS.OK, to one.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "non-<RST> segment is received without a TSopt, a TCP SHOULD silently\ndrop the segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "A TCP MUST NOT abort a TCP connection because any\nsegment lacks an expected TSopt.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "If a TSopt is received on a connection where TSopt was not negotiated\nin the initial three-way handshake, the TSopt MUST be ignored and the\npacket processed normally.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-3.2",
+          "quote": "In the case of crossing <SYN> segments where one <SYN> contains a\nTSopt and the other doesn't, both sides MAY send a TSopt in the\n<SYN,ACK> segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-4.1",
+          "quote": "Values of this\nclock MUST be at least approximately proportional to real time, in\norder to measure actual RTT.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-4.1",
+          "quote": "RTTM Rule: A TSecr value received in a segment MAY be used to update\nthe averaged RTT measurement only if the segment advances\nthe left edge of the send window, i.e., SND.UNA is\nincreased.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-4.2",
+          "quote": "to update the RTT estimator, an implementation SHOULD try to adhere\nto the spirit of the history specified in [RFC6298].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-4.3",
+          "quote": "Thus,\nwhen delayed ACKs are in use, the receiver SHOULD reply with the\nTSval field from the earliest unacknowledged segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-4.3",
+          "quote": "An <ACK> for an out-of-order segment\nSHOULD, therefore, contain the timestamp from the most recent\nsegment that advanced RCV.NXT.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-4.3",
+          "quote": "Thus, the timestamp from the\nlatest segment (which filled the hole) MUST be echoed.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.2",
+          "quote": "The choice of incoming timestamps to be saved for this comparison\nMUST guarantee a value that is monotonically non-decreasing.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.2",
+          "quote": "While still under discussion, to enable research into this area it is\nnow RECOMMENDED that when generating an <RST>, if the segment causing\nthe <RST> to be generated contains a Timestamps option, the <RST>\nshould also contain a Timestamps option.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.2",
+          "quote": "In the <RST> segment,\nSEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and\nSEG.TSval SHOULD be set to zero.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.2",
+          "quote": "If an <RST> is being generated\nbecause of a user abort, and Snd.TS.OK is set, then a Timestamps\noption SHOULD be included in the <RST>.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.2",
+          "quote": "When an <RST> segment is\nreceived, it MUST NOT be subjected to the PAWS check by verifying an\nacceptable value in SEG.TSval, and information from the Timestamps\noption MUST NOT be used to update connection state information.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.2",
+          "quote": "SEG.TSecr MAY be used to provide stricter <RST> acceptance checks.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.3",
+          "quote": "If the PAWS algorithm is used, the following processing MUST be\nperformed on all incoming segments for a synchronized connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.3",
+          "quote": "Also, PAWS processing MUST take precedence over the regular TCP\nacceptability check (Section 3.3 in [RFC0793]), which is performed\nafter verification of the received Timestamps option:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.3",
+          "quote": "It is important to note that the timestamp MUST be checked only when\na segment first arrives at the receiver, regardless of whether it is\nin sequence or it must be queued for later delivery.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.4",
+          "quote": "It MUST tick at least once for each 2^31 bytes sent.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.4",
+          "quote": "In fact,\nin order to be useful to the sender for round-trip timing, the\nclock SHOULD tick at least once per window's worth of data, and\neven with the window extension defined in Section 2.2, 2^31\nbytes must be at least two windows.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.4",
+          "quote": "The recycling time of the timestamp clock MUST be greater than\nMSL seconds.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.5",
+          "quote": "To detect how long the connection has been idle, the TCP MAY update a\nclock or timestamp value associated with the connection whenever\nTS.Recent is updated, for example.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-5.7",
+          "quote": "Setting the DF bit implies the use of Path MTU Discovery as described\nin [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation\nthat implements PAWS MUST also implement Path MTU Discovery.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-7.1",
+          "quote": "It is therefore RECOMMENDED to generate a random, per-\nconnection offset to be used with the clock source when generating\nthe Timestamps option value (see Section 5.4).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc7323#section-7",
+          "quote": "It is therefore\nRECOMMENDED to generate a random, per-connection offset to be used\nwith the clock source when generating the Timestamps option value\n(see Section 5.4).\n"
+        }
+      ]
+    },
+    "2883": {
+      "text_sha256": "ce07f710c36920e7c75f60b671b80513f2290b3ba6fe5274ba15b818c1da2f60",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2883#section-1",
+          "quote": "The keywords MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD,\nSHOULD NOT, RECOMMENDED, MAY, and OPTIONAL, when they appear in this\ndocument, are to be interpreted as described in [B97].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2883#section-3",
+          "quote": "MUST specify\nthe contiguous block of data containing the segment which triggered\nthis ACK, unless that segment advanced the Acknowledgment Number\nfield in the header.\"\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2883#section-3",
+          "quote": "RFC 2018 further specifies that \"if sent\nat all, SACK options SHOULD be included in all ACKs which do not ACK\nthe highest sequence number in the data receiver's queue.\"  RFC 2018\ndoes not specify the use of the SACK option when a duplicate segment\nis received, and the cumulative acknowledgement field in the ACK\nacknowledges all of the data in the data receiver's queue.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc2883#section-5",
+          "quote": "An implementation MUST NOT compare the\nsequence space in the SACK block to the TCP state variable snd.una\n(which carries the total cumulative ACK), as this may result in the\nwrong conclusion if ACK packets are reordered.\n"
+        }
+      ]
+    },
+    "3168": {
+      "text_sha256": "35b437f1826b2624d6c5e7af2f047a6ba0a3110cd5559ffbd0cefdc8c3d87b76",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-12",
+          "quote": "The CE codepoint in a packet header MUST NOT be reset by a\nrouter.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-2",
+          "quote": "The keywords MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD,\nSHOULD NOT, RECOMMENDED, MAY, and OPTIONAL, when they appear in this\ndocument, are to be interpreted as described in [RFC2119].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-20.2",
+          "quote": "This is not consistent with some of the proposed uses of\nECT(1) by the multicast duplication procedures in the previous\nparagraph, and such procedures SHOULD NOT be deployed unless this\ninconsistency between multicast duplication procedures and IP tunnels\nwith full ECN functionality is resolved.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.2",
+          "quote": "To ensure the reliable delivery of the congestion indication\nof the CE codepoint, an ECT codepoint MUST NOT be set in a packet\nunless the loss of that packet in the network would be detected by\nthe end nodes and interpreted as an indication of congestion.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.2",
+          "quote": "We believe that this aspect is still\nthe subject of research, so this document specifies that at this\ntime, \"pure\" ACK packets MUST NOT indicate ECN-Capability.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.3",
+          "quote": "ECN-capable packets MAY have the DF (Don't Fragment) bit set.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.3",
+          "quote": "Reassembly of a fragmented packet MUST NOT lose indications of\ncongestion.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.3",
+          "quote": "In other words, if any fragment of an IP packet to be\nreassembled has the CE codepoint set, then one of two actions MUST be\ntaken:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.3",
+          "quote": "However, this\nMUST NOT occur if any of the other fragments contributing to\nthis reassembly carries the Not-ECT codepoint.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.3",
+          "quote": "If both actions are applicable, either MAY be chosen.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.3",
+          "quote": "Reassembly of\na fragmented packet MUST NOT change the ECN codepoint when all of the\nfragments carry the same codepoint.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5.3",
+          "quote": "In situations\nwhere more precise reassembly behavior would be required, protocol\nspecifications SHOULD instead specify that DF MUST be set in all\nECN-capable packets sent by the protocol.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5",
+          "quote": "Protocols and senders that only require a single ECT codepoint SHOULD\nuse ECT(0).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5",
+          "quote": "Upon the receipt by an ECN-Capable transport of a single CE packet,\nthe congestion control algorithms followed at the end-systems MUST be\nessentially the same as the congestion control response to a *single*\ndropped packet.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5",
+          "quote": "For a router, the CE codepoint of an ECN-Capable packet SHOULD only\nbe set if the router would otherwise have dropped the packet as an\nindication of congestion to the end nodes.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5",
+          "quote": "If so,\nthen instead of dropping the packet, the router MAY instead set the\nCE codepoint in the IP header.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5",
+          "quote": "Specifications for PHBs MAY provide\nmore specifics on how a compliant implementation is to choose between\nsetting CE and dropping a packet, but this is NOT REQUIRED.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-5",
+          "quote": "A router\nMUST NOT set CE instead of dropping a packet when the drop that would\noccur is caused by reasons other than congestion or the desire to\nindicate incipient congestion to end nodes (e.g., a diffserv edge\nnode may be configured to unconditionally drop certain classes of\ntraffic to prevent them from entering its diffserv domain).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1",
+          "quote": "To provide robust connectivity even in the presence of such faulty\nequipment, a host that receives a RST in response to the transmission\nof an ECN-setup SYN packet MAY resend a SYN with CWR and ECE cleared.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1",
+          "quote": "A host that receives no reply to an ECN-setup SYN within the normal\nSYN retransmission timeout interval MAY resend the SYN and any\nsubsequent SYN retransmissions with CWR and ECE cleared.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "* If a host has received an ECN-setup SYN packet, then it MAY send\nan ECN-setup SYN-ACK packet.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "Otherwise, it MUST NOT send an\nECN-setup SYN-ACK packet.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "* A host MUST NOT set ECT on data packets unless it has sent at\nleast one ECN-setup SYN or ECN-setup SYN-ACK packet, and has\nreceived at least one ECN-setup SYN or ECN-setup SYN-ACK packet,\nand has sent no non-ECN-setup SYN or non-ECN-setup SYN-ACK\npacket.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "If a host has received at least one non-ECN-setup SYN\nor non-ECN-setup SYN-ACK packet, then it SHOULD NOT set ECT on\ndata packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "* If a host ever sets the ECT codepoint on a data packet, then\nthat host MUST correctly set/clear the CWR TCP bit on all\nsubsequent packets in the connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "* If a host has sent at least one ECN-setup SYN or ECN-setup SYN-\nACK packet, and has received no non-ECN-setup SYN or non-ECN-\nsetup SYN-ACK packet, then if that host receives TCP data\npackets with ECT and CE codepoints set in the IP header, then\nthat host MUST process these packets as specified for an ECN-\ncapable connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "* A host that is not willing to use ECN on a TCP connection SHOULD\nclear both the ECE and CWR flags in all non-ECN-setup SYN and/or\nSYN-ACK packets that it sends to indicate this unwillingness.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "Receivers MUST correctly handle all forms of the non-ECN-setup\nSYN and SYN-ACK packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1",
+          "quote": "* A host MUST NOT set ECT on SYN or SYN-ACK packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2",
+          "quote": "When only one ECT codepoint\nis needed by a sender for all packets sent on a TCP connection,\nECT(0) SHOULD be used.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2",
+          "quote": "The sending\nTCP SHOULD NOT increase the congestion window in response to the\nreceipt of an ECN-Echo ACK packet.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2",
+          "quote": "Therefore, the sending TCP MUST reset the\nretransmit timer on receiving the ECN-Echo packet when the congestion\nwindow is one.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2",
+          "quote": "Thus, the\nCWR bit in the TCP header SHOULD NOT be set on retransmitted packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2",
+          "quote": "When the TCP data sender is ready to set the CWR bit after reducing\nthe congestion window, it SHOULD set the CWR bit only on the first\nnew data packet that it transmits.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.4",
+          "quote": "For the current generation of TCP congestion control algorithms, pure\nacknowledgement packets (e.g., packets that do not contain any\naccompanying data) MUST be sent with the not-ECT codepoint.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5",
+          "quote": "This document specifies ECN-capable TCP implementations MUST NOT set\neither ECT codepoint (ECT(0) or ECT(1)) in the IP header for\nretransmitted data packets, and that the TCP data receiver SHOULD\nignore the ECN field on arriving data packets that are outside of the\nreceiver's current window.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5",
+          "quote": "To prevent such a denial-of-service attack, we\nspecify that a legitimate TCP data sender MUST NOT set an ECT\ncodepoint on retransmitted data packets, and that the TCP data\nreceiver SHOULD ignore the CE codepoint on out-of-window packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.6",
+          "quote": "Therefore, the TCP data sender MUST NOT set either an ECT codepoint\nor the CWR bit on window probe packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.6",
+          "quote": "Therefore, if\na window probe arrives with the CE codepoint set, then the receiver\nSHOULD respond to the ECN indications.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1",
+          "quote": "(1) An IP tunnel MUST modify the handling of the DS field octet at\nIP tunnel endpoints by implementing either the limited-\nfunctionality or the full-functionality option.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1",
+          "quote": "(2) Optionally, an IP tunnel MAY enable the endpoints of an IP\ntunnel to negotiate the choice between the limited-functionality\nand the full-functionality option for ECN in the tunnel.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1",
+          "quote": "All IP tunnels MUST implement the limited-functionality option, and\nSHOULD support the full-functionality option.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1",
+          "quote": "In addition, it is RECOMMENDED that packets with the CE codepoint in\nthe outer header be dropped if they arrive at the tunnel egress point\nfor a tunnel that uses the limited-functionality option, or for a\ntunnel that uses the full-functionality option but for which the\nnot-ECT codepoint is set in the inner header.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.2",
+          "quote": "It is RECOMMENDED that\non a tunnel that has not been configured to support the full-\nfunctionality option, packets should be dropped at the egress point\nif the CE codepoint is set in the outer header but not in the inner\nheader, and should be forwarded otherwise.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.1",
+          "quote": "[OPTIONAL.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.1",
+          "quote": "The value of this field SHOULD be assumed to be\n\"forbidden\" in implementations that do not support it.]\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.1",
+          "quote": "If this attribute is implemented, then the SA specification in a\nSecurity Policy Database (SPD) entry MUST support a corresponding\nattribute, and this SPD attribute MUST be covered by the SPD\nadministrative interface (currently described in Section 4.4.1 of\n[RFC2401]).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.2",
+          "quote": "This attribute\nis OPTIONAL, although implementations that support it SHOULD also\nsupport the SAD field defined in Section 9.2.1.1.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.2",
+          "quote": "For backwards\ncompatibility with such implementations initiators SHOULD always also\ninclude a proposal without the ECN Tunnel attribute to enable such a\nresponder to select a transform or proposal that does not contain the\nECN Tunnel attribute.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3",
+          "quote": "(5)(6) If the packet will immediately enter a domain for which the\nDSCP value in the outer header is not appropriate, that value MUST\nbe mapped to an appropriate value for the domain [RFC 2474].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3",
+          "quote": "The above description applies to implementations that support the ECN\nTunnel field in the SAD; such implementations MUST implement this\nprocessing instead of the processing of the IPv4 TOS octet and IPv6\nTraffic Class octet defined in [RFC2401].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3",
+          "quote": "An implementation that does not support the ECN Tunnel field in the\nSAD MUST implement this processing by assuming that the value of the\nECN Tunnel field of the SAD is \"forbidden\" for every SA.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3",
+          "quote": "For backwards compatibility, packets with the CE codepoint set in the\nouter header SHOULD be dropped if they arrive on an SA that is using\nthe limited-functionality option, or that is using the full-\nfunctionality option with the not-ECN codepoint set in the inner\nheader.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1",
+          "quote": "If negotiation of ECN usage is implemented, then the SAD field SHOULD\nalso be implemented.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1",
+          "quote": "On the other hand, negotiation of ECN usage is\nOPTIONAL in all cases, even for implementations that support the SAD\nfield.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1",
+          "quote": "The encapsulation and decapsulation processing changes are\nREQUIRED, but MAY be implemented without the other two changes by\nassuming that ECN usage is always forbidden.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1",
+          "quote": "The full-functionality\nalternative for ECN usage over IPsec tunnels consists of the SAD\nfield and the full version of encapsulation and decapsulation\nprocessing changes, with or without the OPTIONAL negotiation support.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.2",
+          "quote": "An implementation MAY create audit records with\nper-SA counts of incorrect packets over some time period rather than\ncreating an audit record for each erroneous packet.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.2",
+          "quote": "Any such audit\nrecord SHOULD contain the headers from at least one erroneous packet,\nbut need not contain the headers from every packet represented by the\nentry.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.3",
+          "quote": "The\naddition to SA negotiation in this document is OPTIONAL and will\nremain so; implementers are free to ignore it.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.3",
+          "quote": "It seems better\nsimply to specify an OPTIONAL extension to the existing SA\nnegotiation mechanism.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3168#section-9.2",
+          "quote": "In particular, in tunnel mode the IPsec tunnel MUST support the\nlimited-functionality option outlined in Section 9.1.1, and SHOULD\nsupport the full-functionality option outlined in Section 9.1.1.\n"
+        }
+      ]
+    },
+    "5961": {
+      "text_sha256": "bba04c91e91f6aa7bd49b491f127bfb3c1280dd22b52f15299d8123f62aab502",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-1.1",
+          "quote": "The mitigations suggested in this document\nSHOULD be implemented in devices that regularly need to maintain TCP\nconnections of the kind most vulnerable to the attacks described in\nthis document.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-1.1",
+          "quote": "These mitigations\nMAY be implemented in other cases.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-3.2",
+          "quote": "Instead, implementations SHOULD implement the following steps in\nplace of those specified in [RFC0793] (as listed above).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-3.2",
+          "quote": "2) If the RST bit is set and the sequence number exactly matches the\nnext expected sequence number (RCV.NXT), then TCP MUST reset the\nconnection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-3.2",
+          "quote": "3) If the RST bit is set and the sequence number does not exactly\nmatch the next expected sequence value, yet is within the current\nreceive window (RCV.NXT < SEG.SEQ < RCV.NXT+RCV.WND), TCP MUST\nsend an acknowledgment (challenge ACK):\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-3.2",
+          "quote": "After sending the challenge ACK, TCP MUST drop the unacceptable\nsegment and stop processing the incoming packet further.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-3.2",
+          "quote": "In all other cases, where\nthe SEQ-field does not match and is outside the window, the receiver\nMUST silently discard the segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-3.2",
+          "quote": "In all\nother cases the receiver MUST silently discard the segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-4.2",
+          "quote": "Instead, the handling of the SYN in the synchronized state SHOULD be\nperformed as follows:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-4.2",
+          "quote": "1) If the SYN bit is set, irrespective of the sequence number, TCP\nMUST send an ACK (also referred to as challenge ACK) to the remote\npeer:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-4.2",
+          "quote": "After sending the acknowledgment, TCP MUST drop the unacceptable\nsegment and stop processing further.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-4.2",
+          "quote": "Upon receipt of a valid RST, the local TCP\nendpoint MUST terminate its connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-5.2",
+          "quote": "All TCP stacks MAY implement the following mitigation.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-5.2",
+          "quote": "TCP stacks\nthat implement this mitigation MUST add an additional input check to\nany incoming segment.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-5.2",
+          "quote": "All incoming segments whose ACK value doesn't satisfy the\nabove condition MUST be discarded and an ACK sent back.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-6",
+          "quote": "As described in the above sections, recommendation levels for RST,\nSYN, and DATA are tagged as SHOULD, SHOULD, and MAY, respectively.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-6",
+          "quote": "The reason that DATA mitigation is tagged as MAY, even though it\nincreased the TCP robustness in general is because, the DATA\ninjection is perceived to be more difficult (twice as unlikely) when\ncompared to RST and SYN counterparts.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-7",
+          "quote": "2) The values for both the time and number of ACKs SHOULD be tunable\nby the system administrator to accommodate different perceived\nlevels of threat and/or system resources.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-7",
+          "quote": "An implementation SHOULD include an ACK throttling mechanism to be\nconservative.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5961#section-7",
+          "quote": "The time limit SHOULD be tunable to help timeout brute force attacks\nfaster than a potential legitimate flood of RSTs.\n"
+        }
+      ]
+    },
+    "3042": {
+      "text_sha256": "c54bec6090d1cc755d111a6341abb964c07fe15b9fb4e4ef63d096d8cc078439",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3042#section-2",
+          "quote": "When a TCP sender has previously unsent data queued for transmission\nit SHOULD use the Limited Transmit algorithm, which calls for a TCP\nsender to transmit new data upon the arrival of the first two\nconsecutive duplicate ACKs when the following conditions are\nsatisfied:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3042#section-2",
+          "quote": "The congestion window (cwnd) MUST NOT be changed when these new\nsegments are transmitted.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc3042#section-2",
+          "quote": "Note: If the connection is using selective acknowledgments [RFC2018],\nthe data sender MUST NOT send new segments in response to duplicate\nACKs that contain no new SACK information, as a misbehaving receiver\ncan generate such ACKs to trigger inappropriate transmission of data\nsegments.\n"
+        }
+      ]
+    },
+    "9406": {
+      "text_sha256": "43e3ddc1d3446142b125f018cd52aa2ff858b3f1ff9c6969924ab9fbf45d5230",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-3",
+          "quote": "At any given time, a TCP MUST NOT\nsend data with a sequence number higher than the sum of the\nhighest acknowledged sequence number and the minimum of the cwnd\nand rwnd.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-4.3",
+          "quote": "It is RECOMMENDED that a HyStart++ implementation use the following\nconstants:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-4.3",
+          "quote": "An implementation MAY tune them for different\nnetwork characteristics.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-4.3",
+          "quote": "While all TCP implementations are REQUIRED to take at least one RTT\nsample each round, implementations of HyStart++ are RECOMMENDED to\ntake at least N_RTT_SAMPLE RTT samples.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-4.3",
+          "quote": "The minimum value of CSS_GROWTH_DIVISOR MUST be at least 2.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-4.3",
+          "quote": "A paced TCP implementation SHOULD use L =\ninfinity.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-4.3",
+          "quote": "An implementation SHOULD use HyStart++ only for the initial slow\nstart (when the ssthresh is at its initial value of arbitrarily high\nper [RFC5681]) and fall back to using standard slow start for the\nremainder of the connection lifetime.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9406#section-4.3",
+          "quote": "An implementation MAY\nuse HyStart++ to grow the restart window [RFC5681] after a long idle\nperiod.\n"
+        }
+      ]
+    },
+    "9438": {
+      "text_sha256": "baa4dd77295e27b9fa5c79993e962e70f728409bd1a48b9029bae4b551b0348a",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.10",
+          "quote": "When _cwnd_ is no more than _ssthresh_, CUBIC MUST employ a slow\nstart algorithm.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.10",
+          "quote": "In general, CUBIC SHOULD use the HyStart++ slow\nstart algorithm [RFC9406] or MAY use the Reno TCP slow start\nalgorithm [RFC5681] in the rare cases when HyStart++ is not suitable.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.2",
+          "quote": "The elapsed time _t_ in Figure 1 MUST NOT include periods during\nwhich _cwnd_ has not been updated due to application-limited behavior\n(see Section 5.8).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.3",
+          "quote": "If so, CUBIC is in the\nReno-friendly region and _cwnd_ SHOULD be set to _W_est_ at each\nreception of a new ACK.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.3",
+          "quote": "Once _W_est_ has grown to reach the _cwnd_ at the time of most\nrecently setting _ssthresh_ -- that is, _W_est_ >= _cwnd_prior_ --\nthe sender SHOULD set \u03b1__cubic_ to 1 to ensure that it can achieve\nthe same congestion window increment rate as Reno, which uses AIMD(1,\n0.5).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.4",
+          "quote": "In this region, _cwnd_ MUST be incremented\nby\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.5",
+          "quote": "In this region, _cwnd_ MUST be\nincremented by\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.6",
+          "quote": "In the case of packet loss, the\nsender MUST reduce _cwnd_ and _ssthresh_ immediately upon entering\nloss recovery, similar to [RFC5681] (and [RFC6675]).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.6",
+          "quote": "The parameter \u03b2__cubic_ SHOULD be set to 0.7, which is different from\nthe multiplicative decrease factor used in [RFC5681] (and [RFC6675])\nduring fast recovery.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.6",
+          "quote": "Implementations\nthat use _cwnd_ MUST use other measures to prevent _cwnd_ from\ngrowing when the volume of bytes in flight is smaller than\n_cwnd_.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.6",
+          "quote": "A QUIC sender that uses a _cwnd_ _value_ to calculate new values for\n_cwnd_ and _ssthresh_ after detecting a congestion event is REQUIRED\nto apply similar mechanisms [RFC9002].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.6",
+          "quote": "Note that CUBIC MUST continue to reduce _cwnd_ in response to\ncongestion events detected by ECN-Echo ACKs until it reaches a value\nof 1 SMSS.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.6",
+          "quote": "If congestion events indicated by ECN-Echo ACKs persist,\na sender with a _cwnd_ of 1 SMSS MUST reduce its sending rate even\nfurther.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.7",
+          "quote": "To speed up this\nbandwidth release by existing flows, the following fast convergence\nmechanism SHOULD be implemented.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.7",
+          "quote": "In network environments with only a single CUBIC flow\nand without any other traffic, fast convergence SHOULD be disabled.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.8",
+          "quote": "In\naddition, for the Reno-friendly region, _W_est_ SHOULD be set to the\ncongestion window size at the beginning of the current congestion\navoidance stage.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.1",
+          "quote": "An implementation MAY detect spurious timeouts based on the\nmechanisms described in Forward RTO-Recovery [RFC5682].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.1",
+          "quote": "When a\nspurious timeout is detected, a TCP implementation MAY follow the\nresponse algorithm described in [RFC4015] to restore the congestion\ncontrol state and adapt the retransmission timer to avoid further\nspurious timeouts.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2",
+          "quote": "Upon receiving an ACK, a TCP implementation MAY detect spurious fast\nretransmits either using TCP Timestamps or via D-SACK [RFC2883].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2",
+          "quote": "When packet loss is detected via acknowledgments, a CUBIC\nimplementation MAY save the current value of the following variables\nbefore the congestion window is reduced.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2",
+          "quote": "Once the previously declared packet loss is confirmed to be spurious,\nCUBIC MAY restore the original values of the above-mentioned\nvariables as follows if the current _cwnd_ is lower than\n_cwnd_prior_.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2",
+          "quote": "In rare cases, when the detection happens long after a spurious fast\nretransmit event and the current _cwnd_ is already higher than\n_cwnd_prior_, CUBIC SHOULD continue to use the current and the most\nrecent values of these variables.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-5.1",
+          "quote": "However, it is NOT\nRECOMMENDED to set _C_ to a very low value like 0.04, since CUBIC\nwith a low _C_ cannot efficiently use the bandwidth in fast and long-\ndistance networks.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc9438#section-5.1",
+          "quote": "Therefore, _C_ SHOULD be set to 0.4.\n"
+        }
+      ]
+    },
+    "1191": {
+      "text_sha256": "3de7c2cb99832c6d1929f9f918172865831848f77e8ab585488125581afa6b68",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1",
+          "quote": "Moreover, doing this prevents PMTU Discovery from discovering PMTUs\nlarger than 576, so hosts SHOULD no longer lower the value they send\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1",
+          "quote": "A host MAY send an MSS value\nderived from the MTU of its connected network (the maximum MTU over\nits connected networks, for a multi-homed host); this should not\ncause problems for PMTU Discovery, and may dissuade a broken peer\nfrom sending enormous datagrams.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "When a host receives a Datagram Too Big message, it MUST reduce its\nestimate of the PMTU for the relevant path, based on the value of the\nNext-Hop MTU field in the message (see section 4).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "We do require that after receiving a Datagram Too Big message, a host\nMUST attempt to avoid eliciting more such messages in the near\nfuture.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "Clearly, the former strategy may\ncontinue to elicit Datagram Too Big messages for a while, but since\neach of these messages (and the dropped datagrams they respond to)\nconsume Internet resources, the host MUST force the PMTU Discovery\nprocess to converge.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "Hosts using PMTU Discovery MUST detect decreases in Path MTU as fast\nas possible.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "Hosts MAY detect increases in Path MTU, but because\ndoing so requires sending datagrams larger than the current estimated\nPMTU, and because the likelihood is that the PMTU will not have\nincreased, this MUST be done at infrequent intervals.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "An attempt to\ndetect an increase (by sending a datagram larger than the current\nestimate) MUST NOT be done less than 5 minutes after a Datagram Too\nBig message has been received for the given destination, or less than\n1 minute after a previous, successful attempted increase.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "Hosts MUST be able to deal with Datagram Too Big messages that do not\ninclude the next-hop MTU, since it is not feasible to upgrade all the\nrouters in the Internet in any finite time.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "A host MUST never reduce its estimate of the Path MTU below 68\noctets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+          "quote": "A host MUST not increase its estimate of the Path MTU in response to\nthe contents of a Datagram Too Big message.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-4",
+          "quote": "To support the Path MTU Discovery\ntechnique specified in this memo, the router MUST include the MTU of\nthat next-hop network in the low-order 16 bits of the ICMP header\nfield that is labelled \"unused\" in the ICMP specification [7].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-4",
+          "quote": "The\nhigh-order 16 bits remain unused, and MUST be set to zero.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3",
+          "quote": "An upper layer MUST not retransmit datagrams in response to an\nincrease in the PMTU estimate, since this increase never comes in\nresponse to an indication of a dropped datagram.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4",
+          "quote": "Note: One MUST not retransmit in response to every Datagram\nToo Big message, since a burst of several oversized segments\nwill give rise to several such messages and hence several\nretransmissions of the same data.\n"
+        }
+      ]
+    },
+    "8201": {
+      "text_sha256": "96c2ea7ac1bf5810f6b817d4ac372a35f68231d2bd0e2675740f1268eb9ac752",
+      "requirements": [],
+      "empty_reason": "RFC8201 uses lowercase requirement wording; pinned Duvet 0.4.3 extracts no keyword requirements. Its operative requirements remain in the manual inventory."
+    },
+    "4821": {
+      "text_sha256": "30e01d01c750f53b8ba7c6502b5eb50db2429881bf8169fae5caa24947d20348",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.1",
+          "quote": "As such, an implementation using this\napproach SHOULD limit the probe size to three times the current MSS\n(causing at most 2 duplicate acknowledgments), or appropriately\nadjust its duplicate acknowledgment threshold for data immediately\nafter a successful probe.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.2",
+          "quote": "The RECOMMENDED method for generating probes is to add a chunk\nconsisting only of padding to an SCTP message.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.2",
+          "quote": "The PAD chunk defined\nin [RFC4820] SHOULD be attached to a minimum length HEARTBEAT (HB)\nchunk to build a probe packet.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.2",
+          "quote": "SCTP MAY also probe with a method similar to TCP's described above,\nusing inline data.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.3",
+          "quote": "To support IP fragmentation as a Packetization Layer under an\nunmodified application, an implementation SHOULD rely on the Path MTU\nsharing described in Section 5.2 plus an adjunct protocol to probe\nthe Path MTU.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.3",
+          "quote": "For this reason,\nimplementations that use IP fragmentation SHOULD use an initial\neff_pmtu, which is selected as described in Section 7.2, except using\na separate global control for the default initial eff_mtu for\nconnectionless protocols.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.4",
+          "quote": "This combination (akin to the SCTP HB plus PAD) is\nRECOMMENDED because an application can separately measure the MTU of\neach direction on a path with asymmetrical MTUs.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "All links MUST enforce their MTU: links that might non-\ndeterministically deliver packets that are larger than their rated\nMTU MUST consistently discard such packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6\nfunctionality.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "All fragmentation SHOULD be done on the host, and all\nIPv4 packets, including fragments, SHOULD have the DF bit set such\nthat they will not be fragmented (again) in the network.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "To use PLPMTUD, a Packetization Layer MUST have a loss reporting\nmechanism that provides the sender with timely and accurate\nindications of which packets were lost in the network.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "Normal congestion control algorithms MUST remain in effect under all\nconditions except when only an isolated probe packet is detected as\nlost.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "In this case alone, the normal congestion (window or data\nrate) reduction SHOULD be suppressed.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "If any other data loss is\ndetected, standard congestion control MUST take place.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "Suppressed congestion control MUST be rate limited such that it\noccurs less frequently than the worst-case loss rate for TCP\ncongestion control at a comparable data rate over the same path\n(i.e., less than the \"TCP-friendly\" loss rate [tcp-friendly]).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "This\nSHOULD be enforced by requiring a minimum headway between a\nsuppressed congestion adjustment (due to a failed probe) and the next\nattempted probe, which is equal to one round-trip time for each\npacket permitted by the congestion window.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "Whenever the MTU is raised, the congestion state variables MUST be\nrescaled so as not to raise the window size in bytes (or data rate in\nbytes per seconds).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "Whenever the MTU is reduced (e.g., when processing ICMP PTB\nmessages), the congestion state variable SHOULD be rescaled so as not\nto raise the window size in packets.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "If PLPMTUD updates the MTU for a particular path, all Packetization\nLayer sessions that share the path representation (as described in\nSection 5.2) SHOULD be notified to make use of the new MTU and make\nthe required congestion control adjustments.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "All implementations MUST include mechanisms for applications to\nselectively transmit packets larger than the current effective Path\nMTU, but smaller than the first-hop link MTU.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "Implementations MAY use different heuristics to select the initial\neffective Path MTU for each protocol.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "Connectionless protocols and\nprotocols that do not support PLPMTUD SHOULD have their own default\nvalue for the initial effective Path MTU, which can be set to a more\nconservative (smaller) value than the initial value used by TCP and\nother protocols that are well suited to PLPMTUD.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+          "quote": "There SHOULD be\nper-protocol and per-route limits on the initial effective Path MTU\n(eff_pmtu) and the upper searching limit (search_high).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.1",
+          "quote": "When\nconducting a probe, the Packetization Layer MUST determine the probe\npacket's final size including IP headers.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "The observed PMTU (eff_pmtu in Section 7.1) MAY be shared\nbetween different flows with a common path representation.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "The IP layer SHOULD be used to store the cached PMTU value and other\nshared state such as MTU values reported by ICMP PTB messages.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "An implementation MAY use the destination address as the local\nrepresentation of a path.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "Since Network Address Translators (NATs) and\nother forms of middle boxes may exhibit differing PMTUs\nsimultaneously at a single IP address, the minimum value SHOULD be\nstored.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "Network or subnet numbers MUST NOT be used as representations of a\npath, because there is not a general mechanism to determine the\nnetwork mask at the remote host.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "For source-routed packets (i.e., packets containing an IPv6 routing\nheader, or IPv4 Loose Source and Record Route (LSRR) or Strict Source\nand Record Route (SSRR) options), the source route MAY further\nqualify the local representation of a path.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "An implementation MAY\nuse source route information in the local representation of a path.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+          "quote": "If IPv6 flows are in use, an implementation MAY use the 3-tuple of\nthe Flow label and the source and destination addresses\n[RFC2460][RFC3697] as the local representation of a path.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.3",
+          "quote": "If IPsec is\ntreated as part of the Packetization Layer, the IPsec header size\nMUST be included in the Packetization Layer's header size\ncalculations.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.4",
+          "quote": "Minimally, an implementation MAY maintain a single MTU value to be\nused for all multicast packets originated from the node.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.4",
+          "quote": "This MTU\nSHOULD be sufficiently small that it is expected to be less than the\nPath MTU of all paths comprising the multicast tree.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.4",
+          "quote": "If a Path MTU\nof less than the configured multicast MTU is learned via unicast\nmeans, the multicast MTU MAY be reduced to this value.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.4",
+          "quote": "If the application using multicast gets complete delivery reports\n(unlikely since this requirement has poor scaling properties),\nPLPMTUD MAY be implemented in multicast protocols such that the\nsmallest path MTU learned across a group becomes the effective MTU\nfor that group.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-6.1",
+          "quote": "PLPMTUD can also be implemented in protocols that rely on timeouts as\ntheir primary mechanism for loss recovery; however, timeouts SHOULD\nNOT be used as the primary mechanism for loss indication unless there\nare no other alternatives.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
+          "quote": "When transmitting non-probes, the Packetization Layer SHOULD create\npackets of a size less than or equal to eff_pmtu.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
+          "quote": "When transmitting probes, the Packetization Layer MUST select a probe\nsize that is larger than search_low and smaller than or equal to\nsearch_high.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
+          "quote": "The initial value of\nsearch_low SHOULD be conservatively low, but performance may be\nbetter if eff_pmtu starts at a higher, less conservative, value.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
+          "quote": "When such a packet is\nacknowledged, it is effectively an \"implicit probe\" and search_low\nSHOULD be raised to the size of the acknowledged packet.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
+          "quote": "However, if\nan \"implicit probe\" is lost, it MUST NOT be treated as a probe\nfailure as a true probe would be.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
+          "quote": "The initial value for search_high SHOULD be the largest possible\npacket that might be supported by the flow.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
+          "quote": "In addition, the initial value for\nsearch_high MAY be limited by a configuration option to prevent\nprobing above some maximum size.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
+          "quote": "It is RECOMMENDED that search_low be initially set to an MTU size\nthat is likely to work over a very wide range of environments.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
+          "quote": "The initial value for search_low SHOULD be configurable.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
+          "quote": "There SHOULD be per-protocol and per-route configuration options to\noverride initial values for eff_pmtu and other PLPMTUD state\nvariables.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.3",
+          "quote": "Each Packetization Layer MUST determine when probing has converged,\nthat is, when the probe size range is small enough that further\nprobing is no longer worth its cost.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.3",
+          "quote": "When probing has converged, a\ntimer SHOULD be set.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.3",
+          "quote": "The value for this timer\nMUST NOT be less than 5 minutes and is recommended to be 10 minutes,\nper RFC 1981.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4",
+          "quote": "Before sending a probe, the flow MUST meet at least the following\nconditions:\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4",
+          "quote": "In addition, the timely loss detection algorithms in most protocols\nhave pre-conditions that SHOULD be satisfied before sending a probe.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4",
+          "quote": "For example, TCP Fast Retransmit is not robust unless there are\nsufficient segments following a probe; that is, the sender SHOULD\nhave enough data queued and sufficient receiver window to send the\nprobe plus at least Tcprexmtthresh [RFC2760] additional segments.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4",
+          "quote": "Protocols MAY delay sending non-probes in order to accumulate enough\ndata to meet the pre-conditions for probing.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4",
+          "quote": "The delayed sending\nalgorithm SHOULD use some self-scaling technique to appropriately\nlimit the time that the data is delayed.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.5",
+          "quote": "Once a probe size in the appropriate range has been selected, and the\nabove preconditions have been met, the Packetization Layer MAY\nconduct a probe.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1",
+          "quote": "To be robust in such a case, the Packetization Layer\nSHOULD conduct MTU verification as described in Section 7.8.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+          "quote": "In this case alone, the\nloss SHOULD NOT be interpreted as congestion signal.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+          "quote": "If eff_pmtu is larger than the probe size,\neff_pmtu MUST be reduced to no larger than search_high, and SHOULD be\nreduced to search_low, as the eff_pmtu has been determined to be\ninvalid, similar to after a full-stop timeout (see Section 7.7).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+          "quote": "If an ICMP PTB message is received matching the probe packet, then\nsearch_high and eff_pmtu MAY be set from the MTU value indicated in\nthe message.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+          "quote": "A probe failure event is the one situation under which the\nPacketization Layer SHOULD ignore loss as a congestion signal.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+          "quote": "Because there is some small risk that suppressing congestion control\nmight have unanticipated consequences (even for one isolated loss),\nit is REQUIRED that probe failure events be less frequent than the\nnormal period for losses under standard congestion control.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+          "quote": "Specifically, after a probe failure event and suppressed congestion\ncontrol, PLPMTUD MUST NOT probe again until an interval that is\nlarger than the expected interval between congestion control events.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3",
+          "quote": "A time interval that is\nfive times the non-timeout failure case (Section 7.6.2) is\nRECOMMENDED.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.4",
+          "quote": "In this case, the state variables eff_pmtu, search_low,\nand search_high SHOULD NOT be updated, and the same-sized probe\nSHOULD be attempted again as soon as the probing preconditions are\nmet (i.e., once the packetization layer has no outstanding\nunrecovered losses).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6",
+          "quote": "When a probe has completed, the result SHOULD be processed as\nfollows, categorized by the probe's result type.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.7",
+          "quote": "Under all conditions, a full-stop timeout (also known as a\n\"persistent timeout\" in other documents) SHOULD be taken as an\nindication of some significantly disruptive event in the network,\nsuch as a router failure or a routing change to a path with a smaller\nMTU.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.7",
+          "quote": "If there is a full-stop timeout and there was not an ICMP message\nindicating a reason (PTB, Net unreachable, etc., or the ICMP message\nwas ignored for some reason), the RECOMMENDED first recovery action\nis to treat this as a detected ICMP black hole as defined in\n[RFC2923].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.7",
+          "quote": "Upon additional\nsuccessive timeouts, search_low and eff_pmtu SHOULD be halved, with a\nlower bound of 68 bytes for IPv4 and 1280 bytes for IPv6.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.7",
+          "quote": "Even lower\nlower bounds MAY be permitted to support limited operation over links\nwith MTUs that are smaller than permitted by the IP specifications.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.8",
+          "quote": "However, to increase robustness,\nan implementation SHOULD implement some form of MTU verification,\nsuch that if increasing eff_pmtu results in a sharp increase in loss\nrate, it will fall back to using a lower MTU.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.8",
+          "quote": "A RECOMMENDED strategy would be to save the value of eff_pmtu before\nraising it.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.8",
+          "quote": "The saved value of eff_pmtu SHOULD be\nrestored, and search_high reduced in the same manner as in a probe\nfailure.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.8",
+          "quote": "PLPMTUD implementations SHOULD implement MTU verification.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-8",
+          "quote": "Packetization Layers SHOULD avoid sending messages that will require\nfragmentation [Kent87] [frag-errors].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-8",
+          "quote": "This approach is NOT RECOMMENDED.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-8",
+          "quote": "It is RECOMMENDED that IPv4 implementations use a strategy that\nmimics IPv6 functionality.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-8",
+          "quote": "When an application sends datagrams that\nare larger than the effective Path MTU, they SHOULD be fragmented to\nthe Path MTU in the host IP layer even if they are smaller than the\nMTU of the first link, directly attached to the host.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-8",
+          "quote": "The DF bit\nSHOULD be set on the fragments, so they will not be fragmented again\nin the network.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-9",
+          "quote": "All implementations MUST include a mechanism where applications using\nconnectionless protocols can send their own probes.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-9",
+          "quote": "There MUST be a mechanism that\npermits an application to send datagrams that are larger than\neff_pmtu, the operating systems estimate of the Path MTU, without\nbeing fragmented.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-9",
+          "quote": "If these are IPv4 packets, they MUST have the DF\nbit set.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc4821#section-9",
+          "quote": "A third mode is\nREQUIRED where the datagram is sent even if it is larger than the\ncurrent estimate of the Path MTU.\n"
+        }
+      ]
+    },
+    "5927": {
+      "text_sha256": "b90bd4a3dbd1dcfb86bf4369a39cb0d50b08bca82d8ecadf0294a63c299c751d",
+      "requirements": [
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-2.2",
+          "quote": "The Host Requirements RFC [RFC1122] states in Section 4.2.3.9 that\nTCP MUST act on an ICMP error message passed up from the IP layer,\ndirecting it to the connection that triggered the error.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-2.3",
+          "quote": "It finally states\nthat to accommodate both ends of this spectrum, a compliant IPsec\nimplementation MUST permit a local administrator to configure an\nIPsec implementation to accept or reject unauthenticated ICMP\ntraffic, and that this control MUST be at the granularity of ICMP\ntype and MAY be at the granularity of ICMP type and code.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-2.3",
+          "quote": "Additionally, an implementation SHOULD incorporate mechanisms and\nparameters for dealing with such traffic.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-3",
+          "quote": "included in the payload of ICMPv4 error messages, and that \"more than\n8 octets MAY be sent\", thus allowing implementations to include more\ndata from the original packet than those required by the original\nICMPv4 specification.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-3",
+          "quote": "The \"Requirements for IP Version 4 Routers\"\nRFC [RFC1812] states that ICMPv4 error messages \"SHOULD contain as\nmuch of the original datagram as possible without the length of the\nICMP datagram exceeding 576 bytes\".\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-5.1",
+          "quote": "The Host Requirements RFC [RFC1122] states (in Section 4.2.3.9) that\na host SHOULD abort the corresponding connection when receiving an\nICMPv4 error message that indicates a \"hard error\", and states that\nICMPv4 error messages of type 3 (Destination Unreachable), codes 2\n(protocol unreachable), 3 (port unreachable), and 4 (fragmentation\nneeded and DF bit set) should be considered as indicating \"hard\nerrors\".\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-5.1",
+          "quote": "In the case of ICMPv4 port unreachables, the specifications\nare ambiguous, as Section 4.2.3.9 of [RFC1122] states that TCP SHOULD\nabort the corresponding connection in response to them, but\nSection 3.2.2.1 of the same RFC ([RFC1122]) states that TCP MUST\nabort the connection in response to them.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-5.2",
+          "quote": "The Host Requirements RFC [RFC1122] states in Section 4.2.3.9 that\nTCP SHOULD abort the corresponding connection in response to ICMPv4\nmessages of type 3 (Destination Unreachable), codes 2 (protocol\nunreachable), 3 (port unreachable), and 4 (fragmentation needed and\nDF bit set).\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-5.2",
+          "quote": "However, Section 3.2.2.1 states that TCP MUST accept an\nICMPv4 port unreachable (type 3, code 3) for the same purpose as a\nRST.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-6.1",
+          "quote": "The Host Requirements RFC [RFC1122] states in Section 4.2.3.9 that\nhosts MUST react to ICMPv4 Source Quench messages by slowing\ntransmission on the connection.\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-6.1",
+          "quote": "[RFC1122] further adds that the RECOMMENDED procedure is\nto put the corresponding connection in the slow-start phase of TCP's\ncongestion control algorithm [RFC5681].\n"
+        },
+        {
+          "target": "https://www.rfc-editor.org/rfc/rfc5927#section-6.2",
+          "quote": "[RFC1812] further states that routers SHOULD NOT send ICMPv4 Source\nQuench messages in response to congestion.\n"
+        }
+      ]
+    }
+  }
+}

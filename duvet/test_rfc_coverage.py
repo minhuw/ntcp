@@ -9,6 +9,7 @@ import tempfile
 import tomllib
 import unittest
 
+from rfc_scopes import ORIGINAL_RFCS, check_registration, load_scopes
 from check_rfc_coverage import PREFIX, RFCS, check
 
 
@@ -35,13 +36,16 @@ def complete_report():
 class CoverageGate(unittest.TestCase):
     def test_config_extracts_all_requested_rfcs_and_all_extension_sections(self):
         config = tomllib.loads((Path(__file__).parent / "duvet.toml").read_text())
-        self.assertEqual(set(RFCS), {9293, 2018, 6675, 8985, 9937, 6298,
-                                     5681, 6582, 6928, 7323, 2883, 3168, 5961, 3042, 9406, 9438, 1191, 8201, 4821, 5927, 7413})
+        self.assertTrue(set(ORIGINAL_RFCS) <= set(RFCS))
+        self.assertEqual(set(check_registration()), set(RFCS))
         self.assertEqual({s["source"] for s in config["specification"]},
                          {f"{PREFIX}{rfc}" for rfc in RFCS})
         patterns = {r["pattern"] for r in config["requirement"]}
-        for rfc in set(RFCS) - {7413}:
-            sections = "section-3*" if rfc == 9293 else "*"
+        for rfc, scope in load_scopes().items():
+            if scope["extraction"] == "manual":
+                self.assertFalse(any(f"rfc{rfc}/" in pattern for pattern in patterns))
+                continue
+            sections = "section-3*" if scope["extraction"] == "section-3" else "*"
             self.assertIn(f"workbench/duvet/requirements/**/rfc{rfc}/{sections}.toml", patterns)
         # TFO has a scoped manual inventory, not full-document extraction.
         self.assertFalse(any("rfc7413/" in pattern for pattern in patterns))
@@ -118,7 +122,8 @@ class CoverageGate(unittest.TestCase):
             root = Path(directory)
             tools = root / "duvet"
             tools.mkdir()
-            for name in ("rfc-report.sh", "duvet.toml", "check_rfc_coverage.py"):
+            for name in ("rfc-report.sh", "duvet.toml", "check_rfc_coverage.py",
+                         "rfc_scopes.py", "rfc-scopes.toml"):
                 shutil.copyfile(Path(__file__).parent / name, tools / name)
             binaries = root / "workbench/tools/bin"
             binaries.mkdir(parents=True)
