@@ -11147,6 +11147,18 @@ fn syn_sent_resets_require_ack_and_abort_outputs_once() {
 //= reason=Receiver replies to persist probes with current next sequence/window; responsive sender survives.
 //# When the receiving TCP peer has a zero window and a segment arrives, it must still send
 //# an acknowledgment showing its next expected sequence number and current window (zero).
+//= https://www.rfc-editor.org/rfc/rfc6429#section-1
+//= type=test
+//# Therefore, zero window probing needs to be supported to prevent a
+//# connection from hanging forever if ACK segments that re-open the window
+//# are lost.
+//= https://www.rfc-editor.org/rfc/rfc6429#section-2
+//= type=test
+//# Although this may result in a prolonged ZWP state, it would be premature
+//# for TCP to take action on its own and close the printer connection
+//# merely due to its lack of progress. Once the printer's paper tray is
+//# reloaded (which may be minutes, hours, or days later), the print job
+//# needs to be able to continue uninterrupted over the same TCP connection.
 fn zero_window_probe_recovers_lost_update_and_responsive_peer_survives() {
     let mut cfg = config(4, 4);
     cfg.user_timeout_us = 5_000_000;
@@ -14163,6 +14175,9 @@ fn passive_syn_received_exception_releases_child_without_user_notification() {
 //= type=test
 //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right
 //# window edge to the left (SHLD-14).
+//= https://www.rfc-editor.org/rfc/rfc6429#section-1
+//= type=test
+//# A TCP MAY keep its offered receive window closed indefinitely.
 fn receiver_zero_window_persists_without_reads_and_sender_probes_after_shrink() {
     let (mut a, mut b) = pair(config(4, 4), u32::MAX - 2);
     a.write(b"abcd").unwrap();
@@ -18061,6 +18076,19 @@ fn time_wait_timestamp_freshness_uses_latest_not_echo_and_handles_wrap() {
     }
 }
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc6429#section-1
+//= type=test
+//# As long as the receiving TCP continues to send acknowledgments in
+//# response to the probe segments, the sending TCP MUST allow the
+//# connection to stay open.
+//= https://www.rfc-editor.org/rfc/rfc6429#section-2
+//= type=test
+//# Per [RFC1122], as long as the ACKs are being received for window probes,
+//# a connection can continue to stay in the persist condition.
+//= https://www.rfc-editor.org/rfc/rfc6429#section-4
+//= type=test
+//# As stated in [RFC1122], a TCP implementation MUST NOT close a connection
+//# merely because it seems to be stuck in the ZWP or persist condition.
 fn application_stall_bounds_responsive_persist_and_window_shrink() {
     for window in [0, 3] {
         for explicit in [false, true] {

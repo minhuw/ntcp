@@ -1,0 +1,16 @@
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-2"
+reason = "Actor boundary: choosing which connections to reclaim under system resource exhaustion belongs to the embedding application or operating system. TCP supplies explicit abort and application deadlines; this sentence prescribes no TCP eviction algorithm."
+quote = """
+In such cases, the application or operating system would need to take
+appropriate action on the TCP connection to reclaim their resources and
+continue to maintain legitimate connections.
+"""
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-3"
+reason = "Actor boundary: application attack detection and victim selection are external to TCP. The core exposes explicit abort and an optional application deadline; the RFC specifies neither a health API nor an orphan mitigation algorithm."
+quote = """
+A clever application needs to detect such attacks with connections that
+are not making progress, and could close these connections.
+"""

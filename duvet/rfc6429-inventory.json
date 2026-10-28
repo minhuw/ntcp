@@ -1,0 +1,245 @@
+{
+  "rfc": 6429,
+  "document_status": "Informational",
+  "scope": "Full operative document: zero-window probing, responsive persist and application/resource-manager termination; no prescribed health API or orphan mitigation",
+  "scope_kind": "full-operative",
+  "text_sha256": "f2d371ecfeb49168b72a86e863a88fb3593fa90a2548b07fa2ead6cff68b6fcf",
+  "paragraphs": [
+    {
+      "id": "6429-1-context-1",
+      "section": "1",
+      "quote": "Section 4.2.2.17 of \"Requirements for Internet Hosts -- Communication Layers\" [RFC1122] says: \"",
+      "status": "context",
+      "reason": "Quoted RFC1122 attribution and ACK-loss explanation, persist definition, DoS motivation and roadmap. Operative receive-window, stay-open, probing and requested-abort clauses have their own rows."
+    },
+    {
+      "id": "6429-receive-window-permission",
+      "section": "1",
+      "quote": "A TCP MAY keep its offered receive window closed indefinitely.",
+      "status": "covered",
+      "reason": "Selected receive-side permission: a full unread receiver retains a zero offered window across ten actual probes without a timeout, while the sender receives ACKs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-1",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn advertised_window(",
+        "crates/stacks/ntcp/src/connection_tests.rs::fn receiver_zero_window_persists_without_reads_and_sender_probes_after_shrink()"
+      ]
+    },
+    {
+      "id": "6429-responsive-open",
+      "section": "1",
+      "quote": "As long as the receiving TCP continues to send acknowledgments in response to the probe segments, the sending TCP MUST allow the connection to stay open.",
+      "status": "covered",
+      "reason": "Responsive zero-window feedback clears transport liveness deadlines; the test asserts open state without an application timeout and termination only under the explicitly selected application deadline.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-1",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn user_deadline(",
+        "crates/stacks/ntcp/src/connection_tests.rs::fn application_stall_bounds_responsive_persist_and_window_shrink()"
+      ]
+    },
+    {
+      "id": "6429-1-context-2",
+      "section": "1",
+      "quote": "DISCUSSION: It is extremely important to remember that ACK (acknowledgment) segments that contain no data are not reliably transmitted by TCP\".",
+      "status": "context",
+      "reason": "Quoted RFC1122 attribution and ACK-loss explanation, persist definition, DoS motivation and roadmap. Operative receive-window, stay-open, probing and requested-abort clauses have their own rows."
+    },
+    {
+      "id": "6429-probe-lost-update",
+      "section": "1",
+      "quote": "Therefore, zero window probing needs to be supported to prevent a connection from hanging forever if ACK segments that re-open the window are lost.",
+      "status": "covered",
+      "reason": "arm_work schedules zero-window probes; the test drops a real window update, exchanges another probe/ACK, reopens the window and transfers the queued bytes on the same connection.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-1",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn arm_work(",
+        "crates/stacks/ntcp/src/connection_tests.rs::fn zero_window_probe_recovers_lost_update_and_responsive_peer_survives()"
+      ]
+    },
+    {
+      "id": "6429-1-context-3",
+      "section": "1",
+      "quote": "The condition where the sender goes into the Zero Window Probe (ZWP) mode is typically known as the 'persist condition'.",
+      "status": "context",
+      "reason": "Quoted RFC1122 attribution and ACK-loss explanation, persist definition, DoS motivation and roadmap. Operative receive-window, stay-open, probing and requested-abort clauses have their own rows."
+    },
+    {
+      "id": "6429-external-abort",
+      "section": "1",
+      "quote": "This guidance is not intended to preclude resource management by the operating system or application, which may request that connections be aborted regardless of whether or not they are in the persist condition. The TCP implementation needs to, of course, comply by aborting such connections.",
+      "status": "covered",
+      "reason": "The public abort API delegates to terminal abort regardless of persist. The test first receives real zero-window probe ACKs, then asserts immediate Aborted state/event, rejection of further writes and a reset received by the peer.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-1",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn abort(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6429_explicit_abort_of_responsive_zero_window_connection()"
+      ]
+    },
+    {
+      "id": "6429-1-context-4",
+      "section": "1",
+      "quote": "If such resource management is not performed external to the protocol implementation, TCP implementations that misinterpret Section 4.2.2.17 of [RFC1122] have the potential to make systems vulnerable to denial-of-service (DoS) [RFC4732] scenarios where attackers tie up resources by keeping connections in the persist condition. Rather than making a change to the standard, this document clarifies what has been until now a misinterpretation of the standard as specified in RFC 1122 [RFC1122]. Section 2 of this document describes why implementations might not close connections merely because they are in the persist condition, yet need to still allow such connections to be closed on command. Section 3 outlines a simple attack on systems that do not sufficiently manage connections in this state. Section 4 concludes with a requirements-language clarification to the RFC 1122 requirement.",
+      "status": "context",
+      "reason": "Quoted RFC1122 attribution and ACK-loss explanation, persist definition, DoS motivation and roadmap. Operative receive-window, stay-open, probing and requested-abort clauses have their own rows."
+    },
+    {
+      "id": "6429-1.1-context-1",
+      "section": "1.1",
+      "quote": "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL\", \"SHALL NOT\", \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"NOT RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in this document are to be interpreted as described in [RFC2119].",
+      "status": "context",
+      "reason": "BCP14 vocabulary definition, not a separate TCP mechanism."
+    },
+    {
+      "id": "6429-responsive-persist",
+      "section": "2",
+      "quote": "Per [RFC1122], as long as the ACKs are being received for window probes, a connection can continue to stay in the persist condition.",
+      "status": "covered",
+      "reason": "No autonomous persist lifetime closes a responsive connection; only unanswered probes or an explicitly configured application policy impose a deadline.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn user_deadline(",
+        "crates/stacks/ntcp/src/connection_tests.rs::fn application_stall_bounds_responsive_persist_and_window_shrink()"
+      ]
+    },
+    {
+      "id": "6429-2-context-1",
+      "section": "2",
+      "quote": "This is an important feature, because applications typically would want the TCP connection to stay open unless an application explicitly closes the connection. For example, take the case of a user running a network print job during which the printer runs out of paper and is waiting for the user to reload the paper tray (user intervention). The printer may not be reading data from the printing application during this time.",
+      "status": "context",
+      "reason": "Printer/DoS examples explain the separately dispositioned stay-open, resumption and abort behavior. SCTP applicability is outside this TCP implementation; no SCTP capability is claimed."
+    },
+    {
+      "id": "6429-printer-resumption",
+      "section": "2",
+      "quote": "Although this may result in a prolonged ZWP state, it would be premature for TCP to take action on its own and close the printer connection merely due to its lack of progress. Once the printer's paper tray is reloaded (which may be minutes, hours, or days later), the print job needs to be able to continue uninterrupted over the same TCP connection.",
+      "status": "covered",
+      "reason": "The lost-window-update test keeps responsive persist open, simulates user intervention by reading the receiver, loses the reopening ACK, then resumes queued transfer after a probe without replacing the connection.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn user_deadline(",
+        "crates/stacks/ntcp/src/connection_tests.rs::fn zero_window_probe_recovers_lost_update_and_responsive_peer_survives()"
+      ]
+    },
+    {
+      "id": "6429-2-context-2",
+      "section": "2",
+      "quote": "However, systems that misinterpret Section 4.2.2.17 of [RFC1122] may fall victim to DoS attacks by not supporting sufficient mechanisms to allow release of system resources tied up by connections in the persist condition during times of resource exhaustion. For example, take the case of a busy server where multiple (attacker) clients can advertise a zero window forever (by reliably acknowledging the ZWPs). This could eventually lead to resource exhaustion in the server system.",
+      "status": "context",
+      "reason": "Printer/DoS examples explain the separately dispositioned stay-open, resumption and abort behavior. SCTP applicability is outside this TCP implementation; no SCTP capability is claimed."
+    },
+    {
+      "id": "6429-resource-manager-action",
+      "section": "2",
+      "quote": "In such cases, the application or operating system would need to take appropriate action on the TCP connection to reclaim their resources and continue to maintain legitimate connections.",
+      "status": "exception",
+      "reason": "Actor boundary: choosing which connections to reclaim under system resource exhaustion belongs to the embedding application or operating system. TCP supplies explicit abort and application deadlines; this sentence prescribes no TCP eviction algorithm.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-2"
+    },
+    {
+      "id": "6429-2-context-3",
+      "section": "2",
+      "quote": "The problem is applicable to TCP and TCP-derived flow-controlled transport protocols such as the Stream Control Transmission Protocol (SCTP).",
+      "status": "context",
+      "reason": "Printer/DoS examples explain the separately dispositioned stay-open, resumption and abort behavior. SCTP applicability is outside this TCP implementation; no SCTP capability is claimed."
+    },
+    {
+      "id": "6429-abort-like-any-other",
+      "section": "2",
+      "quote": "Clearly, a system needs to be robust to such attacks and allow connections in the persist condition to be aborted in the same way as any other connection.",
+      "status": "covered",
+      "reason": "The ordinary endpoint abort API works after repeated responsive zero-window exchanges, both on an open connection and after application shutdown, with the same Aborted event and peer reset.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn abort(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6429_explicit_abort_of_responsive_zero_window_connection()"
+      ]
+    },
+    {
+      "id": "6429-2-context-4",
+      "section": "2",
+      "quote": "Section 4 of this document provides the requisite clarification to permit such resource management.",
+      "status": "context",
+      "reason": "Printer/DoS examples explain the separately dispositioned stay-open, resumption and abort behavior. SCTP applicability is outside this TCP implementation; no SCTP capability is claimed."
+    },
+    {
+      "id": "6429-3-context-1",
+      "section": "3",
+      "quote": "To illustrate a potential DoS scenario, consider the case where many client applications open TCP connections with an HTTP [RFC2616] server, and each sends a GET request for a large page and stops reading the response partway through. This causes the client's TCP implementation to advertise a zero window to the server. For every large HTTP response, the server is left holding on to the response data in its sending queue. The amount of response data held will depend on the size of the send buffer and the advertised window. If the clients never read the data in their receive queues and therefore do not clear the persist condition, the server will continue to hold that data indefinitely. Since there may be a limit to the operating system kernel memory available for TCP buffers, this may result in DoS to legitimate connections by locking up the necessary resources. If the above scenario persists for an extended period of time, it will lead to starvation of TCP buffers and connection blocks, causing legitimate existing connections and new connection attempts to fail.",
+      "status": "context",
+      "reason": "Illustrative HTTP attack and orphaned-connection discussion, not a prescribed TCP attack detector or mitigation. The application advice has a separate actor disposition."
+    },
+    {
+      "id": "6429-application-attack-detection",
+      "section": "3",
+      "quote": "A clever application needs to detect such attacks with connections that are not making progress, and could close these connections.",
+      "status": "exception",
+      "reason": "Actor boundary: application attack detection and victim selection are external to TCP. The core exposes explicit abort and an optional application deadline; the RFC specifies neither a health API nor an orphan mitigation algorithm.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-3"
+    },
+    {
+      "id": "6429-3-context-2",
+      "section": "3",
+      "quote": "However, some applications might have transferred all the data to the TCP socket and subsequently closed the socket, leaving the connections with no controlling process; such connections are referred to as orphaned connections. These orphaned connections might be left holding the data indefinitely in their sending queue. The US Computer Emergency Readiness Team (CERT) has released an advisory in this regard [VU723308] and is making vendors aware of this DoS scenario.",
+      "status": "context",
+      "reason": "Illustrative HTTP attack and orphaned-connection discussion, not a prescribed TCP attack detector or mitigation. The application advice has a separate actor disposition."
+    },
+    {
+      "id": "6429-no-autonomous-persist-close",
+      "section": "4",
+      "quote": "As stated in [RFC1122], a TCP implementation MUST NOT close a connection merely because it seems to be stuck in the ZWP or persist condition.",
+      "status": "covered",
+      "reason": "The application-stall test holds a responsive zero window through the explicit deadline boundary and verifies that the default connection stays established; only an explicitly selected application deadline closes it.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-4",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn user_deadline(",
+        "crates/stacks/ntcp/src/connection_tests.rs::fn application_stall_bounds_responsive_persist_and_window_shrink()"
+      ]
+    },
+    {
+      "id": "6429-allow-requested-termination",
+      "section": "4",
+      "quote": "Though unstated in RFC 1122, but implicit for system robustness, a TCP implementation needs to allow connections in the ZWP or persist condition to be closed or aborted by their applications or other resource management routines in the operating system.",
+      "status": "covered",
+      "reason": "Explicit application shutdown remains pending behind the zero window; explicit abort immediately terminates both that connection and an otherwise open responsive-persist connection. No automatic resource-manager policy is inferred.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6429#section-4",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn abort(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6429_explicit_abort_of_responsive_zero_window_connection()"
+      ]
+    },
+    {
+      "id": "6429-4-context-1",
+      "section": "4",
+      "quote": "An interface that allows an application to inform TCP on what to do when the connection stays in the persist condition, or that allows an application or other resource manager to query the health of the TCP connection, is considered outside the scope of this document. All such techniques, however, are in complete compliance with TCP [RFC0793] and [RFC1122].",
+      "status": "context",
+      "reason": "Health queries and application-policy interfaces are expressly outside the document scope; their use is permitted, with no required API shape."
+    },
+    {
+      "id": "6429-5-context-1",
+      "section": "5",
+      "quote": "This document discusses one system security consideration that is listed in \"Guidelines for Writing RFC Text on Security Considerations\" [RFC3552]. In particular, it describes an inappropriate use of a system that is acting as a server for many users. That use and a possible DoS attack are discussed in Section 3. This document limits itself to clarifying RFC 1122. It does not discuss what can happen with orphaned connections and other possible mitigation techniques, as these are considered outside the scope of this document.",
+      "status": "context",
+      "reason": "Security motivation and express exclusion of orphan mitigation techniques; no additional TCP obligation."
+    },
+    {
+      "id": "6429-6-context-1",
+      "section": "6",
+      "quote": "This document was inspired by the recent discussions that took place regarding the TCP persist condition issue in the TCP Maintenance and Minor Extensions (TCPM) Working Group mailing list [TCPM]. The outcome of those discussions was to come up with a document that would clarify the intentions of the ZWP as discussed in RFC 1122. We would like to thank Mark Allman, Ted Faber, and David Borman for clarifying the objective behind this document. Thanks also go to Wesley Eddy for his extensive editorial comments and to Dan Wing, Mark Allman, and Fernando Gont for providing feedback on this document.",
+      "status": "context",
+      "reason": "Acknowledgements, not protocol behavior."
+    },
+    {
+      "id": "6429-7.1-context-1",
+      "section": "7.1",
+      "quote": "[RFC0793] Postel, J., \"Transmission Control Protocol\", STD 7, RFC 793, September 1981. [RFC1122] Braden, R., Ed., \"Requirements for Internet Hosts - Communication Layers\", STD 3, RFC 1122, October 1989. [RFC2119] Bradner, S., \"Key words for use in RFCs to Indicate Requirement Levels\", BCP 14, RFC 2119, March 1997.",
+      "status": "context",
+      "reason": "Bibliographic references, not independent capability requirements."
+    },
+    {
+      "id": "6429-7.2-context-1",
+      "section": "7.2",
+      "quote": "[RFC2616] Fielding, R., Gettys, J., Mogul, J., Frystyk, H., Masinter, L., Leach, P., and T. Berners-Lee, \"Hypertext Transfer Protocol -- HTTP/1.1\", RFC 2616, June 1999. [RFC3552] Rescorla, E. and B. Korver, \"Guidelines for Writing RFC Text on Security Considerations\", BCP 72, RFC 3552, July 2003. [RFC4732] Handley, M., Ed., Rescorla, E., Ed., and IAB, \"Internet Denial-of-Service Considerations\", RFC 4732, December 2006. [TCPM] IETF, \"TCP Maintenance and Minor Extensions (tcpm) - Charter\", <http://datatracker.ietf.org/wg/tcpm/charter/>. [VU723308] Manion, A. and D. Warren, \"TCP may keep its offered receive window closed indefinitely (RFC 1122)\", November 2009, <http://www.kb.cert.org/vuls/id/723308>.",
+      "status": "context",
+      "reason": "Bibliographic references, not independent capability requirements."
+    }
+  ]
+}

@@ -173,3 +173,19 @@ scope_kind = "selected-requirements"
 scope = "server admission and explicit client credential/MSS boundaries; not full RFC7413 coverage"
 extraction = "manual"
 inventory = "duvet/rfc7413-additions.toml"
+
+[[rfc]]
+id = 6191
+document_status = "Best Current Practice"
+scope_kind = "full-operative"
+scope = "Full operative document, including all seven TIME-WAIT decision branches, definitions, PAWS prerequisite and reboot quiet time; BCP 159"
+extraction = "manual"
+inventory = "duvet/rfc6191-inventory.json"
+
+[[rfc]]
+id = 6429
+document_status = "Informational"
+scope_kind = "full-operative"
+scope = "Full operative document: zero-window probing, responsive persist and application/resource-manager termination; no prescribed health API or orphan mitigation"
+extraction = "manual"
+inventory = "duvet/rfc6429-inventory.json"

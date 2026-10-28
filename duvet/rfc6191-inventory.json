@@ -1,0 +1,258 @@
+{
+  "rfc": 6191,
+  "document_status": "Best Current Practice",
+  "scope": "Full operative document, including all seven TIME-WAIT decision branches, definitions, PAWS prerequisite and reboot quiet time; BCP 159",
+  "scope_kind": "full-operative",
+  "text_sha256": "974f45f076be09e8be66ef8b12e9b5a99ba95b43251502b08539fc53d9347211",
+  "paragraphs": [
+    {
+      "id": "6191-1-context-1",
+      "section": "1",
+      "quote": "The Timestamps option, specified in RFC 1323 [RFC1323], allows a TCP to include a timestamp value in its segments that can be used to perform two functions: Round-Trip Time Measurement (RTTM) and Protection Against Wrapped Sequences (PAWS).",
+      "status": "context",
+      "reason": "Introduction, historical PAWS/reuse motivation and keyword definitions; operative prerequisite is separately dispositioned."
+    },
+    {
+      "id": "6191-paws-monotonic",
+      "section": "1",
+      "quote": "For the purpose of PAWS, the timestamps sent on a connection are required to be monotonically increasing.",
+      "status": "TODO",
+      "reason": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks. Dedicated complete source/test evidence remains missing.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-1"
+    },
+    {
+      "id": "6191-1-context-2",
+      "section": "1",
+      "quote": "While there is no requirement that timestamps are monotonically increasing across TCP connections, the generation of timestamps such that they are monotonically increasing across connections between the same two endpoints allows the use of timestamps for improving the handling of SYN segments that are received while the corresponding four-tuple is in the TIME-WAIT state. That is, the Timestamps option could be used to perform heuristics to determine whether to allow the creation of a new incarnation of a connection that is in the TIME-WAIT state. This use of TCP timestamps is simply an extrapolation of the use of Initial Sequence Numbers (ISNs) for the same purpose, as allowed by RFC 1122 [RFC1122], and it has been incorporated in a number of TCP implementations, such as that included in the Linux kernel [Linux]. The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL\", \"SHALL NOT\", \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in this document are to be interpreted as described in RFC 2119 [RFC2119].",
+      "status": "context",
+      "reason": "Introduction, historical PAWS/reuse motivation and keyword definitions; operative prerequisite is separately dispositioned."
+    },
+    {
+      "id": "6191-2-context-1",
+      "section": "2",
+      "quote": "In a number of scenarios, a socket pair may need to be reused while the corresponding four-tuple is still in the TIME-WAIT state in a remote TCP peer. For example, a client accessing some service on a host may try to create a new incarnation of a previous connection, while the corresponding four-tuple is still in the TIME-WAIT state at the remote TCP peer (the server). This may happen if the ephemeral port numbers are being reused too quickly, either because of a bad policy of selection of ephemeral ports, or simply because of a high connection rate to the corresponding service. In such scenarios, the establishment of new connections that reuse a four-tuple that is in the TIME-WAIT state would fail. This problem is discussed in detail in [INFOCOM-99]. In order to avoid this problem, Section 4.2.2.13 of RFC 1122 [RFC1122] states that when a connection request is received with a four-tuple that is in the TIME-WAIT state, the connection request may be accepted if the sequence number of the incoming SYN segment is greater than the last sequence number seen on the previous incarnation of the connection (for that direction of the data transfer). The goal of this requirement is to prevent the overlap of the sequence number spaces of the old and new incarnations of the connection so that segments from the old incarnation are not accepted as valid by the new incarnation. The same policy may be extrapolated to TCP timestamps. That is, when a connection request is received with a four-tuple that is in the TIME-WAIT state, the connection request could be accepted if the timestamp of the incoming SYN segment is greater than the last timestamp seen on the previous incarnation of the connection (for that direction of the data transfer).",
+      "status": "context",
+      "reason": "Algorithm introduction, governing SHOULD and old-incarnation branch conditions apply to the separately dispositioned branch rows; remaining text explains historical policies and timestamp benefits."
+    },
+    {
+      "id": "6191-processing-boundary",
+      "section": "2",
+      "quote": "The following paragraphs summarize the processing of SYN segments received for connections in the TIME-WAIT state. The processing of SYN segments received for connections in all other states is unchanged. Both the ISN (Initial Sequence Number) and the Timestamps option (if present) of the incoming SYN segment are included in the heuristics performed for allowing a high connection-establishment rate.",
+      "status": "TODO",
+      "reason": "TIME-WAIT reuse is gated in Endpoint input and reuse_syn, but no complete source/test annotation pair establishes the entire unchanged-processing obligation for SYNs in every other TCP state.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2"
+    },
+    {
+      "id": "6191-2-context-2",
+      "section": "2",
+      "quote": "Processing of SYN segments received for connections in the TIME-WAIT state SHOULD occur as follows: o If the previous incarnation of the connection used Timestamps, then:",
+      "status": "context",
+      "reason": "Algorithm introduction, governing SHOULD and old-incarnation branch conditions apply to the separately dispositioned branch rows; remaining text explains historical policies and timestamp benefits."
+    },
+    {
+      "id": "6191-old-ts-newer-ts",
+      "section": "2",
+      "quote": "* If TCP Timestamps would be enabled for the new incarnation of the connection, and the timestamp contained in the incoming SYN segment is greater than the last timestamp seen on the previous incarnation of the connection (for that direction of the data transfer), honor the connection request (creating a connection in the SYN-RECEIVED state).",
+      "status": "TODO",
+      "reason": "Endpoint input only calls reopen_time_wait for SYNs without payload. A data-bearing SYN with bilateral newer timestamps receives a challenge ACK from the old TIME-WAIT connection instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn reopen_time_wait(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait()"
+      ]
+    },
+    {
+      "id": "6191-old-ts-equal-ts",
+      "section": "2",
+      "quote": "* If TCP Timestamps would be enabled for the new incarnation of the connection, the timestamp contained in the incoming SYN segment is equal to the last timestamp seen on the previous incarnation of the connection (for that direction of the data transfer), and the Sequence Number of the incoming SYN segment is greater than the last sequence number seen on the previous incarnation of the connection (for that direction of the data transfer), honor the connection request (creating a connection in the SYN-RECEIVED state).",
+      "status": "TODO",
+      "reason": "The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy. Data-bearing SYNs also bypass reopen_time_wait and receive a challenge ACK even with a newer sequence; the complete RFC clause remains unresolved.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2"
+    },
+    {
+      "id": "6191-old-ts-no-new-ts",
+      "section": "2",
+      "quote": "* If TCP Timestamps would not be enabled for the new incarnation of the connection, but the Sequence Number of the incoming SYN segment is greater than the last sequence number seen on the previous incarnation of the connection (for the same direction of the data transfer), honor the connection request (creating a connection in the SYN-RECEIVED state).",
+      "status": "TODO",
+      "reason": "The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy. Data-bearing SYNs also bypass reopen_time_wait and receive a challenge ACK even with a newer sequence; the complete RFC clause remains unresolved.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2"
+    },
+    {
+      "id": "6191-otherwise-drop",
+      "section": "2",
+      "quote": "* Otherwise, silently drop the incoming SYN segment, thus leaving the previous incarnation of the connection in the TIME-WAIT state.",
+      "status": "TODO",
+      "reason": "Endpoint input bypasses reopen_time_wait for data-bearing SYNs. Rejected freshness cases receive a challenge ACK instead of a silent drop, while the old TIME-WAIT record survives. Empty-payload silent rejection is tested; the complete clause remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn reopen_time_wait(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait()"
+      ],
+      "occurrences": 2,
+      "branches": [
+        "old-timestamps-otherwise",
+        "no-old-timestamps-otherwise"
+      ]
+    },
+    {
+      "id": "6191-2-context-3",
+      "section": "2",
+      "quote": "o If the previous incarnation of the connection did not use Timestamps, then:",
+      "status": "context",
+      "reason": "Algorithm introduction, governing SHOULD and old-incarnation branch conditions apply to the separately dispositioned branch rows; remaining text explains historical policies and timestamp benefits."
+    },
+    {
+      "id": "6191-no-old-ts-new-ts",
+      "section": "2",
+      "quote": "* If TCP Timestamps would be enabled for the new incarnation of the connection, honor the incoming connection request (creating a connection in the SYN-RECEIVED state).",
+      "status": "TODO",
+      "reason": "Endpoint input only calls reopen_time_wait for SYNs without payload. When the old connection did not use timestamps, a data-bearing SYN with new bilateral timestamps receives a challenge ACK instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn reopen_time_wait(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait()"
+      ]
+    },
+    {
+      "id": "6191-no-old-ts-no-new-ts",
+      "section": "2",
+      "quote": "* If TCP Timestamps would not be enabled for the new incarnation of the connection, but the Sequence Number of the incoming SYN segment is greater than the last sequence number seen on the previous incarnation of the connection (for the same direction of the data transfer), honor the incoming connection request (creating a connection in the SYN-RECEIVED state).",
+      "status": "TODO",
+      "reason": "The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy. Data-bearing SYNs also bypass reopen_time_wait and receive a challenge ACK even with a newer sequence; the complete RFC clause remains unresolved.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2"
+    },
+    {
+      "id": "6191-2-context-4",
+      "section": "2",
+      "quote": "Note:",
+      "status": "context",
+      "reason": "Algorithm introduction, governing SHOULD and old-incarnation branch conditions apply to the separately dispositioned branch rows; remaining text explains historical policies and timestamp benefits."
+    },
+    {
+      "id": "6191-bilateral-definition",
+      "section": "2",
+      "quote": "In the above explanation, the phrase \"TCP Timestamps would be enabled for the new incarnation for the connection\" means that the incoming SYN segment contains a TCP Timestamps option (i.e., the client has enabled TCP Timestamps), and that the SYN/ACK segment that would be sent in response to it would also contain a Timestamps option (i.e., the server has enabled TCP Timestamps). In such a scenario, TCP Timestamps would be enabled for the new incarnation of the connection.",
+      "status": "covered",
+      "reason": "reuse_syn filters incoming timestamps through the local enablement flag. The matrix independently varies old negotiation, client option presence and server enablement, and asserts the new SYN/ACK option as well as admission.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn reuse_syn(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_reuse_all_timestamp_sequence_branches()"
+      ]
+    },
+    {
+      "id": "6191-fin-definition",
+      "section": "2",
+      "quote": "The \"last sequence number seen on the previous incarnation of the connection (for the same direction of the data transfer)\" refers to the last sequence number used by the previous incarnation of the connection (for the same direction of the data transfer), and not to the last value seen in the Sequence Number field of the corresponding segments. That is, it refers to the sequence number corresponding to the FIN flag of the previous incarnation of the connection, for that direction of the data transfer.",
+      "status": "TODO",
+      "reason": "The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy; the complete RFC clause remains unresolved.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn reuse_syn(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_sequence_reuse_rejects_fin_plus_one_boundary()"
+      ]
+    },
+    {
+      "id": "6191-2-context-5",
+      "section": "2",
+      "quote": "Many implementations do not include the TCP Timestamps option when performing the above heuristics, thus imposing stricter constraints on the generation of Initial Sequence Numbers, the average data transfer rate of the connections, and the amount of data transferred with them. RFC 793 [RFC0793] states that the ISN generator should be incremented roughly once every four microseconds (i.e., roughly 250,000 times per second). As a result, any connection that transfers more than 250,000 bytes of data at more than 250 kilobytes/ second could lead to scenarios in which the last sequence number seen on a connection that moves into the TIME-WAIT state is still greater than the sequence number of an incoming SYN segment that aims at creating a new incarnation of the same connection. In those scenarios, the ISN heuristics would fail, and therefore the connection request would usually time out. By including the TCP Timestamps option in the heuristics described above, all these constraints are greatly relaxed. It is clear that the use of TCP timestamps for the heuristics described above benefit from timestamps that are monotonically increasing across connections between the same two TCP endpoints. Note: The upcoming revision of RFC 1323, [1323bis], recommends the selection of timestamps such that they are monotonically increasing across connections. An example of such a timestamp generation scheme can be found in [TS-Generation].",
+      "status": "context",
+      "reason": "Algorithm introduction, governing SHOULD and old-incarnation branch conditions apply to the separately dispositioned branch rows; remaining text explains historical policies and timestamp benefits."
+    },
+    {
+      "id": "6191-3-context-1",
+      "section": "3",
+      "quote": "The algorithm proposed in Section 2 clearly benefits from timestamps that are monotonically increasing across connections to the same endpoint. In particular, generation of timestamps such that they are monotonically increasing is important for TCP instances that perform the active open, as those are the timestamps that will be used for the proposed algorithm. While monotonically increasing timestamps ensure that the proposed algorithm will be able to reduce the TIME-WAIT state of a previous incarnation of a connection, implementation of the algorithm (by itself) does not imply a requirement on the timestamp generation algorithm of other TCP implementations.",
+      "status": "context",
+      "reason": "Timestamp-generation interoperability discussion explicitly imposes no requirement on other stacks; extended SYN-cookie/randomization examples are context. The stale-SYN behavior is separately dispositioned."
+    },
+    {
+      "id": "6191-stale-ts-fallback",
+      "section": "3",
+      "quote": "In the worst-case scenario, an incoming SYN corresponding to a new incarnation of a connection in the TIME-WAIT contains a timestamp that is smaller than the last timestamp seen on the previous incarnation of the connection, the heuristics fail, and the result is no worse than the current state of affairs. That is, the SYN segment is ignored (as specified in [RFC1337]), and thus the connection request times out, or is accepted after future retransmissions of the SYN.",
+      "status": "TODO",
+      "reason": "A stale-timestamp SYN without payload is silently rejected and can be retried with a fresh timestamp. A data-bearing stale SYN bypasses reopen_time_wait and receives a challenge ACK, contrary to the stated ignored-SYN behavior; the complete clause remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-3",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn reopen_time_wait(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait()"
+      ]
+    },
+    {
+      "id": "6191-3-context-2",
+      "section": "3",
+      "quote": "Some stacks may implement timestamp generation algorithms that do not lead to monotonically increasing timestamps across connections with the same remote endpoint. An example of such algorithms is the one described in [RFC4987] and [Opperman], which allows the implementation of extended TCP SYN cookies. Note: It should be noted that the \"extended TCP SYN cookies\" could coexist with an algorithm for generating timestamps such that they are monotonically increasing. Monotonically increasing timestamps could be generated for TCP instances that perform the active open, while timestamps for TCP instances that perform the passive open could be generated according to [Opperman]. Some stacks (notably OpenBSD) implement timestamp randomization algorithms which do not result in monotonically increasing ISNs across connections. As noted in [Silbersack], such randomization schemes may prevent the mechanism proposed in this document from recycling connections that are in the TIME-WAIT state. However, as noted earlier in this section in the worst-case scenario, the heuristics fail, and the result is no worse than the current state of affairs.",
+      "status": "context",
+      "reason": "Timestamp-generation interoperability discussion explicitly imposes no requirement on other stacks; extended SYN-cookie/randomization examples are context. The stale-SYN behavior is separately dispositioned."
+    },
+    {
+      "id": "6191-4-context-1",
+      "section": "4",
+      "quote": "[RFC0793] suggests that the ISNs of TCP connections be generated from a global timer, such that they are monotonically increasing across connections. However, this ISN-generation scheme leads to predictable ISNs, which have well-known security implications [CPNI-TCP]. [RFC1948] proposes an alternative ISN-generation scheme that results in monotonically increasing ISNs across connections that are not easily predictable by an off-path attacker. Some stacks (notably OpenBSD) implement ISN randomization algorithms which do not result in monotonically increasing ISNs across connections. As noted in [Silbersack], such ISN randomization schemes break BSD's improved handling of SYN segments received for connections that are in the TIME-WAIT state.",
+      "status": "context",
+      "reason": "Historical ISN generation/security discussion; the operational independence of newer timestamps is separately dispositioned."
+    },
+    {
+      "id": "6191-isn-independence",
+      "section": "4",
+      "quote": "An implementation of the mechanism proposed in this document would enable recycling of the TIME-WAIT state even in the presence of ISNs that are not monotonically increasing across connections, except when the timestamp contained in the incoming SYN is equal to the last timestamp seen on the connection in the TIME-WAIT state (for that direction of the data transfer).",
+      "status": "TODO",
+      "reason": "Newer timestamps admit older SYN sequences only for SYNs without payload. Data-bearing SYNs bypass reopen_time_wait and receive a challenge ACK instead of recycling TIME-WAIT, including with newer timestamps and older ISNs. The complete clause remains TODO; equal-timestamp FIN+1 admission is separately TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-4",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn reopen_time_wait(",
+        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait()"
+      ]
+    },
+    {
+      "id": "6191-5-context-1",
+      "section": "5",
+      "quote": "[TCP-Security] contains a detailed discussion of the security implications of TCP Timestamps and of different timestamp generation algorithms.",
+      "status": "context",
+      "reason": "Security reference and scope discussion, not an additional transport algorithm."
+    },
+    {
+      "id": "6191-6-context-1",
+      "section": "6",
+      "quote": "This document is based on part of the contents of the technical report \"Security Assessment of the Transmission Control Protocol (TCP)\" [CPNI-TCP] written by Fernando Gont on behalf of the United Kingdom's Centre for the Protection of National Infrastructure (UK CPNI). The author of this document would like to thank (in alphabetical order) Mark Allman, Francis Dupont, Wesley Eddy, Lars Eggert, John Heffner, Alfred Hoenes, Christian Huitema, Eric Rescorla, Joe Touch, and Alexander Zimmermann for providing valuable feedback on an earlier version of this document. Additionally, the author would like to thank David Borman for a fruitful discussion on TCP Timestamps at IETF 73. Finally, the author would like to thank the United Kingdom's Centre for the Protection of National Infrastructure (UK CPNI) for their continued support. Fernando Gont's attendance to IETF meetings was supported by ISOC's \"Fellowship to the IETF\" program.",
+      "status": "context",
+      "reason": "Acknowledgements, not protocol behavior."
+    },
+    {
+      "id": "6191-7.1-context-1",
+      "section": "7.1",
+      "quote": "[RFC0793] Postel, J., \"Transmission Control Protocol\", STD 7, RFC 793, September 1981. [RFC1122] Braden, R., \"Requirements for Internet Hosts - Communication Layers\", STD 3, RFC 1122, October 1989. [RFC1323] Jacobson, V., Braden, B., and D. Borman, \"TCP Extensions for High Performance\", RFC 1323, May 1992. [RFC2119] Bradner, S., \"Key words for use in RFCs to Indicate Requirement Levels\", BCP 14, RFC 2119, March 1997.",
+      "status": "context",
+      "reason": "Bibliographic references, not independent capability requirements."
+    },
+    {
+      "id": "6191-7.2-context-1",
+      "section": "7.2",
+      "quote": "[1323bis] Borman, D., Braden, R., and V. Jacobson, \"TCP Extensions for High Performance\", Work in Progress, March 2009. [CPNI-TCP] CPNI, \"Security Assessment of the Transmission Control Protocol (TCP)\", 2009, <http://www.cpni.gov.uk/Docs/ tn-03-09-security-assessment-TCP.pdf>. [INFOCOM-99] Faber, T., Touch, J., and W. Yue, \"The TIME-WAIT state in TCP and Its Effect on Busy Servers\", Proc. IEEE Infocom, 1999, pp. 1573-1583. [Linux] Linux Kernel Organization, \"The Linux Kernel Archives\", <http://www.kernel.org>. [Opperman] Oppermann, A., \"FYI: Extended TCP syncookies in FreeBSD-current\", post to the tcpm mailing list, September 2006, <http://www.ietf.org/mail-archive/ web/tcpm/current/msg02251.html>. [RFC1337] Braden, B., \"TIME-WAIT Assassination Hazards in TCP\", RFC 1337, May 1992. [RFC1948] Bellovin, S., \"Defending Against Sequence Number Attacks\", RFC 1948, May 1996. [RFC4987] Eddy, W., \"TCP SYN Flooding Attacks and Common Mitigations\", RFC 4987, August 2007. [Silbersack] Silbersack, M., \"Improving TCP/IP security through randomization without sacrificing interoperability\", EuroBSDCon 2005. [TCP-Security] Gont, F., \"Security Assessment of the Transmission Control Protocol (TCP)\", Work in Progress, January 2011. [TS-Generation] Gont, F. and A. Oppermann, \"On the generation of TCP timestamps\", Work in Progress, June 2010.",
+      "status": "context",
+      "reason": "Bibliographic references, not independent capability requirements."
+    },
+    {
+      "id": "6191-A.1-context-1",
+      "section": "A.1",
+      "quote": "This section clarifies how this algorithm would operate in case a computer reboots, keeps the same IP address, loses memory of the previous timestamps, and then tries to reestablish a previous connection.",
+      "status": "context",
+      "reason": "Reboot scenario explanation: lost peer timestamp history can defeat reuse, falling back to ordinary TIME-WAIT. The explicit boot quiet-time obligation is separately TODO."
+    },
+    {
+      "id": "6191-boot-quiet-time",
+      "section": "A.1",
+      "quote": "Firstly, as specified in [RFC0793], hosts must not establish new connections for a period of 2*MSL (Maximum Segment Lifetime) after they boot (this is the \"quiet time\" concept). As a result, in terms of specifications, this scenario should never occur.",
+      "status": "TODO",
+      "reason": "No host-boot quiet-time enforcement or executable embedding evidence establishes the stated 2*MSL prohibition. Endpoint construction accepts an initial clock and can immediately open connections; reboot safety cannot be exempted merely because this is an embeddable stack.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1"
+    },
+    {
+      "id": "6191-A.1-context-2",
+      "section": "A.1",
+      "quote": "If a host does not comply with the \"quiet time concept\", a connection request might be sent to a remote host while there is a previous incarnation of the same connection in the TIME-WAIT state at the remote host. In such a scenario, as a result of having lost memory of previous timestamps, the resulting timestamps might not be monotonically increasing, and hence the proposed algorithm might be unable to recycle the previous incarnation of the connection that is in the TIME-WAIT state. This case corresponds to the current state of affairs without the algorithm proposed in this document.",
+      "status": "context",
+      "reason": "Reboot scenario explanation: lost peer timestamp history can defeat reuse, falling back to ordinary TIME-WAIT. The explicit boot quiet-time obligation is separately TODO."
+    }
+  ]
+}

@@ -159,6 +159,15 @@ format = "ietf"
 source = "https://www.rfc-editor.org/rfc/rfc7413"
 format = "ietf"
 
+# Full operative BCP159/Informational ledgers; manual prose avoids keyword duplication.
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6191"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6429"
+format = "ietf"
+
 [report.html]
 enabled = false
 

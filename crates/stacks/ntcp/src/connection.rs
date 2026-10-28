@@ -1500,6 +1500,24 @@ impl Connection {
         self.state == State::TimeWait && self.time_wait_deadline.is_some_and(|end| now < end)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //# In the above explanation, the phrase "TCP Timestamps would be enabled
+    //# for the new incarnation for the connection" means that the incoming SYN
+    //# segment contains a TCP Timestamps option (i.e., the client has enabled
+    //# TCP Timestamps), and that the SYN/ACK segment that would be sent in
+    //# response to it would also contain a Timestamps option (i.e., the server
+    //# has enabled TCP Timestamps). In such a scenario, TCP Timestamps would be
+    //# enabled for the new incarnation of the connection.
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //= reason=The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy; the complete RFC clause remains unresolved.
+    //# The "last sequence number seen on the previous incarnation of the
+    //# connection (for the same direction of the data transfer)" refers to the
+    //# last sequence number used by the previous incarnation of the connection
+    //# (for the same direction of the data transfer), and not to the last
+    //# value seen in the Sequence Number field of the corresponding segments.
+    //# That is, it refers to the sequence number corresponding to the FIN flag
+    //# of the previous incarnation of the connection, for that direction of
+    //# the data transfer.
     pub(crate) fn reuse_syn(&self, now: Instant, syn: &Segment<'_>, timestamps: bool) -> bool {
         if !self.time_wait_valid(now) {
             return false;
@@ -3723,6 +3741,22 @@ impl Connection {
     //# but SHOULD NOT
     //# time out the connection if data beyond the right window edge is not
     //# acknowledged (SHLD-17).
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-1
+    //# As long as the receiving TCP continues to send acknowledgments in
+    //# response to the probe segments, the sending TCP MUST allow the
+    //# connection to stay open.
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-2
+    //# Per [RFC1122], as long as the ACKs are being received for window probes,
+    //# a connection can continue to stay in the persist condition.
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-2
+    //# Although this may result in a prolonged ZWP state, it would be premature
+    //# for TCP to take action on its own and close the printer connection
+    //# merely due to its lack of progress. Once the printer's paper tray is
+    //# reloaded (which may be minutes, hours, or days later), the print job
+    //# needs to be able to continue uninterrupted over the same TCP connection.
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-4
+    //# As stated in [RFC1122], a TCP implementation MUST NOT close a connection
+    //# merely because it seems to be stuck in the ZWP or persist condition.
     fn user_deadline(&self) -> Option<Instant> {
         if !self.user_timer_needed() {
             return None;
@@ -3777,6 +3811,10 @@ impl Connection {
         Ok(true)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-1
+    //# Therefore, zero window probing needs to be supported to prevent a
+    //# connection from hanging forever if ACK segments that re-open the window
+    //# are lost.
     fn arm_work(&mut self) {
         self.resolve_probe_response();
         let early_response = self.early_response_eligible();
@@ -6697,6 +6735,8 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc6928#section-8
     //= reason=Manual receive_capacity=4000 with local RMSS=1000 advertises four segments on both handshake directions; default capacity advertises >=10. Manual mitigation selected, no low-speed autodetection claim.
     //# The negative impact can be mitigated by hosts directly connected to a low-speed link advertising an initial receive window smaller than 10 segments. This can be achieved either through manual configuration by the users or through the host stack auto-detecting the low- bandwidth links.
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-1
+    //# A TCP MAY keep its offered receive window closed indefinitely.
     fn advertised_window(&self, syn: bool) -> u16 {
         if syn {
             return self.syn_window;

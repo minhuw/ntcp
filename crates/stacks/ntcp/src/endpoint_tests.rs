@@ -2675,12 +2675,24 @@ fn tw_segment(
     flags: u8,
     ts: Option<(u32, u32)>,
 ) -> Vec<u8> {
+    tw_segment_with_payload(ip, old, seq, ack, flags, ts, &[])
+}
+
+fn tw_segment_with_payload(
+    ip: IpMetadata,
+    old: wire::Header,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    ts: Option<(u32, u32)>,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
     if let Some((value, echo)) = ts {
         options[4..8].copy_from_slice(&value.to_be_bytes());
         options[8..].copy_from_slice(&echo.to_be_bytes());
     }
-    let mut bytes = vec![0; 32];
+    let mut bytes = vec![0; 32 + payload.len()];
     let len = wire::encode(
         ip,
         wire::Header {
@@ -2693,7 +2705,7 @@ fn tw_segment(
             urgent_pointer: 0,
         },
         if ts.is_some() { &options } else { &[] },
-        &[],
+        payload,
         &mut bytes,
     )
     .unwrap();
@@ -2823,6 +2835,380 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
             assert_eq!(b.state(old), Ok(State::Closed));
         }
         assert!(b.connect(240_003_000, tuple.local, tuple.remote).is_ok());
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. A data-bearing SYN with bilateral newer timestamps receives a challenge ACK from the old TIME-WAIT connection instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+//# * If TCP Timestamps would be enabled for the new incarnation of the
+//# connection, and the timestamp contained in the incoming SYN segment is
+//# greater than the last timestamp seen on the previous incarnation of the
+//# connection (for that direction of the data transfer), honor the
+//# connection request (creating a connection in the SYN-RECEIVED state).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//= reason=Endpoint input bypasses reopen_time_wait for data-bearing SYNs. Rejected freshness cases receive a challenge ACK instead of a silent drop, while the old TIME-WAIT record survives. Empty-payload silent rejection is tested; the complete clause remains TODO.
+//# * Otherwise, silently drop the incoming SYN segment, thus leaving the
+//# previous incarnation of the connection in the TIME-WAIT state.
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. When the old connection did not use timestamps, a data-bearing SYN with new bilateral timestamps receives a challenge ACK instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+//# * If TCP Timestamps would be enabled for the new incarnation of the
+//# connection, honor the incoming connection request (creating a connection
+//# in the SYN-RECEIVED state).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//# In the above explanation, the phrase "TCP Timestamps would be enabled
+//# for the new incarnation for the connection" means that the incoming SYN
+//# segment contains a TCP Timestamps option (i.e., the client has enabled
+//# TCP Timestamps), and that the SYN/ACK segment that would be sent in
+//# response to it would also contain a Timestamps option (i.e., the server
+//# has enabled TCP Timestamps). In such a scenario, TCP Timestamps would be
+//# enabled for the new incarnation of the connection.
+//= https://www.rfc-editor.org/rfc/rfc6191#section-3
+//= type=test
+//= reason=A stale-timestamp SYN without payload is silently rejected and can be retried with a fresh timestamp. A data-bearing stale SYN bypasses reopen_time_wait and receives a challenge ACK, contrary to the stated ignored-SYN behavior; the complete clause remains TODO.
+//# In the worst-case scenario, an incoming SYN corresponding to a new
+//# incarnation of a connection in the TIME-WAIT contains a timestamp that
+//# is smaller than the last timestamp seen on the previous incarnation of
+//# the connection, the heuristics fail, and the result is no worse than the
+//# current state of affairs. That is, the SYN segment is ignored (as
+//# specified in [RFC1337]), and thus the connection request times out, or
+//# is accepted after future retransmissions of the SYN.
+//= https://www.rfc-editor.org/rfc/rfc6191#section-4
+//= type=test
+//= reason=Newer timestamps admit older SYN sequences only for SYNs without payload. Data-bearing SYNs bypass reopen_time_wait and receive a challenge ACK instead of recycling TIME-WAIT, including with newer timestamps and older ISNs. The complete clause remains TODO; equal-timestamp FIN+1 admission is separately TODO.
+//# An implementation of the mechanism proposed in this document would
+//# enable recycling of the TIME-WAIT state even in the presence of ISNs
+//# that are not monotonically increasing across connections, except when
+//# the timestamp contained in the incoming SYN is equal to the last
+//# timestamp seen on the connection in the TIME-WAIT state (for that
+//# direction of the data transfer).
+#[cfg(feature = "packet-test-controls")]
+#[test]
+fn rfc6191_reuse_all_timestamp_sequence_branches() {
+    for old_timestamps in [false, true] {
+        for server_timestamps in [false, true] {
+            for client_timestamps in [false, true] {
+                for timestamp_delta in [u32::MAX, 0, 1] {
+                    for sequence_delta in [u32::MAX, 0, 1, 100] {
+                        let mut cfg = config();
+                        cfg.connection.timestamps = old_timestamps;
+                        let (mut b, listener, old, ip, h, last_ts) = time_wait_endpoint(cfg);
+                        b.packet_test_timestamp_default(server_timestamps);
+                        let baseline = b.buffer_bytes();
+                        let deadline = b.next_deadline();
+                        // The final ACK acknowledges FIN+1, not the FIN itself.
+                        let sequence = h.acknowledgment.wrapping_add(sequence_delta);
+                        let timestamp = last_ts.wrapping_add(timestamp_delta);
+                        let enabled = server_timestamps && client_timestamps;
+                        let newer_sequence = sequence_delta == 1 || sequence_delta == 100;
+                        let expected = if old_timestamps && enabled {
+                            timestamp_delta == 1 || timestamp_delta == 0 && newer_sequence
+                        } else {
+                            enabled || newer_sequence
+                        };
+                        let syn = tw_segment(
+                            ip,
+                            h,
+                            sequence,
+                            0,
+                            wire::SYN,
+                            client_timestamps.then_some((timestamp, 0)),
+                        );
+                        assert_eq!(
+                            b.input(4_000, ip, &syn).unwrap(),
+                            if expected {
+                                InputDisposition::Processed
+                            } else {
+                                InputDisposition::Dropped
+                            },
+                            "old={old_timestamps} server={server_timestamps} client={client_timestamps} ts_delta={timestamp_delta} seq_delta={sequence_delta}"
+                        );
+                        assert_eq!(b.state(old), Ok(State::TimeWait));
+                        assert_eq!(
+                            b.accept(listener),
+                            Err(EndpointError::Connection(Error::WouldBlock))
+                        );
+                        let current = b
+                            .connection_id(Tuple {
+                                local: addresses().1,
+                                remote: addresses().0,
+                            })
+                            .unwrap();
+                        let output = packets(&mut b, 4_000);
+                        assert_eq!(output.len(), usize::from(expected));
+                        if expected {
+                            assert_ne!(current, old);
+                            assert_eq!(b.state(current), Ok(State::SynReceived));
+                            let synack = wire::parse(output[0].0, &output[0].1).unwrap();
+                            assert_eq!(
+                                synack.header.flags & (wire::SYN | wire::ACK),
+                                wire::SYN | wire::ACK
+                            );
+                            assert_eq!(synack.header.acknowledgment, sequence.wrapping_add(1));
+                            assert_eq!(synack.options.timestamps.is_some(), enabled);
+                            assert!(
+                                crate::seq::Seq(synack.header.sequence)
+                                    .after(crate::seq::Seq(h.sequence))
+                            );
+                        } else {
+                            assert_eq!(current, old);
+                            assert_eq!(b.buffer_bytes(), baseline);
+                            assert_eq!(b.next_deadline(), deadline);
+                            // A later retransmission with a fresh timestamp can reuse
+                            // the same old record after the silent rejection.
+                            if old_timestamps && enabled && timestamp_delta == u32::MAX {
+                                let retry = tw_segment(
+                                    ip,
+                                    h,
+                                    sequence,
+                                    0,
+                                    wire::SYN,
+                                    Some((last_ts.wrapping_add(1), 0)),
+                                );
+                                assert_eq!(
+                                    b.input(5_000, ip, &retry).unwrap(),
+                                    InputDisposition::Processed
+                                );
+                                let child = b
+                                    .connection_id(Tuple {
+                                        local: addresses().1,
+                                        remote: addresses().0,
+                                    })
+                                    .unwrap();
+                                assert_eq!(b.state(child), Ok(State::SynReceived));
+                                assert_eq!(packets(&mut b, 5_000).len(), 1);
+                                assert_eq!(b.state(old), Ok(State::TimeWait));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The RFC6191 annotations on the matrix above also describe these partial
+// assertions: SYN payload bypasses reuse regardless of timestamp freshness.
+#[cfg(feature = "packet-test-controls")]
+#[test]
+fn rfc6191_data_bearing_syn_challenges_without_reusing_time_wait() {
+    for old_timestamps in [false, true] {
+        for server_timestamps in [false, true] {
+            for client_timestamps in [false, true] {
+                for timestamp_delta in [u32::MAX, 0, 1] {
+                    for newer_sequence in [false, true] {
+                        let mut cfg = config();
+                        cfg.connection.timestamps = old_timestamps;
+                        let (mut b, listener, old, ip, h, last_ts) = time_wait_endpoint(cfg);
+                        b.packet_test_timestamp_default(server_timestamps);
+                        let baseline = b.buffer_bytes();
+                        let deadline = b.next_deadline();
+                        let tuple = Tuple {
+                            local: addresses().1,
+                            remote: addresses().0,
+                        };
+                        let sequence = if newer_sequence {
+                            h.acknowledgment.wrapping_add(100)
+                        } else {
+                            h.acknowledgment.wrapping_sub(100)
+                        };
+                        let timestamp = last_ts.wrapping_add(timestamp_delta);
+                        let ts = client_timestamps.then_some((timestamp, 0));
+                        let syn =
+                            tw_segment_with_payload(ip, h, sequence, 0, wire::SYN, ts, b"data");
+                        let segment = wire::parse(ip, &syn).unwrap();
+                        assert_eq!(segment.payload, b"data");
+                        assert_eq!(segment.options.timestamps, ts);
+                        assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
+                        assert_eq!(b.connection_id(tuple), Some(old));
+                        assert_eq!(b.state(old), Ok(State::TimeWait));
+                        assert_eq!(b.readable_bytes(old), Ok(0));
+                        assert_eq!(b.buffer_bytes(), baseline);
+                        assert_eq!(
+                            b.accept(listener),
+                            Err(EndpointError::Connection(Error::WouldBlock))
+                        );
+                        let output = packets(&mut b, 4_000);
+                        assert_eq!(output.len(), 1);
+                        let challenge = wire::parse(output[0].0, &output[0].1).unwrap();
+                        assert_eq!(challenge.header.flags, wire::ACK);
+                        assert_eq!(challenge.header.sequence, h.sequence);
+                        assert_eq!(challenge.header.acknowledgment, h.acknowledgment);
+                        assert!(challenge.payload.is_empty());
+                        assert_eq!(b.next_deadline(), deadline);
+
+                        // Removing only payload reaches the reuse decision. This
+                        // also checks that the challenge did not update the old
+                        // timestamp baseline or prevent a later admissible SYN.
+                        let enabled = server_timestamps && client_timestamps;
+                        let expected = if old_timestamps && enabled {
+                            timestamp_delta == 1 || timestamp_delta == 0 && newer_sequence
+                        } else {
+                            enabled || newer_sequence
+                        };
+                        let retry = tw_segment(ip, h, sequence, 0, wire::SYN, ts);
+                        assert_eq!(
+                            b.input(5_000, ip, &retry).unwrap(),
+                            if expected {
+                                InputDisposition::Processed
+                            } else {
+                                InputDisposition::Dropped
+                            }
+                        );
+                        let current = b.connection_id(tuple).unwrap();
+                        let output = packets(&mut b, 5_000);
+                        assert_eq!(output.len(), usize::from(expected));
+                        assert_eq!(b.state(old), Ok(State::TimeWait));
+                        if expected {
+                            assert_ne!(current, old);
+                            assert_eq!(b.state(current), Ok(State::SynReceived));
+                            let synack = wire::parse(output[0].0, &output[0].1).unwrap();
+                            assert_eq!(
+                                synack.header.flags & (wire::SYN | wire::ACK),
+                                wire::SYN | wire::ACK
+                            );
+                            assert_eq!(synack.header.acknowledgment, sequence.wrapping_add(1));
+                            assert_eq!(synack.options.timestamps.is_some(), enabled);
+                        } else {
+                            assert_eq!(current, old);
+                            assert_eq!(b.buffer_bytes(), baseline);
+                            assert_eq!(b.next_deadline(), deadline);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//= reason=The conservative sequence predicate requires SYN.SEQ strictly after receive.next() (peer FIN+1), rejecting FIN+1 although this clause permits it. The exact FIN/FIN+1/FIN+2 test preserves that policy; the complete RFC clause remains unresolved.
+//# The "last sequence number seen on the previous incarnation of the
+//# connection (for the same direction of the data transfer)" refers to the
+//# last sequence number used by the previous incarnation of the connection
+//# (for the same direction of the data transfer), and not to the last
+//# value seen in the Sequence Number field of the corresponding segments.
+//# That is, it refers to the sequence number corresponding to the FIN flag
+//# of the previous incarnation of the connection, for that direction of
+//# the data transfer.
+#[test]
+fn rfc6191_sequence_reuse_rejects_fin_plus_one_boundary() {
+    for old_timestamps in [false, true] {
+        for incoming_timestamps in [false, true] {
+            for offset_from_fin in [0u32, 1, 2] {
+                let mut cfg = config();
+                cfg.connection.timestamps = old_timestamps;
+                let (mut b, _, old, ip, h, last_ts) = time_wait_endpoint(cfg);
+                let fin = h.acknowledgment.wrapping_sub(1);
+                let syn = tw_segment(
+                    ip,
+                    h,
+                    fin.wrapping_add(offset_from_fin),
+                    0,
+                    wire::SYN,
+                    incoming_timestamps.then_some((last_ts, 0)),
+                );
+                let baseline = b.buffer_bytes();
+                let deadline = b.next_deadline();
+                // All combinations here use the sequence-dependent predicate:
+                // equal timestamps, no new timestamps, or neither incarnation's TS.
+                assert_eq!(
+                    b.input(4_000, ip, &syn).unwrap(),
+                    if offset_from_fin == 2 {
+                        InputDisposition::Processed
+                    } else {
+                        InputDisposition::Dropped
+                    }
+                );
+                assert_eq!(b.state(old), Ok(State::TimeWait));
+                assert_eq!(
+                    packets(&mut b, 4_000).len(),
+                    usize::from(offset_from_fin == 2)
+                );
+                if offset_from_fin < 2 {
+                    assert_eq!(b.buffer_bytes(), baseline);
+                    assert_eq!(b.next_deadline(), deadline);
+                }
+            }
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc6429#section-1
+//= type=test
+//# This guidance is not intended to preclude resource management by the
+//# operating system or application, which may request that connections be
+//# aborted regardless of whether or not they are in the persist condition.
+//# The TCP implementation needs to, of course, comply by aborting such
+//# connections.
+//= https://www.rfc-editor.org/rfc/rfc6429#section-2
+//= type=test
+//# Clearly, a system needs to be robust to such attacks and allow
+//# connections in the persist condition to be aborted in the same way as
+//# any other connection.
+//= https://www.rfc-editor.org/rfc/rfc6429#section-4
+//= type=test
+//# Though unstated in RFC 1122, but implicit for system robustness, a TCP
+//# implementation needs to allow connections in the ZWP or persist
+//# condition to be closed or aborted by their applications or other
+//# resource management routines in the operating system.
+#[test]
+fn rfc6429_explicit_abort_of_responsive_zero_window_connection() {
+    for close_first in [false, true] {
+        let (mut a, mut b, listener, client) = endpoints();
+        pump(&mut a, &mut b, 0);
+        let server = b.accept(listener).unwrap();
+        // Fill the real receiver; then queue data behind its advertised zero window.
+        a.write(client, &[7; 1024]).unwrap();
+        tick(&mut a, &mut b, 200_000);
+        assert_eq!(b.readable_bytes(server), Ok(1024));
+        a.write(client, b"blocked response").unwrap();
+        if close_first {
+            a.shutdown(client).unwrap();
+        }
+        // A graceful close queues FIN behind the blocked bytes; the TCP state
+        // remains ESTABLISHED until FIN can actually be sent.
+        let expected_state = State::Established;
+        for _ in 0..3 {
+            let when = a.next_deadline().unwrap();
+            a.on_timeout(when, 64).unwrap();
+            let probes = packets(&mut a, when);
+            assert_eq!(probes.len(), 1);
+            deliver(&mut b, when, probes);
+            let replies = packets(&mut b, when);
+            assert_eq!(replies.len(), 1);
+            let reply = wire::parse(replies[0].0, &replies[0].1).unwrap();
+            assert_eq!(reply.header.window, 0);
+            assert_eq!(reply.header.flags & wire::ACK, wire::ACK);
+            deliver(&mut a, when, replies);
+            assert_eq!(a.state(client), Ok(expected_state));
+            assert_eq!(a.close_reason(client), Ok(None));
+        }
+        let when = a.next_deadline().unwrap();
+        a.abort(client).unwrap();
+        assert_eq!(a.state(client), Ok(State::Closed));
+        assert_eq!(a.close_reason(client), Ok(Some(CloseReason::Aborted)));
+        assert!(core::iter::from_fn(|| a.next_event()).any(|event| {
+            matches!(event, Event::Connection(id, events)
+                if id == client && events.closed == Some(CloseReason::Aborted))
+        }));
+        assert_eq!(
+            a.write(client, b"late"),
+            Err(EndpointError::Connection(Error::InvalidState))
+        );
+        let reset = packets(&mut a, when);
+        assert_eq!(reset.len(), 1);
+        let segment = wire::parse(reset[0].0, &reset[0].1).unwrap();
+        assert_eq!(segment.header.flags & wire::RST, wire::RST);
+        assert!(segment.payload.is_empty());
+        deliver(&mut b, when, reset);
+        assert_eq!(b.state(server), Ok(State::Closed));
+        assert_eq!(b.close_reason(server), Ok(Some(CloseReason::Reset)));
+        assert!(packets(&mut a, when).is_empty());
     }
 }
 

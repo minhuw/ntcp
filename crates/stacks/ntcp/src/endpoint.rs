@@ -2410,6 +2410,9 @@ impl Endpoint {
             if slot.connection.reset_pending() || slot.reset_deadline.is_some() {
                 return Ok(InputDisposition::Dropped);
             }
+            // RFC6191 inventory gap: payload-bearing SYNs retain the old
+            // TIME-WAIT owner and take its challenge-ACK path, bypassing both
+            // freshness admission and the reuse path's silent rejection.
             if self.config.reuse_time_wait
                 && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
                 && segment.header.flags & !(wire::ECE | wire::CWR) == SYN
@@ -2506,6 +2509,39 @@ impl Endpoint {
     //# Current Practice that SHOULD be implemented since Timestamp Options
     //# are commonly used, and using them to reduce TIME-WAIT provides
     //# benefits for busy Internet servers (SHLD-4).
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. A data-bearing SYN with bilateral newer timestamps receives a challenge ACK from the old TIME-WAIT connection instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+    //# * If TCP Timestamps would be enabled for the new incarnation of the
+    //# connection, and the timestamp contained in the incoming SYN segment is
+    //# greater than the last timestamp seen on the previous incarnation of the
+    //# connection (for that direction of the data transfer), honor the
+    //# connection request (creating a connection in the SYN-RECEIVED state).
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //= reason=Endpoint input bypasses reopen_time_wait for data-bearing SYNs. Rejected freshness cases receive a challenge ACK instead of a silent drop, while the old TIME-WAIT record survives. Empty-payload silent rejection is tested; the complete clause remains TODO.
+    //# * Otherwise, silently drop the incoming SYN segment, thus leaving the
+    //# previous incarnation of the connection in the TIME-WAIT state.
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //= reason=Endpoint input only calls reopen_time_wait for SYNs without payload. When the old connection did not use timestamps, a data-bearing SYN with new bilateral timestamps receives a challenge ACK instead of entering SYN-RECEIVED. Empty-payload admission is tested; the complete clause remains TODO.
+    //# * If TCP Timestamps would be enabled for the new incarnation of the
+    //# connection, honor the incoming connection request (creating a connection
+    //# in the SYN-RECEIVED state).
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-3
+    //= reason=A stale-timestamp SYN without payload is silently rejected and can be retried with a fresh timestamp. A data-bearing stale SYN bypasses reopen_time_wait and receives a challenge ACK, contrary to the stated ignored-SYN behavior; the complete clause remains TODO.
+    //# In the worst-case scenario, an incoming SYN corresponding to a new
+    //# incarnation of a connection in the TIME-WAIT contains a timestamp that
+    //# is smaller than the last timestamp seen on the previous incarnation of
+    //# the connection, the heuristics fail, and the result is no worse than the
+    //# current state of affairs. That is, the SYN segment is ignored (as
+    //# specified in [RFC1337]), and thus the connection request times out, or
+    //# is accepted after future retransmissions of the SYN.
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-4
+    //= reason=Newer timestamps admit older SYN sequences only for SYNs without payload. Data-bearing SYNs bypass reopen_time_wait and receive a challenge ACK instead of recycling TIME-WAIT, including with newer timestamps and older ISNs. The complete clause remains TODO; equal-timestamp FIN+1 admission is separately TODO.
+    //# An implementation of the mechanism proposed in this document would
+    //# enable recycling of the TIME-WAIT state even in the presence of ISNs
+    //# that are not monotonically increasing across connections, except when
+    //# the timestamp contained in the incoming SYN is equal to the last
+    //# timestamp seen on the connection in the TIME-WAIT state (for that
+    //# direction of the data transfer).
     fn reopen_time_wait(
         &mut self,
         index: usize,
@@ -2980,6 +3016,21 @@ impl Endpoint {
         self.refresh(id.slot);
         Ok(())
     }
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-1
+    //# This guidance is not intended to preclude resource management by the
+    //# operating system or application, which may request that connections be
+    //# aborted regardless of whether or not they are in the persist condition.
+    //# The TCP implementation needs to, of course, comply by aborting such
+    //# connections.
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-2
+    //# Clearly, a system needs to be robust to such attacks and allow
+    //# connections in the persist condition to be aborted in the same way as
+    //# any other connection.
+    //= https://www.rfc-editor.org/rfc/rfc6429#section-4
+    //# Though unstated in RFC 1122, but implicit for system robustness, a TCP
+    //# implementation needs to allow connections in the ZWP or persist
+    //# condition to be closed or aborted by their applications or other
+    //# resource management routines in the operating system.
     pub fn abort(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
         self.reject_if_output_reserved(id)?;
         self.slot_mut(id)?.connection.abort();

@@ -1,0 +1,87 @@
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-1"
+quote = """
+A TCP MAY keep its offered receive window closed indefinitely.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-1"
+quote = """
+As long as the receiving TCP continues to send acknowledgments in
+response to the probe segments, the sending TCP MUST allow the
+connection to stay open.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-1"
+quote = """
+Therefore, zero window probing needs to be supported to prevent a
+connection from hanging forever if ACK segments that re-open the window
+are lost.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-1"
+quote = """
+This guidance is not intended to preclude resource management by the
+operating system or application, which may request that connections be
+aborted regardless of whether or not they are in the persist condition.
+The TCP implementation needs to, of course, comply by aborting such
+connections.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-2"
+quote = """
+Per [RFC1122], as long as the ACKs are being received for window probes,
+a connection can continue to stay in the persist condition.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-2"
+quote = """
+Although this may result in a prolonged ZWP state, it would be premature
+for TCP to take action on its own and close the printer connection
+merely due to its lack of progress. Once the printer's paper tray is
+reloaded (which may be minutes, hours, or days later), the print job
+needs to be able to continue uninterrupted over the same TCP connection.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-2"
+quote = """
+In such cases, the application or operating system would need to take
+appropriate action on the TCP connection to reclaim their resources and
+continue to maintain legitimate connections.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-2"
+quote = """
+Clearly, a system needs to be robust to such attacks and allow
+connections in the persist condition to be aborted in the same way as
+any other connection.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-3"
+quote = """
+A clever application needs to detect such attacks with connections that
+are not making progress, and could close these connections.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-4"
+quote = """
+As stated in [RFC1122], a TCP implementation MUST NOT close a connection
+merely because it seems to be stuck in the ZWP or persist condition.
+"""
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6429#section-4"
+quote = """
+Though unstated in RFC 1122, but implicit for system robustness, a TCP
+implementation needs to allow connections in the ZWP or persist
+condition to be closed or aborted by their applications or other
+resource management routines in the operating system.
+"""
