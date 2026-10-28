@@ -60,7 +60,8 @@ pub use endpoint::{
     Event, InputDisposition, ListenerId, PollTransmit, Transmit,
 };
 pub use ipv4_options::{
-    Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
+    Ipv4Options, Ipv4OptionsError, Ipv4Timestamp, OutgoingIpv4Options, SourceRoute,
+    TimestampRequest,
 };
 pub use recovery::{CongestionAlgorithm, InitialWindow, RecoveryAlgorithm};
 pub use wire::{IpMetadata, WireError};

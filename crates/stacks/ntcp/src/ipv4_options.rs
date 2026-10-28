@@ -5,8 +5,43 @@ pub enum Ipv4OptionsError {
     Malformed,
     Capacity,
     InvalidAddress,
+    InvalidTimestamp,
     SourceRouteDisabled,
     IncompleteRoute,
+}
+
+/// IPv4 option time, independent of TCP TSval and the transport timebase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv4Timestamp(u32);
+impl Ipv4Timestamp {
+    /// The caller supplies UTC milliseconds since midnight, from a clock updated
+    /// at least 15 times/second and accurate within a few minutes (RFC 1122).
+    /// This checks the day range, not the physical clock's accuracy or cadence.
+    pub fn utc_milliseconds(value: u32) -> Result<Self, Ipv4OptionsError> {
+        if value < 86_400_000 {
+            Ok(Self(value))
+        } else {
+            Err(Ipv4OptionsError::InvalidTimestamp)
+        }
+    }
+
+    /// Mark an arbitrary clock value as nonstandard; preserves all lower bits.
+    pub const fn nonstandard(value: u32) -> Self {
+        Self(value | 0x8000_0000)
+    }
+
+    /// Validate a legacy wire value: unmarked values assert the UTC contract.
+    pub fn from_wire(value: u32) -> Result<Self, Ipv4OptionsError> {
+        if value & 0x8000_0000 != 0 {
+            Ok(Self(value))
+        } else {
+            Self::utc_milliseconds(value)
+        }
+    }
+
+    pub const fn wire_value(self) -> u32 {
+        self.0
+    }
 }
 
 fn unicast(ip: Ipv4Addr) -> bool {
@@ -73,6 +108,27 @@ impl Ipv4Options {
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Preserve opaque TLVs for adapters whose optional known-option processing
+    /// is disabled. Parsing has already enforced all structural/security checks.
+    pub fn unrecognized(&self) -> Self {
+        let mut result = Self::default();
+        let mut offset = 0;
+        while offset < usize::from(self.len) {
+            let len = usize::from(self.bytes[offset + 1]);
+            if !matches!(self.bytes[offset], 7 | 68 | 131 | 137) {
+                let start = usize::from(result.len);
+                result.bytes[start..start + len].copy_from_slice(&self.bytes[offset..offset + len]);
+                result.len += len as u8;
+            }
+            offset += len;
+        }
+        result
+    }
+
+    pub(crate) fn has_known_options(&self) -> bool {
+        self.unrecognized().len != self.len
     }
 
     //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
@@ -189,10 +245,10 @@ impl Ipv4Options {
                 if index == 0 && option[3..].chunks_exact(4).any(|b| !unicast(address(b))) {
                     return Err(InvalidAddress);
                 }
-                let start = usize::from(result.len);
-                result.bytes[start..start + len].copy_from_slice(option);
-                result.len += len as u8;
             }
+            let start = usize::from(result.len);
+            result.bytes[start..start + len].copy_from_slice(option);
+            result.len += len as u8;
             offset += len;
         }
         Ok(result)
@@ -248,6 +304,19 @@ impl Ipv4Options {
     //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
     //# Implementation of originating and processing the Timestamp option is
     //# OPTIONAL. If it is implemented, the following rules apply:
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //# The Timestamp is a right-justified, 32-bit timestamp in milliseconds
+    //# since midnight UT. If the time is not available in milliseconds or
+    //# cannot be provided with respect to midnight UT then any time may be
+    //# inserted as a timestamp provided the high order bit of the timestamp
+    //# field is set to one to indicate the use of a non-standard value.
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the example explicitly marks its elapsed clock nonstandard. Arbitrary callers' standard clocks still need evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8; numeric validation cannot establish those physical-clock properties.
+    //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
+    //# the ICMP Timestamp message.
+    // The u32 is an IPv4Timestamp wire value. Validate only a local slot write;
+    // remote records and irrelevant values on no-write paths remain opaque.
     pub fn record(mut self, local: Ipv4Addr, timestamp: u32) -> Result<Self, Ipv4OptionsError> {
         use Ipv4OptionsError::*;
         if !unicast(local) {
@@ -257,13 +326,16 @@ impl Ipv4Options {
         while offset < usize::from(self.len) {
             let len = usize::from(self.bytes[offset + 1]);
             let o = &mut self.bytes[offset..offset + len];
-            let p = usize::from(o[2]) - 1;
             match o[0] {
-                7 if p < len => {
-                    o[p..p + 4].copy_from_slice(&local.octets());
-                    o[2] += 4;
+                7 => {
+                    let p = usize::from(o[2]) - 1;
+                    if p < len {
+                        o[p..p + 4].copy_from_slice(&local.octets());
+                        o[2] += 4;
+                    }
                 }
                 68 => {
+                    let p = usize::from(o[2]) - 1;
                     let flag = o[3] & 15;
                     if p >= len {
                         if o[3] >> 4 == 15 {
@@ -271,6 +343,7 @@ impl Ipv4Options {
                         }
                         o[3] += 16;
                     } else if flag != 3 || address(&o[p..p + 4]) == local {
+                        let timestamp = Ipv4Timestamp::from_wire(timestamp)?.wire_value();
                         let time = if flag == 0 { p } else { p + 4 };
                         if flag == 1 {
                             o[p..p + 4].copy_from_slice(&local.octets());
@@ -392,6 +465,160 @@ mod tests {
     use super::*;
     fn ip(n: u8) -> Ipv4Addr {
         Ipv4Addr::new(192, 0, 2, n)
+    }
+
+    #[test]
+    fn opaque_tlvs_survive_all_scanners_and_mixed_recording() {
+        for len in 2..=40 {
+            let mut bytes = [0xff; 40];
+            bytes[..2].copy_from_slice(&[158, len as u8]);
+            let parsed = Ipv4Options::parse(&bytes[..len], false).unwrap();
+            assert_eq!(parsed.as_bytes(), &bytes[..len]);
+            assert_eq!(parsed.unrecognized(), parsed);
+            assert_eq!(parsed.record(ip(2), u32::MAX).unwrap(), parsed);
+            assert_eq!(parsed.return_route(ip(1)), None);
+            for cut in 1..len {
+                assert!(Ipv4Options::parse(&bytes[..cut], false).is_err());
+            }
+        }
+        // Repeated unknown kinds, short TLVs and misleading pointer/flag data.
+        let raw = [1, 30, 2, 30, 3, 0, 158, 4, 255, 255, 1, 0, 68];
+        let parsed = Ipv4Options::parse(&raw, false).unwrap();
+        assert_eq!(parsed.as_bytes(), &raw[1..10]);
+        assert_eq!(parsed.record(ip(2), u32::MAX).unwrap(), parsed);
+        assert_eq!(parsed.return_route(ip(1)), None);
+        for len in [0, 1, 41, 255] {
+            assert!(Ipv4Options::parse(&[30, len], false).is_err());
+        }
+        let mixed = [30, 2, 7, 7, 4, 0, 0, 0, 0, 158, 3, 0];
+        let parsed = Ipv4Options::parse(&mixed, false).unwrap();
+        let recorded = parsed.record(ip(2), u32::MAX).unwrap();
+        assert_eq!(
+            recorded.as_bytes(),
+            &[30, 2, 7, 7, 8, 192, 0, 2, 2, 158, 3, 0]
+        );
+        assert_eq!(recorded.unrecognized().as_bytes(), &[30, 2, 158, 3, 0]);
+        for kind in [131, 137] {
+            let raw = [30, 2, kind, 7, 8, 192, 0, 2, 9, 158, 3, 255];
+            assert_eq!(
+                Ipv4Options::parse(&raw, false),
+                Err(Ipv4OptionsError::SourceRouteDisabled)
+            );
+            let parsed = Ipv4Options::parse(&raw, true).unwrap();
+            assert_eq!(parsed.record(ip(2), u32::MAX).unwrap(), parsed);
+            let route = parsed.return_route(ip(1)).unwrap();
+            assert_eq!(route.hops(), &[ip(9)]);
+            assert_eq!(route.strict, kind == 137);
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= type=test
+    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the example explicitly marks its elapsed clock nonstandard. Arbitrary callers' standard clocks still need evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8; numeric validation cannot establish those physical-clock properties.
+    //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
+    //# the ICMP Timestamp message.
+    #[test]
+    fn timestamp_value_contract_only_applies_to_local_writes() {
+        for value in [0, 1, 86_399_999] {
+            assert_eq!(
+                Ipv4Timestamp::utc_milliseconds(value).unwrap().wire_value(),
+                value
+            );
+            assert_eq!(Ipv4Timestamp::from_wire(value).unwrap().wire_value(), value);
+        }
+        for value in [86_400_000, 0x7fff_ffff, u32::MAX] {
+            assert_eq!(
+                Ipv4Timestamp::utc_milliseconds(value),
+                Err(Ipv4OptionsError::InvalidTimestamp)
+            );
+        }
+        for value in [0, 1, 86_400_000, 0x7fff_ffff, u32::MAX] {
+            let wire = Ipv4Timestamp::nonstandard(value).wire_value();
+            assert_eq!(wire, value | 0x8000_0000);
+            assert_eq!(Ipv4Timestamp::from_wire(wire).unwrap().wire_value(), wire);
+        }
+        let invalid = 86_400_000;
+        assert_eq!(
+            Ipv4Options::default().record(ip(1), invalid).unwrap(),
+            Ipv4Options::default()
+        );
+        for flag in [0, 1, 3] {
+            let mut bytes = [0; 12];
+            let len = if flag == 0 { 8 } else { 12 };
+            bytes[..4].copy_from_slice(&[68, len, 5, flag]);
+            if flag == 3 {
+                bytes[4..8].copy_from_slice(&ip(1).octets());
+                let parsed = Ipv4Options::parse(&bytes, false).unwrap();
+                assert_eq!(parsed.record(ip(2), invalid).unwrap(), parsed);
+            }
+            let parsed = Ipv4Options::parse(&bytes[..usize::from(len)], false).unwrap();
+            assert_eq!(
+                parsed.record(ip(1), invalid),
+                Err(Ipv4OptionsError::InvalidTimestamp)
+            );
+            let recorded = parsed.record(ip(1), 86_399_999).unwrap();
+            assert_eq!(recorded.as_bytes()[2], len + 1);
+            assert_eq!(
+                &recorded.as_bytes()[usize::from(len) - 4..],
+                &86_399_999u32.to_be_bytes()
+            );
+            let full = recorded.record(ip(1), invalid).unwrap();
+            assert_eq!(full.as_bytes()[3], flag | 0x10);
+            assert_eq!(full.as_bytes().len(), usize::from(len));
+            bytes[2] = 255;
+            bytes[3] |= 0xf0;
+            let overflowed = Ipv4Options::parse(&bytes[..usize::from(len)], false).unwrap();
+            assert_eq!(
+                overflowed.record(ip(1), invalid),
+                Err(Ipv4OptionsError::Malformed)
+            );
+        }
+        // A remote record is opaque even when its numeric value is nonconforming.
+        let remote = [68, 12, 9, 0, 0x7f, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+        let recorded = Ipv4Options::parse(&remote, false)
+            .unwrap()
+            .record(ip(1), 123)
+            .unwrap();
+        assert_eq!(&recorded.as_bytes()[4..8], &remote[4..8]);
+        assert_eq!(&recorded.as_bytes()[8..12], &123u32.to_be_bytes());
+        for flag in [
+            TimestampRequest::Times(2),
+            TimestampRequest::AddressTimes(2),
+            TimestampRequest::Prespecified {
+                addresses: [ip(1); 4],
+                len: 2,
+            },
+        ] {
+            let request = OutgoingIpv4Options {
+                timestamp: Some(flag),
+                ..Default::default()
+            };
+            let mut out = [0xa5; 40];
+            assert_eq!(
+                request.encode(ip(1), ip(2), invalid, &mut out),
+                Err(Ipv4OptionsError::InvalidTimestamp)
+            );
+            assert_eq!(out, [0xa5; 40]);
+            request
+                .encode(
+                    ip(1),
+                    ip(2),
+                    Ipv4Timestamp::nonstandard(invalid).wire_value(),
+                    &mut out,
+                )
+                .unwrap();
+        }
+        let unmatched = OutgoingIpv4Options {
+            timestamp: Some(TimestampRequest::Prespecified {
+                addresses: [ip(2); 4],
+                len: 1,
+            }),
+            ..Default::default()
+        };
+        let mut out = [0; 40];
+        unmatched.encode(ip(1), ip(2), invalid, &mut out).unwrap();
+        assert_eq!(&out[..4], &[68, 12, 5, 3]);
+        assert_eq!(&out[8..12], &[0; 4]);
     }
 
     //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
@@ -779,10 +1006,11 @@ mod tests {
             assert!(Ipv4Options::parse(bytes, true).is_err(), "{bytes:?}");
         }
         assert!(Ipv4Options::parse(&[1; 41], true).is_err());
-        assert!(
+        assert_eq!(
             Ipv4Options::parse(&[30, 4, 99, 99, 1, 0, 255], true)
                 .unwrap()
-                .is_empty()
+                .as_bytes(),
+            &[30, 4, 99, 99]
         );
         let valid = [131, 11, 12, 192, 0, 2, 3, 192, 0, 2, 4];
         for n in 1..valid.len() {

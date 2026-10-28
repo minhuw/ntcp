@@ -2402,7 +2402,7 @@ impl Endpoint {
         let timestamps = metadata.timestamps;
         timestamps.validate(self.config.connection.timebase)?;
         if !options.is_empty()
-            && (!self.config.ipv4_options_enabled
+            && ((!self.config.ipv4_options_enabled && options.has_known_options())
                 || !ip.source.is_ipv4()
                 || !ip.destination.is_ipv4())
         {

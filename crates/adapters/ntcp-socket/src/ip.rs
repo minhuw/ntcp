@@ -62,6 +62,7 @@ pub(crate) struct Packet<'a> {
     pub ip: ntcp::IpMetadata,
     pub traffic_class: u8,
     pub protocol: u8,
+    pub ipv4_options: ntcp::Ipv4Options,
     pub payload: &'a [u8],
 }
 pub(crate) fn parse(bytes: &[u8]) -> Result<Packet<'_>, ntcp_ip_common::Error> {
@@ -72,6 +73,9 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Packet<'_>, ntcp_ip_common::Error> {
                 ip: p.ip,
                 traffic_class: p.traffic_class,
                 protocol: p.protocol,
+                // Native RR/TS processing remains disabled; opaque TLVs still
+                // reach TCP. Source routes are rejected by the codec above.
+                ipv4_options: p.ipv4_options.unrecognized(),
                 payload: p.payload,
             })
         }
@@ -81,6 +85,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Packet<'_>, ntcp_ip_common::Error> {
                 ip: p.ip,
                 traffic_class: p.traffic_class,
                 protocol: p.protocol,
+                ipv4_options: ntcp::Ipv4Options::default(),
                 payload: p.payload,
             })
         }

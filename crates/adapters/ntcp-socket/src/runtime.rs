@@ -1191,13 +1191,22 @@ impl Owner {
         bytes: &[u8],
         stamps: ntcp::RxPacketTimestamps,
     ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
-        self.input_segmented(now, ip, traffic_class, bytes, stamps, None)
+        self.input_segmented(
+            now,
+            ip,
+            traffic_class,
+            ntcp::Ipv4Options::default(),
+            bytes,
+            stamps,
+            None,
+        )
     }
     fn input_segmented(
         &mut self,
         now: u64,
         ip: ntcp::IpMetadata,
         traffic_class: u8,
+        options: ntcp::Ipv4Options,
         bytes: &[u8],
         stamps: ntcp::RxPacketTimestamps,
         segment_size: Option<core::num::NonZeroU16>,
@@ -1253,7 +1262,7 @@ impl Owner {
             now,
             ip,
             traffic_class,
-            ntcp::Ipv4Options::default(),
+            options,
             bytes,
             ntcp::RxPacketMetadata {
                 timestamps: stamps,

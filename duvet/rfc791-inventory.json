@@ -205,8 +205,12 @@
       "id": "791-timestamp-timebase",
       "section": "3.1",
       "quote": "The Timestamp is a right-justified, 32-bit timestamp in milliseconds since midnight UT. If the time is not available in milliseconds or cannot be provided with respect to midnight UT then any time may be inserted as a timestamp provided the high order bit of the timestamp field is set to one to indicate the use of a non-standard value.",
-      "status": "TODO",
-      "reason": "Timestamp helpers copy a caller-provided u32; they neither establish milliseconds since midnight UT nor enforce the high bit for a nonstandard timebase.",
+      "status": "covered",
+      "reason": "Local timestamp writes validate UTC milliseconds within a day or a marked nonstandard wire value; the supplied example uses explicitly marked elapsed milliseconds at receive and transmit. UTC callers must supply the documented clock contract; arbitrary physical-clock accuracy is not established here.",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn record(",
+        "crates/stacks/ntcp/examples/tun_echo.rs::fn option_frames_record_once_before_real_tcp_handoff()"
+      ],
       "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
     },
     {

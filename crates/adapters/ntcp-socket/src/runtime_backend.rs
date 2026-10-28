@@ -373,6 +373,7 @@ impl Owner {
                 self.now(),
                 p.ip,
                 p.traffic_class,
+                p.ipv4_options,
                 p.payload,
                 stamps,
                 segment_size,

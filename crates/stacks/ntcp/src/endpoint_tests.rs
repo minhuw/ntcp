@@ -2468,6 +2468,79 @@ fn ipv4_active_route_precedence_and_unoverridden_active_learning() {
 }
 
 #[test]
+fn ipv4_opaque_metadata_default_admission_and_failed_input_safety() {
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    let options = Ipv4Options::parse(&[30, 2, 158, 3, 0], false).unwrap();
+    let (syn, bytes) = option_packet(&mut a, 0);
+    let buffers = b.buffer_bytes();
+    for metadata in [
+        completed_route(&[7]),
+        Ipv4Options::parse(&[7, 3, 4], false).unwrap(),
+    ] {
+        assert_eq!(
+            b.input_with_ipv4_options(0, syn.ip, 0, metadata, &bytes)
+                .unwrap(),
+            InputDisposition::Dropped
+        );
+        assert_eq!(b.buffer_bytes(), buffers);
+    }
+    let v6 = IpMetadata {
+        source: "2001:db8::1".parse().unwrap(),
+        destination: "2001:db8::2".parse().unwrap(),
+    };
+    assert_eq!(
+        b.input_with_ipv4_options(0, v6, 0, options, &bytes)
+            .unwrap(),
+        InputDisposition::Dropped
+    );
+    assert_eq!(b.buffer_bytes(), buffers);
+    b.input_with_ipv4_options(0, syn.ip, 0, options, &bytes)
+        .unwrap();
+    let (synack, bytes) = option_packet(&mut b, 0);
+    assert_eq!(synack.ipv4_options, OutgoingIpv4Options::default());
+    a.input(0, synack.ip, &bytes).unwrap();
+    let (ack, bytes) = option_packet(&mut a, 0);
+    b.input_with_ipv4_options(0, ack.ip, 0, options, &bytes)
+        .unwrap();
+    let server = b.accept(listener).unwrap();
+    assert_eq!(b.received_ipv4_options(server).unwrap(), Some(options));
+    let mut corrupt = bytes.clone();
+    corrupt[16] ^= 1;
+    let changed = Ipv4Options::parse(&[158, 2], false).unwrap();
+    b.input_with_ipv4_options(0, ack.ip, 0, changed, &corrupt)
+        .unwrap();
+    assert_eq!(b.received_ipv4_options(server).unwrap(), Some(options));
+    a.write(client, b"opaque metadata").unwrap();
+    let (data, bytes) = option_packet(&mut a, 0);
+    b.input_with_ipv4_options(0, data.ip, 0, changed, &bytes)
+        .unwrap();
+    assert_eq!(b.received_ipv4_options(server).unwrap(), Some(changed));
+    let mut out = [0; 32];
+    let n = b.read(server, &mut out).unwrap();
+    assert_eq!(&out[..n], b"opaque metadata");
+    b.enable_output_reservations().unwrap();
+    b.write(server, b"reply").unwrap();
+    let mut output = [0; 1500];
+    let (reserved, token) = b.poll_reserved_transmit(0, &mut output, 32).unwrap();
+    assert_eq!(
+        reserved.packet.unwrap().ipv4_options,
+        OutgoingIpv4Options::default()
+    );
+    let allocation = b.buffer_bytes();
+    assert_eq!(
+        b.input_with_ipv4_options(0, data.ip, 0, options, &bytes),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(b.received_ipv4_options(server).unwrap(), Some(changed));
+    assert_eq!(b.buffer_bytes(), allocation);
+    b.accept_transmit(0, token.unwrap()).unwrap();
+}
+
+#[test]
 fn ipv4_options_security_profile_validation_and_control_route() {
     use core::net::Ipv4Addr;
     let (local, remote) = addresses();

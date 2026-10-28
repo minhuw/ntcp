@@ -34,6 +34,12 @@ const IP_HEADER: usize = IPV4_HEADER;
 //# All devices that examine IPv4 headers MUST ignore the IPv4 ID field of
 //# atomic datagrams.
 // Selected endpoint codec only: options are exposed in Packet; no ID is exposed.
+//= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+//= reason=Opaque TLVs now survive bounded parsing and real TCP handoff in core, codec, example and native input. Native and disabled example profiles still discard known RR/Timestamp metadata, and the ICMP feedback decoder does not expose option metadata to its consumer; complete all-option TCP/ICMP handoff needs those capability/interface contracts.
+//# All IP options (except NOP or END-OF-LIST) received in datagrams MUST be
+//# passed to the transport layer (or to ICMP processing when the datagram is
+//# an ICMP message). The IP and transport layer MUST each interpret those IP
+//# options that they understand and silently ignore the others.
 pub fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Packet<'_>, Error> {
     let (header, total) = ipv4_bounds(bytes)?;
     if total != bytes.len() {

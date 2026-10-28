@@ -763,6 +763,89 @@ fn pmtud_owner(
     (owner, state)
 }
 
+#[test]
+fn native_ingress_preserves_opaque_options_with_known_processing_disabled() {
+    fn add_options(mut packet: Vec<u8>, options: &[u8]) -> Vec<u8> {
+        assert!(options.len().is_multiple_of(4));
+        packet.splice(20..20, options.iter().copied());
+        packet[0] = 0x45 + (options.len() / 4) as u8;
+        let len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&len.to_be_bytes());
+        packet[10..12].fill(0);
+        let sum = ntcp_ip::checksum(&packet[..20 + options.len()]);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        packet
+    }
+    for known in [false, true] {
+        let (mut a, a_io) = pmtud_owner(2, 1500, None, None);
+        let (mut b, b_io) = pmtud_owner(3, 1500, None, None);
+        let listener = new(&mut b, SOCK_NONBLOCK);
+        b.execute(listener, Op::Bind("10.73.0.3:8080".parse().unwrap()))
+            .unwrap();
+        b.execute(listener, Op::Listen(1)).unwrap();
+        let client = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(client, Op::Connect("10.73.0.3:8080".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        let raw = if known {
+            // RR/TS used to be discarded; retaining unknown bytes must not turn
+            // these formerly harmless packets into disabled-profile drops.
+            vec![30, 2, 158, 3, 0, 7, 3, 4, 68, 8, 5, 0, 0, 0, 0, 0]
+        } else {
+            vec![30, 2, 158, 3, 0, 1, 0, 255]
+        };
+        let expected = ntcp::Ipv4Options::parse(&raw, false)
+            .unwrap()
+            .unrecognized();
+        let syn = poll_packet(&mut a).unwrap();
+        let routed = add_options(syn.clone(), &[131, 7, 8, 10, 73, 0, 9, 0]);
+        assert_eq!(
+            crate::ip::parse(&routed).unwrap_err(),
+            ntcp_ip_common::Error::Options
+        );
+        ingress(&mut b, &b_io, &routed);
+        assert!(poll_packet(&mut b).is_none());
+        ingress(&mut b, &b_io, &add_options(syn.clone(), &raw));
+        let synack = poll_packet(&mut b).expect("ordinary native SYN accepted");
+        assert_eq!(synack[0], 0x45);
+        ingress(&mut a, &a_io, &synack);
+        let ack = poll_packet(&mut a).unwrap();
+        ingress(&mut b, &b_io, &add_options(ack, &raw));
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        let cid = connection(&b, server);
+        assert_eq!(
+            b.endpoint.received_ipv4_options(cid).unwrap(),
+            Some(expected)
+        );
+        a.execute(client, Op::Write(b"native opaque handoff".to_vec()))
+            .unwrap();
+        let data = poll_packet(&mut a).unwrap();
+        ingress(&mut b, &b_io, &add_options(data, &raw));
+        assert_eq!(
+            b.endpoint.received_ipv4_options(cid).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            b.execute(server, Op::Read(BYTES)).unwrap().bytes,
+            b"native opaque handoff"
+        );
+        // Exercise the existing ICMP decoder over a real checksummed raw frame.
+        // This proves acceptance, not a new ICMP host option service.
+        let error = add_options(ptb(&syn, 1400), &raw);
+        let parsed = ntcp_ip::parse(&error, false).unwrap();
+        assert_eq!(parsed.ipv4_options.unrecognized(), expected);
+        assert_eq!(
+            ntcp_icmp::decode_icmp(&error).unwrap().kind,
+            ntcp_icmp::FeedbackKind::PacketTooBig
+        );
+    }
+}
+
 fn pmtud_pair(capacity: Option<usize>) -> (Owner, Owner, u64, u64, Arc<Mutex<State>>) {
     pmtud_paced_pair(capacity, None)
 }

@@ -106,6 +106,11 @@ mod linux {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= reason=The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.
+    //# The destination host MUST (if possible) add the current timestamp to
+    //# a Timestamp option before passing the option to the transport layer
+    //# or to ICMP for processing.
     fn parse_ipv4_options(
         packet: &[u8],
         local: Ipv4Addr,
@@ -133,7 +138,7 @@ mod linux {
         let options = if enabled {
             parsed.ipv4_options.record(local, timestamp).ok()?
         } else {
-            Ipv4Options::default()
+            parsed.ipv4_options.unrecognized()
         };
         Some((parsed.ip, parsed.payload, options))
     }
@@ -558,6 +563,11 @@ mod linux {
         start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
     }
 
+    fn ipv4_timestamp(start: Instant) -> u32 {
+        // Monotonic elapsed time is not UTC. Mark it on both input and output.
+        ntcp::Ipv4Timestamp::nonstandard(start.elapsed().as_millis() as u32).wire_value()
+    }
+
     // Generation commits a TCP send; retain the complete frame until the
     // backend accepts it. No new poll_transmit may overwrite this buffer.
     fn flush_pending(
@@ -759,7 +769,7 @@ mod linux {
                             &input[..len],
                             local,
                             ipv4_options_enabled,
-                            (start.elapsed().as_millis() as u32) | 0x8000_0000,
+                            ipv4_timestamp(start),
                         )?;
                     }
                     Ok(None) => break,
@@ -821,7 +831,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 header_len,
-                (start.elapsed().as_millis() as u32) | 0x8000_0000,
+                ipv4_timestamp(start),
                 &mut tun,
             )?;
             immediate |= pending == 0 && endpoint.has_pending_output();
@@ -1091,7 +1101,12 @@ mod linux {
             // Payload option requires the unsupported Hop-by-Hop header.
             let mut empty = bytes;
             empty[4..6].fill(0);
-            assert!(parse_ipv6(&empty[..IPV6_HEADER], local).unwrap().2.is_empty());
+            assert!(
+                parse_ipv6(&empty[..IPV6_HEADER], local)
+                    .unwrap()
+                    .2
+                    .is_empty()
+            );
             assert!(parse_ipv6(&empty[..len], local).is_none());
             let mut jumbo = empty;
             jumbo[6] = 0;
@@ -1408,6 +1423,149 @@ mod linux {
             transmit.len = 1440;
             assert!(build_ipv4_options(&mut bytes[..MTU - 1], transmit, 0).is_err());
             assert_eq!(bytes, before);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+        //= type=test
+        //= reason=The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.
+        //# The destination host MUST (if possible) add the current timestamp to
+        //# a Timestamp option before passing the option to the transport layer
+        //# or to ICMP for processing.
+
+        //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+        //= type=test
+        //# The Timestamp is a right-justified, 32-bit timestamp in milliseconds
+        //# since midnight UT. If the time is not available in milliseconds or
+        //# cannot be provided with respect to midnight UT then any time may be
+        //# inserted as a timestamp provided the high order bit of the timestamp
+        //# field is set to one to indicate the use of a non-standard value.
+        #[test]
+        fn option_frames_record_once_before_real_tcp_handoff() {
+            use ntcp::{Ipv4Timestamp, OutgoingIpv4Options, TimestampRequest};
+            let source = Ipv4Addr::new(192, 0, 2, 1);
+            let destination = Ipv4Addr::new(192, 0, 2, 2);
+            let source_time = Ipv4Timestamp::nonstandard(123).wire_value();
+            let destination_time = Ipv4Timestamp::nonstandard(456).wire_value();
+            let clock = Instant::now();
+            let before = clock.elapsed().as_millis() as u32;
+            let sample = ipv4_timestamp(clock);
+            let after = clock.elapsed().as_millis() as u32;
+            assert_ne!(sample & 0x8000_0000, 0);
+            assert!((before..=after).contains(&(sample & 0x7fff_ffff)));
+            for request in [
+                None,
+                Some(TimestampRequest::Times(2)),
+                Some(TimestampRequest::AddressTimes(2)),
+                Some(TimestampRequest::Prespecified {
+                    addresses: [source, destination, source, destination],
+                    len: 2,
+                }),
+            ] {
+                let enabled = request.is_some();
+                let cfg = EndpointConfig {
+                    ipv4_options_enabled: enabled,
+                    ..Default::default()
+                };
+                let mut client =
+                    Endpoint::new(cfg.clone(), [1; 32], 0, test_policy(source)).unwrap();
+                let mut server = Endpoint::new(cfg, [2; 32], 0, test_policy(destination)).unwrap();
+                let local = SocketAddr::new(source.into(), 1234);
+                let remote = SocketAddr::new(destination.into(), 8080);
+                let listener = server.listen(remote, 1).unwrap();
+                let outgoing = OutgoingIpv4Options {
+                    source_route: enabled.then(|| ntcp::SourceRoute::new(&[], false).unwrap()),
+                    record_route_slots: enabled.then_some(2),
+                    timestamp: request,
+                    ..Default::default()
+                };
+                let id = client
+                    .connect_with_ipv4_options(0, local, remote, outgoing)
+                    .unwrap();
+                let transfer =
+                    |from: &mut Endpoint, to: &mut Endpoint, local: Ipv4Addr, opaque: bool| {
+                        let mut bytes = [0; MTU];
+                        let tx = from
+                            .poll_transmit(0, &mut bytes[20..], BUDGET)
+                            .unwrap()
+                            .packet
+                            .unwrap();
+                        let mut len = build_ipv4_options(&mut bytes, tx, source_time).unwrap();
+                        if opaque {
+                            let raw: &[u8] = if enabled {
+                                &[30, 2, 158, 2]
+                            } else {
+                                // Disabled known processing preserves historical acceptance.
+                                &[30, 2, 158, 2, 7, 3, 4, 1, 68, 4, 5, 0]
+                            };
+                            bytes.copy_within(20..len, 20 + raw.len());
+                            bytes[20..20 + raw.len()].copy_from_slice(raw);
+                            bytes[0] += (raw.len() / 4) as u8;
+                            len += raw.len();
+                            bytes[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+                            reseal(&mut bytes);
+                        } else {
+                            assert_eq!(bytes[0], 0x45, "received options are not echoed");
+                        }
+                        let parsed = ntcp_ip::parse(&bytes[..len], false).unwrap();
+                        assert!(ntcp::wire::parse(parsed.ip, parsed.payload).is_ok());
+                        let expected = if enabled {
+                            parsed.ipv4_options.record(local, destination_time).unwrap()
+                        } else {
+                            parsed.ipv4_options.unrecognized()
+                        };
+                        input_frame(
+                            to,
+                            0,
+                            &bytes[..len],
+                            local.into(),
+                            enabled,
+                            destination_time,
+                        )
+                        .unwrap();
+                        expected
+                    };
+                transfer(&mut client, &mut server, destination, true);
+                transfer(&mut server, &mut client, source, false);
+                let expected = transfer(&mut client, &mut server, destination, true);
+                let accepted = server.accept(listener).unwrap();
+                assert_eq!(client.state(id).unwrap(), State::Established);
+                assert_eq!(server.state(accepted).unwrap(), State::Established);
+                let received = server.received_ipv4_options(accepted).unwrap().unwrap();
+                assert_eq!(received, expected);
+                assert_eq!(received.unrecognized().as_bytes(), &[30, 2, 158, 2]);
+                if let Some(request) = request {
+                    let bytes = received.as_bytes();
+                    assert_eq!(&bytes[4..7], &[7, 11, 12]);
+                    assert_eq!(&bytes[7..15], &[192, 0, 2, 1, 192, 0, 2, 2]);
+                    let ts = &bytes[15..];
+                    let stride = if matches!(request, TimestampRequest::Times(_)) {
+                        4
+                    } else {
+                        8
+                    };
+                    assert_eq!(ts.len(), 4 + 2 * stride);
+                    assert_eq!(usize::from(ts[2]), ts.len() + 1);
+                    assert_eq!(ts[3] >> 4, 0, "no duplicate destination recording/overflow");
+                    assert_eq!(&ts[stride..stride + 4], &source_time.to_be_bytes());
+                    assert_eq!(
+                        &ts[2 * stride..2 * stride + 4],
+                        &destination_time.to_be_bytes()
+                    );
+                    if stride == 8 {
+                        assert_eq!(&ts[4..8], &source.octets());
+                        assert_eq!(&ts[12..16], &destination.octets());
+                    }
+                }
+                client.write(id, b"destination before TCP").unwrap();
+                let expected = transfer(&mut client, &mut server, destination, true);
+                assert_eq!(
+                    server.received_ipv4_options(accepted).unwrap(),
+                    Some(expected)
+                );
+                let mut payload = [0; 32];
+                let n = server.read(accepted, &mut payload).unwrap();
+                assert_eq!(&payload[..n], b"destination before TCP");
+            }
         }
 
         fn packet() -> ([u8; MTU], usize, Ipv4Addr) {

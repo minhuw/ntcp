@@ -15,7 +15,7 @@ from test_annotation_inventory import report_fixture, report_scopes
 # Exact selected clauses are a review contract: synchronously narrowing a ledger,
 # additions and source/test quotes cannot silently shrink the audited capability.
 CONTRACT = {
-    791: (19, 16, 3, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
+    791: (19, 17, 2, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
           "823132a1638cd0fc39160740de5ecd34c696a65f03fbb863122ffffaaf961e8d"),
     1122: (16, 13, 3, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
            "140d6afa98dde87d39941c1863076d8fa41864673c357689e1d81f343880960d"),
@@ -93,8 +93,27 @@ class Ipv4Inventory(unittest.TestCase):
         self.assertEqual(child["parent"], parent["id"])
         self.assertIn(audit.norm(child["quote"]), audit.norm(parent["quote"]))
         self.assertIn("whether they arrive whole or in fragments", parent["quote"])
-        self.assertIn("high order bit", next(r for r in ledger(791)["paragraphs"]
-                                             if r["id"] == "791-timestamp-timebase")["quote"])
+        timebase = next(r for r in ledger(791)["paragraphs"] if r["id"] == "791-timestamp-timebase")
+        self.assertIn("high order bit", timebase["quote"])
+        self.assertEqual(timebase["status"], "covered")
+        value = next(r for r in ledger(1122)["paragraphs"] if r["id"] == "1122-timestamp-value")
+        self.assertIn("15 updates/second", value["reason"])
+        self.assertIn("accuracy within a few minutes", value["reason"])
+        for id in ("791-record-capacity", "791-timestamp-capacity"):
+            self.assertEqual(next(r for r in ledger(791)["paragraphs"] if r["id"] == id)["status"], "TODO")
+
+    def test_all_partial_ipv4_source_and_test_copies_keep_canonical_reasons(self):
+        partial = {audit.clause_key(row): row for row in ledger(1122)["paragraphs"]
+                   if row["status"] == "TODO"}
+        seen = Counter()
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                key = audit.clause_key(annotation)
+                if key in partial:
+                    self.assertEqual(annotation["reason"], partial[key]["reason"], str(path))
+                    seen[key] += 1
+        self.assertEqual(set(seen), set(partial))
+        self.assertTrue(all(count >= 2 for count in seen.values()))
 
 
 class HistoricalPublication(unittest.TestCase):
