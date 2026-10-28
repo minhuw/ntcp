@@ -247,6 +247,12 @@ mod linux {
         Ok(peer)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
+    //= reason=Enabled core implements PMTUD/PLPMTUD and native IPv4 socket integration is tested. The concrete remaining embedding gap is crates/stacks/ntcp/examples/tun_echo.rs: NTCP_TIMESTAMPS=1 enables timestamps/PAWS, IPv4 encoding sets DF, ConnectionConfig retains default pmtud=None, and input_frame dispatches TCP only rather than ICMP PTB. This supplied example therefore lacks discovery in its PAWS/DF profile. Optional disabled configuration alone, unknown external embeddings, and absence of native IPv6 sockets are not evidence that the TCP implementation lacks PMTUD.
+    //# Setting the DF bit implies the use of Path MTU Discovery as described
+    //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
+    //# that implements PAWS MUST also implement Path MTU Discovery.
+    // Partial evidence: both parsers admit protocol 6 only; no ICMP PTB dispatch.
     fn input_frame(
         endpoint: &mut Endpoint,
         time: u64,
@@ -697,6 +703,13 @@ mod linux {
             ipv4_options_enabled,
             error_reports: true,
             reuse_time_wait: false,
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
+            //= reason=Enabled core implements PMTUD/PLPMTUD and native IPv4 socket integration is tested. The concrete remaining embedding gap is crates/stacks/ntcp/examples/tun_echo.rs: NTCP_TIMESTAMPS=1 enables timestamps/PAWS, IPv4 encoding sets DF, ConnectionConfig retains default pmtud=None, and input_frame dispatches TCP only rather than ICMP PTB. This supplied example therefore lacks discovery in its PAWS/DF profile. Optional disabled configuration alone, unknown external embeddings, and absence of native IPv6 sockets are not evidence that the TCP implementation lacks PMTUD.
+            //# Setting the DF bit implies the use of Path MTU Discovery as described
+            //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
+            //# that implements PAWS MUST also implement Path MTU Discovery.
+            // Partial evidence: run's actual timestamp configuration inherits
+            // pmtud=None; core PMTUD tests do not establish this embedding.
             connection: ConnectionConfig {
                 timestamps,
                 sack,

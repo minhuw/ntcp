@@ -7609,6 +7609,11 @@ impl Connection {
         let packet_mss = wire_mss.min(timestamp_limit);
         let repair_packet_mss = payload_mss(repair_mss).min(timestamp_limit);
         let mut burst_push = false;
+        //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+        //= reason=Exact receiver-driven wire observations in half_flight_segment_output_observations: ten originals at SMSS1/13/128; NewReno emits one full-SMSS retry in each of the first two recovery RTTs; non-RACK/non-PRR SACK without duplex SACK output emits five full-SMSS retries. With an out-of-order duplex byte requiring a 12-byte outgoing SACK option, fixed path budget33/SMSS13 emits 53 one-byte retries in one poll burst before any retry RTT completes; budget148/SMSS128 emits nine packets (116-byte prefixes and 12-byte suffixes), while holes remain. RFC6675 section5(C) byte gating (cwnd-pipe>=SMSS) and actual-byte pipe increments prescribe these admissions but do not prove RFC5681 section4.3 literal half-flight packet count. Retain the concrete packetization/algorithm applicability gap: no compliant packet-count limiter is specified by the selected RFC6675 algorithm, and RFC8985 section9.3 does not waive congestion control. Do not infer a strict PRR defect: zero-entry credit and zero-window epoch cancellation are already fixed; historical initial-credit/uncounted-persist compatibility was removed. General small-flight/lost-copy multi-RTT packet-count proof remains unestablished.
+        //# Second, until all lost segments in the window of data in question are repaired, the number of segments transmitted in each RTT MUST be no more than half the number of outstanding segments when the loss was detected.
+        // Partial evidence: byte credit and packet clipping at recovery admission;
+        // the existing wire witness demonstrates the literal packet-count gap.
         let mut sack_segment = None;
         if reset.is_none()
             && !syn
