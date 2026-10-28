@@ -121,6 +121,8 @@ impl FastOpenCookiePolicy {
     //# the best validation process is to simply regenerate a valid cookie and compare it against the
     //# incoming cookie. In that case, if the incoming cookie fails the check, a valid cookie is readily
     //# available to be sent to the client.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+    //# 4. A server may encode other information in the cookie and accept more than one valid cookie per client at any given time. But this is server-implementation dependent and transparent to the client.
     pub(crate) fn valid(
         &self,
         secret: &[u8; 32],

@@ -3,6 +3,9 @@ use crate::*;
 use core::net::SocketAddr;
 use std::{vec, vec::Vec};
 
+#[path = "fast_open_evidence_tests.rs"]
+mod evidence;
+
 fn addresses(v6: bool, port: u16) -> (SocketAddr, SocketAddr) {
     (
         SocketAddr::new(

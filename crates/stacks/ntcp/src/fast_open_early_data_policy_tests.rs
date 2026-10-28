@@ -315,6 +315,100 @@ fn cookieless_policy_is_listener_local_and_revoke_is_future_only() {
     assert_eq!(other.readable_bytes(next), Ok(0));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-7.3
+//= type=test
+//# If the server believes it's under a DoS attack through other defense mechanisms, it can switch to regular Fast Open for listener sockets.
+#[test]
+fn live_protected_switch_authenticates_new_requests_for_both_cookie_policies() {
+    for v6 in [false, true] {
+        for policy in [
+            FastOpenCookiePolicy::HmacSha256,
+            #[cfg(feature = "tfo-linux-cookie")]
+            super::linux::policy(),
+        ] {
+            let mut ep = server();
+            ep.enable_fast_open().unwrap();
+            ep.set_fast_open_cookie_policy(policy.clone());
+            let (a, mut remote) = pair(v6, 8080);
+            let (b, _) = pair(v6, 8081);
+            let listener = ep.listen(a, 16).unwrap();
+            let neighbor = ep.listen(b, 8).unwrap();
+            ep.set_listener_fast_open(listener, 2).unwrap();
+            ep.set_listener_fast_open(neighbor, 2).unwrap();
+            send_syn(&mut ep, a, remote, Some(FastOpenCookie::request()), b"");
+            let (_, cookie, _) = response(&mut ep);
+            let cookie = cookie.unwrap();
+            for id in [listener, neighbor] {
+                ep.set_listener_fast_open_early_data_policy(
+                    id,
+                    FastOpenEarlyDataPolicy::ApplicationProtected,
+                )
+                .unwrap();
+            }
+            remote.set_port(40001);
+            send_syn(&mut ep, a, remote, None, b"early");
+            ep.enable_output_reservations().unwrap();
+            let mut bytes = [0; 2048];
+            let (out, attempt) = ep.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
+            let tx = out.packet.unwrap();
+            let child = tx.connection.unwrap();
+            let original = bytes[..tx.len].to_vec();
+            let before = ep.buffer_bytes();
+            ep.set_listener_fast_open_early_data_policy(
+                listener,
+                FastOpenEarlyDataPolicy::RequireCookie,
+            )
+            .unwrap();
+            ep.set_fast_open_hmac_key([42; 32]); // Does not revoke application authorization already committed.
+            assert_eq!(ep.buffer_bytes(), before);
+            assert_eq!(&bytes[..tx.len], original);
+            let reply = wire::parse(tx.ip, &original).unwrap();
+            assert_eq!(reply.options.fast_open, None);
+            assert_eq!(reply.header.acknowledgment, 106);
+            assert!(ep.accept_transmit(0, attempt.unwrap()).unwrap());
+            assert_eq!(ep.accept(listener), Ok(child));
+            assert_eq!(ep.read(child, &mut [0; 5]), Ok(5));
+            for (i, incoming) in [
+                None,
+                Some(FastOpenCookie::new(&[0x7b; 8]).unwrap()),
+                Some(FastOpenCookie::request()),
+                Some(cookie),
+                Some(cookie),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                remote.set_port(40100 + i as u16);
+                send_syn(&mut ep, a, remote, incoming, b"early");
+                let (id, response_cookie, ack) = response(&mut ep);
+                let admitted = i == 3;
+                assert_eq!(ack, if admitted { 106 } else { 101 });
+                assert_eq!(ep.readable_bytes(id), Ok(if admitted { 5 } else { 0 }));
+                let refresh_valid = matches!(policy, FastOpenCookiePolicy::HmacSha256);
+                assert_eq!(
+                    response_cookie,
+                    if incoming.is_some() && (i < 3 || refresh_valid) {
+                        Some(cookie)
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(ep.accept(listener).is_ok(), admitted);
+                if admitted {
+                    assert_eq!(ep.read(id, &mut [0; 5]), Ok(5));
+                }
+            }
+            // The protected neighbor still accepts omitted-cookie early data.
+            remote.set_port(40200);
+            send_syn(&mut ep, b, remote, None, b"early");
+            let (id, cookie, ack) = response(&mut ep);
+            assert_eq!((cookie, ack), (None, 106));
+            assert_eq!(ep.accept(neighbor), Ok(id));
+            assert_eq!(ep.read(id, &mut [0; 5]), Ok(5));
+        }
+    }
+}
+
 #[test]
 fn cookieless_reserved_synack_metrics_and_abandon_remain_transactional() {
     for abandon in [false, true] {

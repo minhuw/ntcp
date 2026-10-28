@@ -8,12 +8,15 @@ use super::*;
 use crate::packet_profile::Profile;
 
 fn tfo_listener(b: &mut Owner) -> u64 {
+    tfo_listener_backlog(b, 4)
+}
+fn tfo_listener_backlog(b: &mut Owner, backlog: i32) -> u64 {
     let listener = new(b, SOCK_NONBLOCK);
     b.execute(listener, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 4))
         .unwrap();
     b.execute(listener, Op::Bind("192.0.2.2:8080".parse().unwrap()))
         .unwrap();
-    b.execute(listener, Op::Listen(4)).unwrap();
+    b.execute(listener, Op::Listen(backlog)).unwrap();
     listener
 }
 pub(super) fn tfo_send(bytes: &[u8], flags: i32) -> Op {
@@ -25,9 +28,21 @@ pub(super) fn tfo_send(bytes: &[u8], flags: i32) -> Op {
     )
 }
 pub(super) fn tfo_setup(warm: bool) -> (Owner, Owner, u64) {
+    tfo_setup_cookie_policy(warm, false, 4)
+}
+fn tfo_setup_cookie_policy(warm: bool, linux: bool, backlog: i32) -> (Owner, Owner, u64) {
     let mut a = owner(1, Profile::Pipeline, 8);
     let mut b = owner(2, Profile::Pipeline, 8);
-    let listener = tfo_listener(&mut b);
+    let listener = tfo_listener_backlog(&mut b, backlog);
+    #[cfg(feature = "tfo-linux-cookie")]
+    if linux {
+        b.execute(
+            listener,
+            Op::SetFastOpenKey(LinuxSipHash24Key::new([7; 16])),
+        )
+        .unwrap();
+    }
+    let _ = linux;
     if warm {
         let client = new(&mut a, SOCK_NONBLOCK);
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
@@ -65,6 +80,177 @@ pub(super) fn tfo_deliver(b: &mut Owner, bytes: Vec<u8>) {
 pub(super) fn tfo_no_output(a: &mut Owner) {
     a.service_egress().unwrap();
     assert_eq!(a.execute(0, Op::Capture(65535)).unwrap_err(), EAGAIN);
+}
+
+fn threshold_client(a: &mut Owner) -> u64 {
+    let client = new(a, SOCK_NONBLOCK);
+    a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 4096))
+        .unwrap();
+    a.execute(client, Op::Set(SOL_SOCKET, SO_RCVBUF, 4096))
+        .unwrap();
+    client
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2
+//= type=test
+//# The option enables Fast Open on the listener socket. The option value specifies the PendingFastOpenRequests threshold, i.e., the maximum length of pending SYNs with data payload. Once enabled, the TCP implementation will respond with TFO cookies per request.
+#[test]
+fn native_fast_open_exact_pending_threshold_cookie_responses_and_recovery() {
+    for linux in [
+        false,
+        #[cfg(feature = "tfo-linux-cookie")]
+        true,
+    ] {
+        let (mut a, mut b, listener) = tfo_setup_cookie_policy(true, linux, 16);
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_SNDBUF, 4096))
+            .unwrap();
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_RCVBUF, 4096))
+            .unwrap();
+        b.execute(listener, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 2))
+            .unwrap();
+        assert_eq!(
+            b.execute(listener, Op::Get(IPPROTO_TCP, TCP_FASTOPEN))
+                .unwrap()
+                .value,
+            2
+        );
+        let mut pending = Vec::new();
+        for i in 0..3 {
+            let client = threshold_client(&mut a);
+            assert_eq!(
+                a.execute(client, tfo_send(b"early", MSG_FASTOPEN))
+                    .unwrap()
+                    .value,
+                5
+            );
+            let syn = tfo_capture(&mut a);
+            let cookie = segment(&syn).options.fast_open;
+            let sequence = segment(&syn).header.sequence;
+            tfo_deliver(&mut b, syn.clone());
+            let synack = tfo_capture(&mut b);
+            assert_eq!(
+                segment(&synack).header.acknowledgment,
+                sequence.wrapping_add(if i < 2 { 6 } else { 1 })
+            );
+            assert_eq!(
+                segment(&synack).options.fast_open,
+                if linux { None } else { cookie }
+            );
+            if i < 2 {
+                let server = b
+                    .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                    .unwrap()
+                    .value as u64;
+                assert_eq!(b.execute(server, Op::Read(5)).unwrap().bytes, b"early");
+                assert_eq!(b.endpoint.state(cid(&b, server)), Ok(State::SynReceived));
+                pending.push((server, syn, synack));
+            } else {
+                assert_eq!(
+                    b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+                    EAGAIN
+                );
+            }
+        }
+        // Requests still receive cookies at the exact pending limit.
+        let mut cold = owner(1, Profile::Pipeline, 8);
+        let client = new(&mut cold, SOCK_NONBLOCK);
+        cold.execute(client, Op::Bind("192.0.2.1:49000".parse().unwrap()))
+            .unwrap();
+        assert_eq!(
+            cold.execute(client, tfo_send(b"cold", MSG_FASTOPEN))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        let syn = tfo_capture(&mut cold);
+        assert!(
+            segment(&syn)
+                .options
+                .fast_open
+                .unwrap()
+                .as_bytes()
+                .is_empty()
+        );
+        tfo_deliver(&mut b, syn.clone());
+        let requested = tfo_capture(&mut b);
+        assert!(
+            !segment(&requested)
+                .options
+                .fast_open
+                .unwrap()
+                .as_bytes()
+                .is_empty()
+        );
+        assert_eq!(
+            segment(&requested).header.acknowledgment,
+            segment(&syn).header.sequence.wrapping_add(1)
+        );
+        // Only completing the handshake returns pending credit.
+        tfo_deliver(&mut a, pending[0].2.clone());
+        tfo_deliver(&mut b, tfo_capture(&mut a));
+        assert_eq!(
+            b.endpoint.state(cid(&b, pending[0].0)),
+            Ok(State::Established)
+        );
+        let client = threshold_client(&mut a);
+        a.execute(client, tfo_send(b"early", MSG_FASTOPEN)).unwrap();
+        let syn = tfo_capture(&mut a);
+        tfo_deliver(&mut b, syn.clone());
+        let reply = tfo_capture(&mut b);
+        assert_eq!(
+            segment(&reply).header.acknowledgment,
+            segment(&syn).header.sequence.wrapping_add(6)
+        );
+        let recovered = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        assert_eq!(b.execute(recovered, Op::Read(5)).unwrap().bytes, b"early");
+        // A remote reset retains admission debt; it is not handshake completion.
+        tfo_early_terminal_input(&mut b, &pending[1].1, ntcp::wire::RST);
+        let client = threshold_client(&mut a);
+        a.execute(client, tfo_send(b"early", MSG_FASTOPEN)).unwrap();
+        let syn = tfo_capture(&mut a);
+        tfo_deliver(&mut b, syn.clone());
+        let reply = tfo_capture(&mut b);
+        assert_eq!(
+            segment(&reply).header.acknowledgment,
+            segment(&syn).header.sequence.wrapping_add(1)
+        );
+        assert_eq!(
+            b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+            EAGAIN
+        );
+        // Live socket control changes the threshold, including disabling cookies.
+        b.execute(listener, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 3))
+            .unwrap();
+        let client = threshold_client(&mut a);
+        a.execute(client, tfo_send(b"early", MSG_FASTOPEN)).unwrap();
+        let syn = tfo_capture(&mut a);
+        tfo_deliver(&mut b, syn.clone());
+        let reply = tfo_capture(&mut b);
+        assert_eq!(
+            segment(&reply).header.acknowledgment,
+            segment(&syn).header.sequence.wrapping_add(6)
+        );
+        assert!(b.execute(listener, Op::Accept(SOCK_NONBLOCK)).is_ok());
+        b.execute(listener, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 0))
+            .unwrap();
+        let client = threshold_client(&mut a);
+        a.execute(client, tfo_send(b"early", MSG_FASTOPEN)).unwrap();
+        let syn = tfo_capture(&mut a);
+        tfo_deliver(&mut b, syn.clone());
+        let reply = tfo_capture(&mut b);
+        assert_eq!(
+            segment(&reply).header.acknowledgment,
+            segment(&syn).header.sequence.wrapping_add(1)
+        );
+        assert_eq!(segment(&reply).options.fast_open, None);
+        assert_eq!(
+            b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+            EAGAIN
+        );
+        assert!(b.endpoint.buffer_bytes() <= 32 * 1024 * 1024);
+    }
 }
 
 #[test]

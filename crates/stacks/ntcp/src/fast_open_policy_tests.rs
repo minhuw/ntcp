@@ -176,6 +176,7 @@ fn setters_do_not_enable_service_or_listeners_and_reject_stale_handles() {
         let listener = endpoint.listen(local, 8).unwrap();
         let before = endpoint.buffer_bytes();
         crate::allocation_tests::fail_after(0, || {
+            endpoint.set_fast_open_hmac_key([9; 32]);
             endpoint.set_fast_open_cookie_policy(policy.clone());
             endpoint
                 .set_listener_fast_open_cookie_policy(listener, Some(policy.clone()))
