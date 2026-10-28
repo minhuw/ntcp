@@ -109,7 +109,8 @@ class PmtudInventory(unittest.TestCase):
             4821: ("implicit probe", "search_low SHOULD be raised", "SHOULD be configurable",
                    "same-sized probe", "R1 timeout threshold", "search_high to the probe size minus one",
                    "Data in the probe gap", "The saved value of eff_pmtu SHOULD be restored"),
-            5927: ("SND.UNA =< SEG.SEQ < SND.NXT", "maxsizesent", "maxsizeacked",
+            5927: ("Increasing the port number range", "randomize the ephemeral ports",
+                   "SND.UNA =< SEG.SEQ < SND.NXT", "maxsizesent", "maxsizeacked",
                    '"pending error" condition is cleared', "sequence number arithmetic",
                    "claimedmtu <= MINIMUM_MTU"),
         }
@@ -131,6 +132,16 @@ class PmtudInventory(unittest.TestCase):
         # RFC5927 documents nonstandard mitigations, not a mandatory historical
         # algorithm. Keep each selected policy deviation explicit and quoted.
         rows = {p["id"]: p for p in self.inventory(5927)["paragraphs"]}
+        for i in (49, 50):
+            row = rows[f"5927-{i:03}"]
+            self.assertEqual(row["status"], "covered")
+            self.assertIn("Selected Informational security policy:", row["reason"])
+            self.assertIn("1024..65535", row["reason"])
+            self.assertIn("occupied-cluster bias", row["reason"])
+            self.assertEqual(row["evidence"], [
+                "crates/adapters/ntcp-socket/src/runtime.rs::    fn port(",
+                "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open(",
+            ])
         for i in (103, 104, 106, 108, 109):
             row = rows[f"5927-{i:03}"]
             self.assertEqual(row["status"], "exception")

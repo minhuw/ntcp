@@ -1255,7 +1255,16 @@ fn logical_ephemeral_ports_do_not_follow_reused_os_descriptors() {
     owner.next_port = 60000;
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
     let (mut connect, _) = request(5, fd, 0, remote, 0);
+    let options = owner.connection_options.clone();
+    let detached = owner.detached.clone();
+    let bytes = owner.endpoint.buffer_bytes();
     assert_eq!(owner.execute(&mut connect).err(), Some(EADDRNOTAVAIL));
+    assert!(matches!(owner.sockets[&fd].handle, Handle::Fresh));
+    assert!(owner.sockets[&fd].local.is_none());
+    assert!(owner.sockets[&fd].deferred_peer.is_none());
+    assert_eq!(owner.connection_options, options);
+    assert_eq!(owner.detached, detached);
+    assert_eq!(owner.endpoint.buffer_bytes(), bytes);
 }
 
 #[test]

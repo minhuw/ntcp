@@ -7,6 +7,8 @@ mod egress;
 mod fast_open;
 #[path = "runtime_output.rs"]
 mod output;
+#[path = "runtime_ports.rs"]
+mod ports;
 #[path = "runtime_send.rs"]
 mod send;
 #[path = "runtime_timestamping.rs"]
@@ -564,7 +566,10 @@ struct Owner {
     epoch: Instant,
     #[cfg(test)]
     test_now: Option<u64>,
+    #[cfg(feature = "packet-test")]
     next_port: u16,
+    #[cfg(test)]
+    port_entropy: Option<VecDeque<Result<[u8; 8]>>>,
     next_id: u64,
     detached: Vec<ConnectionId>,
     egress: Option<egress::Egress>,
@@ -574,7 +579,8 @@ struct Owner {
     child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
     pending: VecDeque<Request>,
     child_timeouts: Vec<ChildOptionsSnapshot>,
-    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>, u32)>,
+    // Local tuple survives descriptor close and Endpoint::release until GC.
+    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>, u32, SocketAddr)>,
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
 }
@@ -661,31 +667,10 @@ fn context(io: &crate::IoConfig) -> Result<(IpAddr, u8)> {
     }
     Ok(pair)
 }
-// Blocking getrandom with no fallback source: an owner never starts with a
-// weak secret.
+// Startup secrets and ephemeral selection use the same fail-closed OS source.
 fn random_secret() -> Result<[u8; 32]> {
     let mut secret = [0u8; 32];
-    let mut offset = 0;
-    while offset < secret.len() {
-        let n = unsafe {
-            syscall(
-                SYS_getrandom,
-                secret[offset..].as_mut_ptr(),
-                secret.len() - offset,
-                0,
-            )
-        };
-        if n < 0 {
-            if errno() == EINTR {
-                continue;
-            }
-            return Err(errno());
-        }
-        if n == 0 {
-            return Err(EIO);
-        }
-        offset += n as usize;
-    }
+    ports::fill(&mut secret)?;
     Ok(secret)
 }
 impl Owner {
@@ -770,7 +755,10 @@ impl Owner {
             epoch: Instant::now(),
             #[cfg(test)]
             test_now: None,
+            #[cfg(feature = "packet-test")]
             next_port: 40000,
+            #[cfg(test)]
+            port_entropy: None,
             next_id: 1,
             detached: Vec::new(),
             egress: None,
@@ -1326,7 +1314,7 @@ impl Owner {
             {
                 self.endpoint.set_dscp(cid, tos >> 2)?;
                 self.connection_options
-                    .push((cid, tos, discover, None, mark));
+                    .push((cid, tos, discover, None, mark, tuple.local));
             }
             // Snapshot at accept eligibility, before the adapter publishes the
             // child. Only authenticated TFO data is readable in SynReceived;
@@ -1404,28 +1392,51 @@ impl Owner {
         Ok(id as i32)
     }
     //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
-    //= reason=Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence.
     //# As discussed in the previous sections, in order to perform any of the attacks described in this document, an attacker would need to guess (or know) the four-tuple that identifies the connection to be attacked. Increasing the port number range used for outgoing TCP connections, and randomizing the port number chosen for each outgoing TCP connection, would make it harder for an attacker to perform any of the attacks discussed in this document.
     //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
-    //= reason=Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence.
     //# [PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.
     fn port(&mut self) -> Result<u16> {
         #[cfg(feature = "packet-test")]
-        if self.packets.is_some() && self.next_port >= 60000 {
+        if self.packets.is_some() {
+            // Explicit synthetic packet profiles retain their sequential ports.
+            // Backend-less and external owners always use native selection.
+            if self.next_port >= 60000 {
+                return Err(EADDRNOTAVAIL);
+            }
+            for _ in 0..20000 {
+                let port = self.next_port;
+                self.next_port = if port == 59999 { 40000 } else { port + 1 };
+                if self.port_available(port) {
+                    return Ok(port);
+                }
+            }
             return Err(EADDRNOTAVAIL);
         }
-        for _ in 0..20000 {
-            let p = self.next_port;
-            self.next_port = if p == 59999 { 40000 } else { p + 1 };
-            if !self
-                .sockets
-                .values()
-                .any(|s| s.local.is_some_and(|a| a.port() == p))
-            {
-                return Ok(p);
-            }
+        #[cfg(test)]
+        if let Some(reads) = self.port_entropy.as_mut() {
+            let read = reads.pop_front().expect("unexpected entropy consumption");
+            return ports::allocate(
+                |bytes| {
+                    ports::fill_with(bytes, |out| {
+                        let entropy = read?;
+                        out.copy_from_slice(&entropy);
+                        Ok(entropy.len())
+                    })
+                },
+                |port| self.port_available(port),
+            );
         }
-        Err(EADDRNOTAVAIL)
+        ports::allocate(ports::fill, |port| self.port_available(port))
+    }
+    fn port_available(&self, port: u16) -> bool {
+        !self
+            .sockets
+            .values()
+            .any(|s| s.local.is_some_and(|a| a.port() == port))
+            && !self
+                .connection_options
+                .iter()
+                .any(|p| p.5.port() == port && self.endpoint.connection_exists(p.0))
     }
     fn apply_options(&mut self, cid: ConnectionId, s: &Socket) -> Result<()> {
         // Validate the fallible option before changing the infallible one.

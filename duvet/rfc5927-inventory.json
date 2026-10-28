@@ -361,18 +361,18 @@
       "id": "5927-049",
       "section": "4.2",
       "quote": "As discussed in the previous sections, in order to perform any of the attacks described in this document, an attacker would need to guess (or know) the four-tuple that identifies the connection to be attacked. Increasing the port number range used for outgoing TCP connections, and randomizing the port number chosen for each outgoing TCP connection, would make it harder for an attacker to perform any of the attacks discussed in this document.",
-      "status": "TODO",
-      "reason": "Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence.",
-      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn port("],
+      "status": "covered",
+      "reason": "Selected Informational security policy: native automatic binds use fresh kernel getrandom entropy for each allocation over 1024..65535, with a complete bounded wrapped scan excluding socket and retained connection ports. Entropy errors fail closed; exhaustion remains EADDRNOTAVAIL. RFC6056 Algorithm 1 motivates the mechanism, with known occupied-cluster bias, not perfect uniformity or whole-RFC conformance. Explicit packet-test profiles retain synthetic sequential allocation.",
+      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn port(", "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open("],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
     },
     {
       "id": "5927-050",
       "section": "4.2",
       "quote": "[PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.",
-      "status": "TODO",
-      "reason": "Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence.",
-      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn port("],
+      "status": "covered",
+      "reason": "Selected Informational security policy: native automatic binds use fresh kernel getrandom entropy for each allocation over 1024..65535, with a complete bounded wrapped scan excluding socket and retained connection ports. Entropy errors fail closed; exhaustion remains EADDRNOTAVAIL. RFC6056 Algorithm 1 motivates the mechanism, with known occupied-cluster bias, not perfect uniformity or whole-RFC conformance. Explicit packet-test profiles retain synthetic sequential allocation.",
+      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn port(", "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open("],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
     },
     {

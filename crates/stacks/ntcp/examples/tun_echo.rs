@@ -1066,7 +1066,7 @@ mod linux {
             }
             assert!(parse_ipv6(&bytes[..len + 1], local).is_none());
             assert!(parse_ipv6(&bytes[..len], "2001:db8::3".parse().unwrap()).is_none());
-            for (offset, value) in [(0, 0x40), (4, 1), (5, 19), (5, 21), (7, 0)] {
+            for (offset, value) in [(0, 0x40), (4, 1), (5, 19), (5, 21)] {
                 let mut bad = bytes;
                 bad[offset] = value;
                 assert!(parse_ipv6(&bad[..len], local).is_none());
@@ -1078,9 +1078,24 @@ mod linux {
                 bad[6] = next;
                 assert!(parse_ipv6(&bad[..len], local).is_none());
             }
-            let mut jumbo = bytes;
-            jumbo[4..6].fill(0);
-            assert!(parse_ipv6(&jumbo[..40], local).is_none());
+            // Destination input accepts Hop Limit zero; originating policy is
+            // checked separately below when building frames.
+            let mut expired = bytes;
+            expired[7] = 0;
+            let (ip, class, tcp) = parse_ipv6(&expired[..len], local).unwrap();
+            assert_eq!(ip, v6_transmit(20).ip);
+            assert_eq!(class, 0);
+            assert_eq!(tcp, &bytes[IPV6_HEADER..len]);
+
+            // A zero Payload Length is a legal empty base packet. A Jumbo
+            // Payload option requires the unsupported Hop-by-Hop header.
+            let mut empty = bytes;
+            empty[4..6].fill(0);
+            assert!(parse_ipv6(&empty[..IPV6_HEADER], local).unwrap().2.is_empty());
+            assert!(parse_ipv6(&empty[..len], local).is_none());
+            let mut jumbo = empty;
+            jumbo[6] = 0;
+            assert!(parse_ipv6(&jumbo[..IPV6_HEADER], local).is_none());
             for address in [
                 "::",
                 "ff02::1",

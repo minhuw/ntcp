@@ -2421,7 +2421,31 @@ fn software_gso_wire_matches_scalar_and_capacity_one_refills_second_owner() {
         assert!(state.lock().unwrap().output_calls <= BUDGET + 1);
         // Range owners keep capacity one until the suffix finishes; the next
         // owner still receives service in this call, not on an ACK round trip.
-        let mut by_port: Vec<_> = sent.into_iter().collect();
+        let mut bases = [None; 2];
+        let ports = clients.map(|id| a.endpoint.tuple(connection(&a, id)).unwrap().local.port());
+        let mut by_port: Vec<_> = sent
+            .into_iter()
+            .map(|mut packet| {
+                // Independent native allocations also change tuple-derived ISNs.
+                // Validate each real checksum before comparing the same logical
+                // streams relative to their observed tuple/sequence origins.
+                let ip = ntcp_ip::parse(&packet[14..], false).unwrap();
+                let tcp = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
+                let index = ports
+                    .iter()
+                    .position(|&p| p == tcp.header.source_port)
+                    .unwrap();
+                let (seq, ack) =
+                    *bases[index].get_or_insert((tcp.header.sequence, tcp.header.acknowledgment));
+                let sequence = tcp.header.sequence.wrapping_sub(seq);
+                let acknowledgment = tcp.header.acknowledgment.wrapping_sub(ack);
+                packet[34..36].copy_from_slice(&(index as u16).to_be_bytes());
+                packet[38..42].copy_from_slice(&sequence.to_be_bytes());
+                packet[42..46].copy_from_slice(&acknowledgment.to_be_bytes());
+                packet[50..52].fill(0);
+                packet
+            })
+            .collect();
         by_port.sort_by_key(|packet| u16::from_be_bytes(packet[34..36].try_into().unwrap()));
         packets.push(by_port);
     }

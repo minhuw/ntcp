@@ -132,6 +132,7 @@ impl Owner {
             options.wire_discover(self.local),
             Some(options.zerocopy),
             options.mark,
+            local,
         ));
         let s = self.sockets.get_mut(&id).unwrap();
         s.handle = Handle::Connection(cid);
