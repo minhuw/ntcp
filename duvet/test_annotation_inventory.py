@@ -121,6 +121,39 @@ class InventoryAudit(unittest.TestCase):
         (self.root / scope["inventory"]).write_text(json.dumps(ledger))
         return audit.validate_inventories(self.root, {7413: scope}, {7413: raw})
 
+    def tracked_todo_report_fixture(self):
+        report, entries, texts = report_fixture(self.root)
+        scope, ledger, raw = self.ledger_fixture()
+        row = ledger["paragraphs"][0]
+        row.update(status="TODO", reason="Missing full behavior.")
+        (self.root / "duvet/rfc7413-todos.toml").write_text(
+            '[[TODO]]\ntarget = ' + json.dumps(row["target"])
+            + '\nquote = ' + json.dumps(row["quote"])
+            + '\nreason = ' + json.dumps(row["reason"]) + '\n')
+        for name in ("source", "test"):
+            path = self.root / f"crates/{name}.rs"
+            path.write_text(path.read_text().replace("//#", "//= reason=" + row["reason"] + "\n//#"))
+        # Validate the actual JSON-listed pair before adding unlisted evidence.
+        entries = [e for e in entries if e[2]["target"] != row["target"]]
+        entries.extend(self.validate_ledger(scope, ledger, raw))
+        texts[7413] = raw
+        target = PREFIX + "7413"
+        spec = report["specifications"][target]
+        index = spec["requirements"][0]
+        report["annotations"][index]["source"] = "duvet/rfc7413-additions.toml"
+        for offset, name in ((1, "source"), (2, "test")):
+            report["annotations"][index + offset].update(source=f"crates/{name}.rs", line=1)
+        todo_id = len(report["annotations"])
+        report["annotations"].append({"source": "duvet/rfc7413-todos.toml", "line": 1,
+                                       "target_path": target, "target_section": "section-1",
+                                       "type": "TODO", "comment": row["reason"]})
+        flags = len(report["refs"])
+        report["refs"].append({"spec": True, "citation": True, "test": True, "todo": True})
+        spec["sections"][0]["lines"] = [
+            [[[index, index + 1, index + 2, todo_id], flags, row["quote"]]],
+            "Background context."]
+        return report, entries, texts
+
     def test_exact_provenance_metadata_and_evidence_are_required(self):
         scope, ledger, raw = self.ledger_fixture()
         self.assertEqual(len(self.validate_ledger(scope, ledger, raw)), 1)
@@ -217,22 +250,81 @@ class InventoryAudit(unittest.TestCase):
         report["refs"].extend([{"spec": True, "todo": True}, {"spec": True}])
         section = report["specifications"][PREFIX + "9293"]["sections"][0]
         section["lines"] = [[[[0, todo_id], 1, "Required "], [[0], 2, "behavior."]]]
-        entries.append(("todos.toml", "TODO", {"target": PREFIX + "9293#section-1", "quote": "Required"}))
+        entries.append(("todos.toml", "TODO", {"target": PREFIX + "9293#section-1", "quote": "Required",
+                                              "reason": "Missing behavior."}))
         with self.assertRaisesRegex(ValueError, "untracked in-scope requirement fragment"):
             self.validate_report(report, report_scopes(), entries, texts)
 
     def test_complete_tracking_can_pass_while_strict_coverage_fails(self):
-        report, entries, texts = report_fixture(self.root)
-        todo_id = len(report["annotations"])
-        report["annotations"].append({"source": "todos.toml", "line": 1, "type": "TODO",
-                                       "target_path": PREFIX + "9293", "target_section": "section-1",
-                                       "comment": "Missing assertion."})
-        report["refs"].append({"spec": True, "todo": True, "citation": True, "test": True})
-        report["specifications"][PREFIX + "9293"]["sections"][0]["lines"] = [[[[0, 1, 2, todo_id], 1, "Required behavior."]]]
-        entries.append(("todos.toml", "TODO", {"target": PREFIX + "9293#section-1", "quote": "Required behavior."}))
+        report, entries, texts = self.tracked_todo_report_fixture()
         summaries, errors, omitted = self.validate_report(report, report_scopes(), entries, texts)
-        self.assertEqual((summaries["9293"]["uncovered"], summaries["9293"]["untracked"], omitted), (1, 0, 0))
-        self.assertTrue(any("Missing assertion." in e for e in errors))
+        self.assertEqual((summaries["7413"]["uncovered"], summaries["7413"]["untracked"], omitted), (1, 0, 0))
+        self.assertTrue(any("Missing full behavior." in e for e in errors))
+
+    def test_report_requires_canonical_todo_reason_on_unlisted_full_quote_evidence(self):
+        report, entries, texts = self.tracked_todo_report_fixture()
+        target = PREFIX + "7413"
+        source = self.root / "extra.rs"
+        reason = "Missing full behavior."
+        # The third copy is canonical; the fourth is deliberately outside the
+        # ledger's validated pair. Report comments cannot stand in for source.
+        third = f"//= {target}#section-1\n//= reason={reason}\n//# Required behavior.\nfn third() {{}}\n"
+        for kind in ("citation", "implementation", "test"):
+            with self.subTest(kind=kind):
+                complete = copy.deepcopy(report)
+                ids = complete["specifications"][target]["sections"][0]["lines"][0][0][0]
+                for line, annotation_kind in ((1, "CITATION"), (5, "TEST" if kind == "test" else "CITATION")):
+                    ids.append(len(complete["annotations"]))
+                    complete["annotations"].append({"source": "extra.rs", "line": line,
+                        "target_path": target, "target_section": "section-1",
+                        "type": annotation_kind, "comment": reason})
+                fourth = (f"//= {target}#section-1\n//= type={kind}\n//= reason={reason}\n"
+                          "//# Required   behavior.\nfn fourth() {}\n")
+                source.write_text(third + fourth)
+                # This checks locations, ownership, flags, complete quotes and
+                # strict TODO reporting before changing only the fourth reason.
+                summaries, errors, omitted = self.validate_report(complete, report_scopes(), entries, texts)
+                self.assertEqual((summaries["7413"]["uncovered"], summaries["7413"]["untracked"], omitted), (1, 0, 0))
+                self.assertTrue(any(reason in e for e in errors))
+                for replacement in ("//= reason=Fully implemented.\n", ""):
+                    with self.subTest(reason=replacement):
+                        source.write_text(third + fourth.replace(f"//= reason={reason}\n", replacement))
+                        with self.assertRaisesRegex(ValueError, r"extra.rs:5: source/test canonical TODO reason mismatch"):
+                            self.validate_report(complete, report_scopes(), entries, texts)
+
+    def test_report_todo_reasons_do_not_apply_to_fragments_other_targets_or_exceptions(self):
+        report, entries, texts = self.tracked_todo_report_fixture()
+        target = PREFIX + "7413"
+        for case in ("fragment", "other target", "exception"):
+            with self.subTest(case=case):
+                complete = copy.deepcopy(report)
+                current_entries = list(entries)
+                evidence_target = PREFIX + "9293" if case == "other target" else target
+                quote = "Background context." if case == "exception" else "Required behavior."
+                extra_id = len(complete["annotations"])
+                complete["annotations"].append({"source": "extra.rs", "line": 1, "type": "TEST",
+                    "target_path": evidence_target, "target_section": "section-1"})
+                lines = complete["specifications"][evidence_target]["sections"][0]["lines"]
+                if case == "fragment":
+                    ids, flags, text = lines[0][0]
+                    lines[0] = [[ids + [extra_id], flags, "Required "], [ids, flags, "behavior."]]
+                    quote = "Required"
+                elif case == "other target":
+                    lines[0][0][0].append(extra_id)
+                else:
+                    exception_id = len(complete["annotations"])
+                    complete["annotations"].append({"source": "exceptions.toml", "line": 1, "type": "EXCEPTION",
+                        "target_path": target, "target_section": "section-1"})
+                    current_entries.append(("exceptions.toml", "EXCEPTION", {
+                        "target": target + "#section-1", "quote": quote, "reason": "External actor."}))
+                    flags = len(complete["refs"])
+                    complete["refs"].append({"exception": True, "test": True})
+                    lines[1] = [[[extra_id, exception_id], flags, quote]]
+                (self.root / "extra.rs").write_text(f"//= {evidence_target}#section-1\n//= type=test\n"
+                    f"//= reason=Local partial evidence.\n//# {quote}\nfn extra() {{}}\n")
+                summaries, errors, omitted = self.validate_report(complete, report_scopes(), current_entries, texts)
+                self.assertEqual((summaries["7413"]["uncovered"], summaries["7413"]["untracked"], omitted), (1, 0, 0))
+                self.assertTrue(any("Missing full behavior." in e for e in errors))
 
     def test_mixed_exception_closure_is_not_claimed_as_full_source_and_test(self):
         report, entries, texts = report_fixture(self.root)

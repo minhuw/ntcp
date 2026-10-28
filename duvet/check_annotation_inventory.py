@@ -491,6 +491,7 @@ def validate_report(report, scopes, entries, texts, root=ROOT):
     require(actual == expected, "report inventory mismatch (missing or stale annotations)")
     singleton_omissions = 0
     source_cache = {}
+    todo_reasons = {clause_key(row): row["reason"] for path, kind, row in entries if kind == "TODO"}
     # Duvet may fuzzy-match a misspelled evidence quotation. Read the actual
     # contributing source annotation by location, then validate both its exact
     # official quotation and its complete mapped span, for every inventory type.
@@ -506,6 +507,12 @@ def validate_report(report, scopes, entries, texts, root=ROOT):
                    and row["target"] == target and row["kind"] == kind]
         require(len(matches) == 1, f"{path}:{a['line']}: missing/mismatched source evidence annotation")
         row = matches[0]
+        # Every full-quote copy must retain the complete gap, including evidence
+        # not listed in a ledger pair. Fragments and exceptions have other keys.
+        key = clause_key(row)
+        if key in todo_reasons:
+            require(row["reason"] == todo_reasons[key],
+                    f"{path}:{a['line']}: source/test canonical TODO reason mismatch")
         if not norm(row["quote"]):
             # A metadata-only comment cannot contribute closure. Duvet retains
             # it in annotations, so require that it owns no report fragments.

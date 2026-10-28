@@ -15,7 +15,7 @@ pub struct Packet<'a> {
 }
 
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
-//= reason=Live parse rejects Hop Limit zero as Invalid although the destination rule says to process it normally; checked quote parsing accepts zero. Tests pin zero rejection and positive 1/64/255 preservation. The whole receive obligation remains unresolved; forwarding/decrement behavior is outside the base endpoint codec and does not excuse the destination difference. Encoding also rejects zero; no production fix is authorized.
+//= reason=Live parse rejects Hop Limit zero as Invalid although the destination rule says to process it normally; checked quote parsing accepts zero. Tests pin zero rejection and positive 1/64/255 preservation. The whole receive obligation remains unresolved; forwarding/decrement behavior is outside the base endpoint codec and does not excuse the destination difference. Encoding also rejects zero.
 //# Hop Limit 8-bit unsigned integer. Decremented by 1 by each node that
 //# forwards the packet. When forwarding, the packet is discarded if Hop
 //# Limit was zero when received or is decremented to zero. A node that is
