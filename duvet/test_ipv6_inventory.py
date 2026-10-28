@@ -17,7 +17,7 @@ FINAL_RFCS = {9293, 2018, 6675, 8985, 9937, 6298, 5681, 6582, 6928, 7323,
               2883, 3168, 5961, 3042, 9406, 9438, 1191, 8201, 4821, 5927,
               7413, 6191, 6429, 791, 1122, 3542, 6864, 8200}
 CONTRACT = {
-    8200: (9, 6, 3, "Standards Track",
+    8200: (9, 9, 0, "Standards Track",
            "371ae3f133d562db5d6385e6def4ca9914c4f831be228ea7779fd28799c2f490",
            "c042188ee7e4e094dae253dc1d3ae8bcf239720d40c070ca0251986c2eba4d34"),
     3542: (7, 6, 1, "Informational",
@@ -84,11 +84,11 @@ class Ipv6Inventory(unittest.TestCase):
     def test_selected_gaps_and_unselected_capabilities_remain_distinct(self):
         ip = {r["id"]: r for r in ledger(8200)["paragraphs"]}
         for name in ("8200-hop", "8200-length", "8200-no-next"):
-            self.assertEqual(ip[name]["status"], "TODO")
+            self.assertEqual(ip[name]["status"], "covered")
             self.assertTrue(ip[name]["evidence"])
         self.assertIn("A node that is the destination", ip["8200-hop"]["quote"])
         self.assertIn("it should process the packet normally", ip["8200-hop"]["quote"])
-        self.assertIn("including a bare No Next Header", ip["8200-length"]["reason"])
+        self.assertIn("including zero", ip["8200-length"]["reason"])
         self.assertIn("any extension headers", ip["8200-length"]["quote"])
         self.assertIn("those octets must be ignored", ip["8200-no-next"]["quote"])
         self.assertEqual(ip["8200-extension-boundary"]["status"], "context")

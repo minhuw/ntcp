@@ -57,7 +57,7 @@ fn fullwidth_and_malformed_frames() {
     b[6] = 44;
     assert_eq!(parse(&b).unwrap_err(), Error::FragmentationUnsupported);
     b[4..6].fill(0);
-    assert_eq!(parse(&b).unwrap_err(), Error::JumbogramsUnsupported);
+    assert_eq!(parse(&b).unwrap_err(), Error::FragmentationUnsupported);
 }
 
 #[test]
@@ -183,28 +183,57 @@ fn base_header_fields_and_checked_quotes() {
 
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
 //= type=test
-//= reason=Live parse rejects Hop Limit zero as Invalid although the destination rule says to process it normally; checked quote parsing accepts zero. Tests pin zero rejection and positive 1/64/255 preservation. The whole receive obligation remains unresolved; forwarding/decrement behavior is outside the base endpoint codec and does not excuse the destination difference. Encoding also rejects zero.
+//= reason=This destination codec preserves all Hop Limit values, including zero, while checking structure and declared length. Forwarding and decrement rules remain outside the existing endpoint scope; originating parameter policy is unchanged.
 //# Hop Limit 8-bit unsigned integer. Decremented by 1 by each node that
 //# forwards the packet. When forwarding, the packet is discarded if Hop
 //# Limit was zero when received or is decremented to zero. A node that is
 //# the destination of a packet should not discard a packet with Hop Limit
 //# equal to zero; it should process the packet normally.
 #[test]
-fn destination_hop_limit_zero_remains_rejected() {
+fn destination_hop_limit_zero_is_processed_normally() {
+    // Construct the receive boundary independently of originating policy.
     let mut bytes = [0xa5; 60];
+    bytes[..8].copy_from_slice(&[0x69, 0x70, 0, 0, 0, 20, 6, 0]);
+    bytes[8..24].copy_from_slice(
+        &"2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+    );
+    bytes[24..40].copy_from_slice(
+        &"2001:db8::2".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+    );
     let mut t = tx(true, 20);
+    for hop in [0, 1, 64, 255] {
+        bytes[7] = hop;
+        let before = bytes;
+        let packet = parse(&bytes).unwrap();
+        assert_eq!(packet.hop_limit, hop);
+        assert_eq!(packet.ip, t.ip);
+        assert_eq!(packet.traffic_class, 0x97);
+        assert_eq!(packet.protocol, 6);
+        assert_eq!(packet.payload, &[0xa5; 20]);
+        for cut in [40, 48, 60] {
+            assert_eq!(
+                ntcp_ip6::quote_header(&bytes[..cut]).unwrap(),
+                (t.ip, 40, 60, 6)
+            );
+        }
+        assert_eq!(bytes, before);
+        assert_eq!(parse(&bytes[..39]).unwrap_err(), Error::Truncated);
+        assert_eq!(parse(&bytes[..59]).unwrap_err(), Error::Length);
+        let mut bad = bytes;
+        bad[0] = 0x49;
+        assert_eq!(parse(&bad).unwrap_err(), Error::Version);
+        for length in [0u16, 19, 21] {
+            let mut bad = bytes;
+            bad[4..6].copy_from_slice(&length.to_be_bytes());
+            assert_eq!(parse(&bad).unwrap_err(), Error::Length);
+        }
+    }
     for hop in [1, 64, 255] {
         t.hop_limit = hop;
         encode(&mut bytes, t).unwrap();
         assert_eq!(bytes[7], hop);
         assert_eq!(parse(&bytes).unwrap().hop_limit, hop);
-        assert_eq!(ntcp_ip6::quote_header(&bytes[..40]).unwrap(), (t.ip, 40, 60, 6));
     }
-    // A complete, otherwise valid packet addressed to the endpoint, not a
-    // forwarding fixture. This pins the known destination receive difference.
-    bytes[7] = 0;
-    assert_eq!(parse(&bytes).unwrap_err(), Error::Invalid);
-    assert_eq!(ntcp_ip6::quote_header(&bytes[..40]).unwrap(), (t.ip, 40, 60, 6));
     t.hop_limit = 0;
     let before = bytes;
     assert_eq!(encode(&mut bytes, t).unwrap_err(), Error::Invalid);
@@ -213,14 +242,14 @@ fn destination_hop_limit_zero_remains_rejected() {
 
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
 //= type=test
-//= reason=Positive lengths through 65535 and checked truncated quotes are implemented, but ipv6_bounds rejects every zero Payload Length as JumbogramsUnsupported, including a bare No Next Header packet without a Jumbo Payload option. Zero alone is not evidence of a jumbogram. Preserve the entire field definition including its extension-header qualification; extension processing remains an explicit unsupported boundary, not a justification for rejecting legal empty base packets.
+//= reason=Declared base-packet length is 40 plus the full unsigned 16-bit field, including zero; complete frames require exact bounds and checked quotes retain the original length when truncated. Extension headers, including Jumbo Payload options, remain explicitly unsupported under the existing scope.
 //# Payload Length 16-bit unsigned integer. Length of the IPv6 payload,
 //# i.e., the rest of the packet following this IPv6 header, in octets.
 //# (Note that any extension headers (see Section 4) present are considered
 //# part of the payload, i.e., included in the length count.)
 //= https://www.rfc-editor.org/rfc/rfc8200#section-4.7
 //= type=test
-//= reason=A zero-length base packet with selector 59 is rejected as JumbogramsUnsupported. With a positive length, the codec exposes selector 59 and uninterpreted trailing bytes; this alone does not establish the entire ignore obligation. Tests pin both boundaries. Extension-header traversal and forwarding are outside this endpoint codec, but legal empty base packets remain a selected-scope gap.
+//= reason=For base selector 59, empty and positive-length packets expose no transport payload after exact declared-bound checks; the borrowed input bytes and quoted length/protocol remain intact. Extension traversal and forwarding remain outside the existing endpoint scope.
 //# The value 59 in the Next Header field of an IPv6 header or any
 //# extension header indicates that there is nothing following that
 //# header. If the Payload Length field of the IPv6 header indicates the
@@ -234,29 +263,93 @@ fn payload_length_zero_and_no_next_header_boundaries() {
         let t = tx(true, payload);
         assert_eq!(encode(&mut bytes, t).unwrap(), 40 + payload);
         assert_eq!(u16::from_be_bytes([bytes[4], bytes[5]]) as usize, payload);
-        assert_eq!(parse(&bytes).unwrap().payload, &vec![0xa5; payload]);
-        assert_eq!(ntcp_ip6::quote_header(&bytes[..40]).unwrap(), (t.ip, 40, 40 + payload, 6));
-        assert_eq!(parse(&bytes[..bytes.len() - 1]).unwrap_err(), Error::Length);
-        bytes.push(0);
-        assert_eq!(parse(&bytes).unwrap_err(), Error::Length);
+        for protocol in [6, 58, 59, 253] {
+            bytes[6] = protocol;
+            let before = bytes.clone();
+            let parsed = parse(&bytes).unwrap();
+            assert_eq!(parsed.protocol, protocol);
+            assert_eq!(
+                parsed.payload,
+                if protocol == 59 { &[][..] } else { &bytes[40..] }
+            );
+            for cut in [40, 40 + payload / 2, bytes.len()] {
+                assert_eq!(
+                    ntcp_ip6::quote_header(&bytes[..cut]).unwrap(),
+                    (t.ip, 40, 40 + payload, protocol)
+                );
+            }
+            assert_eq!(bytes, before);
+            assert_eq!(parse(&bytes[..bytes.len() - 1]).unwrap_err(), Error::Length);
+            bytes.push(0);
+            assert_eq!(parse(&bytes).unwrap_err(), Error::Length);
+            bytes.pop();
+        }
     }
-    let mut bytes = [0xa5; 60];
-    encode(&mut bytes, tx(true, 20)).unwrap();
-    bytes[6] = 59;
-    let before = bytes;
-    let parsed = parse(&bytes).unwrap();
-    assert_eq!(parsed.protocol, 59);
-    assert_eq!(parsed.payload, &[0xa5; 20]);
-    assert_eq!(ntcp_ip6::quote_header(&bytes[..40]).unwrap().3, 59);
-    assert_eq!(bytes, before);
-    // No extension header or Jumbo Payload option exists in these 40 bytes.
-    bytes[4..6].fill(0);
-    for protocol in [6, 59] {
-        bytes[6] = protocol;
-        assert_eq!(parse(&bytes[..40]).unwrap_err(), Error::JumbogramsUnsupported);
-        assert_eq!(ntcp_ip6::ipv6_bounds(&bytes[..40]).unwrap_err(), Error::JumbogramsUnsupported);
-        assert_eq!(ntcp_ip6::quote_header(&bytes[..40]).unwrap_err(), Error::JumbogramsUnsupported);
+    // No extension header or Jumbo Payload option exists in this empty base
+    // packet. TCP, ICMP and unknown selectors defer their header checks upward.
+    let mut bytes = [0; 40];
+    bytes[0] = 0x60;
+    for hop in [0, 1, 64, 255] {
+        bytes[7] = hop;
+        for protocol in 0..=255u8 {
+            bytes[6] = protocol;
+            let before = bytes;
+            match protocol {
+                44 => {
+                    assert_eq!(parse(&bytes).unwrap_err(), Error::FragmentationUnsupported);
+                    assert_eq!(
+                        ntcp_ip6::quote_header(&bytes).unwrap_err(),
+                        Error::FragmentationUnsupported
+                    );
+                }
+                0 | 43 | 50 | 51 | 60 | 135 | 139 | 140 => {
+                    assert_eq!(parse(&bytes).unwrap_err(), Error::ExtensionsUnsupported);
+                    assert_eq!(
+                        ntcp_ip6::quote_header(&bytes).unwrap_err(),
+                        Error::ExtensionsUnsupported
+                    );
+                }
+                _ => {
+                    let parsed = parse(&bytes).unwrap();
+                    assert_eq!(parsed.hop_limit, hop);
+                    assert_eq!(parsed.protocol, protocol);
+                    assert!(parsed.payload.is_empty());
+                    assert_eq!(
+                        ntcp_ip6::quote_header(&bytes).unwrap(),
+                        (parsed.ip, 40, 40, protocol)
+                    );
+                    if protocol == 6 {
+                        assert!(matches!(
+                            ntcp::wire::parse(parsed.ip, parsed.payload),
+                            Err(ntcp::wire::WireError::Truncated)
+                        ));
+                    }
+                    let mut extra = bytes.to_vec();
+                    extra.push(0xa5);
+                    assert_eq!(parse(&extra).unwrap_err(), Error::Length);
+                    let mut truncated = bytes;
+                    truncated[4..6].copy_from_slice(&1u16.to_be_bytes());
+                    assert_eq!(parse(&truncated).unwrap_err(), Error::Length);
+                    assert_eq!(
+                        ntcp_ip6::quote_header(&truncated).unwrap(),
+                        (parsed.ip, 40, 41, protocol)
+                    );
+                }
+            }
+            assert_eq!(bytes, before);
+        }
     }
+    // An actual Jumbo Payload option remains behind the unsupported Hop-by-Hop
+    // boundary. Neither complete packets nor truncated quotes traverse it.
+    let mut jumbo = vec![0; 40 + 65536];
+    jumbo[0] = 0x60;
+    jumbo[7] = 64;
+    jumbo[40..48].copy_from_slice(&[6, 0, 0xc2, 4, 0, 1, 0, 0]);
+    assert_eq!(parse(&jumbo).unwrap_err(), Error::ExtensionsUnsupported);
+    assert_eq!(
+        ntcp_ip6::quote_header(&jumbo[..48]).unwrap_err(),
+        Error::ExtensionsUnsupported
+    );
     let before = bytes;
     assert_eq!(encode(&mut bytes, tx(true, 0)).unwrap_err(), Error::Invalid);
     assert_eq!(bytes, before);

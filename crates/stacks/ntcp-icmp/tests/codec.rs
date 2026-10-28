@@ -275,7 +275,15 @@ fn time_exceeded_quotes_allow_expired_inner_packets() {
         if !v6 {
             seal(&mut expired);
         }
-        assert_eq!(parse(&expired, false).unwrap_err(), Error::Invalid);
+        let before = expired.clone();
+        let packet = parse(&expired, false).unwrap();
+        assert_eq!(packet.hop_limit, 0);
+        assert_eq!(packet.protocol, 6);
+        let segment = ntcp::wire::parse(packet.ip, packet.payload).unwrap();
+        assert_eq!(segment.header.source_port, 1234);
+        assert_eq!(segment.header.destination_port, 8080);
+        assert_eq!(segment.header.sequence, 0x12345678);
+        assert_eq!(expired, before);
         for quote_len in [header + 8, expired.len()] {
             let mut error = error_packet(v6, &expired[..quote_len]);
             let ip = parse(&error, false).unwrap().ip;

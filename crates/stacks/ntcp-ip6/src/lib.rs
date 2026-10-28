@@ -14,8 +14,17 @@ pub struct Packet<'a> {
     pub payload: &'a [u8],
 }
 
+//= https://www.rfc-editor.org/rfc/rfc8200#section-4.7
+//= reason=For base selector 59, empty and positive-length packets expose no transport payload after exact declared-bound checks; the borrowed input bytes and quoted length/protocol remain intact. Extension traversal and forwarding remain outside the existing endpoint scope.
+//# The value 59 in the Next Header field of an IPv6 header or any
+//# extension header indicates that there is nothing following that
+//# header. If the Payload Length field of the IPv6 header indicates the
+//# presence of octets past the end of a header whose Next Header field
+//# contains 59, those octets must be ignored and passed on unchanged if
+//# the packet is forwarded.
+
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
-//= reason=Live parse rejects Hop Limit zero as Invalid although the destination rule says to process it normally; checked quote parsing accepts zero. Tests pin zero rejection and positive 1/64/255 preservation. The whole receive obligation remains unresolved; forwarding/decrement behavior is outside the base endpoint codec and does not excuse the destination difference. Encoding also rejects zero.
+//= reason=This destination codec preserves all Hop Limit values, including zero, while checking structure and declared length. Forwarding and decrement rules remain outside the existing endpoint scope; originating parameter policy is unchanged.
 //# Hop Limit 8-bit unsigned integer. Decremented by 1 by each node that
 //# forwards the packet. When forwarding, the packet is discarded if Hop
 //# Limit was zero when received or is decremented to zero. A node that is
@@ -23,9 +32,6 @@ pub struct Packet<'a> {
 //# equal to zero; it should process the packet normally.
 pub fn parse(bytes: &[u8]) -> Result<Packet<'_>, Error> {
     let total = ipv6_bounds(bytes)?;
-    if bytes[7] == 0 {
-        return Err(Error::Invalid);
-    }
     if total != bytes.len() {
         return Err(Error::Length);
     }
@@ -37,7 +43,13 @@ pub fn parse(bytes: &[u8]) -> Result<Packet<'_>, Error> {
         traffic_class: (bytes[0] << 4) | (bytes[1] >> 4),
         hop_limit: bytes[7],
         protocol: bytes[6],
-        payload: &bytes[40..],
+        // No Next Header hides the declared tail from transport consumers.
+        // The borrowed input and its declared bounds remain intact.
+        payload: if bytes[6] == 59 {
+            &bytes[40..40]
+        } else {
+            &bytes[40..]
+        },
     })
 }
 fn v6(b: &[u8]) -> Ipv6Addr {
@@ -50,19 +62,11 @@ fn v6(b: &[u8]) -> Ipv6Addr {
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
 //# Version 4-bit Internet Protocol version number = 6.
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
-//= reason=Positive lengths through 65535 and checked truncated quotes are implemented, but ipv6_bounds rejects every zero Payload Length as JumbogramsUnsupported, including a bare No Next Header packet without a Jumbo Payload option. Zero alone is not evidence of a jumbogram. Preserve the entire field definition including its extension-header qualification; extension processing remains an explicit unsupported boundary, not a justification for rejecting legal empty base packets.
+//= reason=Declared base-packet length is 40 plus the full unsigned 16-bit field, including zero; complete frames require exact bounds and checked quotes retain the original length when truncated. Extension headers, including Jumbo Payload options, remain explicitly unsupported under the existing scope.
 //# Payload Length 16-bit unsigned integer. Length of the IPv6 payload,
 //# i.e., the rest of the packet following this IPv6 header, in octets.
 //# (Note that any extension headers (see Section 4) present are considered
 //# part of the payload, i.e., included in the length count.)
-//= https://www.rfc-editor.org/rfc/rfc8200#section-4.7
-//= reason=A zero-length base packet with selector 59 is rejected as JumbogramsUnsupported. With a positive length, the codec exposes selector 59 and uninterpreted trailing bytes; this alone does not establish the entire ignore obligation. Tests pin both boundaries. Extension-header traversal and forwarding are outside this endpoint codec, but legal empty base packets remain a selected-scope gap.
-//# The value 59 in the Next Header field of an IPv6 header or any
-//# extension header indicates that there is nothing following that
-//# header. If the Payload Length field of the IPv6 header indicates the
-//# presence of octets past the end of a header whose Next Header field
-//# contains 59, those octets must be ignored and passed on unchanged if
-//# the packet is forwarded.
 pub fn ipv6_bounds(b: &[u8]) -> Result<usize, Error> {
     if b.len() < 40 {
         return Err(Error::Truncated);
@@ -71,9 +75,8 @@ pub fn ipv6_bounds(b: &[u8]) -> Result<usize, Error> {
         return Err(Error::Version);
     }
     let payload = usize::from(u16::from_be_bytes([b[4], b[5]]));
-    if payload == 0 {
-        return Err(Error::JumbogramsUnsupported);
-    }
+    // Zero is also the length of a legal empty base packet. Jumbo Payload
+    // options require Hop-by-Hop processing, which remains unsupported below.
     match b[6] {
         44 => return Err(Error::FragmentationUnsupported),
         0 | 43 | 50 | 51 | 60 | 135 | 139 | 140 => return Err(Error::ExtensionsUnsupported),

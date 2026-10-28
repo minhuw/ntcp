@@ -33,8 +33,8 @@
     {
       "id": "8200-length", "section": "3",
       "quote": "Payload Length 16-bit unsigned integer. Length of the IPv6 payload, i.e., the rest of the packet following this IPv6 header, in octets. (Note that any extension headers (see Section 4) present are considered part of the payload, i.e., included in the length count.)",
-      "status": "TODO",
-      "reason": "Positive lengths through 65535 and checked truncated quotes are implemented, but ipv6_bounds rejects every zero Payload Length as JumbogramsUnsupported, including a bare No Next Header packet without a Jumbo Payload option. Zero alone is not evidence of a jumbogram. Preserve the entire field definition including its extension-header qualification; extension processing remains an explicit unsupported boundary, not a justification for rejecting legal empty base packets.",
+      "status": "covered",
+      "reason": "Declared base-packet length is 40 plus the full unsigned 16-bit field, including zero; complete frames require exact bounds and checked quotes retain the original length when truncated. Extension headers, including Jumbo Payload options, remain explicitly unsupported under the existing scope.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
       "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn ipv6_bounds(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn payload_length_zero_and_no_next_header_boundaries()"]
     },
@@ -42,17 +42,17 @@
       "id": "8200-next", "section": "3",
       "quote": "Next Header 8-bit selector. Identifies the type of header immediately following the IPv6 header. Uses the same values as the IPv4 Protocol field [IANA-PN].",
       "status": "covered",
-      "reason": "Encoder emits TCP protocol 6; parser and checked quotes expose the exact selector for non-extension protocols. Known extension/fragment selectors are rejected explicitly. This field-format evidence does not claim extension traversal, unknown-protocol ICMP generation or full host demultiplexing; No Next Header processing is separately TODO.",
+      "reason": "Encoder emits TCP protocol 6; parser and checked quotes expose the exact selector for non-extension protocols. Known extension/fragment selectors are rejected explicitly. This field-format evidence does not claim extension traversal, unknown-protocol ICMP generation or full host demultiplexing; No Next Header processing is separately traced.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
       "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn quote_header(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
     },
     {
       "id": "8200-hop", "section": "3",
       "quote": "Hop Limit 8-bit unsigned integer. Decremented by 1 by each node that forwards the packet. When forwarding, the packet is discarded if Hop Limit was zero when received or is decremented to zero. A node that is the destination of a packet should not discard a packet with Hop Limit equal to zero; it should process the packet normally.",
-      "status": "TODO",
-      "reason": "Live parse rejects Hop Limit zero as Invalid although the destination rule says to process it normally; checked quote parsing accepts zero. Tests pin zero rejection and positive 1/64/255 preservation. The whole receive obligation remains unresolved; forwarding/decrement behavior is outside the base endpoint codec and does not excuse the destination difference. Encoding also rejects zero.",
+      "status": "covered",
+      "reason": "This destination codec preserves all Hop Limit values, including zero, while checking structure and declared length. Forwarding and decrement rules remain outside the existing endpoint scope; originating parameter policy is unchanged.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
-      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn parse(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn destination_hop_limit_zero_remains_rejected()"]
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn parse(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn destination_hop_limit_zero_is_processed_normally()"]
     },
     {
       "id": "8200-source", "section": "3",
@@ -73,10 +73,10 @@
     {
       "id": "8200-no-next", "section": "4.7",
       "quote": "The value 59 in the Next Header field of an IPv6 header or any extension header indicates that there is nothing following that header. If the Payload Length field of the IPv6 header indicates the presence of octets past the end of a header whose Next Header field contains 59, those octets must be ignored and passed on unchanged if the packet is forwarded.",
-      "status": "TODO",
-      "reason": "A zero-length base packet with selector 59 is rejected as JumbogramsUnsupported. With a positive length, the codec exposes selector 59 and uninterpreted trailing bytes; this alone does not establish the entire ignore obligation. Tests pin both boundaries. Extension-header traversal and forwarding are outside this endpoint codec, but legal empty base packets remain a selected-scope gap.",
+      "status": "covered",
+      "reason": "For base selector 59, empty and positive-length packets expose no transport payload after exact declared-bound checks; the borrowed input bytes and quoted length/protocol remain intact. Extension traversal and forwarding remain outside the existing endpoint scope.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-4.7",
-      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn ipv6_bounds(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn payload_length_zero_and_no_next_header_boundaries()"]
+      "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn parse(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn payload_length_zero_and_no_next_header_boundaries()"]
     },
     {
       "id": "8200-extension-boundary", "section": "4",

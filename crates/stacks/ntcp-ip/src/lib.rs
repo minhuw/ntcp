@@ -18,7 +18,7 @@ pub struct Packet<'a> {
 const IP_HEADER: usize = IPV4_HEADER;
 
 //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7
-//= reason=Live parse accepts TTL one but rejects TTL zero even with a correct checksum; structural ICMP quote parsing accepts both. Preserve the complete host receive obligation and observed codec difference.
+//= reason=Endpoint parsing accepts every TTL, including zero and one, after structural and checksum validation; originating TTL zero remains invalid.
 //# A host MUST NOT discard a datagram just because it was received with TTL
 //# less than 2.
 
@@ -36,9 +36,6 @@ const IP_HEADER: usize = IPV4_HEADER;
 // Selected endpoint codec only: options are exposed in Packet; no ID is exposed.
 pub fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Packet<'_>, Error> {
     let (header, total) = ipv4_bounds(bytes)?;
-    if bytes[8] == 0 {
-        return Err(Error::Invalid);
-    }
     if total != bytes.len() {
         return Err(Error::Length);
     }
@@ -107,8 +104,7 @@ pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
     if checksum(&b[..header]) != 0 {
         return Err(Error::Checksum);
     }
-    // ICMP quotes can contain the expired packet that triggered the error.
-    // Live-packet hop-limit policy is enforced by parse, not structural bounds.
+    // Destination packets and ICMP quotes may both have an expired TTL.
     Ok((header, total))
 }
 //= https://www.rfc-editor.org/rfc/rfc1191#section-2

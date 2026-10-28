@@ -274,7 +274,7 @@ fn atomic_identification_is_arbitrary_and_ignored() {
 
 //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7
 //= type=test
-//= reason=Live parse accepts TTL one but rejects TTL zero even with a correct checksum; structural ICMP quote parsing accepts both. Preserve the complete host receive obligation and observed codec difference.
+//= reason=Endpoint parsing accepts every TTL, including zero and one, after structural and checksum validation; originating TTL zero remains invalid.
 //# A host MUST NOT discard a datagram just because it was received with TTL
 //# less than 2.
 
@@ -297,15 +297,62 @@ fn ipv4_ttl_parameters_and_receive_zero_boundary() {
         assert_eq!(bytes[8], ttl);
         assert_eq!(parse(&bytes[..len], false).unwrap().hop_limit, ttl);
     }
-    for ttl in [0, 1] {
+    // Construct received headers directly: the originating API prohibits TTL 0.
+    bytes[..20].copy_from_slice(&[
+        0x45, 0x97, 0, 40, 0, 0, 0x40, 0, 0, 6, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2,
+    ]);
+    for ttl in [0, 1, 64, 255] {
         bytes[8] = ttl;
         seal(&mut bytes);
-        assert!(ntcp_ip::quote_header(&bytes[..20]).is_ok());
-        if ttl == 0 {
-            assert_eq!(parse(&bytes[..40], false).unwrap_err(), Error::Invalid);
-        } else {
-            assert_eq!(parse(&bytes[..40], false).unwrap().hop_limit, 1);
+        let before = bytes;
+        assert_eq!(checksum(&bytes[..20]), 0);
+        let packet = parse(&bytes[..40], false).unwrap();
+        assert_eq!(packet.hop_limit, ttl);
+        assert_eq!(packet.ip, transmit.ip);
+        assert_eq!(packet.protocol, 6);
+        assert_eq!(packet.traffic_class, 0x97);
+        assert_eq!(packet.payload, &[0xa5; 20]);
+        for cut in [20, 28, 40] {
+            assert_eq!(
+                ntcp_ip::quote_header(&bytes[..cut]).unwrap(),
+                (transmit.ip, 20, 40, 6)
+            );
         }
+        assert_eq!(bytes, before);
+
+        let mut bad = bytes;
+        bad[12] ^= 1;
+        assert_eq!(parse(&bad[..40], false).unwrap_err(), Error::Checksum);
+        assert_eq!(
+            ntcp_ip::quote_header(&bad[..20]).unwrap_err(),
+            Error::Checksum
+        );
+        bad = bytes;
+        bad[0] = 0x65;
+        seal(&mut bad);
+        assert_eq!(parse(&bad[..40], false).unwrap_err(), Error::Version);
+        for declared in [19u16, 39, 41] {
+            let mut bad = bytes;
+            bad[2..4].copy_from_slice(&declared.to_be_bytes());
+            seal(&mut bad);
+            assert_eq!(parse(&bad[..40], false).unwrap_err(), Error::Length);
+        }
+        for flags in [0x8000u16, 0x2000, 1, 0x4001] {
+            let mut bad = bytes;
+            bad[6..8].copy_from_slice(&flags.to_be_bytes());
+            seal(&mut bad);
+            assert_eq!(
+                parse(&bad[..40], false).unwrap_err(),
+                Error::FragmentationUnsupported
+            );
+            assert_eq!(
+                ntcp_ip::quote_header(&bad[..20]).unwrap_err(),
+                Error::FragmentationUnsupported
+            );
+        }
+        assert_eq!(parse(&bytes[..19], false).unwrap_err(), Error::Truncated);
+        assert_eq!(parse(&bytes[..39], false).unwrap_err(), Error::Length);
+        assert_eq!(parse(&bytes[..41], false).unwrap_err(), Error::Length);
     }
 }
 

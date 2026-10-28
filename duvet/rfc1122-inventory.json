@@ -45,8 +45,8 @@
       "id": "1122-ttl-receive",
       "section": "3.2.1.7",
       "quote": "A host MUST NOT discard a datagram just because it was received with TTL less than 2.",
-      "status": "TODO",
-      "reason": "Live parse accepts TTL one but rejects TTL zero even with a correct checksum; structural ICMP quote parsing accepts both. Preserve the complete host receive obligation and observed codec difference.",
+      "status": "covered",
+      "reason": "Endpoint parsing accepts every TTL, including zero and one, after structural and checksum validation; originating TTL zero remains invalid.",
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.7",
       "evidence": [
         "crates/stacks/ntcp-ip/src/lib.rs::pub fn parse(",

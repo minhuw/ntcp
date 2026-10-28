@@ -17,7 +17,7 @@ from test_annotation_inventory import report_fixture, report_scopes
 CONTRACT = {
     791: (19, 16, 3, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
           "823132a1638cd0fc39160740de5ecd34c696a65f03fbb863122ffffaaf961e8d"),
-    1122: (16, 12, 4, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
+    1122: (16, 13, 3, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
            "140d6afa98dde87d39941c1863076d8fa41864673c357689e1d81f343880960d"),
     6864: (4, 4, 0, "e00ff443857166e5b26deecfdc77a0a1c5ff17fc87a6a8c50b020ce7f4d516d9",
            "586eabdc924e7104e828cf54cbeddfcdd85f11c2e2ac5e1cc48e5379eba9e772"),
@@ -84,7 +84,9 @@ class Ipv4Inventory(unittest.TestCase):
         self.assertEqual(rows["6864-atomic-definition"]["quote"],
                          "Atomic datagrams: (DF==1)&&(MF==0)&&(frag_offset==0)")
         self.assertEqual(rows["6864-nonatomic-boundary"]["status"], "context")
-        for id in ("1122-options-pass", "1122-ttl-receive", "1122-timestamp-destination", "1122-timestamp-value"):
+        self.assertEqual(next(r for r in ledger(1122)["paragraphs"]
+                              if r["id"] == "1122-ttl-receive")["status"], "covered")
+        for id in ("1122-options-pass", "1122-timestamp-destination", "1122-timestamp-value"):
             self.assertEqual(next(r for r in ledger(1122)["paragraphs"] if r["id"] == id)["status"], "TODO")
         parent = next(r for r in ledger(791)["paragraphs"] if r["id"] == "791-total-context")
         child = next(r for r in ledger(791)["paragraphs"] if r["id"] == "791-total")
