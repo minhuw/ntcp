@@ -100,7 +100,7 @@ existing intermediate system, or that it should be able to establish one dynamic
 # 5927-049
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
-reason = "Ephemeral-port randomization is separate security-policy behavior; this PMTU audit has not established entropy/range tests for native allocation. Informational recommendation remains unclosed, not a mandatory TCP norm."
+reason = "Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence."
 quote = '''
 As discussed in the previous sections, in order to perform any of the attacks described in this document, an attacker would need to guess (or know) the four-tuple that identifies the connection to be attacked. Increasing the port number range used for outgoing TCP connections, and randomizing the port number chosen for each outgoing TCP connection, would make it harder for an attacker to perform any of the attacks discussed in this document.
 '''
@@ -108,7 +108,7 @@ As discussed in the previous sections, in order to perform any of the attacks de
 # 5927-050
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
-reason = "Ephemeral-port randomization is separate security-policy behavior; this PMTU audit has not established entropy/range tests for native allocation. Informational recommendation remains unclosed, not a mandatory TCP norm."
+reason = "Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence."
 quote = '''
 [PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.
 '''

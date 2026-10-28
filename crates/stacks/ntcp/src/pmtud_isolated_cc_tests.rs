@@ -187,6 +187,253 @@ fn isolated_probe_cc_real_receiver_recovery_matrix() {
     }
 }
 
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+//= type=test
+//# Before sending a probe, the flow MUST meet at least the following conditions:
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+//= type=test
+//# o It has no outstanding probes or losses.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+//= type=test
+//# o If the last probe failed or was inconclusive, then the probe timeout has expired (see Section 7.6.2).
+//= https://www.rfc-editor.org/rfc/rfc4821#section-2
+//= type=test
+//# The most likely (and least serious) probe failure is due to the link experiencing congestion-related losses while probing. In this case, it is appropriate to retry a probe of the same size as soon as the Packetization Layer has fully adapted to the congestion and recovered from the losses. In other cases, additional losses or timeouts indicate problems with the link or Packetization Layer. In these situations, it is desirable to use longer delays depending on the severity of the error.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.4
+//= type=test
+//# The presence of other losses near the loss of the probe may indicate that the probe was lost due to congestion rather than due to an MTU limitation. In this case, the state variables eff_pmtu, search_low, and search_high SHOULD NOT be updated, and the same-sized probe SHOULD be attempted again as soon as the probing preconditions are met (i.e., once the packetization layer has no outstanding unrecovered losses). At this point, it is particularly appropriate to re-probe since the flow's congestion window will be at its lowest point, minimizing the probability of congestive losses.
+fn probe_admission_real_loss_recovery_and_cooldown_output() {
+    for mode in 0..3 {
+        for prr in [false, true] {
+            for failure in 0..3 {
+                let second_hole = failure == 1;
+                let mut cfg = isolated_config(mode, prr, false, false);
+                cfg.pmtud.as_mut().unwrap().initial_mtu = Some(1024);
+                let (mut a, mut b) = pair(cfg, u32::MAX - 4000);
+                a.write(b"x").unwrap();
+                deliver(&mut a, &mut b, 32);
+                deliver(&mut b, &mut a, 33);
+                a.write(&[7; 30_000]).unwrap();
+                let first = packet(&mut a, 40); // Drop just the probe, or a second trailing hole too.
+                let probe = a.pmtud.as_ref().unwrap().probe.unwrap();
+                assert_eq!(first.len() + 20, probe.size as usize);
+                assert!(probe.size > 1024);
+                let before = a.path_mtu_info().unwrap();
+                let mut trailing = Vec::new();
+                for _ in 0..8 {
+                    let bytes = packet(&mut a, 41);
+                    assert!(bytes.len() + 20 <= 1024);
+                    assert_eq!(a.pmtud.as_ref().unwrap().probe.unwrap().start, probe.start);
+                    trailing.push(bytes);
+                }
+                let mut now = 140;
+                for (n, bytes) in trailing.iter().enumerate() {
+                    if second_hole && n == 5 {
+                        continue;
+                    }
+                    real_ack(&mut a, &mut b, bytes, now, false);
+                }
+                if !a.congestion.in_recovery() {
+                    now = a.rack.deadline.expect("RACK loss detection");
+                    a.timeout(now).unwrap();
+                }
+                assert!(a.congestion.in_recovery());
+                let timeout_deadline = if failure == 2 {
+                    // Drop the first repair too, then let the actual data RTO fire.
+                    let bytes = packet(&mut a, now + 1);
+                    assert!(bytes.len() + 20 <= 1024);
+                    now = a.rto_deadline.unwrap();
+                    a.timeout(now).unwrap();
+                    assert_eq!(a.consecutive_timeouts, 1);
+                    let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
+                    assert!(deadline >= now + 5 * a.rto());
+                    assert_eq!(a.congestion.cwnd(), a.mss as u32);
+                    Some(deadline)
+                } else {
+                    None
+                };
+                for _ in 0..64 {
+                    now += 1;
+                    let mut out = [0; 2000];
+                    let Some(len) = a.transmit(now, &mut out).unwrap() else {
+                        now = a.next_deadline().expect("probe repair needs a loss timer");
+                        a.timeout(now).unwrap();
+                        continue;
+                    };
+                    // OUTPUT, not merely target(): recovery never emits a new oversized probe.
+                    assert!(len + 20 <= 1024);
+                    real_ack(&mut a, &mut b, &out[..len], now, false);
+                    if second_hole {
+                        assert_eq!(a.path_mtu_info().unwrap(), before);
+                    }
+                    if a.pmtud.as_ref().unwrap().probe.is_none() {
+                        break;
+                    }
+                }
+                assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+                assert!(!a.congestion.in_recovery());
+                assert!(a.prr.is_none());
+                assert_eq!(a.flight(), 0);
+                let info = a.path_mtu_info().unwrap();
+                assert_eq!(info.current_mtu, before.current_mtu);
+                assert_eq!(info.search_low, before.search_low);
+                if second_hole {
+                    assert_eq!(info.search_high, before.search_high);
+                    assert!(a.pmtud.as_ref().unwrap().deadline.is_none());
+                } else {
+                    if failure == 0 {
+                        assert_eq!(info.search_high, probe.size - 1);
+                    }
+                    let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
+                    if let Some(timeout_deadline) = timeout_deadline {
+                        assert!(deadline >= timeout_deadline);
+                    }
+                    let needed =
+                        ((info.search_low + info.search_high).div_ceil(2) - 40) + 3 * a.mss as u32;
+                    for _ in 0..16 {
+                        if a.congestion.cwnd() >= needed {
+                            break;
+                        }
+                        now += 1;
+                        assert!(now < deadline - 1);
+                        let bytes = packet(&mut a, now);
+                        assert!(bytes.len() + 20 <= 1024);
+                        assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+                        real_ack(&mut a, &mut b, &bytes, now, false);
+                    }
+                    assert!(a.congestion.cwnd() >= needed);
+                    assert!(a.snd_wnd >= needed);
+                    a.timeout(deadline - 1).unwrap();
+                    let bytes = packet(&mut a, deadline - 1);
+                    assert!(bytes.len() + 20 <= 1024);
+                    assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+                    real_ack(&mut a, &mut b, &bytes, deadline - 1, false);
+                    a.timeout(deadline).unwrap();
+                    now = deadline - 1;
+                }
+                // Grow the ordinary congestion window if recovery left too little
+                // credit for a probe plus its trailing window. Every ACK is real.
+                let mut next = None;
+                for _ in 0..32 {
+                    now += 1;
+                    let probe_room = a
+                        .snd_wnd
+                        .min(a.congestion.cwnd())
+                        .saturating_sub(a.flight());
+                    let bytes = packet(&mut a, now);
+                    if let Some(probe) = a.pmtud.as_ref().unwrap().probe {
+                        assert_eq!(bytes.len() + 20, probe.size as usize);
+                        next = Some(probe);
+                        break;
+                    }
+                    if second_hole {
+                        assert!(
+                            probe_room < probe.size - 40 + 3 * a.mss as u32,
+                            "same-size retry must occur as soon as congestion credit permits"
+                        );
+                    }
+                    assert!(
+                        failure != 0,
+                        "isolated failure must re-probe at the expiry boundary"
+                    );
+                    assert!(bytes.len() + 20 <= 1024);
+                    real_ack(&mut a, &mut b, &bytes, now, false);
+                }
+                let next = next.expect("probe admission must resume after recovery and cooldown");
+                assert!(next.size > 1024);
+                if second_hole {
+                    assert_eq!(next.size, probe.size);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+//= type=test
+//# o It has no outstanding probes or losses.
+fn probe_admission_ordinary_loss_without_active_probe() {
+    for mode in 0..3 {
+        for prr in [false, true] {
+            for rto in [false, true] {
+                let mut cfg = isolated_config(mode, prr, false, false);
+                cfg.pmtud.as_mut().unwrap().initial_mtu = Some(1024);
+                let (mut a, mut b) = pair(cfg, 0);
+                a.write(b"x").unwrap();
+                deliver(&mut a, &mut b, 32);
+                deliver(&mut b, &mut a, 33);
+                let mut flight = Vec::new();
+                for _ in 0..8 {
+                    // Each write is too short to admit a probe and its tail.
+                    a.write(&[8; 984]).unwrap();
+                    let bytes = packet(&mut a, 40);
+                    assert_eq!(bytes.len() + 20, 1024);
+                    assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+                    flight.push(bytes);
+                }
+                let mut now = 140;
+                if rto {
+                    now = a.rto_deadline.unwrap();
+                    a.timeout(now).unwrap();
+                    assert_eq!(a.consecutive_timeouts, 1);
+                } else {
+                    for bytes in &flight[1..] {
+                        real_ack(&mut a, &mut b, bytes, now, false);
+                    }
+                    if !a.congestion.in_recovery() {
+                        now = a.rack.deadline.unwrap();
+                        a.timeout(now).unwrap();
+                    }
+                    assert!(a.congestion.in_recovery());
+                }
+                // PMTUD itself is ready. Transport loss recovery must veto it.
+                assert!(a.pmtud.as_ref().unwrap().target().is_some());
+                a.write(&[9; 30_000]).unwrap();
+                let recovery_end = a.snd_nxt;
+                for _ in 0..64 {
+                    now += 1;
+                    let mut out = [0; 2000];
+                    let len = match a.transmit(now, &mut out).unwrap() {
+                        Some(len) => len,
+                        None => {
+                            now = a.next_deadline().expect("outstanding loss needs a timer");
+                            a.timeout(now).unwrap();
+                            continue;
+                        }
+                    };
+                    assert!(len + 20 <= 1024);
+                    assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+                    real_ack(&mut a, &mut b, &out[..len], now, false);
+                    if a.snd_una.at_or_after(recovery_end) {
+                        break;
+                    }
+                }
+                assert!(a.snd_una.at_or_after(recovery_end));
+                assert!(!a.congestion.in_recovery());
+                assert!(a.sack_recovery.is_none());
+                assert!(a.sack_post_rto.is_none());
+                assert!(a.prr.is_none());
+                assert_eq!(a.consecutive_timeouts, 0);
+                let mut resumed = false;
+                for _ in 0..32 {
+                    now += 1;
+                    let bytes = packet(&mut a, now);
+                    if let Some(probe) = a.pmtud.as_ref().unwrap().probe {
+                        assert_eq!(bytes.len() + 20, probe.size as usize);
+                        assert!(probe.size > 1024);
+                        resumed = true;
+                        break;
+                    }
+                    real_ack(&mut a, &mut b, &bytes, now, false);
+                }
+                assert!(resumed, "mode={mode}, prr={prr}, rto={rto}");
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Disqualifier {
     Leading,

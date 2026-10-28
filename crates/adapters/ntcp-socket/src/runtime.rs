@@ -1403,6 +1403,12 @@ impl Owner {
         self.sockets.insert(id, s);
         Ok(id as i32)
     }
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
+    //= reason=Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence.
+    //# As discussed in the previous sections, in order to perform any of the attacks described in this document, an attacker would need to guess (or know) the four-tuple that identifies the connection to be attacked. Increasing the port number range used for outgoing TCP connections, and randomizing the port number chosen for each outgoing TCP connection, would make it harder for an attacker to perform any of the attacks discussed in this document.
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
+    //= reason=Native Owner::port starts at 40000, scans up to 20000 choices, increments sequentially, wraps 59999 to 40000 and skips occupied local ports. It does not randomize ephemeral allocation. The full Informational range/randomization recommendation remains TODO; a bounded sequential range is not entropy evidence.
+    //# [PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.
     fn port(&mut self) -> Result<u16> {
         #[cfg(feature = "packet-test")]
         if self.packets.is_some() && self.next_port >= 60000 {

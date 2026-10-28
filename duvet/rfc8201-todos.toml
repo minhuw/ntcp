@@ -51,7 +51,7 @@ Path MTU Discovery supports multicast as well as unicast destinations. In the ca
 # 8201-031
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
-reason = "The enabled core has no same-link bypass, but no exact test models a destination treated as on-link via a proxy with a smaller downstream PMTU. Retain that scenario evidence gap, not a requirement for native IPv6 sockets."
+reason = "The enabled core has no same-link bypass. ipv6_same_prefix_proxy_wire_path_does_not_bypass_downstream_ptb already verifies 1500-to-1280 feedback, bounded repair and real receiver progress for a same-/64 peer, but explicitly does not exercise Neighbor Discovery, proxy configuration or route selection. Applicability to a node actually treating a proxied destination as on-link remains unestablished; this is not a native-IPv6-socket requirement."
 quote = '''
 Note that Path MTU Discovery must be performed even in cases where a node "thinks" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.
 '''
@@ -75,7 +75,7 @@ MMS_S is a transport message size calculated by subtracting the size of the IPv6
 # 8201-052
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "Connection-local tuple is the selected representation of a path. The remaining full-span evidence gap is multi-interface/per-IPv6-link identity and isolation; this paragraph permits choosing a representation and does not itself require a shared cache or Routing Header parser."
+reason = "Connection-local tuples are the selected path representation, and distinct-local-address PTB isolation is tested. Endpoint rejects nonzero IPv6 scope IDs; ipv6_endpoint_rejects_scoped_link_identity_instead_of_claiming_interface_isolation pins rejection for two link-local scopes. Thus per-IPv6-link PMTU maintenance on multiple interfaces is unsupported/unestablished, not merely missing a distinct-address test. The full paragraph remains TODO without inventing a shared-cache requirement."
 quote = '''
 Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.
 '''
@@ -219,7 +219,7 @@ quote = '''
 # 8201-081
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
-reason = "No administrative API sets an arbitrary path PMTU estimate; lower_mss only establishes an independent send ceiling."
+reason = "Endpoint::set_destination_route and set_route_mtu configure same-path transport ceilings rather than an arbitrary learned path PMTU estimate. Removing or raising a ceiling does not raise effective PMTU without ACK proof, and no system-utility PMTU-cache setter is exposed; lower_mss is another independent send ceiling."
 quote = '''
 - Change the PMTU value associated with a given path.
 '''

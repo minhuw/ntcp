@@ -8074,6 +8074,10 @@ impl Connection {
             //# It has no outstanding probes or losses.
             // Leading/trailing retransmissions are tracked through cumulative
             // delivery, so an isolated loss is never inferred prematurely.
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+            //# Before sending a probe, the flow MUST meet at least the following conditions:
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+            //# o It has no outstanding probes or losses.
             let candidate = self.pmtud.as_ref().and_then(|p| p.target()).filter(|_| {
                 !early_response
                     && self.rtt.srtt().is_some()

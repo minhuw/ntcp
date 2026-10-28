@@ -91,7 +91,7 @@ in the MSS option. The MSS option should be 40 octets less than the size of the 
 # 1191-025
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
-reason = "The configured receive MSS is not proven bounded by the maximum connected-link MTU for this recommendation; current PMTUD tests deliberately allow receive MSS1460 with a smaller send-path MTU. No evidence of a sign-bit bug is claimed."
+reason = "receive_mss_offer caps configured MSS by receive_ip_payload_limit, user_mss and advertised_mss, but not by the maximum connected-link MTU. Tests intentionally retain MSS1460 with a smaller send-path MTU. The whole host recommendation remains TODO; no sign-bit bug is alleged."
 quote = '''
 Note: At the moment, we see no reason to send an MSS greater than the maximum MTU of the connected networks, and we recommend that hosts do not use 65495. It is quite possible that some IP implementations have sign-bit bugs that would be tickled by unnecessary use of such a large MSS.
 '''
@@ -347,7 +347,7 @@ quote = '''
 # 1191-092
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
-reason = "No administrative API sets an arbitrary per-route PMTU estimate. lower_mss is a send ceiling, not a route-cache setter."
+reason = "Endpoint::set_destination_route and set_route_mtu expose same-path transport ceilings, and lower_mss supplies a send ceiling. None sets an arbitrary learned per-route IP PMTU estimate or exposes the suggested system-utility route-cache control; relaxing a ceiling still requires ACK proof for growth."
 quote = '''
 - Change the PMTU value associated with a given route.
 '''

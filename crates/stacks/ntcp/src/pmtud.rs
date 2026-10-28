@@ -242,6 +242,8 @@ impl Pmtud {
     //# When transmitting probes, the Packetization Layer MUST select a probe size that is
     //# larger than search_low and smaller than or equal to search_high.
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+    //# o If the last probe failed or was inconclusive, then the probe timeout has expired (see Section 7.6.2).
     pub fn target(&self) -> Option<u32> {
         if self.deadline.is_some()
             || self.periodic_deadline.is_some()
@@ -813,6 +815,10 @@ impl Pmtud {
     //# smaller than the probe size. In this case alone, the loss SHOULD NOT be
     //# interpreted as congestion signal.
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-2
+    //# The most likely (and least serious) probe failure is due to the link experiencing congestion-related losses while probing. In this case, it is appropriate to retry a probe of the same size as soon as the Packetization Layer has fully adapted to the congestion and recovered from the losses. In other cases, additional losses or timeouts indicate problems with the link or Packetization Layer. In these situations, it is desirable to use longer delays depending on the severity of the error.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.4
+    //# The presence of other losses near the loss of the probe may indicate that the probe was lost due to congestion rather than due to an MTU limitation. In this case, the state variables eff_pmtu, search_low, and search_high SHOULD NOT be updated, and the same-sized probe SHOULD be attempted again as soon as the probing preconditions are met (i.e., once the packetization layer has no outstanding unrecovered losses). At this point, it is particularly appropriate to re-probe since the flow's congestion window will be at its lowest point, minimizing the probability of congestive losses.
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
         if self
             .repair_range
@@ -1035,6 +1041,8 @@ impl Pmtud {
     //# interval until the next probe. A time interval that is five times the
     //# non-timeout failure case (Section 7.6.2) is RECOMMENDED.
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+    //# If there is a full-stop timeout and there was not an ICMP message indicating a reason (PTB, Net unreachable, etc., or the ICMP message was ignored for some reason), the RECOMMENDED first recovery action is to treat this as a detected ICMP black hole as defined in [RFC2923].
     pub fn timeout(&mut self, now: Instant, head: Seq, consecutive: u32, cooldown: u64) {
         if let Some((seq, mtu)) = self.pending.take() {
             // Only the quoted data's timeout authorizes a deferred decrease.

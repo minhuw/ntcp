@@ -729,26 +729,76 @@ fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry() {
 //# conservatively low, but performance may be better if eff_pmtu starts at a higher,
 //# less conservative, value. See Section 7.2.
 
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+//= type=test
+//# If there is a full-stop timeout and there was not an ICMP message indicating a reason (PTB, Net unreachable, etc., or the ICMP message was ignored for some reason), the RECOMMENDED first recovery action is to treat this as a detected ICMP black hole as defined in [RFC2923].
 fn pmtud_full_stop_r1_halving_and_normal_congestion_response() {
     for ipv4 in [true, false] {
-        let (mut a, _) = family_pair(cfg(1500), ipv4, 0);
-        a.write(&[7; 1400]).unwrap();
-        packet(&mut a, 40);
-        for count in 1..=8 {
-            let expiry = a.loss_timer.unwrap().1;
-            a.timeout(expiry).unwrap();
-            assert_eq!(a.consecutive_timeouts, count);
-            let expected = if count < 3 {
-                1500
-            } else if !ipv4 {
-                1280
-            } else {
-                (1024u32 >> (count - 3)).max(68)
+        for feedback in 0..4 {
+            let (mut a, _) = family_pair(cfg(1500), ipv4, 0);
+            a.write(&[7; 1400]).unwrap();
+            let original = wire_packet(&mut a, 40, OutgoingIpv4Options::default());
+            // A stale quote cannot explain the current full stop.
+            assert!(
+                !a.network_error(41, a.snd_nxt.0, NetworkError::SoftUnreachable)
+                    .unwrap()
+            );
+            let known_mtu = match feedback {
+                1 => {
+                    assert!(
+                        a.network_error(42, a.snd_una.0, NetworkError::SoftUnreachable)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        a.take_events().network_error,
+                        Some(NetworkError::SoftUnreachable)
+                    );
+                    Some(1500)
+                }
+                2 => {
+                    assert!(
+                        !a.network_error(42, a.snd_una.0, NetworkError::SourceQuench)
+                            .unwrap()
+                    );
+                    assert_eq!(a.take_events().network_error, None);
+                    None
+                }
+                3 => {
+                    let mtu = if ipv4 { 1006 } else { 1280 };
+                    assert!(
+                        a.pmtu_feedback(
+                            42,
+                            a.snd_una.0,
+                            original.len() as u32,
+                            if ipv4 { 20 } else { 40 },
+                            mtu
+                        )
+                        .unwrap()
+                    );
+                    Some(mtu)
+                }
+                _ => None,
             };
-            assert_eq!(a.path_mtu_info().unwrap().current_mtu, expected);
-            let retry = wire_packet(&mut a, expiry, OutgoingIpv4Options::default());
-            assert!(retry.len() <= expected as usize);
-            assert_eq!(a.congestion.cwnd(), a.mss as u32);
+            assert_eq!(a.state(), State::Established);
+            for count in 1..=8 {
+                let expiry = a.loss_timer.unwrap().1;
+                a.timeout(expiry).unwrap();
+                assert_eq!(a.consecutive_timeouts, count);
+                let expected = if let Some(mtu) = known_mtu {
+                    mtu
+                } else if count < 3 {
+                    1500
+                } else if !ipv4 {
+                    1280
+                } else {
+                    (1024u32 >> (count - 3)).max(68)
+                };
+                assert_eq!(a.path_mtu_info().unwrap().current_mtu, expected);
+                let retry = wire_packet(&mut a, expiry, OutgoingIpv4Options::default());
+                assert!(retry.len() <= expected as usize);
+                assert_eq!(a.congestion.cwnd(), a.mss as u32);
+                assert_eq!(a.state(), State::Established);
+            }
         }
     }
 }

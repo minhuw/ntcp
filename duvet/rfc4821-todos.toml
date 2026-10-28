@@ -19,17 +19,9 @@ The isolated loss of a probe packet (with or without an ICMP Packet Too Big mess
 # 4821-012
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "Partial evidence gap after 76800de: real receiver timeout/other-loss traces now establish normal congestion response and preservation of the fivefold timeout hold; pure PMTUD timeout tests pin exact deadlines. The full inconclusive/resume sequence is not established by an integrated next-probe assertion after actual timeout recovery. Timeout-only repair can narrow search_high after trailing delivery; do not infer the full inconclusive-result clause from congestion-response tests alone."
+reason = "Mixed behavior/evidence gap: real receiver loss and repair-RTO traces now reach a subsequent emitted probe after normal congestion response and the longer timeout cooldown. Multiple-loss recovery preserves bounds, but timeout-only repair can still narrow search_high after trailing delivery in Pmtud::ack; pmtud_probe_timeout_cooldown_inconclusive_and_unambiguous_ack asserts that concrete difference from an inconclusive result. Retain the entire timeout-or-additional-loss obligation."
 quote = '''
 If there is a timeout or additional packets are lost during the probing process, the probe is considered to be inconclusive (e.g., the lost probe does not necessarily indicate that the probe exceeded the Path MTU). Furthermore, the losses are treated like any other congestion indication: window or rate adjustments are mandatory per the relevant congestion control standards [RFC2914]. Probing can resume after a delay that is determined by the nature of the detected failure.
-'''
-
-# 4821-014
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "Evidence gap: inconclusive loss preserves bounds, but the next emitted same-sized probe after recovery is not asserted (144). Timeout delay is separately audited at 143."
-quote = '''
-The most likely (and least serious) probe failure is due to the link experiencing congestion-related losses while probing. In this case, it is appropriate to retry a probe of the same size as soon as the Packetization Layer has fully adapted to the congestion and recovered from the losses. In other cases, additional losses or timeouts indicate problems with the link or Packetization Layer. In these situations, it is desirable to use longer delays depending on the severity of the error.
 '''
 
 # 4821-018
@@ -59,7 +51,7 @@ All links MUST enforce their MTU: links that might non- deterministically delive
 # 4821-062
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Evidence gap limited to DF integration: ntcp-ip encode_ipv4 sets DF and TCP does not offer source fragmentation, but a PMTUD end-to-end codec test covering control, probe and repaired packets is not recorded for this complete span. Host datagram fragmentation is outside this TCP API; congestion suppression and shared caches are unrelated."
+reason = "The IPv4 codec encode_present sets DF and never emits fragments; ipv4_bounds rejects fragment input. TCP avoids source fragmentation. Full host-fragmentation advice and actual-codec control/probe/repair DF integration are not established by the hand-built wire_packet test wrapper. Preserve the whole host/IP recommendation as TODO; absence of a fragmentation API is not a scope exception."
 quote = '''
 All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 '''
@@ -250,30 +242,6 @@ quote = '''
 Some protocols may use other mechanisms to choose the probe sizes. For example, protocols that have certain natural data block sizes might simply assemble messages from a number of blocks until the total size is smaller than search_high, and if possible larger than search_low.
 '''
 
-# 4821-124
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
-reason = "Evidence gap for the following mandatory admission list: queue/window gates are tested at 127-129, but explicit attempted output while recovery/loss is outstanding is not recorded at 125. This list introduction inherits only its actual admission clauses."
-quote = '''
-Before sending a probe, the flow MUST meet at least the following conditions:
-'''
-
-# 4821-125
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
-reason = "Evidence gap: target() rejects an outstanding probe and Connection gates recovery, pending retries and reported RACK losses. A negative-output test asserting no new probe while each outstanding-loss gate is active is not recorded; no missing source predicate is alleged."
-quote = '''
-o It has no outstanding probes or losses.
-'''
-
-# 4821-126
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
-reason = "Evidence gap: target() rejects a live deadline and tick() consumes it; timeout cooldown arithmetic is tested. No negative-output assertion immediately before the failed-probe deadline is recorded. Inconclusive recovery has no suppressed-CC delay because CC is retained."
-quote = '''
-o If the last probe failed or was inconclusive, then the probe timeout has expired (see Section 7.6.2).
-'''
-
 # 4821-130
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
@@ -285,7 +253,7 @@ Protocols MAY delay sending non-probes in order to accumulate enough data to mee
 # 4821-136
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
-reason = "Partial evidence gap after 76800de and a4b9a0c: finite isolated proof, logical congestion suppression and timeout congestion response are now tested. The full categorized response list still includes the unresolved same-sized next probe after inconclusive recovery at144; matching-PTB isolated suppression also remains open at 139/142, so this umbrella clause is not closed by no-PTB evidence."
+reason = "Mixed full-list gap: real receiver traces now assert same-sized re-probing after multiple-loss recovery, failed/timeout cooldown output exclusion and subsequent admission. Matching-PTB isolated loss still commits normal congestion response at 139/142, and timeout-only repair can narrow search_high despite its inconclusive classification at 012. Those categorized-result differences keep the complete umbrella TODO."
 quote = '''
 When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.
 '''
@@ -312,22 +280,6 @@ target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
 reason = "Partial no-PTB evidence from 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span."
 quote = '''
 A probe failure event is the one situation under which the Packetization Layer SHOULD ignore loss as a congestion signal. Because there is some small risk that suppressing congestion control might have unanticipated consequences (even for one isolated loss), it is REQUIRED that probe failure events be less frequent than the normal period for losses under standard congestion control. Specifically, after a probe failure event and suppressed congestion control, PLPMTUD MUST NOT probe again until an interval that is larger than the expected interval between congestion control events. See Section 4 for details. The simplest estimate of the interval to the next congestion event is the same number of round trips as the current congestion window in packets.
-'''
-
-# 4821-144
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.4"
-reason = "Multiple observed losses preserve bounds; full same-size next-probe admission after actual recovery requires explicit test. Existing tests establish preservation but do not assert the next emitted probe size in all configurations."
-quote = '''
-The presence of other losses near the loss of the probe may indicate that the probe was lost due to congestion rather than due to an MTU limitation. In this case, the state variables eff_pmtu, search_low, and search_high SHOULD NOT be updated, and the same-sized probe SHOULD be attempted again as soon as the probing preconditions are met (i.e., once the packetization layer has no outstanding unrecovered losses). At this point, it is particularly appropriate to re-probe since the flow's congestion window will be at its lowest point, minimizing the probability of congestive losses.
-'''
-
-# 4821-146
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.7"
-reason = "Evidence gap: no-ICMP R1 fallback is exercised by pmtud_full_stop_r1_halving_and_normal_congestion_response. The contrasting ICMP-since-progress branch is not asserted with a full-stop connection timeout; this is not evidence that fallback is missing."
-quote = '''
-If there is a full-stop timeout and there was not an ICMP message indicating a reason (PTB, Net unreachable, etc., or the ICMP message was ignored for some reason), the RECOMMENDED first recovery action is to treat this as a detected ICMP black hole as defined in [RFC2923].
 '''
 
 # 4821-147
