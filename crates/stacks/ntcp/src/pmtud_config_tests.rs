@@ -442,7 +442,7 @@ fn pmtud_config_live_update_preserves_probe_repair_and_connection_state_without_
             .unwrap()
     );
     assert_eq!(a.path_mtu_info().unwrap().current_mtu, 68); // custom table, below 1262-byte probe
-    assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+    assert_eq!(a.pmtud.as_ref().unwrap().probe.unwrap().start, probe.start);
     let repair = a.pmtud.as_ref().unwrap().repair_limit(probe.start, 9999);
     crate::allocation_tests::fail_after(0, || a.set_pmtud_policy(43, PmtudPolicy::default()))
         .unwrap();

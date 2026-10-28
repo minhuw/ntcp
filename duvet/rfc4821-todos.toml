@@ -8,14 +8,6 @@ quote = '''
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119].
 '''
 
-# 4821-011
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "Partial gap after 76800de and a4b9a0c: finite isolated-loss proof now suppresses logical congestion response after recovery exit, retaining normal repair admission and independent MSS scaling. The complete with-or-without-PTB span is not established: apply_ptb cancels probe classification, and the IPv6 two-PTB fixture explicitly asserts a committed normal congestion response rather than isolation suppression. This is not the literal unchanged-cwnd advice at1191-082/8201-076."
-quote = '''
-The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.
-'''
-
 # 4821-018
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
@@ -62,14 +54,6 @@ target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
 reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
 quote = '''
 All implementations MUST include mechanisms for applications to selectively transmit packets larger than the current effective Path MTU, but smaller than the first-hop link MTU. This is necessary to implement PLPMTUD using a connectionless protocol within an application and to implement diagnostic tools that do not rely on the operating system's implementation of Path MTU Discovery. See Section 9 for further discussion.
-'''
-
-# 4821-065
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span."
-quote = '''
-Normal congestion control algorithms MUST remain in effect under all conditions except when only an isolated probe packet is detected as lost. In this case alone, the normal congestion (window or data rate) reduction SHOULD be suppressed. If any other data loss is detected, standard congestion control MUST take place.
 '''
 
 
@@ -242,36 +226,12 @@ quote = '''
 Protocols MAY delay sending non-probes in order to accumulate enough data to meet the pre-conditions for probing. The delayed sending algorithm SHOULD use some self-scaling technique to appropriately limit the time that the data is delayed. For example, the returning ACKs can be used to prevent the window from falling by more than the amount of data needed for the probe.
 '''
 
-# 4821-136
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
-reason = "Partial full-list gap: receiver-driven timeout and multiple-loss recovery preserve probe bounds, retain normal congestion response and emit same-sized re-probes after recovery, available credit and any cooldown. Matching-PTB isolated loss still commits normal congestion response at 139/142 because apply_ptb cancels probe classification. Retain the complete umbrella TODO until matching-PTB isolation is implemented and proven with finite delivery evidence and all congestion disqualifiers."
-quote = '''
-When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.
-'''
-
-# 4821-139
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
-reason = "Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span."
-quote = '''
-When only the probe is lost, it is treated as an indication that the Path MTU is smaller than the probe size. In this case alone, the loss SHOULD NOT be interpreted as congestion signal.
-'''
-
 # 4821-141
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
 reason = "Optional use of matching PTB to set search_high/eff_pmtu is subject to the selected security gate: feedback may be deferred below proven delivery. No requirement to implement unconditional PTB updates before/after loss is imposed by MAY; actual bound updates remain audited at 140."
 quote = '''
 If an ICMP PTB message is received matching the probe packet, then search_high and eff_pmtu MAY be set from the MTU value indicated in the message. Note that the ICMP message may be received either before or after the protocol loss indication.
-'''
-
-# 4821-142
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
-reason = "Partial no-PTB evidence from 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span."
-quote = '''
-A probe failure event is the one situation under which the Packetization Layer SHOULD ignore loss as a congestion signal. Because there is some small risk that suppressing congestion control might have unanticipated consequences (even for one isolated loss), it is REQUIRED that probe failure events be less frequent than the normal period for losses under standard congestion control. Specifically, after a probe failure event and suppressed congestion control, PLPMTUD MUST NOT probe again until an interval that is larger than the expected interval between congestion control events. See Section 4 for details. The simplest estimate of the interval to the next congestion event is the same number of round trips as the current congestion window in packets.
 '''
 
 # 4821-147

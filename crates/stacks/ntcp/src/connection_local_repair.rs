@@ -247,6 +247,10 @@ impl Connection {
         self.last_departure = None;
         self.reserved_ledger = None;
         self.last_output_range = None;
+        // Withdrawing the PMTU attempt cancels its classification. Restoring
+        // admission/PRR must not resurrect a provisional congestion exemption
+        // whose evidence was discarded by reject_reserved_output().
+        self.resolve_probe_response();
         self.select_loss_timer();
         true
     }

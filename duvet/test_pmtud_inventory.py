@@ -5,6 +5,7 @@ import re
 import tomllib
 import unittest
 
+from check_annotation_inventory import source_annotations
 from check_rfc_coverage import PREFIX, check
 from test_rfc_coverage import complete_report
 
@@ -165,6 +166,39 @@ class PmtudInventory(unittest.TestCase):
         self.assertIn("No administrative per-path discovery-disable flag", path["reason"])
         self.assertIn("Connections configured with PMTUD disabled enforce", path["reason"])
         self.assertEqual(rows["8201-080"]["status"], "TODO")
+
+    def test_matching_ptb_closures_keep_full_quotes_and_all_canonical_copies(self):
+        quotes = {
+            "4821-011": "The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.",
+            "4821-065": "Normal congestion control algorithms MUST remain in effect under all conditions except when only an isolated probe packet is detected as lost. In this case alone, the normal congestion (window or data rate) reduction SHOULD be suppressed. If any other data loss is detected, standard congestion control MUST take place.",
+            "4821-136": "When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.",
+            "4821-139": "When only the probe is lost, it is treated as an indication that the Path MTU is smaller than the probe size. In this case alone, the loss SHOULD NOT be interpreted as congestion signal.",
+            "4821-142": "A probe failure event is the one situation under which the Packetization Layer SHOULD ignore loss as a congestion signal. Because there is some small risk that suppressing congestion control might have unanticipated consequences (even for one isolated loss), it is REQUIRED that probe failure events be less frequent than the normal period for losses under standard congestion control. Specifically, after a probe failure event and suppressed congestion control, PLPMTUD MUST NOT probe again until an interval that is larger than the expected interval between congestion control events. See Section 4 for details. The simplest estimate of the interval to the next congestion event is the same number of round trips as the current congestion window in packets.",
+        }
+        rows = {p["id"]: p for n in (4821, 8201) for p in self.inventory(n)["paragraphs"]}
+        affected = [rows[key] for key in (*quotes, "8201-075")]
+        for key, quote in quotes.items():
+            self.assertEqual(rows[key]["quote"], quote, key)
+            self.assertEqual(rows[key]["status"], "covered", key)
+            self.assertEqual(len(rows[key]["evidence"]), 2, key)
+        # Check even unlisted source/test copies, not just the ledger's two anchors.
+        canonical = {(p["target"], normalize(p["quote"])): p for p in affected}
+        counts = {key: 0 for key in canonical}
+        for path in (ROOT / "crates/stacks/ntcp/src").glob("*.rs"):
+            for annotation in source_annotations(path.read_text()):
+                key = (annotation["target"], normalize(annotation["quote"]))
+                if key in canonical:
+                    self.assertEqual(annotation["reason"], canonical[key]["reason"],
+                                     (canonical[key]["id"], path.name, annotation["line"]))
+                    counts[key] += 1
+        self.assertTrue(all(count >= 2 for count in counts.values()))
+        for key in ("4821-012", "4821-137", "4821-138", "4821-143", "4821-144"):
+            self.assertEqual(rows[key]["status"], "covered", key)
+        # Literal unchanged-cwnd conflicts and the independent black-hole reset
+        # obligation remain unresolved; PTB classification must not close them.
+        for n, key in ((1191, "1191-082"), (8201, "8201-076"), (4821, "4821-147")):
+            row = next(p for p in self.inventory(n)["paragraphs"] if p["id"] == key)
+            self.assertEqual(row["status"], "TODO", key)
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:

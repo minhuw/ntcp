@@ -84,9 +84,13 @@
       "id": "4821-011",
       "section": "2",
       "quote": "The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.",
-      "status": "TODO",
-      "reason": "Partial gap after 76800de and a4b9a0c: finite isolated-loss proof now suppresses logical congestion response after recovery exit, retaining normal repair admission and independent MSS scaling. The complete with-or-without-PTB span is not established: apply_ptb cancels probe classification, and the IPv6 two-PTB fixture explicitly asserts a committed normal congestion response rather than isolation suppression. This is not the literal unchanged-cwnd advice at1191-082/8201-076.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+      "status": "covered",
+      "reason": "Isolated original-probe loss with or without exact matching PTB suppresses only the logical congestion response after finite cumulative delivery and recovery/PRR exit. Dual-family receiver traces assert conservative split repairs, unchanged threshold, independently MSS-scaled window and mandatory headway; all other loss and timeout responses remain active. Literal unchanged-cwnd conflicts at1191-082/8201-076 remain TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/pmtud.rs::    fn apply_ptb(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+      ]
     },
     {
       "id": "4821-012",
@@ -507,8 +511,8 @@
       "id": "4821-065",
       "section": "4",
       "quote": "Normal congestion control algorithms MUST remain in effect under all conditions except when only an isolated probe packet is detected as lost. In this case alone, the normal congestion (window or data rate) reduction SHOULD be suppressed. If any other data loss is detected, standard congestion control MUST take place.",
-      "status": "TODO",
-      "reason": "Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.",
+      "status": "covered",
+      "reason": "Finite original-probe proof survives exact matching PTB while its size result is invalidated. Receiver-driven IPv4/IPv6 traces cover PTB before/after loss, decreasing quotes, wrap, split repairs and finite extended-tail delivery followed by recovery/PRR exit. Normal repair admission, MSS rescaling and PRR remain active; additional original loss, ECE, repair-copy loss, timeout and non-probe PTB commit normal congestion response. Replenishment resumes ACK growth; encoding failure and reservation rejection preserve conservative state.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    fn resolve_probe_response(",
@@ -1162,9 +1166,13 @@
       "id": "4821-136",
       "section": "7.6",
       "quote": "When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.",
-      "status": "TODO",
-      "reason": "Partial full-list gap: receiver-driven timeout and multiple-loss recovery preserve probe bounds, retain normal congestion response and emit same-sized re-probes after recovery, available credit and any cooldown. Matching-PTB isolated loss still commits normal congestion response at 139/142 because apply_ptb cancels probe classification. Retain the complete umbrella TODO until matching-PTB isolation is implemented and proven with finite delivery evidence and all congestion disqualifiers.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
+      "status": "covered",
+      "reason": "Categorized processing retains success/verification evidence at137/138, isolated loss with or without matching PTB at139/142, timeout congestion response and fivefold cooldown at143, and multiple-loss unchanged bounds plus same-sized re-probing at144. The real-probe success/failed-encode test, verification lifecycle, recovery/disqualifier matrices and probe_admission_real_loss_recovery_and_cooldown_output execute these outcomes. Independent PTB ceilings survive original or repair ACKs; timeout alone supplies no failed-size bound.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6",
+      "evidence": [
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn probe_admission_real_loss_recovery_and_cooldown_output()"
+      ]
     },
     {
       "id": "4821-137",
@@ -1194,8 +1202,8 @@
       "id": "4821-139",
       "section": "7.6.2",
       "quote": "When only the probe is lost, it is treated as an indication that the Path MTU is smaller than the probe size. In this case alone, the loss SHOULD NOT be interpreted as congestion signal.",
-      "status": "TODO",
-      "reason": "Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.",
+      "status": "covered",
+      "reason": "Only actual probe repair followed by finite extended-tail cumulative delivery and recovery/PRR exit can suppress the logical congestion response. Dual-family real receiver matrices cover exact matching PTB before/after loss, decreasing ceilings, wrap, PRR, Reno/CUBIC and pacing; other loss, ECE, repair-copy loss and RTO retain normal response. Without PTB the isolated result narrows search_high to probe-1; with matching PTB its invalidated size result cannot undo the accepted ceiling, even on an unexpected original ACK. Independent MSS scaling remains active.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
@@ -1226,8 +1234,8 @@
       "id": "4821-142",
       "section": "7.6.2",
       "quote": "A probe failure event is the one situation under which the Packetization Layer SHOULD ignore loss as a congestion signal. Because there is some small risk that suppressing congestion control might have unanticipated consequences (even for one isolated loss), it is REQUIRED that probe failure events be less frequent than the normal period for losses under standard congestion control. Specifically, after a probe failure event and suppressed congestion control, PLPMTUD MUST NOT probe again until an interval that is larger than the expected interval between congestion control events. See Section 4 for details. The simplest estimate of the interval to the next congestion event is the same number of round trips as the current congestion window in packets.",
-      "status": "TODO",
-      "reason": "Partial no-PTB evidence from 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.",
+      "status": "covered",
+      "reason": "Isolated suppression with or without matching PTB waits for finite cumulative proof and recovery/PRR exit. pmtu_cooldown uses the unsuppressed logical window with one RTT per packet, a strict extra interval/tick and an RTO floor; the arithmetic test distinguishes logical14600 from admission1000. Receiver matrices assert exclusion before the deadline and admission at expiry. Matching PTB additionally retains its mandatory600-second hold through original, split-repair and trailing ACKs; periodic aging cannot disable failure headway.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    fn pmtu_cooldown(",

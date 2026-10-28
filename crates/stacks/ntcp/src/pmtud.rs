@@ -28,6 +28,8 @@ pub(crate) struct Probe {
     pub end: Seq,
     pub trailing_end: Seq,
     pub size: u32,
+    // Matching PTB invalidates size inference, but not finite loss classification.
+    size_result_valid: bool,
     retried: bool,
     loss_reported: bool,
     other_loss: bool,
@@ -264,6 +266,7 @@ impl Pmtud {
             end: start.wrapping_add(payload),
             trailing_end: start.wrapping_add(payload + trailing),
             size,
+            size_result_valid: true,
             retried: false,
             loss_reported: false,
             other_loss: false,
@@ -308,6 +311,12 @@ impl Pmtud {
     }
 
     pub fn loss(&mut self, start: Seq, multiple: bool) {
+        if let Some(outcome) = &mut self.outcome {
+            // Cumulative proof can finish before this ACK's loss detection.
+            // Any remaining loss is outside that delivered flight and must
+            // invalidate isolation before another recovery can reuse its identity.
+            outcome.isolated = false;
+        }
         if let Some(p) = &mut self.probe {
             // Freeze before recovery can emit fresh data, not on its ending ACK.
             p.loss_reported = true;
@@ -630,6 +639,11 @@ impl Pmtud {
             return false;
         };
         let sent_size = known.size;
+        // Only the exact original packet may retain probe classification. A
+        // smaller repair or any other live packet is independent loss evidence.
+        let original_probe = self
+            .probe
+            .is_some_and(|p| known.start == p.start && known.end == p.end && known.size == p.size);
         //= https://www.rfc-editor.org/rfc/rfc8201#section-4
         //# If a node receives a Packet Too Big message reporting a next-hop MTU
         //# that is less than the IPv6 minimum link MTU, it must discard it.
@@ -675,6 +689,12 @@ impl Pmtud {
         // RFC5927 policy: defer a decrease below previously proven delivery,
         // until the quoted data times out; any cumulative progress clears it.
         if mtu < self.max_acked {
+            if !original_probe {
+                // Deferring the size change does not make a report about other
+                // data evidence that the original probe alone was lost.
+                self.probe = None;
+                self.outcome = None;
+            }
             // Even deferred validated PTB feedback inhibits new upward probes.
             self.delay(now, self.hold);
             self.periodic_deadline = None;
@@ -686,7 +706,7 @@ impl Pmtud {
                     .map_or(mtu, |(_, old)| old.min(mtu)),
             ));
         } else {
-            self.apply_ptb(mtu, now);
+            self.apply_ptb(mtu, now, original_probe);
         }
         true
     }
@@ -705,13 +725,26 @@ impl Pmtud {
     //# given path. The recommended setting for this timer is twice its minimum value (10
     //# minutes).
 
-    fn apply_ptb(&mut self, mtu: u32, now: Instant) {
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-2
+    //= reason=Isolated original-probe loss with or without exact matching PTB suppresses only the logical congestion response after finite cumulative delivery and recovery/PRR exit. Dual-family receiver traces assert conservative split repairs, unchanged threshold, independently MSS-scaled window and mandatory headway; all other loss and timeout responses remain active. Literal unchanged-cwnd conflicts at1191-082/8201-076 remain TODO.
+    //# The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.
+    fn apply_ptb(&mut self, mtu: u32, now: Instant, original_probe: bool) {
         self.icmp_since_progress = true;
         self.info.current_mtu = mtu.min(self.info.current_mtu);
         self.record_upper_limit(mtu);
         self.info.search_low = self.info.search_low.min(mtu);
-        // Cancel classification, not the outstanding data's repair boundary.
-        self.probe = None;
+        if original_probe {
+            if let Some(p) = &mut self.probe {
+                // PTB establishes a ceiling independently of congestion. Keep
+                // the original finite delivery proof, never its size result:
+                // even an unexpected original ACK cannot undo this decrease.
+                p.size_result_valid = false;
+            }
+        } else {
+            // Other packets (including repairs) cannot prove isolated probe loss.
+            self.probe = None;
+            self.outcome = None;
+        }
         self.verification = None;
         self.delay(now, self.hold);
         self.periodic_deadline = None;
@@ -810,7 +843,7 @@ impl Pmtud {
     //# discovery (see Section 7.7).
 
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
-    //= reason=Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.
+    //= reason=Only actual probe repair followed by finite extended-tail cumulative delivery and recovery/PRR exit can suppress the logical congestion response. Dual-family real receiver matrices cover exact matching PTB before/after loss, decreasing ceilings, wrap, PRR, Reno/CUBIC and pacing; other loss, ECE, repair-copy loss and RTO retain normal response. Without PTB the isolated result narrows search_high to probe-1; with matching PTB its invalidated size result cannot undo the accepted ceiling, even on an unexpected original ACK. Independent MSS scaling remains active.
     //# When only the probe is lost, it is treated as an indication that the Path MTU is
     //# smaller than the probe size. In this case alone, the loss SHOULD NOT be
     //# interpreted as congestion signal.
@@ -828,6 +861,9 @@ impl Pmtud {
     //# adjustments are mandatory per the relevant congestion control standards
     //# [RFC2914]. Probing can resume after a delay that is determined by the nature
     //# of the detected failure.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6
+    //= reason=Categorized processing retains success/verification evidence at137/138, isolated loss with or without matching PTB at139/142, timeout congestion response and fivefold cooldown at143, and multiple-loss unchanged bounds plus same-sized re-probing at144. The real-probe success/failed-encode test, verification lifecycle, recovery/disqualifier matrices and probe_admission_real_loss_recovery_and_cooldown_output execute these outcomes. Independent PTB ceilings survive original or repair ACKs; timeout alone supplies no failed-size bound.
+    //# When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
         if self
             .repair_range
@@ -871,15 +907,15 @@ impl Pmtud {
                 //# Set search_low to the probe
                 //# size.  If the probe size is larger than the eff_pmtu, raise eff_pmtu
                 //# to the probe size.
-                self.info.search_low = self.info.search_low.max(p.size);
-                if p.size > self.info.current_mtu {
-                    // Active search can make several increases before verification
-                    // finishes. Keep the last verified baseline and all evidence,
-                    // but observe each new size for another two RTO intervals.
-                    self.verification
-                        .get_or_insert((self.info.current_mtu, now, 0, 0))
-                        .1 = now;
-                    self.info.current_mtu = p.size;
+                if p.size_result_valid {
+                    self.info.search_low = self.info.search_low.max(p.size);
+                    if p.size > self.info.current_mtu {
+                        // Preserve the baseline across successive verified increases.
+                        self.verification
+                            .get_or_insert((self.info.current_mtu, now, 0, 0))
+                            .1 = now;
+                        self.info.current_mtu = p.size;
+                    }
                 }
                 self.probe = None;
             } else if ack.at_or_after(p.trailing_end) {
@@ -888,7 +924,7 @@ impl Pmtud {
                     end: p.trailing_end,
                     isolated: p.retried && !p.other_loss && !p.timeout,
                 });
-                if p.retried && !p.other_loss && !p.timeout {
+                if p.size_result_valid && p.retried && !p.other_loss && !p.timeout {
                     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
                     //= reason=Wait for cumulative delivery of the trailing window and exclude timeout or nearby loss. Only conclusive size evidence narrows this bound; congestion outcome consumption is separate.
                     //# In the absence of other indications, set search_high to the probe
@@ -1010,7 +1046,7 @@ impl Pmtud {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
-    //= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+    //= reason=IPv6 lost_probe_repairs uses real receiver ACKs and ntcp-ip6 parsing to assert repairs split within the original probe gap and conservative packet budget, including two decreasing exact original PTBs down to1280 and wrapping sequences. Normal repair admission remains active; finite full-tail proof suppresses only the logical loss response, preserving MSS scaling and the PTB hold. Other-loss, ECN, repair-copy-loss and timeout matrices retain normal retransmission congestion control. Literal unchanged-cwnd and shared-path fanout obligations remain separate.
     //# Note: A packetization layer that determines a probe packet is lost needs to
     //# adapt the segment size of the retransmission. Using the reported size in the
     //# last Packet Too Big message, however, can lead to further losses as there might
@@ -1061,7 +1097,9 @@ impl Pmtud {
         if let Some((seq, mtu)) = self.pending.take() {
             // Only the quoted data's timeout authorizes a deferred decrease.
             if head == seq {
-                self.apply_ptb(mtu, now);
+                // Deferred feedback is applied only on timeout, which cannot
+                // qualify for an isolated-loss congestion exemption.
+                self.apply_ptb(mtu, now, false);
             } else {
                 self.pending = Some((seq, mtu));
             }
@@ -1116,23 +1154,26 @@ mod tests {
     }
 
     #[test]
-    fn ptb_cancelled_probe_retains_only_repair_boundary() {
+    fn matching_ptb_retains_finite_classification_and_repair_boundary() {
         for start in [Seq(1), Seq(u32::MAX - 499)] {
             let mut p = state(false);
             let end = start.wrapping_add(1330);
             p.start_probe(start, 1330, 3660, 1390);
             p.sent(start, end, 1390, 40, false);
             assert!(p.feedback(10, start, 1390, 40, 1389));
+            let partial = start.wrapping_add(1220);
+            p.sent(start, partial, 1280, 40, true);
+            // Retrying marks the old sent entry ambiguous for ACK size proof,
+            // but an exact quote still identifies the original larger probe.
             assert!(p.feedback(11, start, 1390, 40, 1280));
             let info = p.info;
             let deadline = p.deadline;
-            assert!(p.probe.is_none());
+            assert!(p.probe.is_some());
+            assert!(!p.probe.unwrap().size_result_valid);
             assert!(!p.feedback(12, start, 1390, 40, 1280));
             assert!(!p.feedback(13, start, 1390, 40, 1389));
             assert_eq!(p.deadline, deadline);
             assert_eq!(p.repair_limit(start, 1220), 1220);
-            let partial = start.wrapping_add(1220);
-            p.sent(start, partial, 1280, 40, true);
             p.ack(partial, 20, 1000, 1000);
             p.ack(partial, 21, 1000, 1000); // duplicate progress cannot clear the tail
             assert_eq!(p.repair_limit(partial, 1220), 110);
@@ -1144,22 +1185,29 @@ mod tests {
             p.sent(partial, end, 170, 40, true);
             p.ack(end, deadline.unwrap() + 1, 1000, 1000);
             assert!(p.repair_range.is_none());
+            assert!(p.probe.is_some()); // Gap delivery is not full-tail proof.
+            let tail = end.wrapping_add(3660);
+            p.ack(tail, deadline.unwrap() + 2, 1000, 1000);
+            assert!(p.take_probe_outcome(tail).unwrap().isolated);
+            assert!(p.take_probe_outcome(tail).is_none());
             assert!(p.probe.is_none());
             assert!(p.verification.is_none());
             assert_eq!(p.info.current_mtu, 1280);
             assert_eq!(p.info.search_low, 1280);
-            assert_eq!(p.info.search_high, 1500); // no cancelled-probe loss result
+            assert_eq!(p.info.search_high, 1500); // Hold expiry alone reopens search.
+            let ready = p.deadline.unwrap();
+            p.tick(ready);
             let next_size = p.target().unwrap();
             p.start_probe(end, next_size - 60, 3660, next_size);
             assert_eq!(p.repair_limit(end, 2000), next_size - 60);
             let next_end = end.wrapping_add(next_size - 60);
             p.sent(end, next_end, next_size, 40, false);
-            p.ack(next_end, deadline.unwrap() + 2, 1000, 1000);
+            p.ack(next_end, ready + 1, 1000, 1000);
             assert_eq!(p.info.current_mtu, next_size); // fresh probe still classifies
             assert!(p.repair_range.is_none());
-            assert!(!p.feedback(deadline.unwrap() + 3, start, 1390, 40, 1280)); // stale quote
+            assert!(!p.feedback(ready + 2, start, 1390, 40, 1280)); // stale quote
             p.start_probe(next_end, 1330, 3660, 1390);
-            p.apply_ptb(1280, deadline.unwrap() + 3);
+            p.apply_ptb(1280, ready + 2, false);
             p.terminal();
             assert!(p.repair_range.is_none());
             assert!(p.probe.is_none());

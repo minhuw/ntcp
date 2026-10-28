@@ -384,7 +384,13 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, probe.size - 1);
         assert!(feedback(&mut a, 45, &ptb(&lost[..48], 1280)));
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1280);
-        assert!(a.congestion.ssthresh() < cwnd);
+        assert_eq!(a.congestion.ssthresh(), threshold);
+        assert_eq!(a.congestion.pending_probe_response(), Some(probe.start));
+        assert_eq!(
+            a.congestion.unsuppressed_cwnd(),
+            (u64::from(cwnd) * a.mss as u64 / old_mss as u64) as u32
+        );
+        assert!(a.congestion.recovery_target() < a.congestion.unsuppressed_cwnd());
     }
     let mut repairs = 0;
     for n in 0..16 {
@@ -429,22 +435,33 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
             (u64::from(cwnd) * a.mss as u64 / old_mss as u64) as u32
         );
     } else {
-        assert!(a.congestion.ssthresh() < cwnd); // PTB cancellation commits, never undoes CC.
+        assert_eq!(a.path_mtu_info().unwrap().search_high, 1280);
+        assert_eq!(a.congestion.ssthresh(), threshold);
+        assert_eq!(
+            a.congestion.cwnd(),
+            (u64::from(cwnd) * a.mss as u64 / old_mss as u64) as u32
+        );
+        let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
+        assert!(deadline >= 45 + 600_000_000);
+        a.pmtud.as_mut().unwrap().tick(deadline - 1);
+        assert!(a.pmtud.as_ref().unwrap().target().is_none());
     }
+    assert!(a.snd_una.at_or_after(probe.trailing_end));
+    assert!(!a.congestion.in_recovery());
     assert!(a.congestion.pending_probe_response().is_none());
 }
 
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
 //= type=test
-//= reason=Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.
+//= reason=Only actual probe repair followed by finite extended-tail cumulative delivery and recovery/PRR exit can suppress the logical congestion response. Dual-family real receiver matrices cover exact matching PTB before/after loss, decreasing ceilings, wrap, PRR, Reno/CUBIC and pacing; other loss, ECE, repair-copy loss and RTO retain normal response. Without PTB the isolated result narrows search_high to probe-1; with matching PTB its invalidated size result cannot undo the accepted ceiling, even on an unexpected original ACK. Independent MSS scaling remains active.
 //# When only the probe is lost, it is treated as an indication that the Path MTU is
 //# smaller than the probe size. In this case alone, the loss SHOULD NOT be
 //# interpreted as congestion signal.
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
 //= type=test
-//= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+//= reason=IPv6 lost_probe_repairs uses real receiver ACKs and ntcp-ip6 parsing to assert repairs split within the original probe gap and conservative packet budget, including two decreasing exact original PTBs down to1280 and wrapping sequences. Normal repair admission remains active; finite full-tail proof suppresses only the logical loss response, preserving MSS scaling and the PTB hold. Other-loss, ECN, repair-copy-loss and timeout matrices retain normal retransmission congestion control. Literal unchanged-cwnd and shared-path fanout obligations remain separate.
 //# Note: A packetization layer that determines a probe packet is lost needs to
 //# adapt the segment size of the retransmission. Using the reported size in the
 //# last Packet Too Big message, however, can lead to further losses as there might
@@ -463,7 +480,7 @@ fn ipv6_lost_probe_real_receiver_repairs_and_congestion() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
 //= type=test
-//= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+//= reason=IPv6 lost_probe_repairs uses real receiver ACKs and ntcp-ip6 parsing to assert repairs split within the original probe gap and conservative packet budget, including two decreasing exact original PTBs down to1280 and wrapping sequences. Normal repair admission remains active; finite full-tail proof suppresses only the logical loss response, preserving MSS scaling and the PTB hold. Other-loss, ECN, repair-copy-loss and timeout matrices retain normal retransmission congestion control. Literal unchanged-cwnd and shared-path fanout obligations remain separate.
 //# Note: A packetization layer that determines a probe packet is lost needs to
 //# adapt the segment size of the retransmission. Using the reported size in the
 //# last Packet Too Big message, however, can lead to further losses as there might
@@ -480,7 +497,7 @@ fn ipv6_smaller_ptb_preserves_probe_repair_boundary_regression() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
 //= type=test
-//= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+//= reason=IPv6 lost_probe_repairs uses real receiver ACKs and ntcp-ip6 parsing to assert repairs split within the original probe gap and conservative packet budget, including two decreasing exact original PTBs down to1280 and wrapping sequences. Normal repair admission remains active; finite full-tail proof suppresses only the logical loss response, preserving MSS scaling and the PTB hold. Other-loss, ECN, repair-copy-loss and timeout matrices retain normal retransmission congestion control. Literal unchanged-cwnd and shared-path fanout obligations remain separate.
 //# Note: A packetization layer that determines a probe packet is lost needs to
 //# adapt the segment size of the retransmission. Using the reported size in the
 //# last Packet Too Big message, however, can lead to further losses as there might
