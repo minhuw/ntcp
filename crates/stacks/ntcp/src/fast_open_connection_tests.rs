@@ -50,7 +50,7 @@ fn synack_with_payload(a: &mut Connection, acked: u32, now: u64, payload: &[u8])
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-3
 //= type=test
-//= reason=Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.
+//= reason=Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.
 //# 4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not
 //# acknowledged, the client retransmits the data in the ACK packet.
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
@@ -288,7 +288,7 @@ fn selected_packet(a: &mut Connection, now: &mut u64, reserved: bool) -> Option<
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-3
 //= type=test
-//= reason=Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.
+//= reason=Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.
 //# 4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not
 //# acknowledged, the client retransmits the data in the ACK packet.
 fn repair_obeys_negotiated_window(reserved: bool) {

@@ -265,14 +265,16 @@
       "section": "3",
       "quote": "4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not acknowledged, the client retransmits the data in the ACK packet.",
       "status": "TODO",
-      "reason": "Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.",
+      "reason": "Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
       "offset": 1140,
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::fn establish(",
         "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn syn_data_ack_bounds_wrap_partial_retry_and_flush()",
         "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn scalar_fast_open_repair_stops_at_negotiated_cwnd()",
-        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn reserved_fast_open_repair_stops_at_negotiated_cwnd()"
+        "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn reserved_fast_open_repair_stops_at_negotiated_cwnd()",
+        "crates/stacks/ntcp/src/fast_open_partial_synack_tests.rs::fn public_first_ack_capacity_conflicts_and_receiver_driven_completion()",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn native_rejected_syn_repair_uses_first_ack_and_negotiated_capacity()"
       ]
     },
     {
@@ -1069,10 +1071,14 @@
       "id": "7413-server-iw",
       "section": "4.2.2",
       "quote": "If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.",
-      "status": "TODO",
-      "reason": "Configured Rfc5681 or optional RFC6928 IW10 is retained. Early response tests establish the selected configuration cap, but do not prove the literal RFC5681/RFC3390 initial-window clause across all supported congestion configurations. Production behavior is frozen; a referenced RFC permission or one IW test cannot close the full clause.",
+      "status": "covered",
+      "reason": "Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
-      "offset": 1754
+      "offset": 1754,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_receive(",
+        "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_rfc5681_controller_matrix_and_ordinary_controls()"
+      ]
     },
     {
       "id": "7413-synack-timeout",
@@ -1156,9 +1162,14 @@
       "section": "4.2.2",
       "quote": "The client SHOULD retransmit any unacknowledged data in the first ACK packet in step 2.",
       "status": "TODO",
-      "reason": "Small rejected/partial SYN payloads are retransmitted in the first ACK; larger residue is clipped by negotiated MSS, congestion window, receive window and path budget, and may require multiple packets. Existing scalar/reserved repair tests explicitly stop at negotiated cwnd. No universal first-ACK assertion proves the full quoted wording under those supported constraints.",
+      "reason": "Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
-      "offset": 2883
+      "offset": 2883,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn establish(",
+        "crates/stacks/ntcp/src/fast_open_partial_synack_tests.rs::fn public_first_ack_capacity_conflicts_and_receiver_driven_completion()",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn native_rejected_syn_repair_uses_first_ack_and_negotiated_capacity()"
+      ]
     },
     {
       "id": "7413-4.2.2-context-6",

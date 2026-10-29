@@ -46,12 +46,9 @@ fn ack(a: &mut Connection, us: u64, offset: u32, blocks: &[(u32, u32)]) {
     a.input(now, &segment).unwrap();
 }
 
-// Early output remains disabled. Model its proposed state using real scalar
-// output/physical ledger entries, restoring the unacknowledged SYN afterward.
-fn response(mut cfg: ConnectionConfig, iss: u32, pending: bool, fin: bool) -> Connection {
-    if fin {
-        cfg.initial_window = InitialWindow::Iw10;
-    }
+// Model the handoff using real scalar departures and restore the unacknowledged
+// SYN afterward. Keep payload plus FIN within the authorized RFC5681 window.
+fn response(cfg: ConnectionConfig, iss: u32, pending: bool, fin: bool) -> Connection {
     let syn = Segment {
         header: Header {
             source_port: tuple().remote.port(),
@@ -100,7 +97,7 @@ fn response(mut cfg: ConnectionConfig, iss: u32, pending: bool, fin: bool) -> Co
         (500, 50_000),
         (1000, 60_000),
         (1000, 70_000),
-        (1000, 80_000),
+        (if fin { 999 } else { 1000 }, 80_000),
     ] {
         a.write(&vec![42; n]).unwrap();
         if fin && us == 80_000 {
@@ -121,7 +118,7 @@ fn response(mut cfg: ConnectionConfig, iss: u32, pending: bool, fin: bool) -> Co
         };
         a.snd_una = a.iss;
     }
-    assert_eq!(a.data_flight(), 4000);
+    assert_eq!(a.data_flight(), if fin { 3999 } else { 4000 });
     a.take_events();
     a
 }
@@ -269,33 +266,48 @@ fn early_ack_handoff_rejects_full_ack_before_mutation_and_ignores_invalid_sack()
 #[test]
 fn early_ack_handoff_fin_data_and_empty_control_are_separate() {
     for iss in [100, u32::MAX - 1000] {
-        for offset in [0, 500, 4000, 4001] {
+        for offset in [0, 500, 3999, 4000] {
             let mut a = response(cfg(1_000_000, false, false), iss, true, true);
             ack(&mut a, 200_000, offset, &[]);
             assert!(a.handshake_complete());
             assert_eq!(
                 a.state(),
-                if offset == 4001 {
+                if offset == 4000 {
                     State::FinWait2
                 } else {
                     State::FinWait1
                 }
             );
-            assert_eq!(a.acknowledged, u64::from(offset.min(4000)));
-            assert_eq!(a.send.len(), 4000 - offset.min(4000) as usize);
+            assert_eq!(a.acknowledged, u64::from(offset.min(3999)));
+            assert_eq!(a.send.len(), 3999 - offset.min(3999) as usize);
             assert_eq!(
                 a.rack.delivered_segments,
-                if offset >= 4000 {
+                if offset >= 3999 {
                     5
                 } else {
                     u64::from(offset == 500)
                 }
             );
             assert!(!a.fin_delivered); // FIN is counted with its payload packet, not twice.
-            assert_eq!(a.fin_sequence, Some(a.iss.wrapping_add(4001)));
+            assert_eq!(a.fin_sequence, Some(a.iss.wrapping_add(4000)));
         }
-        let (mut a, _) = opening_for_close(config(8192, 1000), iss, false);
-        a.passive_fast_open(None, true);
+        let mut c = cfg(1_000_000, false, false);
+        c.fast_open_early_response = true;
+        let mut peer = Connection::active(reverse(tuple()), c.clone(), 900, 0).unwrap();
+        let bytes = packet(&mut peer, 0);
+        let syn = wire::parse(ip(peer.tuple()), &bytes).unwrap();
+        let mut a = Connection::passive_with_receive(
+            tuple(),
+            c,
+            iss,
+            0,
+            &syn,
+            true,
+            &mut None,
+            RxTimestamps::default(),
+            RxPacketTimestamps::default(),
+        )
+        .unwrap();
         a.shutdown().unwrap();
         packet(&mut a, 20);
         packet(&mut a, 30);

@@ -1,5 +1,233 @@
 use super::*;
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.
+//# 4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not acknowledged, the client retransmits the data in the ACK packet.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.
+//# The client SHOULD retransmit any unacknowledged data in the first ACK packet in step 2.
+#[test]
+fn public_first_ack_capacity_conflicts_and_receiver_driven_completion() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            // The small/zero windows are backed by actual receiver storage.
+            // Only the IPv4 path case lowers a path ceiling below the peer MSS.
+            for (partial, capacity, path) in [
+                (false, 8192, false),
+                (false, 32, false),
+                (true, 128, false),
+                (false, 8192, true),
+            ] {
+                if path && v6 {
+                    continue;
+                }
+                let config = EndpointConfig {
+                    max_connections: 16,
+                    connection: ConnectionConfig {
+                        mss: 1460,
+                        nagle: false,
+                        timestamps: false,
+                        send_capacity: 8192,
+                        receive_capacity: 8192,
+                        initial_window: InitialWindow::Rfc5681,
+                        pmtud: Some(PmtudConfig::new(1500)),
+                        ..ConnectionConfig::default()
+                    },
+                    ..EndpointConfig::default()
+                };
+                let a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+                let b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+                let (mut a, mut b, listener) = warm_pair(v6, a, b);
+                b.set_listener_buffer_capacities(listener, 8192, capacity)
+                    .unwrap();
+                b.set_listener_user_mss(listener, Some(if path { 1460 } else { 64 }))
+                    .unwrap();
+                if !partial {
+                    b.set_fast_open_hmac_key([77; 32]); // A genuinely rejected old cookie.
+                }
+                if reserved {
+                    a.enable_output_reservations_with_gso(
+                        2,
+                        GsoLimits {
+                            max_bytes: 8192,
+                            max_segments: 16,
+                        },
+                    )
+                    .unwrap();
+                }
+                let (local, remote) = addresses(v6, 40001);
+                let data: Vec<u8> = (0..400).map(|n| (n % 251) as u8).collect();
+                let (client, n) = a.connect_fast_open(100, local, remote, &data).unwrap();
+                assert_eq!(n, 400);
+                let syn = emit(&mut a, 100, client, reserved);
+                let original = wire::parse(syn.0, &syn.1).unwrap();
+                assert_eq!(original.payload, data);
+                deliver(&mut b, 110, &syn);
+                let child = b
+                    .connection_id(Tuple {
+                        local: remote,
+                        remote: local,
+                    })
+                    .unwrap();
+                let synack = packet(&mut b, 120);
+                let validated = wire::parse(synack.0, &synack.1).unwrap();
+                let accepted = if partial { capacity as u32 } else { 0 };
+                assert_eq!(
+                    validated.header.flags & (wire::SYN | wire::ACK),
+                    wire::SYN | wire::ACK
+                );
+                assert_eq!(validated.options.mss, Some(if path { 1460 } else { 64 }));
+                assert_eq!(
+                    validated.header.acknowledgment,
+                    original.header.sequence.wrapping_add(1 + accepted)
+                );
+                assert_eq!(
+                    u32::from(validated.header.window),
+                    if partial { 0 } else { capacity as u32 }
+                );
+                if path {
+                    a.set_route_mtu(115, client, Some(68)).unwrap();
+                }
+                deliver(&mut a, 120, &synack);
+                let info = a.transport_info(client).unwrap();
+                let effective = if path { 28 } else { 64 };
+                assert_eq!((info.mss, info.cwnd), (effective, 4 * effective));
+                assert_eq!(a.acknowledged(client).unwrap(), u64::from(accepted));
+                let mut bytes = [0; 2048];
+                // Encoding failure must leave the first repair available.
+                if reserved {
+                    assert!(
+                        a.poll_reserved_transmit_for(121, client, &mut [0; 19], 64)
+                            .is_err()
+                    );
+                } else {
+                    assert!(a.poll_transmit(121, &mut [0; 19], 64).is_err());
+                }
+                assert_eq!(
+                    a.transport_info(client).unwrap().send_used,
+                    (400 - accepted) as usize
+                );
+                let first = if reserved {
+                    let (out, token) = a
+                        .poll_reserved_transmit_for(122, client, &mut bytes, 64)
+                        .unwrap();
+                    let tx = out.packet.unwrap();
+                    let selected = bytes[..tx.len].to_vec();
+                    let token = token.unwrap();
+                    assert!(a.reject_unsubmitted(token).unwrap());
+                    let (out, next) = a
+                        .poll_reserved_transmit_for(123, client, &mut bytes, 64)
+                        .unwrap();
+                    let tx = out.packet.unwrap();
+                    assert_eq!(&bytes[..tx.len], &selected);
+                    assert!(!a.accept_transmit(123, token).unwrap());
+                    assert!(a.accept_transmit(123, next.unwrap()).unwrap());
+                    (tx.ip, selected)
+                } else {
+                    emit(&mut a, 123, client, false)
+                };
+                let first_segment = wire::parse(first.0, &first.1).unwrap();
+                let offered = u32::from(validated.header.window);
+                let lawful_first = effective.min(info.cwnd).min(offered).min(400 - accepted);
+                assert_eq!(first_segment.payload.len(), lawful_first as usize);
+                assert_eq!(
+                    first_segment.header.flags & (wire::SYN | wire::ACK),
+                    wire::ACK
+                );
+                assert_eq!(
+                    first_segment.header.acknowledgment,
+                    validated.header.sequence.wrapping_add(1)
+                );
+                if lawful_first != 0 {
+                    assert_eq!(
+                        first_segment.header.sequence,
+                        original.header.sequence.wrapping_add(1 + accepted)
+                    );
+                }
+                let mut pending = vec![first];
+                let mut before_ack = lawful_first;
+                for _ in 0..32 {
+                    let packet = if reserved {
+                        let (out, token) = a
+                            .poll_reserved_transmit_for(124, client, &mut bytes, 64)
+                            .unwrap();
+                        if let Some(token) = token {
+                            a.accept_transmit(124, token).unwrap();
+                        }
+                        out.packet
+                    } else {
+                        a.poll_transmit(124, &mut bytes, 64).unwrap().packet
+                    };
+                    let Some(tx) = packet else { break };
+                    let segment = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+                    assert!(segment.payload.len() <= effective as usize);
+                    before_ack += segment.payload.len() as u32;
+                    pending.push((tx.ip, bytes[..tx.len].to_vec()));
+                }
+                assert_eq!(before_ack, info.cwnd.min(offered).min(400 - accepted));
+                let mut received = Vec::new();
+                if partial {
+                    let mut got = [0; 512];
+                    let n = b.read(child, &mut got).unwrap();
+                    received.extend_from_slice(&got[..n]);
+                }
+                for p in &pending {
+                    deliver(&mut b, 130, p);
+                }
+                // Actual receiver ACK/window updates, including reopening after
+                // application reads, drive every subsequent repair and new byte.
+                for now in (1000..900_000).step_by(1000) {
+                    b.on_timeout(now, 64).unwrap();
+                    a.on_timeout(now, 64).unwrap();
+                    if let Ok(n) = b.read(child, &mut bytes) {
+                        received.extend_from_slice(&bytes[..n]);
+                    }
+                    if let Some(tx) = b.poll_transmit(now, &mut bytes, 64).unwrap().packet {
+                        a.input(now, tx.ip, &bytes[..tx.len]).unwrap();
+                    }
+                    let out = if reserved {
+                        let (out, token) = a
+                            .poll_reserved_transmit_for(now, client, &mut bytes, 64)
+                            .unwrap();
+                        if let Some(token) = token {
+                            a.accept_transmit(now, token).unwrap();
+                        }
+                        out
+                    } else {
+                        a.poll_transmit(now, &mut bytes, 64).unwrap()
+                    };
+                    if let Some(tx) = out.packet {
+                        assert!(
+                            wire::parse(tx.ip, &bytes[..tx.len]).unwrap().payload.len()
+                                <= effective as usize
+                        );
+                        b.input(now, tx.ip, &bytes[..tx.len]).unwrap();
+                    }
+                    if received.len() == data.len() && a.acknowledged(client).unwrap() == 400 {
+                        break;
+                    }
+                }
+                assert_eq!(received, data);
+                assert_eq!(a.acknowledged(client).unwrap(), 400);
+                // Late copies of the original SYN and repair must not redeliver.
+                deliver(&mut b, 900_000, &syn);
+                deliver(&mut b, 900_000, &pending[0]);
+                assert_eq!(
+                    b.read(child, &mut bytes),
+                    Err(EndpointError::Connection(Error::WouldBlock))
+                );
+                std::eprintln!(
+                    "T3_FIRST_ACK {{\"v6\":{v6},\"reserved\":{reserved},\"syn_bytes\":400,\"accepted\":{accepted},\"advertised_mss\":{},\"effective_mss\":{effective},\"cwnd\":{},\"offered_window\":{offered},\"first_ack_bytes\":{lawful_first},\"before_data_ack\":{before_ack},\"delivered_once\":400}}",
+                    validated.options.mss.unwrap(),
+                    info.cwnd
+                );
+            }
+        }
+    }
+}
+
 fn response(syn: &(IpMetadata, Vec<u8>), acknowledged_data: u32) -> (IpMetadata, Vec<u8>) {
     let mut result = cache_reply(syn, 1460, Some(&[0x12, 0x34, 0xab, 0xcd]));
     let iss = wire::parse(syn.0, &syn.1).unwrap().header.sequence;

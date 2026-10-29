@@ -188,9 +188,11 @@ fn malformed_fast_open_preserves_timestamp_validation_and_ordinary_stream() {
 fn warm(v6: bool) -> (Endpoint, Endpoint, ListenerId) {
     warm_with_server(v6, endpoint(2, v6))
 }
-fn warm_with_server(v6: bool, mut b: Endpoint) -> (Endpoint, Endpoint, ListenerId) {
+fn warm_with_server(v6: bool, b: Endpoint) -> (Endpoint, Endpoint, ListenerId) {
+    warm_pair(v6, endpoint(1, v6), b)
+}
+fn warm_pair(v6: bool, mut a: Endpoint, mut b: Endpoint) -> (Endpoint, Endpoint, ListenerId) {
     let (local, remote) = addresses(v6, 40000);
-    let mut a = endpoint(1, v6);
     a.enable_fast_open().unwrap();
     b.enable_fast_open().unwrap();
     let listener = b.listen(remote, 8).unwrap();

@@ -31,8 +31,16 @@ pub(super) fn tfo_setup(warm: bool) -> (Owner, Owner, u64) {
     tfo_setup_cookie_policy(warm, false, 4)
 }
 fn tfo_setup_cookie_policy(warm: bool, linux: bool, backlog: i32) -> (Owner, Owner, u64) {
-    let mut a = owner(1, Profile::Pipeline, 8);
-    let mut b = owner(2, Profile::Pipeline, 8);
+    tfo_setup_profile(warm, linux, backlog, Profile::Pipeline)
+}
+fn tfo_setup_profile(
+    warm: bool,
+    linux: bool,
+    backlog: i32,
+    profile: Profile,
+) -> (Owner, Owner, u64) {
+    let mut a = owner(1, profile, 8);
+    let mut b = owner(2, profile, 8);
     let listener = tfo_listener_backlog(&mut b, backlog);
     #[cfg(feature = "tfo-linux-cookie")]
     if linux {
@@ -57,6 +65,16 @@ fn tfo_setup_cookie_policy(warm: bool, linux: bool, backlog: i32) -> (Owner, Own
             .execute(listener, Op::Accept(SOCK_NONBLOCK))
             .unwrap()
             .value as u64;
+        if matches!(profile, Profile::Upstream(_)) {
+            // This cookie-request connection is ordinary TCP on both sides.
+            for (endpoint, id) in [
+                (&a.endpoint, cid(&a, client)),
+                (&b.endpoint, cid(&b, server)),
+            ] {
+                let info = endpoint.transport_info(id).unwrap();
+                assert_eq!(info.cwnd, 10 * info.mss);
+            }
+        }
         a.execute(client, Op::Close).unwrap();
         b.execute(server, Op::Close).unwrap();
         exchange(&mut a, &mut b);
@@ -80,6 +98,214 @@ pub(super) fn tfo_deliver(b: &mut Owner, bytes: Vec<u8>) {
 pub(super) fn tfo_no_output(a: &mut Owner) {
     a.service_egress().unwrap();
     assert_eq!(a.execute(0, Op::Capture(65535)).unwrap_err(), EAGAIN);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
+//# If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.
+#[test]
+fn native_upstream_early_rfc5681_and_complete_bidirectional_streams() {
+    for (reno, no_gso) in [(false, false), (true, true)] {
+        let profile = Profile::Upstream(crate::packet_profile::UpstreamOptions {
+            early_response: true,
+            receive64k: true,
+            immediate_ack: true,
+            reno,
+            no_gso,
+            ..Default::default()
+        });
+        let config = crate::packet_profile::config(profile);
+        assert_eq!(config.connection.initial_window, ntcp::InitialWindow::Iw10);
+        assert!(config.connection.fast_open_early_response);
+        let (mut a, mut b, listener) = tfo_setup_profile(true, false, 4, profile);
+        let client = new(&mut a, SOCK_NONBLOCK);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
+        assert_eq!(
+            a.execute(client, tfo_send(b"request", MSG_FASTOPEN))
+                .unwrap()
+                .value,
+            7
+        );
+        let syn = tfo_capture(&mut a);
+        assert_eq!(segment(&syn).payload, b"request");
+        tfo_deliver(&mut b, syn);
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        assert_eq!(b.execute(server, Op::Read(7)).unwrap().bytes, b"request");
+        let response: Vec<u8> = (0..20000).map(|n| (n % 251) as u8).collect();
+        assert_eq!(
+            b.execute(
+                server,
+                Op::Send(vec![(response.as_ptr() as usize, response.len())], 0)
+            )
+            .unwrap()
+            .value as usize,
+            response.len()
+        );
+        let synack = tfo_capture(&mut b);
+        assert_ne!(segment(&synack).header.flags & ntcp::wire::SYN, 0);
+        assert!(segment(&synack).payload.is_empty());
+        tfo_deliver(&mut a, synack);
+        let info = b.endpoint.transport_info(cid(&b, server)).unwrap();
+        assert_eq!(info.mss, 1448);
+        assert_eq!(info.cwnd, 4344);
+        let client_info = a.endpoint.transport_info(cid(&a, client)).unwrap();
+        assert_eq!(client_info.cwnd, 14480); // Ordinary client policy is still IW10.
+        let mut lengths = Vec::new();
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let packet = tfo_capture(&mut b);
+            assert_eq!(segment(&packet).payload.len(), 1448);
+            lengths.push(segment(&packet).payload.len());
+            tfo_deliver(&mut a, packet);
+            received.extend(a.execute(client, Op::Read(65535)).unwrap().bytes);
+        }
+        tfo_no_output(&mut b);
+        assert_eq!(received, response[..4344]);
+        assert_eq!(b.endpoint.state(cid(&b, server)), Ok(State::SynReceived));
+        // Only now physically submit the client's final ACK.
+        tfo_deliver(&mut b, tfo_capture(&mut a));
+        assert_eq!(b.endpoint.state(cid(&b, server)), Ok(State::Established));
+        exchange(&mut a, &mut b);
+        received.extend(a.execute(client, Op::Read(65535)).unwrap().bytes);
+        assert_eq!(received, response);
+        let stream = vec![81; 12000];
+        a.execute(
+            client,
+            Op::Send(vec![(stream.as_ptr() as usize, stream.len())], 0),
+        )
+        .unwrap();
+        let mut ordinary_packets = Vec::new();
+        let mut ordinary_bytes = 0;
+        for _ in 0..16 {
+            a.service_egress().unwrap();
+            while let Ok(packet) = a.execute(0, Op::Capture(65535)) {
+                assert!(segment(&packet.bytes).payload.len() <= 1448);
+                ordinary_bytes += segment(&packet.bytes).payload.len();
+                ordinary_packets.push(packet.bytes);
+            }
+            if ordinary_bytes == stream.len() {
+                break;
+            }
+        }
+        // Ordinary IW10 admits a larger initial flight. The sub-MSS tail
+        // may await the sender's SWS/Nagle rules; ACK progress below drains it.
+        assert!(ordinary_bytes > 4344 && ordinary_bytes <= 14480);
+        assert!(ordinary_bytes <= stream.len());
+        for packet in ordinary_packets {
+            tfo_deliver(&mut b, packet);
+        }
+        let mut client_stream = Vec::new();
+        for now in (11000..900000).step_by(10000) {
+            a.test_now = Some(now);
+            b.test_now = Some(now);
+            a.endpoint.on_timeout(now, 64).unwrap();
+            b.endpoint.on_timeout(now, 64).unwrap();
+            exchange(&mut a, &mut b);
+            if let Ok(reply) = b.execute(server, Op::Read(65535)) {
+                client_stream.extend(reply.bytes);
+            }
+            if client_stream.len() == stream.len() {
+                break;
+            }
+        }
+        assert_eq!(client_stream.len(), stream.len());
+        assert_eq!(client_stream, stream);
+        assert_eq!(a.execute(client, Op::Read(1)).unwrap_err(), EAGAIN);
+        assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), EAGAIN);
+        assert_ne!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
+        assert_eq!(
+            a.execute(client, Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
+        eprintln!(
+            "T3_NATIVE_IW {{\"reno\":{reno},\"gso\":{},\"ordinary_cwnd\":14480,\"early_cwnd\":4344,\"early_bytes\":4344,\"lengths\":{lengths:?},\"ordinary_before_ack\":{ordinary_bytes},\"response_delivered\":20000,\"client_delivered\":12000}}",
+            !no_gso
+        );
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.
+//# 4. The client sends an ACK acknowledging the SYN and the server data. If the client's data is not acknowledged, the client retransmits the data in the ACK packet.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Small rejected/partial SYN payloads are repaired in the first ACK. public_first_ack_capacity_conflicts_and_receiver_driven_completion validates 400 SYN bytes against newly learned MSS64/cwnd256, a 32-byte offered window, partial acceptance128 with zero window, and an IPv4 effective path MSS28/cwnd112; first ACK payloads are 64/32/0/28 and real receiver ACK/window progress completes each stream once. Native PacketIo/Egress independently emits 88 bytes first and 352 before ACK for 400 rejected SYN bytes with MSS88. Existing wrap/scalar/reserved evidence remains. Literal all-data-in-first-ACK wording remains TODO pending explicit AC27/T23 user disposition; no interpretation or standards deviation is approved.
+//# The client SHOULD retransmit any unacknowledged data in the first ACK packet in step 2.
+#[test]
+fn native_rejected_syn_repair_uses_first_ack_and_negotiated_capacity() {
+    let (mut a, mut b, listener) = tfo_setup(true);
+    b.execute(listener, Op::Set(IPPROTO_TCP, TCP_MAXSEG, 88))
+        .unwrap();
+    b.endpoint.set_fast_open_hmac_key([93; 32]);
+    let client = new(&mut a, SOCK_NONBLOCK);
+    let data: Vec<u8> = (0..400).map(|n| (n % 251) as u8).collect();
+    assert_eq!(
+        a.execute(client, tfo_send(&data, MSG_FASTOPEN))
+            .unwrap()
+            .value,
+        400
+    );
+    let syn = tfo_capture(&mut a);
+    let iss = segment(&syn).header.sequence;
+    assert_eq!(segment(&syn).payload, data);
+    tfo_deliver(&mut b, syn.clone());
+    let synack = tfo_capture(&mut b);
+    assert_eq!(segment(&synack).options.mss, Some(88));
+    assert_eq!(segment(&synack).header.acknowledgment, iss.wrapping_add(1));
+    assert!(segment(&synack).header.window >= 400);
+    tfo_deliver(&mut a, synack);
+    let info = a.endpoint.transport_info(cid(&a, client)).unwrap();
+    assert_eq!((info.mss, info.cwnd), (88, 352));
+    let mut repairs = Vec::new();
+    for offset in [0, 88, 176, 264] {
+        let repair = tfo_capture(&mut a);
+        let packet = segment(&repair);
+        assert_eq!(
+            packet.header.flags & (ntcp::wire::SYN | ntcp::wire::ACK),
+            ntcp::wire::ACK
+        );
+        assert_eq!(packet.header.sequence, iss.wrapping_add(1 + offset));
+        assert_eq!(packet.payload, &data[offset as usize..offset as usize + 88]);
+        repairs.push(repair);
+    }
+    tfo_no_output(&mut a);
+    for packet in &repairs {
+        tfo_deliver(&mut b, packet.clone());
+    }
+    let server = b
+        .execute(listener, Op::Accept(SOCK_NONBLOCK))
+        .unwrap()
+        .value as u64;
+    let mut received = b.execute(server, Op::Read(65535)).unwrap().bytes;
+    assert_eq!(received, data[..352]);
+    for now in (11000..500000).step_by(10000) {
+        a.test_now = Some(now);
+        b.test_now = Some(now);
+        a.endpoint.on_timeout(now, 64).unwrap();
+        b.endpoint.on_timeout(now, 64).unwrap();
+        exchange(&mut a, &mut b);
+        if let Ok(reply) = b.execute(server, Op::Read(65535)) {
+            received.extend(reply.bytes);
+        }
+        if received.len() == data.len() {
+            break;
+        }
+    }
+    assert_eq!(received, data);
+    tfo_deliver(&mut b, syn);
+    tfo_deliver(&mut b, repairs[0].clone());
+    assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), EAGAIN);
+    eprintln!(
+        "T3_NATIVE_FIRST_ACK {{\"syn_bytes\":400,\"accepted\":0,\"mss\":88,\"cwnd\":352,\"first_ack_bytes\":88,\"before_data_ack\":352,\"delivered_once\":400}}"
+    );
 }
 
 fn threshold_client(a: &mut Owner) -> u64 {

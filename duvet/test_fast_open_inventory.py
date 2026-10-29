@@ -96,6 +96,16 @@ T2_CLOSURES = {
 }
 
 
+T3_CLOSURES = {
+    "server-iw": (
+        "4.2.2",
+        "If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.",
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_receive(",
+        "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_rfc5681_controller_matrix_and_ordinary_controls()",
+    ),
+}
+
+
 def validate_selected_closure(row, expected):
     section, quote, source, test = expected
     target = f"{PREFIX}7413#" + ("section-" if section[0].isdigit() else "appendix-") + section
@@ -206,7 +216,15 @@ class FastOpenInventory(unittest.TestCase):
             "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn syn_data_ack_bounds_wrap_partial_retry_and_flush()",
             "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn scalar_fast_open_repair_stops_at_negotiated_cwnd()",
             "crates/stacks/ntcp/src/fast_open_connection_tests.rs::fn reserved_fast_open_repair_stops_at_negotiated_cwnd()",
+            "crates/stacks/ntcp/src/fast_open_partial_synack_tests.rs::fn public_first_ack_capacity_conflicts_and_receiver_driven_completion()",
+            "crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs::fn native_rejected_syn_repair_uses_first_ack_and_negotiated_capacity()",
         ])
+        self.assertEqual(rows["7413-first-ack-all-repair"]["evidence"],
+                         [repair["evidence"][0], *repair["evidence"][-2:]])
+        for witness in ("400 SYN bytes", "MSS64/cwnd256", "32-byte offered window",
+                        "partial acceptance128 with zero window", "MSS28/cwnd112",
+                        "88 bytes first and 352 before ACK", "explicit AC27/T23 user disposition"):
+            self.assertIn(witness, repair["reason"])
 
     def test_synack_timeout_attaches_selected_early_response_evidence(self):
         row = next(r for r in ledger()["paragraphs"] if r["id"] == "7413-synack-timeout")
@@ -268,7 +286,7 @@ class FastOpenInventory(unittest.TestCase):
                 with self.subTest(group=group, row=id):
                     self.assertIn(rows[id]["status"], ("covered", "TODO"))
         for id in ("mac-cost", "mac-expiration", "is-cookie-valid",
-                   "first-ack-all-repair", "server-iw",
+                   "first-ack-all-repair",
                    "simultaneous", "api-connect-errno"):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("LinuxSipHash24", rows["mac-expiration"]["reason"])
@@ -281,7 +299,7 @@ class FastOpenInventory(unittest.TestCase):
 
     def test_t2_closures_keep_canonical_source_and_test_reasons(self):
         rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
-        for id in [*T2_CLOSURES, "original-6"]:
+        for id in [*T2_CLOSURES, *T3_CLOSURES, "original-6"]:
             row = rows[id]
             for evidence in row["evidence"]:
                 path, anchor = evidence.split("::", 1)
@@ -296,7 +314,7 @@ class FastOpenInventory(unittest.TestCase):
 
     def test_selected_fast_open_closures_keep_whole_keys_and_executable_evidence(self):
         rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
-        for id, expected in (T10_CLOSURES | T2_CLOSURES).items():
+        for id, expected in (T10_CLOSURES | T2_CLOSURES | T3_CLOSURES).items():
             with self.subTest(row=id):
                 row = rows[id]
                 validate_selected_closure(row, expected)
@@ -345,6 +363,22 @@ class FastOpenInventory(unittest.TestCase):
         self.assertIn("at most one retiring key", rows["rolling-keys"]["reason"])
         self.assertEqual(rows["rolling-keys"]["evidence"][0],
                          "crates/stacks/ntcp/src/fast_open.rs::pub fn install(")
+
+    def test_server_iw_whole_key_retains_public_and_native_wire_evidence(self):
+        row = next(r for r in ledger()["paragraphs"] if r["id"] == "7413-server-iw")
+        for file, anchor in (
+            ("crates/stacks/ntcp/src/connection_early_response_tests.rs",
+             "fn early_response_public_iw10_wire_witness()"),
+            ("crates/adapters/ntcp-socket/src/runtime_fast_open_tests.rs",
+             "fn native_upstream_early_rfc5681_and_complete_bidirectional_streams()"),
+        ):
+            matches = [a for a in audit.source_annotations((ROOT / file).read_text())
+                       if a["kind"] == "TEST" and audit.clause_key(a) == audit.clause_key(row)
+                       and anchor in a["attached"]]
+            self.assertTrue(matches, anchor)
+            self.assertTrue(all(a["reason"] == row["reason"] for a in matches))
+        self.assertIn("before controller construction", row["reason"])
+        self.assertNotIn("frozen", row["reason"])
 
     def test_verified_errata_are_explicit_without_rewriting_published_quotes(self):
         document = ledger()

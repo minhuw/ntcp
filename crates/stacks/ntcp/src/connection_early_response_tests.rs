@@ -160,6 +160,121 @@ fn early_response_actual_gate_and_committed_synack() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
+//# If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.
+#[test]
+fn early_response_rfc5681_controller_matrix_and_ordinary_controls() {
+    // Values straddle both piecewise boundaries before and after the twelve
+    // bytes of timestamp options. Expected byte/segment counts are independent
+    // of InitialWindow::bytes and the connection's dynamic cap.
+    for (advertised, timestamps, effective, segments) in [
+        (1095, false, 1095, 4),
+        (1096, false, 1096, 3),
+        (2190, false, 2190, 3),
+        (2191, false, 2191, 2),
+        (1107, true, 1095, 4),
+        (1108, true, 1096, 3),
+        (2202, true, 2190, 3),
+        (2203, true, 2191, 2),
+    ] {
+        for (growth, recovery, sack, rack, prr) in [
+            (
+                CongestionAlgorithm::Reno,
+                RecoveryAlgorithm::Reno,
+                false,
+                false,
+                false,
+            ),
+            (
+                CongestionAlgorithm::Reno,
+                RecoveryAlgorithm::NewReno,
+                true,
+                false,
+                true,
+            ),
+            (
+                CongestionAlgorithm::Cubic,
+                RecoveryAlgorithm::Reno,
+                true,
+                false,
+                false,
+            ),
+            (
+                CongestionAlgorithm::Cubic,
+                RecoveryAlgorithm::NewReno,
+                true,
+                true,
+                true,
+            ),
+        ] {
+            for reserved in [false, true] {
+                let units = if reserved { 1_000_000_000 } else { 1_000_000 };
+                let mut c = cfg(units);
+                c.mss = advertised;
+                c.timestamps = timestamps;
+                c.congestion_algorithm = growth;
+                c.recovery_algorithm = recovery;
+                c.sack = sack;
+                c.rack = rack;
+                c.prr = prr;
+                c.tlp = rack;
+                let (peer, mut early, _) = opening(c.clone(), u32::MAX - 100, true, b"request");
+                assert_eq!(peer.config.initial_window, InitialWindow::Iw10);
+                assert_eq!(early.config.initial_window, InitialWindow::Rfc5681);
+                assert_eq!(early.config.congestion_algorithm, growth);
+                assert_eq!(early.config.recovery_algorithm, recovery);
+                assert_eq!(
+                    (early.config.sack, early.config.rack, early.config.prr),
+                    (sack, rack, prr)
+                );
+                let expected = effective * segments;
+                assert_eq!(early.transport_info().mss, effective);
+                assert_eq!(early.transport_info().cwnd, expected);
+                early.write(&[71; 12000]).unwrap();
+                emit_at_us(&mut early, 20_000, reserved);
+                let mut sent = 0;
+                for _ in 0..segments {
+                    let bytes = emit_at_us(&mut early, 30_000, reserved);
+                    let packet = wire::parse(ip(early.tuple()), &bytes).unwrap();
+                    assert_eq!(packet.payload.len(), effective as usize);
+                    assert_eq!(packet.header.sequence, early.iss.wrapping_add(1 + sent).0);
+                    sent += packet.payload.len() as u32;
+                }
+                assert_eq!(sent, expected);
+                assert_eq!(early.transmit(early.now, &mut [0; 4096]), Ok(None));
+                acknowledge(&mut early, 100_000, 0, &[]);
+                assert_eq!(early.congestion.cwnd(), expected); // SYN ACK is not data growth.
+                acknowledge(&mut early, 200_000, expected, &[]);
+                assert!(early.congestion.cwnd() > expected);
+                assert_eq!(early.acknowledged, u64::from(expected));
+
+                // Ordinary active and passive opens retain the embedding's IW10.
+                assert!(peer.congestion.cwnd() > expected);
+                let (_, mut ordinary, _) = opening(c.clone(), 100, false, b"");
+                assert_eq!(ordinary.config.initial_window, InitialWindow::Iw10);
+                assert!(ordinary.congestion.cwnd() > expected);
+                emit_at_us(&mut ordinary, 20_000, reserved);
+                acknowledge(&mut ordinary, 100_000, 0, &[]);
+                let ordinary_cap = ordinary.congestion.cwnd();
+                ordinary.write(&[72; 16000]).unwrap();
+                let mut sent = 0;
+                while let Some(n) =
+                    select_and_commit(&mut ordinary, units / 5, &mut [0; 4096], reserved)
+                {
+                    sent += n - 20 - if timestamps { 12 } else { 0 };
+                }
+                assert!(sent as u32 <= ordinary_cap);
+                assert!(sent as u32 > expected);
+                c.initial_window = InitialWindow::Rfc5681;
+                let (_, ordinary, _) = opening(c, 100, false, b"");
+                assert_eq!(ordinary.congestion.cwnd(), expected);
+            }
+        }
+    }
+}
+
 #[test]
 fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
     for units in [1_000_000, 1_000_000_000] {
@@ -247,6 +362,257 @@ fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
             }
         }
     }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
+//# If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.
+#[test]
+fn early_response_public_iw10_wire_witness() {
+    extern crate std;
+    for (v6, linux, protected, empty) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (false, false, false, true),
+        (true, false, true, false),
+        (false, false, true, true),
+        #[cfg(feature = "tfo-linux-cookie")]
+        (false, true, false, false),
+        #[cfg(feature = "tfo-linux-cookie")]
+        (true, true, false, true),
+    ] {
+        for reserved in [false, true] {
+            let (mut a, mut b, listener) = public_pair_policy(true, 1_000_000, v6, linux);
+            if protected {
+                b.set_listener_fast_open_early_data_policy(
+                    listener,
+                    crate::FastOpenEarlyDataPolicy::ApplicationProtected,
+                )
+                .unwrap();
+                // Protected authorization must be independent of the acquired credential.
+                b.set_fast_open_hmac_key([99; 32]);
+            }
+            if reserved {
+                b.enable_output_reservations_with_gso(
+                    2,
+                    GsoLimits {
+                        max_bytes: 16384,
+                        max_segments: 16,
+                    },
+                )
+                .unwrap();
+            }
+            let addresses = public_tuple(v6);
+            let (client, n) = a
+                .connect_fast_open(
+                    100,
+                    core::net::SocketAddr::new(addresses.remote.ip(), 2001),
+                    addresses.local,
+                    if empty { b"" } else { b"request" },
+                )
+                .unwrap();
+            assert_eq!(n, if empty { 0 } else { 7 });
+            let syn = public_packet(&mut a, 100, false);
+            b.input(100, syn.0, &syn.1).unwrap();
+            let child = b.accept(listener).unwrap();
+            let response = vec![73; 10000];
+            assert_eq!(b.write(child, &response).unwrap(), response.len());
+            let synack = public_packet(&mut b, 200, reserved);
+            assert!(wire::parse(synack.0, &synack.1).unwrap().payload.is_empty());
+            a.input(200, synack.0, &synack.1).unwrap();
+            let cwnd = b.transport_info(child).unwrap().cwnd;
+            let mut lengths = Vec::new();
+            let mut received = Vec::new();
+            for _ in 0..16 {
+                let mut bytes = [0; 4096];
+                let packet = if reserved {
+                    let (out, attempt) = b.poll_reserved_transmit(300, &mut bytes, 64).unwrap();
+                    if let Some(attempt) = attempt {
+                        if let Some(group) = b.transmit_segmentation(attempt) {
+                            assert_eq!(group.segment_payload_len, 1000);
+                            assert!(group.payload_len <= 4000);
+                        }
+                        if lengths.len() == 1 {
+                            // Retain a physically submitted prefix of a real group,
+                            // reject the next segment, then reselect it unchanged.
+                            let tx = out.packet.unwrap();
+                            let selected = bytes[..tx.len].to_vec();
+                            let before = b.transport_info(child).unwrap();
+                            assert!(
+                                b.poll_transmit(300, &mut [0; 4096], 64)
+                                    .unwrap()
+                                    .packet
+                                    .is_none()
+                            );
+                            assert!(b.reject_unsubmitted(attempt).unwrap());
+                            assert!(!b.accept_transmit(300, attempt).unwrap());
+                            let (next, token) =
+                                b.poll_reserved_transmit(300, &mut bytes, 64).unwrap();
+                            assert_eq!(next.packet.unwrap().len, tx.len);
+                            assert_eq!(&bytes[..tx.len], &selected);
+                            assert_eq!(
+                                b.transport_info(child).unwrap().send_used,
+                                before.send_used
+                            );
+                            assert!(b.accept_transmit(300, token.unwrap()).unwrap());
+                        } else {
+                            assert!(b.accept_transmit(300, attempt).unwrap());
+                        }
+                    }
+                    out.packet
+                } else {
+                    b.poll_transmit(300, &mut bytes, 64).unwrap().packet
+                };
+                let Some(packet) = packet else { break };
+                let data = wire::parse(packet.ip, &bytes[..packet.len]).unwrap();
+                assert_eq!(data.payload.len(), 1000);
+                lengths.push(data.payload.len());
+                a.input(300, packet.ip, &bytes[..packet.len]).unwrap();
+                let mut got = [0; 2048];
+                let n = a.read(client, &mut got).unwrap();
+                received.extend_from_slice(&got[..n]);
+            }
+            let sent: usize = lengths.iter().sum();
+            std::eprintln!(
+                "T3_SERVER_IW {{\"v6\":{v6},\"linux\":{linux},\"protected\":{protected},\"empty\":{empty},\"reserved\":{reserved},\"cwnd\":{cwnd},\"mss\":1000,\"bytes\":{sent},\"lengths\":{lengths:?}}}"
+            );
+            assert_eq!(cwnd, 4000);
+            assert_eq!(sent, 4000);
+            assert_eq!(b.state(child).unwrap(), State::SynReceived);
+            let ack = public_packet(&mut a, 400, false);
+            b.input(400, ack.0, &ack.1).unwrap();
+            assert_eq!(b.state(child).unwrap(), State::Established);
+            for now in 401..450 {
+                let mut bytes = [0; 4096];
+                if let Some(packet) = b.poll_transmit(now, &mut bytes, 64).unwrap().packet {
+                    a.input(now, packet.ip, &bytes[..packet.len]).unwrap();
+                    let mut got = [0; 4096];
+                    if let Ok(n) = a.read(client, &mut got) {
+                        received.extend_from_slice(&got[..n]);
+                    }
+                }
+                if let Some(packet) = a.poll_transmit(now, &mut bytes, 64).unwrap().packet {
+                    b.input(now, packet.ip, &bytes[..packet.len]).unwrap();
+                }
+                if received.len() == response.len() {
+                    break;
+                }
+            }
+            assert_eq!(received, response);
+            assert_eq!(
+                a.read(client, &mut [0; 1]),
+                Err(crate::EndpointError::Connection(Error::WouldBlock))
+            );
+        }
+    }
+}
+
+#[test]
+fn early_response_public_tight_peer_window_and_path_credit() {
+    for reserved in [false, true] {
+        for window in [1, 700, 16000] {
+            let (mut a, mut b, listener) = public_pair(true, 1_000_000);
+            if reserved {
+                b.enable_output_reservations().unwrap();
+            }
+            let local = core::net::SocketAddr::new(tuple().remote.ip(), 2001);
+            let (client, n) = a
+                .connect_fast_open_with_buffer_capacities(
+                    100,
+                    local,
+                    tuple().local,
+                    b"request",
+                    8192,
+                    window,
+                )
+                .unwrap();
+            assert_eq!(n, 7);
+            let syn = public_packet(&mut a, 100, false);
+            assert_eq!(
+                wire::parse(syn.0, &syn.1).unwrap().header.window as usize,
+                window
+            );
+            b.input(100, syn.0, &syn.1).unwrap();
+            let child = b.accept(listener).unwrap();
+            b.set_first_hop_mtu(110, child, 540).unwrap();
+            assert_eq!(b.transport_info(child).unwrap().mss, 500);
+            assert_eq!(b.transport_info(child).unwrap().cwnd, 2000);
+            b.write(child, &[42; 10000]).unwrap();
+            let synack = public_packet(&mut b, 200, reserved);
+            assert!(wire::parse(synack.0, &synack.1).unwrap().payload.is_empty());
+            a.input(200, synack.0, &synack.1).unwrap();
+            let mut sent = 0;
+            for now in [300, 600_000, 900_000] {
+                b.on_timeout(now, 64).unwrap();
+                for _ in 0..8 {
+                    let mut bytes = [0; 2048];
+                    let out = if reserved {
+                        let (out, token) = b.poll_reserved_transmit(now, &mut bytes, 64).unwrap();
+                        if let Some(token) = token {
+                            b.accept_transmit(now, token).unwrap();
+                        }
+                        out
+                    } else {
+                        b.poll_transmit(now, &mut bytes, 64).unwrap()
+                    };
+                    let Some(tx) = out.packet else { break };
+                    let packet = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+                    assert!(packet.payload.len() <= 500);
+                    assert!(tx.len <= 520);
+                    sent += packet.payload.len();
+                    assert!(sent <= 2000.min(window - 1));
+                }
+            }
+            assert_eq!(sent, 2000.min(window - 1));
+            assert_eq!(b.state(child).unwrap(), State::SynReceived);
+            assert_eq!(a.state(client).unwrap(), State::Established);
+        }
+    }
+}
+
+#[test]
+fn early_response_public_abandon_partially_committed_group_is_terminal() {
+    let (mut a, mut b, listener) = public_pair(true, 1_000_000);
+    b.enable_output_reservations_with_gso(
+        2,
+        GsoLimits {
+            max_bytes: 8192,
+            max_segments: 8,
+        },
+    )
+    .unwrap();
+    let (client, child) = public_open(&mut a, &mut b, listener, 100);
+    b.write(child, &[42; 10000]).unwrap();
+    let synack = public_packet(&mut b, 200, true);
+    a.input(200, synack.0, &synack.1).unwrap();
+    let mut bytes = [0; 2048];
+    let (out, token) = b.poll_reserved_transmit(300, &mut bytes, 64).unwrap();
+    let token = token.unwrap();
+    let group = b.transmit_segmentation(token).unwrap();
+    assert_eq!((group.payload_len, group.segment_payload_len), (4000, 1000));
+    let tx = out.packet.unwrap();
+    assert_eq!(
+        wire::parse(tx.ip, &bytes[..tx.len]).unwrap().payload.len(),
+        1000
+    );
+    b.accept_transmit(300, token).unwrap();
+    a.input(300, tx.ip, &bytes[..tx.len]).unwrap();
+    assert_eq!(a.read(client, &mut bytes).unwrap(), 1000);
+    assert!(b.poll_reserved_transmit(301, &mut [0; 19], 64).is_err());
+    assert!(b.abandon_transmit(token).unwrap());
+    assert!(!b.abandon_transmit(token).unwrap());
+    assert_eq!(b.close_reason(child).unwrap(), Some(CloseReason::Aborted));
+    assert!(
+        b.poll_transmit(400, &mut bytes, 64)
+            .unwrap()
+            .packet
+            .is_none()
+    );
+    assert_eq!(
+        a.read(client, &mut bytes),
+        Err(crate::EndpointError::Connection(Error::WouldBlock))
+    );
 }
 
 fn assert_early_response_window_boundary(window: u32) {
@@ -483,9 +849,31 @@ fn early_response_actual_pmtu_shrink_and_pacing_keep_syn_anchor() {
 // Public Endpoint path: real cookie acquisition, authenticated admission, paired
 // peer input and reservation ownership. No synthesized transport state.
 fn public_pair(early: bool, units: u64) -> (Endpoint, Endpoint, ListenerId) {
+    public_pair_policy(early, units, false, false)
+}
+
+fn public_tuple(v6: bool) -> Tuple {
+    if v6 {
+        Tuple {
+            local: "[2001:db8::1]:8080".parse().unwrap(),
+            remote: "[2001:db8::2]:2000".parse().unwrap(),
+        }
+    } else {
+        tuple()
+    }
+}
+
+fn public_pair_policy(
+    early: bool,
+    units: u64,
+    v6: bool,
+    linux: bool,
+) -> (Endpoint, Endpoint, ListenerId) {
+    let tuple = public_tuple(v6);
     let make = |key, early| {
         let mut c = cfg(units);
         c.fast_open_early_response = early;
+        c.pmtud = Some(crate::PmtudConfig::new(1500));
         Endpoint::new(
             EndpointConfig {
                 max_connections: 16,
@@ -503,10 +891,17 @@ fn public_pair(early: bool, units: u64) -> (Endpoint, Endpoint, ListenerId) {
     let mut b = make(2, early);
     a.enable_fast_open().unwrap();
     b.enable_fast_open().unwrap();
-    let listener = b.listen(tuple().local, 8).unwrap();
+    #[cfg(feature = "tfo-linux-cookie")]
+    if linux {
+        b.set_fast_open_cookie_policy(crate::FastOpenCookiePolicy::LinuxSipHash24(
+            crate::LinuxSipHash24Key::new([17; 16]),
+        ));
+    }
+    let _ = linux;
+    let listener = b.listen(tuple.local, 8).unwrap();
     b.set_listener_fast_open(listener, 2).unwrap();
     let (id, n) = a
-        .connect_fast_open(0, tuple().remote, tuple().local, b"miss")
+        .connect_fast_open(0, tuple.remote, tuple.local, b"miss")
         .unwrap();
     assert_eq!(n, 0);
     let p = public_packet(&mut a, 0, false);
@@ -670,10 +1065,10 @@ fn early_response_public_rejected_synack_stale_attempt_and_terminal_drain() {
 
 #[test]
 fn early_response_public_auth_fallbacks_and_reset_debt_do_not_transmit() {
-    for mode in 0..5 {
+    for mode in 0..7 {
         let (mut a, mut b, listener) = public_pair(true, 1_000_000);
         b.set_listener_fast_open(listener, 1).unwrap();
-        if mode >= 3 {
+        if matches!(mode, 3 | 4) {
             let (client, child) = public_open(&mut a, &mut b, listener, 100);
             let synack = public_packet(&mut b, 200, false);
             b.write(child, b"first reply").unwrap();
@@ -710,6 +1105,11 @@ fn early_response_public_auth_fallbacks_and_reset_debt_do_not_transmit() {
         if mode == 2 {
             b.set_listener_fast_open(listener, 0).unwrap();
         }
+        if mode == 5 {
+            let position = options.windows(2).position(|b| b == [34, 10]).unwrap();
+            options[position + 1] = 2;
+            options[position + 2..position + 10].fill(1); // Request only.
+        }
         let mut bytes = [0; 2048];
         let len = wire::encode(
             syn.0,
@@ -719,10 +1119,17 @@ fn early_response_public_auth_fallbacks_and_reset_debt_do_not_transmit() {
             &mut bytes,
         )
         .unwrap();
-        b.input(310, syn.0, &bytes[..len]).unwrap();
-        assert!(b.accept(listener).is_err());
+        // Delay delivery of a genuinely issued old cookie beyond both HMAC
+        // epochs without servicing timers or changing the key authority.
+        let admitted_at = if mode == 6 {
+            2 * crate::fast_open::LIFETIME_US
+        } else {
+            310
+        };
+        b.input(admitted_at, syn.0, &bytes[..len]).unwrap();
+        assert!(b.accept(listener).is_err(), "mode={mode}");
         let out = b
-            .poll_transmit(320, &mut bytes, 64)
+            .poll_transmit(admitted_at + 10, &mut bytes, 64)
             .unwrap()
             .packet
             .unwrap();
@@ -734,10 +1141,11 @@ fn early_response_public_auth_fallbacks_and_reset_debt_do_not_transmit() {
             parsed.header.sequence.wrapping_add(1)
         );
         let child = out.connection.unwrap();
+        assert_eq!(b.transport_info(child).unwrap().cwnd, 10000);
         b.write(child, b"must wait").unwrap();
         for _ in 0..4 {
             assert!(
-                b.poll_transmit(330, &mut bytes, 64)
+                b.poll_transmit(admitted_at + 20, &mut bytes, 64)
                     .unwrap()
                     .packet
                     .is_none()
@@ -837,16 +1245,8 @@ fn early_response_close_drains_queue_after_handshake_and_keeps_empty_early_fin()
                 assert_eq!(data.payload.len(), 1000);
                 assert_eq!(data.header.flags & FIN, 0);
             }
-            let early_tail = if initial_window == InitialWindow::Iw10 {
-                let bytes = emit_at_us(&mut a, 80_000, false);
-                let tail = wire::parse(ip(a.tuple()), &bytes).unwrap();
-                assert_eq!(tail.payload.len(), 500);
-                assert_eq!(tail.header.flags & FIN, 0);
-                500
-            } else {
-                assert_eq!(a.transmit(80_000, &mut [0; 2048]), Ok(None));
-                0
-            };
+            assert_eq!(a.transmit(80_000, &mut [0; 2048]), Ok(None));
+            let early_tail = 0;
             assert_eq!(a.fin_sequence, None);
             assert_eq!(a.send.len(), 4500);
             acknowledge(&mut a, 200_000, 4000 + early_tail, &[]);
@@ -998,7 +1398,7 @@ fn inventory_tfo_server_early_policy_and_pre_handshake_payload_cap() {
                     }
                 }
                 let sent: usize = lengths.iter().sum();
-                assert_eq!(sent, if enabled { response_bytes } else { 0 });
+                assert_eq!(sent, if enabled { response_bytes.min(4000) } else { 0 });
                 let before_ack_cwnd = a.congestion.cwnd();
                 let mss = a.mss;
                 let state = a.state();
@@ -1026,8 +1426,20 @@ fn inventory_tfo_server_early_policy_and_pre_handshake_payload_cap() {
                 )
                 .unwrap();
                 assert!(a.handshake_complete());
+                // Drain the entire queued response after the final ACK.
+                let mut completed = sent;
+                for us in 1_100_000..1_100_016 {
+                    let mut bytes = [0; 4096];
+                    let Some(n) = select_and_commit(&mut a, us, &mut bytes, reserved) else {
+                        break;
+                    };
+                    completed += wire::parse(ip(tuple()), &bytes[..n]).unwrap().payload.len();
+                    acknowledge(&mut a, us, completed as u32, &[]);
+                }
+                assert_eq!(completed, response_bytes);
+                acknowledge(&mut a, 1_200_000, response_bytes as u32, &[]);
                 a.write(b"after").unwrap();
-                let bytes = emit_at_us(&mut a, 21_000, reserved);
+                let bytes = emit_at_us(&mut a, 1_210_000, reserved);
                 assert!(!wire::parse(ip(tuple()), &bytes).unwrap().payload.is_empty());
                 std::eprintln!(
                     "TFO_INVENTORY {{\"probe\":\"server_early_policy\",\"enabled\":{enabled},\"reserved\":{reserved},\"write_bytes\":{response_bytes},\"timestamps\":{timestamps},\"mss\":{mss},\"cwnd_bytes\":{before_ack_cwnd},\"pre_handshake_sent\":{sent},\"lengths\":{lengths:?},\"gso\":{grouped},\"handshake_completed_on_control_ack\":true}}"
