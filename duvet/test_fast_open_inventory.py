@@ -68,6 +68,34 @@ T10_CLOSURES = {
 }
 
 
+T2_CLOSURES = {
+    "ignore-invalid-and-nonsyn": (
+        "4.1.1",
+        "Options with invalid Length values or without the SYN flag set MUST be ignored.",
+        "crates/stacks/ntcp/src/wire.rs::fn read_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn malformed_fast_open_preserves_timestamp_validation_and_ordinary_stream()",
+    ),
+    "request-retry-period": (
+        "4.2.1",
+        "We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.",
+        "crates/stacks/ntcp/src/connection.rs::fn report_fast_open_failure(",
+        "crates/stacks/ntcp/src/fast_open_cookie_timeout_tests.rs::fn cookie_request_first_timeout_success_preserves_cooldown()",
+    ),
+    "original-7": (
+        "4.2.2",
+        "Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.",
+        "crates/stacks/ntcp/src/connection.rs::if let Some(cookie) = fast_open_option {",
+        "crates/stacks/ntcp/src/fast_open_server_cookie_tests.rs::fn supplied_cookie_cold_limits_options_and_real_mss_learning()",
+    ),
+    "lost-syn-heuristic": (
+        "4.2.2",
+        "If the client has timed out and retransmitted only regular SYN packets, it can heuristically detect paths that intentionally drop SYNs with the Fast Open option or data. If the SYN-ACK acknowledges only the initial sequence and does not carry a Fast Open cookie option, presumably it is triggered by a retransmitted (regular) SYN and the original SYN or the corresponding SYN-ACK was lost.",
+        "crates/stacks/ntcp/src/connection.rs::fn report_fast_open_syn_rejection(",
+        "crates/stacks/ntcp/src/fast_open_cookie_timeout_tests.rs::fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress()",
+    ),
+}
+
+
 def validate_selected_closure(row, expected):
     section, quote, source, test = expected
     target = f"{PREFIX}7413#" + ("section-" if section[0].isdigit() else "appendix-") + section
@@ -158,9 +186,10 @@ class FastOpenInventory(unittest.TestCase):
                 if row["status"] == "TODO":
                     self.assertTrue(all(a["reason"] == row["reason"] for a in matches),
                                     (file, number, kind))
-        # Full auditing may expose a qualifier previously hidden by selected
-        # scope. Preserve the full original obligation and evidence as a TODO.
-        self.assertEqual(originals["7413-original-7"]["status"], "TODO")
+        # Preserve the whole conditional quote and the original evidence floor.
+        # The ordinary cookie branch now obeys both published cold bounds;
+        # section 7.3 authorization stays an explicit separate selection.
+        self.assertEqual(originals["7413-original-7"]["status"], "covered")
         self.assertIn("Held for Document Update", originals["7413-original-7"]["reason"])
         self.assertEqual(originals["7413-original-7"]["evidence"], [
             "crates/stacks/ntcp/src/connection.rs::if let Some(cookie) = fast_open_option {",
@@ -238,8 +267,8 @@ class FastOpenInventory(unittest.TestCase):
             for id in ids:
                 with self.subTest(group=group, row=id):
                     self.assertIn(rows[id]["status"], ("covered", "TODO"))
-        for id in ("mac-cost", "mac-expiration", "is-cookie-valid", "ignore-invalid-and-nonsyn",
-                   "request-retry-period", "first-ack-all-repair", "server-iw",
+        for id in ("mac-cost", "mac-expiration", "is-cookie-valid",
+                   "first-ack-all-repair", "server-iw",
                    "simultaneous", "api-connect-errno"):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("LinuxSipHash24", rows["mac-expiration"]["reason"])
@@ -250,9 +279,24 @@ class FastOpenInventory(unittest.TestCase):
             self.assertEqual(rows[id]["status"], "exception")
         self.assertIn("crates/adapters/ntcp-socket/", rows["api-early-accept"]["evidence"][0])
 
+    def test_t2_closures_keep_canonical_source_and_test_reasons(self):
+        rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
+        for id in [*T2_CLOSURES, "original-6"]:
+            row = rows[id]
+            for evidence in row["evidence"]:
+                path, anchor = evidence.split("::", 1)
+                matches = [a for a in audit.source_annotations((ROOT / path).read_text())
+                           if audit.clause_key(a) == audit.clause_key(row)
+                           and anchor in a["attached"]]
+                self.assertTrue(matches, evidence)
+                self.assertTrue(all(a["reason"] == row["reason"] for a in matches), evidence)
+        self.assertIn("section 7.3", rows["original-7"]["reason"])
+        self.assertEqual(rows["original-7"]["errata"], [8015])
+        self.assertIn("presumption, not proof", rows["lost-syn-heuristic"]["reason"])
+
     def test_selected_fast_open_closures_keep_whole_keys_and_executable_evidence(self):
         rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
-        for id, expected in T10_CLOSURES.items():
+        for id, expected in (T10_CLOSURES | T2_CLOSURES).items():
             with self.subTest(row=id):
                 row = rows[id]
                 validate_selected_closure(row, expected)
@@ -272,7 +316,7 @@ class FastOpenInventory(unittest.TestCase):
         # raw-key restart continuity, cost or broad interoperability.
         for id in ("perform-normal-and-expiry", "server-mac-properties", "mac-expiration",
                    "is-cookie-valid", "request-server-properties", "reuse-until-expired",
-                   "mac-cost", "compatibility", "lost-syn-heuristic"):
+                   "mac-cost", "compatibility"):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("manual key revocation", rows["reuse-until-expired"]["reason"])
         self.assertIn("same-key reinstalls cannot renew expired leases", rows["reuse-until-expired"]["reason"])
@@ -320,7 +364,10 @@ class FastOpenInventory(unittest.TestCase):
         self.assertIn("range 6 to 18", rows["option-layout"]["quote"])
         self.assertIn("source and destination IP addresses and ports", rows["negative-scope"]["quote"])
         self.assertIn("536 bytes", rows["original-7"]["quote"])
-        self.assertEqual(rows["original-7"]["status"], "TODO")
+        self.assertEqual(rows["original-7"]["status"], "covered")
+        self.assertEqual(rows["original-7"]["errata"], [8015])
+        self.assertIn("Held for Document Update", rows["original-7"]["reason"])
+        self.assertIn("not needed for this bound", rows["original-7"]["reason"])
         self.assertIn("Rejected erratum 6239 is not applied", rows["withhold-response-defense"]["reason"])
 
 

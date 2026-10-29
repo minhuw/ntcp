@@ -69,10 +69,128 @@ fn emit(
 fn deliver(endpoint: &mut Endpoint, now: u64, p: &(IpMetadata, Vec<u8>)) {
     endpoint.input(now, p.0, &p.1).unwrap();
 }
+// Construct checksum-correct hostile input without relaxing the output codec.
+fn raw_option_packet(
+    ip: IpMetadata,
+    header: wire::Header,
+    raw: &[u8],
+    payload: &[u8],
+) -> (IpMetadata, Vec<u8>) {
+    let padding = (4 - raw.len() % 4) % 4;
+    let mut bytes = vec![0; 60 + payload.len()];
+    let n = wire::encode(
+        ip,
+        header,
+        &vec![1; padding + raw.len()],
+        payload,
+        &mut bytes,
+    )
+    .unwrap();
+    bytes[20 + padding..20 + padding + raw.len()].copy_from_slice(raw);
+    bytes.truncate(n);
+    repair_cache_checksum(ip, &mut bytes);
+    (ip, bytes)
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+//= type=test
+//= reason=Invalid incoming Kind 34 lengths discard credential metadata; an unframeable suffix stops traversal without guessing boundaries, preserving validated prefix options and DataOffset payload. Non-SYN credentials are ignored. Strict output, checksum/header and unrelated malformed-option rejection remain enforced.
+//# Options with invalid Length values or without the SYN flag set MUST be ignored.
+#[test]
+fn malformed_fast_open_preserves_timestamp_validation_and_ordinary_stream() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            for suffix in [&[34][..], &[34, 0], &[34, 1], &[34, 6, 2, 4, 0], &[34, 255]] {
+                let mut cfg = EndpointConfig::default();
+                cfg.connection.timestamps = true;
+                cfg.connection.sack = true;
+                let b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
+                let (mut a, mut b, listener) = warm_with_server(v6, b);
+                if reserved {
+                    b.enable_output_reservations().unwrap();
+                }
+                let (local, remote) = addresses(v6, 40001);
+                a.connect_fast_open(100, local, remote, b"hello").unwrap();
+                let original = packet(&mut a, 100);
+                let original_syn = wire::parse(original.0, &original.1).unwrap();
+                let cookie = original_syn.options.fast_open.unwrap();
+                let mut raw = vec![2, 4, 2, 24, 3, 3, 2, 4, 2, 8, 10, 0, 0, 0, 7, 0, 0, 0, 0];
+                raw.extend_from_slice(&[34, (cookie.as_bytes().len() + 2) as u8]);
+                raw.extend_from_slice(cookie.as_bytes());
+                raw.extend_from_slice(suffix);
+                let syn = raw_option_packet(original.0, original_syn.header, &raw, b"hello");
+                let parsed = wire::parse(syn.0, &syn.1).unwrap();
+                assert!(parsed.options.fast_open.is_none());
+                assert_eq!(parsed.payload, b"hello");
+                deliver(&mut b, 110, &syn);
+                assert!(b.accept(listener).is_err());
+                let reply = if reserved {
+                    let mut bytes = [0; 2048];
+                    let (out, token) = b.poll_reserved_transmit(120, &mut bytes, 64).unwrap();
+                    let tx = out.packet.unwrap();
+                    b.accept_transmit(120, token.unwrap()).unwrap();
+                    (tx.ip, bytes[..tx.len].to_vec())
+                } else {
+                    packet(&mut b, 120)
+                };
+                let reply = wire::parse(reply.0, &reply.1).unwrap();
+                assert_eq!(
+                    reply.header.acknowledgment,
+                    original_syn.header.sequence.wrapping_add(1)
+                );
+                assert!(reply.options.fast_open.is_none());
+                assert!(parsed.options.sack_permitted);
+                assert!(reply.options.window_scale.is_some());
+                let (ts, echo) = reply.options.timestamps.unwrap();
+                assert_eq!(echo, 7);
+                let header = wire::Header {
+                    flags: wire::ACK,
+                    sequence: original_syn.header.sequence.wrapping_add(1),
+                    acknowledgment: reply.header.sequence.wrapping_add(1),
+                    ..original_syn.header
+                };
+                let mut raw = vec![8, 10, 0, 0, 0, 8];
+                raw.extend_from_slice(&ts.to_be_bytes());
+                raw.extend_from_slice(suffix);
+                let ack = raw_option_packet(original.0, header, &raw, b"hello");
+                deliver(&mut b, 130, &ack);
+                let child = b.accept(listener).unwrap();
+                let mut data = [0; 32];
+                assert_eq!(b.read(child, &mut data), Ok(5));
+                assert_eq!(&data[..5], b"hello");
+                deliver(&mut b, 131, &ack);
+                assert_eq!(b.readable_bytes(child), Ok(0));
+                // A valid prefix TS must still enforce PAWS on damaged non-SYN TFO.
+                let header = wire::Header {
+                    sequence: header.sequence.wrapping_add(5),
+                    ..header
+                };
+                raw[5] = 6;
+                deliver(
+                    &mut b,
+                    140,
+                    &raw_option_packet(original.0, header, &raw, b"next"),
+                );
+                assert_eq!(b.readable_bytes(child), Ok(0));
+                raw[5] = 9;
+                deliver(
+                    &mut b,
+                    150,
+                    &raw_option_packet(original.0, header, &raw, b"next"),
+                );
+                assert_eq!(b.read(child, &mut data), Ok(4));
+                assert_eq!(&data[..4], b"next");
+            }
+        }
+    }
+}
+
 fn warm(v6: bool) -> (Endpoint, Endpoint, ListenerId) {
+    warm_with_server(v6, endpoint(2, v6))
+}
+fn warm_with_server(v6: bool, mut b: Endpoint) -> (Endpoint, Endpoint, ListenerId) {
     let (local, remote) = addresses(v6, 40000);
     let mut a = endpoint(1, v6);
-    let mut b = endpoint(2, v6);
     a.enable_fast_open().unwrap();
     b.enable_fast_open().unwrap();
     let listener = b.listen(remote, 8).unwrap();

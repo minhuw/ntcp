@@ -2,6 +2,559 @@
 use super::*;
 use ntcp::wire::{self, FastOpenCookie};
 
+fn hostile_option_frame(
+    owner: &Owner,
+    ip: ntcp::IpMetadata,
+    header: wire::Header,
+    raw: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let padding = (4 - raw.len() % 4) % 4;
+    let mut tcp = vec![0; 60 + payload.len()];
+    let n = wire::encode(ip, header, &vec![1; padding + raw.len()], payload, &mut tcp).unwrap();
+    tcp.truncate(n);
+    tcp[20 + padding..20 + padding + raw.len()].copy_from_slice(raw);
+    tcp[16..18].fill(0);
+    let sum = wire::checksum(ip, &tcp).unwrap();
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    super::tests::ip_packet(
+        owner,
+        ntcp::Transmit {
+            tx_timestamp: None,
+            connection: None,
+            ipv4_options: Default::default(),
+            ecn: 0,
+            ip,
+            len: n,
+            hop_limit: 64,
+            dscp: 0,
+        },
+        &tcp,
+    )
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+//= type=test
+//= reason=Invalid incoming Kind 34 lengths discard credential metadata; an unframeable suffix stops traversal without guessing boundaries, preserving validated prefix options and DataOffset payload. Non-SYN credentials are ignored. Strict output, checksum/header and unrelated malformed-option rejection remain enforced.
+//# Options with invalid Length values or without the SYN flag set MUST be ignored.
+#[test]
+fn native_malformed_credentials_retain_framing_timestamps_and_stream() {
+    for v6 in [false, true] {
+        for suffix in [&[34][..], &[34, 0], &[34, 1], &[34, 6, 2, 4, 0], &[34, 255]] {
+            let local: IpAddr = if v6 { "2001:db8::2" } else { "192.0.2.2" }
+                .parse()
+                .unwrap();
+            let mut cfg = SocketConfig::new("test", local).tcp;
+            cfg.connection.timestamps = true;
+            cfg.connection.sack = true;
+            let mut b = Owner::with_config(
+                local,
+                (local, if v6 { 128 } else { 32 }),
+                [2; 32],
+                None,
+                cfg,
+            )
+            .unwrap();
+            b.test_now = Some(0);
+            let listener = listener(&mut b, 8080);
+            b.execute(listener, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 4))
+                .unwrap();
+            b.execute(listener, Op::Listen(8)).unwrap();
+            let ip = ntcp::IpMetadata {
+                source: if v6 { "2001:db8::1" } else { "192.0.2.1" }
+                    .parse()
+                    .unwrap(),
+                destination: local,
+            };
+            let header = wire::Header {
+                source_port: 40000,
+                destination_port: 8080,
+                sequence: 100,
+                acknowledgment: 0,
+                flags: wire::SYN,
+                window: 8192,
+                urgent_pointer: 0,
+            };
+            let request = hostile_option_frame(&b, ip, header, &[34, 2], &[]);
+            b.input_ip(&request, Default::default());
+            let response = super::tests::poll_packet(&mut b).unwrap();
+            let p = crate::ip::parse(&response).unwrap();
+            let cookie = wire::parse(p.ip, p.payload)
+                .unwrap()
+                .options
+                .fast_open
+                .unwrap();
+            let header = wire::Header {
+                source_port: 40001,
+                ..header
+            };
+            let mut raw = vec![2, 4, 2, 24, 3, 3, 2, 4, 2, 8, 10, 0, 0, 0, 7, 0, 0, 0, 0];
+            raw.extend_from_slice(&[34, (cookie.as_bytes().len() + 2) as u8]);
+            raw.extend_from_slice(cookie.as_bytes());
+            raw.extend_from_slice(suffix);
+            let syn = hostile_option_frame(&b, ip, header, &raw, b"hello");
+            let mut corrupt = syn.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            b.input_ip(&corrupt, Default::default());
+            assert!(super::tests::poll_packet(&mut b).is_none());
+            for words in [4, 15] {
+                let mut bad_offset = hostile_option_frame(&b, ip, header, &[], &[]);
+                let tcp_start = crate::ip::header_len(ip.source);
+                bad_offset[tcp_start + 12] = words << 4;
+                bad_offset[tcp_start + 16..tcp_start + 18].fill(0);
+                let sum = wire::checksum(ip, &bad_offset[tcp_start..]).unwrap();
+                bad_offset[tcp_start + 16..tcp_start + 18].copy_from_slice(&sum.to_be_bytes());
+                b.input_ip(&bad_offset, Default::default());
+                assert!(super::tests::poll_packet(&mut b).is_none());
+            }
+            for malformed in [&[2, 0][..], &[8, 9, 0, 0, 0, 0, 0, 0, 0]] {
+                b.input_ip(
+                    &hostile_option_frame(&b, ip, header, malformed, b"hello"),
+                    Default::default(),
+                );
+                assert!(super::tests::poll_packet(&mut b).is_none());
+            }
+            b.input_ip(&syn, Default::default());
+            assert_eq!(
+                b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+                EAGAIN
+            );
+            let response = super::tests::poll_packet(&mut b).unwrap();
+            let p = crate::ip::parse(&response).unwrap();
+            let synack = wire::parse(p.ip, p.payload).unwrap();
+            assert_eq!(synack.header.acknowledgment, 101);
+            assert!(synack.options.fast_open.is_none());
+            assert!(synack.options.sack_permitted);
+            assert!(synack.options.window_scale.is_some());
+            let (ts, echo) = synack.options.timestamps.unwrap();
+            assert_eq!(echo, 7);
+            let header = wire::Header {
+                sequence: 101,
+                acknowledgment: synack.header.sequence.wrapping_add(1),
+                flags: wire::ACK,
+                ..header
+            };
+            let mut raw = vec![8, 10, 0, 0, 0, 8];
+            raw.extend_from_slice(&ts.to_be_bytes());
+            raw.extend_from_slice(suffix);
+            let ack = hostile_option_frame(&b, ip, header, &raw, b"hello");
+            b.input_ip(&ack, Default::default());
+            let child = b
+                .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                .unwrap()
+                .value as u64;
+            assert_eq!(b.execute(child, Op::Read(32)).unwrap().bytes, b"hello");
+            b.input_ip(&ack, Default::default());
+            assert_eq!(b.execute(child, Op::Read(32)).unwrap_err(), EAGAIN);
+            let header = wire::Header {
+                sequence: 106,
+                ..header
+            };
+            raw[5] = 6;
+            b.input_ip(
+                &hostile_option_frame(&b, ip, header, &raw, b"next"),
+                Default::default(),
+            );
+            assert_eq!(b.execute(child, Op::Read(32)).unwrap_err(), EAGAIN);
+            raw[5] = 9;
+            b.input_ip(
+                &hostile_option_frame(&b, ip, header, &raw, b"next"),
+                Default::default(),
+            );
+            assert_eq!(b.execute(child, Op::Read(32)).unwrap().bytes, b"next");
+        }
+    }
+}
+
+fn native_pair(v6: bool, reserved: bool) -> (Owner, Owner, u64, SocketAddr) {
+    let local: IpAddr = if v6 { "2001:db8::1" } else { "192.0.2.1" }
+        .parse()
+        .unwrap();
+    let remote: IpAddr = if v6 { "2001:db8::2" } else { "192.0.2.2" }
+        .parse()
+        .unwrap();
+    let mut cfg = SocketConfig::new("test", local).tcp;
+    cfg.connection.mss = 1460;
+    cfg.connection.timestamps = false;
+    cfg.connection.nagle = false;
+    let mut a = Owner::with_config(
+        local,
+        (local, if v6 { 128 } else { 32 }),
+        [1; 32],
+        None,
+        cfg.clone(),
+    )
+    .unwrap();
+    cfg.connection.mss = 940;
+    let mut b = Owner::with_config(
+        remote,
+        (remote, if v6 { 128 } else { 32 }),
+        [2; 32],
+        None,
+        cfg,
+    )
+    .unwrap();
+    a.test_now = Some(0);
+    b.test_now = Some(0);
+    if reserved {
+        a.endpoint.enable_output_reservations().unwrap();
+    }
+    let socket = listener(&mut b, 8080);
+    b.execute(socket, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 8))
+        .unwrap();
+    b.execute(socket, Op::Listen(16)).unwrap();
+    (a, b, socket, SocketAddr::new(remote, 8080))
+}
+
+fn native_output(owner: &mut Owner, reserved: bool) -> Option<Vec<u8>> {
+    if !reserved {
+        return super::tests::poll_packet(owner);
+    }
+    let mut bytes = [0; 2048];
+    let now = owner.now();
+    let (out, token) = owner
+        .endpoint
+        .poll_reserved_transmit(now, &mut bytes, 64)
+        .unwrap();
+    let tx = out.packet?;
+    owner.endpoint.accept_transmit(now, token.unwrap()).unwrap();
+    Some(super::tests::ip_packet(owner, tx, &bytes[..tx.len]))
+}
+
+fn native_pump(a: &mut Owner, b: &mut Owner, reserved: bool) {
+    for _ in 0..16 {
+        let mut progress = false;
+        if let Some(frame) = native_output(a, reserved) {
+            b.input_ip(&frame, Default::default());
+            progress = true;
+        }
+        if let Some(frame) = native_output(b, false) {
+            a.input_ip(&frame, Default::default());
+            progress = true;
+        }
+        a.events();
+        b.events();
+        if !progress {
+            break;
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
+//# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
+#[test]
+fn native_cold_admission_is_independent_of_family_and_learns_real_mss() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            for deferred in [false, true] {
+                for mode in 0..5 {
+                    let (mut a, mut b, listener, remote) = native_pair(v6, reserved);
+                    b.execute(
+                        listener,
+                        Op::SetListenerFastOpenEarlyDataPolicy(
+                            FastOpenEarlyDataPolicy::ApplicationProtected,
+                        ),
+                    )
+                    .unwrap();
+                    let data = vec![7; 1600];
+                    for attempt in 0..2 {
+                        let socket = super::tests::new(&mut a, SOCK_NONBLOCK);
+                        let cookie = match mode {
+                            1 => Some(FastOpenCookie::request()),
+                            2 => Some(FastOpenCookie::new(&[7; 4]).unwrap()),
+                            3 => Some(FastOpenCookie::new(&[8; 16]).unwrap()),
+                            _ => None,
+                        };
+                        if let Some(cookie) = cookie {
+                            a.execute(socket, Op::SetFastOpenServerCookie(Some((remote, cookie))))
+                                .unwrap();
+                        }
+                        if mode == 4 {
+                            a.execute(
+                                socket,
+                                Op::SetFastOpenClientPolicy(Some((
+                                    remote,
+                                    FastOpenClientPolicy::ApplicationProtected,
+                                ))),
+                            )
+                            .unwrap();
+                        }
+                        if deferred {
+                            a.execute(socket, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                                .unwrap();
+                            let result = a.execute(socket, Op::Connect(remote));
+                            if mode == 0 {
+                                assert_eq!(result.unwrap_err(), EINPROGRESS);
+                            } else {
+                                assert_eq!(result.unwrap().value, 0);
+                            }
+                        }
+                        let send = |flags| {
+                            Op::SendTo(
+                                vec![(data.as_ptr() as usize, data.len())],
+                                flags,
+                                Some(remote),
+                                None,
+                            )
+                        };
+                        let expected = if mode == 0 {
+                            0
+                        } else if attempt == 0 {
+                            496
+                        } else {
+                            900
+                        };
+                        let result = a.execute(
+                            socket,
+                            send(if deferred { MSG_DONTWAIT } else { MSG_FASTOPEN }),
+                        );
+                        if mode == 0 {
+                            assert_eq!(
+                                result.unwrap_err(),
+                                if deferred { EAGAIN } else { EINPROGRESS }
+                            );
+                        } else {
+                            assert_eq!(result.unwrap().value, expected);
+                        }
+                        let frame = native_output(&mut a, reserved).unwrap();
+                        let ip = crate::ip::parse(&frame).unwrap();
+                        let syn = wire::parse(ip.ip, ip.payload).unwrap();
+                        assert_eq!(syn.payload.len(), expected as usize);
+                        assert_eq!(syn.options.mss, Some(1460));
+                        assert_eq!(
+                            syn.options.fast_open,
+                            if mode == 0 {
+                                Some(FastOpenCookie::request())
+                            } else {
+                                cookie
+                            }
+                        );
+                        b.input_ip(&frame, Default::default());
+                        native_pump(&mut a, &mut b, reserved);
+                        let child = b
+                            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                            .unwrap()
+                            .value as u64;
+                        a.execute(socket, Op::Write(data[expected as usize..].to_vec()))
+                            .unwrap();
+                        native_pump(&mut a, &mut b, reserved);
+                        assert_eq!(b.execute(child, Op::Read(2000)).unwrap().bytes, data);
+                        assert_eq!(b.execute(child, Op::Read(1)).unwrap_err(), EAGAIN);
+                    }
+                }
+            }
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
+//# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
+#[test]
+fn native_cookie_without_advertised_mss_keeps_all_authorization_modes_cold() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            for deferred in [false, true] {
+                for mode in 0..3 {
+                    let (mut a, mut b, listener, remote) = native_pair(v6, reserved);
+                    if mode != 0 {
+                        b.execute(
+                            listener,
+                            Op::SetListenerFastOpenEarlyDataPolicy(
+                                FastOpenEarlyDataPolicy::ApplicationProtected,
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    let data = vec![7; 1600];
+                    for attempt in 0..3 {
+                        let socket = super::tests::new(&mut a, SOCK_NONBLOCK);
+                        if mode == 1 {
+                            a.execute(
+                                socket,
+                                Op::SetFastOpenServerCookie(Some((
+                                    remote,
+                                    FastOpenCookie::new(&[7; 16]).unwrap(),
+                                ))),
+                            )
+                            .unwrap();
+                        } else if mode == 2 {
+                            a.execute(
+                                socket,
+                                Op::SetFastOpenClientPolicy(Some((
+                                    remote,
+                                    FastOpenClientPolicy::ApplicationProtected,
+                                ))),
+                            )
+                            .unwrap();
+                        }
+                        let cold_request = mode == 0 && attempt == 0;
+                        if deferred {
+                            a.execute(socket, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                                .unwrap();
+                            let result = a.execute(socket, Op::Connect(remote));
+                            if cold_request {
+                                assert_eq!(result.unwrap_err(), EINPROGRESS);
+                            } else {
+                                assert_eq!(result.unwrap().value, 0);
+                            }
+                        }
+                        let expected = if cold_request {
+                            0
+                        } else if attempt < 2 {
+                            496
+                        } else {
+                            900
+                        };
+                        let result = a.execute(
+                            socket,
+                            Op::SendTo(
+                                vec![(data.as_ptr() as usize, data.len())],
+                                if deferred { MSG_DONTWAIT } else { MSG_FASTOPEN },
+                                Some(remote),
+                                None,
+                            ),
+                        );
+                        if cold_request {
+                            assert_eq!(
+                                result.unwrap_err(),
+                                if deferred { EAGAIN } else { EINPROGRESS }
+                            );
+                        } else {
+                            assert_eq!(result.unwrap().value, expected);
+                        }
+                        let frame = native_output(&mut a, reserved).unwrap();
+                        let ip = crate::ip::parse(&frame).unwrap();
+                        let syn = wire::parse(ip.ip, ip.payload).unwrap();
+                        assert_eq!(syn.payload, &data[..expected as usize]);
+                        assert_eq!(syn.options.fast_open.is_some(), mode != 2);
+                        b.input_ip(&frame, Default::default());
+                        let reply = native_output(&mut b, false).unwrap();
+                        let reply = if attempt == 0 {
+                            let ip = crate::ip::parse(&reply).unwrap();
+                            let synack = wire::parse(ip.ip, ip.payload).unwrap();
+                            let mut options = synack.raw_options.to_vec();
+                            assert_eq!(&options[..2], &[2, 4]);
+                            options[..4].fill(1);
+                            hostile_option_frame(&b, ip.ip, synack.header, &options, synack.payload)
+                        } else {
+                            reply
+                        };
+                        let ip = crate::ip::parse(&reply).unwrap();
+                        assert_eq!(
+                            wire::parse(ip.ip, ip.payload).unwrap().options.mss,
+                            if attempt == 0 { None } else { Some(940) }
+                        );
+                        a.input_ip(&reply, Default::default());
+                        native_pump(&mut a, &mut b, reserved);
+                        let child = b
+                            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                            .unwrap()
+                            .value as u64;
+                        a.execute(socket, Op::Write(data[expected as usize..].to_vec()))
+                            .unwrap();
+                        native_pump(&mut a, &mut b, reserved);
+                        assert_eq!(b.execute(child, Op::Read(2000)).unwrap().bytes, data);
+                        assert_eq!(b.execute(child, Op::Read(1)).unwrap_err(), EAGAIN);
+                    }
+                }
+            }
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+//= type=test
+//= reason=The first RTO of a physically transmitted request trains the existing per-source/service cooldown once. Local output failures and held reservations do not train it; successful fallback and late cookie/MSS learning cannot erase it, and expiry permits future requests.
+//# We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.
+#[test]
+fn native_first_request_rto_suppresses_service_and_keeps_ordinary_stream() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            for late_original in [false, true] {
+                let (mut a, mut b, listener, remote) = native_pair(v6, reserved);
+                let socket = super::tests::new(&mut a, SOCK_NONBLOCK);
+                let send = |data: &[u8]| {
+                    Op::SendTo(
+                        vec![(data.as_ptr() as usize, data.len())],
+                        MSG_FASTOPEN,
+                        Some(remote),
+                        None,
+                    )
+                };
+                assert_eq!(a.execute(socket, send(b"cold")).unwrap_err(), EINPROGRESS);
+                let original = native_output(&mut a, reserved).unwrap();
+                let ip = crate::ip::parse(&original).unwrap();
+                assert_eq!(
+                    wire::parse(ip.ip, ip.payload).unwrap().options.fast_open,
+                    Some(FastOpenCookie::request())
+                );
+                let deadline = a.endpoint.next_deadline().unwrap();
+                a.test_now = Some(deadline);
+                b.test_now = Some(deadline);
+                a.endpoint.on_timeout(deadline, 64).unwrap();
+                let retry = native_output(&mut a, reserved).unwrap();
+                let ip = crate::ip::parse(&retry).unwrap();
+                let syn = wire::parse(ip.ip, ip.payload).unwrap();
+                assert!(syn.options.fast_open.is_none() && syn.payload.is_empty());
+                b.input_ip(
+                    if late_original { &original } else { &retry },
+                    Default::default(),
+                );
+                native_pump(&mut a, &mut b, reserved);
+                let child = b
+                    .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                    .unwrap()
+                    .value as u64;
+                a.execute(socket, Op::Write(b"fallback".to_vec())).unwrap();
+                native_pump(&mut a, &mut b, reserved);
+                assert_eq!(b.execute(child, Op::Read(32)).unwrap().bytes, b"fallback");
+                assert_eq!(
+                    a.endpoint
+                        .has_fast_open_cookie(deadline, a.local, remote.ip())
+                        .unwrap(),
+                    late_original
+                );
+                let next = super::tests::new(&mut a, SOCK_NONBLOCK);
+                a.execute(next, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                    .unwrap();
+                assert_eq!(
+                    a.execute(next, Op::Connect(remote)).unwrap_err(),
+                    EINPROGRESS
+                );
+                let frame = native_output(&mut a, reserved).unwrap();
+                let ip = crate::ip::parse(&frame).unwrap();
+                let syn = wire::parse(ip.ip, ip.payload).unwrap();
+                assert!(syn.options.fast_open.is_none() && syn.payload.is_empty());
+                b.input_ip(&frame, Default::default());
+                native_pump(&mut a, &mut b, reserved);
+                let child = b
+                    .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                    .unwrap()
+                    .value as u64;
+                a.execute(next, Op::Write(b"ordinary".to_vec())).unwrap();
+                native_pump(&mut a, &mut b, reserved);
+                assert_eq!(b.execute(child, Op::Read(32)).unwrap().bytes, b"ordinary");
+                let cookie = Some(FastOpenCookie::request());
+                let expiry = deadline + 60_000_000;
+                assert!(
+                    !a.endpoint
+                        .can_defer_fast_open_with_server_cookie(expiry - 1, a.local, remote, cookie)
+                        .unwrap()
+                );
+                assert!(
+                    a.endpoint
+                        .can_defer_fast_open_with_server_cookie(expiry, a.local, remote, cookie)
+                        .unwrap()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "tfo-linux-cookie")]
 fn policy(byte: u8) -> FastOpenCookiePolicy {
     FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([byte; 16]))

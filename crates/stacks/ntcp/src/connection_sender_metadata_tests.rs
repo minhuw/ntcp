@@ -206,7 +206,7 @@ fn fast_open_reserves_metadata_before_accepting_syn_payload() {
         tuple().local.ip(),
         tuple().remote.ip(),
         wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-        536,
+        Some(536),
     );
     let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
     for failure in [None, Some(0), Some(1), Some(2)] {

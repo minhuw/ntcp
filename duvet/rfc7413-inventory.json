@@ -401,10 +401,14 @@
       "id": "7413-ignore-invalid-and-nonsyn",
       "section": "4.1.1",
       "quote": "Options with invalid Length values or without the SYN flag set MUST be ignored.",
-      "status": "TODO",
-      "reason": "Bounded invalid Kind 34 lengths and all non-SYN cookie metadata are ignored. Structurally malformed TLVs (Length 0/1, missing length or overrun) reject the entire TCP segment with InvalidOption rather than literally ignoring the option; existing wire boundary tests assert that behavior. Full published wording is retained, with no blanket closure from the bounded cases.",
+      "status": "covered",
+      "reason": "Invalid incoming Kind 34 lengths discard credential metadata; an unframeable suffix stops traversal without guessing boundaries, preserving validated prefix options and DataOffset payload. Non-SYN credentials are ignored. Strict output, checksum/header and unrelated malformed-option rejection remain enforced.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1",
-      "offset": 851
+      "offset": 851,
+      "evidence": [
+        "crates/stacks/ntcp/src/wire.rs::fn read_options(",
+        "crates/stacks/ntcp/src/fast_open_tests.rs::fn malformed_fast_open_preserves_timestamp_validation_and_ordinary_stream()"
+      ]
     },
     {
       "id": "7413-server-mac-properties",
@@ -594,7 +598,7 @@
       "section": "4.1.3",
       "quote": "Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].",
       "status": "covered",
-      "reason": "Preserved original obligation and its existing implementation/test evidence.",
+      "reason": "Cold SYN admission uses a conservative 536-byte ceiling in both families before option, configuration, path and storage limits; true peer defaults remain 536/1220 and validated learned MSS remains usable.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3",
       "offset": 937,
       "original": true,
@@ -848,10 +852,14 @@
       "id": "7413-request-retry-period",
       "section": "4.2.1",
       "quote": "We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.",
-      "status": "TODO",
-      "reason": "Request-only first RTO falls back locally and a successful bare-SYN fallback permits an immediate new request (cookie_request_first_timeout_success_preserves_next_attempt). Only another committed timeout, ICMP or terminal timeout suppresses the service. That deliberate ambiguity policy is not literal suppression after every failed cookie request; retain the recommendation as unresolved.",
+      "status": "covered",
+      "reason": "The first RTO of a physically transmitted request trains the existing per-source/service cooldown once. Local output failures and held reservations do not train it; successful fallback and late cookie/MSS learning cannot erase it, and expiry permits future requests.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
-      "offset": 1576
+      "offset": 1576,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn report_fast_open_failure(",
+        "crates/stacks/ntcp/src/fast_open_cookie_timeout_tests.rs::fn cookie_request_first_timeout_success_preserves_cooldown()"
+      ]
     },
     {
       "id": "7413-reuse-until-expired",
@@ -879,7 +887,7 @@
       "section": "4.2.2",
       "quote": "To open a TFO connection, the client MUST have obtained a cookie from the server:",
       "status": "exception",
-      "reason": "Scope exception only for explicit FastOpenClientPolicy::ApplicationProtected with independent target-service agreement under section7.3. This user-selected Linux-compatible alternative sends SYN data with no FO option; it does not claim acquisition of a cookie. RequireCookie remains the default and existing supplied/learned credential APIs retain ordinary exchange. Cold536/1220 peer MSS, actual SYN departure/ACK validation, memory limits, retries and negative-response suppression remain authoritative. Native paired-endpoint, mode/default/peer-scoped socket and reserved-departure tests cover the alternative.",
+      "reason": "Scope exception only for explicit FastOpenClientPolicy::ApplicationProtected with independent target-service agreement under section7.3. This user-selected Linux-compatible alternative sends SYN data with no FO option; it does not claim acquisition of a cookie. RequireCookie remains the default and existing supplied/learned credential APIs retain ordinary exchange. Conservative cold536 admission independent of true 536/1220 peer MSS defaults, actual SYN departure/ACK validation, memory limits, retries and negative-response suppression remain authoritative. Native paired-endpoint, mode/default/peer-scoped socket and reserved-departure tests cover the alternative.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
       "offset": 164,
       "original": true
@@ -922,8 +930,8 @@
       "id": "7413-original-7",
       "section": "4.2.2",
       "quote": "Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.",
-      "status": "TODO",
-      "reason": "Published section 4.2.2 says default 536 bytes without the IPv6 qualifier. The implementation follows section 4.1.3 and permits cold IPv6 SYN data up to 1220 minus options. Erratum 8015 proposes that clarification but is Held for Document Update, not Verified; this literal obligation is retained unresolved. Explicit ApplicationProtected also selects omitted-option SYN data under section 7.3. Existing ordinary-path evidence is retained and does not establish literal closure across these choices.",
+      "status": "covered",
+      "reason": "The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
       "offset": 397,
       "original": true,
@@ -1164,10 +1172,14 @@
       "id": "7413-lost-syn-heuristic",
       "section": "4.2.2",
       "quote": "If the client has timed out and retransmitted only regular SYN packets, it can heuristically detect paths that intentionally drop SYNs with the Fast Open option or data. If the SYN-ACK acknowledges only the initial sequence and does not carry a Fast Open cookie option, presumably it is triggered by a retransmitted (regular) SYN and the original SYN or the corresponding SYN-ACK was lost.",
-      "status": "TODO",
-      "reason": "The implementation records committed timeout and unacknowledged-data negatives, but no complete attached test establishes this whole conjunction (only regular retransmissions, SYN-only ACK, absent cookie) and its cache interpretation, including spurious replies. It is a heuristic explanation, not proof of actual middlebox loss.",
+      "status": "covered",
+      "reason": "An emitted regular retry followed by a SYN-only acknowledgment without a cookie realizes the loss heuristic and preserves service suppression with ordinary stream progress. Delayed original, spurious, partial and returned-cookie controls keep independent RTO/rejection evidence authoritative. This is a presumption, not proof of intentional physical middlebox loss.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
-      "offset": 3051
+      "offset": 3051,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn report_fast_open_syn_rejection(",
+        "crates/stacks/ntcp/src/fast_open_cookie_timeout_tests.rs::fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress()"
+      ]
     },
     {
       "id": "7413-4.2.2-context-7",

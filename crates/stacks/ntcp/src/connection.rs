@@ -675,7 +675,7 @@ pub(crate) struct Connection {
     fast_open_retry: Option<(Seq, Seq)>,
     pub(crate) fast_open_early: bool,
     pub(crate) fast_open_peer_reset: bool,
-    pub(crate) fast_open_learned: Option<(Option<wire::FastOpenCookie>, u16)>,
+    pub(crate) fast_open_learned: Option<(Option<wire::FastOpenCookie>, Option<u16>)>,
     snd_una: Seq,
     snd_nxt: Seq,
     send_base: Seq,
@@ -1413,7 +1413,7 @@ impl Connection {
         };
         self.prepare_fast_open_with_server_cookie(
             cached.cookie,
-            Some(cached.mss),
+            cached.mss,
             initial,
             max_charge,
         )
@@ -1423,7 +1423,7 @@ impl Connection {
     // an explicitly agreed zero cookie for a protected RFC7413 section7.3 service.
     // It is still serialized as a Fast Open option; no omitted-option bypass.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
-    //= reason=Cold supplied-cookie admission uses the address-family peer MSS default before applying configuration, path, option and storage limits.
+    //= reason=Cold SYN admission uses a conservative 536-byte ceiling in both families before option, configuration, path and storage limits; true peer defaults remain 536/1220 and validated learned MSS remains usable.
     //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
     pub(crate) fn prepare_fast_open_with_server_cookie(
         &mut self,
@@ -1457,10 +1457,13 @@ impl Connection {
         } else {
             1220
         });
+        // Unknown peer/path capacity calls for conservative cold SYN admission
+        // in both families. Keep the actual peer MSS defaults above independent.
+        let admission_mss = peer_mss.unwrap_or(536);
         // Reserve the entire option budget, including cookies up to 16 bytes.
         // A changed path may clip the SYN further; all accepted bytes remain queued.
         let limit = usize::from(
-            self.peer_mss
+            admission_mss
                 .min(self.config.mss)
                 .min(self.config.user_mss.unwrap_or(u16::MAX)),
         )
@@ -2399,6 +2402,9 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
     //# Negative responses include the server not acknowledging the data in the SYN, ICMP error messages,
     //# and (most importantly) no response (SYN-ACK) from the server at all, i.e., connection timeout.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+    //= reason=The first RTO of a physically transmitted request trains the existing per-source/service cooldown once. Local output failures and held reservations do not train it; successful fallback and late cookie/MSS learning cannot erase it, and expiry permits future requests.
+    //# We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.
     fn report_fast_open_failure(&mut self) {
         if self.handshake_pending() && core::mem::take(&mut self.fast_open_attempt) {
             self.fast_open_negative = true;
@@ -2409,6 +2415,9 @@ impl Connection {
     // positive TFO progress; repair its residue separately (RFC 7413 4.2.2).
     // Only SYN-only acknowledgment adds rejection evidence here. Independent
     // ICMP/RTO evidence is neither consumed nor cleared by partial progress.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //= reason=An emitted regular retry followed by a SYN-only acknowledgment without a cookie realizes the loss heuristic and preserves service suppression with ordinary stream progress. Delayed original, spurious, partial and returned-cookie controls keep independent RTO/rejection evidence authoritative. This is a presumption, not proof of intentional physical middlebox loss.
+    //# If the client has timed out and retransmitted only regular SYN packets, it can heuristically detect paths that intentionally drop SYNs with the Fast Open option or data. If the SYN-ACK acknowledges only the initial sequence and does not carry a Fast Open cookie option, presumably it is triggered by a retransmitted (regular) SYN and the original SYN or the corresponding SYN-ACK was lost.
     fn report_fast_open_syn_rejection(&mut self, ack: Seq) {
         if self.syn_payload_sent != 0 && ack == self.iss.wrapping_add(1) {
             self.report_fast_open_failure();
@@ -4862,7 +4871,10 @@ impl Connection {
                         .then_some(segment.options.fast_open)
                         .flatten()
                         .filter(|cookie| !cookie.as_bytes().is_empty());
-                    self.fast_open_learned = Some((cookie, self.peer_mss));
+                    // The TCP family default is not an observed server MSS.
+                    // A cookie-only reply authorizes future Fast Open attempts,
+                    // but leaves their cold admission bound in place.
+                    self.fast_open_learned = Some((cookie, segment.options.mss));
                 }
                 self.establish();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
@@ -7527,7 +7539,7 @@ impl Connection {
             None
         };
         //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-        //= reason=Published section 4.2.2 says default 536 bytes without the IPv6 qualifier. The implementation follows section 4.1.3 and permits cold IPv6 SYN data up to 1220 minus options. Erratum 8015 proposes that clarification but is Held for Document Update, not Verified; this literal obligation is retained unresolved. Explicit ApplicationProtected also selects omitted-option SYN data under section 7.3. Existing ordinary-path evidence is retained and does not establish literal closure across these choices.
+        //= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
         //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
         if let Some(cookie) = fast_open_option {
             let bytes = cookie.as_bytes();
@@ -9708,17 +9720,11 @@ impl Connection {
         } else if expired_loss == Some(LossTimer::Rto) {
             self.growth_dupack_bytes = 0;
             self.congestion.disarm_initial_ack_heuristic();
-            // RFC 7413 section 4.2.1: a request-only SYN loss may be
-            // spurious. First fall back on this connection; a further RTO
-            // after a physically committed retry is stronger failure evidence.
-            // SYN-data, ICMP and final timeout reporting retain their policy.
-            let cookie_request = self.syn_payload_sent == 0
-                && self
-                    .fast_open
-                    .is_some_and(|cookie| cookie.as_bytes().is_empty());
-            if !cookie_request || self.committed_syn_retransmissions != 0 {
-                self.report_fast_open_failure();
-            }
+            // A genuinely transmitted TFO request that reaches RTO trains the
+            // service cooldown even if its bare retry is locally blocked. The
+            // departure gate and one-shot report prevent unsent attempts or
+            // subsequent retries from creating/renewing failure evidence.
+            self.report_fast_open_failure();
             // Explicit application give-up budget, not the default SYN R2 policy.
             if self.handshake_pending()
                 && self

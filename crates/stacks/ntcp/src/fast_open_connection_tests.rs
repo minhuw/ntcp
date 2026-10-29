@@ -12,7 +12,7 @@ fn client(iss: u32, size: usize) -> Connection {
         tuple().local.ip(),
         tuple().remote.ip(),
         wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-        536,
+        Some(536),
     );
     let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
     assert_eq!(a.prepare_fast_open(cached, &vec![42; size]).unwrap(), size);
@@ -189,7 +189,7 @@ fn option_lengths_small_path_and_timestamp_credit() {
             tuple().local.ip(),
             tuple().remote.ip(),
             wire::FastOpenCookie::new(&[1; 16][..len]).unwrap(),
-            536,
+            Some(536),
         );
         a.prepare_fast_open(
             cache.get(0, 100, tuple().local.ip(), tuple().remote.ip()),
@@ -790,7 +790,7 @@ fn simultaneous_syn_dsack_setup(
         tuple().local.ip(),
         tuple().remote.ip(),
         wire::FastOpenCookie::new(&[0xab, 0xcd, 0x12, 0x34]).unwrap(),
-        1460,
+        Some(1460),
     );
     a.prepare_fast_open(
         cache.get(0, 100, tuple().local.ip(), tuple().remote.ip()),
@@ -1473,7 +1473,7 @@ fn inventory_tfo_partial_synack_resegmentation_counts_original_identity() {
                 tuple().local.ip(),
                 tuple().remote.ip(),
                 wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-                1460,
+                Some(1460),
             );
             let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
             assert_eq!(a.prepare_fast_open(cached, &[42; 1420]).unwrap(), 1420);

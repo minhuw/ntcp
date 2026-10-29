@@ -193,6 +193,9 @@ fn pseudo_header_sum(ip: IpMetadata, len: u32) -> Result<u32, WireError> {
 //# options field. The number MUST be even. Cookie 0, or 4 to 16 bytes (Length - 2)
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
 //# Although the diagram shows a cookie aligned on 32-bit boundaries, alignment is not required.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
+//= reason=Invalid incoming Kind 34 lengths discard credential metadata; an unframeable suffix stops traversal without guessing boundaries, preserving validated prefix options and DataOffset payload. Non-SYN credentials are ignored. Strict output, checksum/header and unrelated malformed-option rejection remain enforced.
+//# Options with invalid Length values or without the SYN flag set MUST be ignored.
 fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
     let mut options = Options::default();
     let mut fast_open_seen = false;
@@ -219,6 +222,18 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
                 //# All TCP Options except End of Option List Option (EOL) and No-Operation
                 //# (NOP) MUST have length fields, including all future options (MUST-68).
+                if kind == 34
+                    && !outgoing
+                    && !bytes
+                        .get(1)
+                        .is_some_and(|&len| len >= 2 && usize::from(len) <= bytes.len())
+                {
+                    // DataOffset already frames the payload. An unframeable
+                    // credential suffix cannot authorize data or supply a next
+                    // TLV boundary; retain only validated ordinary prefix options.
+                    options.fast_open = None;
+                    break;
+                }
                 let len = *bytes.get(1).ok_or(WireError::InvalidOption)? as usize;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
                 //# TCP implementations MUST be prepared to handle
@@ -1335,17 +1350,37 @@ mod tests {
                 if available > 1 {
                     raw[1] = declared;
                 }
+                let parsed = read_options(&raw, false).unwrap();
                 let bounded = available > 1 && declared >= 2 && declared as usize <= available;
-                assert_eq!(read_options(&raw, false).is_ok(), bounded);
                 let valid = bounded && matches!(declared, 2 | 6 | 8 | 10 | 12 | 14 | 16 | 18);
+                assert_eq!(parsed.fast_open.is_some(), valid);
                 assert_eq!(read_options(&raw, true).is_ok(), valid);
+                for ip in ips() {
+                    for flags in [SYN, ACK] {
+                        let bytes = incoming_options(ip, &raw, flags);
+                        let segment = parse(ip, &bytes).unwrap();
+                        assert_eq!(
+                            segment.options.fast_open.is_some(),
+                            valid && flags & SYN != 0
+                        );
+                        assert_eq!(segment.payload, b"odd");
+                    }
+                    let mut out = [0xa5; 80];
+                    let result = encode(ip, header(), &raw, b"odd", &mut out);
+                    assert_eq!(result.is_ok(), valid);
+                    if !valid {
+                        assert_eq!(out, [0xa5; 80]);
+                    }
+                }
             }
         }
         for ip in ips() {
             for raw in [&[34][..], &[34, 0], &[34, 1], &[34, 6, 1, 2, 3], &[34, 255]] {
                 for flags in [SYN, ACK] {
                     let bytes = incoming_options(ip, raw, flags);
-                    parse_error(ip, &bytes, WireError::InvalidOption);
+                    let parsed = parse(ip, &bytes).unwrap();
+                    assert_eq!(parsed.options.fast_open, None);
+                    assert_eq!(parsed.payload, b"odd");
                 }
                 let mut out = [0xa5; 80];
                 assert_eq!(
@@ -1362,12 +1397,80 @@ mod tests {
     }
 
     #[test]
+    fn fast_open_malformed_suffix_retains_prefix_and_payload_boundary() {
+        let prefix = [2, 4, 5, 180, 3, 3, 7, 4, 2, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9];
+        for ip in ips() {
+            for suffix in [
+                &[34][..],
+                &[34, 0],
+                &[34, 1],
+                &[34, 6, 2, 4, 0],
+                &[34, 255],
+                // These apparent ordinary TLVs are an unframeable suffix,
+                // not permission to replace validated prefix MSS/WS/SACK.
+                &[34, 0, 2, 4, 0, 64, 3, 3, 9, 4, 2],
+                &[34, 1, 2, 4, 0, 64, 3, 3, 9, 4, 2],
+                &[34, 255, 2, 4, 0, 64, 3, 3, 9, 4, 2],
+            ] {
+                for prior_cookie in [false, true] {
+                    let mut raw = prefix.to_vec();
+                    if prior_cookie {
+                        raw.extend_from_slice(&[34, 6, 1, 2, 3, 4]);
+                    }
+                    raw.extend_from_slice(suffix);
+                    for flags in [SYN, SYN | ACK, ACK, FIN | ACK, RST] {
+                        let bytes = incoming_options(ip, &raw, flags);
+                        let parsed = parse(ip, &bytes).unwrap();
+                        assert_eq!(parsed.options.fast_open, None);
+                        assert_eq!(parsed.options.mss, Some(1460));
+                        assert_eq!(parsed.options.window_scale, Some(7));
+                        assert!(parsed.options.sack_permitted);
+                        assert_eq!(parsed.options.timestamps, Some((7, 9)));
+                        assert_eq!(parsed.payload, b"odd");
+                        assert_eq!(parsed.raw_options.len(), (raw.len() + 3) / 4 * 4);
+                        let mut bad = bytes.clone();
+                        *bad.last_mut().unwrap() ^= 1;
+                        parse_error(ip, &bad, WireError::InvalidChecksum);
+                        bad = bytes.clone();
+                        bad[12] = 4 << 4;
+                        seal(ip, &mut bad);
+                        parse_error(ip, &bad, WireError::InvalidHeader);
+                        bad[12] = 15 << 4;
+                        seal(ip, &mut bad);
+                        parse_error(ip, &bad, WireError::Truncated);
+                    }
+                    let mut out = [0xa5; 100];
+                    assert_eq!(
+                        encode(ip, header(), &raw, b"odd", &mut out),
+                        Err(WireError::InvalidOption)
+                    );
+                    assert_eq!(out, [0xa5; 100]);
+                }
+            }
+            // The tolerance is specific to Kind 34, including after a valid TS.
+            for suffix in [&[2, 3, 0][..], &[8, 0], &[254, 255]] {
+                let mut raw = prefix.to_vec();
+                raw.extend_from_slice(suffix);
+                parse_error(
+                    ip,
+                    &incoming_options(ip, &raw, SYN),
+                    WireError::InvalidOption,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fast_open_duplicates_discard_metadata_and_output_rejects() {
         let variants = [
             fast_open_option(&[]),
             fast_open_option(&[1; 4]),
             fast_open_option(&[2; 4]),
             fast_open_option(&[3]),
+            vec![34],
+            vec![34, 0],
+            vec![34, 1],
+            vec![34, 255],
         ];
         for ip in ips() {
             for first in &variants {

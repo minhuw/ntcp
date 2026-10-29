@@ -61,8 +61,7 @@ fn explicit_client_policy_separates_wire_option_and_cold_mss() {
                         )
                     }
                     .unwrap();
-                    let bound = usize::from(user_mss.unwrap_or(if v6 { 1220 } else { 536 }))
-                        .saturating_sub(40);
+                    let bound = usize::from(user_mss.unwrap_or(536)).saturating_sub(40);
                     assert_eq!(n, if mode == 0 { 0 } else { bytes.min(bound) });
                     let syn = packet(&mut a, 0);
                     let syn = wire::parse(syn.0, &syn.1).unwrap();
@@ -80,11 +79,7 @@ fn optionless_handshake_learns_mss_without_unsolicited_credentials() {
     for v6 in [false, true] {
         let mut a = client(v6);
         let (_, remote) = addresses(v6, 40000);
-        for (index, mss, expected) in [
-            (0, 940, if v6 { 1000 } else { 496 }),
-            (1, 1460, 900),
-            (2, 1460, 1000),
-        ] {
+        for (index, mss, expected) in [(0, 940, 496), (1, 1460, 900), (2, 1460, 1000)] {
             let (local, _) = addresses(v6, 40000 + index);
             let (id, n) = a
                 .connect_fast_open_with_policy(

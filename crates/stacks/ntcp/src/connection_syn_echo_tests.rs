@@ -16,7 +16,7 @@ fn active_with_payload(tfo: bool, granularity: TimestampGranularity, offset: u32
             tuple().local.ip(),
             tuple().remote.ip(),
             wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-            1000,
+            Some(1000),
         );
         let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
         assert_eq!(a.prepare_fast_open(cached, b"request").unwrap(), 7);

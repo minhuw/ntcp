@@ -31,7 +31,7 @@ fn opening(
         peer.tuple.local.ip(),
         peer.tuple.remote.ip(),
         wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-        1000,
+        Some(1000),
     );
     let cached = cache.get(0, 100, peer.tuple.local.ip(), peer.tuple.remote.ip());
     assert_eq!(

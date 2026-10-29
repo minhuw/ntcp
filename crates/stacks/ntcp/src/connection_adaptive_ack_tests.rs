@@ -255,7 +255,7 @@ fn fast_open_syn_only_and_post_handshake_request_fixtures() {
                     tuple().local.ip(),
                     tuple().remote.ip(),
                     wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-                    syn_bytes + 40,
+                    Some(syn_bytes + 40),
                 );
                 a.prepare_fast_open(
                     cache.get(0, 100, tuple().local.ip(), tuple().remote.ip()),

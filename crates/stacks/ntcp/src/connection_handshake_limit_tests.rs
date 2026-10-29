@@ -54,7 +54,7 @@ fn handshake_limit_tfo_fallback_and_changing_limit_preserve_committed_count() {
             tuple().local.ip(),
             tuple().remote.ip(),
             wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-            536,
+            Some(536),
         );
         let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
         a.prepare_fast_open(cached, b"hello").unwrap();

@@ -29,7 +29,7 @@ fn client(v6: bool, timestamps: bool, size: usize) -> Connection {
         tuple.local.ip(),
         tuple.remote.ip(),
         wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-        1000,
+        Some(1000),
     );
     a.prepare_fast_open(
         cache.get(0, 100, tuple.local.ip(), tuple.remote.ip()),

@@ -207,7 +207,7 @@ fn receive_offer_cap_does_not_truncate_fast_open_request_payload() {
             t.local.ip(),
             t.remote.ip(),
             wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-            1460,
+            Some(1460),
         );
         let cached = cache.get(0, 100, t.local.ip(), t.remote.ip());
         let mut a = Connection::active(t, c, 10, 0).unwrap();

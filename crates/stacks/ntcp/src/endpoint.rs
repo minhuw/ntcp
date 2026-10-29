@@ -2324,7 +2324,7 @@ impl Endpoint {
                 let tuple = slot.connection.tuple();
                 if let Some(cookie) = cookie {
                     service.learn(self.now, tuple.local.ip(), tuple.remote.ip(), cookie, mss);
-                } else {
+                } else if let Some(mss) = mss {
                     service.update_mss(self.now, tuple.local.ip(), tuple.remote.ip(), mss);
                 }
             }

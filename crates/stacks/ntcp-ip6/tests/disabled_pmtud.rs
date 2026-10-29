@@ -539,7 +539,12 @@ fn disabled_ipv6_fast_open_cold_warm_supplied_protected_and_rejected() {
                 .unwrap();
                 // A rejected cookie suppresses subsequent early attempts at that
                 // service; use the existing explicit cache clear for the next case.
-                assert_eq!(n, usize::from(limit.min(1240)) - 60);
+                let expected = if attempt == 0 {
+                    usize::from(limit.min(1240)) - 60 // Validated learned MSS, path limited.
+                } else {
+                    496 // Cold admission after explicit cache clear, including IPv6.
+                };
+                assert_eq!(n, expected);
                 let syn = poll(&mut a, id, now, mode, bound).unwrap();
                 assert_eq!(syn.tcp().header.flags & SYN, SYN);
                 assert_eq!(syn.tcp().options.mss, Some(4096));
@@ -547,7 +552,8 @@ fn disabled_ipv6_fast_open_cold_warm_supplied_protected_and_rejected() {
                 assert!(syn.tcp().options.timestamps.is_some());
                 assert_eq!(syn.tcp().options.fast_open.is_none(), attempt == 3);
                 if attempt == 2 {
-                    assert_eq!(syn.bytes.len(), bound);
+                    assert_eq!(syn.tcp().raw_options.len(), 40);
+                    assert_eq!(syn.bytes.len(), 596); // Full options plus conservative cold data.
                 }
                 if let Some(token) = syn.token {
                     assert!(a.reject_unsubmitted(token).unwrap());
@@ -616,7 +622,8 @@ fn disabled_ipv6_fast_open_cold_warm_supplied_protected_and_rejected() {
                 assert_eq!(a.transport_info(id).unwrap().advertised_mss, 4096);
                 a.clear_fast_open_client_cache();
                 // Explicit supplied and protected cases below do not need the
-                // credential cache; their cold family MSS and send ceiling agree.
+                // credential cache; conservative cold admission remains separate
+                // from the actual IPv6 peer MSS and ordinary send ceiling.
             }
         }
     }

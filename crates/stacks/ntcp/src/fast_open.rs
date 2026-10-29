@@ -24,7 +24,7 @@ pub enum FastOpenClientPolicy {
     #[default]
     RequireCookie,
     /// The target service has independently agreed to protected early data.
-    /// Omit the FO option; retain cold peer-MSS and negative-response limits.
+    /// Omit the FO option; retain conservative cold admission and service cooldown.
     ApplicationProtected,
 }
 
@@ -616,13 +616,13 @@ pub(crate) const LIFETIME_US: u64 = 3_600_000_000;
 #[derive(Clone, Copy)]
 pub(crate) struct CachedCookie {
     pub cookie: FastOpenCookie,
-    pub mss: u16,
+    pub mss: Option<u16>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct CachedPeer {
     credential: Option<(FastOpenCookie, Instant)>,
-    mss: u16,
+    mss: Option<(u16, Instant)>,
     local: IpAddr,
     remote: IpAddr,
     learned: Instant,
@@ -720,7 +720,7 @@ impl FastOpen {
         let (cookie, learned) = peer.credential?;
         (now >= learned && now - learned < lifetime).then_some(CachedCookie {
             cookie,
-            mss: peer.mss,
+            mss: self.peer_mss(now, lifetime, local, remote),
         })
     }
 
@@ -743,7 +743,8 @@ impl FastOpen {
         local: IpAddr,
         remote: IpAddr,
     ) -> Option<u16> {
-        self.peer(now, lifetime, local, remote).map(|e| e.mss)
+        let (mss, learned) = self.peer(now, lifetime, local, remote)?.mss?;
+        (now >= learned && now - learned < lifetime).then_some(mss)
     }
 
     // Validated MSS observations have their own age. They neither create a
@@ -758,13 +759,13 @@ impl FastOpen {
             .find(|e| e.local == local && e.remote == remote)
         {
             if now >= entry.learned {
-                entry.mss = mss;
+                entry.mss = Some((mss, now));
                 entry.learned = now;
             }
         } else {
             self.insert_peer(CachedPeer {
                 credential: None,
-                mss,
+                mss: Some((mss, now)),
                 local,
                 remote,
                 learned: now,
@@ -791,16 +792,16 @@ impl FastOpen {
         local: IpAddr,
         remote: IpAddr,
         cookie: FastOpenCookie,
-        mss: u16,
+        mss: Option<u16>,
     ) {
         // Empty wire options do not by themselves establish a server agreement
         // for a zero cookie. That authorization must be supplied explicitly.
-        if cookie.as_bytes().is_empty() || mss == 0 {
+        if cookie.as_bytes().is_empty() || mss == Some(0) {
             return;
         }
         let peer = CachedPeer {
             credential: Some((cookie, now)),
-            mss,
+            mss: mss.map(|mss| (mss, now)),
             local,
             remote,
             learned: now,
@@ -811,7 +812,10 @@ impl FastOpen {
             .find(|e| e.local == local && e.remote == remote)
         {
             if now >= old.learned {
-                *old = peer;
+                // Cookie-only replies must neither invent an MSS nor renew
+                // the age of an earlier advertised MSS.
+                let mss = peer.mss.or(old.mss);
+                *old = CachedPeer { mss, ..peer };
             }
         } else {
             self.insert_peer(peer);
@@ -891,12 +895,12 @@ mod tests {
             cache.update_mss(9, local, remote, 940);
             assert_eq!(cache.peer_mss(9, 100, local, remote), Some(940));
             assert!(cache.get(9, 100, local, remote).is_none());
-            cache.learn(10, local, remote, cookie, 1460);
-            cache.learn(10, other, remote, cookie, 1220);
-            cache.learn(10, local, other, cookie, 536);
+            cache.learn(10, local, remote, cookie, Some(1460));
+            cache.learn(10, other, remote, cookie, Some(1220));
+            cache.learn(10, local, other, cookie, Some(536));
             cache.update_mss(109, local, remote, 940);
             let entry = cache.get(109, 100, local, remote).unwrap();
-            assert_eq!(entry.mss, 940);
+            assert_eq!(entry.mss, Some(940));
             assert_eq!(entry.cookie, cookie);
             assert!(cache.get(110, 100, local, remote).is_none());
             assert_eq!(cache.peer_mss(110, 100, local, remote), Some(940));
@@ -904,11 +908,11 @@ mod tests {
             cache.update_mss(111, local, remote, 1000);
             assert!(cache.get(111, 100, local, remote).is_none());
             assert_eq!(cache.peer_mss(111, 100, local, remote), Some(1000));
-            assert_eq!(cache.get(109, 100, other, remote).unwrap().mss, 1220);
-            assert_eq!(cache.get(109, 100, local, other).unwrap().mss, 536);
+            assert_eq!(cache.get(109, 100, other, remote).unwrap().mss, Some(1220));
+            assert_eq!(cache.get(109, 100, local, other).unwrap().mss, Some(536));
             assert_eq!(cache.next, 0);
             assert_eq!(cache.entries.len(), 3);
-            cache.learn(112, local, remote, replacement, 1000);
+            cache.learn(112, local, remote, replacement, Some(1000));
             assert_eq!(
                 cache.get(211, 100, local, remote).unwrap().cookie,
                 replacement
@@ -918,14 +922,40 @@ mod tests {
             // Older observations and empty wire options cannot install a key.
             cache.update_mss(1, local, remote, 400);
             assert!(cache.get(212, 100, local, remote).is_none());
-            cache.learn(213, local, remote, FastOpenCookie::request(), 1000);
+            cache.learn(213, local, remote, FastOpenCookie::request(), Some(1000));
             assert!(cache.get(213, 100, local, remote).is_none());
             let mut cache = FastOpen::new().unwrap();
-            cache.learn(u64::MAX - 10, local, remote, cookie, 1460);
+            cache.learn(u64::MAX - 10, local, remote, cookie, Some(1460));
             cache.update_mss(u64::MAX, local, remote, 940);
             assert!(cache.get(u64::MAX, 10, local, remote).is_none());
             assert_eq!(cache.peer_mss(u64::MAX, 10, local, remote), Some(940));
         }
+    }
+
+    #[test]
+    fn cookie_only_learning_preserves_absent_or_aging_advertised_mss() {
+        let local = "2001:db8::1".parse().unwrap();
+        let remote = "2001:db8::2".parse().unwrap();
+        let cookie = FastOpenCookie::new(&[7; 8]).unwrap();
+        let replacement = FastOpenCookie::new(&[8; 8]).unwrap();
+        let mut cache = FastOpen::new().unwrap();
+        cache.learn(1, local, remote, cookie, None);
+        assert_eq!(cache.get(1, 100, local, remote).unwrap().cookie, cookie);
+        assert_eq!(cache.get(1, 100, local, remote).unwrap().mss, None);
+        assert_eq!(cache.peer_mss(1, 100, local, remote), None);
+        cache.update_mss(2, local, remote, 940);
+        cache.learn(101, local, remote, replacement, None);
+        assert_eq!(cache.get(101, 100, local, remote).unwrap().mss, Some(940));
+        // A newly learned cookie remains useful after the old MSS expires,
+        // without converting its absent MSS into a TCP family default.
+        let entry = cache.get(102, 100, local, remote).unwrap();
+        assert_eq!(entry.cookie, replacement);
+        assert_eq!(entry.mss, None);
+        assert_eq!(cache.peer_mss(102, 100, local, remote), None);
+        cache.update_mss(103, local, remote, 1000);
+        assert_eq!(cache.get(200, 100, local, remote).unwrap().mss, Some(1000));
+        assert!(cache.get(201, 100, local, remote).is_none());
+        assert_eq!(cache.peer_mss(201, 100, local, remote), Some(1000));
     }
 
     #[test]
@@ -952,13 +982,13 @@ mod tests {
                 FastOpenCookie::request()
             ));
             let mut cache = FastOpen::new().unwrap();
-            cache.learn(10, local, remote, cookie, 536);
-            assert_eq!(cache.get(10, 100, local, remote).unwrap().mss, 536);
+            cache.learn(10, local, remote, cookie, Some(536));
+            assert_eq!(cache.get(10, 100, local, remote).unwrap().mss, Some(536));
             assert!(cache.get(110, 100, local, remote).is_none());
             assert!(cache.get(9, 100, local, remote).is_none());
             assert!(cache.get(10, 100, other, remote).is_none());
             for n in 1..=65 {
-                cache.learn(10, local, IpAddr::from([198, 51, 100, n]), cookie, 1220);
+                cache.learn(10, local, IpAddr::from([198, 51, 100, n]), cookie, Some(1220));
             }
             assert_eq!(cache.entries.len(), CAPACITY);
             assert!(cache.get(10, 100, local, remote).is_none());
@@ -983,7 +1013,7 @@ mod negative_tests {
             let remote: SocketAddr = "192.0.2.2:80".parse().unwrap();
             let mut cache = FastOpen::new().unwrap();
             let cookie = FastOpenCookie::new(&[1; 8]).unwrap();
-            cache.learn(1, local, remote.ip(), cookie, 536);
+            cache.learn(1, local, remote.ip(), cookie, Some(536));
             cache.fail(10, local, remote);
             for now in [9, 10, 10 + lifetime - 1, 10 + lifetime] {
                 assert_eq!(
@@ -995,8 +1025,8 @@ mod negative_tests {
             assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(other, 80)));
             assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(remote.ip(), 81)));
             assert_eq!(cache.entries[0].credential.unwrap().1, 1);
-            assert_eq!(cache.entries[0].mss, 536);
-            cache.learn(11, local, remote.ip(), cookie, 940);
+            assert_eq!(cache.entries[0].mss, Some((536, 1)));
+            cache.learn(11, local, remote.ip(), cookie, Some(940));
             assert!(cache.suppressed(11, lifetime, local, remote));
             cache.fail(20, local, remote);
             assert_eq!(cache.negative.len(), 1);
@@ -1011,7 +1041,7 @@ mod negative_tests {
             assert_eq!(cache.negative.capacity(), CAPACITY);
             assert!(!cache.suppressed(20, lifetime, local, remote));
             assert_eq!(cache.entries[0].credential.unwrap().1, 11);
-            assert_eq!(cache.entries[0].mss, 940);
+            assert_eq!(cache.entries[0].mss, Some((940, 11)));
         }
     }
 }
@@ -1027,7 +1057,7 @@ mod cache_management_tests {
         let mut cache = FastOpen::new().unwrap();
         for n in 1..=65 {
             let remote = IpAddr::from([198, 51, 100, n]);
-            cache.learn(0, local, remote, cookie, 536);
+            cache.learn(0, local, remote, cookie, Some(536));
             cache.fail(0, local, SocketAddr::new(remote, 80));
         }
         let capacities = (cache.entries.capacity(), cache.negative.capacity());
@@ -1042,9 +1072,9 @@ mod cache_management_tests {
                 capacities
             );
             let remote = IpAddr::from([203, 0, 113, 1]);
-            cache.learn(10, local, remote, cookie, 940);
+            cache.learn(10, local, remote, cookie, Some(940));
             cache.fail(10, local, SocketAddr::new(remote, 80));
-            assert_eq!(cache.get(10, 100, local, remote).unwrap().mss, 940);
+            assert_eq!(cache.get(10, 100, local, remote).unwrap().mss, Some(940));
             assert!(cache.suppressed(10, 100, local, SocketAddr::new(remote, 80)));
             assert!(
                 cache
