@@ -175,6 +175,15 @@ fn setters_do_not_enable_service_or_listeners_and_reject_stale_handles() {
         let (local, remote) = addresses(8080);
         let listener = endpoint.listen(local, 8).unwrap();
         let before = endpoint.buffer_bytes();
+        endpoint.set_fast_open_hmac_key([9; 32]);
+        endpoint
+            .try_set_fast_open_cookie_policy(policy.clone())
+            .unwrap();
+        let registered = endpoint.buffer_bytes();
+        assert_eq!(
+            registered,
+            before + endpoint.fast_open_key_registry_usage().1
+        );
         crate::allocation_tests::fail_after(0, || {
             endpoint.set_fast_open_hmac_key([9; 32]);
             endpoint.set_fast_open_cookie_policy(policy.clone());
@@ -182,7 +191,7 @@ fn setters_do_not_enable_service_or_listeners_and_reject_stale_handles() {
                 .set_listener_fast_open_cookie_policy(listener, Some(policy.clone()))
                 .unwrap();
         });
-        assert_eq!(endpoint.buffer_bytes(), before);
+        assert_eq!(endpoint.buffer_bytes(), registered);
         assert!(endpoint.set_listener_fast_open(listener, 1).is_err());
         assert!(endpoint.connect_fast_open(0, local, remote, b"x").is_err());
         endpoint.enable_fast_open().unwrap();
@@ -343,7 +352,7 @@ mod linux {
 
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
     //= type=test
-    //= reason=Default HMAC authenticates current/previous time epochs and rejects older cookies (default_policy_preserves_hmac_epochs_and_addresses). Opt-in LinuxSipHash24 uses one fixed key and ignores epoch (openssl_linux_vectors_and_validation_boundaries explicitly accepts u64::MAX). There is no enforced timed rotation/expiration for that supported mode. External rotation is available but cannot close timed expiration without an independently established policy.
+    //= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
     //# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed
     //# in the "Security Considerations" section (Section 5). This can be done by either periodically
     //# changing the server key used to generate cookies or including a timestamp when generating the cookie.
@@ -594,16 +603,21 @@ mod linux {
             let before = endpoint.buffer_bytes();
             let replacement = FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([9; 16]));
             // The child snapshots the response before its first output poll.
-            crate::allocation_tests::fail_after(0, || {
-                if listener_override {
-                    endpoint
-                        .set_listener_fast_open_cookie_policy(listener, Some(replacement))
-                        .unwrap();
-                } else {
-                    endpoint.set_fast_open_cookie_policy(replacement);
-                }
-            });
-            assert_eq!(endpoint.buffer_bytes(), before);
+            let registry_before = endpoint.fast_open_key_registry_usage().1;
+            if listener_override {
+                endpoint
+                    .set_listener_fast_open_cookie_policy(listener, Some(replacement))
+                    .unwrap();
+            } else {
+                endpoint
+                    .try_set_fast_open_cookie_policy(replacement)
+                    .unwrap();
+            }
+            assert_eq!(
+                endpoint.buffer_bytes() - endpoint.fast_open_key_registry_usage().1,
+                before - registry_before
+            );
+            let before = endpoint.buffer_bytes();
             let mut bytes = [0; 2048];
             let (output, attempt) = endpoint.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
             let tx = output.packet.unwrap();
@@ -626,6 +640,7 @@ mod linux {
                 Err(EndpointError::OutputReserved)
             );
             // Rotate the selected policy again while the child's output is held.
+            let registry_before = endpoint.fast_open_key_registry_usage().1;
             let replacement =
                 FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([10; 16]));
             let new = cookie(&replacement);
@@ -636,7 +651,10 @@ mod linux {
             } else {
                 endpoint.set_fast_open_cookie_policy(replacement);
             }
-            assert_eq!(endpoint.buffer_bytes(), before);
+            assert_eq!(
+                endpoint.buffer_bytes() - endpoint.fast_open_key_registry_usage().1,
+                before - registry_before
+            );
             assert_eq!(&bytes[..tx.len], original.as_slice());
             assert!(endpoint.reject_unsubmitted(attempt).unwrap());
             let (output, next) = endpoint

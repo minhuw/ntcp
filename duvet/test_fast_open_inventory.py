@@ -243,7 +243,8 @@ class FastOpenInventory(unittest.TestCase):
                    "simultaneous", "api-connect-errno"):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("LinuxSipHash24", rows["mac-expiration"]["reason"])
-        self.assertIn("no enforced timed", rows["mac-expiration"]["reason"])
+        self.assertIn("absolute issue/accept deadlines", rows["mac-expiration"]["reason"])
+        self.assertIn("T20/T15", rows["mac-expiration"]["reason"])
         for id in ("replay-app", "app-reuse", "farm-key", "nat-timestamp-cookie", "aes-example",
                    "cross-connection-cc-disable", "synack-payload-delay", "api-active-option-alternative"):
             self.assertEqual(rows[id]["status"], "exception")
@@ -267,16 +268,39 @@ class FastOpenInventory(unittest.TestCase):
                     mutate(broken)
                     with self.assertRaises(ValueError):
                         validate_selected_closure(broken, expected)
-        # Manual key revocation cannot establish the separate timed-lifecycle,
-        # cost, broad interoperability, or unselected policy obligations.
+        # Live endpoint deadlines and native rotation cannot establish trusted
+        # raw-key restart continuity, cost or broad interoperability.
         for id in ("perform-normal-and-expiry", "server-mac-properties", "mac-expiration",
                    "is-cookie-valid", "request-server-properties", "reuse-until-expired",
                    "mac-cost", "compatibility", "lost-syn-heuristic"):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("manual key revocation", rows["reuse-until-expired"]["reason"])
-        self.assertIn("no enforced timed expiration", rows["reuse-until-expired"]["reason"])
-        self.assertNotIn("no enforced timed expiration or independent rotation contract",
-                         rows["reuse-until-expired"]["reason"])
+        self.assertIn("same-key reinstalls cannot renew expired leases", rows["reuse-until-expired"]["reason"])
+        for id in ("perform-normal-and-expiry", "server-mac-properties", "mac-expiration",
+                   "is-cookie-valid", "request-server-properties", "reuse-until-expired"):
+            row = rows[id]
+            self.assertIn("T20/T15", row["reason"])
+            self.assertIn("raw", row["reason"].lower())
+            self.assertEqual(row["evidence"][1],
+                             "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_timebases()")
+            self.assertNotIn("no enforced timed", row["reason"])
+        for id in ("server-mac-properties", "request-server-properties"):
+            self.assertIn("T6", rows[id]["reason"])
+        self.assertIn("endpoint-owned identity registry", rows["mac-expiration"]["reason"])
+        self.assertEqual(rows["mac-expiration"]["evidence"][2:], [
+            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn credential_authority_rejects_arbitrary_key_cycles_on_actual_traffic()",
+            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn credential_authority_survives_distinct_default_clear_close_and_cross_listener_reuse()",
+            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn hmac_long_cycles_keep_original_epoch_mapping_across_listeners()",
+            "crates/adapters/ntcp-socket/src/runtime_cookie_policy_tests.rs::fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations()",
+        ])
+        self.assertEqual(rows["is-cookie-valid"]["evidence"][2:], [
+            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn global_credential_tightening_reaches_all_listener_selections_and_preserves_children()",
+            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_progress()",
+        ])
+        self.assertEqual(rows["rolling-keys"]["status"], "covered")
+        self.assertIn("at most one retiring key", rows["rolling-keys"]["reason"])
+        self.assertEqual(rows["rolling-keys"]["evidence"][0],
+                         "crates/stacks/ntcp/src/fast_open.rs::pub fn install(")
 
     def test_verified_errata_are_explicit_without_rewriting_published_quotes(self):
         document = ledger()

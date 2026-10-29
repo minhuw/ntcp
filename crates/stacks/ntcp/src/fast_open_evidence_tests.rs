@@ -19,6 +19,1395 @@ fn peer(key: u8) -> (Endpoint, ActiveOpenOptions) {
     (endpoint, options)
 }
 
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn linux_default_lease_expires_at_admission_without_timer_service() {
+    for v6 in [false, true] {
+        let (mut server, _) = peer(2);
+        server.set_fast_open_cookie_policy(FastOpenCookiePolicy::LinuxSipHash24(
+            LinuxSipHash24Key::new([7; 16]),
+        ));
+        let (_, remote) = addresses(v6, 40000);
+        let listener = server.listen(remote, 16).unwrap();
+        server.set_listener_fast_open(listener, 4).unwrap();
+        let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+        for (port, now, early) in [
+            (40001, crate::fast_open::LIFETIME_US - 1, true),
+            (40002, crate::fast_open::LIFETIME_US, false),
+            (40003, crate::fast_open::LIFETIME_US + 1, false),
+        ] {
+            let (mut client, _) = peer(1);
+            let (local, _) = addresses(v6, port);
+            open(
+                &mut client,
+                &mut server,
+                listener,
+                local,
+                remote,
+                now,
+                Some(cookie),
+                early,
+            );
+        }
+    }
+}
+
+// Every branch below exchanges actual SYN/SYN-ACK/ACK/data packets. In
+// particular, fallback proves that rejecting credentials preserves byte progress.
+fn lifecycle_open(
+    server: &mut Endpoint,
+    listener: ListenerId,
+    v6: bool,
+    now: u64,
+    port: u16,
+    cookie: FastOpenCookie,
+    early: bool,
+) -> Option<FastOpenCookie> {
+    let (_, remote) = addresses(v6, port);
+    lifecycle_open_to(server, listener, v6, now, port, remote, cookie, early)
+}
+
+fn lifecycle_open_to(
+    server: &mut Endpoint,
+    listener: ListenerId,
+    v6: bool,
+    now: u64,
+    port: u16,
+    remote: SocketAddr,
+    cookie: FastOpenCookie,
+    early: bool,
+) -> Option<FastOpenCookie> {
+    let (mut client, options) = peer(1);
+    let (local, _) = addresses(v6, port);
+    let (id, n) = client
+        .connect_fast_open_with_server_cookie(now, local, remote, b"early", options, Some(cookie))
+        .unwrap();
+    assert_eq!(n, 5);
+    let syn = packet(&mut client, now);
+    let seq = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
+    deliver(server, now, &syn);
+    let reply = packet(server, now);
+    let parsed = wire::parse(reply.0, &reply.1).unwrap();
+    assert_eq!(
+        parsed.header.acknowledgment,
+        seq.wrapping_add(if early { 6 } else { 1 })
+    );
+    let response = parsed.options.fast_open;
+    let child = if early {
+        Some(server.accept(listener).unwrap())
+    } else {
+        assert!(server.accept(listener).is_err());
+        None
+    };
+    deliver(&mut client, now, &reply);
+    deliver(server, now, &packet(&mut client, now));
+    let child = child.unwrap_or_else(|| server.accept(listener).unwrap());
+    let mut bytes = [0; 5];
+    assert_eq!(server.read(child, &mut bytes), Ok(5));
+    assert_eq!(&bytes, b"early");
+    assert_eq!(server.state(child), Ok(State::Established));
+    assert_eq!(client.state(id), Ok(State::Established));
+    assert_eq!(client.transport_info(id).unwrap().syn_data_acked, early);
+    response
+}
+
+fn server_key(policy: &FastOpenCookiePolicy, byte: u8) -> FastOpenServerKey {
+    match policy {
+        FastOpenCookiePolicy::HmacSha256 => FastOpenServerKey::HmacSha256([byte; 32]),
+        #[cfg(feature = "tfo-linux-cookie")]
+        FastOpenCookiePolicy::LinuxSipHash24(_) => {
+            FastOpenServerKey::LinuxSipHash24(LinuxSipHash24Key::new([byte; 16]))
+        }
+    }
+}
+
+fn timed_install(
+    server: &mut Endpoint,
+    listener: ListenerId,
+    scoped: bool,
+    now: u64,
+    key: FastOpenServerKey,
+    lease: FastOpenKeyLease,
+    rotate: bool,
+) {
+    if scoped {
+        server
+            .install_listener_fast_open_key(now, listener, key, lease, rotate)
+            .unwrap();
+    } else {
+        server
+            .install_fast_open_key(now, key, lease, rotate)
+            .unwrap();
+    }
+}
+
+// Full lifecycle evidence remains partial until the embedding preserves trusted
+// lease deadlines across restart. The raw codec tests alone make no such claim.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//# To gradually invalidate cookies over time, the server can implement key rotation to generate and verify cookies using multiple keys. This approach is useful for large-scale servers to retain Fast Open rolling key updates. We do not specify a particular mechanism because the implementation is server specific.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
+//# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the "Security Considerations" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw-key restart continuity still requires T20/T15 trusted original lease/time mapping; the whole lifecycle remains TODO until that integration.
+//# 5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO for unmeasured relative generation/verification cost (T6) and external raw-key restart/time continuity (T20/T15).
+//# The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use "SHOULD" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20/T15 integration of trusted original lease/time mapping across external raw-key restart.
+//# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+//= type=test
+//= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. This cross-reference still imports unmeasured relative MAC cost (T6) and trusted external raw-key restart/time continuity (T20/T15), so the whole clause remains TODO.
+//# 2. The server responds with a SYN-ACK based on the procedures in the "Server Cookie Handling" section (Section 4.1.2).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. The whole reuse lifecycle remains TODO for T20/T15 trusted original lease/time mapping across external raw-key restart.
+//# Once the client obtains the cookie from the target server, it can perform subsequent TFO connections until the cookie is expired by the server.
+#[test]
+fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_timebases() {
+    for v6 in [false, true] {
+        for units in [1_000_000, 1_000_000_000] {
+            for policy in policies() {
+                for scoped in [false, true] {
+                    let config = EndpointConfig {
+                        max_connections: 32,
+                        connection: ConnectionConfig {
+                            timestamps: false,
+                            nagle: false,
+                            timebase: CallerTimebase {
+                                units_per_second: units,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let tb = config.connection.timebase;
+                    let mut server = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+                    server.enable_fast_open().unwrap();
+                    let (_, remote) = addresses(v6, 40000);
+                    let listener = server.listen(remote, 24).unwrap();
+                    server.set_listener_fast_open(listener, 4).unwrap();
+                    let duration = FastOpenCookieLifetime::from_micros(1_000_000).unwrap();
+                    if scoped {
+                        server
+                            .set_listener_fast_open_cookie_lifetime(listener, duration)
+                            .unwrap();
+                    } else {
+                        server.set_fast_open_cookie_lifetime(duration);
+                    }
+                    let lease = FastOpenKeyLease::for_lifetime(0, duration, tb, true).unwrap();
+                    timed_install(
+                        &mut server,
+                        listener,
+                        scoped,
+                        0,
+                        server_key(&policy, 7),
+                        lease,
+                        false,
+                    );
+                    let (_, old) = learn(&mut server, listener, v6, 0, 40000);
+                    lifecycle_open(&mut server, listener, v6, units - 1, 40001, old, true);
+                    // Issuance stops exactly on issue_until, acceptance continues.
+                    assert_eq!(
+                        lifecycle_open(&mut server, listener, v6, units, 40002, old, true),
+                        None
+                    );
+                    let next = FastOpenKeyLease::for_lifetime(units, duration, tb, true).unwrap();
+                    timed_install(
+                        &mut server,
+                        listener,
+                        scoped,
+                        units,
+                        server_key(&policy, 8),
+                        next,
+                        true,
+                    );
+                    // Current/retiring both authenticate while only current issues.
+                    let fresh = lifecycle_open(&mut server, listener, v6, units, 40003, old, true);
+                    let fresh = fresh.unwrap_or_else(|| {
+                        // Linux omits refresh for valid retiring cookies; obtain
+                        // the new cookie through a real invalid/request SYN.
+                        learn(&mut server, listener, v6, units, 40004).1
+                    });
+                    assert_ne!(old, fresh);
+                    lifecycle_open(&mut server, listener, v6, units + 1, 40005, fresh, true);
+                    let invalid = wire::FastOpenCookie::new(&[0x55; 8]).unwrap();
+                    assert_eq!(
+                        lifecycle_open(&mut server, listener, v6, units + 1, 40006, invalid, false),
+                        Some(fresh)
+                    );
+                    // No timers were serviced. The original retiring deadline
+                    // is authoritative, including for delayed admission.
+                    lifecycle_open(&mut server, listener, v6, 2 * units - 1, 40007, old, true);
+                    assert_eq!(
+                        lifecycle_open(&mut server, listener, v6, 2 * units, 40008, old, false),
+                        None
+                    );
+                    assert_eq!(
+                        lifecycle_open(&mut server, listener, v6, 3 * units, 40009, fresh, false),
+                        None
+                    );
+                    // A same-key install carrying later deadlines cannot revive
+                    // the expired current credential or promise a fresh cookie.
+                    let later =
+                        FastOpenKeyLease::for_lifetime(3 * units, duration, tb, true).unwrap();
+                    timed_install(
+                        &mut server,
+                        listener,
+                        scoped,
+                        3 * units,
+                        server_key(&policy, 8),
+                        later,
+                        false,
+                    );
+                    assert_eq!(
+                        lifecycle_open(&mut server, listener, v6, 3 * units, 40010, fresh, false),
+                        None
+                    );
+                    timed_install(
+                        &mut server,
+                        listener,
+                        scoped,
+                        3 * units,
+                        server_key(&policy, 9),
+                        later,
+                        false,
+                    );
+                    let replacement =
+                        lifecycle_open(&mut server, listener, v6, 3 * units, 40011, fresh, false)
+                            .unwrap();
+                    lifecycle_open(
+                        &mut server,
+                        listener,
+                        v6,
+                        3 * units,
+                        40012,
+                        replacement,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hmac_real_credentials_expire_after_current_and_previous_epochs() {
+    for v6 in [false, true] {
+        let (mut server, _) = peer(2);
+        let (_, remote) = addresses(v6, 40000);
+        let listener = server.listen(remote, 16).unwrap();
+        server.set_listener_fast_open(listener, 4).unwrap();
+        let lifetime = crate::fast_open::LIFETIME_US;
+        let (_, old) = learn(&mut server, listener, v6, lifetime - 1, 40000);
+        lifecycle_open(&mut server, listener, v6, lifetime, 40001, old, true);
+        lifecycle_open(
+            &mut server,
+            listener,
+            v6,
+            2 * lifetime - 1,
+            40002,
+            old,
+            true,
+        );
+        let fresh =
+            lifecycle_open(&mut server, listener, v6, 2 * lifetime, 40003, old, false).unwrap();
+        lifecycle_open(
+            &mut server,
+            listener,
+            v6,
+            2 * lifetime + 1,
+            40004,
+            fresh,
+            true,
+        );
+    }
+}
+
+#[test]
+fn inherited_policy_override_preserves_issue_and_accept_deadlines() {
+    for v6 in [false, true] {
+        for policy in policies() {
+            for override_at in [100, 50] {
+                let (mut server, _) = peer(2);
+                let (_, remote) = addresses(v6, 40000);
+                let listener = server.listen(remote, 16).unwrap();
+                server.set_listener_fast_open(listener, 4).unwrap();
+                let lease = FastOpenKeyLease {
+                    not_before: 0,
+                    issue_until: 50,
+                    accept_until: 100,
+                    units_per_second: 1_000_000,
+                };
+                server
+                    .install_fast_open_key(0, server_key(&policy, 7), lease, false)
+                    .unwrap();
+                let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+                lifecycle_open(&mut server, listener, v6, 49, 40001, cookie, true);
+                // A future-install duration must not change the inherited key's
+                // epoch parameters when it becomes an explicit listener policy.
+                server.set_fast_open_cookie_lifetime(
+                    FastOpenCookieLifetime::from_micros(100).unwrap(),
+                );
+                let early = override_at < lease.accept_until;
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, override_at, 40002, cookie, early),
+                    None
+                );
+                server
+                    .set_listener_fast_open_cookie_policy(listener, Some(policy.clone()))
+                    .unwrap();
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, override_at, 40003, cookie, early),
+                    None
+                );
+                // Restoring inheritance and making it explicit again also
+                // preserves the expired lease, without timer service.
+                server
+                    .set_listener_fast_open_cookie_policy(listener, None)
+                    .unwrap();
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, 100, 40004, cookie, false),
+                    None
+                );
+                server
+                    .set_listener_fast_open_cookie_policy(listener, Some(policy.clone()))
+                    .unwrap();
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, 100, 40005, cookie, false),
+                    None
+                );
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, 101, 40006, cookie, false),
+                    None
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn hmac_policy_round_trip_preserves_expired_lease_and_epoch_metadata() {
+    for v6 in [false, true] {
+        for scoped in [false, true] {
+            for rotate in [false, true] {
+                let (mut server, _) = peer(2);
+                let (_, remote) = addresses(v6, 40000);
+                let listener = server.listen(remote, 16).unwrap();
+                server.set_listener_fast_open(listener, 4).unwrap();
+                let lease = FastOpenKeyLease {
+                    not_before: 0,
+                    issue_until: 10_000_000,
+                    accept_until: 20_000_000,
+                    units_per_second: 1_000_000,
+                };
+                // Make the key available for policy selection in either scope.
+                server.set_fast_open_hmac_key([7; 32]);
+                timed_install(
+                    &mut server,
+                    listener,
+                    scoped,
+                    0,
+                    FastOpenServerKey::HmacSha256([7; 32]),
+                    lease,
+                    false,
+                );
+                let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+                lifecycle_open(&mut server, listener, v6, 19_999_999, 40001, cookie, true);
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, 20_000_000, 40002, cookie, false),
+                    None
+                );
+                let raw = FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([8; 16]));
+                if rotate {
+                    timed_install(
+                        &mut server,
+                        listener,
+                        scoped,
+                        20_000_000,
+                        server_key(&raw, 8),
+                        FastOpenKeyLease::for_lifetime(
+                            20_000_000,
+                            Default::default(),
+                            CallerTimebase::default(),
+                            true,
+                        )
+                        .unwrap(),
+                        true,
+                    );
+                } else if scoped {
+                    server
+                        .set_listener_fast_open_cookie_policy(listener, Some(raw))
+                        .unwrap();
+                } else {
+                    server.set_fast_open_cookie_policy(raw);
+                }
+                if scoped {
+                    server
+                        .set_listener_fast_open_cookie_policy(
+                            listener,
+                            Some(FastOpenCookiePolicy::HmacSha256),
+                        )
+                        .unwrap();
+                } else {
+                    server.set_fast_open_cookie_policy(FastOpenCookiePolicy::HmacSha256);
+                }
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, 20_000_000, 40003, cookie, false),
+                    None
+                );
+                // Neither same-key manual replacement nor a later timed lease
+                // may renew the credential after the policy round trip.
+                server.set_fast_open_hmac_key([7; 32]);
+                let later = FastOpenKeyLease::for_lifetime(
+                    20_000_000,
+                    Default::default(),
+                    CallerTimebase::default(),
+                    true,
+                )
+                .unwrap();
+                timed_install(
+                    &mut server,
+                    listener,
+                    scoped,
+                    20_000_000,
+                    FastOpenServerKey::HmacSha256([7; 32]),
+                    later,
+                    false,
+                );
+                assert_eq!(
+                    lifecycle_open(&mut server, listener, v6, 20_000_000, 40004, cookie, false),
+                    None
+                );
+                timed_install(
+                    &mut server,
+                    listener,
+                    scoped,
+                    20_000_000,
+                    FastOpenServerKey::HmacSha256([9; 32]),
+                    later,
+                    false,
+                );
+                let fresh =
+                    lifecycle_open(&mut server, listener, v6, 20_000_000, 40005, cookie, false)
+                        .unwrap();
+                lifecycle_open(&mut server, listener, v6, 20_000_000, 40006, fresh, true);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn linux_policy_round_trip_preserves_original_lease() {
+    for v6 in [false, true] {
+        for scoped in [false, true] {
+            for explicit in [false, true] {
+                for switch_at in [50, 100] {
+                    for (timed_departure, timed_return) in
+                        [(false, false), (false, true), (true, false), (true, true)]
+                    {
+                        let (mut server, _) = peer(2);
+                        let (_, remote) = addresses(v6, 40000);
+                        let listener = server.listen(remote, 16).unwrap();
+                        server.set_listener_fast_open(listener, 4).unwrap();
+                        let duration = FastOpenCookieLifetime::from_micros(100).unwrap();
+                        server.set_fast_open_cookie_lifetime(duration);
+                        let raw =
+                            FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([7; 16]));
+                        if explicit {
+                            timed_install(
+                                &mut server,
+                                listener,
+                                scoped,
+                                0,
+                                server_key(&raw, 7),
+                                FastOpenKeyLease {
+                                    not_before: 0,
+                                    issue_until: 50,
+                                    accept_until: 100,
+                                    units_per_second: 1_000_000,
+                                },
+                                false,
+                            );
+                        } else if scoped {
+                            server
+                                .set_listener_fast_open_cookie_policy(listener, Some(raw.clone()))
+                                .unwrap();
+                        } else {
+                            server.set_fast_open_cookie_policy(raw.clone());
+                        }
+                        let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+                        lifecycle_open(&mut server, listener, v6, 49, 40001, cookie, true);
+                        lifecycle_open(
+                            &mut server,
+                            listener,
+                            v6,
+                            switch_at,
+                            40002,
+                            cookie,
+                            switch_at < 100,
+                        );
+                        let later = FastOpenKeyLease::for_lifetime(
+                            switch_at,
+                            duration,
+                            CallerTimebase::default(),
+                            true,
+                        )
+                        .unwrap();
+                        if timed_departure {
+                            timed_install(
+                                &mut server,
+                                listener,
+                                scoped,
+                                switch_at,
+                                FastOpenServerKey::HmacSha256([2; 32]),
+                                later,
+                                switch_at == 100,
+                            );
+                        } else if scoped {
+                            server
+                                .set_listener_fast_open_cookie_policy(
+                                    listener,
+                                    Some(FastOpenCookiePolicy::HmacSha256),
+                                )
+                                .unwrap();
+                        } else {
+                            server.set_fast_open_cookie_policy(FastOpenCookiePolicy::HmacSha256);
+                        }
+                        if timed_return {
+                            timed_install(
+                                &mut server,
+                                listener,
+                                scoped,
+                                switch_at,
+                                server_key(&raw, 7),
+                                later,
+                                false,
+                            );
+                        } else if scoped {
+                            server
+                                .set_listener_fast_open_cookie_policy(listener, Some(raw))
+                                .unwrap();
+                        } else {
+                            server.set_fast_open_cookie_policy(raw);
+                        }
+                        if switch_at < 100 {
+                            // Reinstalling before expiry preserves both the old
+                            // issuance boundary and the remaining acceptance window.
+                            let invalid = FastOpenCookie::new(&[0x55; 8]).unwrap();
+                            let response = lifecycle_open(
+                                &mut server,
+                                listener,
+                                v6,
+                                50,
+                                40003,
+                                invalid,
+                                false,
+                            );
+                            assert_eq!(response, (!explicit).then_some(cookie));
+                            lifecycle_open(&mut server, listener, v6, 99, 40004, cookie, true);
+                        }
+                        // No timer servicing: policy selection and a later timed
+                        // install must not revive the old raw cookie at expiry.
+                        assert_eq!(
+                            lifecycle_open(&mut server, listener, v6, 100, 40005, cookie, false),
+                            None
+                        );
+                        assert_eq!(
+                            lifecycle_open(&mut server, listener, v6, 101, 40006, cookie, false),
+                            None
+                        );
+                        timed_install(
+                            &mut server,
+                            listener,
+                            scoped,
+                            101,
+                            FastOpenServerKey::LinuxSipHash24(LinuxSipHash24Key::new([8; 16])),
+                            FastOpenKeyLease::for_lifetime(
+                                101,
+                                duration,
+                                CallerTimebase::default(),
+                                true,
+                            )
+                            .unwrap(),
+                            false,
+                        );
+                        let fresh =
+                            lifecycle_open(&mut server, listener, v6, 101, 40007, cookie, false)
+                                .unwrap();
+                        assert_ne!(fresh, cookie);
+                        lifecycle_open(&mut server, listener, v6, 101, 40008, fresh, true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn hmac_policy_round_trip_keeps_original_epoch_duration() {
+    for v6 in [false, true] {
+        for scoped in [false, true] {
+            let (mut server, _) = peer(2);
+            let (_, remote) = addresses(v6, 40000);
+            let listener = server.listen(remote, 16).unwrap();
+            server.set_listener_fast_open(listener, 4).unwrap();
+            let duration = FastOpenCookieLifetime::from_micros(1_000_000).unwrap();
+            server.set_fast_open_cookie_lifetime(duration);
+            server.set_fast_open_hmac_key([7; 32]);
+            if scoped {
+                server
+                    .set_listener_fast_open_cookie_policy(
+                        listener,
+                        Some(FastOpenCookiePolicy::HmacSha256),
+                    )
+                    .unwrap();
+            }
+            let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+            lifecycle_open(&mut server, listener, v6, 1_999_999, 40001, cookie, true);
+            let raw = FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([8; 16]));
+            // Future-install configuration cannot rewrite the old HMAC epochs.
+            if scoped {
+                server
+                    .set_listener_fast_open_cookie_lifetime(listener, Default::default())
+                    .unwrap();
+                server
+                    .set_listener_fast_open_cookie_policy(listener, Some(raw))
+                    .unwrap();
+                server
+                    .set_listener_fast_open_cookie_policy(
+                        listener,
+                        Some(FastOpenCookiePolicy::HmacSha256),
+                    )
+                    .unwrap();
+            } else {
+                server.set_fast_open_cookie_lifetime(Default::default());
+                server.set_fast_open_cookie_policy(raw);
+                server.set_fast_open_cookie_policy(FastOpenCookiePolicy::HmacSha256);
+            }
+            let fresh =
+                lifecycle_open(&mut server, listener, v6, 2_000_000, 40002, cookie, false).unwrap();
+            assert_ne!(fresh, cookie);
+            lifecycle_open(&mut server, listener, v6, 2_000_000, 40003, fresh, true);
+        }
+    }
+}
+
+#[test]
+fn constructor_hmac_rotation_preserves_current_and_previous_epoch_cookies() {
+    for v6 in [false, true] {
+        for scoped in [false, true] {
+            let (mut server, _) = peer(2);
+            let (_, remote) = addresses(v6, 40000);
+            let listener = server.listen(remote, 16).unwrap();
+            server.set_listener_fast_open(listener, 4).unwrap();
+            let lifetime = crate::fast_open::LIFETIME_US;
+            let (_, old) = learn(&mut server, listener, v6, lifetime / 2, 40000);
+            let now = 3 * lifetime / 4;
+            let lease = FastOpenKeyLease::for_lifetime(
+                now,
+                FastOpenCookieLifetime::default(),
+                CallerTimebase::default(),
+                true,
+            )
+            .unwrap();
+            timed_install(
+                &mut server,
+                listener,
+                scoped,
+                now,
+                FastOpenServerKey::HmacSha256([7; 32]),
+                lease,
+                true,
+            );
+            lifecycle_open(&mut server, listener, v6, now, 40001, old, true);
+            let fresh =
+                lifecycle_open(&mut server, listener, v6, lifetime, 40002, old, true).unwrap();
+            lifecycle_open(
+                &mut server,
+                listener,
+                v6,
+                2 * lifetime - 1,
+                40003,
+                old,
+                true,
+            );
+            assert_eq!(
+                lifecycle_open(&mut server, listener, v6, 2 * lifetime, 40004, old, false),
+                None
+            );
+            lifecycle_open(&mut server, listener, v6, 2 * lifetime, 40005, fresh, true);
+        }
+    }
+}
+
+// All identity-cycle cases use real SYN data and exact ordinary-TCP delivery.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
+//# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the "Security Considerations" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn credential_authority_rejects_arbitrary_key_cycles_on_actual_traffic() {
+    for v6 in [false, true] {
+        for scoped in [false, true] {
+            for length in [2, 3] {
+                for timed in [false, true] {
+                    let (mut server, _) = peer(2);
+                    server.set_fast_open_cookie_lifetime(
+                        FastOpenCookieLifetime::from_micros(100).unwrap(),
+                    );
+                    let (_, remote) = addresses(v6, 40000);
+                    let listener = server.listen(remote, 16).unwrap();
+                    server.set_listener_fast_open(listener, 4).unwrap();
+                    let raw = |byte| {
+                        FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([byte; 16]))
+                    };
+                    let lease = |now| {
+                        FastOpenKeyLease::for_lifetime(
+                            now,
+                            FastOpenCookieLifetime::from_micros(100).unwrap(),
+                            CallerTimebase::default(),
+                            false,
+                        )
+                        .unwrap()
+                    };
+                    timed_install(
+                        &mut server,
+                        listener,
+                        scoped,
+                        0,
+                        server_key(&raw(7), 7),
+                        lease(0),
+                        false,
+                    );
+                    let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+                    lifecycle_open(&mut server, listener, v6, 99, 40001, cookie, true);
+                    for byte in 8..8 + length - 1 {
+                        timed_install(
+                            &mut server,
+                            listener,
+                            scoped,
+                            100,
+                            server_key(&raw(byte), byte),
+                            lease(100),
+                            false,
+                        );
+                        // Interleaving a different codec cannot erase any raw identity.
+                        if scoped {
+                            server
+                                .set_listener_fast_open_cookie_policy(
+                                    listener,
+                                    Some(FastOpenCookiePolicy::HmacSha256),
+                                )
+                                .unwrap();
+                        } else {
+                            server.set_fast_open_cookie_policy(FastOpenCookiePolicy::HmacSha256);
+                        }
+                    }
+                    // Advance the authoritative clock to 101 through actual traffic.
+                    lifecycle_open(&mut server, listener, v6, 101, 40002, cookie, false);
+                    if timed {
+                        timed_install(
+                            &mut server,
+                            listener,
+                            scoped,
+                            101,
+                            server_key(&raw(7), 7),
+                            lease(101),
+                            false,
+                        );
+                    } else if scoped {
+                        server
+                            .set_listener_fast_open_cookie_policy(listener, Some(raw(7)))
+                            .unwrap();
+                    } else {
+                        server.set_fast_open_cookie_policy(raw(7));
+                    }
+                    let usage = server.fast_open_key_registry_usage();
+                    assert_eq!(
+                        lifecycle_open(&mut server, listener, v6, 101, 40003, cookie, false),
+                        None
+                    );
+                    assert_eq!(server.fast_open_key_registry_usage(), usage);
+                    timed_install(
+                        &mut server,
+                        listener,
+                        scoped,
+                        101,
+                        server_key(&raw(11), 11),
+                        lease(101),
+                        false,
+                    );
+                    let fresh =
+                        lifecycle_open(&mut server, listener, v6, 101, 40004, cookie, false)
+                            .unwrap();
+                    lifecycle_open(&mut server, listener, v6, 200, 40005, fresh, true);
+                    assert_eq!(
+                        lifecycle_open(&mut server, listener, v6, 201, 40006, fresh, false),
+                        None
+                    );
+                }
+            }
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
+//# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the "Security Considerations" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn credential_authority_survives_distinct_default_clear_close_and_cross_listener_reuse() {
+    for v6 in [false, true] {
+        let (mut server, _) = peer(2);
+        server.set_fast_open_cookie_lifetime(FastOpenCookieLifetime::from_micros(100).unwrap());
+        let (_, remote) = addresses(v6, 40000);
+        let mut listener = server.listen(remote, 16).unwrap();
+        server.set_listener_fast_open(listener, 4).unwrap();
+        let raw = FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([7; 16]));
+        server
+            .set_listener_fast_open_cookie_policy(listener, Some(raw.clone()))
+            .unwrap();
+        let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+        lifecycle_open(&mut server, listener, v6, 99, 40001, cookie, true);
+        assert_eq!(
+            lifecycle_open(&mut server, listener, v6, 100, 40002, cookie, false),
+            None
+        );
+        server
+            .set_listener_fast_open_cookie_policy(listener, None)
+            .unwrap();
+        // The default is a distinct constructor HMAC identity, with no Linux key.
+        server
+            .set_listener_fast_open_cookie_policy(listener, Some(raw.clone()))
+            .unwrap();
+        assert_eq!(
+            lifecycle_open(&mut server, listener, v6, 101, 40003, cookie, false),
+            None
+        );
+        let usage = server.fast_open_key_registry_usage();
+        server.close_listener(listener).unwrap();
+        server.poll_transmit(101, &mut [0; 2048], 64).unwrap();
+        listener = server.listen(remote, 16).unwrap();
+        server.set_listener_fast_open(listener, 4).unwrap();
+        server
+            .set_listener_fast_open_cookie_policy(listener, Some(raw.clone()))
+            .unwrap();
+        assert_eq!(
+            lifecycle_open(&mut server, listener, v6, 101, 40004, cookie, false),
+            None
+        );
+        let other_remote = SocketAddr::new(remote.ip(), remote.port() + 1);
+        let other = server.listen(other_remote, 16).unwrap();
+        server.set_listener_fast_open(other, 4).unwrap();
+        server
+            .set_listener_fast_open_cookie_policy(other, Some(raw))
+            .unwrap();
+        assert_eq!(
+            lifecycle_open_to(
+                &mut server,
+                other,
+                v6,
+                101,
+                40005,
+                other_remote,
+                cookie,
+                false
+            ),
+            None
+        );
+        server.clear_fast_open_client_cache();
+        assert_eq!(server.fast_open_key_registry_usage(), usage);
+        let fresh_policy = FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([8; 16]));
+        server
+            .set_listener_fast_open_cookie_policy(other, Some(fresh_policy))
+            .unwrap();
+        let fresh = lifecycle_open_to(
+            &mut server,
+            other,
+            v6,
+            101,
+            40006,
+            other_remote,
+            cookie,
+            false,
+        )
+        .unwrap();
+        lifecycle_open_to(
+            &mut server,
+            other,
+            v6,
+            200,
+            40007,
+            other_remote,
+            fresh,
+            true,
+        );
+        assert_eq!(
+            lifecycle_open_to(
+                &mut server,
+                other,
+                v6,
+                201,
+                40008,
+                other_remote,
+                fresh,
+                false
+            ),
+            None
+        );
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20/T15 integration of trusted original lease/time mapping across external raw-key restart.
+//# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
+#[test]
+fn global_credential_tightening_reaches_all_listener_selections_and_preserves_children() {
+    for v6 in [false, true] {
+        for policy in policies() {
+            let (mut server, _) = peer(2);
+            let (_, remote) = addresses(v6, 40000);
+            let listener = server.listen(remote, 16).unwrap();
+            server.set_listener_fast_open(listener, 4).unwrap();
+            let lease = FastOpenKeyLease {
+                not_before: 0,
+                issue_until: 100,
+                accept_until: 100,
+                units_per_second: 1_000_000,
+            };
+            let key = server_key(&policy, 7);
+            server
+                .install_fast_open_key(0, key.clone(), lease, false)
+                .unwrap();
+            server
+                .set_listener_fast_open_cookie_lifetime(
+                    listener,
+                    FastOpenCookieLifetime::from_micros(999).unwrap(),
+                )
+                .unwrap();
+            let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+            let other_remote = SocketAddr::new(remote.ip(), remote.port() + 1);
+            let other = server.listen(other_remote, 16).unwrap();
+            server.set_listener_fast_open(other, 4).unwrap();
+            server
+                .install_listener_fast_open_key(0, other, key.clone(), lease, false)
+                .unwrap();
+            lifecycle_open_to(
+                &mut server,
+                other,
+                v6,
+                49,
+                40001,
+                other_remote,
+                cookie,
+                true,
+            );
+            let (mut held_client, options) = peer(1);
+            let (local, _) = addresses(v6, 40010);
+            held_client
+                .connect_fast_open_with_server_cookie(
+                    49,
+                    local,
+                    remote,
+                    b"early",
+                    options,
+                    Some(cookie),
+                )
+                .unwrap();
+            deliver(&mut server, 49, &packet(&mut held_client, 49));
+            server.enable_output_reservations().unwrap();
+            let mut held = [0; 2048];
+            let (output, token) = server.poll_reserved_transmit(49, &mut held, 64).unwrap();
+            let tx = output.packet.unwrap();
+            let snapshot = held[..tx.len].to_vec();
+            let usage = server.fast_open_key_registry_usage();
+            server
+                .install_fast_open_key(
+                    50,
+                    key,
+                    FastOpenKeyLease {
+                        issue_until: 50,
+                        accept_until: 50,
+                        ..lease
+                    },
+                    false,
+                )
+                .unwrap();
+            assert_eq!(&held[..tx.len], snapshot);
+            assert!(server.accept_transmit(50, token.unwrap()).unwrap());
+            let child = server.accept(listener).unwrap();
+            let mut data = [0; 5];
+            assert_eq!(server.read(child, &mut data), Ok(5));
+            assert_eq!(&data, b"early");
+            deliver(&mut held_client, 50, &(tx.ip, snapshot));
+            deliver(&mut server, 50, &packet(&mut held_client, 50));
+            assert_eq!(server.state(child), Ok(State::Established));
+            assert_eq!(
+                lifecycle_open(&mut server, listener, v6, 50, 40002, cookie, false),
+                None
+            );
+            assert_eq!(
+                lifecycle_open_to(
+                    &mut server,
+                    other,
+                    v6,
+                    50,
+                    40003,
+                    other_remote,
+                    cookie,
+                    false
+                ),
+                None
+            );
+            assert_eq!(server.fast_open_key_registry_usage(), usage);
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
+//# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the "Security Considerations" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.
+#[test]
+fn hmac_long_cycles_keep_original_epoch_mapping_across_listeners() {
+    for v6 in [false, true] {
+        let (mut server, _) = peer(2);
+        server.set_fast_open_cookie_lifetime(FastOpenCookieLifetime::from_micros(100).unwrap());
+        server.try_set_fast_open_hmac_key([7; 32]).unwrap();
+        let (_, remote) = addresses(v6, 40000);
+        let listener = server.listen(remote, 16).unwrap();
+        server.set_listener_fast_open(listener, 4).unwrap();
+        let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+        lifecycle_open(&mut server, listener, v6, 199, 40001, cookie, true);
+        server.try_set_fast_open_hmac_key([8; 32]).unwrap();
+        #[cfg(feature = "tfo-linux-cookie")]
+        server.set_fast_open_cookie_policy(FastOpenCookiePolicy::LinuxSipHash24(
+            LinuxSipHash24Key::new([8; 16]),
+        ));
+        server.try_set_fast_open_hmac_key([9; 32]).unwrap();
+        server.set_fast_open_cookie_lifetime(FastOpenCookieLifetime::from_micros(10_000).unwrap());
+        server.try_set_fast_open_hmac_key([7; 32]).unwrap();
+        server.set_fast_open_cookie_policy(FastOpenCookiePolicy::HmacSha256);
+        let usage = server.fast_open_key_registry_usage();
+        let fresh = lifecycle_open(&mut server, listener, v6, 200, 40002, cookie, false).unwrap();
+        // The old identity still uses epoch 2 of its original 100us mapping,
+        // rather than epoch 0 of the new 10000us setting.
+        assert_eq!(
+            fresh,
+            crate::fast_open::issue(&[7; 32], remote.ip(), addresses(v6, 40000).0.ip(), 2)
+        );
+        server
+            .set_listener_fast_open_cookie_policy(listener, Some(FastOpenCookiePolicy::HmacSha256))
+            .unwrap();
+        lifecycle_open(&mut server, listener, v6, 399, 40003, fresh, true);
+        lifecycle_open(&mut server, listener, v6, 400, 40004, fresh, false);
+        assert_eq!(server.fast_open_key_registry_usage(), usage);
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20/T15 integration of trusted original lease/time mapping across external raw-key restart.
+//# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
+#[test]
+fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_progress() {
+    for v6 in [false, true] {
+        let config = EndpointConfig {
+            max_connections: 16,
+            preallocate_connections: 16,
+            connection: ConnectionConfig {
+                mss: 1460,
+                timestamps: false,
+                nagle: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut probe = Endpoint::new(config.clone(), [2; 32], 0, |_| true).unwrap();
+        probe.enable_fast_open().unwrap();
+        let lease = FastOpenKeyLease {
+            not_before: 0,
+            issue_until: 100,
+            accept_until: 100,
+            units_per_second: 1_000_000,
+        };
+        probe
+            .register_fast_open_key(0, FastOpenServerKey::HmacSha256([7; 32]), lease)
+            .unwrap();
+        let budget = probe.buffer_bytes();
+        let mut server = Endpoint::new(
+            EndpointConfig {
+                max_buffer_bytes: budget,
+                ..config
+            },
+            [2; 32],
+            0,
+            |_| true,
+        )
+        .unwrap();
+        server.enable_fast_open().unwrap();
+        server
+            .install_fast_open_key(0, FastOpenServerKey::HmacSha256([7; 32]), lease, false)
+            .unwrap();
+        let (_, remote) = addresses(v6, 40000);
+        let listener = server.listen(remote, 16).unwrap();
+        server.set_listener_fast_open(listener, 4).unwrap();
+        server
+            .set_listener_fast_open_cookie_lifetime(listener, Default::default())
+            .unwrap();
+        let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+        let usage = server.fast_open_key_registry_usage();
+        assert_eq!(
+            server.try_set_fast_open_hmac_key([8; 32]),
+            Err(Error::NoMemory.into())
+        );
+        lifecycle_open(&mut server, listener, v6, 49, 40001, cookie, true);
+        server.set_fast_open_hmac_key([8; 32]);
+        assert_eq!(server.fast_open_cookie_error(), Some(Error::NoMemory));
+        assert_eq!(server.fast_open_hmac_key_error(), Some(Error::NoMemory));
+        assert_eq!(
+            server.listener_fast_open_cookie_error(listener).unwrap(),
+            Some(Error::NoMemory)
+        );
+        assert_eq!(
+            lifecycle_open(&mut server, listener, v6, 50, 40002, cookie, false),
+            None
+        );
+        // Restore a valid default using a known identity. The explicit blocked
+        // listener must not fall through to this otherwise-authorizing default.
+        server
+            .install_fast_open_key(50, FastOpenServerKey::HmacSha256([2; 32]), lease, false)
+            .unwrap();
+        let default_cookie =
+            crate::fast_open::issue(&[2; 32], remote.ip(), addresses(v6, 40000).0.ip(), 0);
+        assert_eq!(
+            lifecycle_open(&mut server, listener, v6, 50, 40003, default_cookie, false),
+            None
+        );
+        server
+            .set_listener_fast_open_cookie_policy(listener, None)
+            .unwrap();
+        lifecycle_open(&mut server, listener, v6, 50, 40004, default_cookie, true);
+        assert_eq!(server.fast_open_key_registry_usage(), usage);
+        assert!(server.buffer_bytes() <= budget);
+        // A failed void policy replacement blocks inherited listeners too.
+        #[cfg(feature = "tfo-linux-cookie")]
+        {
+            server.set_fast_open_cookie_policy(FastOpenCookiePolicy::LinuxSipHash24(
+                LinuxSipHash24Key::new([9; 16]),
+            ));
+            assert_eq!(server.fast_open_cookie_error(), Some(Error::NoMemory));
+            assert_eq!(
+                lifecycle_open(&mut server, listener, v6, 51, 40005, default_cookie, false),
+                None
+            );
+            assert_eq!(server.fast_open_key_registry_usage(), usage);
+        }
+    }
+}
+
+#[test]
+fn timed_key_interfaces_reject_bad_units_overflow_and_clock_rollback() {
+    assert!(FastOpenCookieLifetime::from_micros(0).is_err());
+    assert!(FastOpenCookieLifetime::from_micros(u64::MAX).is_err());
+    let lifetime = FastOpenCookieLifetime::default();
+    for units in [1_000_000, 1_000_000_000] {
+        let tb = CallerTimebase {
+            units_per_second: units,
+            ..Default::default()
+        };
+        assert!(FastOpenKeyLease::for_lifetime(u64::MAX, lifetime, tb, false).is_err());
+        let mut config = EndpointConfig::default();
+        config.connection.timestamps = false;
+        config.connection.timebase = tb;
+        let mut endpoint = Endpoint::new(config, [2; 32], 10, |_| true).unwrap();
+        let valid = FastOpenKeyLease::for_lifetime(10, lifetime, tb, true).unwrap();
+        for invalid in [
+            FastOpenKeyLease {
+                units_per_second: 123,
+                ..valid
+            },
+            FastOpenKeyLease {
+                not_before: 11,
+                ..valid
+            },
+            FastOpenKeyLease {
+                issue_until: 10,
+                ..valid
+            },
+            FastOpenKeyLease {
+                accept_until: valid.issue_until - 1,
+                ..valid
+            },
+        ] {
+            assert!(
+                endpoint
+                    .install_fast_open_key(
+                        10,
+                        FastOpenServerKey::HmacSha256([7; 32]),
+                        invalid,
+                        false
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            endpoint.install_fast_open_key(9, FastOpenServerKey::HmacSha256([7; 32]), valid, false),
+            Err(EndpointError::Connection(Error::TimeWentBackwards))
+        );
+        endpoint
+            .install_fast_open_key(10, FastOpenServerKey::HmacSha256([7; 32]), valid, false)
+            .unwrap();
+        endpoint
+            .install_fast_open_key(11, FastOpenServerKey::HmacSha256([8; 32]), valid, true)
+            .unwrap();
+        assert!(
+            endpoint
+                .install_fast_open_key(11, FastOpenServerKey::HmacSha256([7; 32]), valid, true)
+                .is_err()
+        );
+        let (local, remote) = addresses(false, 40000);
+        assert!(
+            endpoint
+                .connect_fast_open(11, local, remote, b"disabled")
+                .is_err()
+        );
+    }
+    let invalid = CallerTimebase {
+        units_per_second: 0,
+        ..Default::default()
+    };
+    assert!(FastOpenKeyLease::for_lifetime(0, lifetime, invalid, true).is_err());
+}
+
+#[test]
+fn timed_rotation_preserves_reserved_synack_authorization_pending_and_tcp_identity() {
+    for v6 in [false, true] {
+        for policy in policies() {
+            let (mut server, _) = peer(2);
+            let (_, remote) = addresses(v6, 40000);
+            let listener = server.listen(remote, 16).unwrap();
+            server.set_listener_fast_open(listener, 1).unwrap();
+            let lease = FastOpenKeyLease {
+                not_before: 0,
+                issue_until: 10,
+                accept_until: 20,
+                units_per_second: 1_000_000,
+            };
+            timed_install(
+                &mut server,
+                listener,
+                false,
+                0,
+                server_key(&policy, 7),
+                lease,
+                false,
+            );
+            let (_, old) = learn(&mut server, listener, v6, 0, 40000);
+            let (mut client, options) = peer(1);
+            let (local, _) = addresses(v6, 40001);
+            client
+                .connect_fast_open_with_server_cookie(
+                    0,
+                    local,
+                    remote,
+                    b"early",
+                    options,
+                    Some(old),
+                )
+                .unwrap();
+            deliver(&mut server, 0, &packet(&mut client, 0));
+            server.enable_output_reservations().unwrap();
+            let mut bytes = [0; 2048];
+            let (output, attempt) = server.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
+            let tx = output.packet.unwrap();
+            let original = bytes[..tx.len].to_vec();
+            let charge = server.buffer_bytes();
+            let next = FastOpenKeyLease {
+                not_before: 1,
+                issue_until: 30,
+                accept_until: 40,
+                ..lease
+            };
+            let registry_before = server.fast_open_key_registry_usage().1;
+            server
+                .install_fast_open_key(1, server_key(&policy, 8), next, true)
+                .unwrap();
+            assert_eq!(
+                server.buffer_bytes() - server.fast_open_key_registry_usage().1,
+                charge - registry_before
+            );
+            assert_eq!(&bytes[..tx.len], &original);
+            // Expiry and rotation cannot revoke already authorized data or
+            // recompute the cookie committed to this child's SYN-ACK.
+            assert!(server.accept_transmit(20, attempt.unwrap()).unwrap());
+            let child = server.accept(listener).unwrap();
+            let mut data = [0; 5];
+            assert_eq!(server.read(child, &mut data), Ok(5));
+            assert_eq!(&data, b"early");
+            deliver(&mut client, 20, &(tx.ip, original));
+            deliver(&mut server, 20, &packet(&mut client, 20));
+            assert_eq!(server.state(child), Ok(State::Established));
+            let replacement = lifecycle_open(&mut server, listener, v6, 20, 40002, old, false);
+            assert!(replacement.is_some());
+        }
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn hmac_same_key_is_idempotent_while_retiring_under_linux_and_manual_change_revokes() {
+    for v6 in [false, true] {
+        let (mut server, _) = peer(2);
+        let (_, remote) = addresses(v6, 40000);
+        let listener = server.listen(remote, 16).unwrap();
+        server.set_listener_fast_open(listener, 4).unwrap();
+        let lease = FastOpenKeyLease {
+            not_before: 0,
+            issue_until: 10,
+            accept_until: 20,
+            units_per_second: 1_000_000,
+        };
+        server
+            .install_fast_open_key(0, FastOpenServerKey::HmacSha256([7; 32]), lease, false)
+            .unwrap();
+        let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
+        server
+            .install_fast_open_key(
+                1,
+                FastOpenServerKey::LinuxSipHash24(LinuxSipHash24Key::new([8; 16])),
+                FastOpenKeyLease {
+                    not_before: 1,
+                    issue_until: 30,
+                    accept_until: 40,
+                    ..lease
+                },
+                true,
+            )
+            .unwrap();
+        server.set_fast_open_hmac_key([7; 32]);
+        lifecycle_open(&mut server, listener, v6, 1, 40001, cookie, true);
+        server.set_fast_open_hmac_key([9; 32]);
+        let fresh = lifecycle_open(&mut server, listener, v6, 2, 40002, cookie, false).unwrap();
+        lifecycle_open(&mut server, listener, v6, 2, 40003, fresh, true);
+    }
+}
+
 fn policies() -> Vec<FastOpenCookiePolicy> {
     vec![
         FastOpenCookiePolicy::HmacSha256,
@@ -115,6 +1504,11 @@ fn issued_cookies_are_opaque_for_learned_and_supplied_clients_and_adjacent_epoch
     for v6 in [false, true] {
         for policy in policies() {
             let (mut b, _) = peer(2);
+            // This raw-byte test spans two HMAC epochs. Give the independent
+            // Linux lease two hours explicitly; the production default is one.
+            b.set_fast_open_cookie_lifetime(
+                FastOpenCookieLifetime::from_micros(2 * crate::fast_open::LIFETIME_US).unwrap(),
+            );
             b.set_fast_open_cookie_policy(policy.clone());
             let (_, remote) = addresses(v6, 40000);
             let listener = b.listen(remote, 16).unwrap();
@@ -190,6 +1584,9 @@ fn arbitrary_revocation_rejects_both_hmac_epochs_and_linux_keys_on_new_requests(
         for policy in policies() {
             for listener_override in [false, true] {
                 let (mut b, _) = peer(2);
+                b.set_fast_open_cookie_lifetime(
+                    FastOpenCookieLifetime::from_micros(2 * crate::fast_open::LIFETIME_US).unwrap(),
+                );
                 let (_, remote) = addresses(v6, 40000);
                 let listener = b.listen(remote, 16).unwrap();
                 b.set_listener_fast_open(listener, 4).unwrap();
@@ -214,21 +1611,23 @@ fn arbitrary_revocation_rejects_both_hmac_epochs_and_linux_keys_on_new_requests(
                 deliver(&mut b, now, &cache_reply(&outbound, 940, Some(&[91; 8])));
                 packet(&mut b, now);
                 let before = b.buffer_bytes();
-                crate::allocation_tests::fail_after(0, || {
-                    b.set_fast_open_hmac_key([9; 32]);
-                    #[cfg(feature = "tfo-linux-cookie")]
-                    if matches!(policy, FastOpenCookiePolicy::LinuxSipHash24(_)) {
-                        let replacement =
-                            FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([9; 16]));
-                        if listener_override {
-                            b.set_listener_fast_open_cookie_policy(listener, Some(replacement))
-                                .unwrap();
-                        } else {
-                            b.set_fast_open_cookie_policy(replacement);
-                        }
+                let registry_before = b.fast_open_key_registry_usage().1;
+                b.try_set_fast_open_hmac_key([9; 32]).unwrap();
+                #[cfg(feature = "tfo-linux-cookie")]
+                if matches!(policy, FastOpenCookiePolicy::LinuxSipHash24(_)) {
+                    let replacement =
+                        FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([9; 16]));
+                    if listener_override {
+                        b.set_listener_fast_open_cookie_policy(listener, Some(replacement))
+                            .unwrap();
+                    } else {
+                        b.try_set_fast_open_cookie_policy(replacement).unwrap();
                     }
-                });
-                assert_eq!(b.buffer_bytes(), before);
+                }
+                assert_eq!(
+                    b.buffer_bytes() - b.fast_open_key_registry_usage().1,
+                    before - registry_before
+                );
                 let (local, _) = addresses(v6, 41000);
                 let (_, fresh) = open(
                     &mut previous_client,
@@ -316,7 +1715,8 @@ fn hmac_revocation_preserves_snapshotted_responses_children_and_quota() {
             deliver(&mut b, 0, &early_syn);
             b.enable_output_reservations().unwrap();
             let before = b.buffer_bytes();
-            b.set_fast_open_hmac_key([9; 32]);
+            let registry_before = b.fast_open_key_registry_usage().1;
+            b.try_set_fast_open_hmac_key([9; 32]).unwrap();
             let mut bytes = [0; 2048];
             let (out, token) = b.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
             let tx = out.packet.unwrap();
@@ -328,8 +1728,11 @@ fn hmac_revocation_preserves_snapshotted_responses_children_and_quota() {
                 decoded.header.acknowledgment,
                 early_sequence.wrapping_add(6)
             );
-            crate::allocation_tests::fail_after(0, || b.set_fast_open_hmac_key([10; 32]));
-            assert_eq!(b.buffer_bytes(), before);
+            b.try_set_fast_open_hmac_key([10; 32]).unwrap();
+            assert_eq!(
+                b.buffer_bytes() - b.fast_open_key_registry_usage().1,
+                before - registry_before
+            );
             assert_eq!(&bytes[..tx.len], first);
             assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
             assert!(b.reject_unsubmitted(token.unwrap()).unwrap());

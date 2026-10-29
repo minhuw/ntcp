@@ -1,4 +1,235 @@
 use super::*;
+use crate::CallerTimebase;
+use alloc::vec;
+
+#[test]
+fn administrative_sequences_preserve_authoritative_identity_and_nonincreasing_bounds() {
+    use crate::{FastOpenCookieLifetime, FastOpenKeyLease, FastOpenServerKey};
+    for seed in 0..16u64 {
+        let mut config = EndpointConfig::default();
+        config.connection.timestamps = false;
+        let mut endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        let address = "192.0.2.1:8080".parse().unwrap();
+        let mut listener = endpoint.listen(address, 8).unwrap();
+        let keys = [
+            FastOpenServerKey::HmacSha256([7; 32]),
+            FastOpenServerKey::HmacSha256([8; 32]),
+            #[cfg(feature = "tfo-linux-cookie")]
+            FastOpenServerKey::LinuxSipHash24(crate::LinuxSipHash24Key::new([7; 16])),
+            #[cfg(feature = "tfo-linux-cookie")]
+            FastOpenServerKey::LinuxSipHash24(crate::LinuxSipHash24Key::new([8; 16])),
+        ];
+        let mut seen: Vec<Option<(u64, Instant, Option<FastOpenKeyLease>)>> =
+            vec![None; keys.len()];
+        let mut random = seed + 1;
+        for now in 0..128u64 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let index = (random >> 32) as usize % keys.len();
+            let key = keys[index].clone();
+            let lifetime = FastOpenCookieLifetime::from_micros(100 + now).unwrap();
+            endpoint.set_fast_open_cookie_lifetime(lifetime);
+            let lease =
+                FastOpenKeyLease::for_lifetime(now, lifetime, CallerTimebase::default(), false)
+                    .unwrap();
+            match random % 7 {
+                0 => endpoint
+                    .install_fast_open_key(now, key, lease, false)
+                    .unwrap(),
+                1 => endpoint
+                    .install_listener_fast_open_key(now, listener, key, lease, false)
+                    .unwrap(),
+                2 => endpoint.register_fast_open_key(now, key, lease).unwrap(),
+                3 => {
+                    endpoint
+                        .set_listener_fast_open_cookie_policy(listener, None)
+                        .unwrap();
+                }
+                4 => {
+                    endpoint.close_listener(listener).unwrap();
+                    endpoint.cleanup_one();
+                    listener = endpoint.listen(address, 8).unwrap();
+                }
+                5 => endpoint.clear_fast_open_client_cache(),
+                _ => {
+                    // Every invalid administrative attempt must leave all
+                    // users' facts and the clock untouched, including known keys.
+                    let before = endpoint.fast_open_key_registry_usage();
+                    let clock = endpoint.now;
+                    let facts: Vec<_> = keys
+                        .iter()
+                        .map(|key| endpoint.fast_open_credentials.constraints(key))
+                        .collect();
+                    let invalid = FastOpenKeyLease {
+                        units_per_second: 123,
+                        ..lease
+                    };
+                    assert!(
+                        endpoint
+                            .install_fast_open_key(now, key, invalid, false)
+                            .is_err()
+                    );
+                    assert_eq!(endpoint.fast_open_key_registry_usage(), before);
+                    assert_eq!(endpoint.now, clock);
+                    assert_eq!(
+                        keys.iter()
+                            .map(|key| endpoint.fast_open_credentials.constraints(key))
+                            .collect::<Vec<_>>(),
+                        facts
+                    );
+                }
+            }
+            for (index, key) in keys.iter().enumerate() {
+                let facts = endpoint.fast_open_credentials.constraints(key);
+                if let Some((epoch, registered, Some(lease))) = facts {
+                    if let Some((old_epoch, old_registered, Some(old))) = seen[index] {
+                        assert_eq!(epoch, old_epoch, "epoch mapping changed");
+                        assert_eq!(registered, old_registered, "identity clock changed");
+                        assert!(lease.issue_until <= old.issue_until);
+                        assert!(lease.accept_until <= old.accept_until);
+                        assert!(lease.not_before >= old.not_before);
+                    }
+                    seen[index] = Some((epoch, registered, Some(lease)));
+                } else {
+                    assert!(seen[index].is_none(), "administration erased an identity");
+                }
+            }
+            assert_eq!(
+                endpoint.fast_open_key_registry_usage().0,
+                1 + seen.iter().filter(|entry| entry.is_some()).count()
+            );
+            assert_eq!(
+                endpoint.buffer_bytes(),
+                endpoint.fast_open_key_registry_usage().1
+            );
+            assert!(endpoint.buffer_bytes() <= endpoint.config.max_buffer_bytes);
+        }
+    }
+}
+
+#[test]
+fn registry_capacity_and_allocation_failure_are_atomic_and_legacy_revocation_blocks() {
+    use crate::{FastOpenCookieLifetime, FastOpenKeyLease, FastOpenServerKey};
+    let mut config = EndpointConfig::default();
+    config.connection.timestamps = false;
+    let mut endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    let address = "192.0.2.1:8080".parse().unwrap();
+    let listener = endpoint.listen(address, 8).unwrap();
+    endpoint
+        .set_listener_fast_open_cookie_lifetime(listener, FastOpenCookieLifetime::default())
+        .unwrap();
+    let old = FastOpenServerKey::HmacSha256([42; 32]);
+    let facts = endpoint.fast_open_credentials.constraints(&old);
+    let lease = FastOpenKeyLease::for_lifetime(
+        1,
+        FastOpenCookieLifetime::from_micros(100).unwrap(),
+        CallerTimebase::default(),
+        false,
+    )
+    .unwrap();
+    crate::allocation_tests::fail_after(0, || {
+        assert_eq!(
+            endpoint.install_fast_open_key(1, FastOpenServerKey::HmacSha256([7; 32]), lease, true),
+            Err(Error::NoMemory.into())
+        );
+    });
+    assert_eq!(endpoint.now, 0);
+    assert_eq!(endpoint.fast_open_key_registry_usage(), (1, 0));
+    assert_eq!(endpoint.fast_open_credentials.constraints(&old), facts);
+    endpoint.config.max_buffer_bytes = 0;
+    assert_eq!(
+        endpoint.try_set_fast_open_hmac_key([7; 32]),
+        Err(Error::NoMemory.into())
+    );
+    assert_eq!(endpoint.fast_open_hmac_key, [42; 32]);
+    assert_eq!(endpoint.fast_open_cookie_error(), None);
+    endpoint.set_fast_open_hmac_key([7; 32]);
+    assert_eq!(endpoint.fast_open_cookie_error(), Some(Error::NoMemory));
+    assert_eq!(
+        endpoint.listener_fast_open_cookie_error(listener).unwrap(),
+        Some(Error::NoMemory)
+    );
+    assert!(
+        endpoint.listeners[listener.slot]
+            .as_ref()
+            .unwrap()
+            .fast_open_cookie_policy
+            .is_some()
+    );
+    let local = address.ip();
+    let remote = "192.0.2.2".parse().unwrap();
+    let cookie = crate::fast_open::issue(&[42; 32], local, remote, 0);
+    let context = endpoint.listeners[listener.slot]
+        .as_ref()
+        .unwrap()
+        .fast_open_cookie_policy
+        .as_ref()
+        .unwrap();
+    assert!(!context.valid(&endpoint.fast_open_credentials, 1, local, remote, cookie));
+    assert_eq!(
+        context.issue(&endpoint.fast_open_credentials, 1, local, remote),
+        None
+    );
+    // Unknown listener selection is fallible and cannot clear a blocked override.
+    assert_eq!(
+        endpoint
+            .set_listener_fast_open_cookie_policy(listener, Some(FastOpenCookiePolicy::HmacSha256)),
+        Err(Error::NoMemory.into())
+    );
+    assert_eq!(
+        endpoint.listener_fast_open_cookie_error(listener).unwrap(),
+        Some(Error::NoMemory)
+    );
+    crate::allocation_tests::fail_after(0, || {
+        endpoint.try_set_fast_open_hmac_key([42; 32]).unwrap();
+    });
+    assert_eq!(endpoint.fast_open_key_registry_usage(), (1, 0));
+    assert_eq!(endpoint.fast_open_cookie_error(), None);
+    // Charge actual growth, then freeze the configured budget at that charge.
+    endpoint.config.max_buffer_bytes = usize::MAX;
+    endpoint
+        .install_fast_open_key(1, FastOpenServerKey::HmacSha256([7; 32]), lease, false)
+        .unwrap();
+    endpoint.config.max_buffer_bytes = endpoint.buffer_bytes();
+    let before = endpoint.fast_open_key_registry_usage();
+    let facts = endpoint
+        .fast_open_credentials
+        .constraints(&FastOpenServerKey::HmacSha256([7; 32]));
+    let invalid = ListenerId {
+        slot: listener.slot,
+        generation: listener.generation + 1,
+    };
+    assert_eq!(
+        endpoint.install_listener_fast_open_key(
+            2,
+            invalid,
+            old.clone(),
+            FastOpenKeyLease {
+                issue_until: 2,
+                accept_until: 2,
+                ..lease
+            },
+            false
+        ),
+        Err(EndpointError::InvalidHandle)
+    );
+    assert_eq!(
+        endpoint.install_fast_open_key(2, FastOpenServerKey::HmacSha256([8; 32]), lease, true),
+        Err(Error::NoMemory.into())
+    );
+    assert_eq!(endpoint.fast_open_key_registry_usage(), before);
+    assert_eq!(endpoint.now, 1);
+    assert_eq!(
+        endpoint
+            .fast_open_credentials
+            .constraints(&FastOpenServerKey::HmacSha256([7; 32])),
+        facts
+    );
+    endpoint
+        .install_fast_open_key(2, old, lease, false)
+        .unwrap();
+    assert_eq!(endpoint.fast_open_key_registry_usage(), before);
+    assert!(endpoint.buffer_bytes() <= endpoint.config.max_buffer_bytes);
+}
 
 #[test]
 fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection() {
@@ -28,8 +259,30 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
         let timestamp = endpoint.digest(&domain, tuple);
         let isn = endpoint.isn(tuple);
         let before = endpoint.buffer_bytes();
-        crate::allocation_tests::fail_after(0, || endpoint.set_fast_open_hmac_key([9; 32]));
-        assert_eq!(endpoint.buffer_bytes(), before);
+        endpoint.try_set_fast_open_hmac_key([9; 32]).unwrap();
+        endpoint
+            .install_fast_open_key(
+                0,
+                crate::FastOpenServerKey::HmacSha256([99; 32]),
+                crate::FastOpenKeyLease::for_lifetime(
+                    0,
+                    Default::default(),
+                    crate::CallerTimebase::default(),
+                    true,
+                )
+                .unwrap(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            endpoint.buffer_bytes(),
+            before + endpoint.fast_open_key_registry_usage().1
+        );
+        let usage = endpoint.fast_open_key_registry_usage();
+        crate::allocation_tests::fail_after(0, || {
+            endpoint.try_set_fast_open_hmac_key([99; 32]).unwrap();
+        });
+        assert_eq!(endpoint.fast_open_key_registry_usage(), usage);
         assert!(endpoint.fast_open.is_none());
         assert_eq!(endpoint.secret, [42; 32]);
         assert_eq!(endpoint.digest(b"ntcp initial sequence", tuple), identity);
@@ -45,15 +298,15 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
             endpoint.set_fast_open_hmac_key([10; 32]);
             assert_eq!(
                 endpoint.fast_open_cookie_policy.issue(
-                    &endpoint.fast_open_hmac_key,
+                    &endpoint.fast_open_credentials,
+                    0,
                     tuple.local.ip(),
-                    tuple.remote.ip(),
-                    u64::MAX
+                    tuple.remote.ip()
                 ),
                 before
             );
             assert!(matches!(
-                endpoint.fast_open_cookie_policy,
+                endpoint.fast_open_cookie_policy.policy(),
                 FastOpenCookiePolicy::LinuxSipHash24(_)
             ));
         }
@@ -63,7 +316,7 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
             if cfg!(feature = "tfo-linux-cookie") {
                 [10; 32]
             } else {
-                [9; 32]
+                [99; 32]
             }
         );
     }

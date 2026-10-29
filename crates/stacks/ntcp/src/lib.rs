@@ -20,7 +20,10 @@ mod endpoint;
 mod fast_open;
 #[cfg(feature = "tfo-linux-cookie")]
 pub use fast_open::LinuxSipHash24Key;
-pub use fast_open::{FastOpenClientPolicy, FastOpenCookiePolicy, FastOpenEarlyDataPolicy};
+pub use fast_open::{
+    FastOpenClientPolicy, FastOpenCookieLifetime, FastOpenCookiePolicy, FastOpenEarlyDataPolicy,
+    FastOpenKeyLease, FastOpenServerKey,
+};
 #[cfg(test)]
 mod fast_open_policy_tests;
 #[cfg(test)]

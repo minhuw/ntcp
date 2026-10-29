@@ -2,12 +2,15 @@
 use super::*;
 use ntcp::wire::{self, FastOpenCookie};
 
+#[cfg(feature = "tfo-linux-cookie")]
 fn policy(byte: u8) -> FastOpenCookiePolicy {
     FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([byte; 16]))
 }
+#[cfg(feature = "tfo-linux-cookie")]
 fn set(owner: &mut Owner, id: u64, byte: u8) -> Result<Reply> {
     owner.execute(id, Op::SetFastOpenKey(LinuxSipHash24Key::new([byte; 16])))
 }
+#[cfg(feature = "tfo-linux-cookie")]
 fn syn(owner: &mut Owner, port: u16, remote_port: u16) {
     let ip = ntcp::IpMetadata {
         source: "192.0.2.1".parse().unwrap(),
@@ -30,13 +33,14 @@ fn syn(owner: &mut Owner, port: u16, remote_port: u16) {
         &mut bytes,
     )
     .unwrap();
-    owner.endpoint.input(0, ip, &bytes[..n]).unwrap();
+    owner.endpoint.input(owner.now(), ip, &bytes[..n]).unwrap();
 }
+#[cfg(feature = "tfo-linux-cookie")]
 fn response(owner: &mut Owner) -> Option<FastOpenCookie> {
     let mut bytes = [0; 2048];
     let tx = owner
         .endpoint
-        .poll_transmit(0, &mut bytes, 64)
+        .poll_transmit(owner.now(), &mut bytes, 64)
         .unwrap()
         .packet
         .unwrap();
@@ -53,6 +57,7 @@ fn listener(owner: &mut Owner, port: u16) -> u64 {
     id
 }
 
+#[cfg(feature = "tfo-linux-cookie")]
 #[test]
 fn typed_default_staging_rotation_isolation_and_failed_handles() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
@@ -66,7 +71,10 @@ fn typed_default_staging_rotation_isolation_and_failed_handles() {
     let a = listener(&mut owner, 8080);
     set(&mut owner, a, 2).unwrap();
     owner.execute(a, Op::Listen(8)).unwrap();
-    assert_eq!(owner.endpoint.buffer_bytes(), budget);
+    assert_eq!(
+        owner.endpoint.buffer_bytes(),
+        budget + owner.endpoint.fast_open_key_registry_usage().1
+    );
     syn(&mut owner, 8080, 40000);
     assert_eq!(response(&mut owner), None); // Policy is not enablement.
     owner
@@ -127,6 +135,554 @@ fn typed_default_staging_rotation_isolation_and_failed_handles() {
     assert!(owner.sockets[&active].fast_open_cookie_policy.is_none());
 }
 
+fn native_exchange(
+    owner: &mut Owner,
+    socket: u64,
+    port: u16,
+    cookie: Option<FastOpenCookie>,
+    early: bool,
+) -> (Option<FastOpenCookie>, ConnectionId) {
+    let now = owner.now();
+    let mut config = EndpointConfig::default();
+    config.connection.timestamps = false;
+    config.connection.nagle = false;
+    let mut client = Endpoint::new(config, [1; 32], now, |_| true).unwrap();
+    client.enable_fast_open().unwrap();
+    let options = ntcp::ActiveOpenOptions::from(&ntcp::ConnectionConfig::default());
+    let local = SocketAddr::new(
+        if owner.local.is_ipv6() {
+            "2001:db8::1"
+        } else {
+            "192.0.2.1"
+        }
+        .parse()
+        .unwrap(),
+        port,
+    );
+    let remote = SocketAddr::new(owner.local, 8080);
+    let (client_id, admitted) = client
+        .connect_fast_open_with_server_cookie(now, local, remote, b"hello", options, cookie)
+        .unwrap();
+    let mut bytes = [0; 2048];
+    let tx = client
+        .poll_transmit(now, &mut bytes, 64)
+        .unwrap()
+        .packet
+        .unwrap();
+    let sequence = wire::parse(tx.ip, &bytes[..tx.len])
+        .unwrap()
+        .header
+        .sequence;
+    owner.endpoint.input(now, tx.ip, &bytes[..tx.len]).unwrap();
+    let tx = owner
+        .endpoint
+        .poll_transmit(now, &mut bytes, 64)
+        .unwrap()
+        .packet
+        .unwrap();
+    let parsed = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+    assert_eq!(
+        parsed.header.acknowledgment,
+        sequence.wrapping_add(if early { 6 } else { 1 })
+    );
+    let issued = parsed.options.fast_open;
+    let Handle::Listener(listener) = owner.sockets[&socket].handle else {
+        panic!()
+    };
+    let child = if early {
+        Some(owner.endpoint.accept(listener).unwrap())
+    } else {
+        None
+    };
+    client.input(now, tx.ip, &bytes[..tx.len]).unwrap();
+    let tx = client
+        .poll_transmit(now, &mut bytes, 64)
+        .unwrap()
+        .packet
+        .unwrap();
+    owner.endpoint.input(now, tx.ip, &bytes[..tx.len]).unwrap();
+    let child = child.unwrap_or_else(|| owner.endpoint.accept(listener).unwrap());
+    if admitted == 0 {
+        client.write(client_id, b"hello").unwrap();
+        let tx = client
+            .poll_transmit(now, &mut bytes, 64)
+            .unwrap()
+            .packet
+            .unwrap();
+        owner.endpoint.input(now, tx.ip, &bytes[..tx.len]).unwrap();
+    }
+    let mut data = [0; 5];
+    assert_eq!(owner.endpoint.read(child, &mut data), Ok(5));
+    assert_eq!(&data, b"hello");
+    assert_eq!(client.state(client_id), Ok(State::Established));
+    (issued, child)
+}
+
+#[test]
+fn unmanaged_hmac_initial_lifetime_applies_to_native_traffic() {
+    for local in ["192.168.0.1", "2001:db8::2"] {
+        let local: IpAddr = local.parse().unwrap();
+        let mut config = SocketConfig::new("test", local);
+        config.fast_open_managed_keys = Some(false);
+        config.fast_open_cookie_lifetime =
+            ntcp::FastOpenCookieLifetime::from_micros(1_000_000).unwrap();
+        let mut owner = Owner::with_config(
+            local,
+            (local, if local.is_ipv4() { 32 } else { 128 }),
+            [42; 32],
+            None,
+            config.tcp.clone(),
+        )
+        .unwrap();
+        owner.test_now = Some(0);
+        owner.fast_open_entropy = Some(VecDeque::from([Ok([7; 32])]));
+        owner.initialize_socket_config(&config).unwrap();
+        let id = listener(&mut owner, 8080);
+        owner
+            .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+            .unwrap();
+        owner.execute(id, Op::Listen(24)).unwrap();
+        let cookie = native_exchange(&mut owner, id, 40000, None, false)
+            .0
+            .unwrap();
+        for (port, now) in [(40001, 999_999), (40002, 1_000_000), (40003, 1_999_999)] {
+            owner.test_now = Some(now);
+            native_exchange(&mut owner, id, port, Some(cookie), true);
+        }
+        owner.test_now = Some(2_000_000);
+        owner.apply_socket_config(&config).unwrap();
+        let fresh = native_exchange(&mut owner, id, 40004, Some(cookie), false)
+            .0
+            .unwrap();
+        assert_ne!(fresh, cookie);
+        native_exchange(&mut owner, id, 40005, Some(fresh), true);
+        assert!(owner.fast_open_keys.is_none());
+        assert!(owner.fast_open_entropy.as_ref().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn unmanaged_hmac_initial_entropy_failure_preserves_established_flows() {
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
+    let mut config = SocketConfig::new("test", local);
+    config.fast_open_managed_keys = Some(false);
+    config.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
+    let mut owner =
+        Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
+    owner.test_now = Some(0);
+    let id = listener(&mut owner, 8080);
+    owner
+        .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+        .unwrap();
+    owner.execute(id, Op::Listen(24)).unwrap();
+    let (cookie, live) = native_exchange(&mut owner, id, 40000, None, false);
+    let cookie = cookie.unwrap();
+    owner.fast_open_entropy = Some(VecDeque::from([Err(EIO), Ok([7; 32])]));
+    owner.test_now = Some(1);
+    assert_eq!(owner.apply_socket_config(&config), Err(EIO));
+    assert!(!owner.fast_open_configured);
+    assert_eq!(owner.endpoint.state(live), Ok(State::Established));
+    native_exchange(&mut owner, id, 40001, Some(cookie), true);
+    owner.apply_socket_config(&config).unwrap();
+    let fresh = native_exchange(&mut owner, id, 40002, Some(cookie), false)
+        .0
+        .unwrap();
+    native_exchange(&mut owner, id, 40003, Some(fresh), true);
+    assert_eq!(owner.endpoint.write(live, b"still live"), Ok(10));
+    assert!(owner.fast_open_keys.is_none());
+    assert!(owner.fast_open_entropy.as_ref().unwrap().is_empty());
+}
+
+#[test]
+fn explicit_hmac_lease_requires_unmanaged_mode_and_enforces_deadlines() {
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
+    let mut config = SocketConfig::new("test", local);
+    config.fast_open_key_lease = Some(ntcp::FastOpenKeyLease {
+        not_before: 0,
+        issue_until: 50,
+        accept_until: 100,
+        units_per_second: 1_000_000,
+    });
+    assert_eq!(
+        config.validate().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let mut owner =
+        Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
+    owner.test_now = Some(0);
+    owner.fast_open_entropy = Some(VecDeque::new());
+    assert_eq!(owner.apply_socket_config(&config), Err(EINVAL));
+    assert!(owner.fast_open_keys.is_none());
+
+    config.fast_open_managed_keys = Some(false);
+    config.validate().unwrap();
+    owner.apply_socket_config(&config).unwrap();
+    let id = listener(&mut owner, 8080);
+    owner
+        .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+        .unwrap();
+    owner.execute(id, Op::Listen(24)).unwrap();
+    let (cookie, live) = native_exchange(&mut owner, id, 40000, None, false);
+    let cookie = cookie.unwrap();
+    owner.test_now = Some(49);
+    assert!(
+        native_exchange(&mut owner, id, 40001, Some(cookie), true)
+            .0
+            .is_some()
+    );
+    owner.test_now = Some(50);
+    assert_eq!(
+        native_exchange(&mut owner, id, 40002, Some(cookie), true).0,
+        None
+    );
+    owner.test_now = Some(100);
+    assert_eq!(
+        native_exchange(&mut owner, id, 40003, Some(cookie), false).0,
+        None
+    );
+    assert_eq!(owner.endpoint.state(live), Ok(State::Established));
+    assert!(owner.fast_open_entropy.as_ref().unwrap().is_empty());
+}
+
+#[test]
+fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows() {
+    for local in ["192.168.0.1", "2001:db8::2"] {
+        for selected in [
+            FastOpenCookiePolicy::HmacSha256,
+            #[cfg(feature = "tfo-linux-cookie")]
+            policy(99),
+        ] {
+            let local: IpAddr = local.parse().unwrap();
+            let mut config = SocketConfig::new("test", local);
+            config.fast_open_cookie_policy = selected;
+            config.fast_open_managed_keys = Some(true);
+            config.fast_open_cookie_lifetime =
+                ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
+            config.tcp.max_connections = 16;
+            config.tcp.preallocate_connections = 16;
+            config.tcp.connection.timestamps = false;
+            let mut probe = Endpoint::new(config.tcp.clone(), [42; 32], 0, |_| true).unwrap();
+            probe.enable_fast_open().unwrap();
+            let lease = ntcp::FastOpenKeyLease::for_lifetime(
+                0,
+                config.fast_open_cookie_lifetime,
+                config.tcp.connection.timebase,
+                true,
+            )
+            .unwrap();
+            probe
+                .register_fast_open_key(0, ntcp::FastOpenServerKey::HmacSha256([1; 32]), lease)
+                .unwrap();
+            config.tcp.max_buffer_bytes = probe.buffer_bytes();
+            let budget = config.tcp.max_buffer_bytes;
+            let mut owner = Owner::with_config(
+                local,
+                (local, if local.is_ipv4() { 32 } else { 128 }),
+                [42; 32],
+                None,
+                config.tcp.clone(),
+            )
+            .unwrap();
+            owner.test_now = Some(0);
+            owner.fast_open_entropy = Some(VecDeque::from([Ok([1; 32]), Ok([2; 32]), Ok([3; 32])]));
+            owner.apply_socket_config(&config).unwrap();
+            let id = listener(&mut owner, 8080);
+            owner
+                .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+                .unwrap();
+            owner.execute(id, Op::Listen(16)).unwrap();
+            let (cookie, live) = native_exchange(&mut owner, id, 40000, None, false);
+            let cookie = cookie.unwrap();
+            let usage = owner.endpoint.fast_open_key_registry_usage();
+            owner.test_now = Some(100);
+            assert_eq!(owner.rotate_fast_open_keys(100), Err(ENOMEM));
+            assert_eq!(
+                owner.fast_open_keys.as_ref().unwrap().last_error,
+                Some(ENOMEM)
+            );
+            assert_eq!(owner.fast_open_keys.as_ref().unwrap().next_rotation, 200);
+            native_exchange(&mut owner, id, 40001, Some(cookie), true);
+            owner.test_now = Some(200);
+            assert_eq!(owner.rotate_fast_open_keys(200), Err(ENOMEM));
+            assert_eq!(
+                native_exchange(&mut owner, id, 40002, Some(cookie), false).0,
+                None
+            );
+            assert_eq!(owner.endpoint.state(live), Ok(State::Established));
+            assert_eq!(owner.endpoint.write(live, b"still live"), Ok(10));
+            assert_eq!(owner.endpoint.fast_open_key_registry_usage(), usage);
+            assert!(owner.endpoint.buffer_bytes() <= budget);
+            // Native administrative failure reports a resource error and leaves
+            // a fresh socket's pending selection untouched, even after expiry.
+            #[cfg(feature = "tfo-linux-cookie")]
+            {
+                let fresh = listener(&mut owner, 8081);
+                assert_eq!(set(&mut owner, fresh, 55).unwrap_err(), ENOMEM);
+                assert!(owner.sockets[&fresh].fast_open_cookie_policy.is_none());
+                assert!(owner.sockets[&fresh].fast_open_key_lease.is_none());
+                if let FastOpenCookiePolicy::LinuxSipHash24(_) = config.fast_open_cookie_policy {
+                    set(&mut owner, fresh, 1).unwrap();
+                    assert_eq!(owner.endpoint.fast_open_key_registry_usage(), usage);
+                }
+            }
+            assert!(owner.fast_open_entropy.as_ref().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn automatic_rotation_entropy_failures_expire_credentials_and_preserve_live_flows() {
+    for selected in [
+        FastOpenCookiePolicy::HmacSha256,
+        #[cfg(feature = "tfo-linux-cookie")]
+        policy(99),
+    ] {
+        let local: IpAddr = "192.168.0.1".parse().unwrap();
+        let mut config = SocketConfig::new("test", local);
+        config.fast_open_cookie_policy = selected.clone();
+        config.fast_open_managed_keys = Some(true);
+        config.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
+        let mut owner =
+            Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
+        owner.test_now = Some(0);
+        owner.fast_open_entropy = Some(VecDeque::from([
+            Ok([1; 32]),
+            Ok([2; 32]),
+            Err(EIO),
+            Err(EAGAIN),
+            Ok([3; 32]),
+        ]));
+        owner.apply_socket_config(&config).unwrap();
+        let id = listener(&mut owner, 8080);
+        owner
+            .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+            .unwrap();
+        owner.execute(id, Op::Listen(24)).unwrap();
+        let (old, live) = native_exchange(&mut owner, id, 40000, None, false);
+        let old = old.unwrap();
+        native_exchange(&mut owner, id, 40001, Some(old), true);
+        // Applying unchanged configuration neither consumes entropy nor renews.
+        owner.apply_socket_config(&config).unwrap();
+        owner.test_now = Some(100);
+        owner.rotate_fast_open_keys(100).unwrap();
+        let fresh = native_exchange(&mut owner, id, 40002, None, false)
+            .0
+            .unwrap();
+        assert_ne!(fresh, old);
+        native_exchange(&mut owner, id, 40003, Some(old), true);
+        native_exchange(&mut owner, id, 40004, Some(fresh), true);
+        owner.test_now = Some(200);
+        assert_eq!(owner.rotate_fast_open_keys(200), Err(EIO));
+        assert_eq!(owner.fast_open_keys.as_ref().unwrap().last_error, Some(EIO));
+        assert_eq!(
+            native_exchange(&mut owner, id, 40005, Some(old), false).0,
+            None
+        );
+        assert_eq!(
+            native_exchange(&mut owner, id, 40006, Some(fresh), true).0,
+            None
+        );
+        owner.test_now = Some(300);
+        assert_eq!(owner.rotate_fast_open_keys(300), Err(EAGAIN));
+        assert_eq!(
+            native_exchange(&mut owner, id, 40007, Some(fresh), false).0,
+            None
+        );
+        assert_eq!(owner.endpoint.state(live), Ok(State::Established));
+        assert_eq!(owner.endpoint.write(live, b"still live"), Ok(10));
+        owner.test_now = Some(400);
+        owner.rotate_fast_open_keys(400).unwrap();
+        // Consume the unrelated established flow's queued output first.
+        let mut bytes = [0; 2048];
+        owner.endpoint.poll_transmit(400, &mut bytes, 64).unwrap();
+        let newest = native_exchange(&mut owner, id, 40008, None, false)
+            .0
+            .unwrap();
+        native_exchange(&mut owner, id, 40009, Some(newest), true);
+        assert_eq!(owner.fast_open_keys.as_ref().unwrap().last_error, None);
+        assert!(owner.fast_open_entropy.as_ref().unwrap().is_empty());
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
+//# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the "Security Considerations" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations() {
+    for local in ["192.168.0.1", "2001:db8::2"] {
+        for staged in [false, true] {
+            for length in [2, 3] {
+                let local: IpAddr = local.parse().unwrap();
+                let config = SocketConfig::new("test", local);
+                let prefix = if local.is_ipv4() { 32 } else { 128 };
+                let mut reference =
+                    Owner::with_config(local, (local, prefix), [42; 32], None, config.tcp.clone())
+                        .unwrap();
+                reference.test_now = Some(0);
+                let reference_id = listener(&mut reference, 8080);
+                set(&mut reference, reference_id, 7).unwrap();
+                reference
+                    .execute(reference_id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+                    .unwrap();
+                reference.execute(reference_id, Op::Listen(24)).unwrap();
+                let cookie = native_exchange(&mut reference, reference_id, 39999, None, false)
+                    .0
+                    .unwrap();
+                let mut owner =
+                    Owner::with_config(local, (local, prefix), [42; 32], None, config.tcp).unwrap();
+                owner.test_now = Some(0);
+                owner.fast_open_cookie_lifetime =
+                    ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
+                let mut id = listener(&mut owner, 8080);
+                set(&mut owner, id, 7).unwrap();
+                assert_eq!(owner.endpoint.fast_open_key_registry_usage().0, 2);
+                owner
+                    .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+                    .unwrap();
+                if !staged {
+                    owner.execute(id, Op::Listen(24)).unwrap();
+                    native_exchange(&mut owner, id, 39999, Some(cookie), true);
+                }
+                owner.test_now = Some(100);
+                for byte in 8..8 + length - 1 {
+                    set(&mut owner, id, byte).unwrap();
+                }
+                owner.test_now = Some(101);
+                set(&mut owner, id, 7).unwrap();
+                let usage = owner.endpoint.fast_open_key_registry_usage();
+                if staged {
+                    owner.execute(id, Op::Listen(24)).unwrap();
+                    assert_eq!(owner.endpoint.fast_open_key_registry_usage(), usage);
+                }
+                assert_eq!(
+                    native_exchange(&mut owner, id, 40000, Some(cookie), false).0,
+                    None
+                );
+                set(&mut owner, id, 11).unwrap();
+                let fresh = native_exchange(&mut owner, id, 40001, Some(cookie), false)
+                    .0
+                    .unwrap();
+                native_exchange(&mut owner, id, 40002, Some(fresh), true);
+                owner.test_now = Some(201);
+                assert_eq!(
+                    native_exchange(&mut owner, id, 40003, Some(fresh), false).0,
+                    None
+                );
+                owner.execute(id, Op::Close).unwrap();
+                owner
+                    .endpoint
+                    .poll_transmit(201, &mut [0; 2048], 64)
+                    .unwrap();
+                id = listener(&mut owner, 8080);
+                set(&mut owner, id, 7).unwrap();
+                owner
+                    .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+                    .unwrap();
+                owner.execute(id, Op::Listen(24)).unwrap();
+                assert_eq!(
+                    native_exchange(&mut owner, id, 40004, Some(cookie), false).0,
+                    None
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn native_set_key_staging_and_same_key_after_expiry_do_not_renew_lease() {
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
+    let config = SocketConfig::new("test", local);
+    let mut owner = Owner::with_config(local, (local, 32), [42; 32], None, config.tcp).unwrap();
+    owner.test_now = Some(0);
+    owner.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
+    let id = listener(&mut owner, 8080);
+    set(&mut owner, id, 7).unwrap();
+    owner.test_now = Some(50);
+    set(&mut owner, id, 7).unwrap();
+    assert_eq!(
+        owner.sockets[&id].fast_open_key_lease.unwrap().accept_until,
+        100
+    );
+    owner
+        .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+        .unwrap();
+    owner.execute(id, Op::Listen(24)).unwrap();
+    let cookie = native_exchange(&mut owner, id, 40000, None, false)
+        .0
+        .unwrap();
+    owner.test_now = Some(99);
+    native_exchange(&mut owner, id, 40001, Some(cookie), true);
+    owner.test_now = Some(100);
+    set(&mut owner, id, 7).unwrap();
+    assert_eq!(
+        native_exchange(&mut owner, id, 40002, Some(cookie), false).0,
+        None
+    );
+    owner.test_now = Some(101);
+    set(&mut owner, id, 8).unwrap();
+    let fresh = native_exchange(&mut owner, id, 40003, Some(cookie), false)
+        .0
+        .unwrap();
+    native_exchange(&mut owner, id, 40004, Some(fresh), true);
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn external_config_lease_survives_reapply_and_expired_absolute_reinstall() {
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
+    let mut config = SocketConfig::new("test", local);
+    config.fast_open_cookie_policy = policy(7);
+    config.fast_open_managed_keys = Some(false);
+    config.fast_open_key_lease = Some(ntcp::FastOpenKeyLease {
+        not_before: 0,
+        issue_until: 50,
+        accept_until: 100,
+        units_per_second: 1_000_000,
+    });
+    let make = |now| {
+        let mut owner =
+            Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
+        owner.test_now = Some(now);
+        owner.apply_socket_config(&config).unwrap();
+        let id = listener(&mut owner, 8080);
+        owner
+            .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+            .unwrap();
+        owner.execute(id, Op::Listen(24)).unwrap();
+        (owner, id)
+    };
+    let (mut owner, id) = make(0);
+    let cookie = native_exchange(&mut owner, id, 40000, None, false)
+        .0
+        .unwrap();
+    owner.test_now = Some(49);
+    owner.apply_socket_config(&config).unwrap();
+    native_exchange(&mut owner, id, 40001, Some(cookie), true);
+    owner.test_now = Some(50);
+    assert_eq!(
+        native_exchange(&mut owner, id, 40002, Some(cookie), true).0,
+        None
+    );
+    owner.test_now = Some(100);
+    owner.apply_socket_config(&config).unwrap();
+    assert_eq!(
+        native_exchange(&mut owner, id, 40003, Some(cookie), false).0,
+        None
+    );
+    // This supplies an already-trusted original absolute deadline explicitly.
+    // It exercises reinstall, not a claim that an OS restart preserves clocks.
+    let (mut replacement, id) = make(100);
+    assert_eq!(
+        native_exchange(&mut replacement, id, 40004, Some(cookie), false).0,
+        None
+    );
+    assert!(replacement.fast_open_keys.is_none());
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
 #[test]
 fn socket_rotation_keeps_held_synack_and_budget_unchanged() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
@@ -155,8 +711,12 @@ fn socket_rotation_keeps_held_synack_and_budget_unchanged() {
     let tx = output.packet.unwrap();
     let original = bytes[..tx.len].to_vec();
     let budget = owner.endpoint.buffer_bytes();
+    let registry_before = owner.endpoint.fast_open_key_registry_usage().1;
     set(&mut owner, id, 2).unwrap();
-    assert_eq!(owner.endpoint.buffer_bytes(), budget);
+    assert_eq!(
+        owner.endpoint.buffer_bytes() - owner.endpoint.fast_open_key_registry_usage().1,
+        budget - registry_before
+    );
     assert_eq!(&bytes[..tx.len], original);
     assert!(owner.endpoint.reject_unsubmitted(attempt.unwrap()).unwrap());
     let (output, retry) = owner

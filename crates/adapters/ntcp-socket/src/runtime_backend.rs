@@ -137,7 +137,7 @@ impl Owner {
         let tcp = backend_config_family(config.tcp.clone(), &*backend.io, local)?;
         let secret = random_secret()?;
         let mut owner = Self::with_config(config.io.address, (network, prefix), secret, None, tcp)?;
-        owner.apply_socket_config(config)?;
+        owner.initialize_socket_config(config)?;
         owner.ethernet = Some(EthernetBackend {
             io: backend.io,
             local: backend.local_mac,
@@ -208,7 +208,7 @@ impl Owner {
             None,
             backend_config_family(config.tcp.clone(), &io, local)?,
         )?;
-        owner.apply_socket_config(config)?;
+        owner.initialize_socket_config(config)?;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,

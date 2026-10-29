@@ -384,6 +384,7 @@ struct Socket {
     send_finish: Option<send::SendFinish>,
     fast_open_limit: i32,
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
+    fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
     fast_open_connect: bool,
     server_cookie: Option<(SocketAddr, FastOpenCookie)>,
     client_policy: Option<(SocketAddr, FastOpenClientPolicy)>,
@@ -467,6 +468,7 @@ impl Socket {
             send_finish: None,
             fast_open_limit: 0,
             fast_open_cookie_policy: None,
+            fast_open_key_lease: None,
             fast_open_connect: false,
             server_cookie: None,
             client_policy: None,
@@ -555,7 +557,19 @@ type ChildOptionsSnapshot = (
     (bool, bool, bool, u32, bool, u8, i32),
 );
 
+struct ManagedFastOpenKeys {
+    policy: FastOpenCookiePolicy,
+    lifetime: ntcp::FastOpenCookieLifetime,
+    next_rotation: u64,
+    last_error: Option<i32>,
+}
+
 struct Owner {
+    fast_open_keys: Option<ManagedFastOpenKeys>,
+    fast_open_configured: bool,
+    fast_open_cookie_lifetime: ntcp::FastOpenCookieLifetime,
+    #[cfg(test)]
+    fast_open_entropy: Option<VecDeque<Result<[u8; 32]>>>,
     endpoint: Endpoint,
     defaults: EndpointConfig,
     socket_policy: crate::SocketPolicy,
@@ -687,22 +701,137 @@ impl Owner {
         let secret = random_secret()?;
         let tcp = backend::backend_config_family(config.tcp.clone(), &tun, local)?;
         let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
-        owner.apply_socket_config(config)?;
+        owner.initialize_socket_config(config)?;
         owner.enable_reservations(&config.io, index)?;
         Ok(owner)
     }
+    fn initialize_socket_config(&mut self, config: &SocketConfig) -> Result<()> {
+        // with_config establishes the owner/endpoint monotonic origin at zero.
+        // Startup setup consumes lease time; it must not shift that origin or
+        // grant a fresh interval when backend initialization completes later.
+        self.apply_socket_config_at(config, 0)
+    }
+
+    #[cfg(test)]
     fn apply_socket_config(&mut self, config: &SocketConfig) -> Result<()> {
+        self.apply_socket_config_at(config, self.now())
+    }
+
+    fn apply_socket_config_at(&mut self, config: &SocketConfig, now: u64) -> Result<()> {
+        let managed = config.fast_open_keys_managed().map_err(|_| EINVAL)?;
         self.socket_policy = config.socket;
+        self.fast_open_cookie_lifetime = config.fast_open_cookie_lifetime;
         self.endpoint
-            .set_fast_open_cookie_policy(config.fast_open_cookie_policy.clone());
-        let now = self.now();
+            .set_fast_open_cookie_lifetime(config.fast_open_cookie_lifetime);
+        if managed {
+            if self.fast_open_keys.as_ref().is_none_or(|keys| {
+                keys.policy != config.fast_open_cookie_policy
+                    || keys.lifetime != config.fast_open_cookie_lifetime
+            }) {
+                self.fast_open_keys = Some(ManagedFastOpenKeys {
+                    policy: config.fast_open_cookie_policy.clone(),
+                    lifetime: config.fast_open_cookie_lifetime,
+                    next_rotation: now,
+                    last_error: None,
+                });
+            }
+            self.rotate_fast_open_keys(now)?;
+        } else {
+            self.fast_open_keys = None;
+            if let Some(lease) = config.fast_open_key_lease {
+                let key = match &config.fast_open_cookie_policy {
+                    FastOpenCookiePolicy::HmacSha256 => {
+                        ntcp::FastOpenServerKey::HmacSha256(random_secret()?)
+                    }
+                    #[cfg(feature = "tfo-linux-cookie")]
+                    FastOpenCookiePolicy::LinuxSipHash24(key) => {
+                        ntcp::FastOpenServerKey::LinuxSipHash24(key.clone())
+                    }
+                };
+                self.endpoint
+                    .install_fast_open_key(now, key, lease, false)
+                    .map_err(engine)?;
+            } else {
+                if !self.fast_open_configured
+                    && matches!(
+                        config.fast_open_cookie_policy,
+                        FastOpenCookiePolicy::HmacSha256
+                    )
+                {
+                    // Install the initial unmanaged HMAC key only after setting
+                    // its configured epoch duration. The constructor credential
+                    // uses the default duration; same-key selection cannot
+                    // change it. Reapplying configuration must not renew keys.
+                    let key = self.fast_open_secret()?;
+                    self.endpoint
+                        .try_set_fast_open_hmac_key(key)
+                        .map_err(engine)?;
+                }
+                self.endpoint
+                    .try_set_fast_open_cookie_policy(config.fast_open_cookie_policy.clone())
+                    .map_err(engine)?;
+            }
+        }
         for &(destination, policy) in &config.routes {
             self.endpoint
                 .set_destination_route(now, destination, Some(policy))
                 .map_err(engine)?;
         }
+        self.fast_open_configured = true;
         Ok(())
     }
+    fn fast_open_secret(&mut self) -> Result<[u8; 32]> {
+        #[cfg(test)]
+        if let Some(reads) = &mut self.fast_open_entropy {
+            return reads
+                .pop_front()
+                .expect("unexpected Fast Open entropy consumption");
+        }
+        random_secret()
+    }
+
+    fn rotate_fast_open_keys(&mut self, now: u64) -> Result<()> {
+        let Some(keys) = &self.fast_open_keys else {
+            return Ok(());
+        };
+        if now < keys.next_rotation {
+            return Ok(());
+        }
+        let lifetime = keys.lifetime;
+        let policy = keys.policy.clone();
+        let result = (|| {
+            let lease = ntcp::FastOpenKeyLease::for_lifetime(
+                now,
+                lifetime,
+                self.defaults.connection.timebase,
+                true,
+            )
+            .map_err(|_| EINVAL)?;
+            let bytes = self.fast_open_secret()?;
+            let key = match policy {
+                FastOpenCookiePolicy::HmacSha256 => ntcp::FastOpenServerKey::HmacSha256(bytes),
+                #[cfg(feature = "tfo-linux-cookie")]
+                FastOpenCookiePolicy::LinuxSipHash24(_) => ntcp::FastOpenServerKey::LinuxSipHash24(
+                    LinuxSipHash24Key::new(bytes[..16].try_into().unwrap()),
+                ),
+            };
+            self.endpoint
+                .install_fast_open_key(now, key, lease, true)
+                .map_err(engine)
+        })();
+        let keys = self.fast_open_keys.as_mut().unwrap();
+        // Bound entropy retries by the configured interval. Failure retains
+        // original deadlines; admission expires credentials without a timer.
+        keys.next_rotation = now.checked_add(lifetime.as_micros()).unwrap_or(u64::MAX);
+        keys.last_error = result.as_ref().err().copied();
+        if let Err(error) = result {
+            eprintln!(
+                "ntcp: Fast Open key rotation failed ({error}); credential deadlines retained"
+            );
+        }
+        result
+    }
+
     fn with_config(
         local: impl Into<IpAddr>,
         (address, prefix): (impl Into<IpAddr>, u8),
@@ -745,6 +874,11 @@ impl Owner {
         })
         .map_err(engine)?;
         Ok(Self {
+            fast_open_keys: None,
+            fast_open_configured: false,
+            fast_open_cookie_lifetime: Default::default(),
+            #[cfg(test)]
+            fast_open_entropy: None,
             endpoint,
             defaults,
             socket_policy: crate::SocketPolicy::default(),
@@ -1067,6 +1201,7 @@ impl Owner {
                 break;
             }
             let now = self.now();
+            let _ = self.rotate_fast_open_keys(now);
             if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
@@ -1803,13 +1938,32 @@ impl Owner {
                 {
                     return Err(EINVAL);
                 }
-                let policy = FastOpenCookiePolicy::LinuxSipHash24(key);
+                let policy = FastOpenCookiePolicy::LinuxSipHash24(key.clone());
+                let now = self.now();
+                let lease = if s.fast_open_cookie_policy.as_ref() == Some(&policy) {
+                    s.fast_open_key_lease.ok_or(EINVAL)?
+                } else {
+                    ntcp::FastOpenKeyLease::for_lifetime(
+                        now,
+                        self.fast_open_cookie_lifetime,
+                        self.defaults.connection.timebase,
+                        false,
+                    )
+                    .map_err(|_| EINVAL)?
+                };
+                let key = ntcp::FastOpenServerKey::LinuxSipHash24(key);
                 if let Handle::Listener(listener) = s.handle {
                     self.endpoint
-                        .set_listener_fast_open_cookie_policy(listener, Some(policy.clone()))
+                        .install_listener_fast_open_key(now, listener, key, lease, false)
+                        .map_err(engine)?;
+                } else {
+                    self.endpoint
+                        .register_fast_open_key(now, key, lease)
                         .map_err(engine)?;
                 }
-                self.sockets.get_mut(&id).unwrap().fast_open_cookie_policy = Some(policy);
+                let socket = self.sockets.get_mut(&id).unwrap();
+                socket.fast_open_cookie_policy = Some(policy);
+                socket.fast_open_key_lease = Some(lease);
             }
             Op::Bind(mut addr) => {
                 let mut local = s.normalize_address(addr, self.local, true)?;
@@ -1845,6 +1999,7 @@ impl Owner {
                 }
                 let fast_open_limit = s.fast_open_limit;
                 let cookie_policy = s.fast_open_cookie_policy.clone();
+                let cookie_lease = s.fast_open_key_lease;
                 let capacities = (s.send_capacity, s.receive_capacity);
                 let application_timeout = user_timeout_us(s.user_timeout_ms)?;
                 let syn_retries = s.syn_retries;
@@ -1910,10 +2065,29 @@ impl Owner {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
                 }
-                if let Err(e) = self
-                    .endpoint
-                    .set_listener_fast_open_cookie_policy(listener, cookie_policy)
-                {
+                #[cfg(feature = "tfo-linux-cookie")]
+                let installed =
+                    if let (Some(FastOpenCookiePolicy::LinuxSipHash24(key)), Some(lease)) =
+                        (cookie_policy.clone(), cookie_lease)
+                    {
+                        self.endpoint.install_listener_fast_open_key(
+                            self.now(),
+                            listener,
+                            ntcp::FastOpenServerKey::LinuxSipHash24(key),
+                            lease,
+                            false,
+                        )
+                    } else {
+                        self.endpoint
+                            .set_listener_fast_open_cookie_policy(listener, cookie_policy)
+                    };
+                #[cfg(not(feature = "tfo-linux-cookie"))]
+                let installed = {
+                    let _ = cookie_lease;
+                    self.endpoint
+                        .set_listener_fast_open_cookie_policy(listener, cookie_policy)
+                };
+                if let Err(e) = installed {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
                 }
@@ -2902,7 +3076,7 @@ mod packet_tests;
 #[path = "runtime_admission_tests.rs"]
 mod admission_tests;
 
-#[cfg(all(test, feature = "tfo-linux-cookie"))]
+#[cfg(test)]
 #[path = "runtime_cookie_policy_tests.rs"]
 mod cookie_policy_tests;
 

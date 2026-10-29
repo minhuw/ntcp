@@ -23,7 +23,7 @@ quote = '''
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-3"
-reason = "Ordinary TCP tests and repeated Fast Open are present, but the whole quoted lifecycle includes server expiration. LinuxSipHash24 intentionally ignores epoch and has no built-in expiry or enforced key-rotation contract. Default HMAC expires after current/previous epochs; that does not establish this clause for Linux mode."
+reason = "Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw-key restart continuity still requires T20/T15 trusted original lease/time mapping; the whole lifecycle remains TODO until that integration."
 quote = '''
 5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).
 '''
@@ -37,7 +37,7 @@ Options with invalid Length values or without the SYN flag set MUST be ignored.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2"
-reason = "Server-selected HMAC/SipHash authenticate addresses and protected services explicitly bypass cookies. The complete SHOULD property set additionally includes relative generation/verification cost and timed expiration, neither established for all supported policies; individual properties are separately dispositioned."
+reason = "Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO for unmeasured relative generation/verification cost (T6) and external raw-key restart/time continuity (T20/T15)."
 quote = '''
 The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use "SHOULD" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.
 '''
@@ -51,21 +51,14 @@ quote = '''
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2"
-reason = "Default HMAC authenticates current/previous time epochs and rejects older cookies (default_policy_preserves_hmac_epochs_and_addresses). Opt-in LinuxSipHash24 uses one fixed key and ignores epoch (openssl_linux_vectors_and_validation_boundaries explicitly accepts u64::MAX). There is no enforced timed rotation/expiration for that supported mode. External rotation is available but cannot close timed expiration without an independently established policy."
+reason = "Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration."
 quote = '''
 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the "Security Considerations" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.
 '''
 
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2"
-reason = "Unselected optional rolling multiple-key mechanism: HMAC versions the MAC input with time epochs using one secret; LinuxSipHash24 has one replaceable key. This paragraph permits a deployment-specific alternative and prescribes no particular rotation mechanism. Timed expiration itself remains TODO."
-quote = '''
-To gradually invalidate cookies over time, the server can implement key rotation to generate and verify cookies using multiple keys. This approach is useful for large-scale servers to retain Fast Open rolling key updates. We do not specify a particular mechanism because the implementation is server specific.
-'''
-
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2"
-reason = "Address authentication is implemented for both MAC policies, but unexpired validity is not assured by LinuxSipHash24: it has no timed expiry. HMAC current/previous epoch validity does not close this compound operation for all selected policies."
+reason = "Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20/T15 integration of trusted original lease/time mapping across external raw-key restart."
 quote = '''
 - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
 '''
@@ -100,7 +93,7 @@ Any client attempting TFO MUST first request a cookie from the server with the f
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1"
-reason = "Request/response cookies are implemented and tested, but the reference imports section 4.1.2 properties, including expiration absent from Linux single-key policy and unmeasured relative generation cost. This compound cross-reference remains TODO."
+reason = "Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. This cross-reference still imports unmeasured relative MAC cost (T6) and trusted external raw-key restart/time continuity (T20/T15), so the whole clause remains TODO."
 quote = '''
 2. The server responds with a SYN-ACK based on the procedures in the "Server Cookie Handling" section (Section 4.1.2).
 '''
@@ -114,7 +107,7 @@ We also RECOMMEND the client to record the set of servers that failed to respond
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
-reason = "Repeated ordinary Fast Open and manual key revocation are implemented, but the complete quoted reuse lifetime depends on timed server expiration. HMAC current/previous epochs expire credentials; LinuxSipHash24 has no enforced timed expiration or timed rotation policy. Manual replacement of a compromised key does not close that lifecycle dependency, so the full selected-policy obligation remains TODO."
+reason = "Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. The whole reuse lifecycle remains TODO for T20/T15 trusted original lease/time mapping across external raw-key restart."
 quote = '''
 Once the client obtains the cookie from the target server, it can perform subsequent TFO connections until the cookie is expired by the server.
 '''

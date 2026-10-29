@@ -29,19 +29,19 @@ pub enum FastOpenClientPolicy {
 }
 
 /// Server cookie authentication policy. Selecting a policy does not enable TFO.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FastOpenCookiePolicy {
     /// Address-bound HMAC with current and previous epoch acceptance.
     #[default]
     HmacSha256,
-    /// Linux v5.3+ address cookies: a single key, without epochs or backup keys.
+    /// Linux v5.3+ raw address encoding. Server admission separately enforces leases.
     #[cfg(feature = "tfo-linux-cookie")]
     LinuxSipHash24(LinuxSipHash24Key),
 }
 
 /// Raw Linux socket key bytes, not textual sysctl words.
 #[cfg(feature = "tfo-linux-cookie")]
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LinuxSipHash24Key([u8; 16]);
 
 #[cfg(feature = "tfo-linux-cookie")]
@@ -103,10 +103,10 @@ impl FastOpenCookiePolicy {
         }
     }
 
-    // Partial evidence only: the complete expiration obligation remains TODO
-    // for the Linux single-key policy, even though HMAC epochs do expire.
+    // Raw codecs authenticate bytes only. ServerCookieContext enforces admission
+    // deadlines; accepting a raw vector at u64::MAX does not authorize a SYN.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
-    //= reason=Default HMAC authenticates current/previous time epochs and rejects older cookies (default_policy_preserves_hmac_epochs_and_addresses). Opt-in LinuxSipHash24 uses one fixed key and ignores epoch (openssl_linux_vectors_and_validation_boundaries explicitly accepts u64::MAX). There is no enforced timed rotation/expiration for that supported mode. External rotation is available but cannot close timed expiration without an independently established policy.
+    //= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20/T15 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
     //# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed
     //# in the "Security Considerations" section (Section 5). This can be done by either periodically
     //# changing the server key used to generate cookies or including a timestamp when generating the cookie.
@@ -144,6 +144,468 @@ impl FastOpenCookiePolicy {
                 })
             }
         }
+    }
+}
+
+/// Credential duration in microseconds, independent of the caller's tick unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FastOpenCookieLifetime(u64);
+
+impl Default for FastOpenCookieLifetime {
+    fn default() -> Self {
+        Self(LIFETIME_US)
+    }
+}
+
+impl FastOpenCookieLifetime {
+    pub fn from_micros(us: u64) -> Result<Self, Error> {
+        // Both supported timebases must represent two HMAC epochs exactly.
+        if us == 0 || us.checked_mul(2000).is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(Self(us))
+    }
+
+    pub fn as_micros(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn ticks(self, timebase: crate::CallerTimebase) -> Result<u64, Error> {
+        if !timebase.valid() {
+            return Err(Error::InvalidArgument);
+        }
+        self.0
+            .checked_mul(timebase.units_per_second / 1_000_000)
+            .ok_or(Error::InvalidArgument)
+    }
+}
+
+/// Absolute deadlines in the endpoint's caller timebase. The embedding must
+/// preserve these deadlines across reinstall/restart using a trusted clock
+/// mapping, or supply fresh key material. Raw cookies carry no installation ID.
+/// Issuance is [not_before, issue_until); acceptance is [not_before, accept_until).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FastOpenKeyLease {
+    pub not_before: Instant,
+    pub issue_until: Instant,
+    pub accept_until: Instant,
+    pub units_per_second: u64,
+}
+
+impl FastOpenKeyLease {
+    pub fn validate(self, now: Instant, timebase: crate::CallerTimebase) -> Result<(), Error> {
+        if !timebase.valid()
+            || self.units_per_second != timebase.units_per_second
+            || self.not_before > now
+            || self.not_before >= self.issue_until
+            || self.issue_until > self.accept_until
+        {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    pub fn for_lifetime(
+        now: Instant,
+        lifetime: FastOpenCookieLifetime,
+        timebase: crate::CallerTimebase,
+        retiring: bool,
+    ) -> Result<Self, Error> {
+        let ticks = lifetime.ticks(timebase)?;
+        let issue_until = now.checked_add(ticks).ok_or(Error::InvalidArgument)?;
+        let accept_until = if retiring {
+            issue_until
+                .checked_add(ticks)
+                .ok_or(Error::InvalidArgument)?
+        } else {
+            issue_until
+        };
+        Ok(Self {
+            not_before: now,
+            issue_until,
+            accept_until,
+            units_per_second: timebase.units_per_second,
+        })
+    }
+}
+
+/// Actual server key material. Linux bytes are never interpreted as a seed.
+#[derive(Clone)]
+pub enum FastOpenServerKey {
+    HmacSha256([u8; 32]),
+    #[cfg(feature = "tfo-linux-cookie")]
+    LinuxSipHash24(LinuxSipHash24Key),
+}
+
+impl core::fmt::Debug for FastOpenServerKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FastOpenServerKey([REDACTED])")
+    }
+}
+
+impl FastOpenServerKey {
+    pub(crate) fn policy(&self) -> FastOpenCookiePolicy {
+        match self {
+            Self::HmacSha256(_) => FastOpenCookiePolicy::HmacSha256,
+            #[cfg(feature = "tfo-linux-cookie")]
+            Self::LinuxSipHash24(key) => FastOpenCookiePolicy::LinuxSipHash24(key.clone()),
+        }
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        #[cfg(feature = "tfo-linux-cookie")]
+        use subtle::ConstantTimeEq;
+        match (self, other) {
+            (Self::HmacSha256(a), Self::HmacSha256(b)) => {
+                use hmac::digest::CtOutput;
+                CtOutput::<Sha256>::new((*a).into()) == CtOutput::<Sha256>::new((*b).into())
+            }
+            #[cfg(feature = "tfo-linux-cookie")]
+            (Self::LinuxSipHash24(a), Self::LinuxSipHash24(b)) => bool::from(a.0.ct_eq(&b.0)),
+            #[cfg(feature = "tfo-linux-cookie")]
+            _ => false,
+        }
+    }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut hash = Sha256::new();
+        hash.update(b"ntcp credential identity\0");
+        match self {
+            Self::HmacSha256(key) => {
+                hash.update(b"hmac-sha256\0");
+                hash.update(key);
+            }
+            #[cfg(feature = "tfo-linux-cookie")]
+            Self::LinuxSipHash24(key) => {
+                hash.update(b"linux-siphash24\0");
+                hash.update(key.0);
+            }
+        }
+        hash.finalize().into()
+    }
+
+    fn secret(&self) -> &[u8; 32] {
+        match self {
+            Self::HmacSha256(secret) => secret,
+            #[cfg(feature = "tfo-linux-cookie")]
+            Self::LinuxSipHash24(_) => &[0; 32], // Unused by the raw codec.
+        }
+    }
+}
+
+// Only selection contexts retain accepting material. Registry identities rely on
+// SHA-256 collision resistance, with codec domain separation; they are not keys.
+#[derive(Clone, Copy)]
+pub(crate) struct CredentialRecord {
+    fingerprint: [u8; 32],
+    epoch_ticks: u64,
+    registered_at: Instant,
+    lease: Option<FastOpenKeyLease>,
+}
+
+impl CredentialRecord {
+    fn accepts(&self, now: Instant) -> bool {
+        now >= self.registered_at
+            && self
+                .lease
+                .is_none_or(|lease| now >= lease.not_before && now < lease.accept_until)
+    }
+
+    fn issues(&self, now: Instant) -> bool {
+        self.accepts(now) && self.lease.is_none_or(|lease| now < lease.issue_until)
+    }
+
+    fn constrain(&mut self, lease: FastOpenKeyLease) {
+        self.lease = Some(match self.lease {
+            Some(old) => FastOpenKeyLease {
+                not_before: old.not_before.max(lease.not_before),
+                issue_until: old.issue_until.min(lease.issue_until),
+                accept_until: old.accept_until.min(lease.accept_until),
+                units_per_second: old.units_per_second,
+            },
+            None => lease,
+        });
+    }
+}
+
+// Endpoint authority, independent of policy selection and listener generations.
+// The constructor credential is inline. Additional records never disappear;
+// administrative registration alone grows this storage, charged to buffer_bytes.
+pub(crate) struct CredentialRegistry {
+    initial: CredentialRecord,
+    records: Vec<CredentialRecord>,
+}
+
+impl CredentialRegistry {
+    pub fn new(key: &FastOpenServerKey, timebase: crate::CallerTimebase, now: Instant) -> Self {
+        Self {
+            initial: CredentialRecord {
+                fingerprint: key.fingerprint(),
+                epoch_ticks: FastOpenCookieLifetime::default().ticks(timebase).unwrap(),
+                registered_at: now,
+                lease: None,
+            },
+            records: Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        1 + self.records.len()
+    }
+
+    pub fn allocation_bytes(&self) -> usize {
+        self.records.capacity() * core::mem::size_of::<CredentialRecord>()
+    }
+
+    #[cfg(test)]
+    pub fn constraints(
+        &self,
+        key: &FastOpenServerKey,
+    ) -> Option<(u64, Instant, Option<FastOpenKeyLease>)> {
+        let fingerprint = key.fingerprint();
+        core::iter::once(&self.initial)
+            .chain(self.records.iter())
+            .find(|record| record.fingerprint == fingerprint)
+            .map(|record| (record.epoch_ticks, record.registered_at, record.lease))
+    }
+
+    fn get(&self, id: usize) -> &CredentialRecord {
+        if id == 0 {
+            &self.initial
+        } else {
+            &self.records[id - 1]
+        }
+    }
+
+    fn get_mut(&mut self, id: usize) -> &mut CredentialRecord {
+        if id == 0 {
+            &mut self.initial
+        } else {
+            &mut self.records[id - 1]
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        key: &FastOpenServerKey,
+        lifetime: FastOpenCookieLifetime,
+        now: Instant,
+        timebase: crate::CallerTimebase,
+        lease: Option<FastOpenKeyLease>,
+        room: usize,
+    ) -> Result<usize, Error> {
+        let epoch_ticks = lifetime.ticks(timebase)?;
+        if let Some(lease) = lease {
+            lease.validate(now, timebase)?;
+        }
+        let fingerprint = key.fingerprint();
+        if let Some(id) = core::iter::once(&self.initial)
+            .chain(self.records.iter())
+            .position(|record| record.fingerprint == fingerprint)
+        {
+            if let Some(lease) = lease {
+                self.get_mut(id).constrain(lease);
+            }
+            return Ok(id);
+        }
+        let lease = match (lease, key) {
+            (Some(lease), _) => Some(lease),
+            (None, FastOpenServerKey::HmacSha256(_)) => None,
+            #[cfg(feature = "tfo-linux-cookie")]
+            (None, FastOpenServerKey::LinuxSipHash24(_)) => Some(FastOpenKeyLease::for_lifetime(
+                now, lifetime, timebase, false,
+            )?),
+        };
+        if self.records.len() == self.records.capacity() {
+            // Stage bounded growth before touching canonical facts. Include both
+            // old and new allocations in the peak budget; allocator failure is
+            // atomic even when other listeners use the same registry.
+            let capacity = self.records.len().checked_add(1).ok_or(Error::NoMemory)?;
+            capacity
+                .checked_mul(core::mem::size_of::<CredentialRecord>())
+                .filter(|bytes| *bytes <= room)
+                .ok_or(Error::NoMemory)?;
+            let mut staged = Vec::new();
+            staged
+                .try_reserve_exact(capacity)
+                .map_err(|_| Error::NoMemory)?;
+            if staged.capacity() * core::mem::size_of::<CredentialRecord>() > room {
+                return Err(Error::NoMemory);
+            }
+            staged.extend_from_slice(&self.records);
+            self.records = staged;
+        }
+        self.records.push(CredentialRecord {
+            fingerprint,
+            epoch_ticks,
+            registered_at: now,
+            lease,
+        });
+        Ok(self.records.len())
+    }
+
+    fn retire(&mut self, id: usize, now: Instant, timebase: crate::CallerTimebase) {
+        let record = self.get_mut(id);
+        if record.lease.is_none() {
+            // Last-issued epoch remains valid through its original next epoch.
+            let deadline = (now / record.epoch_ticks)
+                .checked_add(2)
+                .and_then(|epoch| epoch.checked_mul(record.epoch_ticks))
+                .unwrap_or(now);
+            record.constrain(FastOpenKeyLease {
+                not_before: record.registered_at,
+                issue_until: now,
+                accept_until: deadline,
+                units_per_second: timebase.units_per_second,
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Credential {
+    key: FastOpenServerKey,
+    id: usize,
+}
+
+impl Credential {
+    fn valid(
+        &self,
+        registry: &CredentialRegistry,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+        cookie: FastOpenCookie,
+    ) -> bool {
+        let record = registry.get(self.id);
+        record.accepts(now)
+            && self.key.policy().valid(
+                self.key.secret(),
+                local,
+                remote,
+                now / record.epoch_ticks,
+                cookie,
+            )
+    }
+}
+
+// At most current + one retiring accepting credential per selection. Timing is
+// always queried from the endpoint authority, never copied with a selection.
+#[derive(Clone)]
+pub(crate) struct ServerCookieContext {
+    current: Credential,
+    retiring: Option<Credential>,
+    pub lifetime: FastOpenCookieLifetime,
+    pub error: Option<Error>,
+}
+
+impl ServerCookieContext {
+    pub fn new(key: FastOpenServerKey) -> Self {
+        Self {
+            current: Credential { key, id: 0 },
+            retiring: None,
+            lifetime: Default::default(),
+            error: None,
+        }
+    }
+
+    pub fn policy(&self) -> FastOpenCookiePolicy {
+        self.current.key.policy()
+    }
+
+    pub fn replace(&mut self, key: FastOpenServerKey, id: usize) {
+        if !self.current.key.same(&key) {
+            self.current = Credential { key, id };
+            self.retiring = None;
+        }
+        self.error = None;
+    }
+
+    pub fn check_install(&self, key: &FastOpenServerKey) -> Result<(), Error> {
+        if self.retiring.as_ref().is_some_and(|old| old.key.same(key)) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+    //# To gradually invalidate cookies over time, the server can implement key rotation to generate and verify cookies using multiple keys. This approach is useful for large-scale servers to retain Fast Open rolling key updates. We do not specify a particular mechanism because the implementation is server specific.
+    pub fn install(
+        &mut self,
+        key: FastOpenServerKey,
+        id: usize,
+        registry: &mut CredentialRegistry,
+        now: Instant,
+        timebase: crate::CallerTimebase,
+        rotate: bool,
+    ) {
+        if !self.current.key.same(&key) {
+            let old = core::mem::replace(&mut self.current, Credential { key, id });
+            if rotate {
+                registry.retire(old.id, now, timebase);
+            }
+            self.retiring = (rotate && registry.get(old.id).accepts(now)).then_some(old);
+        }
+        self.error = None;
+    }
+
+    pub fn replace_hmac(&mut self, key: [u8; 32], id: usize) {
+        if matches!(self.current.key, FastOpenServerKey::HmacSha256(_)) {
+            self.replace(FastOpenServerKey::HmacSha256(key), id);
+        }
+        self.revoke_retiring_hmac(key);
+    }
+
+    pub fn block_hmac(&mut self, key: [u8; 32], error: Error) {
+        if matches!(self.current.key, FastOpenServerKey::HmacSha256(_)) {
+            self.error = Some(error);
+        }
+        self.revoke_retiring_hmac(key);
+    }
+
+    fn revoke_retiring_hmac(&mut self, key: [u8; 32]) {
+        if self.retiring.as_ref().is_some_and(|old| {
+            matches!(old.key, FastOpenServerKey::HmacSha256(_))
+                && !old.key.same(&FastOpenServerKey::HmacSha256(key))
+        }) {
+            self.retiring = None;
+        }
+    }
+
+    pub fn valid(
+        &self,
+        registry: &CredentialRegistry,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+        cookie: FastOpenCookie,
+    ) -> bool {
+        self.error.is_none()
+            && (self.current.valid(registry, now, local, remote, cookie)
+                | self
+                    .retiring
+                    .as_ref()
+                    .is_some_and(|old| old.valid(registry, now, local, remote, cookie)))
+    }
+
+    pub fn issue(
+        &self,
+        registry: &CredentialRegistry,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+    ) -> Option<FastOpenCookie> {
+        let record = registry.get(self.current.id);
+        if self.error.is_some() || !record.issues(now) {
+            return None;
+        }
+        self.current.key.policy().issue(
+            self.current.key.secret(),
+            local,
+            remote,
+            now / record.epoch_ticks,
+        )
     }
 }
 

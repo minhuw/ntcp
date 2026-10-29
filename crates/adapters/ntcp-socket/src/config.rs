@@ -23,6 +23,13 @@ pub struct SocketConfig {
     pub tcp: ntcp::EndpointConfig,
     pub socket: SocketPolicy,
     pub fast_open_cookie_policy: ntcp::FastOpenCookiePolicy,
+    /// None manages HMAC automatically and treats explicitly supplied Linux
+    /// keys as external. Some(true) manages fresh keys for either codec.
+    pub fast_open_managed_keys: Option<bool>,
+    pub fast_open_cookie_lifetime: ntcp::FastOpenCookieLifetime,
+    /// Trusted absolute lease in owner microseconds; external deployments must
+    /// preserve its clock mapping across restart, or provide fresh keys.
+    pub fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
     pub io: IoConfig,
     pub routes: Vec<(IpAddr, ntcp::RoutePolicy)>,
 }
@@ -80,6 +87,9 @@ impl SocketConfig {
             tcp,
             socket: SocketPolicy::default(),
             fast_open_cookie_policy: ntcp::FastOpenCookiePolicy::default(),
+            fast_open_managed_keys: None,
+            fast_open_cookie_lifetime: Default::default(),
+            fast_open_key_lease: None,
             routes: Vec::new(),
             io: IoConfig {
                 backend: Backend::Tun,
@@ -95,7 +105,24 @@ impl SocketConfig {
         }
     }
 
+    pub(crate) fn fast_open_keys_managed(&self) -> io::Result<bool> {
+        let managed = self.fast_open_managed_keys.unwrap_or(matches!(
+            self.fast_open_cookie_policy,
+            ntcp::FastOpenCookiePolicy::HmacSha256
+        ));
+        if managed && self.fast_open_key_lease.is_some() {
+            return Err(invalid());
+        }
+        Ok(managed)
+    }
+
     pub fn validate(&self) -> io::Result<()> {
+        self.fast_open_keys_managed()?;
+        if let Some(lease) = self.fast_open_key_lease {
+            lease
+                .validate(lease.not_before, self.tcp.connection.timebase)
+                .map_err(|_| invalid())?;
+        }
         if self.io.receive_aggregation && self.io.backend != Backend::AfPacket {
             return Err(invalid());
         }
@@ -250,6 +277,35 @@ impl SocketConfig {
                     };
                 }
                 "socket.fast_open_cookie" => cookie_mode = value,
+                "socket.fast_open_managed_keys" => {
+                    config.fast_open_managed_keys = Some(match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(invalid()),
+                    })
+                }
+                "socket.fast_open_cookie_lifetime_us" => {
+                    config.fast_open_cookie_lifetime =
+                        ntcp::FastOpenCookieLifetime::from_micros(number(value)?)
+                            .map_err(|_| invalid())?;
+                }
+                "socket.fast_open_key_not_before_us"
+                | "socket.fast_open_key_issue_until_us"
+                | "socket.fast_open_key_accept_until_us" => {
+                    let lease = config
+                        .fast_open_key_lease
+                        .get_or_insert(ntcp::FastOpenKeyLease {
+                            not_before: 0,
+                            issue_until: 0,
+                            accept_until: 0,
+                            units_per_second: 1_000_000,
+                        });
+                    match key {
+                        "socket.fast_open_key_not_before_us" => lease.not_before = number(value)?,
+                        "socket.fast_open_key_issue_until_us" => lease.issue_until = number(value)?,
+                        _ => lease.accept_until = number(value)?,
+                    }
+                }
                 "socket.fast_open_key" => cookie_key = Some(value),
                 "socket.notsent_lowat" => config.socket.notsent_lowat = number(value)?,
                 "io.backend" => {

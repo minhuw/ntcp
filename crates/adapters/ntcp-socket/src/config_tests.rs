@@ -4,6 +4,36 @@ use super::*;
 const BASE: &str = "io.interface=ntcp0\nio.address=10.73.0.2\n";
 
 #[test]
+fn finite_cookie_lifetime_and_explicit_lease_configuration() {
+    let config = SocketConfig::parse(&format!("{BASE}socket.fast_open_managed_keys=false\nsocket.fast_open_cookie_lifetime_us=100\nsocket.fast_open_key_not_before_us=10\nsocket.fast_open_key_issue_until_us=110\nsocket.fast_open_key_accept_until_us=210\n")).unwrap();
+    assert_eq!(config.fast_open_managed_keys, Some(false));
+    assert_eq!(config.fast_open_cookie_lifetime.as_micros(), 100);
+    assert_eq!(
+        config.fast_open_key_lease.unwrap(),
+        ntcp::FastOpenKeyLease {
+            not_before: 10,
+            issue_until: 110,
+            accept_until: 210,
+            units_per_second: 1_000_000,
+        }
+    );
+    for suffix in [
+        "socket.fast_open_cookie_lifetime_us=0",
+        "socket.fast_open_cookie_lifetime_us=18446744073709551615",
+        "socket.fast_open_managed_keys=1",
+        "socket.fast_open_key_issue_until_us=100",
+        "socket.fast_open_key_issue_until_us=100\nsocket.fast_open_key_accept_until_us=99",
+        "socket.fast_open_managed_keys=true\nsocket.fast_open_key_issue_until_us=100\nsocket.fast_open_key_accept_until_us=200",
+        "socket.fast_open_key_issue_until_us=50\nsocket.fast_open_key_accept_until_us=100",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}{suffix}")).is_err(),
+            "{suffix}"
+        );
+    }
+}
+
+#[test]
 fn parser_and_typed_validation() {
     let default = SocketConfig::new("ntcp0", "10.73.0.2".parse::<std::net::IpAddr>().unwrap());
     assert_eq!(

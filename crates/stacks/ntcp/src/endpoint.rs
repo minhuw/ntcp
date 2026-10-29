@@ -338,7 +338,7 @@ struct Slot {
 }
 struct Listener {
     early_data_policy: crate::FastOpenEarlyDataPolicy,
-    fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
+    fast_open_cookie_policy: Option<crate::fast_open::ServerCookieContext>,
     fast_open_limit: usize,
     reset_debt: usize,
     reset_debt_expiry: Option<Instant>,
@@ -371,8 +371,10 @@ impl Listener {
 pub struct Endpoint {
     #[cfg(feature = "packet-test-controls")]
     test_timestamp_default: Option<bool>,
-    fast_open_cookie_policy: FastOpenCookiePolicy,
+    fast_open_cookie_policy: crate::fast_open::ServerCookieContext,
+    fast_open_credentials: crate::fast_open::CredentialRegistry,
     fast_open_hmac_key: [u8; 32],
+    fast_open_hmac_error: Option<Error>,
     fast_open: Option<crate::fast_open::FastOpen>,
     reservations: Vec<crate::output_reservation::OutputReservation>,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
@@ -484,8 +486,16 @@ impl Endpoint {
             #[cfg(feature = "packet-test-controls")]
             test_timestamp_default: None,
             fast_open: None,
-            fast_open_cookie_policy: FastOpenCookiePolicy::default(),
+            fast_open_cookie_policy: crate::fast_open::ServerCookieContext::new(
+                crate::FastOpenServerKey::HmacSha256(secret),
+            ),
+            fast_open_credentials: crate::fast_open::CredentialRegistry::new(
+                &crate::FastOpenServerKey::HmacSha256(secret),
+                config.connection.timebase,
+                now,
+            ),
             fast_open_hmac_key: secret,
+            fast_open_hmac_error: None,
             reservations: Vec::new(),
             address_policy: Box::new(address_policy),
             passive_errors,
@@ -1158,7 +1168,6 @@ impl Endpoint {
                 .fast_open_cookie_policy
                 .as_ref()
                 .unwrap_or(&self.fast_open_cookie_policy);
-            let epoch = self.now / self.fast_open_lifetime();
             let protected = self.listeners[listener.slot]
                 .as_ref()
                 .unwrap()
@@ -1173,10 +1182,10 @@ impl Endpoint {
             let valid = !protected
                 && syn.options.fast_open.is_some_and(|cookie| {
                     policy.valid(
-                        &self.fast_open_hmac_key,
+                        &self.fast_open_credentials,
+                        self.now,
                         tuple.local.ip(),
                         tuple.remote.ip(),
-                        epoch,
                         cookie,
                     )
                 });
@@ -1191,13 +1200,13 @@ impl Endpoint {
             // This decision is independent of payload admission and pending quota.
             if !protected
                 && syn.options.fast_open.is_some()
-                && (!valid || policy.refresh_valid_cookie())
+                && (!valid || policy.policy().refresh_valid_cookie())
             {
                 fast_open_response = policy.issue(
-                    &self.fast_open_hmac_key,
+                    &self.fast_open_credentials,
+                    self.now,
                     tuple.local.ip(),
                     tuple.remote.ip(),
-                    epoch,
                 );
             }
         }
@@ -1386,7 +1395,101 @@ impl Endpoint {
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1
     //# The server can expire the cookie at any time to enhance security.
     pub fn set_fast_open_cookie_policy(&mut self, policy: FastOpenCookiePolicy) {
-        self.fast_open_cookie_policy = policy;
+        if let Err(EndpointError::Connection(error)) = self.try_set_fast_open_cookie_policy(policy)
+        {
+            self.fast_open_cookie_policy.error = Some(error);
+        }
+    }
+
+    /// Atomic policy selection. Known material retains its original timing,
+    /// including an expired lease (selection succeeds but remains inactive).
+    /// New identities require memory within max_buffer_bytes; none are evicted.
+    pub fn try_set_fast_open_cookie_policy(
+        &mut self,
+        policy: FastOpenCookiePolicy,
+    ) -> Result<(), EndpointError> {
+        let key = self.fast_open_server_key(policy);
+        let id = self.register_fast_open_credential(
+            &key,
+            self.fast_open_cookie_policy.lifetime,
+            self.now,
+            None,
+        )?;
+        self.fast_open_cookie_policy.replace(key, id);
+        Ok(())
+    }
+
+    /// Inspect a legacy default selection failure. A blocked selection issues
+    /// and accepts no cookies; ordinary TCP remains available.
+    pub fn fast_open_cookie_error(&self) -> Option<Error> {
+        self.fast_open_cookie_policy.error
+    }
+
+    /// Last legacy HMAC registration failure, including a key staged while a
+    /// different codec is selected. Contains no key material.
+    pub fn fast_open_hmac_key_error(&self) -> Option<Error> {
+        self.fast_open_hmac_error
+    }
+
+    pub fn listener_fast_open_cookie_error(
+        &self,
+        id: ListenerId,
+    ) -> Result<Option<Error>, EndpointError> {
+        let listener = self.listener(id)?;
+        Ok(listener
+            .fast_open_cookie_policy
+            .as_ref()
+            .unwrap_or(&self.fast_open_cookie_policy)
+            .error)
+    }
+
+    /// Permanent identity count and actual dynamic registry allocation charge.
+    /// The constructor identity uses inline storage and requires no allocation.
+    pub fn fast_open_key_registry_usage(&self) -> (usize, usize) {
+        (
+            self.fast_open_credentials.len(),
+            self.fast_open_credentials.allocation_bytes(),
+        )
+    }
+
+    fn register_fast_open_credential(
+        &mut self,
+        key: &crate::FastOpenServerKey,
+        lifetime: crate::FastOpenCookieLifetime,
+        now: Instant,
+        lease: Option<crate::FastOpenKeyLease>,
+    ) -> Result<usize, EndpointError> {
+        let before = self.fast_open_credentials.allocation_bytes();
+        let room = self.buffer_room();
+        let id = self.fast_open_credentials.register(
+            key,
+            lifetime,
+            now,
+            self.config.connection.timebase,
+            lease,
+            room,
+        )?;
+        self.buffer_bytes += self.fast_open_credentials.allocation_bytes() - before;
+        Ok(id)
+    }
+
+    /// Register staged administrative material without selecting it. Socket
+    /// adapters use this before listen so staging cannot renew an old identity.
+    /// Failure changes neither canonical bounds nor the endpoint clock.
+    pub fn register_fast_open_key(
+        &mut self,
+        now: Instant,
+        key: crate::FastOpenServerKey,
+        lease: crate::FastOpenKeyLease,
+    ) -> Result<(), EndpointError> {
+        self.check_clock(now)?;
+        self.register_fast_open_credential(
+            &key,
+            self.fast_open_cookie_policy.lifetime,
+            now,
+            Some(lease),
+        )?;
+        self.clock(now)
     }
 
     /// Replace the endpoint-wide HMAC cookie key for future passive opens,
@@ -1399,7 +1502,37 @@ impl Endpoint {
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1
     //# The server can expire the cookie at any time to enhance security.
     pub fn set_fast_open_hmac_key(&mut self, key: [u8; 32]) {
+        if let Err(EndpointError::Connection(error)) = self.try_set_fast_open_hmac_key(key) {
+            // Preserve revocation intent even though the void API cannot return
+            // failure. Explicit listeners stay explicit, including blocked ones.
+            self.fast_open_hmac_key = key;
+            self.fast_open_hmac_error = Some(error);
+            self.fast_open_cookie_policy.block_hmac(key, error);
+            for listener in self.listeners.iter_mut().flatten() {
+                if let Some(context) = &mut listener.fast_open_cookie_policy {
+                    context.block_hmac(key, error);
+                }
+            }
+        }
+    }
+
+    /// Fallible endpoint-wide HMAC replacement; failure is atomic for all users.
+    pub fn try_set_fast_open_hmac_key(&mut self, key: [u8; 32]) -> Result<(), EndpointError> {
+        let id = self.register_fast_open_credential(
+            &crate::FastOpenServerKey::HmacSha256(key),
+            self.fast_open_cookie_policy.lifetime,
+            self.now,
+            None,
+        )?;
         self.fast_open_hmac_key = key;
+        self.fast_open_hmac_error = None;
+        self.fast_open_cookie_policy.replace_hmac(key, id);
+        for listener in self.listeners.iter_mut().flatten() {
+            if let Some(context) = &mut listener.fast_open_cookie_policy {
+                context.replace_hmac(key, id);
+            }
+        }
+        Ok(())
     }
 
     /// Override one live listener's policy; `None` inherits the endpoint policy.
@@ -1410,11 +1543,157 @@ impl Endpoint {
         policy: Option<FastOpenCookiePolicy>,
     ) -> Result<(), EndpointError> {
         self.listener(id)?;
+        let context = if let Some(policy) = policy {
+            let key = self.fast_open_server_key(policy);
+            let mut context = self.listeners[id.slot]
+                .as_ref()
+                .unwrap()
+                .fast_open_cookie_policy
+                .clone()
+                .unwrap_or_else(|| self.fast_open_cookie_policy.clone());
+            let credential =
+                self.register_fast_open_credential(&key, context.lifetime, self.now, None)?;
+            context.replace(key, credential);
+            Some(context)
+        } else {
+            None
+        };
         self.listeners[id.slot]
             .as_mut()
             .unwrap()
-            .fast_open_cookie_policy = policy;
+            .fast_open_cookie_policy = context;
         Ok(())
+    }
+
+    fn fast_open_server_key(&self, policy: FastOpenCookiePolicy) -> crate::FastOpenServerKey {
+        match policy {
+            FastOpenCookiePolicy::HmacSha256 => {
+                crate::FastOpenServerKey::HmacSha256(self.fast_open_hmac_key)
+            }
+            #[cfg(feature = "tfo-linux-cookie")]
+            FastOpenCookiePolicy::LinuxSipHash24(key) => {
+                crate::FastOpenServerKey::LinuxSipHash24(key)
+            }
+        }
+    }
+
+    /// Configure the duration for future key installations. Existing credentials
+    /// keep their epoch and lease deadlines; this cannot renew or revive them.
+    /// Client cache aging and negative-cache policy remain independent.
+    pub fn set_fast_open_cookie_lifetime(&mut self, lifetime: crate::FastOpenCookieLifetime) {
+        self.fast_open_cookie_policy.lifetime = lifetime;
+    }
+
+    /// Configure one listener's future key installations. An inherited listener
+    /// snapshots the default key context, including its original deadlines.
+    pub fn set_listener_fast_open_cookie_lifetime(
+        &mut self,
+        id: ListenerId,
+        lifetime: crate::FastOpenCookieLifetime,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        let context = self.listeners[id.slot]
+            .as_mut()
+            .unwrap()
+            .fast_open_cookie_policy
+            .get_or_insert_with(|| self.fast_open_cookie_policy.clone());
+        context.lifetime = lifetime;
+        Ok(())
+    }
+
+    /// Install actual key material with absolute deadlines in the endpoint's
+    /// timebase. `rotate` retains at most one prior accepting key through its
+    /// original deadline; false immediately revokes it. Same-key installs never
+    /// extend deadlines, including after expiry. Reuse of a retiring key fails.
+    /// Across restart the embedding must preserve trusted lease deadlines or
+    /// install fresh keys; this endpoint does not provide persistent time trust.
+    /// Does not select protected mode, enable TFO, or mutate children/output.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+    //= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw-key restart continuity still requires T20/T15 trusted original lease/time mapping; the whole lifecycle remains TODO until that integration.
+    //# 5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+    //= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO for unmeasured relative generation/verification cost (T6) and external raw-key restart/time continuity (T20/T15).
+    //# The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use "SHOULD" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+    //= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20/T15 integration of trusted original lease/time mapping across external raw-key restart.
+    //# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
+    //= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. This cross-reference still imports unmeasured relative MAC cost (T6) and trusted external raw-key restart/time continuity (T20/T15), so the whole clause remains TODO.
+    //# 2. The server responds with a SYN-ACK based on the procedures in the "Server Cookie Handling" section (Section 4.1.2).
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. The whole reuse lifecycle remains TODO for T20/T15 trusted original lease/time mapping across external raw-key restart.
+    //# Once the client obtains the cookie from the target server, it can perform subsequent TFO connections until the cookie is expired by the server.
+    pub fn install_fast_open_key(
+        &mut self,
+        now: Instant,
+        key: crate::FastOpenServerKey,
+        lease: crate::FastOpenKeyLease,
+        rotate: bool,
+    ) -> Result<(), EndpointError> {
+        self.check_clock(now)?;
+        let hmac_key = match &key {
+            crate::FastOpenServerKey::HmacSha256(key) => Some(*key),
+            #[cfg(feature = "tfo-linux-cookie")]
+            crate::FastOpenServerKey::LinuxSipHash24(_) => None,
+        };
+        self.fast_open_cookie_policy.check_install(&key)?;
+        let id = self.register_fast_open_credential(
+            &key,
+            self.fast_open_cookie_policy.lifetime,
+            now,
+            Some(lease),
+        )?;
+        self.fast_open_cookie_policy.install(
+            key,
+            id,
+            &mut self.fast_open_credentials,
+            now,
+            self.config.connection.timebase,
+            rotate,
+        );
+        if let Some(key) = hmac_key {
+            self.fast_open_hmac_key = key;
+            self.fast_open_hmac_error = None;
+        }
+        self.clock(now)
+    }
+
+    /// Listener-scoped timed installation using the same bounded key context.
+    /// None/default inheritance can subsequently be restored with the policy setter.
+    pub fn install_listener_fast_open_key(
+        &mut self,
+        now: Instant,
+        id: ListenerId,
+        key: crate::FastOpenServerKey,
+        lease: crate::FastOpenKeyLease,
+        rotate: bool,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        self.check_clock(now)?;
+        lease.validate(now, self.config.connection.timebase)?;
+        let timebase = self.config.connection.timebase;
+        let mut context = self.listeners[id.slot]
+            .as_ref()
+            .unwrap()
+            .fast_open_cookie_policy
+            .clone()
+            .unwrap_or_else(|| self.fast_open_cookie_policy.clone());
+        context.check_install(&key)?;
+        let credential =
+            self.register_fast_open_credential(&key, context.lifetime, now, Some(lease))?;
+        context.install(
+            key,
+            credential,
+            &mut self.fast_open_credentials,
+            now,
+            timebase,
+            rotate,
+        );
+        self.listeners[id.slot]
+            .as_mut()
+            .unwrap()
+            .fast_open_cookie_policy = Some(context);
+        self.clock(now)
     }
 
     /// Enable the bounded cookie service. Cookies authenticate addresses, not
