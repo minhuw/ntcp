@@ -244,6 +244,62 @@ class PmtudInventory(unittest.TestCase):
             if row["id"] != "1191-025":
                 self.assertGreaterEqual(counts[key], 2, row["id"])
 
+    def test_contemporary_policy_keeps_whole_quote_and_host_integration_gaps(self):
+        rows = {p["id"]: p for p in self.inventory(1191)["paragraphs"]}
+        plateau = rows["1191-099"]
+        full_key = plateau["target"] + "\n" + " ".join(plateau["quote"].split())
+        self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(),
+                         "925511a597fd044370716a667751ee20e22334a330af0ba11a848c9a30732bf5")
+        self.assertEqual(plateau["status"], "covered")
+        self.assertEqual(plateau["evidence"], [
+            "crates/stacks/ntcp-path/src/service.rs::    pub fn set_ipv4_plateaus(",
+            "crates/stacks/ntcp-path/tests/lifecycle.rs::fn live_policy_replacement_notifies_ipv4_only_and_preserves_all_learned_estimates(",
+        ])
+        self.assertIn("AWS EC2 and Google VPC", plateau["reason"])
+        self.assertIn("historical defaults and Error compatibility", plateau["reason"])
+        # Table policy does not establish validated ICMP dispatch, fragmentation
+        # or actual cross-protocol consumers at the managed host boundary.
+        self.assertEqual(rows["1191-050"]["status"], "TODO")
+        self.assertIn("T9", rows["1191-050"]["reason"])
+        self.assertIn("T13", rows["1191-050"]["reason"])
+        self.assertEqual(rows["1191-059"]["status"], "TODO")
+        self.assertEqual(rows["1191-060"]["status"], "context")
+        self.assertEqual(rows["1191-060"]["quote"], "path.")
+
+    def test_shared_path_interface_closures_keep_exact_keys_and_partial_runtime_obligations(self):
+        rows = {p["id"]: p for p in self.inventory(1191)["paragraphs"]}
+        for key, digest in {
+            "1191-052": "2d4c2d93d53134f45bbc4f1b1ee8626b7285919f186119e1c326dca29afdaff6",
+            "1191-053": "97fb5f346af4c744925251b2dacd00b184658c991039343f86d4ab6ab4725b9e",
+            "1191-055": "e6185f5b761aaad8bbd9830d175b96794b28694eddeccdeae2abb88458db1a61",
+        }.items():
+            row = rows[key]
+            full_key = row["target"] + "\n" + " ".join(row["quote"].split())
+            self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(), digest, key)
+            self.assertEqual(row["status"], "covered", key)
+            self.assertEqual(len(row["evidence"]), 2, key)
+            self.assertIn("ntcp-path/src/service/cache.rs::", row["evidence"][0])
+            self.assertIn("ntcp-path/tests/lifecycle.rs::", row["evidence"][1])
+        for key, dependencies in {
+            "1191-021": ("T8", "T9/T10"),
+            "1191-050": ("T8/T10", "T9", "T13"),
+            "1191-056": ("T8/T9",),
+            "1191-057": ("T8/T9", "T10"),
+            "1191-058": ("T8/T10", "T9"),
+            "1191-059": ("T9/T10",),
+            "1191-074": ("T8/T9/T10",),
+        }.items():
+            self.assertEqual(rows[key]["status"], "TODO", key)
+            self.assertNotIn("T7 phase2", rows[key]["reason"], key)
+            for dependency in dependencies:
+                self.assertIn(dependency, rows[key]["reason"], key)
+        for key in ("1191-056", "1191-057", "1191-058", "1191-074"):
+            self.assertEqual(len(rows[key]["evidence"]), 2, key)
+        rows6 = {p["id"]: p for p in self.inventory(8201)["paragraphs"]}
+        for key in ("8201-049", "8201-050", "8201-052", "8201-062", "8201-063"):
+            self.assertEqual(rows6[key]["status"], "TODO", key)
+            self.assertIn("T7 PathService", rows6[key]["reason"], key)
+
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:
             with self.subTest(rfc=n):

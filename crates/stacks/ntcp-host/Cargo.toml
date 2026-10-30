@@ -1,0 +1,9 @@
+[package]
+name = "ntcp-host"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/minhuw/ntcp"
+
+[dependencies]
+ntcp-path = { path = "../ntcp-path", version = "0.0.1" }

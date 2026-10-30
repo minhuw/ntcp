@@ -51,7 +51,7 @@ Note that Path MTU Discovery must be performed even in cases where a node "think
 # 8201-049
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
-reason = "PMTU state lives in Connection rather than the suggested IP-layer cache, and there is no generic MMS_S-change interface to other packetization layers. Extension-header parsing is not the reason for this storage/service gap."
+reason = "T7 PathService now stores shared IPv6 per-host estimates with versioned MMS_S and complete-header queries, bounded client notifications and checked route/link/source provenance. Actual serialized host ownership and Connection/datagram bindings remain T8/T10; validated ICMPv6 processing and submitted-quote correlation remain T9."
 quote = '''
 It is therefore suggested that the IP layer store PMTU information and that the ICMPv6 layer process received Packet Too Big messages. The packetization layers may respond to changes in the PMTU by changing the size of the messages they send. To support this layering, packetization layers require a way to learn of changes in the value of MMS_S, the "maximum send transport-message size" [RFC1122].
 '''
@@ -59,7 +59,7 @@ It is therefore suggested that the IP layer store PMTU information and that the 
 # 8201-050
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
-reason = "Supported base IPv6 headers and TCP options are budgeted without source fragmentation, but accounting for IPv6 extension-header lengths is unsupported. Source fragmentation is an explicitly conditional alternative, not itself a required missing capability."
+reason = "T7 PathService checks complete caller-provided IPv6 header lengths, including extension overhead, independently of minimum-header MMS_S and transport ceilings. Actual extension parsing/encoding and managed packetization use remain T17/T8/T10; fragmentation and reassembly-aware EMTU_S remain T13/T16. Source fragmentation remains an explicitly conditional alternative in this quote."
 quote = '''
 MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see "Fragment Header", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.
 '''
@@ -67,7 +67,7 @@ MMS_S is a transport message size calculated by subtracting the size of the IPv6
 # 8201-052
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "Connection-local tuples are the selected path representation, and distinct-local-address PTB isolation is tested. Endpoint rejects nonzero IPv6 scope IDs; ipv6_endpoint_rejects_scoped_link_identity_instead_of_claiming_interface_isolation pins rejection for two link-local scopes. Thus per-IPv6-link PMTU maintenance on multiple interfaces is unsupported/unestablished, not merely missing a distinct-address test. The full paragraph remains TODO without inventing a shared-cache requirement."
+reason = "T7 PathService maintains independent learned estimates for canonical scoped IPv6 source/destination/link generations; public tests exercise identical link-local octets on two live links. Actual Endpoint/native scope propagation, managed binding and ND remain T8/T18; existing Endpoint rejection of nonzero scope IDs is preserved until that integration."
 quote = '''
 Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.
 '''
@@ -131,7 +131,7 @@ The node then uses the value in the MTU field in the Packet Too Big message as a
 # 8201-062
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "PTB changes only the matching Connection; no shared-path fanout notifies every packetization-layer instance using that path."
+reason = "T7 PathService marks every bound IPv6 client dirty on a trusted decrease and preserves newest snapshots across blocked readers and independent acknowledgements. Actual Connection/datagram bindings, validated ICMPv6 production and physical output barriers remain T8/T9/T10; logical client fanout alone does not establish runtime packetization integration."
 quote = '''
 The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
 '''
@@ -139,7 +139,7 @@ The packetization layers must be notified about decreases in the PMTU. Any packe
 # 8201-063
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "UDP-quoted IPv6 PTB is not dispatched to TCP connections sharing the path; no cross-protocol notification mechanism exists."
+reason = "T7 PathService shares trusted IPv6 decreases across independent clients without transport-specific state. Actual UDP submission, validated UDP-quoted ICMPv6 correlation and dispatch to bound TCP connections remain T9/T10."
 quote = '''
 Note: even if the Packet Too Big message contains an Original Packet Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given path.
 '''

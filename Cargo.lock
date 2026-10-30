@@ -101,6 +101,7 @@ dependencies = [
  "ntcp-ip",
  "ntcp-ip-common",
  "ntcp-ip6",
+ "ntcp-path",
  "sha2",
  "siphasher",
  "subtle",
@@ -122,6 +123,13 @@ dependencies = [
  "ntcp-ip",
  "ntcp-ip-common",
  "ntcp-ip6",
+]
+
+[[package]]
+name = "ntcp-host"
+version = "0.0.1"
+dependencies = [
+ "ntcp-path",
 ]
 
 [[package]]
@@ -208,6 +216,10 @@ dependencies = [
  "ntcp-ip",
  "ntcp-socket",
 ]
+
+[[package]]
+name = "ntcp-path"
+version = "0.0.1"
 
 [[package]]
 name = "ntcp-rfc-host"

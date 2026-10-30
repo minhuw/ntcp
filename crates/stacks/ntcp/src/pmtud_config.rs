@@ -34,39 +34,25 @@ impl SearchAging {
     }
 }
 
+/// Public compatibility adapter for the canonical IP-layer plateau policy.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Ipv4Plateaus {
-    values: [u32; Self::CAPACITY],
-    len: u8,
-}
+pub struct Ipv4Plateaus(ntcp_path::Ipv4Plateaus);
 
 impl Ipv4Plateaus {
-    pub const CAPACITY: usize = 16;
-    pub const RFC1191: Self = Self {
-        values: [
-            65535, 32000, 17914, 8166, 4352, 2002, 1492, 1006, 508, 296, 68, 0, 0, 0, 0, 0,
-        ],
-        len: 11,
-    };
+    pub const CAPACITY: usize = ntcp_path::Ipv4Plateaus::CAPACITY;
+    pub const RFC1191: Self = Self(ntcp_path::Ipv4Plateaus::RFC1191);
+    pub const HISTORICAL: Self = Self::RFC1191;
+    pub const CONTEMPORARY: Self = Self(ntcp_path::Ipv4Plateaus::CONTEMPORARY);
 
     pub fn new(values: &[u32]) -> Result<Self, Error> {
-        if values.len() > Self::CAPACITY
-            || values.last() != Some(&68)
-            || values.iter().any(|v| !(68..=65535).contains(v))
-            || values.windows(2).any(|v| v[0] <= v[1])
-        {
-            return Err(Error::InvalidArgument);
-        }
-        let mut table = Self {
-            values: [0; Self::CAPACITY],
-            len: values.len() as u8,
-        };
-        table.values[..values.len()].copy_from_slice(values);
-        Ok(table)
+        ntcp_path::Ipv4Plateaus::new(values)
+            .map(Self)
+            .map_err(|_| Error::InvalidArgument)
     }
 
     pub fn as_slice(&self) -> &[u32] {
-        &self.values[..usize::from(self.len)]
+        self.0.as_slice()
     }
 }
 

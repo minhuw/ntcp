@@ -352,7 +352,7 @@
       "section": "3.1",
       "quote": "Some TCP implementations send an MSS option only if the destination host is on a non-connected network. However, in general the TCP layer may not have the appropriate information to make this decision, so it is preferable to leave to the IP layer the task of determining a suitable MTU for the Internet path.",
       "status": "TODO",
-      "reason": "Quoted RFC1122 layering recommendation: path selection is Connection-local, not an IP-layer MTU service. This is not a multihoming MSS-advertisement clause; first-hop limits and advertised MSS are audited separately.",
+      "reason": "T7 PathService resolves authoritative IP forwarding paths and stores independent learned per-host estimates with MMS_S and complete-header budgets. Actual native/TUN TCP selection and serialized IP ownership remain T8; validated shared ICMP decreases and runtime fanout remain T9/T10. First-hop receive MSS/topology advertisement remains independently audited.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
     },
     {
@@ -587,7 +587,7 @@
       "section": "6.1",
       "quote": "We therefore believe that the IP layer should store PMTU information and that the ICMP layer should process received Datagram Too Big messages. The packetization layers must still be able to respond to changes in the Path MTU, by changing the size of the datagrams they send, and must also be able to specify that datagrams are sent with the DF bit set. We do not want the IP layer to simply set the DF bit in every packet, since it is possible that a packetization layer, perhaps a UDP application outside the kernel, is unable to change its datagram size. Protocols involving intentional fragmentation, while inelegant, are sometimes successful (NFS being the primary example), and we do not want to break such protocols.",
       "status": "TODO",
-      "reason": "The shared IP-layer PMTU storage recommendation is not implemented: state lives in Connection. TCP does adapt its packetization and the codec sets DF; this retained layering gap is not a claim that those host behaviors are absent.",
+      "reason": "T7 PathService provides bounded shared IP per-host estimates, canonical forwarding authority, checked budgets and versioned client notifications. The whole compound obligation still needs actual serialized host and packetization integration T8/T10, validated ICMP processing T9 and intentional datagram fragmentation/DF policy T13. Existing TCP packetization and codec DF behavior remain supported.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
     },
     {
@@ -601,17 +601,25 @@
       "id": "1191-052",
       "section": "6.1",
       "quote": "A way to learn of changes in the value of MMS_S, the \"maximum send transport-message size\", which is derived from the Path MTU by subtracting the minimum IP header size.",
-      "status": "TODO",
-      "reason": "No generic IP MMS_S-change service interface is exposed to packetization layers; TCP internally refreshes its own send budget.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
+      "status": "covered",
+      "reason": "T7 PathService exposes minimum-header MMS_S and checked complete-header payload budgets through versioned snapshots, bounded dirty scans and explicit path-generation acknowledgements. Public dual-family tests verify independent consumers, coalescing and readN/update/ackN without consuming newer changes. Actual TCP budget application and physical submission barriers remain separate T8/T10 obligations.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    pub fn mms_s(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn independent_clients_share_network_decreases_and_coalesce_without_consuming_reads("
+      ]
     },
     {
       "id": "1191-053",
       "section": "6.2",
       "quote": "In general, the IP layer should associate each PMTU value that it has learned with a specific path. A path is identified by a source address, a destination address and an IP type-of-service. (Some implementations do not record the source address of paths; this is acceptable for single-homed hosts, which have only one possible source address.)",
-      "status": "TODO",
-      "reason": "Connection identity stores local/remote addresses but does not provide the described shared IP path association including type-of-service.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
+      "status": "covered",
+      "reason": "T7 PathService stores each learned estimate under the canonical context, source identity/address, destination/scope, routing DSCP, link, next-hop and route generation. Mutable ECN and transport ports are excluded; public tests prove sharing and independent source/destination/DSCP/scoped-link estimates. Native/TUN binding and validated ICMP production remain separate T8/T9 integration obligations.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    pub fn trusted_decrease(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn cached_estimates_are_isolated_by_source_dscp_destination_and_ecn_is_excluded("
+      ]
     },
     {
       "id": "1191-054",
@@ -624,32 +632,48 @@
       "id": "1191-055",
       "section": "6.2",
       "quote": "The obvious place to store this association is as a field in the routing table entries. A host will not have a route for every possible destination, but it should be able to cache a per-host route for every active destination. (This requirement is already imposed by the need to process ICMP Redirect messages.)",
-      "status": "TODO",
-      "reason": "No per-host routing-table PMTU cache exists. Connection-local state is not evidence of the suggested routing-cache organization.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
+      "status": "covered",
+      "reason": "T7 PathService maintains bounded per-host resolved routing records with independent learned estimates and exact first-hop authority. Every acquired active destination is pinned by its clients; capacity exhaustion preserves active records, and deterministic idle eviction uses fresh generations. Public tests exercise shared pinning, full-cache backpressure, idle reuse and repeated release cycles. ICMP Redirect processing remains a separate T9 producer obligation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    pub fn acquire(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn active_pinning_full_cache_atomic_rebind_idle_eviction_and_stale_handles("
+      ]
     },
     {
       "id": "1191-056",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    fn install_path(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn independent_clients_share_network_decreases_and_coalesce_without_consuming_reads("
+      ],
       "section": "6.2",
       "quote": "When the first packet is sent to a host for which no per-host route exists, a route is chosen either from the set of per-network routes, or from the set of default routes. The PMTU fields in these route entries should be initialized to be the MTU of the associated first-hop data link, and must never be changed by the PMTU Discovery process. (PMTU Discovery only creates or changes entries for per-host routes). Until a Datagram Too Big message is received, the PMTU associated with the initially-chosen route is presumed to be accurate.",
       "status": "TODO",
-      "reason": "No per-network/default/per-host routing-entry hierarchy implements this initialization and immutable first-hop-entry scheme. Connection first-hop initialization is independently implemented.",
+      "reason": "T7 PathService initializes resolved per-host records from the physical first hop, retaining immutable network/default forwarding facts separately from learned decreases and query-only transport limits. Public tests prove host isolation and no learned copying across route/link generations. Actual first-packet managed host selection and validated ICMP dispatch remain T8/T9.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
       "id": "1191-057",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    pub fn trusted_ipv4_fallback(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn live_policy_replacement_notifies_ipv4_only_and_preserves_all_learned_estimates("
+      ],
       "section": "6.2",
       "quote": "When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.",
       "status": "TODO",
-      "reason": "A received PTB can reduce a Connection estimate, but no per-host route is created or updated in a routing table as described here.",
+      "reason": "T7 PathService trusted_decrease and live legacy fallback update only the resolved per-host estimate, preserving the selected first hop and checking live source/link/route generations. These trusted entrypoints do not authenticate received ICMP. Actual submitted-quote correlation, dispatch and creation/use by the serialized host remain T8/T9; packetization barriers and fanout remain T10.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
       "id": "1191-058",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    fn mark_dirty(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn independent_clients_share_network_decreases_and_coalesce_without_consuming_reads("
+      ],
       "section": "6.2",
       "quote": "The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.",
       "status": "TODO",
-      "reason": "Validated feedback updates only the matching Connection; no shared-path fanout notifies every active packetization-layer instance.",
+      "reason": "T7 PathService marks every bound client dirty on a trusted decrease, coalesces newest versions and preserves updates across independent acknowledgements and logical blocked consumers. Actual Connection/datagram bindings and physical output barriers remain T8/T10; validated ICMP production remains T9. Logical clients alone do not prove runtime packetization fanout.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -657,7 +681,7 @@
       "section": "6.2",
       "quote": "Note: even if the Datagram Too Big message contains an Original Datagram Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given",
       "status": "TODO",
-      "reason": "UDP-quoted PTB is not dispatched to TCP connections sharing that path; no cross-protocol fanout. Sentence continuation is preserved in 1191-060.",
+      "reason": "T7 PathService can share one trusted network decrease across independent clients regardless of transport. Actual UDP submission, validated UDP-quoted PTB correlation and dispatch to bound TCP connections remain T9/T10. Sentence continuation is preserved in 1191-060.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -778,10 +802,14 @@
     },
     {
       "id": "1191-074",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    pub(super) fn commit_revision(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn every_route_mutation_reconsiders_pinned_paths_including_live_shadowed_routes("
+      ],
       "section": "6.3",
       "quote": "PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.",
       "status": "TODO",
-      "reason": "No ICMP Redirect/route-deletion notification API refreshes packetization state. Local-link MTU updates are not equivalent to routing-cache invalidation.",
+      "reason": "T7 PathService atomically re-resolves every bound path after route/source/link changes, including new shadowing routes, retains pinned invalidated snapshots and notifies all clients. Failed rebind preserves pending invalidation with explicit capacity backpressure. Actual managed TCP refresh, physical output barriers and validated Redirect handling remain T8/T9/T10.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
@@ -997,16 +1025,20 @@
       "id": "1191-099",
       "section": "7",
       "quote": "We do not expect that the values in the table, especially for higher MTU levels, are going to be valid forever. The values given here are an implementation suggestion, NOT a specification or requirement. Implementors should use up-to-date references to pick a set of plateaus; it is important that the table not contain too many entries or the process of searching for a PMTU might waste Internet resources. Implementors should also make it convenient for customers without source code to update the table values in their systems (for example, the table in a BSD-derived Unix kernel could be changed using a new \"ioctl\" command).",
-      "status": "TODO",
-      "reason": "Partial gap after 0030a96 and 912cf80: bounded runtime Ipv4Plateaus (at most16 descending unique legal values ending in68) and live Endpoint::set_pmtud_policy provide source-free table replacement; tests cover custom selection, validation and legal IPv4 floor feedback. The default remains the historical RFC1191 table, with no up-to-date reference justification for contemporary plateau selection. Retain this full-span implementation-advice TODO for that aspect, not for missing runtime configuration.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7"
+      "status": "covered",
+      "reason": "T7 canonical bounded16 IPv4 policy selects nine contemporary values from AWS EC2 and Google VPC MTU documentation, RFC2516 PPPoE and RFC791 wire/fallback/floor limits. PathService defaults to this compact policy and atomically replaces validated tables at runtime without source changes; public tests exercise historical/custom/contemporary replacement and fallback. The low-level ntcp adapter preserves historical defaults and Error compatibility. Owner-authorized utility integration is independently T12, not a prerequisite imposed by this example ioctl advice.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service.rs::    pub fn set_ipv4_plateaus(",
+        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn live_policy_replacement_notifies_ipv4_only_and_preserves_all_learned_estimates("
+      ]
     },
     {
       "id": "1191-100",
       "section": "7",
       "quote": "Note: It might be a good idea to add a few table entries for values equal to small powers of 2 plus 40 (for the IP and TCP headers), where no similar values exist, since this seems to be a reasonably non-arbitrary way of choosing arbitrary values.",
       "status": "exception",
-      "reason": "Optional suggested plateau-table additions are not selected by default; the historical RFC1191 table remains the default. Runtime bounded table replacement is implemented; contemporary reference selection remains open at1191-099.",
+      "reason": "Optional suggested near-power-of-two additions are not required by the selected compact contemporary managed-service policy. The low-level historical default remains compatible; bounded source-free live replacement and current primary-reference selection are implemented at1191-099.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7"
     },
     {
@@ -1014,7 +1046,7 @@
       "section": "7",
       "quote": "The table might also contain entries for values slightly less than large powers of 2, in case MTUs are defined near those values (it is better in this case for the table entries to be low than to be high, or else the next lowest plateau may be chosen instead).",
       "status": "exception",
-      "reason": "Optional suggested plateau-table additions are not selected by default; the historical RFC1191 table remains the default. Runtime bounded table replacement is implemented; contemporary reference selection remains open at1191-099.",
+      "reason": "Optional suggested near-power-of-two additions are not required by the selected compact contemporary managed-service policy. The low-level historical default remains compatible; bounded source-free live replacement and current primary-reference selection are implemented at1191-099.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7"
     },
     {
@@ -1046,7 +1078,7 @@
       "section": "7.1",
       "quote": "Plateau MTU Comments Reference ------ --- -------- --------- 65535 Official maximum MTU RFC 791 65535 Hyperchannel RFC 1044 65535 32000 Just in case 17914 16Mb IBM Token Ring ref. [6] 17914 8166 IEEE 802.4 RFC 1042 8166 4464 IEEE 802.5 (4Mb max) RFC 1042 4352 FDDI (Revised) RFC 1188 4352 (1%) 2048 Wideband Network RFC 907 2002 IEEE 802.5 (4Mb recommended) RFC 1042 2002 (2%) 1536 Exp. Ethernet Nets RFC 895 1500 Ethernet Networks RFC 894 1500 Point-to-Point (default) RFC 1134 1492 IEEE 802.3 RFC 1042 1492 (3%) 1006 SLIP RFC 1055 1006 ARPANET BBN 1822 1006 576 X.25 Networks RFC 877 544 DEC IP Portal ref. [10] 512 NETBIOS RFC 1088 508 IEEE 802/Source-Rt Bridge RFC 1042 508 ARCNET RFC 1051 508 (13%) 296 Point-to-Point (low delay) RFC 1144 296 68 Official minimum MTU RFC 791",
       "status": "context",
-      "reason": "Exact Table7-1 supplies the selected plateau constants (65535,32000,17914,8166,4352,2002,1492,1006,508,296,68); 576 is an MTU row, NOT a plateau. Table values are expressly implementation suggestions under section7, not invented mandatory levels. Algorithm is inventoried in1191-039/040/041; update configurability remains1191-099 TODO."
+      "reason": "Exact Table7-1 supplies the explicit historical plateau constants (65535,32000,17914,8166,4352,2002,1492,1006,508,296,68); 576 is an MTU row, NOT a historical plateau. Table values are expressly implementation suggestions under section7, not invented mandatory levels. Algorithm is inventoried in1191-039/040/041; contemporary selection and source-free replacement are implemented at1191-099."
     },
     {
       "id": "1191-106",
