@@ -7,11 +7,15 @@
 mod linux {
     use ntcp::{
         AddressValidation, ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError,
-        Error, Event, IpMetadata, Ipv4Options, PmtudConfig, State, Tuple,
+        Error, Event, PmtudConfig, State, Tuple,
     };
+    #[cfg(test)]
+    use ntcp::{IpMetadata, Ipv4Options};
+    use ntcp_host::{EgressContext, Host, IngressContext, path};
     use ntcp_io::{PacketIo, TxOutcome};
     use ntcp_io_tun::Tun;
     use std::{
+        collections::VecDeque,
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
         os::fd::AsRawFd,
@@ -22,7 +26,201 @@ mod linux {
     const IP_HEADER: usize = 20;
     const MAX_FLOWS: usize = 128;
     const BUDGET: usize = 32;
+    const MAX_IP_PACKET: usize = 65575;
     const TICK_US: u64 = 10_000;
+
+    fn host_error(error: ntcp_host::Error) -> io::Error {
+        io::Error::other(format!("IP host: {error:?}"))
+    }
+
+    struct RetainedIngress {
+        owner: ConnectionId,
+        bytes: Vec<u8>,
+        timestamp: u32,
+    }
+
+    // One actual caller-owned L3 forwarding port. All ingress storage is
+    // allocated once, independently of remote traffic or transport buffers.
+    struct TunHost {
+        host: Host,
+        ingress: IngressContext,
+        local: IpAddr,
+        dscp: u8,
+        options_enabled: bool,
+        received: VecDeque<RetainedIngress>,
+        free: Vec<Vec<u8>>,
+    }
+
+    impl TunHost {
+        fn attach(
+            endpoint: &mut Endpoint,
+            config: &EndpointConfig,
+            local: IpAddr,
+        ) -> io::Result<Self> {
+            // Independent public lifetime identity, never derived from TCP's
+            // confidential ISN/Fast Open key or an interface/address alone.
+            let identity = acquire_secret()?;
+            // Occupied transport generations + one provisional factory and
+            // stateless lease; one serialized rebind gets migration headroom.
+            // Peer packets never create forwarding routes.
+            let (paths, limits) =
+                ntcp_host::managed_limits(config, 1, 1, 1, 1, 1).map_err(host_error)?;
+            let mut host = Host::new(
+                path::ContextId::new(u128::from_ne_bytes(identity[..16].try_into().unwrap())),
+                paths,
+                limits,
+                endpoint.caller_timebase(),
+            )
+            .map_err(host_error)?;
+            let forwarder = path::ForwarderId(1);
+            let ingress = host
+                .register_link(
+                    path::InterfaceKey(1),
+                    MTU as u32, // runtime_config checked the actual fixed TUN MTU.
+                    ntcp_host::ReceiveCapabilities {
+                        max_ip_packet: MAX_IP_PACKET,
+                        ipv4: if local.is_ipv4() {
+                            if config.ipv4_options_enabled {
+                                ntcp_host::Ipv4Receive::Options {
+                                    source_routes: true,
+                                }
+                            } else {
+                                ntcp_host::Ipv4Receive::Unrecognized
+                            }
+                        } else {
+                            ntcp_host::Ipv4Receive::Disabled
+                        },
+                        ipv6: if local.is_ipv6() {
+                            ntcp_host::Ipv6Receive::BaseHeader
+                        } else {
+                            ntcp_host::Ipv6Receive::Disabled
+                        },
+                        gro: false,
+                    },
+                    ntcp_host::Forwarding::Forwarder(forwarder),
+                )
+                .map_err(host_error)?;
+            host.register_source(
+                path::ScopedAddress::new(local, None).map_err(|e| host_error(e.into()))?,
+                ingress.link(),
+            )
+            .map_err(host_error)?;
+            host.add_route(path::Route {
+                destination: path::IpPrefix::new(
+                    if local.is_ipv4() {
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                    } else {
+                        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                    },
+                    0,
+                )
+                .map_err(|e| host_error(e.into()))?,
+                source: None,
+                dscp: None,
+                link: ingress.link(),
+                next_hop: path::NextHop::Forwarder(forwarder),
+                metric: 0,
+            })
+            .map_err(host_error)?;
+            let mut free = Vec::new();
+            free.try_reserve_exact(BUDGET)
+                .map_err(|_| host_error(ntcp_host::Error::Allocation))?;
+            for _ in 0..BUDGET {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(MAX_IP_PACKET)
+                    .map_err(|_| host_error(ntcp_host::Error::Allocation))?;
+                free.push(bytes);
+            }
+            let mut received = VecDeque::new();
+            received
+                .try_reserve_exact(BUDGET)
+                .map_err(|_| host_error(ntcp_host::Error::Allocation))?;
+            endpoint.enable_output_reservations().map_err(engine)?;
+            host.attach(endpoint).map_err(host_error)?;
+            Ok(Self {
+                host,
+                ingress,
+                local,
+                dscp: config.dscp,
+                options_enabled: config.ipv4_options_enabled,
+                received,
+                free,
+            })
+        }
+
+        fn owner(&self, endpoint: &Endpoint, frame: &[u8]) -> Option<ConnectionId> {
+            let packet = self.host.decode_ingress(self.ingress, frame).ok()?;
+            let tuple = if packet.protocol == 6 {
+                let tcp = ntcp::wire::parse(packet.ip, packet.payload).ok()?;
+                Tuple {
+                    local: SocketAddr::new(packet.ip.destination, tcp.header.destination_port),
+                    remote: SocketAddr::new(packet.ip.source, tcp.header.source_port),
+                }
+            } else {
+                let feedback = ntcp_icmp::decode_icmp(frame).ok()?;
+                if feedback.kind == ntcp_icmp::FeedbackKind::SourceQuench {
+                    return None;
+                }
+                let q = feedback.quoted;
+                Tuple {
+                    local: SocketAddr::new(q.ip.source, q.source_port),
+                    remote: SocketAddr::new(q.ip.destination, q.destination_port),
+                }
+            };
+            endpoint.connection_id(tuple)
+        }
+
+        fn can_receive(&self) -> bool {
+            !self.free.is_empty()
+        }
+
+        fn replay(&mut self, endpoint: &mut Endpoint, time: u64) -> io::Result<()> {
+            for _ in 0..self.received.len() {
+                let retained = self.received.pop_front().unwrap();
+                if endpoint.is_output_reserved(retained.owner) {
+                    self.received.push_back(retained);
+                    continue;
+                }
+                // A tuple reused by another generation cannot inherit input.
+                if self.owner(endpoint, &retained.bytes) == Some(retained.owner) {
+                    self.dispatch(endpoint, time, &retained.bytes, retained.timestamp)?;
+                }
+                let mut bytes = retained.bytes;
+                bytes.clear();
+                self.free.push(bytes);
+            }
+            Ok(())
+        }
+
+        fn dispatch(
+            &mut self,
+            endpoint: &mut Endpoint,
+            time: u64,
+            frame: &[u8],
+            timestamp: u32,
+        ) -> io::Result<()> {
+            match self.host.input_ip(
+                endpoint,
+                self.ingress,
+                time,
+                frame,
+                ntcp::RxPacketMetadata::default(),
+                self.dscp,
+                self.options_enabled.then_some(timestamp),
+            ) {
+                Ok(_) => Ok(()),
+                // Malformed/unsupported wire input remains a silent discard;
+                // bounded factory/provider failures remain observable to run().
+                Err(
+                    ntcp_host::Error::Codec(_)
+                    | ntcp_host::Error::Unsupported
+                    | ntcp_host::Error::Path(path::Error::NoRoute),
+                ) => Ok(()),
+                Err(error) => Err(host_error(error)),
+            }
+        }
+    }
 
     fn invalid(message: &str) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -106,11 +304,7 @@ mod linux {
         }
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
-    //= reason=The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.
-    //# The destination host MUST (if possible) add the current timestamp to
-    //# a Timestamp option before passing the option to the transport layer
-    //# or to ICMP for processing.
+    #[cfg(test)]
     fn parse_ipv4_options(
         packet: &[u8],
         local: Ipv4Addr,
@@ -198,10 +392,7 @@ mod linux {
             && ip.to_ipv4_mapped().is_none()
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
-    //= type=implementation
-    //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class; extension headers, fragmentation and jumbograms are scoped adapter limits.
-    //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
+    #[cfg(test)]
     fn parse_ipv6(packet: &[u8], local: Ipv6Addr) -> Option<(IpMetadata, u8, &[u8])> {
         let parsed = ntcp_ip6::parse(packet).ok()?;
         let (IpAddr::V6(source), IpAddr::V6(destination)) =
@@ -257,7 +448,17 @@ mod linux {
     //# Setting the DF bit implies the use of Path MTU Discovery as described
     //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
     //# that implements PAWS MUST also implement Path MTU Discovery.
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+    //= reason=The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.
+    //# The destination host MUST (if possible) add the current timestamp to
+    //# a Timestamp option before passing the option to the transport layer
+    //# or to ICMP for processing.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= type=implementation
+    //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class; extension headers, fragmentation and jumbograms are scoped adapter limits.
+    //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
     fn input_frame(
+        network: &mut TunHost,
         endpoint: &mut Endpoint,
         time: u64,
         packet: &[u8],
@@ -265,47 +466,46 @@ mod linux {
         options_enabled: bool,
         timestamp: u32,
     ) -> io::Result<()> {
-        // Decode complete outer frames. The router source need not be the peer;
-        // the endpoint validates the quoted tuple, live sequence and exact send.
-        if let Ok(feedback) = ntcp_icmp::decode_icmp(packet)
-            && feedback.outer.destination == local
-            && feedback.kind == ntcp_icmp::FeedbackKind::PacketTooBig
-        {
-            let quote = feedback.quoted;
-            endpoint
-                .pmtu_feedback(
-                    time,
-                    Tuple {
-                        local: SocketAddr::new(quote.ip.source, quote.source_port),
-                        remote: SocketAddr::new(quote.ip.destination, quote.destination_port),
-                    },
-                    quote.sequence,
-                    quote.ip_packet_len,
-                    quote.ip_header_len,
-                    feedback.candidate_mtu.unwrap_or(0),
-                )
-                .map_err(engine)?;
+        if local != network.local || options_enabled != network.options_enabled {
             return Ok(());
         }
-        match local {
-            IpAddr::V4(local) => {
-                if let Some((ip, tcp, options)) =
-                    parse_ipv4_options(packet, local, options_enabled, timestamp)
-                {
-                    endpoint
-                        .input_with_ipv4_options(time, ip, packet[1], options, tcp)
-                        .map_err(engine)?;
-                }
-            }
-            IpAddr::V6(local) => {
-                if let Some((ip, class, tcp)) = parse_ipv6(packet, local) {
-                    endpoint
-                        .input_with_traffic_class(time, ip, class, tcp)
-                        .map_err(engine)?;
-                }
-            }
+        // Preserve IPv4 trailing-padding acceptance, passing only the complete
+        // IP frame to canonical authority and the exact-bounds codec.
+        let packet = if packet.first().is_some_and(|b| b >> 4 == 4) {
+            let Some(total) = packet.get(2..4) else {
+                return Ok(());
+            };
+            let total = usize::from(u16::from_be_bytes([total[0], total[1]]));
+            let Some(frame) = packet.get(..total) else {
+                return Ok(());
+            };
+            frame
+        } else {
+            packet
+        };
+        if network
+            .host
+            .decode_ingress(network.ingress, packet)
+            .is_err()
+        {
+            return Ok(());
         }
-        Ok(())
+        if let Some(owner) = network.owner(endpoint, packet)
+            && endpoint.is_output_reserved(owner)
+        {
+            let mut bytes = network
+                .free
+                .pop()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            bytes.extend_from_slice(packet);
+            network.received.push_back(RetainedIngress {
+                owner,
+                bytes,
+                timestamp,
+            });
+            return Ok(());
+        }
+        network.dispatch(endpoint, time, packet, timestamp)
     }
 
     fn build_frame(
@@ -542,7 +742,7 @@ mod linux {
         // One bounded chunk per flow. Never read again until all pending bytes
         // have been accepted by TCP, even when peer FIN has already arrived.
         fn drive(&mut self, endpoint: &mut Endpoint) -> io::Result<bool> {
-            if self.shutdown {
+            if self.shutdown || endpoint.is_output_reserved(self.id) {
                 return Ok(false);
             }
             let mut progress = false;
@@ -589,61 +789,130 @@ mod linux {
         ntcp::Ipv4Timestamp::nonstandard(start.elapsed().as_millis() as u32).wire_value()
     }
 
-    // Generation commits a TCP send; retain the complete frame until the
-    // backend accepts it. No new poll_transmit may overwrite this buffer.
-    fn flush_pending(
-        output: &[u8],
-        pending: &mut usize,
-        send: impl FnOnce(&[u8]) -> io::Result<TxOutcome>,
-    ) -> io::Result<bool> {
-        if *pending == 0 {
-            return Ok(true);
-        }
-        match send(&output[..*pending]) {
-            Ok(TxOutcome::Submitted) => {
-                *pending = 0;
-                Ok(true)
-            }
-            Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
-            Err(error) => Err(error),
-        }
+    struct PendingFrame {
+        attempt: ntcp::TransmitAttempt,
+        context: Option<EgressContext>,
+        len: usize,
+        blocked: bool,
     }
 
     fn transmit_frames(
+        network: &mut TunHost,
         endpoint: &mut Endpoint,
         time: u64,
         output: &mut [u8],
-        pending: &mut usize,
+        pending: &mut Option<PendingFrame>,
         header_len: usize,
         timestamp: u32,
         backend: &mut impl PacketIo,
     ) -> io::Result<()> {
-        // Each poll spends one engine work unit, at most 32 units/packets.
+        // The bounded sweep retains dirty updates when authority cannot rebind.
+        // A blocked selected packet below exposes that failure and pauses output.
+        let _ = network.host.refresh_all(endpoint);
         for _ in 0..BUDGET {
-            if !flush_pending(output, pending, |packet| backend.transmit(packet))? {
-                break;
+            if pending.is_none() {
+                let (polled, attempt) = endpoint
+                    .poll_reserved_transmit(time, &mut output[header_len..], 1)
+                    .map_err(engine)?;
+                let Some(packet) = polled.packet else {
+                    if !polled.more_work {
+                        break;
+                    }
+                    continue;
+                };
+                let attempt =
+                    attempt.ok_or_else(|| io::Error::other("missing transmit attempt"))?;
+                let len = match build_frame(output, packet, timestamp) {
+                    Ok(len) => len,
+                    Err(error) => {
+                        // Encoding failed before any backend call. Keep core's
+                        // selected bytes/accounting for safe suffix reselection.
+                        endpoint.reject_unsubmitted(attempt).map_err(engine)?;
+                        return Err(error);
+                    }
+                };
+                *pending = Some(PendingFrame {
+                    attempt,
+                    context: None,
+                    len,
+                    blocked: false,
+                });
             }
-            let polled = endpoint
-                .poll_transmit(time, &mut output[header_len..], 1)
-                .map_err(engine)?;
-            if let Some(packet) = polled.packet {
-                *pending = build_frame(output, packet, timestamp)?;
-                if !flush_pending(output, pending, |packet| backend.transmit(packet))? {
+            let held = pending.as_mut().unwrap();
+            let validation = held
+                .context
+                .map_or_else(|| network.host.egress_context(endpoint, held.attempt), Ok)
+                .and_then(|context| {
+                    network.host.with_validated_egress(
+                        endpoint,
+                        context,
+                        &output[..held.len],
+                        0,
+                        |live| {
+                            // This one physical backend implements only its assigned
+                            // opaque L3 forwarder, never arbitrary neighbor mappings.
+                            if live.link != network.ingress.link()
+                                || live.next_hop
+                                    != path::ResolvedNextHop::Forwarder(path::ForwarderId(1))
+                            {
+                                return (live, None);
+                            }
+                            (live, Some(backend.transmit(&output[..held.len])))
+                        },
+                    )
+                });
+            match validation {
+                Ok((live, Some(outcome))) => {
+                    held.context = Some(live);
+                    held.blocked = false;
+                    match outcome {
+                        Ok(TxOutcome::Submitted) => {
+                            if !endpoint
+                                .accept_transmit(time, held.attempt)
+                                .map_err(engine)?
+                            {
+                                return Err(io::Error::other("stale accepted transmit attempt"));
+                            }
+                            *pending = None;
+                            network.host.collect(endpoint).map_err(host_error)?;
+                            // Yield to retained ingress before selecting more
+                            // work for an owner whose reservation just completed.
+                            network.replay(endpoint, time)?;
+                        }
+                        Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
+                        // Unknown outcome: terminate with the attempt pinned.
+                        // Never issue a not-sent certificate or retry it.
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(ntcp_host::Error::Obsolete) => {
+                    if !endpoint.reject_unsubmitted(held.attempt).map_err(engine)? {
+                        return Err(io::Error::other("stale rejected transmit attempt"));
+                    }
+                    *pending = None;
+                    network.host.collect(endpoint).map_err(host_error)?;
+                }
+                result => {
+                    if !held.blocked {
+                        eprintln!(
+                            "TUN output paused: {:?}",
+                            result.err().unwrap_or(ntcp_host::Error::Unsupported)
+                        );
+                    }
+                    held.blocked = true;
                     break;
                 }
-            }
-            if !polled.more_work {
-                break;
             }
         }
         Ok(())
     }
 
-    fn wait(tun: &Tun, timeout_ms: i32, pending: bool) -> io::Result<()> {
+    fn wait(tun: &Tun, timeout_ms: i32, pending: bool, readable: bool) -> io::Result<()> {
         let mut fd = libc::pollfd {
             fd: tun.as_raw_fd(),
-            events: libc::POLLIN | if pending { libc::POLLOUT } else { 0 },
+            events: (if readable { libc::POLLIN } else { 0 })
+                | if pending { libc::POLLOUT } else { 0 },
             revents: 0,
         };
         // SAFETY: fd points to one initialized pollfd for the duration of poll.
@@ -775,25 +1044,38 @@ mod linux {
             }
         };
         let config = runtime_config(&tun, local, timestamps, sack, ipv4_options_enabled)?;
+        let open_options = ntcp::ManagedOpenOptions {
+            transport: ntcp::ActiveOpenOptions::from(&config.connection),
+            dscp: config.dscp,
+            ipv4_options: ntcp::OutgoingIpv4Options::default(),
+            receive_authority: None,
+        };
         let mut endpoint =
-            Endpoint::new(config, secret, now(start), address_policy).map_err(engine)?;
+            Endpoint::new(config.clone(), secret, now(start), address_policy).map_err(engine)?;
+        let mut network = TunHost::attach(&mut endpoint, &config, local)?;
         let listener = endpoint
             .listen(SocketAddr::new(local, port), MAX_FLOWS)
             .map_err(engine)?;
         let mut flows = Vec::with_capacity(MAX_FLOWS);
         if let Some(peer) = peer {
             let id = endpoint
-                .connect(now(start), SocketAddr::new(local, port), peer)
-                .map_err(engine)?;
+                .connect_with_path_provider(
+                    now(start),
+                    SocketAddr::new(local, port),
+                    peer,
+                    open_options,
+                    &mut network.host,
+                )
+                .map_err(|error| host_error(error.into()))?;
             flows.push(Flow::new(id));
         }
         // One byte beyond the largest non-jumbo IPv6 datagram: a truncated
         // oversized frame cannot masquerade as an exact-length base-header packet.
         // IPv4 total-length handling remains unchanged.
         let mut input = [0u8; 65576];
-        // Reserve all output storage BEFORE polling: generation commits a send.
+        // Storage precedes selection; only actual Submitted accepts a reservation.
         let mut output = [0u8; MTU];
-        let mut pending = 0;
+        let mut pending = None;
         let mut accepting = false;
         eprintln!(
             "echo listening on {local}:{port} via {} (caller-configured TUN)",
@@ -801,13 +1083,18 @@ mod linux {
         );
         loop {
             let mut immediate = false;
+            network.replay(&mut endpoint, now(start))?;
             for _ in 0..BUDGET {
+                if !network.can_receive() {
+                    break;
+                }
                 match tun.receive(&mut input) {
                     Ok(Some(0)) => {
                         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
                     }
                     Ok(Some(len)) => {
                         input_frame(
+                            &mut network,
                             &mut endpoint,
                             now(start),
                             &input[..len],
@@ -858,6 +1145,10 @@ mod linux {
             let mut index = 0;
             while index < flows.len() {
                 let id = flows[index].id;
+                if endpoint.is_output_reserved(id) {
+                    index += 1;
+                    continue;
+                }
                 if matches!(
                     endpoint.state(id).map_err(engine)?,
                     State::Closed | State::TimeWait
@@ -870,6 +1161,7 @@ mod linux {
                 }
             }
             transmit_frames(
+                &mut network,
                 &mut endpoint,
                 now(start),
                 &mut output,
@@ -878,7 +1170,8 @@ mod linux {
                 ipv4_timestamp(start),
                 &mut tun,
             )?;
-            immediate |= pending == 0 && endpoint.has_pending_output();
+            network.host.collect(&endpoint).map_err(host_error)?;
+            immediate |= pending.is_none() && endpoint.has_pending_output();
             let current = now(start);
             let delay = endpoint.next_deadline().map_or(TICK_US, |deadline| {
                 deadline.saturating_sub(current).min(TICK_US)
@@ -888,7 +1181,19 @@ mod linux {
             } else {
                 delay.div_ceil(1000) as i32
             };
-            wait(&tun, timeout_ms, pending != 0)?;
+            // Held-owner deadlines cannot be serviced until submission; avoid
+            // spinning on an already expired transport deadline while blocked.
+            let timeout_ms = if pending.is_some() {
+                timeout_ms.max(1)
+            } else {
+                timeout_ms
+            };
+            wait(
+                &tun,
+                timeout_ms,
+                pending.as_ref().is_some_and(|held| !held.blocked),
+                network.can_receive(),
+            )?;
         }
     }
 
@@ -1001,24 +1306,36 @@ mod linux {
                     Ok(TxOutcome::Submitted)
                 }
             }
-            let (mut output, len, local) = packet();
-            let staged = output[..len].to_vec();
-            let mut pending = len;
+            let (_, _, local) = packet();
+            let mut output = [0; MTU];
+            let mut pending = None;
             let mut backend = Mock {
                 attempts: 0,
                 submitted: Vec::new(),
             };
+            let config = EndpointConfig::default();
             let mut endpoint =
-                Endpoint::new(EndpointConfig::default(), [1; 32], 0, test_policy(local)).unwrap();
-            endpoint
-                .connect(
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
+            let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
+            let id = endpoint
+                .connect_with_path_provider(
                     0,
                     SocketAddr::new(local.into(), 1234),
                     "10.0.0.1:8080".parse().unwrap(),
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&config.connection),
+                        dscp: config.dscp,
+                        ipv4_options: Default::default(),
+                        receive_authority: None,
+                    },
+                    &mut network.host,
                 )
                 .unwrap();
+            let mut staged = Vec::new();
+            let mut attempt = None;
             for _ in 0..2 {
                 transmit_frames(
+                    &mut network,
                     &mut endpoint,
                     0,
                     &mut output,
@@ -1028,16 +1345,19 @@ mod linux {
                     &mut backend,
                 )
                 .unwrap();
-                assert_eq!(pending, len);
-                assert_eq!(&output[..len], staged);
-                assert!(
-                    endpoint.has_pending_output(),
-                    "next SYN generated while frame blocked"
-                );
+                let held = pending.as_ref().unwrap();
+                if staged.is_empty() {
+                    staged.extend_from_slice(&output[..held.len]);
+                    attempt = Some(held.attempt);
+                }
+                assert_eq!(&output[..held.len], staged);
+                assert_eq!(Some(held.attempt), attempt);
+                assert!(endpoint.is_output_reserved(id));
                 assert!(backend.submitted.is_empty());
                 assert_eq!(backend.receive(&mut [0; 1]).unwrap(), None);
             }
             transmit_frames(
+                &mut network,
                 &mut endpoint,
                 0,
                 &mut output,
@@ -1047,19 +1367,12 @@ mod linux {
                 &mut backend,
             )
             .unwrap();
-            assert_eq!(pending, 0);
-            assert_eq!(backend.submitted.len(), 2);
-            assert_eq!(backend.submitted[0], staged);
-            let next = ntcp_ip::parse(&backend.submitted[1], false).unwrap();
-            assert_ne!(
-                ntcp::wire::parse(next.ip, next.payload)
-                    .unwrap()
-                    .header
-                    .flags
-                    & ntcp::wire::SYN,
-                0
-            );
+            assert!(pending.is_none());
+            assert!(!endpoint.is_output_reserved(id));
+            assert_eq!(backend.submitted, vec![staged]);
+            assert!(endpoint.transmit_attempt_packet(attempt.unwrap()).is_none());
             transmit_frames(
+                &mut network,
                 &mut endpoint,
                 0,
                 &mut output,
@@ -1069,7 +1382,7 @@ mod linux {
                 &mut backend,
             )
             .unwrap();
-            assert_eq!(backend.submitted.len(), 2, "duplicate send");
+            assert_eq!(backend.submitted.len(), 1, "duplicate send");
         }
 
         fn v6_transmit(len: usize) -> ntcp::Transmit {
@@ -1245,40 +1558,31 @@ mod linux {
         #[test]
         fn ipv6_framed_handshake_and_ecn_feedback() {
             fn transfer(
+                from_host: &mut TunHost,
                 from: &mut Endpoint,
+                to_host: &mut TunHost,
                 to: &mut Endpoint,
                 local: IpAddr,
                 time: u64,
                 mark_ce: bool,
             ) -> Vec<(u8, u8, usize)> {
-                let mut bytes = [0; MTU];
                 let mut observed = Vec::new();
-                for _ in 0..BUDGET {
-                    // Same pre-commit header reservation as the TUN runtime.
-                    let polled = from
-                        .poll_transmit(time, &mut bytes[IPV6_HEADER..], 1)
-                        .unwrap();
-                    if let Some(transmit) = polled.packet {
-                        let len = build_frame(&mut bytes, transmit, 0).unwrap();
-                        let IpAddr::V6(local_v6) = local else {
-                            panic!("wrong family")
-                        };
-                        let (ip, class, tcp) = parse_ipv6(&bytes[..len], local_v6).unwrap();
-                        let segment = ntcp::wire::parse(ip, tcp).unwrap();
-                        assert_eq!(class >> 2, 37);
-                        assert_eq!(bytes[7], 64);
-                        observed.push((segment.header.flags, class & 3, segment.payload.len()));
-                        if mark_ce && !segment.payload.is_empty() {
-                            assert_eq!(class & 3, 2, "negotiated data must be ECT(0)");
-                            bytes[1] = (bytes[1] & 0xcf) | 0x30;
-                        }
-                        input_frame(to, time, &bytes[..len], local, false, 0).unwrap();
+                for mut bytes in super::pmtu_tests::emit(from_host, from, time, local) {
+                    let IpAddr::V6(local_v6) = local else {
+                        panic!("wrong family")
+                    };
+                    let (ip, class, tcp) = parse_ipv6(&bytes, local_v6).unwrap();
+                    let segment = ntcp::wire::parse(ip, tcp).unwrap();
+                    assert_eq!(class >> 2, 37);
+                    assert_eq!(bytes[7], 64);
+                    observed.push((segment.header.flags, class & 3, segment.payload.len()));
+                    if mark_ce && !segment.payload.is_empty() {
+                        assert_eq!(class & 3, 2, "negotiated data must be ECT(0)");
+                        bytes[1] = (bytes[1] & 0xcf) | 0x30;
                     }
-                    if !polled.more_work {
-                        return observed;
-                    }
+                    input_frame(to_host, to, time, &bytes, local, false, 0).unwrap();
                 }
-                panic!("IPv6 framed transfer exceeded bounded work budget");
+                observed
             }
             let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
             let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
@@ -1291,32 +1595,87 @@ mod linux {
             cfg.connection.receive_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
             cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
             let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
-            let mut server = Endpoint::new(cfg, [2; 32], 0, tun_v6_policy(b)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
+            let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
+            let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
             let local = SocketAddr::new(a.into(), 1234);
             let remote = SocketAddr::new(b.into(), 8080);
             let listener = server.listen(remote, 1).unwrap();
-            let id = client.connect(0, local, remote).unwrap();
-            let syn = transfer(&mut client, &mut server, b.into(), 0, false);
+            let id = client
+                .connect_with_path_provider(
+                    0,
+                    local,
+                    remote,
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                        dscp: cfg.dscp,
+                        ipv4_options: Default::default(),
+                        receive_authority: None,
+                    },
+                    &mut client_host.host,
+                )
+                .unwrap();
+            let syn = transfer(
+                &mut client_host,
+                &mut client,
+                &mut server_host,
+                &mut server,
+                b.into(),
+                0,
+                false,
+            );
             assert_eq!(syn.len(), 1);
             assert_eq!(
                 syn[0],
                 (ntcp::wire::SYN | ntcp::wire::ECE | ntcp::wire::CWR, 0, 0)
             );
-            let synack = transfer(&mut server, &mut client, a.into(), 0, false);
+            let synack = transfer(
+                &mut server_host,
+                &mut server,
+                &mut client_host,
+                &mut client,
+                a.into(),
+                0,
+                false,
+            );
             assert_eq!(synack.len(), 1);
             assert_eq!(
                 synack[0],
                 (ntcp::wire::SYN | ntcp::wire::ACK | ntcp::wire::ECE, 0, 0)
             );
-            transfer(&mut client, &mut server, b.into(), 0, false);
+            transfer(
+                &mut client_host,
+                &mut client,
+                &mut server_host,
+                &mut server,
+                b.into(),
+                0,
+                false,
+            );
             let accepted = server.accept(listener).unwrap();
             assert_eq!(client.state(id).unwrap(), State::Established);
             assert_eq!(server.state(accepted).unwrap(), State::Established);
             client.write(id, b"CE-marked data").unwrap();
-            let data = transfer(&mut client, &mut server, b.into(), 1, true);
+            let data = transfer(
+                &mut client_host,
+                &mut client,
+                &mut server_host,
+                &mut server,
+                b.into(),
+                1,
+                true,
+            );
             assert!(data.iter().any(|&(_, ecn, len)| ecn == 2 && len == 14));
             server.on_timeout(300_000, BUDGET).unwrap();
-            let feedback = transfer(&mut server, &mut client, a.into(), 300_000, false);
+            let feedback = transfer(
+                &mut server_host,
+                &mut server,
+                &mut client_host,
+                &mut client,
+                a.into(),
+                300_000,
+                false,
+            );
             assert!(
                 feedback
                     .iter()
@@ -1326,7 +1685,15 @@ mod linux {
             let count = server.read(accepted, &mut received).unwrap();
             assert_eq!(&received[..count], b"CE-marked data");
             client.write(id, b"after feedback").unwrap();
-            let cwr = transfer(&mut client, &mut server, b.into(), 300_001, false);
+            let cwr = transfer(
+                &mut client_host,
+                &mut client,
+                &mut server_host,
+                &mut server,
+                b.into(),
+                300_001,
+                false,
+            );
             assert!(
                 cwr.iter()
                     .any(|&(flags, ecn, len)| flags & ntcp::wire::CWR != 0 && ecn == 2 && len > 0)
@@ -1411,6 +1778,115 @@ mod linux {
                     assert!(endpoint.buffer_bytes() > 0);
                     assert!(output.packet.is_some());
                 }
+            }
+        }
+
+        // Rejected-source SYNs through the real TunHost ingress must stay
+        // silent discards: they neither terminate run() nor disturb a stream.
+        #[test]
+        fn framed_rejected_source_syns_keep_tun_loop_and_stream_alive() {
+            let a = Ipv4Addr::new(192, 0, 2, 1);
+            let b = Ipv4Addr::new(192, 0, 2, 2);
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.nagle = false;
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy(b)).unwrap();
+            let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
+            let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
+            let remote = SocketAddr::new(b.into(), 8080);
+            let listener = server.listen(remote, 4).unwrap();
+            let id = client
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(a.into(), 1234),
+                    remote,
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                        dscp: cfg.dscp,
+                        ipv4_options: Default::default(),
+                        receive_authority: None,
+                    },
+                    &mut client_host.host,
+                )
+                .unwrap();
+            let exchange = |client: &mut Endpoint,
+                                client_host: &mut TunHost,
+                                server: &mut Endpoint,
+                                server_host: &mut TunHost,
+                                time: u64| {
+                for _ in 0..16 {
+                    let to_server = super::pmtu_tests::emit(client_host, client, time, b.into());
+                    for frame in &to_server {
+                        input_frame(server_host, server, time, frame, b.into(), false, 0).unwrap();
+                    }
+                    let to_client = super::pmtu_tests::emit(server_host, server, time, a.into());
+                    for frame in &to_client {
+                        input_frame(client_host, client, time, frame, a.into(), false, 0).unwrap();
+                    }
+                    if to_server.is_empty() && to_client.is_empty() {
+                        return;
+                    }
+                }
+                panic!("framed exchange did not quiesce");
+            };
+            exchange(&mut client, &mut client_host, &mut server, &mut server_host, 0);
+            let accepted = server.accept(listener).unwrap();
+            assert_eq!(client.state(id).unwrap(), State::Established);
+            let bindings = server_host.host.binding_count();
+            for (index, source) in [
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::new(224, 0, 0, 1),
+                Ipv4Addr::new(192, 0, 2, 255),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let ip = IpMetadata {
+                    source: source.into(),
+                    destination: b.into(),
+                };
+                let mut packet = [0; MTU];
+                let tcp_len = ntcp::wire::encode(
+                    ip,
+                    ntcp::wire::Header {
+                        source_port: 40000 + index as u16,
+                        destination_port: 8080,
+                        sequence: 1,
+                        acknowledgment: 0,
+                        flags: ntcp::wire::SYN,
+                        window: 1024,
+                        urgent_pointer: 0,
+                    },
+                    &[],
+                    &[],
+                    &mut packet[IP_HEADER..],
+                )
+                .unwrap();
+                // Build with a unicast placeholder, then install the real source.
+                let placeholder = IpMetadata {
+                    source: Ipv4Addr::new(198, 51, 100, 7).into(),
+                    destination: b.into(),
+                };
+                let len = build_ipv4(&mut packet, placeholder, tcp_len, 64, 0, 0).unwrap();
+                packet[12..16].copy_from_slice(&source.octets());
+                reseal(&mut packet);
+                let result =
+                    input_frame(&mut server_host, &mut server, 1, &packet[..len], b.into(), false, 0);
+                println!("framed TUN SYN from {source}: {result:?}");
+                assert!(result.is_ok());
+                assert_eq!(server_host.host.binding_count(), bindings);
+                assert!(super::pmtu_tests::emit(&mut server_host, &mut server, 1, a.into()).is_empty());
+            }
+            for (time, payload) in [(2, &b"after rejected"[..]), (3, &b"second round"[..])] {
+                client.write(id, payload).unwrap();
+                exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
+                let mut received = [0; 32];
+                let count = server.read(accepted, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
+                server.write(accepted, &received[..count]).unwrap();
+                exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
+                let count = client.read(id, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
             }
         }
 
@@ -1517,7 +1993,11 @@ mod linux {
                 };
                 let mut client =
                     Endpoint::new(cfg.clone(), [1; 32], 0, test_policy(source)).unwrap();
-                let mut server = Endpoint::new(cfg, [2; 32], 0, test_policy(destination)).unwrap();
+                let mut server =
+                    Endpoint::new(cfg.clone(), [2; 32], 0, test_policy(destination)).unwrap();
+                let mut client_host = TunHost::attach(&mut client, &cfg, source.into()).unwrap();
+                let mut server_host =
+                    TunHost::attach(&mut server, &cfg, destination.into()).unwrap();
                 let local = SocketAddr::new(source.into(), 1234);
                 let remote = SocketAddr::new(destination.into(), 8080);
                 let listener = server.listen(remote, 1).unwrap();
@@ -1528,54 +2008,97 @@ mod linux {
                     ..Default::default()
                 };
                 let id = client
-                    .connect_with_ipv4_options(0, local, remote, outgoing)
+                    .connect_with_path_provider(
+                        0,
+                        local,
+                        remote,
+                        ntcp::ManagedOpenOptions {
+                            transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                            dscp: cfg.dscp,
+                            ipv4_options: outgoing,
+                            receive_authority: None,
+                        },
+                        &mut client_host.host,
+                    )
                     .unwrap();
-                let transfer =
-                    |from: &mut Endpoint, to: &mut Endpoint, local: Ipv4Addr, opaque: bool| {
-                        let mut bytes = [0; MTU];
-                        let tx = from
-                            .poll_transmit(0, &mut bytes[20..], BUDGET)
-                            .unwrap()
-                            .packet
-                            .unwrap();
-                        let mut len = build_ipv4_options(&mut bytes, tx, source_time).unwrap();
-                        if opaque {
-                            let raw: &[u8] = if enabled {
-                                &[30, 2, 158, 2]
-                            } else {
-                                // Disabled known processing preserves historical acceptance.
-                                &[30, 2, 158, 2, 7, 3, 4, 1, 68, 4, 5, 0]
-                            };
-                            bytes.copy_within(20..len, 20 + raw.len());
-                            bytes[20..20 + raw.len()].copy_from_slice(raw);
-                            bytes[0] += (raw.len() / 4) as u8;
-                            len += raw.len();
-                            bytes[2..4].copy_from_slice(&(len as u16).to_be_bytes());
-                            reseal(&mut bytes);
-                        } else {
-                            assert_eq!(bytes[0], 0x45, "received options are not echoed");
-                        }
-                        let parsed = ntcp_ip::parse(&bytes[..len], false).unwrap();
-                        assert!(ntcp::wire::parse(parsed.ip, parsed.payload).is_ok());
-                        let expected = if enabled {
-                            parsed.ipv4_options.record(local, destination_time).unwrap()
-                        } else {
-                            parsed.ipv4_options.unrecognized()
-                        };
-                        input_frame(
-                            to,
-                            0,
-                            &bytes[..len],
-                            local.into(),
-                            enabled,
-                            destination_time,
-                        )
+                let transfer = |from_host: &mut TunHost,
+                                from: &mut Endpoint,
+                                to_host: &mut TunHost,
+                                to: &mut Endpoint,
+                                local: Ipv4Addr,
+                                opaque: bool| {
+                    let mut bytes = [0; MTU];
+                    let (poll, attempt) = from
+                        .poll_reserved_transmit(0, &mut bytes[20..], BUDGET)
                         .unwrap();
-                        expected
+                    let tx = poll.packet.unwrap();
+                    let attempt = attempt.unwrap();
+                    let mut len = build_ipv4_options(&mut bytes, tx, source_time).unwrap();
+                    let context = from_host.host.egress_context(from, attempt).unwrap();
+                    from_host
+                        .host
+                        .with_validated_egress(from, context, &bytes[..len], 0, |_| ())
+                        .unwrap();
+                    assert!(from.accept_transmit(0, attempt).unwrap());
+                    if opaque {
+                        let raw: &[u8] = if enabled {
+                            &[30, 2, 158, 2]
+                        } else {
+                            // Disabled known processing preserves historical acceptance.
+                            &[30, 2, 158, 2, 7, 3, 4, 1, 68, 4, 5, 0]
+                        };
+                        bytes.copy_within(20..len, 20 + raw.len());
+                        bytes[20..20 + raw.len()].copy_from_slice(raw);
+                        bytes[0] += (raw.len() / 4) as u8;
+                        len += raw.len();
+                        bytes[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+                        reseal(&mut bytes);
+                    } else {
+                        assert_eq!(bytes[0], 0x45, "received options are not echoed");
+                    }
+                    let parsed = ntcp_ip::parse(&bytes[..len], false).unwrap();
+                    assert!(ntcp::wire::parse(parsed.ip, parsed.payload).is_ok());
+                    let expected = if enabled {
+                        parsed.ipv4_options.record(local, destination_time).unwrap()
+                    } else {
+                        parsed.ipv4_options.unrecognized()
                     };
-                transfer(&mut client, &mut server, destination, true);
-                transfer(&mut server, &mut client, source, false);
-                let expected = transfer(&mut client, &mut server, destination, true);
+                    input_frame(
+                        to_host,
+                        to,
+                        0,
+                        &bytes[..len],
+                        local.into(),
+                        enabled,
+                        destination_time,
+                    )
+                    .unwrap();
+                    expected
+                };
+                transfer(
+                    &mut client_host,
+                    &mut client,
+                    &mut server_host,
+                    &mut server,
+                    destination,
+                    true,
+                );
+                transfer(
+                    &mut server_host,
+                    &mut server,
+                    &mut client_host,
+                    &mut client,
+                    source,
+                    false,
+                );
+                let expected = transfer(
+                    &mut client_host,
+                    &mut client,
+                    &mut server_host,
+                    &mut server,
+                    destination,
+                    true,
+                );
                 let accepted = server.accept(listener).unwrap();
                 assert_eq!(client.state(id).unwrap(), State::Established);
                 assert_eq!(server.state(accepted).unwrap(), State::Established);
@@ -1606,7 +2129,14 @@ mod linux {
                     }
                 }
                 client.write(id, b"destination before TCP").unwrap();
-                let expected = transfer(&mut client, &mut server, destination, true);
+                let expected = transfer(
+                    &mut client_host,
+                    &mut client,
+                    &mut server_host,
+                    &mut server,
+                    destination,
+                    true,
+                );
                 assert_eq!(
                     server.received_ipv4_options(accepted).unwrap(),
                     Some(expected)

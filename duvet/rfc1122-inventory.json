@@ -180,7 +180,7 @@
       "status": "TODO",
       "reason": "The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.",
       "evidence": [
-        "crates/stacks/ntcp/examples/tun_echo.rs::fn parse_ipv4_options(",
+        "crates/stacks/ntcp/examples/tun_echo.rs::fn input_frame(",
         "crates/stacks/ntcp/examples/tun_echo.rs::fn option_frames_record_once_before_real_tcp_handoff()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"

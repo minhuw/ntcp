@@ -2,6 +2,8 @@
 use super::super::tests::pacing_tests::{paced_pair, pacing_tick};
 use super::super::tests::{ip_packet, new, pair, poll_packet, pump};
 use super::*;
+#[path = "runtime_managed_tests.rs"]
+mod managed;
 use crate::timestamping as ts;
 use ntcp_io::{TimestampCapabilities, TxTimestampCompletion, TxTimestampRequest};
 use std::{
@@ -40,6 +42,13 @@ struct State {
     error: Option<io::ErrorKind>,
     poll_error: Option<io::ErrorKind>,
     disabled: bool,
+    shared: bool,
+    shared_offered: Vec<(usize, usize)>,
+}
+fn frame_port(bytes: &[u8]) -> Option<[u8; 2]> {
+    let frame = ntcp_ethernet::parse_ethernet(bytes).ok()?;
+    let packet = crate::ip::parse(frame.payload).ok()?;
+    packet.payload.get(..2)?.try_into().ok()
 }
 struct Fixture(Arc<Mutex<State>>);
 impl PacketIo for Fixture {
@@ -97,16 +106,42 @@ impl PacketIo for Fixture {
         if state.interrupted
             || state.block
             || state.block_after.is_some_and(|(port, limit)| {
-                state.sent.len() >= limit && bytes.get(34..36) == Some(&port.to_be_bytes())
+                state.sent.len() >= limit && frame_port(bytes) == Some(port.to_be_bytes())
             })
             || state
                 .block_port
-                .is_some_and(|port| bytes.get(34..36) == Some(&port.to_be_bytes()))
+                .is_some_and(|port| frame_port(bytes) == Some(port.to_be_bytes()))
         {
             return Ok(TxOutcome::WouldBlock);
         }
         state.sent.push_back(bytes.to_vec());
         Ok(TxOutcome::Submitted)
+    }
+    fn zero_copy_capabilities(&self) -> Option<ntcp_io::ZeroCopyCapabilities> {
+        self.0
+            .lock()
+            .unwrap()
+            .shared
+            .then_some(ntcp_io::ZeroCopyCapabilities {
+                max_payload_segments: 8,
+                max_packet_len: 2048,
+            })
+    }
+    fn zero_copy_payload_supported(&self, payload: &ntcp_io::Payload) -> bool {
+        payload.storage::<Vec<u8>>().is_some()
+    }
+    fn transmit_zero_copy(&mut self, packet: &ntcp_io::OwnedPacket) -> io::Result<TxOutcome> {
+        let payload_len = packet.payload.iter().map(ntcp_io::Payload::len).sum();
+        self.0
+            .lock()
+            .unwrap()
+            .shared_offered
+            .push((packet.header.len(), payload_len));
+        let mut wire = packet.header.clone();
+        for part in &packet.payload {
+            wire.extend_from_slice(part.as_slice());
+        }
+        self.transmit(&wire)
     }
     fn timestamp_capabilities(&self) -> TimestampCapabilities {
         let state = self.0.lock().unwrap();
@@ -138,11 +173,11 @@ impl PacketIo for Fixture {
         if state.interrupted
             || state.block
             || state.block_after.is_some_and(|(port, limit)| {
-                state.sent.len() >= limit && bytes.get(34..36) == Some(&port.to_be_bytes())
+                state.sent.len() >= limit && frame_port(bytes) == Some(port.to_be_bytes())
             })
             || state
                 .block_port
-                .is_some_and(|port| bytes.get(34..36) == Some(&port.to_be_bytes()))
+                .is_some_and(|port| frame_port(bytes) == Some(port.to_be_bytes()))
         {
             return Ok(TxOutcome::WouldBlock);
         }

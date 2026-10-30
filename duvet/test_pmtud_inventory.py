@@ -156,7 +156,7 @@ class PmtudInventory(unittest.TestCase):
         self.assertEqual(disabled["quote"],
                          "Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.")
         self.assertEqual(disabled["evidence"], [
-            "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive(",
+            "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive_path(",
             "crates/stacks/ntcp-ip6/tests/disabled_pmtud.rs::fn disabled_ipv6_codec_peer_boundaries_options_loss_and_output_modes()",
         ])
         path = rows["8201-082"]
@@ -280,14 +280,17 @@ class PmtudInventory(unittest.TestCase):
             self.assertEqual(len(row["evidence"]), 2, key)
             self.assertIn("ntcp-path/src/service/cache.rs::", row["evidence"][0])
             self.assertIn("ntcp-path/tests/lifecycle.rs::", row["evidence"][1])
+        for key in ("1191-021", "1191-056"):
+            self.assertEqual(rows[key]["status"], "covered", key)
+            self.assertIn("ntcp-host/src/lib.rs::", rows[key]["evidence"][0])
+            self.assertIn("ntcp-host/src/tests.rs::", rows[key]["evidence"][1])
+            self.assertIn("before TCP construction", rows[key]["reason"])
         for key, dependencies in {
-            "1191-021": ("T8", "T9/T10"),
-            "1191-050": ("T8/T10", "T9", "T13"),
-            "1191-056": ("T8/T9",),
-            "1191-057": ("T8/T9", "T10"),
-            "1191-058": ("T8/T10", "T9"),
+            "1191-050": ("T8", "T9", "T10", "T13"),
+            "1191-057": ("T8", "T9", "T10"),
+            "1191-058": ("T8", "T9/T10"),
             "1191-059": ("T9/T10",),
-            "1191-074": ("T8/T9/T10",),
+            "1191-074": ("T8", "T9/T10"),
         }.items():
             self.assertEqual(rows[key]["status"], "TODO", key)
             self.assertNotIn("T7 phase2", rows[key]["reason"], key)

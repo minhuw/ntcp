@@ -65,6 +65,7 @@ impl Owner {
     }
 
     pub(super) fn connect_local(&mut self, id: u64) -> Result<SocketAddr> {
+        self.collect_paths()?;
         self.connection_options
             .retain(|p| self.endpoint.connection_exists(p.0));
         if self.connection_options.len() == self.socket_limit() {
@@ -104,36 +105,61 @@ impl Owner {
             receive_capacity: options.receive_capacity,
             user_mss: options.user_mss,
         };
+        self.collect_paths()?;
+        let now = self.now();
+        let managed = ntcp::ManagedOpenOptions {
+            transport: open,
+            dscp: options.wire_tos(self.local) >> 2,
+            ipv4_options: ntcp::OutgoingIpv4Options::default(),
+            receive_authority: options.receive_authority,
+        };
+        let cookie = options.server_cookie_for(remote);
+        let policy = options.client_policy_for(remote, self.socket_policy.fast_open_client_policy);
         let (cid, accepted) = if let Some(initial) = initial {
             self.endpoint.enable_fast_open().map_err(engine)?;
-            self.endpoint
-                .connect_fast_open_with_receive_authority(
-                    self.now(),
-                    local,
-                    remote,
-                    initial,
-                    open,
-                    options.server_cookie_for(remote),
-                    options.client_policy_for(remote, self.socket_policy.fast_open_client_policy),
-                    options.receive_authority,
-                )
-                .map_err(engine)?
+            if let Some(host) = &mut self.host {
+                self.endpoint
+                    .connect_fast_open_with_path_provider(
+                        now, local, remote, initial, managed, cookie, policy, host,
+                    )
+                    .map_err(managed_error)?
+            } else {
+                self.endpoint
+                    .connect_fast_open_with_receive_authority(
+                        now,
+                        local,
+                        remote,
+                        initial,
+                        open,
+                        cookie,
+                        policy,
+                        options.receive_authority,
+                    )
+                    .map_err(engine)?
+            }
         } else {
-            (
+            let cid = if let Some(host) = &mut self.host {
+                self.endpoint
+                    .connect_with_path_provider(now, local, remote, managed, host)
+                    .map_err(managed_error)?
+            } else {
                 self.endpoint
                     .connect_with_receive_authority(
-                        self.now(),
+                        now,
                         local,
                         remote,
                         open,
                         options.receive_authority,
                     )
-                    .map_err(engine)?,
-                0,
-            )
+                    .map_err(engine)?
+            };
+            (cid, 0)
         };
         if let Err(e) = self.apply_options(cid, &options) {
-            self.rollback_connection(cid);
+            // Serialized factory: no input or output can have observed this
+            // active generation. Cancel it without leaving a retained slot.
+            self.endpoint.cancel_unsubmitted_open(cid).map_err(engine)?;
+            self.collect_paths()?;
             return Err(e);
         }
         // Publish the new attempt only after all pre-output options succeeded.

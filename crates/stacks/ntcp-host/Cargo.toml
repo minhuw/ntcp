@@ -7,3 +7,7 @@ repository = "https://github.com/minhuw/ntcp"
 
 [dependencies]
 ntcp-path = { path = "../ntcp-path", version = "0.0.1" }
+ntcp = { path = "../ntcp", version = "0.0.1" }
+ntcp-ip = { path = "../ntcp-ip", version = "0.0.1" }
+ntcp-ip6 = { path = "../ntcp-ip6", version = "0.0.1" }
+ntcp-icmp = { path = "../ntcp-icmp", version = "0.0.1" }

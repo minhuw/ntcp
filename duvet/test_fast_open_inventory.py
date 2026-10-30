@@ -100,7 +100,7 @@ T3_CLOSURES = {
     "server-iw": (
         "4.2.2",
         "If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.",
-        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_receive(",
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_receive_path(",
         "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_rfc5681_controller_matrix_and_ordinary_controls()",
     ),
 }

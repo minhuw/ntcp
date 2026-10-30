@@ -642,6 +642,7 @@ struct DeferredSyn {
 }
 
 pub(crate) struct Connection {
+    pub(crate) managed_path: Option<crate::PreparedPath>,
     tuple: Tuple,
     config: ConnectionConfig,
     state: State,
@@ -884,12 +885,25 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
     //= reason=Constructor rejects TLP unless both RACK and SACK are configured; runtime additionally requires negotiated SACK.
     //# TLP requires RACK.
+    #[cfg(test)]
     pub(crate) fn active_with_receive(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+        receive: &mut Option<ReceiveBuffer>,
+    ) -> Result<Self, Error> {
+        Self::active_with_receive_path(tuple, config, iss, now, receive, None, None)
+    }
+
+    pub(crate) fn active_with_receive_path(
         tuple: Tuple,
         mut config: ConnectionConfig,
         iss: u32,
         now: Instant,
         receive: &mut Option<ReceiveBuffer>,
+        managed_path: Option<crate::PreparedPath>,
+        initial_ip_header_len: Option<u16>,
     ) -> Result<Self, Error> {
         config.validate(tuple.local.is_ipv4())?;
         if tuple.local.is_ipv4() != tuple.remote.is_ipv4() {
@@ -921,10 +935,11 @@ impl Connection {
             .find(|&shift| config.receive_capacity <= (65535usize << shift))
             .unwrap_or(14);
         let syn_window = config.receive_capacity.min(65535) as u16;
-        let ip_header_len = if tuple.local.is_ipv4() { 20 } else { 40 };
+        let ip_header_len = initial_ip_header_len.unwrap_or(if tuple.local.is_ipv4() { 20 } else { 40 });
         let pmtud = config
             .pmtud
-            .map(|p| {
+            .map(|mut p| {
+                p.policy.ipv4_plateaus = p.policy.ipv4_plateaus.for_path(managed_path);
                 crate::pmtud::Pmtud::new(
                     p,
                     config.initial_path_bound(p.first_hop_mtu, tuple.local.is_ipv4()),
@@ -937,6 +952,9 @@ impl Connection {
             .mss
             .min(config.user_mss.unwrap_or(u16::MAX))
             .min(config.send_ip_payload_limit - 20) as usize;
+        let mss = if managed_path.is_some() {
+            mss.saturating_sub(usize::from(ip_header_len) - if tuple.local.is_ipv4() { 20 } else { 40 }).max(1)
+        } else { mss };
         let mss = pmtud.as_ref().map_or(mss, |p| {
             mss.min(
                 p.info
@@ -944,6 +962,10 @@ impl Connection {
                     .saturating_sub(u32::from(ip_header_len) + 20)
                     .max(1) as usize,
             )
+        });
+        let mss = managed_path.map_or(mss, |path| {
+            mss.min(path.snapshot.ip_packet_budget().unwrap()
+                .saturating_sub(u32::from(ip_header_len) + 20).max(1) as usize)
         });
         let congestion = Congestion::new(
             mss as u32,
@@ -974,6 +996,7 @@ impl Connection {
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
         let ack_ato = config.ack_timeout_floor();
         Ok(Self {
+            managed_path,
             tuple,
             peer_mss: config.mss,
             receive_mss_offer: config.receive_mss_offer(),
@@ -1190,6 +1213,7 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
     //= reason=Authorized passive children and explicitly selected active receive contexts select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
     //# If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn passive_with_receive(
         tuple: Tuple,
@@ -1201,6 +1225,24 @@ impl Connection {
         receive: &mut Option<ReceiveBuffer>,
         rx_timestamps: RxTimestamps,
         timestamps: RxPacketTimestamps,
+    ) -> Result<Self, Error> {
+        Self::passive_with_receive_path(tuple, config, iss, now, syn, early_authorized,
+            receive, rx_timestamps, timestamps, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn passive_with_receive_path(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+        syn: &Segment<'_>,
+        early_authorized: bool,
+        receive: &mut Option<ReceiveBuffer>,
+        rx_timestamps: RxTimestamps,
+        timestamps: RxPacketTimestamps,
+        managed_path: Option<crate::PreparedPath>,
+        initial_ip_header_len: Option<u16>,
     ) -> Result<Self, Error> {
         if syn.header.flags & (SYN | ACK | RST) != SYN {
             return Err(Error::InvalidArgument);
@@ -1214,7 +1256,7 @@ impl Connection {
         if early_authorized {
             config.initial_window = InitialWindow::Rfc5681;
         }
-        let mut connection = Self::active_with_receive(tuple, config, iss, now, receive)?;
+        let mut connection = Self::active_with_receive_path(tuple, config, iss, now, receive, managed_path, initial_ip_header_len)?;
         connection.rx_timestamps = rx_timestamps;
         connection.input_timestamps = timestamps;
         connection.passive_open = true;
@@ -2613,11 +2655,24 @@ impl Connection {
     //# A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.
     fn refresh_path_mss(&mut self) {
         let Some(link) = self.pmtud.as_ref().map(|p| p.info.first_hop_mtu) else {
+            if self.managed_path.is_some() {
+                let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
+                let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
+                let effective = usize::from(self.peer_mss.min(self.send_mss_limit)
+                    .min(self.config.user_mss.unwrap_or(u16::MAX)))
+                    .min(self.scratch.len()).saturating_sub(options).max(1)
+                    .min(self.path_payload_limit().saturating_sub(20 + if self.timestamps { 12 } else { 0 }).max(1));
+                self.set_path_mss(effective);
+            }
             return;
         };
         let bound = self.path_bound(link);
         let p = self.pmtud.as_mut().unwrap();
-        p.constrain(bound);
+        if self.managed_path.is_some() {
+            p.constrain_network(bound);
+        } else {
+            p.constrain(bound);
+        }
         let mss = p
             .info
             .current_mtu
@@ -2638,7 +2693,7 @@ impl Connection {
         let budget = (self.config.send_ip_payload_limit as usize)
             .saturating_sub(20 + if self.timestamps { 12 } else { 0 })
             .max(1);
-        self.set_path_mss(mss.min(ceiling).min(budget));
+        self.set_path_mss(mss.min(ceiling).min(budget).min(self.managed_payload_mss()));
         self.resolve_probe_response();
     }
 
@@ -2903,7 +2958,7 @@ impl Connection {
     }
 
     pub(crate) fn path_payload_limit(&self) -> usize {
-        self.pmtud
+        let local = self.pmtud
             .as_ref()
             .map_or(self.config.send_ip_payload_limit as usize, |p| {
                 (self.config.send_ip_payload_limit as usize).min(
@@ -2911,8 +2966,65 @@ impl Connection {
                         .current_mtu
                         .saturating_sub(u32::from(self.ip_header_len)) as usize,
                 )
-            })
+            });
+        local.min(self.managed_path.map_or(usize::MAX, |path| {
+            path.snapshot.ip_packet_budget().unwrap_or(0)
+                .saturating_sub(u32::from(self.ip_header_len)) as usize
+        }))
     }
+
+    fn managed_payload_mss(&self) -> usize {
+        self.managed_path.map_or(usize::MAX, |path| {
+            path.snapshot.ip_packet_budget().unwrap_or(0)
+                .saturating_sub(u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 })
+                .max(1) as usize
+        })
+    }
+
+    /// Network authority changes packetization, never loss/retry classification.
+    /// Safe while a reservation is held: its immutable bytes are checked again
+    /// by the serialized submission barrier and split only after nonsubmission.
+    pub(crate) fn apply_managed_budget(&mut self, path: crate::PreparedPath) -> Result<(), Error> {
+        let old = self.managed_path.ok_or(Error::InvalidState)?;
+        if path.snapshot.status() != ntcp_path::PathStatus::Valid
+            || old.snapshot.key().context() != path.snapshot.key().context()
+            || old.snapshot.key().source_address() != path.snapshot.key().source_address()
+            || old.snapshot.key().destination() != path.snapshot.key().destination()
+            || (old.client == path.client && path.snapshot.version() < old.snapshot.version())
+        {
+            return Err(Error::InvalidArgument);
+        }
+        if old == path {
+            return Ok(());
+        }
+        let replaced = old.snapshot.path() != path.snapshot.path();
+        let bound = self.path_bound(path.snapshot.first_hop_mtu());
+        if let Some(p) = &mut self.pmtud {
+            p.set_plateaus(self.config.pmtud.unwrap().policy.ipv4_plateaus.for_path(Some(path)));
+            p.network_link_bound(path.snapshot.first_hop_mtu(), bound);
+            if replaced {
+                p.replace_network_authority();
+            } else if old.snapshot.negative_revision() != path.snapshot.negative_revision() {
+                p.invalidate_probe_size_result();
+            }
+        }
+        self.managed_path = Some(path);
+        let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
+        let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
+        let local = self.pmtud.as_ref().map_or(usize::MAX, |p| {
+            p.info.current_mtu.saturating_sub(u32::from(self.ip_header_len) + 20
+                + if self.timestamps { 12 } else { 0 }).max(1) as usize
+        });
+        let effective = usize::from(self.peer_mss.min(self.send_mss_limit)
+            .min(self.config.user_mss.unwrap_or(u16::MAX)))
+            .min(self.scratch.len()).saturating_sub(options).max(1)
+            .min(self.config.send_ip_payload_limit as usize - 20 - if self.timestamps { 12 } else { 0 })
+            .min(local).min(self.managed_payload_mss());
+        self.set_path_mss_budget(effective);
+        Ok(())
+    }
+
+    pub(crate) fn ip_header_len(&self) -> u16 { self.ip_header_len }
 
     pub(crate) fn set_ip_header_len(&mut self, len: u16) {
         if self.ip_header_len != len {
@@ -2950,7 +3062,9 @@ impl Connection {
             .search_aging
             .ticks(self.config.timebase.units_per_second)?;
         self.update_time(now)?;
-        self.pmtud.as_mut().unwrap().set_policy(now, policy, aging);
+        let mut effective = policy;
+        effective.ipv4_plateaus = policy.ipv4_plateaus.for_path(self.managed_path);
+        self.pmtud.as_mut().unwrap().set_policy(now, effective, aging);
         self.config.pmtud.as_mut().unwrap().policy = policy;
         self.arm_work();
         Ok(())
@@ -3242,12 +3356,21 @@ impl Connection {
     //# dropped datagram.
 
     fn set_path_mss(&mut self, effective: usize) {
+        self.update_path_mss(effective, true);
+    }
+
+    fn set_path_mss_budget(&mut self, effective: usize) {
+        self.update_path_mss(effective, false);
+    }
+
+    fn update_path_mss(&mut self, effective: usize, repair: bool) {
+        let effective = effective.min(self.managed_payload_mss());
         if effective == self.mss {
             return;
         }
         let decreased = effective < self.mss;
         self.mss = effective;
-        if self.pmtud.is_some() {
+        if self.pmtud.is_some() || self.managed_path.is_some() {
             self.congestion.set_path_mss(effective as u32);
         } else {
             self.congestion.set_mss(effective as u32);
@@ -3262,7 +3385,7 @@ impl Connection {
         }
         // An increase is not evidence of loss. Leave existing retry work alone;
         // only a decrease may require repacketizing outstanding bytes.
-        if decreased && self.flight() != 0 {
+        if repair && decreased && self.flight() != 0 {
             if self.handshake_pending() {
                 self.syn_pending = true;
             } else if self.synchronized() && self.snd_wnd != 0 && self.sack_recovery.is_none() {
@@ -4620,6 +4743,10 @@ impl Connection {
             self.reset_reply = false;
             self.terminal(CloseReason::Aborted);
         }
+    }
+
+    pub(crate) fn unsubmitted_active_open(&self) -> bool {
+        self.state == State::SynSent && !self.syn_committed
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
@@ -8246,7 +8373,16 @@ impl Connection {
             //# Before sending a probe, the flow MUST meet at least the following conditions:
             //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
             //# o It has no outstanding probes or losses.
-            let candidate = self.pmtud.as_ref().and_then(|p| p.target()).filter(|_| {
+            let candidate = self.pmtud.as_ref().and_then(|p| {
+                if let Some(path) = self.managed_path {
+                    if now < path.snapshot.retry_not_before() { return None; }
+                    p.target_for_network(path.snapshot.ip_packet_budget().ok()?)
+                } else {
+                    p.target()
+                }
+            }).filter(|&size| {
+                self.managed_path.is_none_or(|path| size <= path.snapshot.first_hop_mtu())
+            }).filter(|_| {
                 !early_response
                     && self.rtt.srtt().is_some()
                     && !pacing_blocked
@@ -8933,6 +9069,11 @@ impl Connection {
             && pmtu_probe.is_none()
             && self.initial_pacing_room() >= count as u32;
         self.last_departure = reserve.then_some(Departure {
+            discovery: pmtu_probe.and_then(|(size, _, _)| self.managed_path.map(|binding| crate::DiscoveryIntent {
+                binding,
+                ip_packet_len: size,
+                selected_at: now,
+            })),
             initial_burst,
             data_ack,
             defer_push: self.repair_undo.is_some()

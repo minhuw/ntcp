@@ -1057,7 +1057,7 @@
       "status": "covered",
       "reason": "Admission combines outstanding-probe/repair and cooldown exclusion in Pmtud::target with transport loss-recovery and queue/window credit checks. Real loss/RTO and cooldown output traces cover 125/126; pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates supplies the complementary queue/window assertions at 127-129.",
       "evidence": [
-        "crates/stacks/ntcp/src/connection.rs::            let candidate = self.pmtud.as_ref().and_then(|p| p.target()).filter(|_| {",
+        "crates/stacks/ntcp/src/connection.rs::            let candidate = self.pmtud.as_ref().and_then(|p| {",
         "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn probe_admission_real_loss_recovery_and_cooldown_output()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
@@ -1069,7 +1069,7 @@
       "status": "covered",
       "reason": "Receiver-driven NewReno/SACK/RACK loss, PRR and actual RTO recovery emit only ordinary-sized repairs while losses remain; ordinary-loss traces keep PMTUD target eligible with no active probe to exercise the independent transport veto. Outstanding-probe traces assert unchanged probe identity and bounded trailing output, then a new probe after recovery.",
       "evidence": [
-        "crates/stacks/ntcp/src/connection.rs::            let candidate = self.pmtud.as_ref().and_then(|p| p.target()).filter(|_| {",
+        "crates/stacks/ntcp/src/connection.rs::            let candidate = self.pmtud.as_ref().and_then(|p| {",
         "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn probe_admission_ordinary_loss_without_active_probe()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"

@@ -128,7 +128,7 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     );
     assert_eq!(
         b.input_stamped(4_000, ip, 0, &syn, Default::default()),
-        Err(EndpointError::LimitReached)
+        Err(EndpointError::LimitReached.into())
     );
     assert_eq!(b.endpoint.connection_id(tuple), Some(old));
     assert_eq!(b.endpoint.state(old), Ok(State::TimeWait));
@@ -161,7 +161,7 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     );
     assert_ne!(
         b.input_stamped(4_000, ip, 0, &ack_syn, Default::default()),
-        Err(EndpointError::LimitReached)
+        Err(EndpointError::LimitReached.into())
     );
     assert_eq!(b.endpoint.connection_id(tuple), Some(old));
     // Free one real pending child, then retry the same data-bearing SYN.

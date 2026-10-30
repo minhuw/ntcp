@@ -156,6 +156,55 @@ class MacCostEvidence(unittest.TestCase):
                             self.assertEqual(events, ["snapshot", "build", "snapshot", "execute", "snapshot"])
                             self.assertIs(provenance.call_args.args[-1], snapshot)
 
+    def test_source_fingerprint_includes_linked_local_crates_and_untracked_sources(self):
+        # The example adds Host as a local dev edge. Its production dependencies
+        # must be bound to the measured binary even before a new file is tracked.
+        paths = [f"{prefix}/src/{name}.rs" for prefix, name in (
+            ("crates/stacks/ntcp", "endpoint_managed"),
+            ("crates/net/ntcp-buffer", "lib"),
+            ("crates/stacks/ntcp-ip-common", "lib"),
+            ("crates/stacks/ntcp-path", "service"),
+            ("crates/stacks/ntcp-host", "lib"),
+            ("crates/stacks/ntcp-ip", "lib"),
+            ("crates/stacks/ntcp-ip6", "lib"),
+            ("crates/stacks/ntcp-icmp", "lib"),
+            ("crates/stacks/ntcp-ethernet", "lib"),
+            ("crates/stacks/ntcp-host", "new_untracked_production"),
+        )]
+        contents = {path: b"original" for path in paths}
+
+        def command(args):
+            if args[:2] == ["git", "ls-files"]:
+                self.assertEqual(args[2:], ["--cached", "--others", "--exclude-standard"])
+                return "\n".join(paths + ["unrelated.rs"])
+            if args[:2] == ["git", "show"]:
+                return "algorithm"
+            return "unchanged Git state"
+
+        root = mock.MagicMock()
+        root.__truediv__.side_effect = lambda path: SimpleNamespace(
+            read_bytes=lambda: contents.get(path, b"stable input"),
+            read_text=lambda: "algorithm\n",
+        )
+        with (mock.patch.object(mac, "ROOT", root),
+              mock.patch.object(mac, "command", side_effect=command),
+              mock.patch.object(mac.subprocess, "check_output", return_value=b"stable diff")):
+            snapshot = mac.source_snapshot()
+            self.assertTrue(set(paths) <= snapshot["relevant_source"]["files"].keys())
+            self.assertNotIn("unrelated.rs", snapshot["relevant_source"]["files"])
+            mac.verify_sources(snapshot, "unchanged")
+            for path in paths:
+                for phase in ("during compilation", "after compilation or during measurement"):
+                    with self.subTest(path=path, phase=phase):
+                        contents[path] = b"changed production source"
+                        with self.assertRaisesRegex(ValueError, "source hashes/list or Git state changed"):
+                            mac.verify_sources(snapshot, phase)
+                        contents[path] = b"original"
+            # A newly discovered untracked file also changes the exact file set.
+            paths.append("crates/stacks/ntcp-path/src/new_untracked.rs")
+            with self.assertRaisesRegex(ValueError, "source hashes/list or Git state changed"):
+                mac.verify_sources(snapshot, "during compilation")
+
     def test_provenance_uses_rustc_override_instead_of_path_toolchain(self):
         selected = "/toolchains/1.90.0/bin/rustc"
         env = {"PATH": "/toolchains/stable/bin", "RUSTC": selected,

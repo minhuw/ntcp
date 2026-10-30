@@ -95,6 +95,7 @@ dependencies = [
  "hmac",
  "libc",
  "ntcp-buffer",
+ "ntcp-host",
  "ntcp-icmp",
  "ntcp-io",
  "ntcp-io-tun",
@@ -129,6 +130,10 @@ dependencies = [
 name = "ntcp-host"
 version = "0.0.1"
 dependencies = [
+ "ntcp",
+ "ntcp-icmp",
+ "ntcp-ip",
+ "ntcp-ip6",
  "ntcp-path",
 ]
 
@@ -240,6 +245,7 @@ dependencies = [
  "ntcp",
  "ntcp-egress",
  "ntcp-ethernet",
+ "ntcp-host",
  "ntcp-icmp",
  "ntcp-io",
  "ntcp-io-af-packet",

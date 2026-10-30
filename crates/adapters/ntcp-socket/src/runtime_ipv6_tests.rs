@@ -158,9 +158,26 @@ fn native_ipv6_handshake_data_half_close_and_family_policy() {
     );
     a.execute(client, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, 40))
         .unwrap();
+    let initial = a
+        .host
+        .as_ref()
+        .unwrap()
+        .binding(cid(&a, client))
+        .unwrap()
+        .snapshot;
+    assert_eq!(initial.first_hop_mtu(), 1520);
+    assert_eq!(initial.ip_packet_budget(), Ok(1520));
+    assert_eq!(
+        a.endpoint
+            .path_mtu_info(cid(&a, client))
+            .unwrap()
+            .unwrap()
+            .current_mtu,
+        1280
+    );
     assert_eq!(
         a.endpoint.transport_info(cid(&a, client)).unwrap().mss,
-        1460
+        1220 // Selected initial IPv6 PMTU, with complete base/TCP headers.
     );
     a.execute(client, Op::Write(vec![3; 1800])).unwrap();
     b.execute(server, Op::Write(vec![4; 100])).unwrap();

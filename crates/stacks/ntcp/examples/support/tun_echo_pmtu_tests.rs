@@ -7,6 +7,9 @@ struct Backend {
     errno: Option<i32>,
     queries: Cell<usize>,
     blocked: bool,
+    rejected: bool,
+    tx_errno: Option<i32>,
+    attempts: usize,
     frames: Vec<Vec<u8>>,
 }
 
@@ -17,6 +20,9 @@ impl Default for Backend {
             errno: None,
             queries: Cell::new(0),
             blocked: false,
+            rejected: false,
+            tx_errno: None,
+            attempts: 0,
             frames: Vec::new(),
         }
     }
@@ -37,6 +43,13 @@ impl PacketIo for Backend {
         Ok(None)
     }
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+        self.attempts += 1;
+        if let Some(errno) = self.tx_errno {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        if self.rejected {
+            return Ok(TxOutcome::Rejected);
+        }
         if self.blocked {
             return Ok(TxOutcome::WouldBlock);
         }
@@ -54,15 +67,21 @@ fn addresses(v6: bool) -> (SocketAddr, SocketAddr) {
     (a.parse().unwrap(), b.parse().unwrap())
 }
 
-fn endpoint(local: IpAddr, timestamps: bool) -> Endpoint {
+fn endpoint(local: IpAddr, timestamps: bool) -> (Endpoint, TunHost) {
+    endpoint_with_options(local, timestamps, false)
+}
+
+fn endpoint_with_options(local: IpAddr, timestamps: bool, options: bool) -> (Endpoint, TunHost) {
     let backend = Backend::default();
-    let config = runtime_config(&backend, local, timestamps, true, false).unwrap();
+    let config = runtime_config(&backend, local, timestamps, true, options).unwrap();
     assert_eq!(backend.queries.get(), 1);
     let policy: Box<dyn Fn(AddressValidation) -> bool> = match local {
         IpAddr::V4(ip) => Box::new(tun_address_policy(ip, (ip, 24))),
         IpAddr::V6(ip) => Box::new(tun_v6_policy(ip)),
     };
-    Endpoint::new(config, [7; 32], 0, policy).unwrap()
+    let mut endpoint = Endpoint::new(config.clone(), [7; 32], 0, policy).unwrap();
+    let network = TunHost::attach(&mut endpoint, &config, local).unwrap();
+    (endpoint, network)
 }
 
 // These assertions use the same constructor, dispatcher and output loop as run.
@@ -141,11 +160,17 @@ fn segment(frame: &[u8]) -> ntcp::wire::Segment<'_> {
     ntcp::wire::parse(ip, tcp).unwrap()
 }
 
-fn emit(endpoint: &mut Endpoint, time: u64, local: IpAddr) -> Vec<Vec<u8>> {
+pub(super) fn emit(
+    network: &mut TunHost,
+    endpoint: &mut Endpoint,
+    time: u64,
+    local: IpAddr,
+) -> Vec<Vec<u8>> {
     let mut backend = Backend::default();
     let mut output = [0; MTU];
-    let mut pending = 0;
+    let mut pending = None;
     transmit_frames(
+        network,
         endpoint,
         time,
         &mut output,
@@ -159,7 +184,7 @@ fn emit(endpoint: &mut Endpoint, time: u64, local: IpAddr) -> Vec<Vec<u8>> {
         &mut backend,
     )
     .unwrap();
-    assert_eq!(pending, 0);
+    assert!(pending.is_none());
     for frame in &backend.frames {
         segment(frame);
     }
@@ -168,7 +193,9 @@ fn emit(endpoint: &mut Endpoint, time: u64, local: IpAddr) -> Vec<Vec<u8>> {
 
 struct Pair {
     a: Endpoint,
+    ahost: TunHost,
     b: Endpoint,
+    bhost: TunHost,
     aid: ConnectionId,
     bid: ConnectionId,
     local: SocketAddr,
@@ -179,25 +206,49 @@ struct Pair {
 impl Pair {
     fn new(v6: bool, timestamps: bool) -> Self {
         let (local, remote) = addresses(v6);
-        let mut a = endpoint(local.ip(), timestamps);
-        let mut b = endpoint(remote.ip(), timestamps);
+        let (mut a, mut ahost) = endpoint(local.ip(), timestamps);
+        let (mut b, mut bhost) = endpoint(remote.ip(), timestamps);
         // Match run(): an active opener also retains its passive listener.
         a.listen(local, MAX_FLOWS).unwrap();
         let listener = b.listen(remote, MAX_FLOWS).unwrap();
-        let aid = a.connect(0, local, remote).unwrap();
+        let cfg = runtime_config(&Backend::default(), local.ip(), timestamps, true, false).unwrap();
+        let aid = a
+            .connect_with_path_provider(
+                0,
+                local,
+                remote,
+                ntcp::ManagedOpenOptions {
+                    transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                    dscp: cfg.dscp,
+                    ipv4_options: Default::default(),
+                    receive_authority: None,
+                },
+                &mut ahost.host,
+            )
+            .unwrap();
         for passive in [false, true] {
-            let (from, to, destination, time, flags) = if passive {
+            let (from_host, from, to_host, to, destination, time, flags) = if passive {
                 (
+                    &mut bhost,
                     &mut b,
+                    &mut ahost,
                     &mut a,
                     local.ip(),
                     2000,
                     ntcp::wire::SYN | ntcp::wire::ACK,
                 )
             } else {
-                (&mut a, &mut b, remote.ip(), 1000, ntcp::wire::SYN)
+                (
+                    &mut ahost,
+                    &mut a,
+                    &mut bhost,
+                    &mut b,
+                    remote.ip(),
+                    1000,
+                    ntcp::wire::SYN,
+                )
             };
-            let frames = emit(from, time, destination);
+            let frames = emit(from_host, from, time, destination);
             assert_eq!(frames.len(), 1);
             let syn = segment(&frames[0]);
             assert_eq!(
@@ -205,9 +256,9 @@ impl Pair {
                 flags
             );
             assert_eq!(syn.options.timestamps.is_some(), timestamps);
-            input_frame(to, time, &frames[0], destination, false, 0).unwrap();
+            input_frame(to_host, to, time, &frames[0], destination, false, 0).unwrap();
         }
-        let final_ack = emit(&mut a, 3000, local.ip());
+        let final_ack = emit(&mut ahost, &mut a, 3000, local.ip());
         assert_eq!(final_ack.len(), 1);
         let ack = segment(&final_ack[0]);
         assert_eq!(
@@ -217,7 +268,7 @@ impl Pair {
         assert!(ack.payload.is_empty());
         assert_eq!(ack.options.timestamps.is_some(), timestamps);
         for frame in final_ack {
-            input_frame(&mut b, 3000, &frame, remote.ip(), false, 0).unwrap();
+            input_frame(&mut bhost, &mut b, 3000, &frame, remote.ip(), false, 0).unwrap();
         }
         let bid = b.accept(listener).unwrap();
         for (e, id) in [(&a, aid), (&b, bid)] {
@@ -230,7 +281,9 @@ impl Pair {
         }
         Self {
             a,
+            ahost,
             b,
+            bhost,
             aid,
             bid,
             local,
@@ -258,7 +311,7 @@ impl Pair {
         let mut sent = Vec::new();
         let mut drops = 0;
         for _ in 0..200 {
-            for frame in emit(&mut self.a, self.time, self.local.ip()) {
+            for frame in emit(&mut self.ahost, &mut self.a, self.time, self.local.ip()) {
                 let tcp = segment(&frame);
                 if !tcp.payload.is_empty() {
                     assert!(tcp.options.timestamps.is_some());
@@ -266,8 +319,16 @@ impl Pair {
                 if frame.len() > path {
                     drops += 1;
                 } else {
-                    input_frame(&mut self.b, self.time, &frame, self.remote.ip(), false, 0)
-                        .unwrap();
+                    input_frame(
+                        &mut self.bhost,
+                        &mut self.b,
+                        self.time,
+                        &frame,
+                        self.remote.ip(),
+                        false,
+                        0,
+                    )
+                    .unwrap();
                 }
                 sent.push(frame);
             }
@@ -277,8 +338,17 @@ impl Pair {
                 Err(EndpointError::Connection(Error::WouldBlock)) => {}
                 other => panic!("receiver: {other:?}"),
             }
-            for frame in emit(&mut self.b, self.time, self.remote.ip()) {
-                input_frame(&mut self.a, self.time, &frame, self.local.ip(), false, 0).unwrap();
+            for frame in emit(&mut self.bhost, &mut self.b, self.time, self.remote.ip()) {
+                input_frame(
+                    &mut self.ahost,
+                    &mut self.a,
+                    self.time,
+                    &frame,
+                    self.local.ip(),
+                    false,
+                    0,
+                )
+                .unwrap();
             }
             let info = self.a.transport_info(self.aid).unwrap();
             if received.len() == expected.len() && info.unacked == 0 && info.notsent_bytes == 0 {
@@ -300,6 +370,175 @@ impl Pair {
             expected.len(),
             self.a.transport_info(self.aid)
         );
+    }
+}
+
+#[test]
+fn runtime_zero_mtu_icmp_uses_live_host_plateaus_and_transport_overrides() {
+    let mut p = Pair::new(false, false);
+    p.a.write(p.aid, &[7; 1460]).unwrap();
+    let original = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip()).pop().unwrap();
+    assert_eq!(original.len(), 1500);
+    let report = ptb(&original, 0);
+    let feedback = ntcp_icmp::decode_icmp(&report).unwrap();
+    assert_eq!(feedback.kind, ntcp_icmp::FeedbackKind::PacketTooBig);
+    assert_eq!(feedback.candidate_mtu, None); // zero-next-hop legacy feedback
+    input_frame(&mut p.ahost, &mut p.a, p.time, &report, p.local.ip(), false, 0).unwrap();
+    assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1460);
+    p.ahost.host.set_ipv4_plateaus(path::Ipv4Plateaus::new(&[1500, 1200, 68]).unwrap()).unwrap();
+    p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 1, &report, p.local.ip(), false, 0).unwrap();
+    assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1200);
+    p.a.set_pmtud_policy(p.time + 2, p.aid, ntcp::PmtudPolicy {
+        ipv4_plateaus: ntcp::Ipv4Plateaus::HISTORICAL, ..Default::default()
+    }).unwrap();
+    p.ahost.host.set_ipv4_plateaus(path::Ipv4Plateaus::new(&[1500, 900, 68]).unwrap()).unwrap();
+    p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 3, &report, p.local.ip(), false, 0).unwrap();
+    assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1006);
+    p.a.set_pmtud_policy(p.time + 4, p.aid, ntcp::PmtudPolicy::default()).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 5, &report, p.local.ip(), false, 0).unwrap();
+    assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 900);
+    assert_eq!(p.ahost.host.binding(p.aid).unwrap().snapshot.learned_mtu(), None,
+        "local feedback is not shared validated publication");
+}
+
+#[test]
+fn runtime_source_quench_discards_without_touching_reserved_owner_or_clock() {
+    let mut p = Pair::new(false, true);
+    let payload = vec![0x3c; 12000];
+    p.a.write(p.aid, &payload).unwrap();
+    let mut backend = Backend { blocked: true, ..Default::default() };
+    let mut output = [0; MTU];
+    let mut pending = None;
+    transmit_frames(&mut p.ahost, &mut p.a, p.time, &mut output,
+        &mut pending, IP_HEADER, 0, &mut backend).unwrap();
+    let held = pending.as_ref().unwrap();
+    let attempt = held.attempt;
+    let mut report = ptb(&output[..held.len], 0);
+    report[IP_HEADER] = 4;
+    report[IP_HEADER + 1] = 0;
+    seal_feedback(&mut report);
+    assert_eq!(ntcp_icmp::decode_icmp(&report).unwrap().kind,
+        ntcp_icmp::FeedbackKind::SourceQuench);
+    assert_eq!(p.ahost.owner(&p.a, &report), None);
+    let before = (p.a.transport_info(p.aid).unwrap(), p.a.path_mtu_info(p.aid).unwrap(),
+        p.a.next_deadline(), p.a.send_progress(p.aid).unwrap());
+    // A discarded message must not advance the caller's clock either.
+    input_frame(&mut p.ahost, &mut p.a, p.time + 1_000_000, &report,
+        p.local.ip(), false, 0).unwrap();
+    assert_eq!((p.a.transport_info(p.aid).unwrap(), p.a.path_mtu_info(p.aid).unwrap(),
+        p.a.next_deadline(), p.a.send_progress(p.aid).unwrap()), before);
+    assert!(p.a.is_output_reserved(p.aid));
+    assert!(p.a.transmit_attempt_packet(attempt).is_some());
+    assert!(p.ahost.received.is_empty());
+    backend.blocked = false;
+    transmit_frames(&mut p.ahost, &mut p.a, p.time, &mut output,
+        &mut pending, IP_HEADER, 0, &mut backend).unwrap();
+    assert!(pending.is_none());
+    for frame in &backend.frames {
+        input_frame(&mut p.bhost, &mut p.b, p.time, frame, p.remote.ip(), false, 0).unwrap();
+    }
+    p.progress(MTU, &payload);
+}
+
+#[test]
+fn runtime_exhausted_timestamp_discards_then_valid_stream_progresses() {
+    let (local, remote) = addresses(false);
+    let (mut a, mut ahost) = endpoint(local.ip(), false);
+    let (mut b, mut bhost) = endpoint_with_options(remote.ip(), false, true);
+    let listener = b.listen(remote, MAX_FLOWS).unwrap();
+    let cfg = runtime_config(&Backend::default(), local.ip(), false, true, false).unwrap();
+    let aid = a.connect_with_path_provider(0, local, remote, ntcp::ManagedOpenOptions {
+        transport: ntcp::ActiveOpenOptions::from(&cfg.connection), dscp: 0,
+        ipv4_options: Default::default(), receive_authority: None,
+    }, &mut ahost.host).unwrap();
+    let syn = emit(&mut ahost, &mut a, 1, local.ip()).pop().unwrap();
+    let mut exhausted = syn.clone();
+    exhausted.splice(20..20, [68, 4, 5, 0xf0]);
+    exhausted[0] = 0x46;
+    let n = exhausted.len() as u16;
+    exhausted[2..4].copy_from_slice(&n.to_be_bytes());
+    seal_ip(&mut exhausted);
+    let packet = bhost.host.decode_ingress(bhost.ingress, &exhausted).unwrap();
+    let IpAddr::V4(local_ip) = remote.ip() else { unreachable!() };
+    assert!(packet.options.record(local_ip, 123).is_err());
+    let before = b.next_deadline();
+    input_frame(&mut bhost, &mut b, 1_000_000, &exhausted, remote.ip(), true, 123).unwrap();
+    assert_eq!(b.next_deadline(), before);
+    assert_eq!(bhost.host.binding_count(), 0);
+    // Use the original time to also prove the failed option did not advance it.
+    input_frame(&mut bhost, &mut b, 2, &syn, remote.ip(), true, 124).unwrap();
+    let reply = emit(&mut bhost, &mut b, 3, remote.ip()).pop().unwrap();
+    input_frame(&mut ahost, &mut a, 4, &reply, local.ip(), false, 0).unwrap();
+    for frame in emit(&mut ahost, &mut a, 5, local.ip()) {
+        input_frame(&mut bhost, &mut b, 6, &frame, remote.ip(), true, 125).unwrap();
+    }
+    let bid = b.accept(listener).unwrap();
+    let payload = b"valid traffic after exhausted Timestamp";
+    a.write(aid, payload).unwrap();
+    for frame in emit(&mut ahost, &mut a, 7, local.ip()) {
+        input_frame(&mut bhost, &mut b, 8, &frame, remote.ip(), true, 126).unwrap();
+    }
+    let ack_time = b.next_deadline().unwrap();
+    b.on_timeout(ack_time, BUDGET).unwrap();
+    for frame in emit(&mut bhost, &mut b, ack_time, remote.ip()) {
+        input_frame(&mut ahost, &mut a, ack_time + 1, &frame, local.ip(), false, 0).unwrap();
+    }
+    let mut bytes = [0; 128];
+    assert_eq!(b.read(bid, &mut bytes).unwrap(), payload.len());
+    assert_eq!(&bytes[..payload.len()], payload);
+    assert_eq!(a.transport_info(aid).unwrap().unacked, 0);
+}
+
+#[test]
+fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
+    for replace_source in [false, true] {
+        let (local, remote) = addresses(false);
+        let (mut a, mut ahost) = endpoint(local.ip(), false);
+        let (mut b, mut bhost) = endpoint(remote.ip(), false);
+        let cfg = runtime_config(&Backend::default(), local.ip(), false, true, false).unwrap();
+        let id = a.connect_with_path_provider(0, local, remote, ntcp::ManagedOpenOptions {
+            transport: ntcp::ActiveOpenOptions::from(&cfg.connection), dscp: 0,
+            ipv4_options: Default::default(), receive_authority: None,
+        }, &mut ahost.host).unwrap();
+        let syn = emit(&mut ahost, &mut a, 1, local.ip()).pop().unwrap();
+        input_frame(&mut bhost, &mut b, 2, &syn, remote.ip(), false, 0).unwrap();
+        let mut backend = Backend { blocked: true, ..Default::default() };
+        let mut output = [0; MTU];
+        let mut pending = None;
+        transmit_frames(&mut bhost, &mut b, 3, &mut output, &mut pending,
+            IP_HEADER, 0, &mut backend).unwrap();
+        let held = pending.as_ref().unwrap();
+        assert!(b.transmit_attempt_packet(held.attempt).unwrap().connection.is_none());
+        let old = held.context.unwrap();
+        let staged = output[..held.len].to_vec();
+        let route = bhost.host.paths().route(old.binding.snapshot.key().route()).unwrap();
+        if replace_source {
+            bhost.host.remove_source_owner(old.binding.snapshot.key().source(), bhost.ingress.link()).unwrap();
+        } else {
+            bhost.host.remove_route(old.binding.snapshot.key().route()).unwrap();
+        }
+        backend.blocked = false;
+        let calls = backend.attempts;
+        transmit_frames(&mut bhost, &mut b, 4, &mut output, &mut pending,
+            IP_HEADER, 0, &mut backend).unwrap();
+        assert_eq!(backend.attempts, calls);
+        assert!(pending.as_ref().unwrap().blocked);
+        assert!(bhost.host.paths().is_dirty(old.binding.client).unwrap());
+        if replace_source {
+            bhost.host.register_source(path::ScopedAddress::new(remote.ip(), None).unwrap(), bhost.ingress.link()).unwrap();
+        } else {
+            bhost.host.add_route(route).unwrap();
+        }
+        transmit_frames(&mut bhost, &mut b, 5, &mut output, &mut pending,
+            IP_HEADER, 0, &mut backend).unwrap();
+        assert!(pending.is_none());
+        assert_eq!(backend.frames, vec![staged]);
+        assert_eq!(bhost.host.lease_count(), 0);
+        assert_eq!(bhost.host.paths().usage().clients, 0);
+        input_frame(&mut ahost, &mut a, 6, &backend.frames[0], local.ip(), false, 0).unwrap();
+        assert_eq!(a.state(id).unwrap(), State::Closed);
     }
 }
 
@@ -378,7 +617,7 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
         let mut p = Pair::new(v6, true);
         let payload: Vec<u8> = (0..12000).map(|n| (n % 251) as u8).collect();
         assert_eq!(p.a.write(p.aid, &payload).unwrap(), payload.len());
-        let frames = emit(&mut p.a, p.time, p.local.ip());
+        let frames = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
         let original = &frames[0];
         let path = if v6 { 1280 } else { 1006 };
         assert!(original.len() > path);
@@ -388,7 +627,16 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
             ntcp_icmp::decode_icmp(&report).unwrap().outer.source,
             p.remote.ip()
         );
-        input_frame(&mut p.a, p.time, &report, p.local.ip(), false, 0).unwrap();
+        input_frame(
+            &mut p.ahost,
+            &mut p.a,
+            p.time,
+            &report,
+            p.local.ip(),
+            false,
+            0,
+        )
+        .unwrap();
         assert_eq!(
             p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu,
             path as u32
@@ -406,7 +654,16 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
         let before = p.a.path_mtu_info(p.aid).unwrap();
         // An acknowledged original quote is stale, even with a lower candidate.
         let stale = ptb(original, if v6 { 1280 } else { 508 });
-        input_frame(&mut p.a, p.time, &stale, p.local.ip(), false, 0).unwrap();
+        input_frame(
+            &mut p.ahost,
+            &mut p.a,
+            p.time,
+            &stale,
+            p.local.ip(),
+            false,
+            0,
+        )
+        .unwrap();
         assert_eq!(p.a.path_mtu_info(p.aid).unwrap(), before);
     }
 }
@@ -427,7 +684,7 @@ fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
         let mut p = Pair::new(v6, true);
         let payload: Vec<u8> = (0..12000).map(|n| (n % 239) as u8).collect();
         p.a.write(p.aid, &payload).unwrap();
-        let original = emit(&mut p.a, p.time, p.local.ip());
+        let original = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
         let path = if v6 { 1280 } else { 1024 };
         assert!(original.iter().any(|f| f.len() > path));
         let initial = p.a.transport_info(p.aid).unwrap();
@@ -441,7 +698,7 @@ fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
                     break;
                 }
                 // Tail-loss probes also disappear into the same black hole.
-                emit(&mut p.a, p.time, p.local.ip());
+                emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
             }
             let info = p.a.transport_info(p.aid).unwrap();
             assert!(info.rto_backoff > backoff);
@@ -450,7 +707,7 @@ fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
             let mtu = p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu;
             assert_eq!(mtu, if count < 3 { 1500 } else { path as u32 });
             if count < 3 {
-                let retries = emit(&mut p.a, p.time, p.local.ip());
+                let retries = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
                 assert!(retries.iter().any(|f| f.len() > path));
             }
         }
@@ -468,11 +725,20 @@ fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
         p.next_timeout();
         let followup = vec![0x93; 60000];
         p.a.write(p.aid, &followup).unwrap();
-        let probes = emit(&mut p.a, p.time, p.local.ip());
+        let probes = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
         let mut largest = probes.iter().map(Vec::len).max().unwrap_or(0);
         for frame in probes {
             assert!(segment(&frame).options.timestamps.is_some());
-            input_frame(&mut p.b, p.time, &frame, p.remote.ip(), false, 0).unwrap();
+            input_frame(
+                &mut p.bhost,
+                &mut p.b,
+                p.time,
+                &frame,
+                p.remote.ip(),
+                false,
+                0,
+            )
+            .unwrap();
         }
         let (_, later) = p.progress(MTU, &followup);
         largest = largest.max(later.iter().map(Vec::len).max().unwrap_or(0));
@@ -495,7 +761,7 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
     for v6 in [false, true] {
         let mut p = Pair::new(v6, true);
         p.a.write(p.aid, &[0x5a; 12000]).unwrap();
-        let original = emit(&mut p.a, p.time, p.local.ip()).remove(0);
+        let original = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip()).remove(0);
         let h = header(&original);
         let path = if v6 { 1280 } else { 1006 };
         let valid = ptb(&original, path);
@@ -569,16 +835,35 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
         let buffers = p.a.buffer_bytes();
         let deadline = p.a.next_deadline();
         for (name, report, configured) in cases {
-            input_frame(&mut p.a, p.time, &report, configured, false, 0).unwrap();
+            input_frame(
+                &mut p.ahost,
+                &mut p.a,
+                p.time,
+                &report,
+                configured,
+                false,
+                0,
+            )
+            .unwrap();
             assert_eq!(p.a.path_mtu_info(p.aid).unwrap(), before, "{v6}: {name}");
             assert_eq!(p.a.transport_info(p.aid).unwrap(), transport, "{name}");
             assert_eq!(p.a.buffer_bytes(), buffers, "{name}");
             assert_eq!(p.a.next_deadline(), deadline, "{name}");
             // Even a valid report cannot instantiate an unknown TCP connection.
-            let mut empty = endpoint(p.local.ip(), true);
+            let (mut empty, mut empty_host) = endpoint(p.local.ip(), true);
+            let reserved_storage = empty.buffer_bytes();
             empty.listen(p.local, 1).unwrap();
-            input_frame(&mut empty, p.time, &report, configured, false, 0).unwrap();
-            assert_eq!(empty.buffer_bytes(), 0, "{name}");
+            input_frame(
+                &mut empty_host,
+                &mut empty,
+                p.time,
+                &report,
+                configured,
+                false,
+                0,
+            )
+            .unwrap();
+            assert_eq!(empty.buffer_bytes(), reserved_storage, "{name}");
             assert_eq!(
                 empty.connection_id(Tuple {
                     local: p.local,
@@ -586,10 +871,11 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
                 }),
                 None
             );
-            assert!(emit(&mut empty, p.time, p.local.ip()).is_empty());
+            assert!(emit(&mut empty_host, &mut empty, p.time, p.local.ip()).is_empty());
         }
         // Positive control on the identical flight after every rejected report.
         input_frame(
+            &mut p.ahost,
             &mut p.a,
             p.time,
             &ptb(&original, path),
@@ -612,16 +898,22 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
 fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
     for v6 in [false, true] {
         let mut p = Pair::new(v6, true);
-        let payload = [0x6d; 12000];
-        p.a.write(p.aid, &payload).unwrap();
+        let first_len = if v6 { 1428 } else { 1448 };
+        let payload = vec![0x6d; first_len + 12000];
+        p.a.write(p.aid, &payload[..first_len]).unwrap();
+        let submitted = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].len(), MTU);
+        p.a.write(p.aid, &payload[first_len..]).unwrap();
         let mut backend = Backend {
             blocked: true,
             ..Default::default()
         };
         let mut output = [0; MTU];
-        let mut pending = 0;
+        let mut pending = None;
         let h = if v6 { IPV6_HEADER } else { IP_HEADER };
         transmit_frames(
+            &mut p.ahost,
             &mut p.a,
             p.time,
             &mut output,
@@ -631,26 +923,35 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
             &mut backend,
         )
         .unwrap();
-        let committed = output[..pending].to_vec();
+        let selected = output[..pending.as_ref().unwrap().len].to_vec();
+        let attempt = pending.as_ref().unwrap().attempt;
         let path = if v6 { 1280 } else { 1006 };
-        assert!(committed.len() > path);
-        segment(&committed);
-        input_frame(
-            &mut p.a,
-            p.time,
-            &ptb(&committed, path as u32),
-            p.local.ip(),
-            false,
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu,
-            path as u32
+        assert!(selected.len() > path);
+        // Feedback quotes a genuinely Submitted packet, not the held attempt.
+        let report = ptb(&submitted[0], path as u32);
+        for _ in 0..BUDGET {
+            input_frame(
+                &mut p.ahost,
+                &mut p.a,
+                p.time,
+                &report,
+                p.local.ip(),
+                false,
+                0,
+            )
+            .unwrap();
+        }
+        assert!(
+            !p.ahost.can_receive(),
+            "full retention backpressures TUN reads"
         );
+        assert_eq!(p.ahost.received.len(), BUDGET);
+        assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1500);
         let transport = p.a.transport_info(p.aid).unwrap();
         for _ in 0..3 {
+            p.ahost.replay(&mut p.a, p.time).unwrap();
             transmit_frames(
+                &mut p.ahost,
                 &mut p.a,
                 p.time,
                 &mut output,
@@ -660,16 +961,14 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
                 &mut backend,
             )
             .unwrap();
-            assert_eq!(&output[..pending], committed);
-            assert_eq!(
-                p.a.transport_info(p.aid).unwrap(),
-                transport,
-                "blocked polls cannot commit more TCP bytes"
-            );
+            assert_eq!(pending.as_ref().unwrap().attempt, attempt);
+            assert_eq!(&output[..pending.as_ref().unwrap().len], selected);
+            assert_eq!(p.a.transport_info(p.aid).unwrap(), transport);
             assert!(backend.frames.is_empty());
         }
         backend.blocked = false;
         transmit_frames(
+            &mut p.ahost,
             &mut p.a,
             p.time,
             &mut output,
@@ -679,19 +978,384 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
             &mut backend,
         )
         .unwrap();
-        assert_eq!(pending, 0);
-        assert_eq!(backend.frames[0], committed);
+        assert!(pending.is_none());
+        assert!(p.ahost.can_receive());
+        assert!(p.ahost.received.is_empty());
+        assert_eq!(backend.frames[0], selected);
+        assert_eq!(backend.frames.iter().filter(|f| **f == selected).count(), 1);
         assert_eq!(
-            backend.frames.iter().filter(|f| **f == committed).count(),
-            1
+            p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu,
+            path as u32
         );
-        // The already committed oversized packet is dropped by the path; admit
-        // subsequent fitting output. Real ACKs must recover the entire stream.
+        // The two already Submitted oversized packets disappear at the path;
+        // only subsequent fitting repairs reach the real peer.
         for frame in &backend.frames[1..] {
             assert!(frame.len() <= path);
             segment(frame);
-            input_frame(&mut p.b, p.time, frame, p.remote.ip(), false, 0).unwrap();
+            input_frame(
+                &mut p.bhost,
+                &mut p.b,
+                p.time,
+                frame,
+                p.remote.ip(),
+                false,
+                0,
+            )
+            .unwrap();
         }
         p.progress(path, &payload);
+    }
+}
+
+#[test]
+fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
+    let local: IpAddr = "192.0.2.1".parse().unwrap();
+    let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+    let hop: Ipv4Addr = "192.0.2.9".parse().unwrap();
+    let mut cfg = runtime_config(&Backend::default(), local, true, true, true).unwrap();
+    cfg.dscp = 37;
+    let mut endpoint = Endpoint::new(
+        cfg.clone(),
+        [9; 32],
+        0,
+        tun_address_policy(
+            "192.0.2.1".parse().unwrap(),
+            ("192.0.2.1".parse().unwrap(), 24),
+        ),
+    )
+    .unwrap();
+    let mut network = TunHost::attach(&mut endpoint, &cfg, local).unwrap();
+    let id = endpoint
+        .connect_with_path_provider(
+            0,
+            SocketAddr::new(local, 1234),
+            remote,
+            ntcp::ManagedOpenOptions {
+                transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                dscp: cfg.dscp,
+                ipv4_options: ntcp::OutgoingIpv4Options {
+                    source_route: Some(ntcp::SourceRoute::new(&[hop], false).unwrap()),
+                    record_route_slots: Some(2),
+                    timestamp: Some(ntcp::TimestampRequest::Times(2)),
+                    ..Default::default()
+                },
+                receive_authority: None,
+            },
+            &mut network.host,
+        )
+        .unwrap();
+    let mut backend = Backend {
+        blocked: true,
+        ..Default::default()
+    };
+    let mut bytes = [0; MTU];
+    let mut pending = None;
+    transmit_frames(
+        &mut network,
+        &mut endpoint,
+        0,
+        &mut bytes,
+        &mut pending,
+        IP_HEADER,
+        0x8000_0123,
+        &mut backend,
+    )
+    .unwrap();
+    let held = pending.as_ref().unwrap();
+    let context = held.context.unwrap();
+    let staged = bytes[..held.len].to_vec();
+    assert_eq!(
+        context.binding.snapshot.key().destination().address(),
+        remote.ip()
+    );
+    assert_eq!(
+        context
+            .binding
+            .snapshot
+            .key()
+            .forwarding_destination()
+            .address(),
+        IpAddr::V4(hop)
+    );
+    assert_eq!(&staged[16..20], &hop.octets());
+    assert!(header(&staged) > IP_HEADER);
+    // Harmless stamp changes retain the exact selected option/timestamp bytes.
+    network
+        .host
+        .set_link_mtu(network.ingress.link(), 1600)
+        .unwrap();
+    backend.blocked = false;
+    transmit_frames(
+        &mut network,
+        &mut endpoint,
+        0,
+        &mut bytes,
+        &mut pending,
+        IP_HEADER,
+        0x8000_0456,
+        &mut backend,
+    )
+    .unwrap();
+    assert!(pending.is_none());
+    assert_eq!(backend.frames, vec![staged]);
+    // This is an originating, not-yet-forwarded source route. The ingress
+    // codec correctly rejects it as incomplete at the final destination;
+    // quote_header validates the outbound header and its logical peer instead.
+    let (ip, header_len, total, protocol) = ntcp_ip::quote_header(&backend.frames[0]).unwrap();
+    assert_eq!(ip.destination, remote.ip());
+    assert_eq!(total, backend.frames[0].len());
+    assert_eq!(protocol, 6);
+    assert_eq!(backend.frames[0][1] >> 2, 37);
+    assert!(ntcp::wire::parse(ip, &backend.frames[0][header_len..]).is_ok());
+    assert_eq!(
+        endpoint.managed_path(id).unwrap().forwarding_destination,
+        IpAddr::V4(hop)
+    );
+}
+
+#[test]
+fn runtime_rejection_interruption_and_unknown_outcome_never_accept_selected_bytes() {
+    for v6 in [false, true] {
+        for errno in [None, Some(libc::EINTR), Some(libc::EIO)] {
+            let mut p = Pair::new(v6, true);
+            let payload = vec![0x2b; 12000];
+            p.a.write(p.aid, &payload).unwrap();
+            let before = p.a.transport_info(p.aid).unwrap();
+            let mut backend = Backend {
+                rejected: errno.is_none(),
+                tx_errno: errno,
+                ..Default::default()
+            };
+            let mut bytes = [0; MTU];
+            let mut pending = None;
+            let header = if v6 { IPV6_HEADER } else { IP_HEADER };
+            let result = transmit_frames(
+                &mut p.ahost,
+                &mut p.a,
+                p.time,
+                &mut bytes,
+                &mut pending,
+                header,
+                0,
+                &mut backend,
+            );
+            if errno == Some(libc::EIO) {
+                assert_eq!(result.unwrap_err().raw_os_error(), errno);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(backend.attempts, 1);
+            assert!(backend.frames.is_empty());
+            let held = pending.as_ref().unwrap();
+            assert!(p.a.transmit_attempt_packet(held.attempt).is_some());
+            assert!(p.a.is_output_reserved(p.aid));
+            assert_eq!(p.a.transport_info(p.aid).unwrap().unacked, before.unacked);
+            if errno == Some(libc::EIO) {
+                // run() propagates this unknown outcome and drops the runtime;
+                // it never rejects, retries or claims these bytes Submitted.
+                continue;
+            }
+            backend.rejected = false;
+            backend.tx_errno = None;
+            transmit_frames(
+                &mut p.ahost,
+                &mut p.a,
+                p.time,
+                &mut bytes,
+                &mut pending,
+                header,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            assert!(pending.is_none());
+            for frame in &backend.frames {
+                input_frame(
+                    &mut p.bhost,
+                    &mut p.b,
+                    p.time,
+                    frame,
+                    p.remote.ip(),
+                    false,
+                    0,
+                )
+                .unwrap();
+            }
+            p.progress(MTU, &payload);
+        }
+    }
+}
+
+#[test]
+fn runtime_stale_source_pauses_held_output_until_canonical_rebind() {
+    for v6 in [false, true] {
+        let mut p = Pair::new(v6, true);
+        let payload = vec![0x8f; 12000];
+        p.a.write(p.aid, &payload).unwrap();
+        let mut backend = Backend {
+            blocked: true,
+            ..Default::default()
+        };
+        let mut bytes = [0; MTU];
+        let mut pending = None;
+        let header = if v6 { IPV6_HEADER } else { IP_HEADER };
+        transmit_frames(
+            &mut p.ahost,
+            &mut p.a,
+            p.time,
+            &mut bytes,
+            &mut pending,
+            header,
+            0,
+            &mut backend,
+        )
+        .unwrap();
+        let attempt = pending.as_ref().unwrap().attempt;
+        let old = p.ahost.host.binding(p.aid).unwrap();
+        p.ahost
+            .host
+            .remove_source_owner(old.snapshot.key().source(), p.ahost.ingress.link())
+            .unwrap();
+        backend.blocked = false;
+        let calls = backend.attempts;
+        for _ in 0..2 {
+            transmit_frames(
+                &mut p.ahost,
+                &mut p.a,
+                p.time,
+                &mut bytes,
+                &mut pending,
+                header,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            assert!(pending.as_ref().unwrap().blocked);
+            assert_eq!(pending.as_ref().unwrap().attempt, attempt);
+            assert_eq!(
+                backend.attempts, calls,
+                "no backend call under stale authority"
+            );
+            assert!(p.ahost.host.paths().is_dirty(old.client).unwrap());
+        }
+        p.ahost
+            .host
+            .register_source(
+                path::ScopedAddress::new(p.local.ip(), None).unwrap(),
+                p.ahost.ingress.link(),
+            )
+            .unwrap();
+        transmit_frames(
+            &mut p.ahost,
+            &mut p.a,
+            p.time,
+            &mut bytes,
+            &mut pending,
+            header,
+            0,
+            &mut backend,
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert_ne!(
+            p.ahost.host.binding(p.aid).unwrap().snapshot.path(),
+            old.snapshot.path()
+        );
+        for frame in &backend.frames {
+            input_frame(
+                &mut p.bhost,
+                &mut p.b,
+                p.time,
+                frame,
+                p.remote.ip(),
+                false,
+                0,
+            )
+            .unwrap();
+        }
+        p.progress(MTU, &payload);
+    }
+}
+
+#[test]
+fn runtime_held_attempt_repacketizes_on_shared_or_physical_decrease() {
+    for (v6, physical) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut p = Pair::new(v6, true);
+        let payload = vec![0x93; 12000];
+        p.a.write(p.aid, &payload).unwrap();
+        let before = p.a.transport_info(p.aid).unwrap();
+        let mut backend = Backend {
+            blocked: true,
+            ..Default::default()
+        };
+        let mut output = [0; MTU];
+        let mut pending = None;
+        let h = if v6 { IPV6_HEADER } else { IP_HEADER };
+        transmit_frames(
+            &mut p.ahost,
+            &mut p.a,
+            p.time,
+            &mut output,
+            &mut pending,
+            h,
+            0,
+            &mut backend,
+        )
+        .unwrap();
+        let attempt = pending.as_ref().unwrap().attempt;
+        let selected_sequence = segment(&output[..pending.as_ref().unwrap().len])
+            .header
+            .sequence;
+        assert_eq!(
+            p.a.transport_info(p.aid).unwrap().unacked,
+            before.unacked,
+            "WouldBlock does not accept selected stream bytes"
+        );
+        let path = p.ahost.host.binding(p.aid).unwrap().snapshot.path();
+        let limit = if v6 { 1280 } else { 1006 };
+        if physical {
+            p.ahost
+                .host
+                .set_link_mtu(p.ahost.ingress.link(), limit)
+                .unwrap();
+        } else {
+            p.ahost.host.trusted_decrease(p.time, path, limit).unwrap();
+        }
+        backend.blocked = false;
+        transmit_frames(
+            &mut p.ahost,
+            &mut p.a,
+            p.time,
+            &mut output,
+            &mut pending,
+            h,
+            0,
+            &mut backend,
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert!(p.a.transmit_attempt_packet(attempt).is_none());
+        assert!(!backend.frames.is_empty());
+        assert_eq!(
+            segment(&backend.frames[0]).header.sequence,
+            selected_sequence
+        );
+        for frame in &backend.frames {
+            assert!(
+                frame.len() <= limit as usize,
+                "no stale oversized submission"
+            );
+            input_frame(
+                &mut p.bhost,
+                &mut p.b,
+                p.time,
+                frame,
+                p.remote.ip(),
+                false,
+                0,
+            )
+            .unwrap();
+        }
+        p.progress(limit as usize, &payload);
     }
 }

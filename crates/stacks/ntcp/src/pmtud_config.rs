@@ -37,41 +37,57 @@ impl SearchAging {
 /// Public compatibility adapter for the canonical IP-layer plateau policy.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Ipv4Plateaus(ntcp_path::Ipv4Plateaus);
+pub struct Ipv4Plateaus(Option<ntcp_path::Ipv4Plateaus>);
 
 impl Ipv4Plateaus {
     pub const CAPACITY: usize = ntcp_path::Ipv4Plateaus::CAPACITY;
-    pub const RFC1191: Self = Self(ntcp_path::Ipv4Plateaus::RFC1191);
+    /// Use the canonical host table in managed mode; raw transports retain
+    /// the historical RFC1191 table. Explicit tables always take precedence.
+    pub const INHERIT: Self = Self(None);
+    pub const RFC1191: Self = Self(Some(ntcp_path::Ipv4Plateaus::RFC1191));
     pub const HISTORICAL: Self = Self::RFC1191;
-    pub const CONTEMPORARY: Self = Self(ntcp_path::Ipv4Plateaus::CONTEMPORARY);
+    pub const CONTEMPORARY: Self = Self(Some(ntcp_path::Ipv4Plateaus::CONTEMPORARY));
 
     pub fn new(values: &[u32]) -> Result<Self, Error> {
         ntcp_path::Ipv4Plateaus::new(values)
-            .map(Self)
+            .map(|table| Self(Some(table)))
             .map_err(|_| Error::InvalidArgument)
     }
 
     pub fn as_slice(&self) -> &[u32] {
-        self.0.as_slice()
+        self.0
+            .as_ref()
+            .unwrap_or(&ntcp_path::Ipv4Plateaus::RFC1191)
+            .as_slice()
+    }
+
+    pub(crate) fn for_path(self, path: Option<crate::PreparedPath>) -> Self {
+        if self.0.is_none() {
+            path.map_or(Self::RFC1191, |p| Self(p.snapshot.ipv4_plateaus()))
+        } else {
+            self
+        }
     }
 }
 
 impl Default for Ipv4Plateaus {
     fn default() -> Self {
-        Self::RFC1191
+        Self::INHERIT
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmtudPolicy {
     pub search_aging: SearchAging,
+    /// INHERIT selects the live canonical table for managed transports and
+    /// RFC1191 for raw transports. An explicit table overrides host policy.
     pub ipv4_plateaus: Ipv4Plateaus,
 }
 
 impl PmtudPolicy {
     pub const DEFAULT: Self = Self {
         search_aging: SearchAging::Seconds(600),
-        ipv4_plateaus: Ipv4Plateaus::RFC1191,
+        ipv4_plateaus: Ipv4Plateaus::INHERIT,
     };
 }
 

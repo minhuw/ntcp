@@ -16,6 +16,7 @@ tfo-linux-cookie = ["ntcp/tfo-linux-cookie"]
 [dependencies]
 ntcp-egress = { path = "../../net/ntcp-egress" }
 libc = "0.2"
+ntcp-host = { path = "../../stacks/ntcp-host", version = "0.0.1" }
 ntcp = { path = "../../stacks/ntcp", version = "0.0.1" }
 ntcp-ip = { path = "../../stacks/ntcp-ip", version = "0.0.1" }
 ntcp-io = { path = "../../io/ntcp-io", version = "0.0.1" }

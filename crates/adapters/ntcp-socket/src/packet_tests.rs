@@ -18,6 +18,25 @@ const TCP_INFO_SIZE: usize = 280;
 struct Owner {
     inner: SocketOwner,
 }
+fn fixture_connect(
+    owner: &mut Owner,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> std::result::Result<ConnectionId, ntcp::ManagedError<ntcp_host::Error>> {
+    let inner = &mut owner.inner;
+    inner.endpoint.connect_with_path_provider(
+        0,
+        local,
+        remote,
+        ntcp::ManagedOpenOptions {
+            transport: ntcp::ActiveOpenOptions::from(&inner.defaults.connection),
+            dscp: inner.defaults.dscp,
+            ipv4_options: Default::default(),
+            receive_authority: None,
+        },
+        inner.host.as_mut().unwrap(),
+    )
+}
 impl Deref for Owner {
     type Target = SocketOwner;
     fn deref(&self) -> &SocketOwner {
@@ -209,7 +228,7 @@ impl Owner {
         let mut owner = Self::new(settings)?;
         let mut config = crate::packet_profile::config(settings.1);
         config.connection.prr_pacing = pacing;
-        owner.inner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).map_err(engine)?;
+        owner.inner.replace_packet_endpoint(config)?;
         Ok(owner)
     }
     fn alloc(&mut self, mut socket: Socket) -> Result<u64> {
@@ -591,15 +610,12 @@ fn ipv4_validation_and_address_roundtrip() {
 fn reuseaddr_allows_rebinding_connected_socket_but_not_listener() {
     let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let address = SocketAddr::new(local().into(), 40000);
-    let id = owner
-        .inner
-        .endpoint
-        .connect(
-            0,
-            address,
-            SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
-        )
-        .unwrap();
+    let id = fixture_connect(
+        &mut owner,
+        address,
+        SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
+    )
+    .unwrap();
     let mut first = Socket::new(0);
     first.handle = Handle::Connection(id);
     first.local = Some(address);
@@ -1001,15 +1017,12 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
         drop(unreserved);
         // Learn the core's private metadata charge from the first connection;
         // verify it covers buffers and at least one timestamp per send octet.
-        let first = owner
-            .inner
-            .endpoint
-            .connect(
-                0,
-                SocketAddr::new(local().into(), 40000),
-                SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
-            )
-            .unwrap();
+        let first = fixture_connect(
+            &mut owner,
+            SocketAddr::new(local().into(), 40000),
+            SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
+        )
+        .unwrap();
         assert_eq!(
             owner
                 .endpoint
@@ -1026,14 +1039,12 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
         let max_bytes = 32 * 1024 * 1024;
         let count = LIMIT.min((max_bytes - reservation_bytes) / per_connection);
         for i in 1..count {
-            owner
-                .endpoint
-                .connect(
-                    0,
-                    SocketAddr::new(local().into(), 40000 + i as u16),
-                    SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
-                )
-                .unwrap();
+            fixture_connect(
+                &mut owner,
+                SocketAddr::new(local().into(), 40000 + i as u16),
+                SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
+            )
+            .unwrap();
             assert_eq!(
                 owner.inner.endpoint.buffer_bytes(),
                 reservation_bytes + (i + 1) * per_connection
@@ -1041,12 +1052,12 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
             assert!(owner.inner.endpoint.buffer_bytes() <= max_bytes);
         }
         assert_eq!(
-            owner.inner.endpoint.connect(
-                0,
+            fixture_connect(
+                &mut owner,
                 SocketAddr::new(local().into(), 50000),
                 SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
             ),
-            Err(EndpointError::LimitReached)
+            Err(EndpointError::LimitReached.into())
         );
         assert_eq!(
             owner.inner.endpoint.buffer_bytes(),
@@ -2554,7 +2565,7 @@ fn ip_metadata_limit_is_reserved_before_connect_and_reused_after_gc() {
     config.connection.receive_capacity = 128;
     config.connection.send_capacity = 128;
     config.connection.mss = 128;
-    owner.inner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    owner.inner.replace_packet_endpoint(config).unwrap();
     let remote = encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080));
     let mut first = None;
     for _ in 0..LIMIT {
@@ -2794,7 +2805,7 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
     config.max_connections = LIMIT + 1; // Core still has room when metadata fills.
     config.connection.receive_capacity = 128;
     config.connection.send_capacity = 128;
-    owner.inner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    owner.inner.replace_packet_endpoint(config).unwrap();
     let listener = owner.alloc(Socket::new(0)).unwrap();
     owner.sockets.get_mut(&listener).unwrap().receive_capacity = 128;
     owner.sockets.get_mut(&listener).unwrap().send_capacity = 128;
@@ -2866,7 +2877,7 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
     let len = ntcp::wire::encode(ip, incoming, &[], &[], &mut bytes).unwrap();
     assert_eq!(
         owner.inner.input(owner.inner.now(), ip, 0, &bytes[..len]),
-        Err(EndpointError::LimitReached)
+        Err(EndpointError::LimitReached.into())
     );
     let packet = frame(
         ntcp::Transmit {

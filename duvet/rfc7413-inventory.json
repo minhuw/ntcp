@@ -1080,7 +1080,7 @@
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
       "offset": 1754,
       "evidence": [
-        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_receive(",
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_receive_path(",
         "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_rfc5681_controller_matrix_and_ordinary_controls()"
       ]
     },

@@ -150,10 +150,28 @@ fn mask6(length: u8) -> u128 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ForwarderId(pub u64);
+
+/// Explicit embedding assignment, scoped by the canonical link. This does
+/// not assert that a peer is on-link or that an IP neighbor has been resolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ResolvedNextHop {
+    Address(ScopedAddress),
+    Forwarder(ForwarderId),
+}
+
+impl PartialEq<ScopedAddress> for ResolvedNextHop {
+    fn eq(&self, other: &ScopedAddress) -> bool {
+        *self == Self::Address(*other)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NextHop {
     OnLink,
     Gateway(ScopedAddress),
+    Forwarder(ForwarderId),
 }
 
 /// Forwarding policy only. No transport ceilings, ports or peer MSS participate.
@@ -233,9 +251,10 @@ pub struct PathKey {
     source: SourceId,
     source_address: ScopedAddress,
     destination: ScopedAddress,
+    forwarding_destination: ScopedAddress,
     dscp: Dscp,
     link: LinkId,
-    next_hop: ScopedAddress,
+    next_hop: ResolvedNextHop,
     route: RouteId,
 }
 
@@ -252,13 +271,18 @@ impl PathKey {
     pub const fn destination(self) -> ScopedAddress {
         self.destination
     }
+    /// Actual destination used for forwarding (the first source-route hop
+    /// when explicitly supplied), distinct from the transport destination.
+    pub const fn forwarding_destination(self) -> ScopedAddress {
+        self.forwarding_destination
+    }
     pub const fn dscp(self) -> Dscp {
         self.dscp
     }
     pub const fn link(self) -> LinkId {
         self.link
     }
-    pub const fn next_hop(self) -> ScopedAddress {
+    pub const fn next_hop(self) -> ResolvedNextHop {
         self.next_hop
     }
     pub const fn route(self) -> RouteId {
@@ -589,6 +613,28 @@ impl PathService {
         Ok(source)
     }
 
+    /// Canonical source lookup; ownership is checked against the live link.
+    /// No separate address registry is needed by the serialized host.
+    pub fn local_source(&self, address: ScopedAddress, link: LinkId) -> Result<SourceId, Error> {
+        self.link(link)?;
+        self.sources.slots.iter().enumerate().find_map(|(slot, record)| {
+            let source = record.value?;
+            if source.address != address {
+                return None;
+            }
+            let id = SourceId(Handle { context: self.context, slot, generation: record.generation });
+            self.owns_source(id, link).ok().filter(|owned| *owned).map(|_| id)
+        }).ok_or(Error::NoRoute)
+    }
+
+    pub fn sources(&self) -> impl Iterator<Item = (SourceId, ScopedAddress)> + '_ {
+        self.sources.slots.iter().enumerate().filter_map(|(slot, record)| {
+            record.value.map(|source| (SourceId(Handle {
+                context: self.context, slot, generation: record.generation,
+            }), source.address))
+        })
+    }
+
     pub fn source_address(&self, source: SourceId) -> Result<ScopedAddress, Error> {
         Ok(self.sources.get(self.context, source.0)?.address)
     }
@@ -739,7 +785,17 @@ impl PathService {
     }
 
     pub fn resolve(&self, request: PathRequest) -> Result<ResolvedPath, Error> {
+        self.resolve_via(request, request.destination)
+    }
+
+    /// Explicit originating source-route context, never inferred from ingress.
+    /// Both final and forwarding destinations participate in canonical identity.
+    pub fn resolve_via(&self, request: PathRequest, forwarding_destination: ScopedAddress) -> Result<ResolvedPath, Error> {
         let source = self.source_address(request.source)?;
+        self.check_address(forwarding_destination)?;
+        if forwarding_destination.address.is_ipv4() != request.destination.address.is_ipv4() {
+            return Err(Error::InvalidArgument);
+        }
         self.check_address(source)?;
         self.check_address(request.destination)?;
         if source.address.is_ipv4() != request.destination.address.is_ipv4()
@@ -763,12 +819,13 @@ impl PathService {
             let Some(route) = record.value else {
                 continue;
             };
-            if !route.destination.contains(request.destination.address)
+            if !route.destination.contains(forwarding_destination.address)
                 || route.source.is_some_and(|p| !p.contains(source.address))
                 || route.dscp.is_some_and(|d| d != request.dscp)
                 // A scoped source may reach an unscoped destination, but only
                 // through its authoritative link, irrespective of precedence.
                 || source.zone.is_some_and(|zone| zone != route.link)
+                || forwarding_destination.zone.is_some_and(|zone| zone != route.link)
                 || request
                     .destination
                     .zone
@@ -795,11 +852,13 @@ impl PathService {
                 source: request.source,
                 source_address: source,
                 destination: request.destination,
+                forwarding_destination,
                 dscp: request.dscp,
                 link: route.link,
                 next_hop: match route.next_hop {
-                    NextHop::OnLink => request.destination,
-                    NextHop::Gateway(g) => g,
+                    NextHop::OnLink => ResolvedNextHop::Address(forwarding_destination),
+                    NextHop::Gateway(g) => ResolvedNextHop::Address(g),
+                    NextHop::Forwarder(id) => ResolvedNextHop::Forwarder(id),
                 },
                 route: id,
             },
@@ -817,7 +876,7 @@ impl PathService {
         }
         self.link(key.link)?;
         self.route(key.route)?;
-        let current = self.resolve(key.request())?;
+        let current = self.resolve_via(key.request(), key.forwarding_destination)?;
         if current.key != key {
             return Err(Error::SelectionChanged);
         }

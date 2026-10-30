@@ -76,15 +76,15 @@ fn invalid(
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.1
 //= type=test
-//= reason=T7 PathService exposes minimum-header MMS_S and checked complete-header payload budgets through versioned snapshots, bounded dirty scans and explicit path-generation acknowledgements. Public dual-family tests verify independent consumers, coalescing and readN/update/ackN without consuming newer changes. Actual TCP budget application and physical submission barriers remain separate T8/T10 obligations.
+//= reason=T7 PathService exposes minimum-header MMS_S, complete-header budgets and versioned notifications with exact acknowledgements. T8 Host applies snapshots to actual native/TUN TCP owners and gates every reserved physical submission. Independent-reader/coalescing tests preserve readN/update/ackN; validated cross-protocol publication remains T9/T10.
 //# A way to learn of changes in the value of MMS_S, the "maximum send transport-message size", which is derived from the Path MTU by subtracting the minimum IP header size.
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
 //= type=test
-//= reason=T7 PathService initializes resolved per-host records from the physical first hop, retaining immutable network/default forwarding facts separately from learned decreases and query-only transport limits. Public tests prove host isolation and no learned copying across route/link generations. Actual first-packet managed host selection and validated ICMP dispatch remain T8/T9.
+//= reason=Managed factories acquire per-host records from configured network/default routes before TCP construction, initializing unlearned budgets from the physical first hop. Trusted decreases change only per-host learned estimates, preserving forwarding routes and independent first-hop facts. Dual-family two-Endpoint tests exercise both route selections, first SYN/hidden child and later decreases without forwarding-route mutation. Generic ICMP publication remains the separate 1191-057 obligation.
 //# When the first packet is sent to a host for which no per-host route exists, a route is chosen either from the set of per-network routes, or from the set of default routes. The PMTU fields in these route entries should be initialized to be the MTU of the associated first-hop data link, and must never be changed by the PMTU Discovery process. (PMTU Discovery only creates or changes entries for per-host routes). Until a Datagram Too Big message is received, the PMTU associated with the initially-chosen route is presumed to be accurate.
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
 //= type=test
-//= reason=T7 PathService marks every bound client dirty on a trusted decrease, coalesces newest versions and preserves updates across independent acknowledgements and logical blocked consumers. Actual Connection/datagram bindings and physical output barriers remain T8/T10; validated ICMP production remains T9. Logical clients alone do not prove runtime packetization fanout.
+//= reason=T7 PathService coalesces dirty snapshots with exact acknowledgements. T8 Host refreshes actual native/TUN TCP owners, including reserved/released generations, without inventing repair or loss events; two-flow and held-output tests exercise trusted decreases. Generic validated ICMP producers and actual datagram consumers/fanout remain T9/T10.
 //# The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
 fn independent_clients_share_network_decreases_and_coalesce_without_consuming_reads() {
     for ipv6 in [false, true] {
@@ -170,7 +170,7 @@ fn independent_clients_share_network_decreases_and_coalesce_without_consuming_re
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
 //= type=test
-//= reason=T7 PathService stores each learned estimate under the canonical context, source identity/address, destination/scope, routing DSCP, link, next-hop and route generation. Mutable ECN and transport ports are excluded; public tests prove sharing and independent source/destination/DSCP/scoped-link estimates. Native/TUN binding and validated ICMP production remain separate T8/T9 integration obligations.
+//= reason=T7 PathService keys learned estimates by canonical context, source, destination/scope, routing DSCP, link, next-hop and route generation, excluding ECN and ports. T8 Host binds actual native/TUN TCP owners to these records; public tests preserve source/destination/DSCP/scoped-link isolation. Generic validated ICMP publication remains T9.
 //# In general, the IP layer should associate each PMTU value that it has learned with a specific path. A path is identified by a source address, a destination address and an IP type-of-service. (Some implementations do not record the source address of paths; this is acceptable for single-homed hosts, which have only one possible source address.)
 fn cached_estimates_are_isolated_by_source_dscp_destination_and_ecn_is_excluded() {
     let (mut service, link, _, req) = setup(8, 12, false, 9001);
@@ -212,7 +212,7 @@ fn cached_estimates_are_isolated_by_source_dscp_destination_and_ecn_is_excluded(
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
 //= type=test
-//= reason=T7 PathService atomically re-resolves every bound path after route/source/link changes, including new shadowing routes, retains pinned invalidated snapshots and notifies all clients. Failed rebind preserves pending invalidation with explicit capacity backpressure. Actual managed TCP refresh, physical output barriers and validated Redirect handling remain T8/T9/T10.
+//= reason=T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners and gates held physical output; failed rebind preserves dirty authority and bounded backpressure. Validated ICMP Redirect production and full cross-protocol physical races remain T9/T10.
 //# PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.
 fn every_route_mutation_reconsiders_pinned_paths_including_live_shadowed_routes() {
     // add more-specific; add cheaper; replace alternative to cheaper; replace
@@ -873,7 +873,7 @@ fn scoped_paths_foreign_context_and_binding_acknowledgements_stay_isolated() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
 //= type=test
-//= reason=T7 PathService trusted_decrease and live legacy fallback update only the resolved per-host estimate, preserving the selected first hop and checking live source/link/route generations. These trusted entrypoints do not authenticate received ICMP. Actual submitted-quote correlation, dispatch and creation/use by the serialized host remain T8/T9; packetization barriers and fanout remain T10.
+//= reason=T7 PathService supports trusted per-host decreases and legacy fallback without changing first-hop routes. T8 Host creates actual native/TUN bindings and preserves existing connection-local ICMP validation. These trusted APIs are not received-packet authentication: submitted-quote correlation and shared ICMP publication remain T9, with cross-protocol fanout T10.
 //# When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
 //= https://www.rfc-editor.org/rfc/rfc1191#section-7
 //= type=test

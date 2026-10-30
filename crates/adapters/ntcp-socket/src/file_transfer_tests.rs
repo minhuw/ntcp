@@ -143,9 +143,10 @@ fn freebind_local_nonlocal_policy_and_passive_snapshot() {
     a.execute(id, Op::Bind(nonlocal)).unwrap();
     assert_eq!(a.execute(id, Op::Name(false)).unwrap().addr, Some(nonlocal));
     // Binding permission must not grant a new backend source route.
-    assert!(
+    assert_eq!(
         a.execute(id, Op::Connect("10.73.0.3:18000".parse().unwrap()))
-            .is_err()
+            .unwrap_err(),
+        EINVAL
     );
     a.execute(id, Op::Listen(1)).unwrap();
 

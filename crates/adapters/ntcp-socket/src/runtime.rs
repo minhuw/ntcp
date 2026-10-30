@@ -350,6 +350,27 @@ fn engine(e: EndpointError) -> i32 {
         _ => EINVAL,
     }
 }
+fn host_error(error: ntcp_host::Error) -> i32 {
+    use ntcp_host::{Error as H, path::Error as P};
+    match error {
+        H::Endpoint(EndpointError::OutputReserved) => EAGAIN,
+        H::Endpoint(error) => engine(error),
+        H::Allocation | H::Path(P::Allocation) => ENOMEM,
+        H::Capacity | H::Path(P::Capacity | P::Exhausted) => ENOBUFS,
+        H::Path(P::NoRoute) => ENETUNREACH,
+        H::Path(P::SourceNotOwned) => EADDRNOTAVAIL,
+        H::InvalidContext
+        | H::Obsolete
+        | H::Path(P::ForeignContext | P::StaleHandle | P::Invalidated | P::SelectionChanged) => {
+            ESTALE
+        }
+        H::Unsupported => EOPNOTSUPP,
+        H::Codec(_) | H::Path(P::InvalidArgument | P::Duplicate) => EINVAL,
+    }
+}
+fn managed_error(error: ntcp::ManagedError<ntcp_host::Error>) -> i32 {
+    host_error(error.into())
+}
 #[derive(Clone, Copy)]
 enum Handle {
     Fresh,
@@ -574,6 +595,9 @@ struct Owner {
     #[cfg(test)]
     fast_open_entropy: Option<VecDeque<Result<[u8; 32]>>>,
     endpoint: Endpoint,
+    // Absent only during construction or in explicitly backend-less core fixtures.
+    host: Option<ntcp_host::Host>,
+    ingress: Option<ntcp_host::IngressContext>,
     defaults: EndpointConfig,
     socket_policy: crate::SocketPolicy,
     tun: Option<Tun>,
@@ -705,6 +729,7 @@ impl Owner {
         let tcp = backend::backend_config_family(config.tcp.clone(), &tun, local)?;
         let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
         owner.initialize_socket_config(config)?;
+        owner.attach_backend_host(u64::from(index))?;
         owner.enable_reservations(&config.io, index)?;
         Ok(owner)
     }
@@ -883,6 +908,8 @@ impl Owner {
             #[cfg(test)]
             fast_open_entropy: None,
             endpoint,
+            host: None,
+            ingress: None,
             defaults,
             socket_policy: crate::SocketPolicy::default(),
             tun,
@@ -956,8 +983,21 @@ impl Owner {
                 FastOpenClientPolicy::ApplicationProtected;
         }
         owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
+        owner.attach_backend_host(1)?;
         owner.enable_egress(options.egress_capacity, crate::packet_profile::gso(profile))?;
         Ok(owner)
+    }
+    #[cfg(all(test, feature = "packet-test"))]
+    fn replace_packet_endpoint(&mut self, config: EndpointConfig) -> Result<()> {
+        // Configuration variants in packet fixtures still attach their actual
+        // port through the production bridge before exercising socket startup.
+        assert!(self.packets.is_some());
+        assert_eq!(self.host.as_ref().unwrap().binding_count(), 0);
+        self.endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).map_err(engine)?;
+        self.defaults = config;
+        self.host = None;
+        self.ingress = None;
+        self.attach_backend_host(1)
     }
     fn check_address(&self, addr: SocketAddr) -> Result<()> {
         if addr.is_ipv4() != self.local.is_ipv4() {
@@ -1243,6 +1283,9 @@ impl Owner {
                     true
                 }
             });
+            if self.collect_paths().is_err() {
+                break 'run;
+            }
             // Bounded owner work and a 1ms ceiling also cover shared wakefd consumers.
             let wait = self.output_wait();
             // Keep admission open while teardown has room; packet capture must
@@ -1297,6 +1340,12 @@ impl Owner {
             let _ = request.reply.send(result);
         }
     }
+    fn collect_paths(&mut self) -> Result<()> {
+        if let Some(host) = &mut self.host {
+            host.collect(&self.endpoint).map_err(host_error)?;
+        }
+        Ok(())
+    }
     fn prune_child_timeouts(&mut self) {
         self.child_timeouts
             .retain(|(cid, _, _, _, _)| self.endpoint.connection_exists(*cid));
@@ -1310,7 +1359,7 @@ impl Owner {
         ip: ntcp::IpMetadata,
         traffic_class: u8,
         bytes: &[u8],
-    ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
+    ) -> std::result::Result<ntcp::InputDisposition, ntcp_host::Error> {
         let stamps = ntcp::RxPacketTimestamps {
             software: self.software_rx_enabled().then(|| ntcp::RxTimestamp {
                 value: timestamps::realtime(),
@@ -1328,7 +1377,7 @@ impl Owner {
         traffic_class: u8,
         bytes: &[u8],
         stamps: ntcp::RxPacketTimestamps,
-    ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
+    ) -> std::result::Result<ntcp::InputDisposition, ntcp_host::Error> {
         self.input_segmented(
             now,
             ip,
@@ -1348,7 +1397,10 @@ impl Owner {
         bytes: &[u8],
         stamps: ntcp::RxPacketTimestamps,
         segment_size: Option<core::num::NonZeroU16>,
-    ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
+    ) -> std::result::Result<ntcp::InputDisposition, ntcp_host::Error> {
+        if let Some(host) = &mut self.host {
+            host.collect(&self.endpoint)?;
+        }
         // Endpoint validates the packet; the ports are only used to observe
         // generation-aware tuple ownership before and after passive admission.
         let tuple = bytes.get(..4).map(|ports| ntcp::Tuple {
@@ -1357,14 +1409,11 @@ impl Owner {
         });
         let before = tuple.and_then(|tuple| self.endpoint.connection_id(tuple));
         let before_state = before.and_then(|cid| self.endpoint.state(cid).ok());
-        let listener_options = tuple.and_then(|tuple| {
+        let listener = tuple.and_then(|tuple| self.endpoint.matching_listener(tuple.local));
+        let listener_options = listener.and_then(|listener| {
             self.sockets
                 .values()
-                .find(|s| {
-                    matches!(s.handle, Handle::Listener(_))
-                        && s.local
-                            .is_some_and(|local| binding_overlap(local, tuple.local))
-                })
+                .find(|s| matches!(s.handle, Handle::Listener(id) if id == listener))
                 .map(|s| {
                     (
                         s.wire_tos(self.local),
@@ -1389,22 +1438,33 @@ impl Owner {
             self.connection_options
                 .retain(|p| self.endpoint.connection_exists(p.0));
             if self.connection_options.len() == self.socket_limit() {
-                return Err(EndpointError::LimitReached);
+                return Err(EndpointError::LimitReached.into());
             }
         }
 
         let pair = ClockPair::sample(self);
-        let result = self.endpoint.input_with_metadata(
-            now,
-            ip,
-            traffic_class,
-            options,
-            bytes,
-            ntcp::RxPacketMetadata {
-                timestamps: stamps,
-                tcp_segment_size: segment_size,
-            },
-        );
+        let metadata = ntcp::RxPacketMetadata {
+            timestamps: stamps,
+            tcp_segment_size: segment_size,
+        };
+        let result = if let Some(host) = &mut self.host {
+            self.endpoint
+                .input_with_path_provider(
+                    now,
+                    ip,
+                    traffic_class,
+                    options,
+                    bytes,
+                    metadata,
+                    listener_options.map_or(self.defaults.dscp, |p| p.0 >> 2),
+                    host,
+                )
+                .map_err(ntcp_host::Error::from)
+        } else {
+            self.endpoint
+                .input_with_metadata(now, ip, traffic_class, options, bytes, metadata)
+                .map_err(ntcp_host::Error::from)
+        };
         self.drain_timestamps(pair);
         self.prune_child_timeouts();
         // A failed TIME-WAIT candidate can restore an existing tuple owner.
@@ -1415,13 +1475,11 @@ impl Owner {
             .filter(|cid| {
                 Some(*cid) != before && !self.connection_options.iter().any(|p| p.0 == *cid)
             });
-        if let Some(tuple) = tuple
-            && let Some(cid) = new_child
-            && let Some((&listener, s)) = self.sockets.iter().find(|(_, s)| {
-                matches!(s.handle, Handle::Listener(_))
-                    && s.local
-                        .is_some_and(|local| binding_overlap(local, tuple.local))
-            })
+        if let Some(cid) = new_child
+            && let Some((&listener, s)) = self
+                .sockets
+                .iter()
+                .find(|(_, s)| matches!(s.handle, Handle::Listener(id) if Some(id) == listener))
         {
             // Runtime bind policy admits only one listener per port. Input can
             // only create passive children; active opens go through Connect.
@@ -1623,6 +1681,9 @@ impl Owner {
         // release retains storage until any reset output has drained.
         let _ = self.endpoint.abort(cid);
         let _ = self.endpoint.release(cid);
+        // Descriptor and accept rollback do not determine binding lifetime:
+        // retained final output keeps the exact core generation's authority.
+        let _ = self.collect_paths();
     }
     fn send_state(&mut self, id: u64) -> Result<ConnectionId> {
         let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
@@ -1804,6 +1865,7 @@ impl Owner {
             return Err(EAGAIN);
         }
         self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
+        self.collect_paths()?;
         let result = self.dispatch(id, op);
         let _ = self.refresh_readiness(id);
         result
@@ -2889,10 +2951,15 @@ impl Owner {
                         //# TCP may or may not use the new information when
                         //# retransmitting segments that were originally sent
                         //# when the old sticky options were in effect.
-                        (IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self
-                            .endpoint
-                            .set_dscp(cid, s.wire_tos(self.local) >> 2)
-                            .map_err(engine)?,
+                        (IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => {
+                            let dscp = s.wire_tos(self.local) >> 2;
+                            if let Some(host) = &mut self.host {
+                                host.rebind_dscp(&mut self.endpoint, cid, dscp)
+                                    .map_err(host_error)?;
+                            } else {
+                                self.endpoint.set_dscp(cid, dscp).map_err(engine)?;
+                            }
+                        }
                         _ => (),
                     }
                 }
@@ -3183,4 +3250,3 @@ mod listener_query;
 
 #[path = "runtime_address.rs"]
 mod address_policy;
-use address_policy::binding_overlap;

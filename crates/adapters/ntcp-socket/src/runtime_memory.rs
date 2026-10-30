@@ -46,6 +46,21 @@ impl PacketIo for PacketBackend {
     fn layer(&self) -> ntcp_io::PacketLayer {
         ntcp_io::PacketLayer::Ip
     }
+    fn local_ip_mtu(&self) -> std::io::Result<Option<u32>> {
+        // The in-memory port accepts every complete IP packet up to BYTES.
+        // Explicit packet-test link profiles additionally emulate that limit.
+        let mtu = match self.profile {
+            crate::packet_profile::Profile::Upstream(options) => {
+                options.link_mtu.unwrap_or(if options.pmtud1500 {
+                    1500
+                } else {
+                    crate::packet_profile::BYTES as u32
+                })
+            }
+            _ => crate::packet_profile::BYTES as u32,
+        };
+        Ok(Some(mtu))
+    }
     fn max_packet_len(&self) -> Option<usize> {
         Some(crate::packet_profile::BYTES)
     }
@@ -81,7 +96,7 @@ impl PacketIo for PacketBackend {
         if self.local_reject {
             return Ok(TxOutcome::Rejected);
         }
-        if packet.len() > crate::packet_profile::BYTES {
+        if packet.len() > self.local_ip_mtu()?.unwrap() as usize {
             return Err(std::io::Error::from_raw_os_error(EMSGSIZE));
         }
         if self.output.len() == self.capacity {

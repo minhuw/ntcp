@@ -78,8 +78,7 @@ fn setup_bounded(v6: bool, warm: bool, capacity: usize) -> (Owner, Owner, u64, S
     let [a, b] = &mut owners;
     let mut config = crate::packet_profile::config(Profile::Pipeline);
     config.max_connections = capacity;
-    a.endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).unwrap();
-    a.defaults = config;
+    a.replace_packet_endpoint(config).unwrap();
     a.endpoint.enable_fast_open().unwrap();
     a.enable_egress(2, None).unwrap();
     let remote = SocketAddr::new(b.local, 8080);

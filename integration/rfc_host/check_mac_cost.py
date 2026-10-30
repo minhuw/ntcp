@@ -42,8 +42,10 @@ def fingerprint(paths):
 
 
 def source_snapshot():
-    paths = command(["git", "ls-files"]).splitlines()
-    relevant = {p for p in paths if p.startswith(("crates/stacks/ntcp/", "crates/net/ntcp-buffer/", "crates/stacks/ntcp-ip-common/"))}
+    paths = command(["git", "ls-files", "--cached", "--others", "--exclude-standard"]).splitlines()
+    relevant = {p for p in paths if p.startswith(("crates/stacks/ntcp/", "crates/net/ntcp-buffer/", "crates/stacks/ntcp-ip-common/",
+                                                "crates/stacks/ntcp-path/", "crates/stacks/ntcp-host/", "crates/stacks/ntcp-ip/",
+                                                "crates/stacks/ntcp-ip6/", "crates/stacks/ntcp-icmp/", "crates/stacks/ntcp-ethernet/"))}
     relevant.update(("Cargo.toml", "Cargo.lock", "integration/rfc_host/check_mac_cost.py", "crates/stacks/ntcp/src/mac_cost_tests.rs",
                      "duvet/test_mac_cost.py", "duvet/test_fast_open_inventory.py",
                      "duvet/rfc7413-inventory.json", "duvet/rfc7413-todos.toml"))

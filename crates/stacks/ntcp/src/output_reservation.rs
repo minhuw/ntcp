@@ -5,6 +5,7 @@ use crate::{EndpointError, Error, Instant, Transmit, wire};
 // Only physical-departure work; sequence, recovery and PRR charges stay selected.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Departure {
+    pub discovery: Option<crate::DiscoveryIntent>,
     pub data_ack: bool,
     pub defer_push: bool,
     pub fresh_data: bool,
@@ -77,6 +78,7 @@ pub(crate) struct OutputReservation {
 }
 
 pub(crate) struct ReservedOutput {
+    pub emitted_packet: Transmit,
     pub packet: Transmit,
     pub attempt: Option<TransmitAttempt>,
     pub abandon_attempt: TransmitAttempt,
@@ -158,6 +160,7 @@ impl OutputReservation {
         self.shared_options[..n - 20].copy_from_slice(&header[20..n]);
         self.shared_option_len = n - 20;
         self.current = Some(ReservedOutput {
+            emitted_packet: packet,
             packet,
             attempt: Some(attempt),
             abandon_attempt: attempt,
@@ -230,18 +233,21 @@ impl OutputReservation {
         r.emitted_bytes = count;
         r.emitted_sacks = 0;
         r.finished = finished;
-        Ok(Transmit {
+        let packet = Transmit {
             len: n + count,
             tx_timestamp: None,
             ecn: if count == 0 { 0 } else { r.packet.ecn },
             ..r.packet
-        })
+        };
+        r.emitted_packet = packet;
+        Ok(packet)
     }
 
     pub fn capture(&mut self, packet: Transmit, bytes: &[u8], attempt: TransmitAttempt) {
         self.clear();
         self.bytes[..packet.len].copy_from_slice(&bytes[..packet.len]);
         self.current = Some(ReservedOutput {
+            emitted_packet: packet,
             packet,
             attempt: Some(attempt),
             abandon_attempt: attempt,
@@ -378,11 +384,13 @@ impl OutputReservation {
         r.finished = finished;
         // A cancelled backend observation must not masquerade as a retry's actual
         // submit timestamp. Scheduled/ACK observations remain owned by the stream.
-        Ok(Transmit {
+        let packet = Transmit {
             len,
             tx_timestamp: None,
             ecn: if count == 0 { 0 } else { r.packet.ecn },
             ..r.packet
-        })
+        };
+        r.emitted_packet = packet;
+        Ok(packet)
     }
 }

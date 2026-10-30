@@ -154,6 +154,17 @@ impl Pmtud {
     }
 
     pub fn constrain(&mut self, bound: u32) {
+        self.constrain_inner(bound, false);
+    }
+
+    /// Managed physical selection bounds cannot cancel the finite loss
+    /// classification of a probe that was already submitted. All subsequent
+    /// ACK/MSS refreshes must retain that distinction as well as the update.
+    pub(crate) fn constrain_network(&mut self, bound: u32) {
+        self.constrain_inner(bound, true);
+    }
+
+    fn constrain_inner(&mut self, bound: u32, preserve_probe_loss: bool) {
         self.bound = bound;
         let bound = self.route_bound();
         self.initial_low = bound.min(self.low_limit.unwrap_or(default_search_low(self.ipv4)));
@@ -166,7 +177,11 @@ impl Pmtud {
         self.info.search_low = self.info.search_low.min(bound);
         self.info.search_high = self.info.search_high.min(self.search_ceiling());
         if self.probe.is_some_and(|p| p.size > bound) {
-            self.probe = None;
+            if preserve_probe_loss {
+                self.invalidate_probe_size_result();
+            } else {
+                self.probe = None;
+            }
         }
     }
 
@@ -256,6 +271,58 @@ impl Pmtud {
             return None;
         }
         Some(self.info.search_low + (self.info.search_high - self.info.search_low).div_ceil(2))
+    }
+
+    /// A shared decrease revokes permission to publish this probe's size;
+    /// its independent loss-classification evidence remains intact.
+    pub(crate) fn invalidate_probe_size_result(&mut self) {
+        if let Some(probe) = &mut self.probe {
+            probe.size_result_valid = false;
+        }
+    }
+
+    pub(crate) fn set_plateaus(&mut self, plateaus: Ipv4Plateaus) {
+        self.plateaus = plateaus;
+    }
+
+    pub(crate) fn network_link_bound(&mut self, mtu: u32, bound: u32) {
+        if self.info.first_hop_mtu == mtu && self.bound == bound { return; }
+        self.info.first_hop_mtu = mtu;
+        self.bound = bound;
+        // Authority to select a future size is separate from the outstanding
+        // probe's loss-classification record. Retain local negative evidence
+        // until its existing cooldown/aging rules authorize forgetting it.
+        self.info.search_high = self
+            .search_ceiling()
+            .min(self.discovered_high.unwrap_or(u32::MAX));
+        if self.probe.is_some_and(|p| p.size > self.route_bound()) {
+            self.invalidate_probe_size_result();
+        }
+    }
+
+    pub(crate) fn replace_network_authority(&mut self) {
+        self.invalidate_probe_size_result();
+        self.verification = None;
+        self.sent.fill(None);
+        self.max_sent = 0;
+        self.max_acked = 0;
+        self.pending = None;
+        self.discovered_high = None;
+        self.info.search_low = self.initial_low.min(self.route_bound());
+        self.info.search_high = self.search_ceiling();
+        self.info.current_mtu = self.info.search_low;
+    }
+
+    /// Challenge a shared ordinary ceiling with real TCP data. Existing local
+    /// probe/loss/cooldown admission still applies, even if prior local proof
+    /// is larger than the shared estimate. Positive publication is separate.
+    pub(crate) fn target_for_network(&self, ordinary: u32) -> Option<u32> {
+        self.target().or_else(|| {
+            (self.deadline.is_none() && self.periodic_deadline.is_none()
+                && self.probe.is_none() && self.repair_range.is_none()
+                && self.info.current_mtu > ordinary)
+                .then_some(self.info.current_mtu)
+        })
     }
 
     pub fn start_probe(&mut self, start: Seq, payload: u32, trailing: u32, size: u32) {

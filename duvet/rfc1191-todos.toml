@@ -64,14 +64,6 @@ quote = '''
 2 minutes, respectively).
 '''
 
-# 1191-021
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
-reason = "T7 PathService resolves authoritative IP forwarding paths and stores independent learned per-host estimates with MMS_S and complete-header budgets. Actual native/TUN TCP selection and serialized IP ownership remain T8; validated shared ICMP decreases and runtime fanout remain T9/T10. First-hop receive MSS/topology advertisement remains independently audited."
-quote = '''
-Some TCP implementations send an MSS option only if the destination host is on a non-connected network. However, in general the TCP layer may not have the appropriate information to make this decision, so it is preferable to leave to the IP layer the task of determining a suitable MTU for the Internet path.
-'''
-
 # 1191-024
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
@@ -131,7 +123,7 @@ A more sophisticated approach is to do a binary search on the packet size. This 
 # 1191-050
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
-reason = "T7 PathService provides bounded shared IP per-host estimates, canonical forwarding authority, checked budgets and versioned client notifications. The whole compound obligation still needs actual serialized host and packetization integration T8/T10, validated ICMP processing T9 and intentional datagram fragmentation/DF policy T13. Existing TCP packetization and codec DF behavior remain supported."
+reason = "T7 PathService stores shared IP estimates; T8 Host binds actual native/TUN TCP factories, applies budget-only snapshots and validates reserved physical output. Existing TCP ICMP feedback remains connection-local. The compound obligation still needs generic validated ICMP publication T9, cross-protocol consumers/fanout T10 and intentional datagram fragmentation/DF policy T13."
 quote = '''
 We therefore believe that the IP layer should store PMTU information and that the ICMP layer should process received Datagram Too Big messages. The packetization layers must still be able to respond to changes in the Path MTU, by changing the size of the datagrams they send, and must also be able to specify that datagrams are sent with the DF bit set. We do not want the IP layer to simply set the DF bit in every packet, since it is possible that a packetization layer, perhaps a UDP application outside the kernel, is unable to change its datagram size. Protocols involving intentional fragmentation, while inelegant, are sometimes successful (NFS being the primary example), and we do not want to break such protocols.
 '''
@@ -139,18 +131,10 @@ We therefore believe that the IP layer should store PMTU information and that th
 
 
 
-# 1191-056
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
-reason = "T7 PathService initializes resolved per-host records from the physical first hop, retaining immutable network/default forwarding facts separately from learned decreases and query-only transport limits. Public tests prove host isolation and no learned copying across route/link generations. Actual first-packet managed host selection and validated ICMP dispatch remain T8/T9."
-quote = '''
-When the first packet is sent to a host for which no per-host route exists, a route is chosen either from the set of per-network routes, or from the set of default routes. The PMTU fields in these route entries should be initialized to be the MTU of the associated first-hop data link, and must never be changed by the PMTU Discovery process. (PMTU Discovery only creates or changes entries for per-host routes). Until a Datagram Too Big message is received, the PMTU associated with the initially-chosen route is presumed to be accurate.
-'''
-
 # 1191-057
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
-reason = "T7 PathService trusted_decrease and live legacy fallback update only the resolved per-host estimate, preserving the selected first hop and checking live source/link/route generations. These trusted entrypoints do not authenticate received ICMP. Actual submitted-quote correlation, dispatch and creation/use by the serialized host remain T8/T9; packetization barriers and fanout remain T10."
+reason = "T7 PathService supports trusted per-host decreases and legacy fallback without changing first-hop routes. T8 Host creates actual native/TUN bindings and preserves existing connection-local ICMP validation. These trusted APIs are not received-packet authentication: submitted-quote correlation and shared ICMP publication remain T9, with cross-protocol fanout T10."
 quote = '''
 When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
 '''
@@ -158,7 +142,7 @@ When a Datagram Too Big message is received, the ICMP layer determines a new est
 # 1191-058
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
-reason = "T7 PathService marks every bound client dirty on a trusted decrease, coalesces newest versions and preserves updates across independent acknowledgements and logical blocked consumers. Actual Connection/datagram bindings and physical output barriers remain T8/T10; validated ICMP production remains T9. Logical clients alone do not prove runtime packetization fanout."
+reason = "T7 PathService coalesces dirty snapshots with exact acknowledgements. T8 Host refreshes actual native/TUN TCP owners, including reserved/released generations, without inventing repair or loss events; two-flow and held-output tests exercise trusted decreases. Generic validated ICMP producers and actual datagram consumers/fanout remain T9/T10."
 quote = '''
 The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
 '''
@@ -238,7 +222,7 @@ quote = '''
 # 1191-074
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
-reason = "T7 PathService atomically re-resolves every bound path after route/source/link changes, including new shadowing routes, retains pinned invalidated snapshots and notifies all clients. Failed rebind preserves pending invalidation with explicit capacity backpressure. Actual managed TCP refresh, physical output barriers and validated Redirect handling remain T8/T9/T10."
+reason = "T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners and gates held physical output; failed rebind preserves dirty authority and bounded backpressure. Validated ICMP Redirect production and full cross-protocol physical races remain T9/T10."
 quote = '''
 PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.
 '''

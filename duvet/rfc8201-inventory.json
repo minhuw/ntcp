@@ -38,7 +38,7 @@
       "reason": "Shared active/passive construction caps only the disabled IPv6 send IP-payload budget at the minimum link MTU minus the supported base header, preserving smaller caller limits, receive capability and configured storage. Actual codec/peer tests cover boundary-sized scalar, reserved, shared and coalesced output, options, RTO repair, Fast Open, live MSS updates and TIME-WAIT reopening; enabled discovery retains larger packets and validated growth. Smaller packets can cost throughput; discovery defaults are unchanged.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1",
       "evidence": [
-        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive(",
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive_path(",
         "crates/stacks/ntcp-ip6/tests/disabled_pmtud.rs::fn disabled_ipv6_codec_peer_boundaries_options_loss_and_output_modes()"
       ]
     },
@@ -451,7 +451,7 @@
       "section": "5.1",
       "quote": "It is therefore suggested that the IP layer store PMTU information and that the ICMPv6 layer process received Packet Too Big messages. The packetization layers may respond to changes in the PMTU by changing the size of the messages they send. To support this layering, packetization layers require a way to learn of changes in the value of MMS_S, the \"maximum send transport-message size\" [RFC1122].",
       "status": "TODO",
-      "reason": "T7 PathService now stores shared IPv6 per-host estimates with versioned MMS_S and complete-header queries, bounded client notifications and checked route/link/source provenance. Actual serialized host ownership and Connection/datagram bindings remain T8/T10; validated ICMPv6 processing and submitted-quote correlation remain T9.",
+      "reason": "T7 PathService stores shared IPv6 estimates and versioned MMS_S budgets. T8 Host binds actual native/TUN TCP factories, refreshes reserved/released owners and validates physical output while preserving connection-local ICMP behavior. Generic submitted-quote correlation/publication remains T9 and datagram consumers/cross-protocol fanout remain T10.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
     },
     {
@@ -459,7 +459,7 @@
       "section": "5.1",
       "quote": "MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see \"Fragment Header\", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.",
       "status": "TODO",
-      "reason": "T7 PathService checks complete caller-provided IPv6 header lengths, including extension overhead, independently of minimum-header MMS_S and transport ceilings. Actual extension parsing/encoding and managed packetization use remain T17/T8/T10; fragmentation and reassembly-aware EMTU_S remain T13/T16. Source fragmentation remains an explicitly conditional alternative in this quote.",
+      "reason": "T7 PathService checks complete caller-provided IPv6 header budgets; T8 Host applies actual base-header budgets in native/TUN factories and reserved submission. Complete extension parsing/encoding remains T17, fragmentation/reassembly-aware EMTU_S remains T13/T16 and datagram integration remains T10. Source fragmentation is conditional in the preserved whole quote.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
     },
     {
@@ -479,7 +479,7 @@
       "section": "5.2",
       "quote": "Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.",
       "status": "TODO",
-      "reason": "T7 PathService maintains independent learned estimates for canonical scoped IPv6 source/destination/link generations; public tests exercise identical link-local octets on two live links. Actual Endpoint/native scope propagation, managed binding and ND remain T8/T18; existing Endpoint rejection of nonzero scope IDs is preserved until that integration.",
+      "reason": "T7 PathService maintains independent canonical IPv6 source/destination/link generations, including equal link-local octets on different links. T8 Host uses canonical bindings in actual native/TUN unscoped TCP processing. Actual Endpoint/native zone propagation and multi-link ND remain T18; typed library identities alone do not establish that runtime capability.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -567,7 +567,7 @@
       "section": "5.2",
       "quote": "The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.",
       "status": "TODO",
-      "reason": "T7 PathService marks every bound IPv6 client dirty on a trusted decrease and preserves newest snapshots across blocked readers and independent acknowledgements. Actual Connection/datagram bindings, validated ICMPv6 production and physical output barriers remain T8/T9/T10; logical client fanout alone does not establish runtime packetization integration.",
+      "reason": "T7 PathService preserves newest IPv6 notifications across independent readers. T8 Host applies trusted decreases to actual native/TUN TCP owners, including held reservations, with budget-only refresh and a physical submission barrier. Generic validated ICMPv6 publication and actual datagram consumers/cross-protocol fanout remain T9/T10.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {

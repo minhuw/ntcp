@@ -115,6 +115,110 @@ pub(super) fn backend_config_family(
 }
 
 impl Owner {
+    // Complete the constructor using the actual configured one-port backend.
+    // InterfaceKey is an embedding assignment within an independently minted
+    // context; external ports need no fabricated kernel interface identity.
+    pub(super) fn attach_backend_host(&mut self, interface: u64) -> Result<()> {
+        if self.host.is_some() {
+            return Err(EINVAL);
+        }
+        let io: &dyn PacketIo = if let Some(backend) = &self.ethernet {
+            &*backend.io
+        } else if let Some(tun) = &self.tun {
+            tun
+        } else {
+            #[cfg(feature = "packet-test")]
+            {
+                self.packets
+                    .as_ref()
+                    .map(|io| io as &dyn PacketIo)
+                    .ok_or(EOPNOTSUPP)?
+            }
+            #[cfg(not(feature = "packet-test"))]
+            return Err(EOPNOTSUPP);
+        };
+        let mtu = io
+            .local_ip_mtu()
+            .map_err(|e| e.raw_os_error().unwrap_or(EIO))?
+            .ok_or(EOPNOTSUPP)?;
+        if mtu < if self.local.is_ipv4() { 68 } else { 1280 } {
+            return Err(EINVAL);
+        }
+        let overhead = if io.layer() == ntcp_io::PacketLayer::Ethernet {
+            14
+        } else {
+            0
+        };
+        let max_ip_packet = io
+            .max_packet_len()
+            .unwrap_or(65535 + overhead)
+            .checked_sub(overhead)
+            .ok_or(EINVAL)?
+            .min(65535);
+        let mut identity = [0; 16];
+        ports::fill(&mut identity)?;
+        use ntcp_host::{Forwarding, Ipv4Receive, Ipv6Receive, ReceiveCapabilities, path};
+        // Occupied transports + provisional TIME-WAIT generation + stateless
+        // lane + one serialized live-class migration. No peer-created routes.
+        let (paths, limits) =
+            ntcp_host::managed_limits(&self.defaults, 1, 1, 1, 1, 1).map_err(host_error)?;
+        let mut host = ntcp_host::Host::new(
+            path::ContextId::new(u128::from_ne_bytes(identity)),
+            paths,
+            limits,
+            self.endpoint.caller_timebase(),
+        )
+        .map_err(host_error)?;
+        let forwarder = path::ForwarderId(1);
+        let ingress = host
+            .register_link(
+                path::InterfaceKey(interface),
+                mtu,
+                ReceiveCapabilities {
+                    max_ip_packet,
+                    ipv4: if self.local.is_ipv4() {
+                        Ipv4Receive::Options {
+                            source_routes: false,
+                        }
+                    } else {
+                        Ipv4Receive::Disabled
+                    },
+                    ipv6: if self.local.is_ipv6() {
+                        Ipv6Receive::BaseHeader
+                    } else {
+                        Ipv6Receive::Disabled
+                    },
+                    // The current input adapter accepts validated segment-size metadata
+                    // from this PacketIo. This does not promise aggregation offload.
+                    gro: true,
+                },
+                Forwarding::Forwarder(forwarder),
+            )
+            .map_err(host_error)?;
+        host.register_source(
+            path::ScopedAddress::new(self.local, None).map_err(|e| host_error(e.into()))?,
+            ingress.link(),
+        )
+        .map_err(host_error)?;
+        let network = if self.local.is_ipv4() {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        };
+        host.add_route(path::Route {
+            destination: path::IpPrefix::new(network, 0).map_err(|e| host_error(e.into()))?,
+            source: None,
+            dscp: None,
+            link: ingress.link(),
+            next_hop: path::NextHop::Forwarder(forwarder),
+            metric: 0,
+        })
+        .map_err(host_error)?;
+        host.attach(&mut self.endpoint).map_err(host_error)?;
+        self.ingress = Some(ingress);
+        self.host = Some(host);
+        Ok(())
+    }
     pub(super) fn external_backend(
         config: &SocketConfig,
         backend: crate::EthernetPacketIo,
@@ -145,6 +249,7 @@ impl Owner {
             next_cookie: 1,
             pending: Vec::with_capacity(timestamps::PHASES),
         });
+        owner.attach_backend_host(1)?;
         owner.enable_egress(config.io.egress_capacity, config.io.gso)?;
         owner.reservation_timeout_us = u64::from(config.io.output_reservation_timeout_ms) * 1000;
         Ok(owner)
@@ -216,6 +321,7 @@ impl Owner {
             next_cookie: 1,
             pending: Vec::with_capacity(timestamps::PHASES),
         });
+        owner.attach_backend_host(u64::from(index))?;
         owner.enable_reservations(&config.io, index)?;
         Ok(owner)
     }
@@ -362,8 +468,34 @@ impl Owner {
         stamps: ntcp::RxPacketTimestamps,
         segment_size: Option<core::num::NonZeroU16>,
     ) {
-        let Ok(p) = crate::ip::parse(bytes) else {
-            return;
+        let p = if let Some(host) = &self.host {
+            let Some(ingress) = self.ingress else {
+                return;
+            };
+            let Ok(packet) = host.decode_ingress(ingress, bytes) else {
+                return;
+            };
+            if segment_size.is_some()
+                && !host
+                    .receive_capabilities(ingress)
+                    .is_ok_and(|caps| caps.gro)
+            {
+                return;
+            }
+            crate::ip::Packet {
+                ip: packet.ip,
+                traffic_class: packet.traffic_class,
+                protocol: packet.protocol,
+                // Keep the native adapter's existing known-option policy;
+                // complete destination processing remains a separate feature.
+                ipv4_options: packet.options.unrecognized(),
+                payload: packet.payload,
+            }
+        } else {
+            let Ok(packet) = crate::ip::parse(bytes) else {
+                return;
+            };
+            packet
         };
         if p.ip.destination != self.local {
             return;

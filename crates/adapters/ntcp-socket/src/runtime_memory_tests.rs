@@ -352,7 +352,7 @@ pub(crate) fn ptb_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
     let mut a = owner(1, Profile::PipelineGso, capacity);
     let mut config = crate::packet_profile::config(Profile::PipelineGso);
     config.connection.pmtud = Some(ntcp::PmtudConfig::new(1500));
-    a.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    a.replace_packet_endpoint(config).unwrap();
     a.enable_egress(2, crate::packet_profile::gso(Profile::PipelineGso))
         .unwrap();
     pair_with_owner(a)

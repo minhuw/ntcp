@@ -48,7 +48,7 @@
       "status": "covered",
       "reason": "Sticky storage retains the exact accepted byte while live endpoint updates pass only its six DSCP bits, preserving TCP's independent outgoing ECN policy. Wire tests compare both ECN-disabled data (Not-ECT) and negotiated ECN data (ECT(0)) against conflicting user low bits, and verify DSCP, delivered payload, persistence and inherited-child live updates.",
       "target": "https://www.rfc-editor.org/rfc/rfc3542#section-6.5",
-      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn()"]
+      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => {", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn()"]
     },
     {
       "id": "3542-live", "section": "4.1",
@@ -56,7 +56,7 @@
       "status": "covered",
       "reason": "For the selected IPV6_TCLASS sticky option, live connection updates reach Endpoint::set_dscp. Successive writes emit the newly selected class; repeated writes without another setsockopt retain it. The retransmission sentence permits either policy and does not require reproducing old class values. Other options in the surrounding section are outside this capability.",
       "target": "https://www.rfc-editor.org/rfc/rfc3542#section-4.1",
-      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn()"]
+      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => {", "crates/adapters/ntcp-socket/src/runtime_tclass_tests.rs::fn ipv6_tclass_reset_invalid_input_and_live_wire_preserve_ecn()"]
     },
     {
       "id": "3542-get-sticky", "section": "4",

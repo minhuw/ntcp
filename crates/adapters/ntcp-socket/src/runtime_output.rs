@@ -83,20 +83,39 @@ impl Owner {
         refresh.outstanding = false;
         // Failed/unchanged queries must neither spin nor kill other connections.
         // Keep the rejected obligation parked until its original deadline.
-        if let Ok(Some(mtu)) = result
-            && self
-                .defaults
-                .connection
-                .pmtud
-                .is_some_and(|p| p.first_hop_mtu != mtu)
-            && self
-                .endpoint
-                .set_endpoint_first_hop_mtu(self.now(), mtu)
-                .is_ok()
-        {
-            self.defaults.connection.pmtud = Some(ntcp::PmtudConfig::new(mtu));
-            if let Some(egress) = &mut self.egress {
-                egress.mtu_refreshed();
+        if let Ok(Some(mtu)) = result {
+            let changed = if let (Some(host), Some(ingress)) = (&mut self.host, self.ingress) {
+                let changed = host
+                    .paths()
+                    .link(ingress.link())
+                    .is_ok_and(|link| link.mtu != mtu);
+                if changed && host.set_link_mtu(ingress.link(), mtu).is_ok() {
+                    // Canonical physical state first; budget-only application
+                    // also visits reserved/released generations. A failed
+                    // rebind remains dirty and is retried during service.
+                    let _ = host.refresh_all(&mut self.endpoint);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                // Explicit raw Endpoint embedding used by low-level fixtures.
+                self.defaults
+                    .connection
+                    .pmtud
+                    .is_some_and(|p| p.first_hop_mtu != mtu)
+                    && self
+                        .endpoint
+                        .set_endpoint_first_hop_mtu(self.now(), mtu)
+                        .is_ok()
+            };
+            if changed {
+                if let Some(policy) = &mut self.defaults.connection.pmtud {
+                    policy.first_hop_mtu = mtu;
+                }
+                if let Some(egress) = &mut self.egress {
+                    egress.mtu_refreshed();
+                }
             }
         }
     }

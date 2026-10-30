@@ -621,8 +621,7 @@ fn upstream_inq_server_read_window_ack_and_fin_schedules() {
             assert_eq!(cfg.connection.coalesce_read_window_updates, coalesce);
             let mut a = owner(1, profile, 8);
             if !coalesce {
-                a.defaults = cfg.clone();
-                a.endpoint = Endpoint::new(cfg, [42; 32], 0, |_| true).unwrap();
+                a.replace_packet_endpoint(cfg).unwrap();
                 a.enable_egress(2, crate::packet_profile::gso(profile))
                     .unwrap();
             }

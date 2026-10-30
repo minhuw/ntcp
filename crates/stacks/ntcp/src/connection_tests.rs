@@ -19595,6 +19595,8 @@ mod route_mtu;
 mod pmtud_config;
 #[path = "pmtud_growth_tests.rs"]
 mod pmtud_growth;
+#[path = "connection_managed_tests.rs"]
+mod managed_paths;
 #[test]
 fn logical_send_finish_marks_only_selected_byte_and_releases_cork() {
     let (mut a, _) = pair(config(32, 4), 100);

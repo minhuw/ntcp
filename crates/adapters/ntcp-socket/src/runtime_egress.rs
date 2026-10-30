@@ -12,6 +12,10 @@ struct Entry {
     not_before: u64,
     waiting_mtu: bool,
     mark: u32,
+    context: Option<ntcp_host::EgressContext>,
+    // Resident IP bytes only: neither Ethernet padding nor shared payload.
+    ip_len: usize,
+    blocked: Option<ntcp_host::Error>,
 }
 struct TxSlot {
     bytes: Vec<u8>,
@@ -99,6 +103,22 @@ impl Egress {
             .find(|entry| entry.owner == Some(owner))
             .unwrap()
             .attempt
+    }
+    #[cfg(test)]
+    pub(super) fn context(&self, owner: ConnectionId) -> Option<ntcp_host::EgressContext> {
+        self.tx
+            .iter()
+            .filter_map(|s| s.entry.as_ref())
+            .find(|e| e.owner == Some(owner))
+            .and_then(|e| e.context)
+    }
+    #[cfg(test)]
+    pub(super) fn blocked(&self, owner: ConnectionId) -> Option<ntcp_host::Error> {
+        self.tx
+            .iter()
+            .filter_map(|s| s.entry.as_ref())
+            .find(|e| e.owner == Some(owner))
+            .and_then(|e| e.blocked)
     }
     pub(super) fn mtu_refreshed(&mut self) {
         for slot in &mut self.tx {
@@ -310,6 +330,17 @@ impl Owner {
         if owner.is_some_and(|id| !self.endpoint.is_output_reserved(id) && egress.retained_rx(id)) {
             return Ok(());
         }
+        if let (Some(host), Some(owner)) = (&mut self.host, owner) {
+            // Refresh before selecting a new packet or a reserved suffix. A
+            // failed rebind keeps the newest notification and only parks this
+            // lane; unrelated owners still get admission and scheduler turns.
+            if let Err(error) = host.refresh(&mut self.endpoint, owner) {
+                if let Some(index) = existing {
+                    egress.tx[index].entry.as_mut().unwrap().blocked = Some(error);
+                }
+                return Ok(());
+            }
+        }
         let ethernet = self.ethernet.is_some();
         let offset = if ethernet { 14 } else { 0 };
         let header = crate::ip::header_len(self.local);
@@ -356,6 +387,9 @@ impl Owner {
                 return Ok(());
             }
             Err(EndpointError::ReservationMtuTooSmall) if existing.is_some() => {
+                // An indivisible held SYN/TFO or option header cannot be
+                // suffix-split. Fail only this certainly-unsubmitted owner;
+                // never claim acceptance or roll back a submitted prefix.
                 let attempt = egress.tx[index].entry.as_ref().unwrap().attempt;
                 if !self.endpoint.abandon_transmit(attempt).map_err(engine)? {
                     return Err(EIO);
@@ -368,6 +402,13 @@ impl Owner {
             return Ok(());
         };
         let attempt = attempt.ok_or(EIO)?;
+        let (context, blocked) = match &mut self.host {
+            Some(host) => match host.egress_context(&mut self.endpoint, attempt) {
+                Ok(context) => (Some(context), None),
+                Err(error) => (None, Some(error)),
+            },
+            None => (None, None), // Explicit low-level Endpoint fixtures.
+        };
         let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
         let ip_len = crate::ip::encode(
             &mut bytes[offset..],
@@ -407,12 +448,18 @@ impl Owner {
                 not_before: now,
                 waiting_mtu: false,
                 mark: self.output_mark(owner),
+                context,
+                ip_len,
+                blocked,
             });
         }
         let slot = &mut egress.tx[index];
         let entry = slot.entry.as_mut().unwrap();
         entry.attempt = attempt;
         entry.timestamp = tx.tx_timestamp;
+        entry.context = context;
+        entry.ip_len = ip_len;
+        entry.blocked = blocked;
         entry.not_before = now;
         entry.packet = Some(
             egress
@@ -433,6 +480,11 @@ impl Owner {
     pub(super) fn service_egress(&mut self) -> Result<()> {
         let mut egress = self.egress.take().unwrap();
         let result = (|| {
+            if let Some(host) = &mut self.host {
+                // Apply every subscriber's budget even when it has no output.
+                // refresh_all visits all bindings and retains failed updates.
+                let _ = host.refresh_all(&mut self.endpoint);
+            }
             egress.candidates.clear();
             egress.candidates.extend(self.endpoint.ready_connections());
             // Outstanding tickets are excluded from core readiness, but their
@@ -490,6 +542,87 @@ impl Owner {
                     .unwrap_or_default();
                 self.set_backend_mark(entry.mark)
                     .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+                if let Some(host) = &mut self.host {
+                    let offset = if self.ethernet.is_some() { 14 } else { 0 };
+                    let shared_len = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
+                    // The Owner is serialized through this validation and the
+                    // synchronous physical call below, including timestamp
+                    // fallback. Every software-GSO segment gets its own turn.
+                    let validation = entry
+                        .context
+                        .map_or_else(
+                            || host.egress_context(&mut self.endpoint, entry.attempt),
+                            Ok,
+                        )
+                        .and_then(|context| {
+                            host.validate_egress(
+                                &mut self.endpoint,
+                                context,
+                                &slot.bytes[offset..offset + entry.ip_len],
+                                shared_len,
+                            )
+                        })
+                        .and_then(|live| {
+                            // One actual attached port. Its fixed MAC/L3 endpoint
+                            // only implements the explicitly assigned forwarder;
+                            // it supplies no IP-neighbor or new-link resolution.
+                            if self.ingress.is_none_or(|port| port.link() != live.link)
+                                || live.next_hop
+                                    != ntcp_host::path::ResolvedNextHop::Forwarder(
+                                        ntcp_host::path::ForwarderId(1),
+                                    )
+                            {
+                                Err(ntcp_host::Error::Unsupported)
+                            } else {
+                                Ok(live)
+                            }
+                        });
+                    match validation {
+                        Ok(live) => {
+                            entry.context = Some(live);
+                            entry.blocked = None;
+                        }
+                        Err(ntcp_host::Error::Obsolete) => {
+                            // No backend call occurred: this is a synchronous
+                            // nonsubmission certificate, including after an
+                            // immutable accepted GSO/shared prefix.
+                            if !self
+                                .endpoint
+                                .reject_unsubmitted(entry.attempt)
+                                .map_err(engine)?
+                            {
+                                return Err(EIO);
+                            }
+                            egress
+                                .scheduler
+                                .resolve(token, Outcome::Dropped)
+                                .map_err(|_| EIO)?;
+                            entry.packet = None;
+                            entry.context = None;
+                            if entry.owner.is_none() {
+                                egress.clear(index)?;
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            entry.blocked = Some(error);
+                            entry
+                                .deadline
+                                .get_or_insert(now.saturating_add(self.reservation_timeout_us));
+                            entry.not_before = now.saturating_add(1000);
+                            egress
+                                .scheduler
+                                .resolve(
+                                    token,
+                                    Outcome::Retry {
+                                        not_before: entry.not_before,
+                                    },
+                                )
+                                .map_err(|_| EIO)?;
+                            continue;
+                        }
+                    }
+                }
                 let submitted = if !slot.shared.payload.is_empty() {
                     if sources != (false, false) {
                         return Err(EOPNOTSUPP);
@@ -602,6 +735,9 @@ impl Owner {
                 }
                 self.drain_timestamps(ClockPair::sample(self));
                 self.cancel_unused_backend_timestamps();
+            }
+            if let Some(host) = &mut self.host {
+                host.collect(&self.endpoint).map_err(host_error)?;
             }
             Ok(())
         })();

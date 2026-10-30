@@ -485,7 +485,7 @@ fn ipv6_tclass_failed_transactions_keep_exact_sticky_and_wire_policy() {
     assert_eq!(
         a.dispatch(client, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, 171))
             .unwrap_err(),
-        EINVAL
+        EAGAIN
     );
     assert_eq!(a.sockets[&client].ipv6_tclass, 43);
     assert_eq!(a.connection_options, options);

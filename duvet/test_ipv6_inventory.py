@@ -112,7 +112,7 @@ class Ipv6Inventory(unittest.TestCase):
         self.assertEqual(sticky["quote"], "Issuing getsockopt() for the above options will return the sticky option value i.e., the value set with setsockopt().")
         self.assertIn("exact accepted sticky integer including both user ECN bits", sticky["reason"])
         self.assertIn("six DSCP bits", outgoing["reason"])
-        self.assertIn("runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self", outgoing["evidence"][0])
+        self.assertIn("runtime.rs::(IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => {", outgoing["evidence"][0])
         # Every complete source/test quotation must shed the obsolete TODO reason,
         # even when the ledger does not select that particular copy as evidence.
         for path in (ROOT / "crates/adapters/ntcp-socket/src").glob("*.rs"):

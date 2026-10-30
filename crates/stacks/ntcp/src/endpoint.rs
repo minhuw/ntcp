@@ -386,7 +386,12 @@ impl Listener {
 // may select routes using the address pair and capture owned network state.
 // Ambiguous overlapping ingress domains need separate endpoints, not implicit
 // context guessing from addresses.
+#[path = "endpoint_managed.rs"]
+mod managed;
+
 pub struct Endpoint {
+    managed_context: Option<ntcp_path::ContextId>,
+    factory_transaction: Option<crate::managed_path::FactoryTransaction>,
     #[cfg(feature = "packet-test-controls")]
     test_timestamp_default: Option<bool>,
     fast_open_cookie_policy: crate::fast_open::ServerCookieContext,
@@ -436,6 +441,10 @@ fn reserved_vec<T>(capacity: usize) -> Result<Vec<T>, EndpointError> {
 
 fn supported_socket(address: SocketAddr) -> bool {
     !matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
+}
+
+fn unzoned_link_local(address: IpAddr) -> bool {
+    matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local())
 }
 
 fn valid_address(address: IpAddr) -> bool {
@@ -501,6 +510,8 @@ impl Endpoint {
             .try_reserve_exact(count)
             .map_err(|_| Error::NoMemory)?;
         Ok(Self {
+            managed_context: None,
+            factory_transaction: None,
             #[cfg(feature = "packet-test-controls")]
             test_timestamp_default: None,
             fast_open: None,
@@ -1190,6 +1201,27 @@ impl Endpoint {
         receive_authority: Option<ListenerId>,
     ) -> Result<Connection, Error> {
         options.validate()?;
+        // Managed mode requires a live provisional path before allocation,
+        // TFO authorization or controller/initial PMTU construction.
+        let managed_path = match self.managed_context {
+            Some(context) => {
+                let transaction = self.factory_transaction.ok_or(Error::InvalidState)?;
+                if transaction.request.tuple != tuple
+                    || transaction.inserted.is_some()
+                    || !crate::managed_path::valid_prepared(context, transaction.request, transaction.prepared)
+                {
+                    return Err(Error::InvalidState);
+                }
+                Some(transaction.prepared)
+            }
+            None => None,
+        };
+        let initial_ip_header_len = if let Some(transaction) = self.factory_transaction {
+            if let (IpAddr::V4(source), IpAddr::V4(destination)) = (tuple.local.ip(), tuple.remote.ip()) {
+                Some(20 + transaction.request.ipv4_options.encode(source, destination, 0, &mut [0; 40])
+                    .map_err(|_| Error::InvalidArgument)?.1 as u16)
+            } else { Some(40) }
+        } else { None };
         let capacities = (options.send_capacity, options.receive_capacity);
         let charge = Connection::allocation_bytes(
             capacities.0,
@@ -1235,6 +1267,11 @@ impl Endpoint {
         if let Some(route) = self.destination_route(tuple.remote.ip()) {
             route.apply(&mut connection_config)?;
         }
+        if let Some(path) = managed_path
+            && let Some(pmtud) = &mut connection_config.pmtud
+        {
+            pmtud.first_hop_mtu = path.snapshot.first_hop_mtu().min(if tuple.local.is_ipv4() { 65535 } else { 65575 });
+        }
         let mut receive = pool_index.map(|index| self.receive_pool.swap_remove(index));
         // Apply the same policy to ordinary passive opens and TIME-WAIT reuse.
         let mut fast_open_response = None;
@@ -1274,7 +1311,7 @@ impl Endpoint {
         }
         let syn = filtered_syn.as_ref().or(syn);
         let mut result = match syn {
-            Some(syn) => Connection::passive_with_receive(
+            Some(syn) => Connection::passive_with_receive_path(
                 tuple,
                 connection_config,
                 iss,
@@ -1284,13 +1321,17 @@ impl Endpoint {
                 &mut receive,
                 rx_timestamps,
                 timestamps,
+                managed_path,
+                initial_ip_header_len,
             ),
-            None => Connection::active_with_receive(
+            None => Connection::active_with_receive_path(
                 tuple,
                 connection_config,
                 iss,
                 self.now,
                 &mut receive,
+                managed_path,
+                initial_ip_header_len,
             ),
         };
         if result.as_ref().is_ok_and(|connection| {
@@ -1404,6 +1445,19 @@ impl Endpoint {
             received_ipv4_options: None,
         });
         let id = self.id(index);
+        if let Some(transaction) = &mut self.factory_transaction {
+            debug_assert!(transaction.inserted.is_none());
+            transaction.inserted = Some(id);
+            let slot = self.slots[index].as_mut().unwrap();
+            slot.dscp = transaction.request.dscp.value();
+            slot.ipv4_options = transaction.request.ipv4_options;
+            // Passive factories carry learned peer return routes. Only an
+            // active application's selection (including empty/direct) wins
+            // over later validated received route definitions.
+            slot.explicit_route = transaction.request.role == crate::FactoryRole::Active
+                && slot.ipv4_options.source_route.is_some();
+            Self::sync_ip_header_len(slot);
+        }
         if let Some(parent) = listener {
             self.listeners[parent.slot]
                 .as_mut()
@@ -1997,18 +2051,13 @@ impl Endpoint {
         policy: crate::FastOpenClientPolicy,
         receive_authority: Option<ListenerId>,
     ) -> Result<(ConnectionId, usize), EndpointError> {
-        options.validate()?;
-        if let Some(authority) = receive_authority {
-            self.validate_fast_open_receive_authority(authority, local.ip())?;
-        }
-        self.check_clock(now)?;
+        let tuple = Tuple { local, remote };
+        self.active_admission(now, tuple, &options, receive_authority, true)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
         let suppressed =
             service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote);
         let cached = service.get(now, self.fast_open_lifetime(), local.ip(), remote.ip());
         let peer_mss = service.peer_mss(now, self.fast_open_lifetime(), local.ip(), remote.ip());
-        let tuple = Tuple { local, remote };
-        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
         self.clock(now)?;
         let iss = self.isn(tuple);
         let mut connection = self.new_connection_with_options(
@@ -2043,6 +2092,29 @@ impl Endpoint {
         let id = self.insert(connection, None, None)?;
         self.slots[id.slot].as_mut().unwrap().receive_authority = receive_authority;
         Ok((id, accepted))
+    }
+
+    /// Non-constructing active-open admission in the raw open paths' error
+    /// precedence. Managed factories run it before preparing path authority,
+    /// so a rejected OPEN draws no ISN, advances no clock and leaves no
+    /// provider reservation, and keeps its established error.
+    pub(crate) fn active_admission(
+        &self,
+        now: Instant,
+        tuple: Tuple,
+        options: &ActiveOpenOptions,
+        receive_authority: Option<ListenerId>,
+        fast_open: bool,
+    ) -> Result<(), EndpointError> {
+        options.validate()?;
+        if let Some(authority) = receive_authority {
+            self.validate_fast_open_receive_authority(authority, tuple.local.ip())?;
+        }
+        self.check_clock(now)?;
+        if fast_open && self.fast_open.is_none() {
+            return Err(Error::InvalidState.into());
+        }
+        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))
     }
 
     pub fn connect(
@@ -2809,55 +2881,9 @@ impl Endpoint {
         metadata: crate::RxPacketMetadata,
     ) -> Result<InputDisposition, EndpointError> {
         let timestamps = metadata.timestamps;
-        timestamps.validate(self.config.connection.timebase)?;
-        if !options.is_empty()
-            && ((!self.config.ipv4_options_enabled && options.has_known_options())
-                || !ip.source.is_ipv4()
-                || !ip.destination.is_ipv4())
-        {
+        let Some((route, segment)) = self.ingress_admission(ip, options, bytes, metadata)? else {
             return Ok(InputDisposition::Dropped);
-        }
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
-        //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
-        //# |  An incoming SYN with an invalid source address MUST be ignored
-        //# |  either by TCP or by the IP layer [(MUST-63)] (see
-        //# |  Section 3.2.1.3).
-
-        // Scoped to the required ingress-context policy; no subnet is inferred.
-        // Jumbo-link TCP is not supported by this endpoint profile.
-        if bytes.len() > u16::MAX as usize
-            || !valid_address(ip.source)
-            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
-            //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
-            //# |
-            //# |  A TCP implementation MUST silently discard an incoming SYN segment
-            //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
-
-            // Scoped to the required ingress-context policy; no subnet is inferred.
-            || !valid_address(ip.destination)
-            || ip.source.is_ipv4() != ip.destination.is_ipv4()
-            || !(self.address_policy)(AddressValidation::Incoming {
-                source: ip.source, destination: ip.destination,
-            })
-        {
-            return Ok(InputDisposition::Dropped);
-        }
-        let route = match ip.source {
-            IpAddr::V4(source) => options.return_route(source),
-            _ => None,
         };
-        if route.is_some_and(|r| {
-            r.hops()
-                .iter()
-                .any(|&a| !self.valid_route(ip.destination, ip.source, a.into()))
-        }) {
-            return Ok(InputDisposition::Dropped);
-        }
-        let segment = match wire::parse(ip, bytes) {
-            Ok(segment) => segment,
-            Err(_) => return Ok(InputDisposition::Dropped),
-        };
-        metadata.validate_segment(&segment)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
         //# A passive OPEN call with a specified "local IP address" parameter
         //# will await an incoming connection request to that address.  If the
@@ -2942,14 +2968,10 @@ impl Endpoint {
             if segment.header.flags & SYN == 0 {
                 return Ok(InputDisposition::Dropped);
             }
-            let record = self.listeners[listener.slot].as_ref().unwrap();
-            if record.children.len() >= record.backlog
-                || self
-                    .resource_admission(tuple, record.buffer_capacities)
-                    .is_err()
-            {
+            if !self.passive_room(now, None, listener, tuple, &segment) {
                 return Ok(InputDisposition::Dropped);
             }
+            let record = self.listeners[listener.slot].as_ref().unwrap();
             let application_timeout = record.application_timeout_us;
             let handshake_retransmission_limit = record.handshake_retransmission_limit;
             let buffer_capacities = record.buffer_capacities;
@@ -2985,6 +3007,109 @@ impl Endpoint {
         }
         self.reset_for(ip, &segment, route);
         Ok(InputDisposition::Dropped)
+    }
+
+    /// Non-constructing wire, address and received-route admission shared by
+    /// raw and managed input. A managed factory runs this before preparing
+    /// path authority, so input this Endpoint silently discards can neither
+    /// consume a provider transaction nor surface as an embedding error.
+    /// `Ok(None)` is the ordinary discard.
+    pub(crate) fn ingress_admission<'a>(
+        &self,
+        ip: IpMetadata,
+        options: Ipv4Options,
+        bytes: &'a [u8],
+        metadata: crate::RxPacketMetadata,
+    ) -> Result<Option<(Option<SourceRoute>, wire::Segment<'a>)>, EndpointError> {
+        metadata
+            .timestamps
+            .validate(self.config.connection.timebase)?;
+        if !options.is_empty()
+            && ((!self.config.ipv4_options_enabled && options.has_known_options())
+                || !ip.source.is_ipv4()
+                || !ip.destination.is_ipv4())
+        {
+            return Ok(None);
+        }
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+        //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
+        //# |  An incoming SYN with an invalid source address MUST be ignored
+        //# |  either by TCP or by the IP layer [(MUST-63)] (see
+        //# |  Section 3.2.1.3).
+
+        // Scoped to the required ingress-context policy; no subnet is inferred.
+        // Jumbo-link TCP is not supported by this endpoint profile.
+        if bytes.len() > u16::MAX as usize
+            || !valid_address(ip.source)
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+            //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
+            //# |
+            //# |  A TCP implementation MUST silently discard an incoming SYN segment
+            //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
+
+            // Scoped to the required ingress-context policy; no subnet is inferred.
+            || !valid_address(ip.destination)
+            || ip.source.is_ipv4() != ip.destination.is_ipv4()
+            // Managed path authority needs a zone for an IPv6 link-local
+            // address (RFC 4007); this Endpoint's tuples carry none, so such
+            // input is unsupported here rather than an authority failure.
+            || (self.managed_context.is_some()
+                && (unzoned_link_local(ip.source) || unzoned_link_local(ip.destination)))
+            || !(self.address_policy)(AddressValidation::Incoming {
+                source: ip.source, destination: ip.destination,
+            })
+        {
+            return Ok(None);
+        }
+        let route = match ip.source {
+            IpAddr::V4(source) => options.return_route(source),
+            _ => None,
+        };
+        if route.is_some_and(|r| {
+            r.hops()
+                .iter()
+                .any(|&a| !self.valid_route(ip.destination, ip.source, a.into()))
+        }) {
+            return Ok(None);
+        }
+        let segment = match wire::parse(ip, bytes) {
+            Ok(segment) => segment,
+            Err(_) => return Ok(None),
+        };
+        metadata.validate_segment(&segment)?;
+        Ok(Some((route, segment)))
+    }
+
+    /// Non-constructing passive factory admission shared by the listener and
+    /// TIME-WAIT reuse factories and by the managed pre-check: backlog,
+    /// transport resources and, for reuse, the old record's reset/freshness
+    /// state. A failure is the ordinary silent resource/freshness discard.
+    pub(crate) fn passive_room(
+        &self,
+        now: Instant,
+        target: Option<usize>,
+        listener: ListenerId,
+        tuple: Tuple,
+        syn: &wire::Segment<'_>,
+    ) -> bool {
+        let record = self.listeners[listener.slot].as_ref().unwrap();
+        if record.children.len() >= record.backlog {
+            return false;
+        }
+        match target {
+            None => self
+                .resource_admission(tuple, record.buffer_capacities)
+                .is_ok(),
+            Some(index) => {
+                let slot = self.slots[index].as_ref().unwrap();
+                !slot.connection.reset_pending()
+                    && slot.reset_deadline.is_none()
+                    && self.has_capacity(record.buffer_capacities)
+                    && slot
+                        .connection
+                        .reuse_syn(now, syn, self.new_connection_timestamps())
+            }
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
@@ -3047,17 +3172,10 @@ impl Endpoint {
         let Some(listener) = self.match_listener(tuple.local) else {
             return Ok(InputDisposition::Dropped);
         };
-        let record = self.listeners[listener.slot].as_ref().unwrap();
-        if record.children.len() >= record.backlog
-            || !self.has_capacity(record.buffer_capacities)
-            || !self.slots[index].as_ref().unwrap().connection.reuse_syn(
-                self.now,
-                syn,
-                self.new_connection_timestamps(),
-            )
-        {
+        if !self.passive_room(self.now, Some(index), listener, tuple, syn) {
             return Ok(InputDisposition::Dropped);
         }
+        let record = self.listeners[listener.slot].as_ref().unwrap();
         let application_timeout = record.application_timeout_us;
         let handshake_retransmission_limit = record.handshake_retransmission_limit;
         let buffer_capacities = record.buffer_capacities;
@@ -3901,7 +4019,10 @@ impl Endpoint {
     //# Services field for segments that are sent on a connection (MUST-48).
     pub fn set_dscp(&mut self, id: ConnectionId, dscp: u8) -> Result<(), EndpointError> {
         self.reject_if_output_reserved(id)?;
-        if dscp > 63 {
+        if dscp > 63 || self.slot(id)?.connection.managed_path
+            .is_some_and(|path| path.snapshot.key().dscp().value() != dscp)
+        {
+            // Managed class changes require atomic provider rebind.
             return Err(Error::InvalidArgument.into());
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
