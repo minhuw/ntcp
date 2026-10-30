@@ -322,6 +322,7 @@ struct Slot {
     accepted_ready: bool,
     // Independent of accept-queue ownership: early accept must not free quota.
     fast_open_owner: Option<ListenerId>,
+    receive_authority: Option<ListenerId>,
     released: bool,
     closed_output_drained: bool,
     mapped: bool,
@@ -336,6 +337,19 @@ struct Slot {
     explicit_route: bool,
     received_ipv4_options: Option<Ipv4Options>,
 }
+// Only Endpoint can construct this invocation-scoped decision. It carries no
+// retained key or permission; Connection still validates the crossing SYN.
+pub(crate) struct CrossingSynAuthorization {
+    early: bool,
+    response: Option<wire::FastOpenCookie>,
+}
+
+impl CrossingSynAuthorization {
+    pub(crate) fn consume(self) -> (bool, Option<wire::FastOpenCookie>) {
+        (self.early, self.response)
+    }
+}
+
 struct Listener {
     early_data_policy: crate::FastOpenEarlyDataPolicy,
     fast_open_cookie_policy: Option<crate::fast_open::ServerCookieContext>,
@@ -771,6 +785,93 @@ impl Endpoint {
             .ok_or(EndpointError::InvalidHandle)
     }
 
+    /// Validate an explicit local receive authority independently of its port.
+    /// Selection grants no early-data permission and reserves no pending quota.
+    pub fn validate_fast_open_receive_authority(
+        &self,
+        id: ListenerId,
+        local: IpAddr,
+    ) -> Result<(), EndpointError> {
+        let address = self.listener(id)?.address.ip();
+        if address.is_ipv4() != local.is_ipv4() || !address.is_unspecified() && address != local {
+            return Err(EndpointError::InvalidAddress);
+        }
+        Ok(())
+    }
+
+    fn crossing_syn_authorization(
+        &mut self,
+        listener: ListenerId,
+        tuple: Tuple,
+        syn: &wire::Segment<'_>,
+    ) -> CrossingSynAuthorization {
+        let mut decision = CrossingSynAuthorization {
+            early: false,
+            response: None,
+        };
+        if self
+            .validate_fast_open_receive_authority(listener, tuple.local.ip())
+            .is_err()
+            || self.fast_open.is_none()
+        {
+            return decision;
+        }
+        let record = self.listeners[listener.slot].as_mut().unwrap();
+        let limit = record.fast_open_limit;
+        if limit == 0 {
+            return decision;
+        }
+        let debt = record.reset_debt(self.now);
+        let protected =
+            record.early_data_policy == crate::FastOpenEarlyDataPolicy::ApplicationProtected;
+        let policy = record
+            .fast_open_cookie_policy
+            .as_ref()
+            .unwrap_or(&self.fast_open_cookie_policy);
+        let pending = self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|slot| {
+                slot.fast_open_owner == Some(listener)
+                    && !slot.connection.handshake_complete()
+                    && slot.connection.state() != State::Closed
+            })
+            .count();
+        let valid = !protected
+            && syn.options.fast_open.is_some_and(|cookie| {
+                policy.valid(
+                    &self.fast_open_credentials,
+                    self.now,
+                    tuple.local.ip(),
+                    tuple.remote.ip(),
+                    cookie,
+                )
+            });
+        let application_authorized = protected
+            && (syn.options.fast_open.is_some()
+                || !syn.payload.is_empty()
+                || syn.header.flags & wire::FIN != 0);
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
+        //= reason=Pending children plus reset debt constrain both authorization modes before admitting a new early child.
+        //# If this variable goes over a preset system limit, the server MUST disable TFO for all new connection requests until PendingFastOpenRequests drops below the system limit.
+        let accept_syn_data =
+            (valid || application_authorized) && pending.saturating_add(debt) < limit;
+        decision.early = accept_syn_data;
+        if !protected
+            && syn.options.fast_open.is_some()
+            && (!valid || policy.policy().refresh_valid_cookie())
+        {
+            decision.response = policy.issue(
+                &self.fast_open_credentials,
+                self.now,
+                tuple.local.ip(),
+                tuple.remote.ip(),
+            );
+        }
+        decision
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
     //# Every passive OPEN call either creates a new connection record in
     //# LISTEN state, or it returns an error; it MUST NOT affect any
@@ -1035,6 +1136,7 @@ impl Endpoint {
             },
             rx_ranges,
             timestamps,
+            None,
         )
     }
 
@@ -1081,6 +1183,7 @@ impl Endpoint {
         options: ActiveOpenOptions,
         rx_ranges: usize,
         timestamps: RxPacketTimestamps,
+        receive_authority: Option<ListenerId>,
     ) -> Result<Connection, Error> {
         options.validate()?;
         let capacities = (options.send_capacity, options.receive_capacity);
@@ -1122,6 +1225,9 @@ impl Endpoint {
         {
             connection_config.initial_window = crate::InitialWindow::Rfc5681;
         }
+        if receive_authority.is_some() {
+            connection_config.initial_window = crate::InitialWindow::Rfc5681;
+        }
         if let Some(route) = self.destination_route(tuple.remote.ip()) {
             route.apply(&mut connection_config)?;
         }
@@ -1135,80 +1241,19 @@ impl Endpoint {
         let mut filtered_syn = None;
         if let Some(syn) = syn
             && let Some(listener) = self.match_listener(tuple.local)
-            && self.listeners[listener.slot]
-                .as_ref()
-                .unwrap()
-                .fast_open_limit
-                != 0
-            && self.fast_open.is_some()
         {
-            let limit = self.listeners[listener.slot]
-                .as_ref()
-                .unwrap()
-                .fast_open_limit;
-            // ponytail: scan at most max_connections on passive setup only;
-            // use a generation-bound counter if measured SYN load warrants it.
-            let pending = self
-                .slots
-                .iter()
-                .flatten()
-                .filter(|slot| {
-                    slot.fast_open_owner == Some(listener)
-                        && !slot.connection.handshake_complete()
-                        && slot.connection.state() != State::Closed
-                })
-                .count();
-            let reset_debt = self.listeners[listener.slot]
-                .as_mut()
-                .unwrap()
-                .reset_debt(self.now);
-            let policy = self.listeners[listener.slot]
-                .as_ref()
-                .unwrap()
-                .fast_open_cookie_policy
-                .as_ref()
-                .unwrap_or(&self.fast_open_cookie_policy);
-            let protected = self.listeners[listener.slot]
-                .as_ref()
-                .unwrap()
-                .early_data_policy
-                == crate::FastOpenEarlyDataPolicy::ApplicationProtected;
-            // Authorization replaces the credential check, not TCP parsing or
-            // resource admission. A plain data-less SYN remains ordinary TCP.
-            let application_authorized = protected
-                && (syn.options.fast_open.is_some()
-                    || !syn.payload.is_empty()
-                    || syn.header.flags & wire::FIN != 0);
-            let valid = !protected
-                && syn.options.fast_open.is_some_and(|cookie| {
-                    policy.valid(
-                        &self.fast_open_credentials,
-                        self.now,
-                        tuple.local.ip(),
-                        tuple.remote.ip(),
-                        cookie,
-                    )
-                });
-            //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
-            //= reason=Pending children plus reset debt constrain both authorization modes before admitting a new early child.
-            //# If this variable goes over a preset system limit, the server MUST disable TFO for all new connection requests until PendingFastOpenRequests drops below the system limit.
-            accept_syn_data =
-                (valid || application_authorized) && pending.saturating_add(reset_debt) < limit;
-            // Pending quota also covers authenticated, data-less early children.
-            early = accept_syn_data;
-            // RFC 7413 §4.2.2 permits omission; Linux does not refresh valid cookies.
-            // This decision is independent of payload admission and pending quota.
-            if !protected
-                && syn.options.fast_open.is_some()
-                && (!valid || policy.policy().refresh_valid_cookie())
+            let decision = self.crossing_syn_authorization(listener, tuple, syn);
+            early = decision.early;
+            if self.fast_open.is_some()
+                && self.listeners[listener.slot]
+                    .as_ref()
+                    .unwrap()
+                    .fast_open_limit
+                    != 0
             {
-                fast_open_response = policy.issue(
-                    &self.fast_open_credentials,
-                    self.now,
-                    tuple.local.ip(),
-                    tuple.remote.ip(),
-                );
+                accept_syn_data = early;
             }
+            fast_open_response = decision.response;
         }
         if let Some(syn) = syn
             && !accept_syn_data
@@ -1338,6 +1383,7 @@ impl Endpoint {
         };
         self.slots[index] = Some(Slot {
             fast_open_owner,
+            receive_authority: None,
             connection,
             listener,
             accepted_ready: false,
@@ -1890,6 +1936,7 @@ impl Endpoint {
             options,
             cookie,
             crate::FastOpenClientPolicy::RequireCookie,
+            None,
         )
     }
 
@@ -1905,7 +1952,33 @@ impl Endpoint {
         options: ActiveOpenOptions,
         policy: crate::FastOpenClientPolicy,
     ) -> Result<(ConnectionId, usize), EndpointError> {
-        self.connect_fast_open_authorized(now, local, remote, initial, options, None, policy)
+        self.connect_fast_open_authorized(now, local, remote, initial, options, None, policy, None)
+    }
+
+    /// Active Fast Open with an independent local listener receive authority.
+    /// Outgoing supplied/cache cookies and client policy retain their own roles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_fast_open_with_receive_authority(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        initial: &[u8],
+        options: ActiveOpenOptions,
+        cookie: Option<wire::FastOpenCookie>,
+        policy: crate::FastOpenClientPolicy,
+        receive_authority: Option<ListenerId>,
+    ) -> Result<(ConnectionId, usize), EndpointError> {
+        self.connect_fast_open_authorized(
+            now,
+            local,
+            remote,
+            initial,
+            options,
+            cookie,
+            policy,
+            receive_authority,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1918,8 +1991,12 @@ impl Endpoint {
         options: ActiveOpenOptions,
         cookie: Option<wire::FastOpenCookie>,
         policy: crate::FastOpenClientPolicy,
+        receive_authority: Option<ListenerId>,
     ) -> Result<(ConnectionId, usize), EndpointError> {
         options.validate()?;
+        if let Some(authority) = receive_authority {
+            self.validate_fast_open_receive_authority(authority, local.ip())?;
+        }
         self.check_clock(now)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
         let suppressed =
@@ -1937,6 +2014,7 @@ impl Endpoint {
             options,
             0,
             RxPacketTimestamps::default(),
+            receive_authority,
         )?;
         let old_charge = connection.buffer_charge();
         let budget = self
@@ -1958,7 +2036,9 @@ impl Endpoint {
             }
         };
         self.buffer_bytes = self.buffer_bytes - old_charge + connection.buffer_charge();
-        self.insert(connection, None, None).map(|id| (id, accepted))
+        let id = self.insert(connection, None, None)?;
+        self.slots[id.slot].as_mut().unwrap().receive_authority = receive_authority;
+        Ok((id, accepted))
     }
 
     pub fn connect(
@@ -2002,7 +2082,23 @@ impl Endpoint {
         remote: SocketAddr,
         options: ActiveOpenOptions,
     ) -> Result<ConnectionId, EndpointError> {
+        self.connect_with_receive_authority(now, local, remote, options, None)
+    }
+
+    /// Select a live local listener as receive authority before active output.
+    /// The active connection retains its identity and never enters accept queues.
+    pub fn connect_with_receive_authority(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        options: ActiveOpenOptions,
+        receive_authority: Option<ListenerId>,
+    ) -> Result<ConnectionId, EndpointError> {
         options.validate()?;
+        if let Some(authority) = receive_authority {
+            self.validate_fast_open_receive_authority(authority, local.ip())?;
+        }
         self.clock(now)?;
         let tuple = Tuple { local, remote };
         self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
@@ -2014,8 +2110,11 @@ impl Endpoint {
             options,
             0,
             RxPacketTimestamps::default(),
+            receive_authority,
         )?;
-        self.insert(connection, None, None)
+        let id = self.insert(connection, None, None)?;
+        self.slots[id.slot].as_mut().unwrap().receive_authority = receive_authority;
+        Ok(id)
     }
 
     pub fn buffer_capacities(&self, id: ConnectionId) -> Result<(usize, usize), EndpointError> {
@@ -2790,10 +2889,30 @@ impl Endpoint {
                     timestamps,
                 );
             }
+            let authority = slot.receive_authority.filter(|_| {
+                slot.connection.state() == State::SynSent
+                    && segment.header.flags & (SYN | ACK | RST) == SYN
+            });
+            let authorization =
+                authority.map(|id| self.crossing_syn_authorization(id, tuple, &segment));
             let slot = self.slots[index].as_mut().unwrap();
             slot.received_dscp = Some(traffic_class >> 2);
-            slot.connection
-                .input_with_metadata(now, traffic_class, &segment, metadata)?;
+            let admitted = if let Some(authorization) = authorization {
+                slot.connection.input_with_receive_authorization(
+                    now,
+                    traffic_class,
+                    &segment,
+                    metadata,
+                    Some(authorization),
+                )?
+            } else {
+                slot.connection
+                    .input_with_metadata(now, traffic_class, &segment, metadata)?;
+                false
+            };
+            if admitted {
+                slot.fast_open_owner = authority;
+            }
             if slot.connection.accepted_metadata {
                 Self::save_ipv4_options(slot, options, route);
             }
@@ -6252,6 +6371,10 @@ mod endpoint_mtu_update_tests {
         assert!(e.control.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "fast_open_simultaneous_tests.rs"]
+mod fast_open_simultaneous_tests;
 
 #[cfg(test)]
 #[path = "fast_open_key_tests.rs"]

@@ -56,6 +56,7 @@ pub enum Op {
     SetFastOpenClientEnabled(bool),
     SetFastOpenClientDefaultPolicy(FastOpenClientPolicy),
     SetFastOpenClientPolicy(Option<(SocketAddr, FastOpenClientPolicy)>),
+    SetFastOpenReceiveAuthority(Option<u64>),
     SetFastOpenServerCookie(Option<(SocketAddr, FastOpenCookie)>),
     SetListenerFastOpenEarlyDataPolicy(ntcp::FastOpenEarlyDataPolicy),
     SetDestinationRoute(IpAddr, Option<ntcp::RoutePolicy>),
@@ -386,6 +387,7 @@ struct Socket {
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
     fast_open_connect: bool,
+    receive_authority: Option<ntcp::ListenerId>,
     server_cookie: Option<(SocketAddr, FastOpenCookie)>,
     client_policy: Option<(SocketAddr, FastOpenClientPolicy)>,
     deferred_client_policy: Option<FastOpenClientPolicy>,
@@ -470,6 +472,7 @@ impl Socket {
             fast_open_cookie_policy: None,
             fast_open_key_lease: None,
             fast_open_connect: false,
+            receive_authority: None,
             server_cookie: None,
             client_policy: None,
             deferred_client_policy: None,
@@ -1708,14 +1711,15 @@ impl Owner {
             Handle::Connection(cid) => {
                 let state = self.endpoint.state(cid).map_err(engine)?;
                 let info = self.endpoint.transport_info(cid).map_err(engine)?;
-                let eof = matches!(
-                    state,
-                    State::CloseWait
-                        | State::Closing
-                        | State::LastAck
-                        | State::TimeWait
-                        | State::Closed
-                );
+                let eof = s.peer_fin
+                    || matches!(
+                        state,
+                        State::CloseWait
+                            | State::Closing
+                            | State::LastAck
+                            | State::TimeWait
+                            | State::Closed
+                    );
                 let readable = if state == State::Closed {
                     self.endpoint.terminal_readable_bytes(cid)
                 } else {
@@ -1908,6 +1912,34 @@ impl Owner {
                 }
                 self.sockets.get_mut(&id).unwrap().client_policy = policy;
             }
+            Op::SetFastOpenReceiveAuthority(listener_socket) => {
+                if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
+                    return Err(EINVAL);
+                }
+                let authority = listener_socket
+                    .map(|listener_socket| {
+                        let listener_socket = self.sockets.get(&listener_socket).ok_or(EBADF)?;
+                        let Handle::Listener(listener) = listener_socket.handle else {
+                            return Err(EINVAL);
+                        };
+                        let local = s.local.map_or(self.local, |a| {
+                            if a.ip().is_unspecified() {
+                                self.local
+                            } else {
+                                a.ip()
+                            }
+                        });
+                        if s.domain == AF_INET6 && s.v6only && local.is_ipv4() {
+                            return Err(EAFNOSUPPORT);
+                        }
+                        self.endpoint
+                            .validate_fast_open_receive_authority(listener, local)
+                            .map_err(engine)?;
+                        Ok(listener)
+                    })
+                    .transpose()?;
+                self.sockets.get_mut(&id).unwrap().receive_authority = authority;
+            }
             Op::SetFastOpenServerCookie(credential) => {
                 if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
                     return Err(EINVAL);
@@ -1975,6 +2007,16 @@ impl Owner {
                 }
                 if !s.freebind && local.ip() != self.local && !local.ip().is_unspecified() {
                     return Err(EADDRNOTAVAIL);
+                }
+                if let Some(authority) = s.receive_authority {
+                    let ip = if local.ip().is_unspecified() {
+                        self.local
+                    } else {
+                        local.ip()
+                    };
+                    self.endpoint
+                        .validate_fast_open_receive_authority(authority, ip)
+                        .map_err(engine)?;
                 }
                 let reuse = s.reuse;
                 let new_v6only = s.v6only;
@@ -2229,6 +2271,11 @@ impl Owner {
                     return Err(EINVAL);
                 }
                 let local = self.connect_local(id)?;
+                if let Some(authority) = self.sockets[&id].receive_authority {
+                    self.endpoint
+                        .validate_fast_open_receive_authority(authority, local.ip())
+                        .map_err(engine)?;
+                }
                 // Previously saved options do not authorize a new TFO open
                 // after administrative disablement. Ordinary connect still works.
                 if self.sockets[&id].fast_open_connect
@@ -2287,6 +2334,7 @@ impl Owner {
                 }
                 // Deliver buffered data before the terminal error/EOF.
                 let terminal = self.endpoint.state(cid).map_err(engine)? == State::Closed;
+                let completed_failure = terminal && !s.connected && !s.connect_pending;
                 let available = if terminal {
                     self.endpoint.terminal_readable_bytes(cid)
                 } else {
@@ -2299,7 +2347,7 @@ impl Owner {
                     s.error = 0;
                     return Err(e);
                 }
-                if terminal && !s.connected {
+                if terminal && !s.connected && available == 0 {
                     return Err(ENOTCONN);
                 }
                 out.bytes.resize(capacity.min(BYTES), 0);
@@ -2351,6 +2399,11 @@ impl Owner {
                         }
                     }
                     out.bytes.clear();
+                }
+                if completed_failure
+                    && self.endpoint.terminal_readable_bytes(cid).map_err(engine)? == 0
+                {
+                    self.release_failed_connect(id, cid);
                 }
             }
             #[cfg(test)]

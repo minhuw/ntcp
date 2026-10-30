@@ -106,6 +106,16 @@ T3_CLOSURES = {
 }
 
 
+T4_CLOSURES = {
+    "simultaneous": (
+        "4.2.2",
+        "A special case is simultaneous open where the SYN receiver is a client in SYN-SENT state. The protocol remains the same because [RFC793] already supports both data in the SYN and simultaneous open.",
+        "crates/stacks/ntcp/src/connection.rs::fn input_authorized(",
+        "crates/stacks/ntcp/src/fast_open_simultaneous_tests.rs::fn simultaneous_independent_authorities_complete_both_streams()",
+    ),
+}
+
+
 def validate_selected_closure(row, expected):
     section, quote, source, test = expected
     target = f"{PREFIX}7413#" + ("section-" if section[0].isdigit() else "appendix-") + section
@@ -287,7 +297,7 @@ class FastOpenInventory(unittest.TestCase):
                     self.assertIn(rows[id]["status"], ("covered", "TODO"))
         for id in ("mac-cost", "mac-expiration", "is-cookie-valid",
                    "first-ack-all-repair",
-                   "simultaneous", "api-connect-errno"):
+                   "api-connect-errno"):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("LinuxSipHash24", rows["mac-expiration"]["reason"])
         self.assertIn("absolute issue/accept deadlines", rows["mac-expiration"]["reason"])
@@ -299,7 +309,7 @@ class FastOpenInventory(unittest.TestCase):
 
     def test_t2_closures_keep_canonical_source_and_test_reasons(self):
         rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
-        for id in [*T2_CLOSURES, *T3_CLOSURES, "original-6"]:
+        for id in [*T2_CLOSURES, *T3_CLOSURES, *T4_CLOSURES, "original-6"]:
             row = rows[id]
             for evidence in row["evidence"]:
                 path, anchor = evidence.split("::", 1)
@@ -314,7 +324,7 @@ class FastOpenInventory(unittest.TestCase):
 
     def test_selected_fast_open_closures_keep_whole_keys_and_executable_evidence(self):
         rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
-        for id, expected in (T10_CLOSURES | T2_CLOSURES | T3_CLOSURES).items():
+        for id, expected in (T10_CLOSURES | T2_CLOSURES | T3_CLOSURES | T4_CLOSURES).items():
             with self.subTest(row=id):
                 row = rows[id]
                 validate_selected_closure(row, expected)

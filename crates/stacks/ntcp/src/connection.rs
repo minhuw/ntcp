@@ -655,6 +655,9 @@ pub(crate) struct Connection {
     irs: Option<Seq>,
     passive_open: bool,
     fast_open: Option<wire::FastOpenCookie>,
+    // A crossing SYN's locally issued response never replaces our peer cookie.
+    fast_open_response: Option<wire::FastOpenCookie>,
+    fast_open_response_committed: bool,
     fast_open_client_policy: crate::FastOpenClientPolicy,
     // Physical option provenance is independent of early-send authorization.
     fast_open_option_sent: bool,
@@ -665,9 +668,9 @@ pub(crate) struct Connection {
     syn_payload_sent: usize,
     syn_data_acked: bool,
     syn_data_fully_acked: bool,
-    // First actually stored authenticated passive SYN byte, independent of reads.
-    // Its exclusive ACK is sufficient proof; no per-byte receive ledger is needed.
-    passive_syn_data_start: Option<Seq>,
+    // First actually stored authenticated SYN byte, independent of reads and
+    // active/passive open role. Its exclusive ACK is sufficient departure proof.
+    received_syn_data_start: Option<Seq>,
     syn_delivered: bool,
     fin_delivered: bool,
     fin_needs_separate_credit: bool,
@@ -990,6 +993,8 @@ impl Connection {
             irs: None,
             passive_open: false,
             fast_open: None,
+            fast_open_response: None,
+            fast_open_response_committed: false,
             fast_open_client_policy: crate::FastOpenClientPolicy::RequireCookie,
             fast_open_option_sent: false,
             fast_open_initial: 0,
@@ -998,7 +1003,7 @@ impl Connection {
             syn_payload_sent: 0,
             syn_data_acked: false,
             syn_data_fully_acked: false,
-            passive_syn_data_start: None,
+            received_syn_data_start: None,
             syn_delivered: false,
             fin_delivered: false,
             fin_needs_separate_credit: false,
@@ -1183,7 +1188,7 @@ impl Connection {
     //# SND.NXT is set to ISS+1 and SND.UNA to ISS. The connection state should be changed to
     //# SYN-RECEIVED.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-    //= reason=Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
+    //= reason=Authorized passive children and explicitly selected active receive contexts select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
     //# If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn passive_with_receive(
@@ -1422,12 +1427,7 @@ impl Connection {
         let Some(cached) = cached else {
             return Ok(0);
         };
-        self.prepare_fast_open_with_server_cookie(
-            cached.cookie,
-            cached.mss,
-            initial,
-            max_charge,
-        )
+        self.prepare_fast_open_with_server_cookie(cached.cookie, cached.mss, initial, max_charge)
     }
 
     // A supplied cookie is a credential obtained from this server, including
@@ -1516,7 +1516,7 @@ impl Connection {
         if early {
             self.events.readable = self.receive.readable() != 0;
             if self.events.readable {
-                self.passive_syn_data_start = self.irs.map(|irs| irs.wrapping_add(1));
+                self.received_syn_data_start = self.irs.map(|irs| irs.wrapping_add(1));
             }
         }
     }
@@ -2261,14 +2261,31 @@ impl Connection {
         segment: &Segment<'_>,
         metadata: crate::RxPacketMetadata,
     ) -> Result<(), Error> {
+        self.input_with_receive_authorization(now, traffic_class, segment, metadata, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn input_with_receive_authorization(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        metadata: crate::RxPacketMetadata,
+        authorization: Option<crate::endpoint::CrossingSynAuthorization>,
+    ) -> Result<bool, Error> {
         metadata.timestamps.validate(self.config.timebase)?;
         metadata.validate_segment(segment)?;
         self.input_timestamps = metadata.timestamps;
         self.input_segment_size = metadata.tcp_segment_size;
-        let result = self.input_with_traffic_class(now, traffic_class, segment);
+        let was_early = self.fast_open_early;
+        let result = if authorization.is_some() {
+            self.input_authorized(now, traffic_class, segment, authorization)
+        } else {
+            self.input_with_traffic_class(now, traffic_class, segment)
+        };
         self.input_timestamps = RxPacketTimestamps::default();
         self.input_segment_size = None;
-        result
+        result.map(|()| !was_early && self.fast_open_early)
     }
 
     pub(crate) fn acknowledged(&self) -> u64 {
@@ -2422,8 +2439,9 @@ impl Connection {
         }
     }
 
-    // Called after SYN-ACK validation. Any acknowledged SYN payload is
-    // positive TFO progress; repair its residue separately (RFC 7413 4.2.2).
+    // Called after SYN-ACK or active handshake ACK validation. Any acknowledged
+    // SYN payload is positive TFO progress; repair its residue separately
+    // (RFC 7413 4.2.2).
     // Only SYN-only acknowledgment adds rejection evidence here. Independent
     // ICMP/RTO evidence is neither consumed nor cleared by partial progress.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
@@ -2744,8 +2762,8 @@ impl Connection {
         }
         self.adaptive_departure(d.data_ack, d.fresh_data && count != 0 && !d.syn);
         d.data_ack = false; // One logical ACK, including SACK-only repair fragments.
-        self.syn_data_acked |= d.passive_syn_data_acked;
-        self.syn_data_fully_acked |= d.passive_syn_data_acked;
+        self.syn_data_acked |= d.received_syn_data_acked;
+        self.syn_data_fully_acked |= d.received_syn_data_acked;
         // Payload has accepted-departure evidence in RACK. SYN (including
         // SYN+data) and standalone FIN retain their Karn-eligible sample, but
         // measure from acceptance, never from the encoded TSval's selection.
@@ -2760,6 +2778,7 @@ impl Connection {
             if finished {
                 self.fast_open_attempt |= d.fast_open && !self.syn_committed;
                 self.fast_open_option_sent |= d.fast_open_option;
+                self.fast_open_response_committed |= d.simultaneous_response;
                 self.record_syn_departure(d.syn_timestamp);
             }
             self.syn_payload_sent = self.syn_payload_sent.max(count);
@@ -3407,6 +3426,22 @@ impl Connection {
         self.ecn_feedback() && !self.ecn_sent_plain
     }
 
+    fn learn_fast_open_response(&mut self, segment: &Segment<'_>) {
+        if self.fast_open_option_sent
+            || self.fast_open_client_policy == crate::FastOpenClientPolicy::ApplicationProtected
+                && self.syn_payload_sent != 0
+        {
+            let cookie = self
+                .fast_open_option_sent
+                .then_some(segment.options.fast_open)
+                .flatten()
+                .filter(|cookie| !cookie.as_bytes().is_empty());
+            // A family default is not an observed MSS. Pure crossing SYNs
+            // never reach this path: their credential was issued locally.
+            self.fast_open_learned = Some((cookie, segment.options.mss));
+        }
+    }
+
     pub(crate) fn last_output_ecn(&self) -> u8 {
         self.last_output_ecn
     }
@@ -3698,7 +3733,11 @@ impl Connection {
         self.events.readable =
             !self.read_closed && (self.receive.readable() != 0 || self.receive.eof());
         self.events.pushed |= self.receive.take_push();
-        self.events.urgent = if self.read_closed { None } else { self.rcv_up };
+        // An admitted active opener already published its urgent endpoint with
+        // the early receive prefix. Establishment must not notify it again.
+        if self.passive_open || !self.fast_open_early {
+            self.events.urgent = if self.read_closed { None } else { self.rcv_up };
+        }
         if self.receive.eof() {
             self.events.half_closed = true;
             if self.state == State::Established {
@@ -4779,6 +4818,19 @@ impl Connection {
         traffic_class: u8,
         segment: &Segment<'_>,
     ) -> Result<(), Error> {
+        self.input_authorized(now, traffic_class, segment, None)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //= reason=Explicit live local ListenerId selection authorizes only the first acceptable crossing SYN using current finite listener credentials, protected policy and shared pending/reset-debt limits. Active identity, RFC5681 construction, early reads and frozen rejection remain independent of outgoing cookies; local SYN-ACK cookies require actual departure and never train client request provenance. Two actual Endpoint listeners issue asymmetric credentials, and core/native PacketIo and public-fd tests complete both streams through fallback, expiry, wrap, duplicates, loss and reserved output without false connect completion.
+    //# A special case is simultaneous open where the SYN receiver is a client in SYN-SENT state. The protocol remains the same because [RFC793] already supports both data in the SYN and simultaneous open.
+    fn input_authorized(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        authorization: Option<crate::endpoint::CrossingSynAuthorization>,
+    ) -> Result<(), Error> {
         self.accepted_metadata = false;
         self.check_time(now)?;
         // Supersede the previous packet's D-SACK even when this checked arrival
@@ -4849,7 +4901,12 @@ impl Connection {
             self.accepted_metadata = true;
             // RFC 7413 §4.2.2 also governs simultaneous open. An outgoing
             // cookie is not receive authorization; normal SYN-ACK data is allowed.
-            if !valid_ack && segment.options.fast_open.is_some() {
+            let (early, response) = if !valid_ack {
+                authorization.map_or((false, None), |grant| grant.consume())
+            } else {
+                (false, None)
+            };
+            if !valid_ack && !early && segment.options.fast_open.is_some() {
                 let mut header = segment.header;
                 header.flags &= !(FIN | PSH | URG);
                 header.urgent_pointer = 0;
@@ -4863,7 +4920,20 @@ impl Connection {
                     false,
                 );
             } else {
-                self.learn_syn(segment, false);
+                self.learn_syn(segment, early);
+            }
+            if !valid_ack {
+                self.fast_open_response = response;
+                self.fast_open_early = early;
+                if early {
+                    self.events.readable = self.receive.readable() != 0 || self.receive.eof();
+                    self.events.pushed |= self.receive.take_push();
+                    self.events.half_closed = self.receive.eof();
+                    self.events.urgent = if self.read_closed { None } else { self.rcv_up };
+                    if self.receive.readable() != 0 {
+                        self.received_syn_data_start = self.irs.map(|irs| irs.wrapping_add(1));
+                    }
+                }
             }
             self.last_received = now;
             if valid_ack {
@@ -4876,20 +4946,7 @@ impl Connection {
                     false,
                     0,
                 );
-                if self.fast_open.is_some()
-                    || self.fast_open_client_policy
-                        == crate::FastOpenClientPolicy::ApplicationProtected
-                {
-                    let cookie = self
-                        .fast_open_option_sent
-                        .then_some(segment.options.fast_open)
-                        .flatten()
-                        .filter(|cookie| !cookie.as_bytes().is_empty());
-                    // The TCP family default is not an observed server MSS.
-                    // A cookie-only reply authorizes future Fast Open attempts,
-                    // but leaves their cold admission bound in place.
-                    self.fast_open_learned = Some((cookie, segment.options.mss));
-                }
+                self.learn_fast_open_response(segment);
                 self.establish();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
                 //# Data or controls that were queued for transmission MAY be included.
@@ -5031,7 +5088,7 @@ impl Connection {
         if self.handshake_pending()
             && self.irs == Some(seq)
             && h.flags & (SYN | ACK | RST) == SYN
-            && (h.flags & FIN == 0 || self.deferred_syn.is_some())
+            && (h.flags & FIN == 0 || self.deferred_syn.is_some() || self.fast_open_early)
         {
             self.learn_ecn(h.flags);
             self.sack_send |= self.config.sack && segment.options.sack_permitted;
@@ -5051,6 +5108,15 @@ impl Connection {
                 || self.fast_open_initial != 0 && ack.after(self.iss))
             && self.snd_nxt.at_or_after(ack)
         {
+            if self.timestamps
+                && let Some((_, echo)) = segment.options.timestamps
+                && echo != 0
+                && self
+                    .syn_timestamp_range
+                    .is_none_or(|(first, last)| echo.wrapping_sub(first) > last.wrapping_sub(first))
+            {
+                return Ok(());
+            }
             self.accepted_metadata = true;
             self.learn_ecn(h.flags);
             self.sack_send |= self.config.sack && segment.options.sack_permitted;
@@ -5061,6 +5127,15 @@ impl Connection {
                 self.ts_latest = value;
                 self.ts_recent_at = now;
             }
+            // The SYN-ACK can acknowledge only a prefix and close the peer's
+            // window after early admission. Apply its unscaled SYN window
+            // before ACK processing creates repair work; do not relearn the
+            // SYN or reset the already readable receive frontier.
+            self.snd_wnd = h.window as u32;
+            self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
+            self.wl1 = seq;
+            self.wl2 = ack;
+            self.congestion.on_window_update(now, self.snd_wnd);
             self.report_fast_open_syn_rejection(ack);
             self.accept_ack(
                 ack,
@@ -5070,6 +5145,7 @@ impl Connection {
                 false,
                 0,
             );
+            self.learn_fast_open_response(segment);
             self.establish();
             self.last_received = now;
             self.immediate_ack();
@@ -5228,8 +5304,7 @@ impl Connection {
         //# prescribed below according to the connection state.
         if h.flags & RST != 0 {
             if seq == next {
-                self.fast_open_peer_reset =
-                    self.handshake_pending() && self.passive_open && self.fast_open_early;
+                self.fast_open_peer_reset = self.handshake_pending() && self.fast_open_early;
                 // Preserve earlier path-failure evidence without adding any for RST.
                 let passive =
                     self.handshake_pending() && self.passive_open && !self.fast_open_early;
@@ -5380,6 +5455,11 @@ impl Connection {
                 self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
                 self.reset_reply = true;
                 return Ok(());
+            }
+            // Active simultaneous open can finish with a plain ACK when the
+            // peer receives our SYN-ACK before selecting its own response.
+            if !self.passive_open {
+                self.report_fast_open_syn_rejection(ack);
             }
             // Leave response delivery for the normal ACK/SACK/PRR snapshot below.
             self.accept_ack(
@@ -7544,14 +7624,20 @@ impl Connection {
         //# retransmitting the SYN without data or cookie options after the initial SYN timeout.
         //= https://www.rfc-editor.org/rfc/rfc7413#section-9
         //# Current and new implementations SHOULD use option (34).
-        let fast_open_option = if syn && self.snd_nxt == self.iss && !self.syn_timed_out {
-            self.fast_open.filter(|cookie| {
-                let padded = (option_len + cookie.as_bytes().len() + 2 + 3) & !3;
-                padded <= 40 && 20 + padded <= self.path_payload_limit()
-            })
+        let response_syn = syn && !self.passive_open && self.state != State::SynSent;
+        let candidate_cookie = if response_syn {
+            (!self.fast_open_response_committed)
+                .then_some(self.fast_open_response)
+                .flatten()
+        } else if syn && self.snd_nxt == self.iss && !self.syn_timed_out {
+            self.fast_open
         } else {
             None
         };
+        let fast_open_option = candidate_cookie.filter(|cookie| {
+            let padded = (option_len + cookie.as_bytes().len() + 2 + 3) & !3;
+            padded <= 40 && 20 + padded <= self.path_payload_limit()
+        });
         //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
         //= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
         //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
@@ -8831,15 +8917,15 @@ impl Connection {
             let buffer = gso.as_mut().unwrap();
             self.send.copy(offset, &mut buffer.payload[..count]);
         }
-        let passive_syn_data_acked = flags & ACK != 0
+        let received_syn_data_acked = flags & ACK != 0
             && self
-                .passive_syn_data_start
+                .received_syn_data_start
                 .is_some_and(|start| Seq(header.acknowledgment).after(start));
         let data_ack = flags & ACK != 0
-            && (self.unacked_segments != 0 || (passive_syn_data_acked && !self.syn_data_acked));
+            && (self.unacked_segments != 0 || (received_syn_data_acked && !self.syn_data_acked));
         if !reserve {
-            self.syn_data_acked |= passive_syn_data_acked;
-            self.syn_data_fully_acked |= passive_syn_data_acked;
+            self.syn_data_acked |= received_syn_data_acked;
+            self.syn_data_fully_acked |= received_syn_data_acked;
         }
         self.reserved_ledger = None;
         let initial_burst = fresh_data
@@ -8854,7 +8940,7 @@ impl Connection {
                 && (application_push || !group_push),
             fresh_data,
             deferred_fresh,
-            passive_syn_data_acked,
+            received_syn_data_acked,
             segmentation,
             selected_at: now,
             start: seq.0,
@@ -8862,12 +8948,18 @@ impl Connection {
             stream: count != 0 && !keepalive,
             syn,
             syn_timestamp: timestamp.map(|(value, _)| value),
-            fast_open: !self.passive_open
+            fast_open: syn
+                && !response_syn
+                && !self.passive_open
                 && (fast_open_option.is_some()
                     || self.fast_open_client_policy
                         == crate::FastOpenClientPolicy::ApplicationProtected
                         && count != 0),
-            fast_open_option: fast_open_option.is_some() && !self.passive_open,
+            fast_open_option: syn
+                && !response_syn
+                && fast_open_option.is_some()
+                && !self.passive_open,
+            simultaneous_response: response_syn,
             fin: flags & FIN != 0,
             rto: !keepalive
                 && !probe
@@ -9166,13 +9258,16 @@ impl Connection {
         //# 2. Advance to SYN-SENT state and update SND.NXT to include the data accordingly.
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if syn && !reserve {
-            self.fast_open_attempt |= !self.passive_open
+            self.fast_open_attempt |= !response_syn
+                && !self.passive_open
                 && !self.syn_committed
                 && (fast_open_option.is_some()
                     || self.fast_open_client_policy
                         == crate::FastOpenClientPolicy::ApplicationProtected
                         && count != 0);
-            self.fast_open_option_sent |= fast_open_option.is_some() && !self.passive_open;
+            self.fast_open_option_sent |=
+                !response_syn && fast_open_option.is_some() && !self.passive_open;
+            self.fast_open_response_committed |= response_syn;
             self.record_syn_departure(timestamp.map(|(value, _)| value));
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack

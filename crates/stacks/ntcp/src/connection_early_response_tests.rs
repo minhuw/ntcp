@@ -162,7 +162,7 @@ fn early_response_actual_gate_and_committed_synack() {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
+//= reason=Authorized passive children and explicitly selected active receive contexts select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
 //# If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.
 #[test]
 fn early_response_rfc5681_controller_matrix_and_ordinary_controls() {
@@ -366,7 +366,7 @@ fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
+//= reason=Authorized passive children and explicitly selected active receive contexts select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.
 //# If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.
 #[test]
 fn early_response_public_iw10_wire_witness() {

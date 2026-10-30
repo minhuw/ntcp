@@ -881,7 +881,7 @@
       "section": "4.2.2",
       "quote": "Client: Sending SYN",
       "status": "context",
-      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "reason": "Procedure headings, valid-cookie reuse and heuristic introduction. The RFC leaves simultaneous-open API design unspecified; the supported local-authority API exposes early reads. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
       "offset": 144
     },
     {
@@ -925,7 +925,7 @@
       "section": "4.2.2",
       "quote": "b.",
       "status": "context",
-      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "reason": "Procedure headings, valid-cookie reuse and heuristic introduction. The RFC leaves simultaneous-open API design unspecified; the supported local-authority API exposes early reads. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
       "offset": 394
     },
     {
@@ -968,7 +968,7 @@
       "offset": 616,
       "original": true,
       "evidence": [
-        "crates/stacks/ntcp/src/connection.rs::let fast_open_option = if syn && self.snd_nxt == self.iss && !self.syn_timed_out {",
+        "crates/stacks/ntcp/src/connection.rs::let fast_open_option = candidate_cookie.filter(",
         "crates/stacks/ntcp/src/fast_open_server_cookie_tests.rs::fn supplied_cookie_timeout_retries_without_option_or_data_and_keeps_negative_cache() {"
       ]
     },
@@ -977,7 +977,7 @@
       "section": "4.2.2",
       "quote": "Server: Receiving SYN and responding with SYN-ACK Upon receiving the SYN packet with Fast Open option:",
       "status": "context",
-      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "reason": "Procedure headings, valid-cookie reuse and heuristic introduction. The RFC leaves simultaneous-open API design unspecified; the supported local-authority API exposes early reads. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
       "offset": 806
     },
     {
@@ -1072,7 +1072,7 @@
       "section": "4.2.2",
       "quote": "If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.",
       "status": "covered",
-      "reason": "Authorized passive children select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.",
+      "reason": "Authorized passive children and explicitly selected active receive contexts select Rfc5681 before controller construction and negotiated effective-MSS recalculation, independently of ordinary IW10 and growth/recovery selection. Controller, public Endpoint and native Egress tests assert piecewise boundaries, physical output limits, authorization, transactional output and complete streams.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
       "offset": 1754,
       "evidence": [
@@ -1097,17 +1097,21 @@
       "id": "7413-simultaneous",
       "section": "4.2.2",
       "quote": "A special case is simultaneous open where the SYN receiver is a client in SYN-SENT state. The protocol remains the same because [RFC793] already supports both data in the SYN and simultaneous open.",
-      "status": "TODO",
-      "reason": "Outgoing cookie possession does not authorize receiving a recognized crossing SYN payload. The implementation rejects such data until ordinary retransmission (simultaneous_open_rejects_recognized_syn_data_until_retransmitted). A complete symmetric Fast Open receive procedure for active sockets is not established; the RFC explicitly leaves the associated API change outside scope.",
+      "status": "covered",
+      "reason": "Explicit live local ListenerId selection authorizes only the first acceptable crossing SYN using current finite listener credentials, protected policy and shared pending/reset-debt limits. Active identity, RFC5681 construction, early reads and frozen rejection remain independent of outgoing cookies; local SYN-ACK cookies require actual departure and never train client request provenance. Two actual Endpoint listeners issue asymmetric credentials, and core/native PacketIo and public-fd tests complete both streams through fallback, expiry, wrap, duplicates, loss and reserved output without false connect completion.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
-      "offset": 2049
+      "offset": 2049,
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::fn input_authorized(",
+        "crates/stacks/ntcp/src/fast_open_simultaneous_tests.rs::fn simultaneous_independent_authorities_complete_both_streams()"
+      ]
     },
     {
       "id": "7413-4.2.2-context-4",
       "section": "4.2.2",
       "quote": "But the client's socket may have data available to read before it's connected. This document does not cover the corresponding API change. Client: Receiving SYN-ACK The client SHOULD perform the following steps upon receiving the SYN-ACK:",
       "status": "context",
-      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "reason": "Procedure headings, valid-cookie reuse and heuristic introduction. The RFC leaves simultaneous-open API design unspecified; the supported local-authority API exposes early reads. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
       "offset": 2247
     },
     {
@@ -1154,7 +1158,7 @@
       "section": "4.2.2",
       "quote": "Note there is no latency penalty if the server does not acknowledge the data in the original SYN packet.",
       "status": "context",
-      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "reason": "Procedure headings, valid-cookie reuse and heuristic introduction. The RFC leaves simultaneous-open API design unspecified; the supported local-authority API exposes early reads. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
       "offset": 2778
     },
     {
@@ -1176,7 +1180,7 @@
       "section": "4.2.2",
       "quote": "The data exchange will start after the handshake like a regular TCP connection.",
       "status": "context",
-      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "reason": "Procedure headings, valid-cookie reuse and heuristic introduction. The RFC leaves simultaneous-open API design unspecified; the supported local-authority API exposes early reads. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
       "offset": 2971
     },
     {
@@ -1197,7 +1201,7 @@
       "section": "4.2.2",
       "quote": "Server: Receiving ACK",
       "status": "context",
-      "reason": "Procedure headings, permission to reuse a still-valid cookie, heuristic introduction and expressly excluded simultaneous-open API. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
+      "reason": "Procedure headings, valid-cookie reuse and heuristic introduction. The RFC leaves simultaneous-open API design unspecified; the supported local-authority API exposes early reads. Protocol steps, expiry and simultaneous-open behavior have operative rows (including section 3 repeated-use/expiry).",
       "offset": 3441
     },
     {

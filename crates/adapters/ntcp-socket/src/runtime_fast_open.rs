@@ -28,29 +28,37 @@ impl Owner {
         match self.endpoint.state(cid).map_err(engine)? {
             State::SynSent | State::SynReceived => return Err(EAGAIN),
             State::Closed => {
-                // __inet_stream_connect's sock_error path returns to
-                // SS_UNCONNECTED; do not leave a failed implicit open pending.
-                // Snapshot before timestamp cleanup/release can invalidate the
-                // core view. Queries must retain its validity bits and errors.
+                // Match SS_UNCONNECTED while retaining any independently
+                // authorized receive prefix until the application drains it.
+                // Snapshot before cleanup/release can invalidate the core view.
                 s.terminal_transport = Some(self.endpoint.transport_info(cid).map_err(engine));
                 let error = if s.error != 0 { s.error } else { ECONNABORTED };
                 s.error = 0;
-                s.handle = Handle::Fresh;
                 s.connect_pending = false;
                 s.connected = false;
-                s.peer_fin = false;
-                s.write_shutdown = false;
-                s.read_shutdown = false;
-                let options = s.timestamps.options;
-                s.timestamps = TimestampState::default();
-                s.timestamps.options = options;
-                self.rollback_connection(cid);
+                if self.endpoint.terminal_readable_bytes(cid).map_err(engine)? == 0 {
+                    self.release_failed_connect(id, cid);
+                }
                 return Err(error);
             }
             _ => (),
         }
         s.connect_pending = false;
         Ok(())
+    }
+
+    // Called after failed completion, immediately if there is no accepted data
+    // or after the final read. Keep the terminal transport snapshot for queries.
+    pub(super) fn release_failed_connect(&mut self, id: u64, cid: ConnectionId) {
+        let s = self.sockets.get_mut(&id).unwrap();
+        s.handle = Handle::Fresh;
+        s.peer_fin = false;
+        s.write_shutdown = false;
+        s.read_shutdown = false;
+        let options = s.timestamps.options;
+        s.timestamps = TimestampState::default();
+        s.timestamps.options = options;
+        self.rollback_connection(cid);
     }
 
     pub(super) fn connect_local(&mut self, id: u64) -> Result<SocketAddr> {
@@ -83,6 +91,11 @@ impl Owner {
             return Err(EINVAL);
         }
         let options = self.sockets[&id].clone();
+        if let Some(authority) = options.receive_authority {
+            self.endpoint
+                .validate_fast_open_receive_authority(authority, local.ip())
+                .map_err(engine)?;
+        }
         let open = ntcp::ActiveOpenOptions {
             send_capacity: options.send_capacity,
             receive_capacity: options.receive_capacity,
@@ -90,42 +103,39 @@ impl Owner {
         };
         let (cid, accepted) = if let Some(initial) = initial {
             self.endpoint.enable_fast_open().map_err(engine)?;
-            if let Some(cookie) = options.server_cookie_for(remote) {
-                self.endpoint.connect_fast_open_with_server_cookie(
+            self.endpoint
+                .connect_fast_open_with_receive_authority(
                     self.now(),
                     local,
                     remote,
                     initial,
                     open,
-                    Some(cookie),
-                )
-            } else {
-                self.endpoint.connect_fast_open_with_policy(
-                    self.now(),
-                    local,
-                    remote,
-                    initial,
-                    open,
+                    options.server_cookie_for(remote),
                     options.client_policy_for(remote, self.socket_policy.fast_open_client_policy),
+                    options.receive_authority,
                 )
-            }
-            .map_err(engine)?
+                .map_err(engine)?
         } else {
             (
                 self.endpoint
-                    .connect_with_options(self.now(), local, remote, open)
+                    .connect_with_receive_authority(
+                        self.now(),
+                        local,
+                        remote,
+                        open,
+                        options.receive_authority,
+                    )
                     .map_err(engine)?,
                 0,
             )
         };
-        // Core admission begins the next transport attempt. Invalid requests,
-        // failed admission, and deferred peer selection retain the old view.
-        self.sockets.get_mut(&id).unwrap().terminal_transport = None;
-        self.sockets.get_mut(&id).unwrap().soft_error = 0;
         if let Err(e) = self.apply_options(cid, &options) {
             self.rollback_connection(cid);
             return Err(e);
         }
+        // Publish the new attempt only after all pre-output options succeeded.
+        self.sockets.get_mut(&id).unwrap().terminal_transport = None;
+        self.sockets.get_mut(&id).unwrap().soft_error = 0;
         self.connection_options.push((
             cid,
             options.wire_tos(self.local),

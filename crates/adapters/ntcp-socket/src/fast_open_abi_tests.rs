@@ -97,11 +97,97 @@ fn fast_open_raw_options_and_aliases() {
     }
 }
 
+#[cfg(feature = "linux")]
+#[test]
+fn receive_authority_public_helper_aliases_clear_and_stale_generation() {
+    if !child(
+        "fast_open_abi_tests::receive_authority_public_helper_aliases_clear_and_stale_generation",
+        "NTCP_T4_AUTHORITY_CHILD",
+    ) {
+        return;
+    }
+    assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
+    let managed = |op| {
+        let id = call(0, op).unwrap().value as u64;
+        let (fd, t) = token(SOCK_CLOEXEC).unwrap();
+        install(fd, t, id).unwrap();
+        (fd, id)
+    };
+    let (listener, lid) = managed(Op::New(SOCK_NONBLOCK));
+    call(lid, Op::Bind("10.73.0.2:9000".parse().unwrap())).unwrap();
+    call(lid, Op::Listen(4)).unwrap();
+    let (active, aid) = managed(Op::New(SOCK_NONBLOCK));
+    unsafe {
+        let alias = dup(active);
+        let listener_alias = dup(listener);
+        assert!(alias >= 0 && listener_alias >= 0);
+        set_fast_open_receive_authority(alias, Some(listener_alias)).unwrap();
+        assert_eq!(
+            set_fast_open_receive_authority(active, Some(alias))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(EINVAL)
+        );
+        assert_eq!(
+            set_fast_open_receive_authority(listener, Some(listener))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(EINVAL)
+        );
+        let native = syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32;
+        assert_eq!(
+            set_fast_open_receive_authority(active, Some(native))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(EOPNOTSUPP)
+        );
+        syscall(SYS_close, native);
+        let (v6, v6id) = managed(Op::NewDomain(AF_INET6, SOCK_NONBLOCK));
+        set_fast_open_receive_authority(v6, Some(listener)).unwrap();
+        set_fast_open_receive_authority(v6, None).unwrap();
+        call(v6id, Op::Set(IPPROTO_IPV6, IPV6_V6ONLY, 1)).unwrap();
+        assert_eq!(
+            set_fast_open_receive_authority(v6, Some(listener))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(EAFNOSUPPORT)
+        );
+        close(v6);
+        assert_eq!(close(listener), 0);
+        // The alias still owns the exact live listener.
+        set_fast_open_receive_authority(active, Some(listener_alias)).unwrap();
+        assert_eq!(close(listener_alias), 0);
+        let (replacement, rid) = managed(Op::New(SOCK_NONBLOCK));
+        call(rid, Op::Bind("10.73.0.2:9001".parse().unwrap())).unwrap();
+        call(rid, Op::Listen(4)).unwrap();
+        // A new managed descriptor cannot revive the closed selection.
+        assert!(call(aid, Op::Connect("10.73.0.1:42001".parse().unwrap())).is_err());
+        set_fast_open_receive_authority(alias, None).unwrap();
+        assert_eq!(
+            call(aid, Op::Connect("10.73.0.1:42001".parse().unwrap())).unwrap_err(),
+            EINPROGRESS
+        );
+        assert_eq!(
+            set_fast_open_receive_authority(active, Some(replacement))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(EINVAL)
+        );
+        close(replacement);
+        close(active);
+        close(alias);
+    }
+}
+
+#[cfg(all(feature = "packet-test", feature = "linux"))]
+#[path = "simultaneous_abi_tests.rs"]
+mod simultaneous;
+
 #[cfg(feature = "packet-test")]
 mod packets {
     use super::*;
     use ntcp::wire::{ACK, SYN};
-    fn capture() -> Vec<u8> {
+    pub(super) fn capture() -> Vec<u8> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match packet_test::try_capture(65535) {
@@ -111,7 +197,7 @@ mod packets {
             }
         }
     }
-    fn segment(bytes: &[u8]) -> ntcp::wire::Segment<'_> {
+    pub(super) fn segment(bytes: &[u8]) -> ntcp::wire::Segment<'_> {
         let p = ntcp_ip::parse(bytes, false).unwrap();
         ntcp::wire::parse(p.ip, p.payload).unwrap()
     }
@@ -162,7 +248,7 @@ mod packets {
         assert_eq!(segment(&packet).header.flags & SYN, 0);
         packet
     }
-    fn socket() -> i32 {
+    pub(super) fn socket() -> i32 {
         let fd = unsafe {
             packet_test::packet_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP)
         };

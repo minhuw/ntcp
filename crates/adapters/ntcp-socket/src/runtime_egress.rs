@@ -200,6 +200,8 @@ impl Owner {
         Ok(())
     }
     pub(super) fn command_held(&self, id: u64, op: &Op) -> bool {
+        // Receive-authority selection uses the normal ownership guard below:
+        // only a fresh socket may change it, never a held connection.
         // This policy-only command cannot rewrite a held packet or its owner.
         if matches!(
             op,

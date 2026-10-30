@@ -378,6 +378,22 @@ pub fn set_fast_open_server_cookie(
     apply().map_err(std::io::Error::from_raw_os_error)
 }
 
+/// Select a managed local listener as receive authority for a fresh active
+/// socket. The listener identity is resolved now and checked again at open and
+/// admission. None clears selection. This does not enable outgoing Fast Open.
+pub fn set_fast_open_receive_authority(fd: i32, listener_fd: Option<i32>) -> std::io::Result<()> {
+    let apply = || -> Result<()> {
+        mutation_context()?;
+        let id = owned(fd)?.ok_or(EOPNOTSUPP)?;
+        let listener = listener_fd
+            .map(|fd| owned(fd)?.ok_or(EOPNOTSUPP))
+            .transpose()?;
+        call(id, Op::SetFastOpenReceiveAuthority(listener))?;
+        Ok(())
+    };
+    apply().map_err(std::io::Error::from_raw_os_error)
+}
+
 /// Change future early admissions on one managed listening socket. TFO service
 /// and listener enablement remain separate. ApplicationProtected is appropriate
 /// only for applications with independent resource/amplification protection and
