@@ -383,6 +383,36 @@ class FastOpenInventory(unittest.TestCase):
         self.assertEqual(rows["rolling-keys"]["evidence"][0],
                          "crates/stacks/ntcp/src/fast_open.rs::pub fn install(")
 
+    def test_mac_cost_keeps_whole_todo_and_actual_release_evidence_contract(self):
+        rows = {r["id"]: r for r in ledger()["paragraphs"]}
+        cost = rows["7413-mac-cost"]
+        self.assertEqual(cost["status"], "TODO")
+        self.assertEqual(cost["quote"],
+                         "3. The generation and verification are fast relative to the rest of SYN and SYN-ACK processing.")
+        self.assertEqual(cost["evidence"], [
+            "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn valid(",
+            "crates/stacks/ntcp/src/mac_cost_tests.rs::fn release_mac_cost()",
+        ])
+        for fact in ("check_mac_cost.py", "observer", "multiplicities", "HMAC overlap remains substantial",
+                     "independent quantitative review/T23", "without persistent state"):
+            self.assertIn(fact, cost["reason"])
+        for key in ("7413-server-mac-properties", "7413-request-server-properties"):
+            row = rows[key]
+            self.assertEqual(row["status"], "TODO")
+            self.assertIn("T20/T15", row["reason"])
+            self.assertIn("check_mac_cost.py", row["reason"])
+            self.assertNotIn("unmeasured", row["reason"])
+        harness = (ROOT / "crates/stacks/ntcp/src/mac_cost_tests.rs").read_text()
+        self.assertIn('#[ignore = "release measurement; run integration/rfc_host/check_mac_cost.py"]', harness)
+        self.assertIn('assert!(!cfg!(debug_assertions)', harness)
+        self.assertIn('self.endpoint.input(', harness)
+        self.assertIn('self.endpoint.poll_transmit(', harness)
+        self.assertIn('self.endpoint.release(child)', harness)
+        wrapper = (ROOT / "integration/rfc_host/check_mac_cost.py").read_text()
+        for flag in ('"--release"', '"--locked"', '"--all-features"', '"--exact"',
+                     '"--ignored"', '"--nocapture"', '"--test-threads=1"'):
+            self.assertIn(flag, wrapper)
+
     def test_server_iw_whole_key_retains_public_and_native_wire_evidence(self):
         row = next(r for r in ledger()["paragraphs"] if r["id"] == "7413-server-iw")
         for file, anchor in (

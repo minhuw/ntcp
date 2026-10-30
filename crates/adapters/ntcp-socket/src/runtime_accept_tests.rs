@@ -35,8 +35,11 @@ impl PacketIo for Backend {
 // Establish before enabling egress: the held packet is a data ACK, not SYN-ACK.
 fn held_child(siblings: usize, flags: i32) -> (Owner, u64, ConnectionId, Arc<Mutex<AckBackend>>) {
     let (mut a, mut b, _, _, listener) = pair();
-    a.test_now = Some(1_000_000);
-    b.test_now = Some(1_000_000);
+    // Pair setup uses elapsed time; never move either endpoint backwards if
+    // parallel test load makes that setup take more than one second.
+    let now = a.now().max(b.now()).max(1_000_000);
+    a.test_now = Some(now);
+    b.test_now = Some(now);
     b.sockets.get_mut(&listener).unwrap().flags = flags;
     let mut clients = Vec::new();
     for _ in 0..=siblings {

@@ -1139,6 +1139,8 @@ fn user_timeout_preconnect_updates_reset_and_deadlines() {
 #[test]
 fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
     let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
+    // The deadline assertions below are absolute ticks from this fixed origin.
+    owner.inner.test_now = Some(0);
     let listener = owner.alloc(Socket::new(0)).unwrap();
     execute_value(&mut owner, 11, listener, 5, 1234).unwrap();
     let (mut bind, _) = request(

@@ -581,6 +581,8 @@ impl ServerCookieContext {
         remote: IpAddr,
         cookie: FastOpenCookie,
     ) -> bool {
+        #[cfg(all(test, feature = "tfo-linux-cookie"))]
+        let _scope = crate::endpoint::mac_cost_tests::Scope::new(0);
         self.error.is_none()
             && (self.current.valid(registry, now, local, remote, cookie)
                 | self
@@ -596,6 +598,8 @@ impl ServerCookieContext {
         local: IpAddr,
         remote: IpAddr,
     ) -> Option<FastOpenCookie> {
+        #[cfg(all(test, feature = "tfo-linux-cookie"))]
+        let _scope = crate::endpoint::mac_cost_tests::Scope::new(1);
         let record = registry.get(self.current.id);
         if self.error.is_some() || !record.issues(now) {
             return None;
@@ -823,7 +827,7 @@ impl FastOpen {
     }
 }
 
-fn mac(secret: &[u8; 32], local: IpAddr, remote: IpAddr, epoch: u64) -> Hmac<Sha256> {
+fn address_mac(secret: &[u8; 32], local: IpAddr, remote: IpAddr) -> Hmac<Sha256> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
     mac.update(b"ntcp fast open cookie\0");
     for address in [local, remote] {
@@ -838,6 +842,11 @@ fn mac(secret: &[u8; 32], local: IpAddr, remote: IpAddr, epoch: u64) -> Hmac<Sha
             }
         }
     }
+    mac
+}
+
+fn mac(secret: &[u8; 32], local: IpAddr, remote: IpAddr, epoch: u64) -> Hmac<Sha256> {
+    let mut mac = address_mac(secret, local, remote);
     mac.update(&epoch.to_be_bytes());
     mac
 }
@@ -851,6 +860,9 @@ pub(crate) fn issue(
     FastOpenCookie::new(&mac(secret, local, remote, epoch).finalize().into_bytes()[..8]).unwrap()
 }
 
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= reason=Release measurements now exist in integration/rfc_host/check_mac_cost.py and the ignored release_mac_cost core test: both policies, IPv4/IPv6, small/64-listener tables, allocating/pooled receive storage, current/previous epochs, current/retiring keys, request/invalid/expired/revoked/length controls, actual admission/issuance multiplicities and encoded committed SYN-ACKs. Raw rounds, source/executable/toolchain provenance, clock/recorder controls and signed disabled/enabled perturbation are retained. Measured repeated HMAC key/address setup justified sharing the prefix within each two-epoch verification without persistent state; cookie bytes and both comparisons are preserved. On the measured Xeon 6230R, pooled small-listener overlap/refresh admission was approximately 6.14/7.99 microseconds for IPv4/IPv6 versus 12.35/13.12 microseconds outside the observed scopes; Linux admission was approximately 0.12-0.26 microseconds. HMAC overlap remains substantial, raw codec drift and paired observer variation limit precise speedup inference, and no arbitrary compliance percentage is asserted. Keep the complete fast-relative property TODO pending independent quantitative review/T23 disposition; any further per-credential preparation experiment must preserve resource accounting and use these same real-path boundaries.
+//# 3. The generation and verification are fast relative to the rest of SYN and SYN-ACK processing.
 pub(crate) fn valid(
     secret: &[u8; 32],
     local: IpAddr,
@@ -861,11 +873,18 @@ pub(crate) fn valid(
     if cookie.as_bytes().len() != 8 {
         return false;
     }
+    // Both epochs authenticate the same key/domain/address prefix. Prepare it
+    // once per verification to avoid repeated key setup and serialization on
+    // every SYN. Only bounded stack state is cloned; no credential/cache state
+    // or allocation is added, and each epoch retains a complete MAC comparison.
+    let base = address_mac(secret, local, remote);
+    let mut current_mac = base.clone();
+    current_mac.update(&epoch.to_be_bytes());
+    let mut previous_mac = base;
+    previous_mac.update(&epoch.saturating_sub(1).to_be_bytes());
     // Both comparisons use the crypto crate's constant-time truncated verifier.
-    let current = mac(secret, local, remote, epoch)
-        .verify_truncated_left(cookie.as_bytes())
-        .is_ok();
-    let previous = mac(secret, local, remote, epoch.saturating_sub(1))
+    let current = current_mac.verify_truncated_left(cookie.as_bytes()).is_ok();
+    let previous = previous_mac
         .verify_truncated_left(cookie.as_bytes())
         .is_ok();
     current | previous
@@ -956,6 +975,60 @@ mod tests {
         assert_eq!(cache.get(200, 100, local, remote).unwrap().mss, Some(1000));
         assert!(cache.get(201, 100, local, remote).is_none());
         assert_eq!(cache.peer_mss(201, 100, local, remote), Some(1000));
+    }
+
+    #[test]
+    fn shared_prefix_matches_independent_t5_bytes_and_both_epoch_results() {
+        // Deliberately keep the old complete serialization independent of the
+        // shared-prefix helper, including family tags and epoch-zero saturation.
+        fn old(secret: &[u8; 32], local: IpAddr, remote: IpAddr, epoch: u64) -> FastOpenCookie {
+            let mut h = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+            h.update(b"ntcp fast open cookie\0");
+            for ip in [local, remote] {
+                match ip {
+                    IpAddr::V4(ip) => {
+                        h.update(&[4]);
+                        h.update(&ip.octets());
+                    }
+                    IpAddr::V6(ip) => {
+                        h.update(&[6]);
+                        h.update(&ip.octets());
+                    }
+                }
+            }
+            h.update(&epoch.to_be_bytes());
+            FastOpenCookie::new(&h.finalize().into_bytes()[..8]).unwrap()
+        }
+        let addresses: [IpAddr; 4] = [
+            "192.0.2.1".parse().unwrap(),
+            "198.51.100.254".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8:ffff::abcd".parse().unwrap(),
+        ];
+        for byte in [0, 1, 7, 8, 127, 255] {
+            let secret = [byte; 32];
+            for local in addresses {
+                for remote in addresses {
+                    for epoch in [0, 1, 2, 1 << 32, u64::MAX - 1, u64::MAX] {
+                        let current = old(&secret, local, remote, epoch);
+                        let previous = old(&secret, local, remote, epoch.saturating_sub(1));
+                        assert_eq!(issue(&secret, local, remote, epoch), current);
+                        assert!(valid(&secret, local, remote, epoch, current));
+                        assert!(valid(&secret, local, remote, epoch, previous));
+                        for offered in [
+                            old(&[byte ^ 128; 32], local, remote, epoch),
+                            FastOpenCookie::new(&[99; 8]).unwrap(),
+                            FastOpenCookie::new(&[99; 4]).unwrap(),
+                            FastOpenCookie::request(),
+                        ] {
+                            let expected = offered.as_bytes().len() == 8
+                                && (offered == current || offered == previous);
+                            assert_eq!(valid(&secret, local, remote, epoch, offered), expected);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

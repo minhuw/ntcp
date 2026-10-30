@@ -156,7 +156,7 @@ fn timed_install(
 //# 5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
 //= type=test
-//= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO for unmeasured relative generation/verification cost (T6) and external raw-key restart/time continuity (T20/T15).
+//= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO: T6 now supplies release actual-path measurements with source/executable provenance, scoped admission/issuance counts, raw rounds and observer controls in integration/rfc_host/check_mac_cost.py; HMAC overlap remains substantial and the complete relative-cost assessment awaits independent review/T23 disposition. External raw-key restart/time continuity still requires T20/T15.
 //# The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use "SHOULD" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
 //= type=test
@@ -164,7 +164,7 @@ fn timed_install(
 //# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
 //= type=test
-//= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. This cross-reference still imports unmeasured relative MAC cost (T6) and trusted external raw-key restart/time continuity (T20/T15), so the whole clause remains TODO.
+//= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. T6 now measures actual release SYN/SYN-ACK admission/issuance and remaining processing in integration/rfc_host/check_mac_cost.py, retaining raw rounds, multiplicities, source/executable provenance and observer controls; HMAC overlap remains substantial and full relative-cost assessment awaits independent review/T23 disposition. The cross-reference also still imports trusted external raw-key restart/time continuity (T20/T15), so the whole clause remains TODO.
 //# 2. The server responds with a SYN-ACK based on the procedures in the "Server Cookie Handling" section (Section 4.1.2).
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
