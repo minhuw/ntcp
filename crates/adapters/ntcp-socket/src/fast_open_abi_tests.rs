@@ -183,6 +183,10 @@ fn receive_authority_public_helper_aliases_clear_and_stale_generation() {
 #[path = "simultaneous_abi_tests.rs"]
 mod simultaneous;
 
+#[cfg(all(feature = "packet-test", feature = "linux"))]
+#[path = "handshake_error_abi_tests.rs"]
+mod handshake_errors;
+
 #[cfg(feature = "packet-test")]
 mod packets {
     use super::*;
@@ -201,7 +205,7 @@ mod packets {
         let p = ntcp_ip::parse(bytes, false).unwrap();
         ntcp::wire::parse(p.ip, p.payload).unwrap()
     }
-    fn reply(syn: &ntcp::wire::Segment<'_>) -> Vec<u8> {
+    pub(super) fn reply(syn: &ntcp::wire::Segment<'_>) -> Vec<u8> {
         let ip = ntcp::IpMetadata {
             source: Ipv4Addr::new(192, 0, 2, 2).into(),
             destination: Ipv4Addr::new(192, 0, 2, 1).into(),

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "runtime_handshake_early_tests.rs"]
+mod handshake_errors;
+
 fn listener(owner: &mut Owner, address: SocketAddr) -> u64 {
     let id = new(owner, SOCK_NONBLOCK);
     owner

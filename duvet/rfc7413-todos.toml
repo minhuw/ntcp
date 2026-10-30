@@ -72,7 +72,7 @@ Therefore, the client MAY limit the cached MSS to 1460 bytes for IPv4 or 1440 fo
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2"
-reason = "Ordinary TCP fallback and selected peer encodings are tested, but no complete interoperability evidence establishes compatibility with every existing client/server TCP implementation. This broad goal is not closed by a few successful handshakes."
+reason = "Actual Linux interoperability is exercised by integration/rfc_host/run.py::matrix and child, integration/rfc_host/src/main.rs::run through public configure_with_packet_io and real AfPacket, integration/rfc_host/linux_peer.py::main through kernel sockets, and integration/rfc_host/bridge.py::Bridge after physical submission. The required IPv4/IPv6 matrix covers both roles, ordinary streams, cold/warm MSG_FASTOPEN and TCP_FASTOPEN_CONNECT, listener/client disablement with ordinary continuation, Kind34 stripping, one submitted data-SYN loss, kernel key revocation, native finite HMAC/managed Linux expiry and external no-issuer fallback, native 128-byte partial SYN admission followed by public SO_RCVBUF growth, and Linux closed-port refusal. Actual cookies/ACKs/checksums and complete bidirectional stream hashes/EOF are required. This finite current-Linux matrix does not establish compatibility with every existing TCP implementation; the complete quotation remains TODO pending explicit AC27/T23 user disposition."
 quote = '''
 One predominant requirement of TFO is to be fully compatible with existing TCP implementations, on both the client and server sides.
 '''
@@ -201,13 +201,6 @@ target = "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1"
 reason = "Unselected API alternative: preserve connect() and select MSG_FASTOPEN plus a separate TCP_FASTOPEN_CONNECT option, rather than replacing connect() with a user-buffer signature. This example recommendation does not mandate one ABI."
 quote = '''
 The active open side involves changing or replacing the connect() call, which does not take a user data buffer argument. We recommend replacing the connect() call to minimize API changes, and, hence, applications to reduce the deployment hurdle.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1"
-reason = "Reset and timeout Fast Open tests assert ECONNREFUSED/ETIMEDOUT and preserve terminal query state, but no full paired comparison against connect() covers every handshake failure/error mapping. Those two cases alone cannot prove the entire same-errno obligation."
-quote = '''
-On errors, it returns the same errno as connect() if the handshake fails.
 '''
 
 [[exception]]

@@ -116,6 +116,16 @@ T4_CLOSURES = {
 }
 
 
+T5_CLOSURES = {
+    "api-connect-errno": (
+        "A.1",
+        "On errors, it returns the same errno as connect() if the handshake fails.",
+        "crates/adapters/ntcp-socket/src/runtime_fast_open.rs::pub(super) fn complete_connect(",
+        "crates/adapters/ntcp-socket/src/runtime_handshake_error_tests.rs::fn paired_handshake_failure_completion_matrix()",
+    ),
+}
+
+
 def validate_selected_closure(row, expected):
     section, quote, source, test = expected
     target = f"{PREFIX}7413#" + ("section-" if section[0].isdigit() else "appendix-") + section
@@ -296,8 +306,7 @@ class FastOpenInventory(unittest.TestCase):
                 with self.subTest(group=group, row=id):
                     self.assertIn(rows[id]["status"], ("covered", "TODO"))
         for id in ("mac-cost", "mac-expiration", "is-cookie-valid",
-                   "first-ack-all-repair",
-                   "api-connect-errno"):
+                   "first-ack-all-repair"):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("LinuxSipHash24", rows["mac-expiration"]["reason"])
         self.assertIn("absolute issue/accept deadlines", rows["mac-expiration"]["reason"])
@@ -309,7 +318,7 @@ class FastOpenInventory(unittest.TestCase):
 
     def test_t2_closures_keep_canonical_source_and_test_reasons(self):
         rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
-        for id in [*T2_CLOSURES, *T3_CLOSURES, *T4_CLOSURES, "original-6"]:
+        for id in [*T2_CLOSURES, *T3_CLOSURES, *T4_CLOSURES, *T5_CLOSURES, "original-6"]:
             row = rows[id]
             for evidence in row["evidence"]:
                 path, anchor = evidence.split("::", 1)
@@ -324,7 +333,7 @@ class FastOpenInventory(unittest.TestCase):
 
     def test_selected_fast_open_closures_keep_whole_keys_and_executable_evidence(self):
         rows = {r["id"].removeprefix("7413-"): r for r in ledger()["paragraphs"]}
-        for id, expected in (T10_CLOSURES | T2_CLOSURES | T3_CLOSURES | T4_CLOSURES).items():
+        for id, expected in (T10_CLOSURES | T2_CLOSURES | T3_CLOSURES | T4_CLOSURES | T5_CLOSURES).items():
             with self.subTest(row=id):
                 row = rows[id]
                 validate_selected_closure(row, expected)
@@ -389,6 +398,47 @@ class FastOpenInventory(unittest.TestCase):
             self.assertTrue(all(a["reason"] == row["reason"] for a in matches))
         self.assertIn("before controller construction", row["reason"])
         self.assertNotIn("frozen", row["reason"])
+
+    def test_connect_errno_whole_key_requires_paired_failure_and_separate_channels(self):
+        row = next(r for r in ledger()["paragraphs"] if r["id"] == "7413-api-connect-errno")
+        validate_selected_closure(row, T5_CLOSURES["api-connect-errno"])
+        self.assertEqual(row["offset"], 871)
+        native = ROOT / "crates/adapters/ntcp-socket/src"
+        matrix = (native / "runtime_handshake_error_tests.rs").read_text()
+        for case in ("Failure::Refused", "Failure::R2", "Failure::Application",
+                     "Failure::ApplicationHeld", "Failure::SynBudget", "Failure::Abort", "Failure::Cancel",
+                     "Failure::Abandon", "Failure::Hard(2)"):
+            self.assertIn(case, matrix)
+        for test_file, test in (
+            ("runtime_handshake_error_tests.rs", "paired_handshake_soft_feedback_keeps_completion_and_stream_live"),
+            ("runtime_handshake_startup_tests.rs", "startup_capacity_is_real_transactional_admission_not_a_handshake_timeout"),
+            ("runtime_handshake_startup_tests.rs", "startup_entropy_uses_existing_native_port_seam_and_never_falls_back"),
+            ("runtime_handshake_startup_tests.rs", "handshake_feedback_rejects_forged_checksums_tuples_and_unsubmitted_sequences"),
+            ("runtime_handshake_early_tests.rs", "paired_completion_preserves_authorized_terminal_prefix_for_every_start"),
+            ("handshake_error_abi_tests.rs", "public_paired_handshake_errors_alias_poll_epoll_and_consumption"),
+        ):
+            self.assertIn("fn " + test + "()", (native / test_file).read_text())
+        for channel in ("consumed SO_ERROR", "public descriptor aliases/poll/epoll",
+                        "authorized receive drain", "separate stages"):
+            self.assertIn(channel, row["reason"])
+        compatibility = next(r for r in ledger()["paragraphs"] if r["id"] == "7413-compatibility")
+        self.assertEqual(compatibility["status"], "TODO")
+        self.assertEqual(compatibility["quote"],
+                         "One predominant requirement of TFO is to be fully compatible with existing TCP implementations, on both the client and server sides.")
+
+    def test_linux_matrix_is_partial_evidence_without_closing_compatibility_whole_quote(self):
+        row = next(r for r in ledger()["paragraphs"] if r["id"] == "7413-compatibility")
+        self.assertEqual(row["status"], "TODO")
+        self.assertEqual(row["quote"],
+                         "One predominant requirement of TFO is to be fully compatible with existing TCP implementations, on both the client and server sides.")
+        for anchor in ("integration/rfc_host/run.py::matrix", "integration/rfc_host/src/main.rs::run",
+                       "integration/rfc_host/linux_peer.py::main", "integration/rfc_host/bridge.py::Bridge"):
+            self.assertIn(anchor, row["reason"])
+            path, symbol = anchor.split("::")
+            self.assertIn(symbol, (ROOT / path).read_text())
+        for fact in ("both roles", "IPv4/IPv6", "real AfPacket", "physical submission",
+                     "bidirectional stream hashes/EOF", "SO_RCVBUF growth", "AC27/T23 user disposition"):
+            self.assertIn(fact, row["reason"])
 
     def test_verified_errata_are_explicit_without_rewriting_published_quotes(self):
         document = ledger()

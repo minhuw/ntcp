@@ -1,0 +1,11 @@
+[package]
+name = "ntcp-rfc-host"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2"
+ntcp = { path = "../../crates/stacks/ntcp", features = ["tfo-linux-cookie"] }
+ntcp-socket = { path = "../../crates/adapters/ntcp-socket", features = ["tfo-linux-cookie"] }
+ntcp-io-af-packet = { path = "../../crates/io/ntcp-io-af-packet" }

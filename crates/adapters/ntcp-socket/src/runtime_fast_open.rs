@@ -20,6 +20,9 @@ impl Owner {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1
+    //= reason=Shared active startup and consumable completion preserve ordinary connect errno semantics for MSG_FASTOPEN and deferred first writes. Paired IPv4/IPv6 packet and Owner tests cover validated refusal, R2/application/SYN-budget timeout, local abort, unsubmitted reservation abandonment, normal cancellation and every supported hard ICMP code; all soft/time/parameter/quench codes remain notifications through successful completion and stream delivery. Blocking/nonblocking completion, consumed SO_ERROR fallback, readiness generations, public descriptor aliases/poll/epoll, retry, terminal TCP_INFO prefixes and authorized receive drain retain their distinct channels. Initial admission returns and pre-start address/copy/resource/allocation/entropy rejections are separate stages, not universal send-buffer errno claims or Linux-kernel equivalence.
+    //# On errors, it returns the same errno as connect() if the handshake fails.
     pub(super) fn complete_connect(&mut self, id: u64) -> Result<()> {
         let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
         let Handle::Connection(cid) = s.handle else {

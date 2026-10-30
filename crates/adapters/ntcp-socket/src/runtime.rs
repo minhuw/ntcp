@@ -3154,6 +3154,10 @@ mod adaptive_ack_profile_tests;
 mod pmtud_profile_tests;
 
 #[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_handshake_error_tests.rs"]
+mod handshake_errors;
+
+#[cfg(all(test, feature = "packet-test"))]
 #[path = "runtime_icmp_tests.rs"]
 mod icmp_tests;
 

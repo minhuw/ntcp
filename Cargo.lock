@@ -210,6 +210,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntcp-rfc-host"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "ntcp",
+ "ntcp-io-af-packet",
+ "ntcp-socket",
+]
+
+[[package]]
 name = "ntcp-socket"
 version = "0.0.1"
 dependencies = [

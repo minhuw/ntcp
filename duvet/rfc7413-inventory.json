@@ -682,7 +682,7 @@
       "section": "4.2",
       "quote": "One predominant requirement of TFO is to be fully compatible with existing TCP implementations, on both the client and server sides.",
       "status": "TODO",
-      "reason": "Ordinary TCP fallback and selected peer encodings are tested, but no complete interoperability evidence establishes compatibility with every existing client/server TCP implementation. This broad goal is not closed by a few successful handshakes.",
+      "reason": "Actual Linux interoperability is exercised by integration/rfc_host/run.py::matrix and child, integration/rfc_host/src/main.rs::run through public configure_with_packet_io and real AfPacket, integration/rfc_host/linux_peer.py::main through kernel sockets, and integration/rfc_host/bridge.py::Bridge after physical submission. The required IPv4/IPv6 matrix covers both roles, ordinary streams, cold/warm MSG_FASTOPEN and TCP_FASTOPEN_CONNECT, listener/client disablement with ordinary continuation, Kind34 stripping, one submitted data-SYN loss, kernel key revocation, native finite HMAC/managed Linux expiry and external no-issuer fallback, native 128-byte partial SYN admission followed by public SO_RCVBUF growth, and Linux closed-port refusal. Actual cookies/ACKs/checksums and complete bidirectional stream hashes/EOF are required. This finite current-Linux matrix does not establish compatibility with every existing TCP implementation; the complete quotation remains TODO pending explicit AC27/T23 user disposition.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2",
       "offset": 0
     },
@@ -1783,10 +1783,14 @@
       "id": "7413-api-connect-errno",
       "section": "A.1",
       "quote": "On errors, it returns the same errno as connect() if the handshake fails.",
-      "status": "TODO",
-      "reason": "Reset and timeout Fast Open tests assert ECONNREFUSED/ETIMEDOUT and preserve terminal query state, but no full paired comparison against connect() covers every handshake failure/error mapping. Those two cases alone cannot prove the entire same-errno obligation.",
+      "status": "covered",
+      "reason": "Shared active startup and consumable completion preserve ordinary connect errno semantics for MSG_FASTOPEN and deferred first writes. Paired IPv4/IPv6 packet and Owner tests cover validated refusal, R2/application/SYN-budget timeout, local abort, unsubmitted reservation abandonment, normal cancellation and every supported hard ICMP code; all soft/time/parameter/quench codes remain notifications through successful completion and stream delivery. Blocking/nonblocking completion, consumed SO_ERROR fallback, readiness generations, public descriptor aliases/poll/epoll, retry, terminal TCP_INFO prefixes and authorized receive drain retain their distinct channels. Initial admission returns and pre-start address/copy/resource/allocation/entropy rejections are separate stages, not universal send-buffer errno claims or Linux-kernel equivalence.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1",
-      "offset": 871
+      "offset": 871,
+      "evidence": [
+        "crates/adapters/ntcp-socket/src/runtime_fast_open.rs::pub(super) fn complete_connect(",
+        "crates/adapters/ntcp-socket/src/runtime_handshake_error_tests.rs::fn paired_handshake_failure_completion_matrix()"
+      ]
     },
     {
       "id": "7413-api-active-option-alternative",
