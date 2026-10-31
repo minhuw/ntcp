@@ -237,6 +237,7 @@ fn attach(owner: &mut Owner, capacity: usize) -> Arc<Mutex<State>> {
         next_hop: [4; 6],
         next_cookie: 1,
         pending: Vec::new(),
+        cancelled: Vec::new(),
     });
     state
 }
@@ -794,6 +795,7 @@ fn pmtud_owner(
         next_hop: [4; 6],
         next_cookie: 1,
         pending: Vec::new(),
+        cancelled: Vec::new(),
     });
     (owner, state)
 }

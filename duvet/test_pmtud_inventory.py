@@ -289,8 +289,8 @@ class PmtudInventory(unittest.TestCase):
             "1191-050": ("T8", "T9", "T10", "T13"),
             "1191-057": ("T8", "T9", "T10"),
             "1191-058": ("T8", "T9/T10"),
-            "1191-059": ("T9/T10",),
-            "1191-074": ("T8", "T9/T10"),
+            "1191-059": ("T9", "T10"),
+            "1191-074": ("T8", "T9", "T10", "T18"),
         }.items():
             self.assertEqual(rows[key]["status"], "TODO", key)
             self.assertNotIn("T7 phase2", rows[key]["reason"], key)
@@ -302,6 +302,14 @@ class PmtudInventory(unittest.TestCase):
         for key in ("8201-049", "8201-050", "8201-052", "8201-062", "8201-063"):
             self.assertEqual(rows6[key]["status"], "TODO", key)
             self.assertIn("T7 PathService", rows6[key]["reason"], key)
+        # T9 closes only the whole distinct-notification clause; the drop
+        # notifications themselves still await exact T11 repair.
+        self.assertEqual(rows6["8201-066"]["status"], "covered")
+        self.assertIn("ntcp-host/src/lib.rs::", rows6["8201-066"]["evidence"][0])
+        for key, dependency in (("1191-061", "T11"), ("8201-064", "T11"), ("4821-019", "T10"), ("4821-079", "T10")):
+            row = (rows6 if key.startswith("8201") else {**rows, **{p["id"]: p for p in self.inventory(4821)["paragraphs"]}})[key]
+            self.assertEqual(row["status"], "TODO", key)
+            self.assertIn(dependency, row["reason"], key)
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:

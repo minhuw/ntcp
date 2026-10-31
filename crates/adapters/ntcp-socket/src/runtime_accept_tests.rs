@@ -65,6 +65,7 @@ fn held_child(siblings: usize, flags: i32) -> (Owner, u64, ConnectionId, Arc<Mut
         next_hop: [4; 6],
         next_cookie: 1,
         pending: Vec::new(),
+        cancelled: Vec::new(),
     });
     b.enable_egress(4, None).unwrap();
     a.execute(clients[0], Op::Write(vec![7; 10])).unwrap();

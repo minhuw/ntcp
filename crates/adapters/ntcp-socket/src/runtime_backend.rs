@@ -16,6 +16,11 @@ pub(super) struct EthernetBackend {
     pub(super) next_hop: [u8; 6],
     next_cookie: u64,
     pending: Vec<(u64, ntcp::TxTimestampToken, bool, bool)>,
+    // Endpoint-side timestamp cancellations recorded during one physical
+    // call, which runs inside the Host submission transaction while the Host
+    // holds the Endpoint. Drained by `finish_cancellations` after every call:
+    // at most every pending entry (<= PHASES) plus the fallback request.
+    cancelled: Vec<(ntcp::TxTimestampToken, bool, bool)>,
 }
 impl Drop for EthernetBackend {
     fn drop(&mut self) {
@@ -248,6 +253,7 @@ impl Owner {
             next_hop: backend.next_hop_mac,
             next_cookie: 1,
             pending: Vec::with_capacity(timestamps::PHASES),
+            cancelled: Vec::with_capacity(timestamps::PHASES + 1),
         });
         owner.attach_backend_host(1)?;
         owner.enable_egress(config.io.egress_capacity, config.io.gso)?;
@@ -320,6 +326,7 @@ impl Owner {
             next_hop,
             next_cookie: 1,
             pending: Vec::with_capacity(timestamps::PHASES),
+            cancelled: Vec::with_capacity(timestamps::PHASES + 1),
         });
         owner.attach_backend_host(u64::from(index))?;
         owner.enable_reservations(&config.io, index)?;
@@ -391,16 +398,6 @@ impl Owner {
             .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
             .map_or(0, |p| p.4)
     }
-    pub(super) fn transmit_ip_backend(&mut self, bytes: &[u8]) -> std::io::Result<TxOutcome> {
-        #[cfg(feature = "packet-test")]
-        if let Some(packets) = &mut self.packets {
-            return packets.transmit(bytes);
-        }
-        match &mut self.tun {
-            Some(tun) => tun.transmit(bytes),
-            None => Err(std::io::Error::from_raw_os_error(EIO)),
-        }
-    }
     // Each rejected frame consumes one iteration, just like an accepted frame.
     pub(super) fn receive_batch(&mut self, input: &mut [u8]) -> std::io::Result<()> {
         if self.egress.is_some() {
@@ -462,6 +459,23 @@ impl Owner {
     pub(super) fn input_ip(&mut self, bytes: &[u8], stamps: ntcp::RxPacketTimestamps) {
         self.input_ip_metadata(bytes, stamps, None);
     }
+    /// Managed ICMP: the single Host dispatcher validates the error, admits
+    /// it on this context, correlates its quote with the submission ledger and
+    /// applies TCP policy or datagram advice. A report about a reserved owner
+    /// returns unapplied; the caller retains the frame and replays it with
+    /// `Host::replay_icmp` for that exact owner generation.
+    pub(super) fn input_icmp(&mut self, bytes: &[u8]) -> Option<ntcp_host::DeferredIcmp> {
+        let now = self.now();
+        let ingress = self.ingress?;
+        match self
+            .host
+            .as_mut()?
+            .input_icmp(&mut self.endpoint, ingress, now, bytes)
+        {
+            Ok(ntcp_host::IcmpDispatch::Deferred(deferred)) => Some(deferred),
+            _ => None,
+        }
+    }
     pub(super) fn input_ip_metadata(
         &mut self,
         bytes: &[u8],
@@ -475,6 +489,18 @@ impl Owner {
             let Ok(packet) = host.decode_ingress(ingress, bytes) else {
                 return;
             };
+            if packet.protocol
+                == if packet.ip.destination.is_ipv4() {
+                    1
+                } else {
+                    58
+                }
+            {
+                // Without a retention queue a reserved owner's report is
+                // dropped unapplied, as the Endpoint entry used to refuse it.
+                let _ = self.input_icmp(bytes);
+                return;
+            }
             if segment_size.is_some()
                 && !host
                     .receive_capabilities(ingress)
@@ -629,15 +655,28 @@ impl EthernetBackend {
         }
     }
     fn cancel_oldest(&mut self, endpoint: &mut Endpoint) -> std::io::Result<()> {
+        self.evict_oldest()?;
+        self.finish_cancellations(endpoint);
+        Ok(())
+    }
+    fn evict_oldest(&mut self) -> std::io::Result<()> {
         let (cookie, token, sw, hw) = self.pending[0];
         self.io.cancel_tx_timestamp(cookie)?;
         self.pending.remove(0);
-        Self::cancel_sources(endpoint, token, sw, hw);
+        self.cancelled.push((token, sw, hw));
         Ok(())
     }
+    /// Apply the Endpoint side of cancellations recorded by `transmit_frame`.
+    pub(super) fn finish_cancellations(&mut self, endpoint: &mut Endpoint) {
+        for (token, sw, hw) in self.cancelled.drain(..) {
+            Self::cancel_sources(endpoint, token, sw, hw);
+        }
+    }
+    /// One physical call, including its timestamp fallback. Endpoint-side
+    /// cancellations are only recorded; the caller applies them with
+    /// `finish_cancellations` once the call's outcome is finalized.
     pub(super) fn transmit_frame(
         &mut self,
-        endpoint: &mut Endpoint,
         token: Option<ntcp::TxTimestampToken>,
         sources: (bool, bool),
         frame: &[u8],
@@ -665,8 +704,7 @@ impl EthernetBackend {
                 > capacity
             {
                 // Cancellation errors are not synchronous packet rejection.
-                self.cancel_oldest(endpoint)
-                    .map_err(std::io::Error::other)?;
+                self.evict_oldest().map_err(std::io::Error::other)?;
             }
             let cookie = self.next_cookie;
             match self.io.transmit_with_timestamp(
@@ -689,7 +727,7 @@ impl EthernetBackend {
                 Err(e) => return Err(e),
             }
         }
-        Self::cancel_sources(endpoint, token, sources.0, sources.1);
+        self.cancelled.push((token, sources.0, sources.1));
         self.io.transmit(frame)
     }
 }

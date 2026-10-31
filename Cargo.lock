@@ -133,6 +133,7 @@ dependencies = [
  "ntcp",
  "ntcp-icmp",
  "ntcp-ip",
+ "ntcp-ip-common",
  "ntcp-ip6",
  "ntcp-path",
 ]

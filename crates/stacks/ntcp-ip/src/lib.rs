@@ -1,9 +1,33 @@
 #![no_std]
 use core::net::{IpAddr, Ipv4Addr};
-use ntcp::{IpMetadata, Ipv4Options};
+use ntcp::{IpMetadata, Ipv4Options, OutgoingIpv4Options};
 
-pub use ntcp_ip_common::{Error, checksum};
+pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, UDP_HEADER, checksum};
 pub const IPV4_HEADER: usize = 20;
+
+/// Per-datagram IPv4 send parameters shared by every transport protocol.
+/// `ip.destination` is the final destination; a source route option places its
+/// first hop in the header while transport checksums keep the final address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Header {
+    pub ip: IpMetadata,
+    pub hop_limit: u8,
+    pub dscp: u8,
+    pub ecn: u8,
+    pub ipv4_options: OutgoingIpv4Options,
+}
+
+impl From<ntcp::Transmit> for Header {
+    fn from(t: ntcp::Transmit) -> Self {
+        Self {
+            ip: t.ip,
+            hop_limit: t.hop_limit,
+            dscp: t.dscp,
+            ecn: t.ecn,
+            ipv4_options: t.ipv4_options,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Packet<'a> {
@@ -123,7 +147,42 @@ pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
 //# changes and the new PMTU is lower, it will be discovered.
 
 pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit, timestamp: u32) -> Result<usize, Error> {
-    encode_present(packet, transmit, timestamp, transmit.len)
+    let len = transmit.len;
+    encode_present(packet, transmit.into(), PROTOCOL_TCP, len, timestamp, len)
+}
+
+/// Encode IP around `len` transport bytes of `protocol` resident at
+/// `packet[IPV4_HEADER..]`; they move behind any options. Returns stored length.
+pub fn encode_datagram(
+    packet: &mut [u8],
+    header: Header,
+    protocol: u8,
+    len: usize,
+    timestamp: u32,
+) -> Result<usize, Error> {
+    encode_present(packet, header, protocol, len, timestamp, len)
+}
+
+/// Encode a checksummed UDP datagram whose `payload_len` data bytes are
+/// resident at `packet[IPV4_HEADER + UDP_HEADER..]`. Returns the packet length.
+/// The payload is never modified; on error only header bytes may be.
+pub fn encode_udp(
+    packet: &mut [u8],
+    header: Header,
+    source_port: u16,
+    destination_port: u16,
+    payload_len: usize,
+    timestamp: u32,
+) -> Result<usize, Error> {
+    let len = ntcp_ip_common::encode_udp(
+        header.ip.source,
+        header.ip.destination,
+        source_port,
+        destination_port,
+        packet.get_mut(IP_HEADER..).ok_or(Error::Length)?,
+        payload_len,
+    )?;
+    encode_datagram(packet, header, PROTOCOL_UDP, len, timestamp)
 }
 
 /// Encode IP around an already checksummed TCP header. The remaining TCP bytes
@@ -140,7 +199,15 @@ pub fn encode_shared_header(
     {
         return Err(Error::Length);
     }
-    encode_present(packet, transmit, timestamp, tcp_header_len)
+    let len = transmit.len;
+    encode_present(
+        packet,
+        transmit.into(),
+        PROTOCOL_TCP,
+        len,
+        timestamp,
+        tcp_header_len,
+    )
 }
 //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
 //# Total Length is the length of the datagram, measured in octets, including
@@ -181,19 +248,19 @@ pub fn encode_shared_header(
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 fn encode_present(
     packet: &mut [u8],
-    transmit: ntcp::Transmit,
+    header: Header,
+    protocol: u8,
+    transport_len: usize,
     timestamp: u32,
     present: usize,
 ) -> Result<usize, Error> {
-    let ntcp::Transmit {
+    let Header {
         ip,
-        len: tcp_len,
         hop_limit,
         dscp,
         ecn,
         ipv4_options,
-        ..
-    } = transmit;
+    } = header;
     let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
         return Err(Error::Version);
     };
@@ -202,7 +269,7 @@ fn encode_present(
         .encode(source, destination, timestamp, &mut options)
         .map_err(|_| Error::Options)?;
     let header_len = IP_HEADER + option_len;
-    let total_len = tcp_len.checked_add(header_len).ok_or(Error::Length)?;
+    let total_len = transport_len.checked_add(header_len).ok_or(Error::Length)?;
     let stored_len = header_len.checked_add(present).ok_or(Error::Length)?;
     if total_len > usize::from(u16::MAX) || stored_len > packet.len() {
         return Err(Error::Length);
@@ -238,7 +305,7 @@ fn encode_present(
     //# change to the IP layer, when it sends segments on the connection
     //# (SHLD-22).
     header[1] = (dscp << 2) | (ecn & 3);
-    header[9] = 6;
+    header[9] = protocol;
     header[12..16].copy_from_slice(&source.octets());
     header[16..20].copy_from_slice(&destination.octets());
     let sum = checksum(header);

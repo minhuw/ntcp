@@ -388,6 +388,7 @@ impl Listener {
 // context guessing from addresses.
 #[path = "endpoint_managed.rs"]
 mod managed;
+pub use managed::{CorrelatedPmtu, CorrelatedSegment};
 
 pub struct Endpoint {
     managed_context: Option<ntcp_path::ContextId>,
@@ -3332,6 +3333,12 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.send_progress())
     }
 
+    /// Configured send buffer capacity of one connection, without sampling
+    /// the rest of `transport_info`.
+    pub fn send_capacity(&self, id: ConnectionId) -> Result<usize, EndpointError> {
+        Ok(self.slot(id)?.connection.send_capacity())
+    }
+
     pub fn set_rx_timestamp_capacity(
         &mut self,
         id: ConnectionId,
@@ -3678,6 +3685,18 @@ impl Endpoint {
         if error == crate::NetworkError::SourceQuench {
             return Ok(false);
         }
+        self.deliver_network_error(index, now, quoted_sequence, error)
+    }
+    // Shared by the tuple-routed and the Host-correlated entrypoints, after
+    // reservation and clock checks.
+    fn deliver_network_error(
+        &mut self,
+        index: usize,
+        now: Instant,
+        quoted_sequence: u32,
+        error: crate::NetworkError,
+    ) -> Result<bool, EndpointError> {
+        let tuple = self.slots[index].as_ref().unwrap().connection.tuple();
         let listener = self.slots[index].as_ref().unwrap().listener;
         if self.config.error_reports
             && listener.is_some()
@@ -4632,15 +4651,18 @@ impl Endpoint {
         }
     }
 
-    pub fn accept_transmit(
-        &mut self,
+    /// Read-only form of every check `accept_transmit` performs. Ok(true)
+    /// means an immediately following `accept_transmit` with the same `now`
+    /// and no intervening Endpoint call succeeds and returns true, so an
+    /// embedding can finish all fallible work before a physical submission.
+    pub fn preflight_accept_transmit(
+        &self,
         now: Instant,
         attempt: crate::TransmitAttempt,
     ) -> Result<bool, EndpointError> {
-        let index = attempt.reservation;
         let Some(r) = self
             .reservations
-            .get(index)
+            .get(attempt.reservation)
             .and_then(|slot| slot.current.as_ref())
         else {
             return Ok(false);
@@ -4648,6 +4670,32 @@ impl Endpoint {
         if r.attempt != Some(attempt) {
             return Ok(false);
         }
+        let count = if r.repaired {
+            r.emitted_bytes
+        } else {
+            r.departure.map_or(0, |d| d.payload)
+        };
+        if let Some(id) = r.packet.connection {
+            let owner = &self.retained_slot(id)?.connection;
+            owner.check_time(now)?;
+            if let Some(d) = &r.departure {
+                owner.validate_reserved_output(now, d, r.offset, count)?;
+            }
+        }
+        self.check_clock(now)?;
+        Ok(true)
+    }
+
+    pub fn accept_transmit(
+        &mut self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+    ) -> Result<bool, EndpointError> {
+        if !self.preflight_accept_transmit(now, attempt)? {
+            return Ok(false);
+        }
+        let index = attempt.reservation;
+        let r = self.reservations[index].current.as_ref().unwrap();
         let connection = r.packet.connection;
         let (mut departure, offset, count, finished) = (
             r.departure,
@@ -4659,13 +4707,6 @@ impl Endpoint {
             },
             r.finished,
         );
-        if let Some(id) = connection {
-            let owner = &self.retained_slot(id)?.connection;
-            owner.check_time(now)?;
-            if let Some(d) = &departure {
-                owner.validate_reserved_output(now, d, offset, count)?;
-            }
-        }
         self.clock(now)?;
         if let Some(id) = connection
             && let Some(d) = &mut departure

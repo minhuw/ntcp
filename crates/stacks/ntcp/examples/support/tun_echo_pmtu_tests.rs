@@ -396,11 +396,47 @@ fn runtime_zero_mtu_icmp_uses_live_host_plateaus_and_transport_overrides() {
     p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
     input_frame(&mut p.ahost, &mut p.a, p.time + 3, &report, p.local.ip(), false, 0).unwrap();
     assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1006);
+    // The shared publication never undercuts the decrease the owner applied
+    // under its own plateau policy: the override keeps its local meaning.
+    let path = p.ahost.host.binding(p.aid).unwrap().snapshot.path();
+    let learned = |p: &Pair| p.ahost.host.paths().path_snapshot(path).unwrap().learned_mtu();
+    assert_eq!(learned(&p), Some(1006), "published the owner's applied decrease");
+    p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
+    assert_eq!(p.a.managed_path(p.aid).unwrap().ordinary_ip_budget, 1006);
+    eprintln!("ZERO_MTU override=HISTORICAL host_table=900 tcp=1006 published={:?} budget={}",
+        learned(&p), p.a.managed_path(p.aid).unwrap().ordinary_ip_budget);
+    // Following the live Host table again, TCP and the Host agree.
     p.a.set_pmtud_policy(p.time + 4, p.aid, ntcp::PmtudPolicy::default()).unwrap();
     input_frame(&mut p.ahost, &mut p.a, p.time + 5, &report, p.local.ip(), false, 0).unwrap();
     assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 900);
-    assert_eq!(p.ahost.host.binding(p.aid).unwrap().snapshot.learned_mtu(), None,
-        "local feedback is not shared validated publication");
+    assert_eq!(learned(&p), Some(900), "correlated decrease from the Host plateau table");
+    eprintln!("ZERO_MTU override=INHERIT host_table=900 tcp=900 published={:?}", learned(&p));
+}
+
+#[test]
+fn runtime_zero_mtu_override_below_host_table_publishes_the_host_value() {
+    let mut p = Pair::new(false, false);
+    p.a.write(p.aid, &[7; 1460]).unwrap();
+    let original = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip()).pop().unwrap();
+    assert_eq!(original.len(), 1500);
+    let report = ptb(&original, 0);
+    p.ahost.host.set_ipv4_plateaus(path::Ipv4Plateaus::new(&[1500, 1200, 68]).unwrap()).unwrap();
+    p.a.set_pmtud_policy(p.time + 1, p.aid, ntcp::PmtudPolicy {
+        ipv4_plateaus: ntcp::Ipv4Plateaus::HISTORICAL, ..Default::default()
+    }).unwrap();
+    p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 2, &report, p.local.ip(), false, 0).unwrap();
+    assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1006);
+    // One connection's override never lowers other clients below the
+    // Host's own table; the connection keeps its lower local value.
+    let path = p.ahost.host.binding(p.aid).unwrap().snapshot.path();
+    let learned = p.ahost.host.paths().path_snapshot(path).unwrap().learned_mtu();
+    assert_eq!(learned, Some(1200));
+    p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
+    assert_eq!(p.a.managed_path(p.aid).unwrap().ordinary_ip_budget, 1006);
+    assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1006);
+    eprintln!("ZERO_MTU override=HISTORICAL host_table=1200 tcp=1006 published={learned:?} budget={}",
+        p.a.managed_path(p.aid).unwrap().ordinary_ip_budget);
 }
 
 #[test]

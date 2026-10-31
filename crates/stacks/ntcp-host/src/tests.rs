@@ -1,10 +1,14 @@
 extern crate std;
 mod admission;
+mod correlation;
+mod dispatch;
 mod source_routes;
+mod submission;
 use super::*;
+use core::net::SocketAddr;
 use ntcp::{
     ActiveOpenOptions, ConnectionConfig, FastOpenClientPolicy, FastOpenEarlyDataPolicy,
-    InitialWindow, ManagedOpenOptions, OutgoingIpv4Options, PmtudConfig, State,
+    InitialWindow, ManagedOpenOptions, OutgoingIpv4Options, PmtudConfig, State, Tuple,
 };
 use std::{vec, vec::Vec};
 
@@ -64,7 +68,43 @@ fn managed_route_policy(
     path_capacity: Option<usize>,
     denied_hop: Option<IpAddr>,
 ) -> (Host, Endpoint, IngressContext) {
-    let (mut paths, limits) = managed_limits(&cfg, 1, 1, 1, 4, 1).unwrap();
+    managed_with(local, identity, cfg, gso, path_capacity, denied_hop, |_| 1)
+}
+fn managed_with(
+    local: SocketAddr,
+    identity: u128,
+    cfg: EndpointConfig,
+    gso: bool,
+    path_capacity: Option<usize>,
+    denied_hop: Option<IpAddr>,
+    // Adjusts ledger budgets; returns the Endpoint output pool size.
+    ledger: impl FnOnce(&mut LedgerLimits) -> usize,
+) -> (Host, Endpoint, IngressContext) {
+    managed_limited(
+        local,
+        identity,
+        cfg,
+        gso,
+        path_capacity,
+        denied_hop,
+        |paths, mut limits| {
+            let reservations = ledger(&mut limits.ledger);
+            (paths, limits, reservations)
+        },
+    )
+}
+// Like `managed_with`, but adjusts every Host limit (e.g. adds UDP flows).
+fn managed_limited(
+    local: SocketAddr,
+    identity: u128,
+    cfg: EndpointConfig,
+    gso: bool,
+    path_capacity: Option<usize>,
+    denied_hop: Option<IpAddr>,
+    adjust: impl FnOnce(path::Limits, Limits) -> (path::Limits, Limits, usize),
+) -> (Host, Endpoint, IngressContext) {
+    let (paths, limits) = managed_limits(&cfg, 1, 1, 1, 4, 1).unwrap();
+    let (mut paths, limits, reservations) = adjust(paths, limits);
     if let Some(capacity) = path_capacity {
         paths.paths = capacity;
     }
@@ -131,7 +171,9 @@ fn managed_route_policy(
             )
             .unwrap();
     } else {
-        endpoint.enable_output_reservations().unwrap();
+        endpoint
+            .enable_output_reservations_with_capacity(reservations)
+            .unwrap();
     }
     (host, endpoint, context)
 }
@@ -177,9 +219,13 @@ fn selected(endpoint: &mut Endpoint, now: u64) -> Option<(TransmitAttempt, Trans
 fn emit(host: &mut Host, endpoint: &mut Endpoint, now: u64) -> Option<Vec<u8>> {
     let (attempt, _, frame) = selected(endpoint, now)?;
     let context = host.egress_context(endpoint, attempt).unwrap();
-    host.with_validated_egress(endpoint, context, &frame, 0, |_| ())
+    let ticket = host.submission_ticket(endpoint, context).unwrap();
+    let submitted = host
+        .submit(endpoint, now, ticket, context, &frame, 0, |_| {
+            BackendOutcome::Submitted
+        })
         .unwrap();
-    assert!(endpoint.accept_transmit(now, attempt).unwrap());
+    assert!(submitted == Submission::Submitted);
     host.collect(endpoint).unwrap();
     Some(frame)
 }
@@ -580,12 +626,14 @@ fn exact_probe_attempt_and_negative_revision_gate_actual_submission() {
         a.0.trusted_decrease(hold + 1, path, if v6 { 1280 } else { 1050 })
             .unwrap();
         let mut submitted = false;
-        assert_eq!(
-            a.0.with_validated_egress(&mut a.1, context, &frame, 0, |_| {
+        let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
+        let refused =
+            a.0.submit(&mut a.1, hold + 1, ticket, context, &frame, 0, |_| {
                 submitted = true;
-            }),
-            Err(Error::Obsolete)
-        );
+                BackendOutcome::Submitted
+            })
+            .unwrap_err();
+        assert_eq!(refused.error, Error::Obsolete);
         assert!(!submitted);
         assert_eq!(
             a.1.transport_info(id).unwrap().rto_backoff,
@@ -596,8 +644,15 @@ fn exact_probe_attempt_and_negative_revision_gate_actual_submission() {
         assert!(a.1.transmit_discovery_intent(attempt).is_none());
         let (next, _, smaller) = selected(&mut a.1, hold + 2).unwrap();
         assert!(a.1.transmit_discovery_intent(next).is_none());
+        // The retained ticket follows the replacement attempt.
         let context = a.0.egress_context(&mut a.1, next).unwrap();
         a.0.validate_egress(&mut a.1, context, &smaller, 0).unwrap();
+        let submitted =
+            a.0.submit(&mut a.1, hold + 2, refused.ticket, context, &smaller, 0, |_| {
+                BackendOutcome::Submitted
+            })
+            .unwrap();
+        assert!(submitted == Submission::Submitted);
         assert!(smaller.len() <= if v6 { 1280 } else { 1050 });
     }
 }
@@ -622,9 +677,12 @@ fn stateless_rebind_capacity_failure_preserves_lease_pins_then_submits_once() {
     b.0.replace_route(old.snapshot.key().route(), route).unwrap();
     let usage = b.0.paths().usage();
     let mut submissions = 0;
-    assert_eq!(b.0.with_validated_egress(&mut b.1, held, &frame, 0, |_| {
+    let ticket = b.0.submission_ticket(&mut b.1, held).unwrap();
+    let refused = b.0.submit(&mut b.1, 4, ticket, held, &frame, 0, |_| {
         submissions += 1;
-    }), Err(Error::Path(path::Error::Capacity)));
+        BackendOutcome::Submitted
+    }).unwrap_err();
+    assert_eq!(refused.error, Error::Path(path::Error::Capacity));
     assert_eq!(submissions, 0);
     assert_eq!(b.0.paths().usage(), usage);
     assert_eq!(b.0.leases[0].unwrap().prepared, old);
@@ -632,16 +690,20 @@ fn stateless_rebind_capacity_failure_preserves_lease_pins_then_submits_once() {
     assert!(b.0.paths().is_dirty(old.client).unwrap());
     assert_eq!(b.1.transmit_attempt_packet(attempt), Some(packet));
     b.0.paths.release(blocker).unwrap();
-    let live = b.0.with_validated_egress(&mut b.1, held, &frame, 0, |live| {
+    let mut live = None;
+    let submitted = b.0.submit(&mut b.1, 4, refused.ticket, held, &frame, 0, |current| {
         submissions += 1;
-        live
+        live = Some(current);
+        BackendOutcome::Submitted
     }).unwrap();
+    assert!(submitted == Submission::Submitted);
+    let live = live.unwrap();
     assert_eq!(submissions, 1);
     assert_ne!(live.binding.client, old.client);
     assert_ne!(live.binding.snapshot.path(), old.snapshot.path());
     assert_eq!(b.0.paths().path_pins(old.snapshot.path()).unwrap(), 0);
     assert!(!b.0.paths().is_dirty(live.binding.client).unwrap());
-    assert!(b.1.accept_transmit(4, attempt).unwrap());
+    assert!(!b.1.accept_transmit(4, attempt).unwrap());
     b.0.collect(&b.1).unwrap();
     assert_eq!(b.0.lease_count(), 0);
     assert_eq!(b.0.paths().usage().clients, 0);

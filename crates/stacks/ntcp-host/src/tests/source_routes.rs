@@ -453,9 +453,17 @@ fn changed_return_route_failed_refresh_and_class_rebind_preserve_authority_and_r
         assert_wire(&frame, addresses(false).0, &[11, 10]);
         let mut submissions = 0;
         let result = b.0.egress_context(&mut b.1, attempt).and_then(|context| {
-            b.0.with_validated_egress(&mut b.1, context, &frame, 0, |_| submissions += 1)
+            let ticket = b.0.submission_ticket(&mut b.1, context)?;
+            b.0.submit(&mut b.1, 13, ticket, context, &frame, 0, |_| {
+                submissions += 1;
+                BackendOutcome::Submitted
+            })
+            .map_err(|refused| {
+                b.0.cancel_submission(refused.ticket);
+                refused.error
+            })
         });
-        assert_eq!(result, Err(expected));
+        assert_eq!(result.map(|_| ()), Err(expected));
         assert_eq!(submissions, 0);
         assert_eq!(b.0.binding(server).unwrap(), old);
         assert_eq!(b.0.paths().snapshot(old.client).unwrap(), notification);
@@ -484,10 +492,13 @@ fn changed_return_route_failed_refresh_and_class_rebind_preserve_authority_and_r
             IpAddr::V4(hop(11))
         );
         assert_eq!(context.binding.snapshot.key().dscp().value(), 24);
-        b.0.with_validated_egress(&mut b.1, context, &frame, 0, |_| submissions += 1)
-            .unwrap();
+        let ticket = b.0.submission_ticket(&mut b.1, context).unwrap();
+        let submitted = b.0.submit(&mut b.1, 14, ticket, context, &frame, 0, |_| {
+            submissions += 1;
+            BackendOutcome::Submitted
+        });
+        assert!(submitted == Ok(Submission::Submitted));
         assert_eq!(submissions, 1);
-        b.1.accept_transmit(14, attempt).unwrap();
         receive(&mut a, 15, &frame, &FIRST);
         b.0.rebind_dscp(&mut b.1, server, 32).unwrap();
         assert_eq!(

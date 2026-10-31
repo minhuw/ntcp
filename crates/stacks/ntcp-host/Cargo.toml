@@ -5,9 +5,14 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/minhuw/ntcp"
 
+[features]
+# Ledger inspection for the tests of crates that submit through a Host.
+test-support = []
+
 [dependencies]
 ntcp-path = { path = "../ntcp-path", version = "0.0.1" }
 ntcp = { path = "../ntcp", version = "0.0.1" }
 ntcp-ip = { path = "../ntcp-ip", version = "0.0.1" }
+ntcp-ip-common = { path = "../ntcp-ip-common", version = "0.0.1" }
 ntcp-ip6 = { path = "../ntcp-ip6", version = "0.0.1" }
 ntcp-icmp = { path = "../ntcp-icmp", version = "0.0.1" }

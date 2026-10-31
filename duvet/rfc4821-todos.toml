@@ -19,7 +19,7 @@ In the limiting case, all ICMP PTB messages might be unconditionally ignored, an
 # 4821-019
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "Missing behavior: PMTU state remains inside each Connection, with no IP-layer shared-cache access/update interface. This is the same layering recommendation as 079, not a loss-processing gap."
+reason = "T7 PathService is the IP-layer path cache and T8 Host binds TCP owners to it. T9 lets TCP (correlated immediate PTB decreases) and Host UDP flows (UDP-quoted PTB publication, budget-limited sends) update and read it through the Host. Remaining T10: TCP PLPMTUD probe-confirmed estimates stay connection-local without positive publication, and datagram consumers are not notified of shared changes. This is the same layering recommendation as 079."
 quote = '''
 Most of the difficulty in implementing PLPMTUD arises because it needs to be implemented in several different places within a single node. In general, each Packetization Protocol needs to have its own implementation of PLPMTUD. Furthermore, the natural mechanism to share Path MTU information between concurrent or subsequent connections is a path information cache in the IP layer. The various Packetization Protocols need to have the means to access and update the shared cache in the IP layer. This memo describes PLPMTUD in terms of its primary subsystems without fully describing how they are assembled into a complete implementation.
 '''
@@ -76,7 +76,7 @@ Alternatively, PLPMTUD could be implemented such that its complete state is asso
 # 4821-079
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
-reason = "Missing behavior: no IP-layer cached PMTU/shared PTB state exists; Pmtud is owned by Connection. The IP-layer SHOULD remains open, independently of the legal connection-local identity and optional sharing at 076."
+reason = "T7 PathService stores per-path estimates keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation, and T9 Host stores correlated ICMP PTB MTUs there with a 600-second hold (TCP immediate decreases, UDP and path-level reports). Remaining T10: TCP's PLPMTUD-confirmed cached PMTU and deferred below-proven-delivery PTB values remain connection-local until positive and pending publication."
 quote = '''
 The IP layer SHOULD be used to store the cached PMTU value and other shared state such as MTU values reported by ICMP PTB messages. Ideally, this shared state should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path.
 '''

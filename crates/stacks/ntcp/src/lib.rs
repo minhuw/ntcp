@@ -38,7 +38,7 @@ mod hystart;
 mod ipv4_options;
 mod pacing;
 mod pmtud;
-pub use pmtud::PathMtuInfo;
+pub use pmtud::{PathMtuInfo, PmtuFeedback};
 mod pmtud_config;
 pub use pmtud_config::{Ipv4Plateaus, PmtudConfig, PmtudPolicy, SearchAging};
 mod route_policy;
@@ -61,8 +61,9 @@ pub use connection::{
     KeepaliveConfig, NetworkError, PacingConfig, State, TimestampGranularity, TransportInfo, Tuple,
 };
 pub use endpoint::{
-    ActiveOpenOptions, AddressValidation, ConnectionId, Endpoint, EndpointConfig, EndpointError,
-    Event, InputDisposition, ListenerId, PollTransmit, Transmit,
+    ActiveOpenOptions, AddressValidation, ConnectionId, CorrelatedPmtu, CorrelatedSegment,
+    Endpoint, EndpointConfig, EndpointError, Event, InputDisposition, ListenerId, PollTransmit,
+    Transmit,
 };
 pub use ipv4_options::{
     Ipv4Options, Ipv4OptionsError, Ipv4Timestamp, OutgoingIpv4Options, SourceRoute,

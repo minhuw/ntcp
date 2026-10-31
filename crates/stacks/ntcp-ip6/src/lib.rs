@@ -2,8 +2,17 @@
 use core::net::{IpAddr, Ipv6Addr};
 use ntcp::IpMetadata;
 
-pub use ntcp_ip_common::Error;
+pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, UDP_HEADER};
 pub const IPV6_HEADER: usize = 40;
+
+/// Per-packet IPv6 send parameters shared by every upper-layer protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Header {
+    pub ip: IpMetadata,
+    pub hop_limit: u8,
+    pub dscp: u8,
+    pub ecn: u8,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Packet<'a> {
@@ -77,16 +86,74 @@ pub fn ipv6_bounds(b: &[u8]) -> Result<usize, Error> {
     let payload = usize::from(u16::from_be_bytes([b[4], b[5]]));
     // Zero is also the length of a legal empty base packet. Jumbo Payload
     // options require Hop-by-Hop processing, which remains unsupported below.
-    match b[6] {
-        44 => return Err(Error::FragmentationUnsupported),
-        0 | 43 | 50 | 51 | 60 | 135 | 139 | 140 => return Err(Error::ExtensionsUnsupported),
-        _ => {}
-    }
+    upper_layer(b[6])?;
     Ok(40 + payload)
 }
 
+// This codec neither traverses nor emits extension headers.
+fn upper_layer(next_header: u8) -> Result<(), Error> {
+    match next_header {
+        44 => Err(Error::FragmentationUnsupported),
+        0 | 43 | 50 | 51 | 60 | 135 | 139 | 140 => Err(Error::ExtensionsUnsupported),
+        _ => Ok(()),
+    }
+}
+
 pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit) -> Result<usize, Error> {
-    encode_present(packet, transmit, transmit.len)
+    encode_tcp(packet, transmit, transmit.len)
+}
+
+/// Encode the base header for `len` upper-layer bytes of `next_header` already
+/// resident at `packet[IPV6_HEADER..]`. Extension header selectors are refused
+/// because none is emitted. Returns the packet length.
+pub fn encode_datagram(
+    packet: &mut [u8],
+    header: Header,
+    next_header: u8,
+    len: usize,
+) -> Result<usize, Error> {
+    upper_layer(next_header).map_err(|_| Error::Invalid)?;
+    encode_present(packet, header, next_header, len, len)
+}
+
+/// Encode a checksummed UDP datagram whose `payload_len` data bytes are
+/// resident at `packet[IPV6_HEADER + UDP_HEADER..]`. Returns the packet length.
+/// The payload is never modified; on error only header bytes may be.
+pub fn encode_udp(
+    packet: &mut [u8],
+    header: Header,
+    source_port: u16,
+    destination_port: u16,
+    payload_len: usize,
+) -> Result<usize, Error> {
+    let len = ntcp_ip_common::encode_udp(
+        header.ip.source,
+        header.ip.destination,
+        source_port,
+        destination_port,
+        packet.get_mut(IPV6_HEADER..).ok_or(Error::Length)?,
+        payload_len,
+    )?;
+    encode_datagram(packet, header, PROTOCOL_UDP, len)
+}
+
+// TCP compatibility: a Transmit has no IPv6 meaning for IPv4 options or for an
+// empty segment, so both remain invalid exactly as before.
+fn encode_tcp(packet: &mut [u8], transmit: ntcp::Transmit, present: usize) -> Result<usize, Error> {
+    if !transmit.ip.source.is_ipv6() || !transmit.ip.destination.is_ipv6() {
+        return Err(Error::Version);
+    }
+    transmit.len.checked_add(IPV6_HEADER).ok_or(Error::Length)?;
+    if transmit.len == 0 || transmit.ipv4_options != ntcp::OutgoingIpv4Options::default() {
+        return Err(Error::Invalid);
+    }
+    let header = Header {
+        ip: transmit.ip,
+        hop_limit: transmit.hop_limit,
+        dscp: transmit.dscp,
+        ecn: transmit.ecn,
+    };
+    encode_present(packet, header, PROTOCOL_TCP, transmit.len, present)
 }
 
 // Encode only the resident header. Payload ranges remain owned by PacketIo.
@@ -101,7 +168,7 @@ pub fn encode_shared_header(
     {
         return Err(Error::Length);
     }
-    encode_present(packet, transmit, present_tcp_len)
+    encode_tcp(packet, transmit, present_tcp_len)
 }
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
 //# Traffic Class 8-bit Traffic Class field. See Section 7.
@@ -116,39 +183,37 @@ pub fn encode_shared_header(
 //# present). See [RFC4291] and Section 4.4.
 fn encode_present(
     packet: &mut [u8],
-    transmit: ntcp::Transmit,
-    present_tcp_len: usize,
+    params: Header,
+    next_header: u8,
+    len: usize,
+    present: usize,
 ) -> Result<usize, Error> {
-    let (IpAddr::V6(source), IpAddr::V6(destination)) =
-        (transmit.ip.source, transmit.ip.destination)
+    let (IpAddr::V6(source), IpAddr::V6(destination)) = (params.ip.source, params.ip.destination)
     else {
         return Err(Error::Version);
     };
-    transmit.len.checked_add(IPV6_HEADER).ok_or(Error::Length)?;
-    if transmit.len > usize::from(u16::MAX)
-        || present_tcp_len > transmit.len
-        || present_tcp_len
+    if len > usize::from(u16::MAX)
+        || present > len
+        || present
             .checked_add(IPV6_HEADER)
             .is_none_or(|n| n > packet.len())
-        || transmit.len == 0
-        || transmit.hop_limit == 0
-        || transmit.dscp > 63
-        || transmit.ecn > 3
-        || transmit.ipv4_options != ntcp::OutgoingIpv4Options::default()
+        || params.hop_limit == 0
+        || params.dscp > 63
+        || params.ecn > 3
     {
         return Err(Error::Invalid);
     }
     let header = &mut packet[..IPV6_HEADER];
     header.fill(0);
-    let class = (transmit.dscp << 2) | transmit.ecn;
+    let class = (params.dscp << 2) | params.ecn;
     header[0] = 0x60 | (class >> 4);
     header[1] = class << 4;
-    header[4..6].copy_from_slice(&(transmit.len as u16).to_be_bytes());
-    header[6] = 6;
-    header[7] = transmit.hop_limit;
+    header[4..6].copy_from_slice(&(len as u16).to_be_bytes());
+    header[6] = next_header;
+    header[7] = params.hop_limit;
     header[8..24].copy_from_slice(&source.octets());
     header[24..40].copy_from_slice(&destination.octets());
-    Ok(IPV6_HEADER + present_tcp_len)
+    Ok(IPV6_HEADER + present)
 }
 
 // Checked quoted header: returns metadata, header length, original packet

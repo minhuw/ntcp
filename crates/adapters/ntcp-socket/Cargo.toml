@@ -28,5 +28,8 @@ ntcp-ip-common = { version = "0.0.1", path = "../../stacks/ntcp-ip-common" }
 ntcp-icmp = { version = "0.0.1", path = "../../stacks/ntcp-icmp" }
 ntcp-ethernet = { version = "0.0.1", path = "../../stacks/ntcp-ethernet" }
 
+[dev-dependencies]
+ntcp-host = { path = "../../stacks/ntcp-host", version = "0.0.1", features = ["test-support"] }
+
 [build-dependencies]
 cc = "1"

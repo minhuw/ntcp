@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 import os
+import struct
 import unittest
 from unittest.mock import patch
 
+from bridge import checksum
+import icmp
 import run
 
 
@@ -35,3 +38,56 @@ class NamespaceGuard(unittest.TestCase):
                         required.add("expiry-no-issuer")
                     actual = {c["scenario"] for c in cases if (c["family"], c["role"], c["policy"]) == (family, role, policy)}
                     self.assertTrue(required <= actual)
+
+
+class IcmpScenario(unittest.TestCase):
+    def test_icmp_case_without_inherited_proof_cannot_reach_setup(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(icmp, "setup") as setup:
+            with self.assertRaises(KeyError):
+                run.child(dict(kind="icmp", family=4, scenario="udp-quoted"))
+            setup.assert_not_called()
+
+    def test_cases_cover_both_families_both_quoted_transports_and_the_forged_control(self):
+        self.assertEqual({(c["family"], c["scenario"]) for c in icmp.cases()},
+                         {(f, s) for f in (4, 6) for s in ("udp-quoted", "tcp-quoted", "forged")})
+        self.assertFalse(any(c in run.matrix() for c in icmp.cases()))
+
+    def original(self, family):
+        payload = bytes(range(200)) * 8
+        if family == 4:
+            header = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 28 + len(payload), 0, 0x4000, 64, 17, 0,
+                                           bytes([198, 18, 1, 2]), bytes([198, 18, 2, 2])))
+            struct.pack_into("!H", header, 10, checksum(bytes(header)))
+        else:
+            header = bytearray(struct.pack("!IHBB16s16s", 6 << 28, 8 + len(payload), 17, 64,
+                                           bytes(15) + b"\2", bytes(15) + b"\3"))
+        return bytes(header) + struct.pack("!HHHH", 18080, 18090, 8 + len(payload), 0x1234) + payload
+
+    def test_forged_variants_alter_a_correlated_field_with_well_formed_inner_headers(self):
+        for family in (4, 6):
+            original = self.original(family)
+            exact = icmp.mutate(family, original, "exact")
+            self.assertTrue(icmp.quotes(exact, original))
+            self.assertEqual(len(exact), 548 if family == 4 else 1232)
+            for name in ("udp-checksum", "udp-port", "ip-length", "destination"):
+                forged = icmp.mutate(family, original, name)
+                self.assertEqual(len(forged), len(exact))
+                self.assertFalse(icmp.quotes(forged, original), (family, name))
+                if family == 4:
+                    self.assertEqual(checksum(forged[:20]), 0, name)
+            # Router-mutated TTL/hop limit alone does not break the match.
+            routed = bytearray(exact)
+            routed[8 if family == 4 else 7] -= 1
+            self.assertTrue(icmp.quotes(bytes(routed), original))
+
+    def test_decoder_reports_ptb_mtu_and_quote(self):
+        original = self.original(4)
+        quote = icmp.mutate(4, original, "exact")
+        body = bytearray(struct.pack("!BBHHH", 3, 4, 0, 0, 1280) + quote)
+        struct.pack_into("!H", body, 2, checksum(bytes(body)))
+        header = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(body), 0, 0, 64, 1, 0,
+                                       bytes([198, 18, 1, 1]), bytes([198, 18, 1, 2])))
+        struct.pack_into("!H", header, 10, checksum(bytes(header)))
+        event = icmp.parse(bytes(header + body))
+        self.assertTrue(event["ptb"] and event["checksum_valid"] and event["ip_checksum_valid"])
+        self.assertEqual((event["mtu"], event["source"], event["quote"]), (1280, "198.18.1.1", quote))

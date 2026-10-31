@@ -1,7 +1,7 @@
 #![no_std]
 use core::net::IpAddr;
 use ntcp::IpMetadata;
-pub use ntcp_ip_common::{Error, checksum};
+pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, checksum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeedbackKind {
@@ -20,18 +20,84 @@ pub struct TcpQuote {
     pub destination_port: u16,
     pub sequence: u32,
 }
+/// Transport fields a quote carries. Only TCP and UDP have selectors; any
+/// other protocol is kept structurally, without transport semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Feedback {
+pub enum QuotedTransport {
+    Tcp {
+        source_port: u16,
+        destination_port: u16,
+        sequence: u32,
+    },
+    Udp {
+        source_port: u16,
+        destination_port: u16,
+        length: u16,
+        // Raw field: zero is an IPv4 datagram sent without a checksum. The
+        // quote may be truncated, so the checksum itself cannot be verified.
+        checksum: u16,
+    },
+    Other,
+}
+
+/// Protocol-generic quote of the offending datagram. `ip.destination` is the
+/// final destination, recovered from an unfinished IPv4 source route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Quote {
+    pub ip: IpMetadata,
+    pub ip_packet_len: u32,
+    pub ip_header_len: u16,
+    pub protocol: u8,
+    pub transport: QuotedTransport,
+}
+
+impl Quote {
+    /// Exact projection used by TCP-only consumers.
+    pub fn tcp(self) -> Option<TcpQuote> {
+        let QuotedTransport::Tcp {
+            source_port,
+            destination_port,
+            sequence,
+        } = self.transport
+        else {
+            return None;
+        };
+        Some(TcpQuote {
+            ip: self.ip,
+            ip_packet_len: self.ip_packet_len,
+            ip_header_len: self.ip_header_len,
+            source_port,
+            destination_port,
+            sequence,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Feedback<Q = TcpQuote> {
     pub outer: IpMetadata,
     pub kind: FeedbackKind,
     pub code: u8,
     // Untrusted candidate only; caller must correlate tuple/sequence with a
     // live transmission and apply path policy. This is not autonomous PMTUD.
     pub candidate_mtu: Option<u32>,
-    pub quoted: TcpQuote,
+    pub quoted: Q,
 }
 
-impl Feedback {
+impl Feedback<Quote> {
+    /// Exact TCP view: present only when the quote is TCP.
+    pub fn tcp(self) -> Option<Feedback> {
+        Some(Feedback {
+            outer: self.outer,
+            kind: self.kind,
+            code: self.code,
+            candidate_mtu: self.candidate_mtu,
+            quoted: self.quoted.tcp()?,
+        })
+    }
+}
+
+impl<Q: Copy> Feedback<Q> {
     // RFC9293 3.9.2.2: IPv6 unreachable0/3 and time/parameter errors
     // are soft. Other recognized policy/reachability failures remain soft
     // unless the protocol explicitly identifies a hard unreachable2/4.
@@ -88,6 +154,12 @@ impl Feedback {
 //# attacks described in this document, as the ICMP error messages might legitimately come
 //# from an intermediate system.
 pub fn decode_icmp(bytes: &[u8]) -> Result<Feedback, Error> {
+    decode_icmp_quote(bytes)?.tcp().ok_or(Error::Quote)
+}
+
+/// Decode an ICMP error quoting any protocol. Validation is identical to
+/// `decode_icmp` except that the quoted protocol is not required to be TCP.
+pub fn decode_icmp_quote(bytes: &[u8]) -> Result<Feedback<Quote>, Error> {
     let (outer, protocol, icmp) = parse_outer(bytes)?;
     if icmp.len() < 8 {
         return Err(Error::Truncated);
@@ -122,24 +194,64 @@ pub fn decode_icmp(bytes: &[u8]) -> Result<Feedback, Error> {
         quoted,
     })
 }
-fn quote(b: &[u8], ipv6: bool) -> Result<TcpQuote, Error> {
+// Every quote carries the complete inner header (checksummed IPv4 with
+// recovered source-route destination, or an extension-free IPv6 base header)
+// and no more than the declared original packet. TCP and UDP additionally need
+// their first eight transport bytes: ports plus sequence or length/checksum.
+fn quote(b: &[u8], ipv6: bool) -> Result<Quote, Error> {
     let (ip, header, total, protocol) = quote_header(b, ipv6)?;
-    if protocol != 6 || total < header + 20 || b.len() < header + 8 || b.len() > total {
+    if b.len() > total {
         return Err(Error::Quote);
     }
-    let tcp = &b[header..];
-    let source_port = u16::from_be_bytes([tcp[0], tcp[1]]);
-    let destination_port = u16::from_be_bytes([tcp[2], tcp[3]]);
-    if source_port == 0 || destination_port == 0 {
-        return Err(Error::Quote);
-    }
-    Ok(TcpQuote {
+    let transport = match protocol {
+        PROTOCOL_TCP => {
+            if total < header + 20 || b.len() < header + 8 {
+                return Err(Error::Quote);
+            }
+            let tcp = &b[header..];
+            let source_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+            let destination_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+            if source_port == 0 || destination_port == 0 {
+                return Err(Error::Quote);
+            }
+            QuotedTransport::Tcp {
+                source_port,
+                destination_port,
+                sequence: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+            }
+        }
+        PROTOCOL_UDP => {
+            if b.len() < header + 8 {
+                return Err(Error::Quote);
+            }
+            let udp = &b[header..];
+            let length = u16::from_be_bytes([udp[4], udp[5]]);
+            // Same length rule as received datagrams: the header must fit
+            // and the datagram cannot exceed the original IP payload.
+            if usize::from(length) < 8 || header + usize::from(length) > total {
+                return Err(Error::Quote);
+            }
+            let destination_port = u16::from_be_bytes([udp[2], udp[3]]);
+            // Source port zero is RFC 768's unused value; no datagram is
+            // sent to destination port zero.
+            if destination_port == 0 {
+                return Err(Error::Quote);
+            }
+            QuotedTransport::Udp {
+                source_port: u16::from_be_bytes([udp[0], udp[1]]),
+                destination_port,
+                length,
+                checksum: u16::from_be_bytes([udp[6], udp[7]]),
+            }
+        }
+        _ => QuotedTransport::Other,
+    };
+    Ok(Quote {
         ip,
         ip_packet_len: total as u32,
         ip_header_len: header as u16,
-        source_port,
-        destination_port,
-        sequence: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+        protocol,
+        transport,
     })
 }
 
@@ -204,18 +316,8 @@ fn icmpv6_feedback(icmp: &[u8]) -> Result<(FeedbackKind, Option<u32>), Error> {
 }
 
 pub fn icmpv6_checksum(ip: IpMetadata, bytes: &[u8]) -> Result<u16, Error> {
-    let (IpAddr::V6(source), IpAddr::V6(destination)) = (ip.source, ip.destination) else {
+    let (IpAddr::V6(_), IpAddr::V6(_)) = (ip.source, ip.destination) else {
         return Err(Error::Version);
     };
-    let len = u32::try_from(bytes.len()).map_err(|_| Error::Length)?;
-    let mut pseudo = [0; 40];
-    pseudo[..16].copy_from_slice(&source.octets());
-    pseudo[16..32].copy_from_slice(&destination.octets());
-    pseudo[32..36].copy_from_slice(&len.to_be_bytes());
-    pseudo[39] = 58;
-    let mut sum = u32::from(!checksum(&pseudo)) + u32::from(!checksum(bytes));
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    Ok(!(sum as u16))
+    ntcp_ip_common::pseudo_header_checksum(ip.source, ip.destination, 58, bytes)
 }

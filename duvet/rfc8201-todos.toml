@@ -51,7 +51,7 @@ Note that Path MTU Discovery must be performed even in cases where a node "think
 # 8201-049
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
-reason = "T7 PathService stores shared IPv6 estimates and versioned MMS_S budgets. T8 Host binds actual native/TUN TCP factories, refreshes reserved/released owners and validates physical output while preserving connection-local ICMP behavior. Generic submitted-quote correlation/publication remains T9 and datagram consumers/cross-protocol fanout remain T10."
+reason = "T7 PathService stores shared IPv6 estimates and versioned MMS_S budgets; T8 Host binds actual native/TUN TCP factories. T9 Host ICMPv6 dispatch processes Packet Too Big against committed TCP/UDP submissions and publishes accepted decreases; TCP learns MMS_S changes through budget refresh, while a Host UDP flow learns its maximum payload only from UdpSendError::TooBig or a consumed UdpEvent::PacketTooBig. Remaining T10: a datagram-consumer way to learn MMS_S changes without a failed send, and cross-protocol fanout."
 quote = '''
 It is therefore suggested that the IP layer store PMTU information and that the ICMPv6 layer process received Packet Too Big messages. The packetization layers may respond to changes in the PMTU by changing the size of the messages they send. To support this layering, packetization layers require a way to learn of changes in the value of MMS_S, the "maximum send transport-message size" [RFC1122].
 '''
@@ -139,7 +139,7 @@ The packetization layers must be notified about decreases in the PMTU. Any packe
 # 8201-063
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "T7 PathService shares trusted IPv6 decreases across independent clients without transport-specific state. Actual UDP submission, validated UDP-quoted ICMPv6 correlation and dispatch to bound TCP connections remain T9/T10."
+reason = "T7 PathService shares trusted IPv6 decreases across clients; T9 Host correlates ICMPv6 PTBs quoting Host UDP datagrams with its committed ledger, publishes the decrease, and every TCP binding on the path adopts it at its next egress (tun_echo UDP-quoted test and isolated namespace udp-quoted case). Native sockets submit no UDP datagrams. Remaining T10: verified fanout of one accepted decrease to several TCP flows and a UDP flow on one path, coalescing while clients are reserved, and datagram consumers of shared changes."
 quote = '''
 Note: even if the Packet Too Big message contains an Original Packet Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given path.
 '''
@@ -147,7 +147,7 @@ Note: even if the Packet Too Big message contains an Original Packet Header that
 # 8201-064
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "Equal/nondecreasing PTB is rejected without separately notifying the sending instance that its packet was dropped. Normal retransmission is not the stated unchanged-PMTU notification."
+reason = "T9 delivers correlated drop notification independently of the estimate: an equal or nondecreasing PTB at or above the IPv6 minimum and below the packet size is consumed by the correlated TCP owner as PmtuFeedback::Unchanged drop advice (black-hole classification without estimate increase, hold restart, error or head retry) and queued to the sending Host UDP flow as UdpEvent::PacketTooBig. Remaining T11: TCP retransmission of exactly the dropped data that advice names (non-head, partially acknowledged and wrapped ranges with duplicate suppression); normal retransmission is distinct."
 quote = '''
 Also, the instance that sent the packet that elicited the Packet Too Big message should be notified that its packet has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped data.
 '''
@@ -158,14 +158,6 @@ target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
 reason = "Unselected alternative that defers PMTU-decrease notification until SEND fails, suggested especially for UDP. TCP uses validated feedback and immediate packetization refresh instead; shared-path fanout and dropped-packet notification are audited separately."
 quote = '''
 Note: An implementation can avoid the use of an asynchronous notification mechanism for PMTU decreases by postponing notification until the next attempt to send a packet larger than the PMTU estimate. In this approach, when an attempt is made to SEND a packet that is larger than the PMTU estimate, the SEND function should fail and return a suitable error indication. This approach may be more suitable to a connectionless packetization layer (such as one using UDP), which (in some implementations) may be hard to "notify" from the ICMPv6 layer. In this case, the normal timeout-based retransmission mechanisms would be used to recover from the dropped packets.
-'''
-
-# 8201-066
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "No separate immediate dropped-packet notification exists independently of a PMTU change; the Connection updates its budget and may rearm head retry. The distinction matters even without a shared IP cache."
-quote = '''
-It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet.
 '''
 
 # 8201-076

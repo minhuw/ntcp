@@ -15,11 +15,13 @@ import time
 sys.dont_write_bytecode = True
 
 from bridge import Bridge
+import icmp
 from linux_peer import fnv, pattern
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 BINARY = ROOT / "workbench/network-target/debug/ntcp-rfc-host"
+TUN_ECHO = ROOT / "workbench/network-target/debug/examples/tun_echo"
 
 
 def emit(tag, data):
@@ -193,8 +195,18 @@ def wire_proof(events, direction, expectation):
                 all_checksums_valid=all(e["checksum_valid"] for e in events))
 
 
+def icmp_child(case, proof):
+    evidence = icmp.child(case, proof, TUN_ECHO, Peer, command, emit)
+    emit("T9_ICMP_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                              kernel_version=os.uname().version, evidence=evidence,
+                              build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                         commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
 def child(case):
     proof = namespace_guard()  # Must precede every link/sysctl/neighbor/route mutation.
+    if case.get("kind") == "icmp":
+        return icmp_child(case, proof)
     family, role, policy, scenario = (case[k] for k in ("family", "role", "policy", "scenario"))
     kernel, native = ("198.18.0.1", "198.18.0.2") if family == 4 else ("fd54:3500::1", "fd54:3500::2")
     settings = setup(family, kernel, native)
@@ -378,11 +390,19 @@ def main():
     features = subprocess.run(["cargo", "tree", "--locked", "-p", "ntcp-rfc-host", "-e", "features"],
                               cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     assert features.returncode == 0 and "packet-test" not in features.stdout, features.stderr
+    # The ICMP cases run the unmodified tun_echo example: real TUN, one Host.
+    echo_build = ["cargo", "build", "--locked", "-p", "ntcp", "--example", "tun_echo",
+                  "--target-dir", str(BINARY.parents[1])]
+    p = subprocess.run(echo_build, cwd=ROOT, env=env, timeout=600)
+    assert p.returncode == 0, dict(command=echo_build, exit=p.returncode)
     source = fingerprint()
     commit = command(["git", "rev-parse", "HEAD"]).strip()
     cases = matrix()
+    icmp_cases = icmp.cases()
     emit("T5_NETWORK_BUILD", dict(schema_version=1, command=build, commit=commit,
                                   source_sha256=source, binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
+                                  icmp_command=echo_build, icmp_cases=icmp_cases,
+                                  tun_echo_sha256=hashlib.sha256(TUN_ECHO.read_bytes()).hexdigest(),
                                   kernel=os.uname().release, kernel_version=os.uname().version,
                                   rustc=command(["rustc", "--version"]).strip(), packet_test=False,
                                   applicability=dict(partial_syn="Native server 128-byte receive admission, then public SO_RCVBUF growth after prefix read",
@@ -393,7 +413,8 @@ def main():
     stream_count = 0
     refusal_count = 0
     namespace_ids = []
-    for case in cases:
+    icmp_completed = 0
+    for case in icmp_cases + cases:
         assert time.monotonic() - started < 1740, "30 minute total gate budget"
         fds = [os.open("/proc/self/ns/" + kind, os.O_RDONLY) for kind in ("net", "user")]
         try:
@@ -423,9 +444,14 @@ def main():
             if err:
                 print(err, end="", file=sys.stderr, flush=True)
             assert code == 0, dict(case=case, command=cmd, exit=code)
-            summaries = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith("T5_NETWORK_CASE ")]
+            tag = "T9_ICMP_CASE " if case in icmp_cases else "T5_NETWORK_CASE "
+            summaries = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(tag)]
             assert len(summaries) == 1 and summaries[0]["case"] == case, "missing case summary"
             summary = summaries[0]
+            if case in icmp_cases:
+                namespace_ids.append(summary["namespace"])
+                icmp_completed += 1
+                continue
             stream_count += summary["streams"]
             refusal_count += summary["completions"] - summary["streams"]
             namespace_ids.append(summary["namespace"])
@@ -434,7 +460,9 @@ def main():
             for fd in fds:
                 os.close(fd)
     assert completed == len(cases) and stream_count > 0 and refusal_count == 12
+    assert icmp_completed == len(icmp_cases) == 6
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
+                                    icmp_cases=icmp_completed,
                                     namespaces=namespace_ids, kernel=os.uname().release,
                                     stream_sha256={name: hashlib.sha256(pattern(n, salt)).hexdigest()
                                                    for name, n, salt in (("request", 8192, 7), ("response", 6144, 11),

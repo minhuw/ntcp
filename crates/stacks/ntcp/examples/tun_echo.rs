@@ -1,4 +1,5 @@
 // Run as: tun_echo TUN_NAME LOCAL_IP TCP_PORT [PEER_SOCKET_ADDR].
+// TCP_PORT also names a UDP echo service; UDP replies are never fragmented.
 // The caller must configure the TUN interface (MTU 1500) and routes beforehand.
 // This adapter exchanges IP packets, not Ethernet frames; it does not configure
 // the host or implement ARP, routing, IP fragmentation, or general ICMP services.
@@ -11,7 +12,10 @@ mod linux {
     };
     #[cfg(test)]
     use ntcp::{IpMetadata, Ipv4Options};
-    use ntcp_host::{EgressContext, Host, IngressContext, path};
+    use ntcp_host::{
+        BackendOutcome, DeferredIcmp, EgressContext, Host, IcmpDispatch, IngressContext,
+        Submission, SubmissionTicket, UdpEvent, UdpFlowId, UdpSendError, UdpSent, path,
+    };
     use ntcp_io::{PacketIo, TxOutcome};
     use ntcp_io_tun::Tun;
     use std::{
@@ -28,13 +32,48 @@ mod linux {
     const BUDGET: usize = 32;
     const MAX_IP_PACKET: usize = 65575;
     const TICK_US: u64 = 10_000;
+    const UDP_HEADER: usize = 8;
+    // The largest UDP payload the fixed 1500-octet TUN carries unfragmented
+    // (IPv4's smaller header gives the larger payload).
+    const UDP_PAYLOAD: usize = MTU - IP_HEADER - UDP_HEADER;
 
     fn host_error(error: ntcp_host::Error) -> io::Error {
         io::Error::other(format!("IP host: {error:?}"))
     }
 
+    // Malformed/unsupported wire input remains a silent discard; bounded
+    // factory/provider failures remain observable to run().
+    fn silent<T>(result: Result<T, ntcp_host::Error>) -> io::Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(
+                ntcp_host::Error::Codec(_)
+                | ntcp_host::Error::Unsupported
+                | ntcp_host::Error::Path(path::Error::NoRoute),
+            ) => Ok(None),
+            Err(error) => Err(host_error(error)),
+        }
+    }
+
+    // Input whose owner's output is reserved. TCP segments are classified by
+    // their tuple; ICMP errors only by the Host dispatcher's correlation with
+    // its own submission evidence, which also revalidates them on replay.
+    #[derive(Clone, Copy)]
+    enum Retained {
+        Tcp(ConnectionId),
+        Icmp(DeferredIcmp),
+    }
+    impl Retained {
+        fn owner(self) -> ConnectionId {
+            match self {
+                Self::Tcp(owner) => owner,
+                Self::Icmp(deferred) => deferred.owner(),
+            }
+        }
+    }
+
     struct RetainedIngress {
-        owner: ConnectionId,
+        owner: Retained,
         bytes: Vec<u8>,
         timestamp: u32,
     }
@@ -65,6 +104,30 @@ mod linux {
             // Peer packets never create forwarding routes.
             let (paths, limits) =
                 ntcp_host::managed_limits(config, 1, 1, 1, 1, 1).map_err(host_error)?;
+            // One UDP echo flow. Its receive and advice queues match the
+            // per-iteration read budget, so one loop drains what one read
+            // pass can deliver; slots hold the largest unfragmented payload.
+            // Evicted replies keep exact signatures for a client sustaining
+            // one read budget of datagrams per second over the feedback
+            // horizon, so its later ICMP stays attributable to the echo.
+            let horizon_seconds =
+                limits.ledger.feedback_horizon / config.connection.timebase.units_per_second;
+            let evicted_signatures = usize::try_from(horizon_seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(BUDGET))
+                .ok_or_else(|| host_error(ntcp_host::Error::Capacity))?;
+            let (paths, limits) = ntcp_host::managed_udp_limits(
+                paths,
+                limits,
+                ntcp_host::UdpLimits {
+                    flows: 1,
+                    receive_datagrams: BUDGET,
+                    max_payload: UDP_PAYLOAD,
+                    events: BUDGET,
+                    evicted_signatures,
+                },
+            )
+            .map_err(host_error)?;
             let mut host = Host::new(
                 path::ContextId::new(u128::from_ne_bytes(identity[..16].try_into().unwrap())),
                 paths,
@@ -149,26 +212,31 @@ mod linux {
             })
         }
 
+        // TCP segments only; ICMP ownership is the Host dispatcher's decision.
         fn owner(&self, endpoint: &Endpoint, frame: &[u8]) -> Option<ConnectionId> {
             let packet = self.host.decode_ingress(self.ingress, frame).ok()?;
-            let tuple = if packet.protocol == 6 {
-                let tcp = ntcp::wire::parse(packet.ip, packet.payload).ok()?;
-                Tuple {
-                    local: SocketAddr::new(packet.ip.destination, tcp.header.destination_port),
-                    remote: SocketAddr::new(packet.ip.source, tcp.header.source_port),
-                }
-            } else {
-                let feedback = ntcp_icmp::decode_icmp(frame).ok()?;
-                if feedback.kind == ntcp_icmp::FeedbackKind::SourceQuench {
-                    return None;
-                }
-                let q = feedback.quoted;
-                Tuple {
-                    local: SocketAddr::new(q.ip.source, q.source_port),
-                    remote: SocketAddr::new(q.ip.destination, q.destination_port),
-                }
-            };
-            endpoint.connection_id(tuple)
+            if packet.protocol != 6 {
+                return None;
+            }
+            let tcp = ntcp::wire::parse(packet.ip, packet.payload).ok()?;
+            endpoint.connection_id(Tuple {
+                local: SocketAddr::new(packet.ip.destination, tcp.header.destination_port),
+                remote: SocketAddr::new(packet.ip.source, tcp.header.source_port),
+            })
+        }
+
+        fn retain(&mut self, owner: Retained, frame: &[u8], timestamp: u32) -> io::Result<()> {
+            let mut bytes = self
+                .free
+                .pop()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            bytes.extend_from_slice(frame);
+            self.received.push_back(RetainedIngress {
+                owner,
+                bytes,
+                timestamp,
+            });
+            Ok(())
         }
 
         fn can_receive(&self) -> bool {
@@ -177,14 +245,32 @@ mod linux {
 
         fn replay(&mut self, endpoint: &mut Endpoint, time: u64) -> io::Result<()> {
             for _ in 0..self.received.len() {
-                let retained = self.received.pop_front().unwrap();
-                if endpoint.is_output_reserved(retained.owner) {
+                let mut retained = self.received.pop_front().unwrap();
+                if endpoint.is_output_reserved(retained.owner.owner()) {
                     self.received.push_back(retained);
                     continue;
                 }
-                // A tuple reused by another generation cannot inherit input.
-                if self.owner(endpoint, &retained.bytes) == Some(retained.owner) {
-                    self.dispatch(endpoint, time, &retained.bytes, retained.timestamp)?;
+                match retained.owner {
+                    // A tuple reused by another generation cannot inherit input.
+                    Retained::Tcp(owner) => {
+                        if self.owner(endpoint, &retained.bytes) == Some(owner) {
+                            self.dispatch(endpoint, time, &retained.bytes, retained.timestamp)?;
+                        }
+                    }
+                    // Revalidated from the frame for this exact generation;
+                    // anything else is discarded by the Host as stale.
+                    Retained::Icmp(deferred) => {
+                        if let Some(IcmpDispatch::Deferred(again)) = silent(self.host.replay_icmp(
+                            endpoint,
+                            deferred,
+                            time,
+                            &retained.bytes,
+                        ))? {
+                            retained.owner = Retained::Icmp(again);
+                            self.received.push_back(retained);
+                            continue;
+                        }
+                    }
                 }
                 let mut bytes = retained.bytes;
                 bytes.clear();
@@ -200,7 +286,7 @@ mod linux {
             frame: &[u8],
             timestamp: u32,
         ) -> io::Result<()> {
-            match self.host.input_ip(
+            silent(self.host.input_ip(
                 endpoint,
                 self.ingress,
                 time,
@@ -208,17 +294,8 @@ mod linux {
                 ntcp::RxPacketMetadata::default(),
                 self.dscp,
                 self.options_enabled.then_some(timestamp),
-            ) {
-                Ok(_) => Ok(()),
-                // Malformed/unsupported wire input remains a silent discard;
-                // bounded factory/provider failures remain observable to run().
-                Err(
-                    ntcp_host::Error::Codec(_)
-                    | ntcp_host::Error::Unsupported
-                    | ntcp_host::Error::Path(path::Error::NoRoute),
-                ) => Ok(()),
-                Err(error) => Err(host_error(error)),
-            }
+            ))?;
+            Ok(())
         }
     }
 
@@ -483,27 +560,26 @@ mod linux {
         } else {
             packet
         };
-        if network
-            .host
-            .decode_ingress(network.ingress, packet)
-            .is_err()
-        {
+        let Ok(decoded) = network.host.decode_ingress(network.ingress, packet) else {
+            return Ok(());
+        };
+        if decoded.protocol == if decoded.ip.source.is_ipv4() { 1 } else { 58 } {
+            // The single Host dispatcher classifies, correlates and applies
+            // ICMP; a reserved owner's report comes back unapplied to retain.
+            if let Some(IcmpDispatch::Deferred(deferred)) = silent(network.host.input_icmp(
+                endpoint,
+                network.ingress,
+                time,
+                packet,
+            ))? {
+                network.retain(Retained::Icmp(deferred), packet, timestamp)?;
+            }
             return Ok(());
         }
         if let Some(owner) = network.owner(endpoint, packet)
             && endpoint.is_output_reserved(owner)
         {
-            let mut bytes = network
-                .free
-                .pop()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-            bytes.extend_from_slice(packet);
-            network.received.push_back(RetainedIngress {
-                owner,
-                bytes,
-                timestamp,
-            });
-            return Ok(());
+            return network.retain(Retained::Tcp(owner), packet, timestamp);
         }
         network.dispatch(endpoint, time, packet, timestamp)
     }
@@ -792,8 +868,34 @@ mod linux {
     struct PendingFrame {
         attempt: ntcp::TransmitAttempt,
         context: Option<EgressContext>,
+        ticket: Option<SubmissionTicket>,
         len: usize,
         blocked: bool,
+    }
+
+    // The one physical TUN call, as the Host transaction's backend outcome.
+    // This embedding retries the identical attempt after a refusal or EINTR;
+    // any other error is an unknown outcome, kept for the caller.
+    fn tun_transmit(
+        backend: &mut impl PacketIo,
+        frame: &[u8],
+        failure: &mut Option<io::Error>,
+    ) -> BackendOutcome {
+        match backend.transmit(frame) {
+            Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
+            Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => BackendOutcome::WouldBlock,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => BackendOutcome::WouldBlock,
+            Err(error) => {
+                *failure = Some(error);
+                BackendOutcome::Unknown
+            }
+        }
+    }
+
+    // This one physical backend implements only its assigned opaque L3
+    // forwarder, never arbitrary neighbor mappings.
+    fn tun_egress(port: path::LinkId, link: path::LinkId, next_hop: path::ResolvedNextHop) -> bool {
+        link == port && next_hop == path::ResolvedNextHop::Forwarder(path::ForwarderId(1))
     }
 
     fn transmit_frames(
@@ -834,58 +936,84 @@ mod linux {
                 *pending = Some(PendingFrame {
                     attempt,
                     context: None,
+                    ticket: None,
                     len,
                     blocked: false,
                 });
             }
             let held = pending.as_mut().unwrap();
-            let validation = held
-                .context
-                .map_or_else(|| network.host.egress_context(endpoint, held.attempt), Ok)
-                .and_then(|context| {
-                    network.host.with_validated_egress(
-                        endpoint,
-                        context,
-                        &output[..held.len],
-                        0,
-                        |live| {
-                            // This one physical backend implements only its assigned
-                            // opaque L3 forwarder, never arbitrary neighbor mappings.
-                            if live.link != network.ingress.link()
-                                || live.next_hop
-                                    != path::ResolvedNextHop::Forwarder(path::ForwarderId(1))
-                            {
-                                return (live, None);
-                            }
-                            (live, Some(backend.transmit(&output[..held.len])))
-                        },
-                    )
-                });
-            match validation {
-                Ok((live, Some(outcome))) => {
-                    held.context = Some(live);
-                    held.blocked = false;
-                    match outcome {
-                        Ok(TxOutcome::Submitted) => {
-                            if !endpoint
-                                .accept_transmit(time, held.attempt)
-                                .map_err(engine)?
-                            {
-                                return Err(io::Error::other("stale accepted transmit attempt"));
-                            }
+            // Authority and the attempt's single evidence reservation precede
+            // any backend call; a held frame keeps both across retries.
+            let prepared = match (held.context, held.ticket.take()) {
+                (Some(context), Some(ticket)) => Ok((context, ticket)),
+                (context, _) => context
+                    .map_or_else(|| network.host.egress_context(endpoint, held.attempt), Ok)
+                    .and_then(|context| {
+                        Ok((context, network.host.submission_ticket(endpoint, context)?))
+                    }),
+            };
+            let refused: Result<(), _> = match prepared {
+                Ok((context, ticket)) => {
+                    let mut live = None;
+                    let mut unusable = false;
+                    let mut failure = None;
+                    let frame = &output[..held.len];
+                    let port = network.ingress.link();
+                    let result =
+                        network
+                            .host
+                            .submit(endpoint, time, ticket, context, frame, 0, |context| {
+                                live = Some(context);
+                                if !tun_egress(port, context.link, context.next_hop) {
+                                    unusable = true;
+                                    return BackendOutcome::WouldBlock;
+                                }
+                                tun_transmit(backend, frame, &mut failure)
+                            });
+                    match result {
+                        Ok(Submission::Submitted) => {
                             *pending = None;
                             network.host.collect(endpoint).map_err(host_error)?;
                             // Yield to retained ingress before selecting more
                             // work for an owner whose reservation just completed.
                             network.replay(endpoint, time)?;
+                            continue;
                         }
-                        Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
-                        // Unknown outcome: terminate with the attempt pinned.
-                        // Never issue a not-sent certificate or retry it.
-                        Err(error) => return Err(error),
+                        Ok(Submission::Blocked(ticket)) => {
+                            held.context = live.or(Some(context));
+                            held.ticket = Some(ticket);
+                            if !unusable {
+                                held.blocked = false;
+                                break;
+                            }
+                            Err(ntcp_host::Error::Unsupported)
+                        }
+                        // Unknown outcome: terminate with the attempt pinned and
+                        // its evidence sealed as possibly submitted. Never issue
+                        // a not-sent certificate or retry it.
+                        Ok(Submission::PossiblySubmitted) => {
+                            return Err(
+                                failure.unwrap_or_else(|| io::Error::other("unknown TUN outcome"))
+                            );
+                        }
+                        Ok(Submission::Rejected(_) | Submission::Cancelled) => {
+                            unreachable!("this backend reports neither outcome")
+                        }
+                        Err(refused) => {
+                            held.context = Some(context);
+                            if refused.error == ntcp_host::Error::Obsolete {
+                                // Certified unsent: no backend call happened.
+                                network.host.cancel_submission(refused.ticket);
+                            } else {
+                                held.ticket = Some(refused.ticket);
+                            }
+                            Err(refused.error)
+                        }
                     }
                 }
+                Err(error) => Err(error),
+            };
+            match refused {
                 Err(ntcp_host::Error::Obsolete) => {
                     if !endpoint.reject_unsubmitted(held.attempt).map_err(engine)? {
                         return Err(io::Error::other("stale rejected transmit attempt"));
@@ -906,6 +1034,136 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    // Bounded UDP echo beside the TCP echo. Requests wait in the Host's
+    // bounded flow queue; at most one reply is held here, so a blocked TUN
+    // stops reading requests instead of growing storage. Every reply is a
+    // real application datagram through the Host's submission transaction,
+    // and the flow's correlated ICMP advice is consumed on every pass.
+    struct UdpEcho {
+        flow: UdpFlowId,
+        reply: [u8; UDP_PAYLOAD],
+        packet: [u8; MTU],
+        held: Option<(SocketAddr, usize)>,
+        blocked: bool,
+    }
+
+    impl UdpEcho {
+        fn open(
+            network: &mut TunHost,
+            endpoint: &Endpoint,
+            local: SocketAddr,
+            config: &EndpointConfig,
+        ) -> io::Result<Self> {
+            let flow = network
+                .host
+                .udp_open(
+                    endpoint,
+                    local,
+                    None,
+                    ntcp_host::UdpOptions {
+                        dscp: config.dscp,
+                        hop_limit: config.hop_limit,
+                    },
+                )
+                .map_err(host_error)?;
+            Ok(Self {
+                flow,
+                reply: [0; UDP_PAYLOAD],
+                packet: [0; MTU],
+                held: None,
+                blocked: false,
+            })
+        }
+
+        fn drive(
+            &mut self,
+            network: &mut TunHost,
+            endpoint: &Endpoint,
+            time: u64,
+            backend: &mut impl PacketIo,
+        ) -> io::Result<bool> {
+            let mut progress = false;
+            // Advice concerns replies already sent; any shared decrease it
+            // caused is already the budget every later reply is held to.
+            for _ in 0..BUDGET {
+                match network.host.udp_event(self.flow).map_err(host_error)? {
+                    Some(UdpEvent::PacketTooBig {
+                        remote,
+                        mtu,
+                        dropped_len,
+                    }) => eprintln!(
+                        "UDP echo reply to {remote} ({dropped_len} octets) dropped by the \
+                         path (next-hop MTU {mtu:?}); later replies use the reduced budget"
+                    ),
+                    Some(UdpEvent::NetworkError { remote, error }) => {
+                        eprintln!("UDP echo reply to {remote} failed: {error:?}")
+                    }
+                    None => break,
+                }
+                progress = true;
+            }
+            for _ in 0..BUDGET {
+                let Some((peer, len)) = self.held else {
+                    match network
+                        .host
+                        .udp_receive(self.flow, &mut self.reply)
+                        .map_err(host_error)?
+                    {
+                        Some(request) => self.held = Some(request),
+                        None => break,
+                    }
+                    progress = true;
+                    continue;
+                };
+                let mut unusable = false;
+                let mut failure = None;
+                let port = network.ingress.link();
+                let result = network.host.udp_send(
+                    endpoint,
+                    time,
+                    self.flow,
+                    Some(peer),
+                    &self.reply[..len],
+                    &mut self.packet,
+                    |egress, frame| {
+                        if !tun_egress(port, egress.link, egress.next_hop) {
+                            unusable = true;
+                            return BackendOutcome::NotSubmitted;
+                        }
+                        tun_transmit(backend, frame, &mut failure)
+                    },
+                );
+                match result {
+                    Ok(UdpSent::Submitted(_)) => {}
+                    // Same contract as TCP output: an unknown outcome ends
+                    // the runtime rather than claiming or repeating it.
+                    Ok(UdpSent::PossiblySubmitted(_)) => {
+                        return Err(
+                            failure.unwrap_or_else(|| io::Error::other("unknown TUN outcome"))
+                        );
+                    }
+                    Err(UdpSendError::TooBig { max_payload }) => eprintln!(
+                        "UDP echo of {len} octets to {peer} exceeds the current path payload \
+                         of {max_payload}; replies are never fragmented, so it is dropped"
+                    ),
+                    // Retry the same reply once the TUN or evidence storage frees.
+                    Err(
+                        UdpSendError::NotSubmitted(_)
+                        | UdpSendError::Host(ntcp_host::Error::Capacity),
+                    ) if !unusable => {
+                        self.blocked = true;
+                        break;
+                    }
+                    Err(error) => eprintln!("UDP echo reply to {peer} not sent: {error:?}"),
+                }
+                self.held = None;
+                self.blocked = false;
+                progress = true;
+            }
+            Ok(progress)
+        }
     }
 
     fn wait(tun: &Tun, timeout_ms: i32, pending: bool, readable: bool) -> io::Result<()> {
@@ -1056,6 +1314,12 @@ mod linux {
         let listener = endpoint
             .listen(SocketAddr::new(local, port), MAX_FLOWS)
             .map_err(engine)?;
+        let mut udp = UdpEcho::open(
+            &mut network,
+            &endpoint,
+            SocketAddr::new(local, port),
+            &config,
+        )?;
         let mut flows = Vec::with_capacity(MAX_FLOWS);
         if let Some(peer) = peer {
             let id = endpoint
@@ -1170,6 +1434,7 @@ mod linux {
                 ipv4_timestamp(start),
                 &mut tun,
             )?;
+            immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
             network.host.collect(&endpoint).map_err(host_error)?;
             immediate |= pending.is_none() && endpoint.has_pending_output();
             let current = now(start);
@@ -1191,7 +1456,7 @@ mod linux {
             wait(
                 &tun,
                 timeout_ms,
-                pending.as_ref().is_some_and(|held| !held.blocked),
+                pending.as_ref().is_some_and(|held| !held.blocked) || udp.blocked,
                 network.can_receive(),
             )?;
         }
@@ -1200,6 +1465,9 @@ mod linux {
     #[cfg(test)]
     mod pmtu_tests {
         include!("support/tun_echo_pmtu_tests.rs");
+        mod udp {
+            include!("support/tun_echo_udp_tests.rs");
+        }
     }
 
     #[cfg(test)]
@@ -2035,11 +2303,15 @@ mod linux {
                     let attempt = attempt.unwrap();
                     let mut len = build_ipv4_options(&mut bytes, tx, source_time).unwrap();
                     let context = from_host.host.egress_context(from, attempt).unwrap();
-                    from_host
+                    let ticket = from_host.host.submission_ticket(from, context).unwrap();
+                    let submitted = from_host
                         .host
-                        .with_validated_egress(from, context, &bytes[..len], 0, |_| ())
+                        .submit(from, 0, ticket, context, &bytes[..len], 0, |_| {
+                            BackendOutcome::Submitted
+                        })
                         .unwrap();
-                    assert!(from.accept_transmit(0, attempt).unwrap());
+                    assert!(submitted == Submission::Submitted);
+                    assert!(from.transmit_attempt_packet(attempt).is_none());
                     if opaque {
                         let raw: &[u8] = if enabled {
                             &[30, 2, 158, 2]

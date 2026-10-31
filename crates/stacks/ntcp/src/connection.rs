@@ -2247,6 +2247,10 @@ impl Connection {
             })
     }
 
+    pub(crate) fn send_capacity(&self) -> usize {
+        self.config.send_capacity
+    }
+
     pub(crate) fn send_progress(&self) -> SendProgress {
         SendProgress {
             acknowledged: self.acknowledged,
@@ -3204,6 +3208,47 @@ impl Connection {
             self.arm_work();
         }
         Ok(accepted)
+    }
+
+    /// Managed counterpart of `pmtu_feedback`: the Host already proved the
+    /// physical submission (span and sizes), so only TCP policy runs here.
+    /// Deferred and Decreased keep the legacy local effects; Unchanged drop
+    /// advice touches nothing but the black-hole classification.
+    pub(crate) fn correlated_pmtu_feedback(
+        &mut self,
+        now: Instant,
+        report: crate::CorrelatedPmtu,
+    ) -> Result<crate::PmtuFeedback, Error> {
+        self.update_time(now)?;
+        let segment = report.segment;
+        let start = Seq(segment.start);
+        if matches!(self.state, State::Closed | State::TimeWait)
+            || start.in_window(self.snd_una, self.flight()) != Some(true)
+        {
+            return Ok(crate::PmtuFeedback::Rejected);
+        }
+        let Some(p) = &mut self.pmtud else {
+            return Ok(crate::PmtuFeedback::Rejected);
+        };
+        let outcome = p.correlated_feedback(
+            now,
+            start,
+            Seq(segment.end),
+            segment.ip_packet_len,
+            segment.ip_header_len,
+            report.quoted_packet_len,
+            report.candidate_mtu,
+            report.current_path,
+        );
+        if matches!(
+            outcome,
+            crate::PmtuFeedback::Deferred | crate::PmtuFeedback::Decreased { .. }
+        ) {
+            self.report_fast_open_failure();
+            self.refresh_path_mss();
+            self.arm_work();
+        }
+        Ok(outcome)
     }
 
     fn note_probe_loss(&mut self, start: Seq, multiple: bool) {

@@ -66,6 +66,7 @@ fn attach_limit(owner: &mut Owner, packet_limit: usize) -> Arc<Mutex<SharedState
         next_hop: [4; 6],
         next_cookie: 1,
         pending: Vec::with_capacity(timestamps::PHASES),
+        cancelled: Vec::new(),
     });
     owner.enable_egress(4, None).unwrap();
     state

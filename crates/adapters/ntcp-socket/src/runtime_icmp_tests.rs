@@ -364,14 +364,9 @@ fn packet_icmp_retained_generation_cannot_migrate_to_a_reused_tuple() {
     a.execute(clients[0], Op::Write(vec![7; 4380])).unwrap();
     let packet = tfo_capture(&mut a);
     assert!(a.endpoint.is_output_reserved(old));
-    let mut error = icmp_error_frame(&packet, 3, 3);
-    // Two1ms backend retries advance the four-microsecond ISN clock500
-    // ticks. Together with the intervening second open, the reused tuple's
-    // next ISN coincides with this live byte. A missing generation guard
-    // would therefore hard-abort it, rather than merely fail sequence checks.
-    let colliding = segment(&packet).header.sequence.wrapping_add(500);
-    error[52..56].copy_from_slice(&colliding.to_be_bytes());
-    ptb_checksums(&mut error);
+    // The Host correlates the exact quote with the old generation's sealed
+    // submission and returns it deferred for that generation, unapplied.
+    let error = icmp_error_frame(&packet, 3, 3);
     a.execute(0, Op::Inject(error)).unwrap();
     receive(&mut a);
     assert!(a.egress.as_ref().unwrap().retained_rx(old));
@@ -406,8 +401,16 @@ fn packet_icmp_retained_generation_cannot_migrate_to_a_reused_tuple() {
     let id = cid(&a, replacement);
     assert_ne!(id, old);
     let syn = tfo_capture(&mut a);
-    assert_eq!(segment(&syn).header.sequence, colliding);
     assert_eq!(a.endpoint.connection_id(tuple), Some(id));
+    // The retained report now quotes the new generation's sealed SYN, so it
+    // correlates with that live owner. A missing generation guard would
+    // therefore hard-abort it, rather than fail correlation.
+    a.egress
+        .as_mut()
+        .unwrap()
+        .replace_retained_rx(old, &icmp_error_frame(&syn, 3, 3));
+    // Replay acts for the retained generation only: the quote's owner is a
+    // different generation, so the report is discarded as stale.
     receive(&mut a);
     assert!(!a.egress.as_ref().unwrap().retained_rx(old));
     assert_eq!(a.endpoint.state(id).unwrap(), State::SynSent);

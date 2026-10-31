@@ -4,7 +4,82 @@ use crate::{
     PathProvider, PreparedPath,
 };
 
+/// What a managed Host proved about one physically submitted TCP segment of
+/// an exact connection generation: the sequence span it consumed and the
+/// complete IP packet and header lengths it was submitted with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CorrelatedSegment {
+    pub start: u32,
+    pub end: u32,
+    pub ip_packet_len: u32,
+    pub ip_header_len: u16,
+}
+
+/// A Packet Too Big report correlated by the Host with `segment`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CorrelatedPmtu {
+    pub segment: CorrelatedSegment,
+    /// Complete length as quoted; an IPv4 report without next-hop MTU may
+    /// carry RFC 1191's legacy header-length inflation.
+    pub quoted_packet_len: u32,
+    /// Zero only for an IPv4 report without a next-hop MTU.
+    pub candidate_mtu: u32,
+    /// Whether the segment's path incarnation is still the connection's
+    /// current one. Feedback about an older one is drop advice only.
+    pub current_path: bool,
+}
+
 impl Endpoint {
+    /// Host-correlated Packet Too Big for an exact connection generation.
+    /// The Host's submission ledger is the authenticity check; this applies
+    /// TCP policy (state/window, deferral, probe semantics, IPv6 floor,
+    /// impossible candidates) without a second lookup in the connection's
+    /// bounded sent ring, which cannot establish Host provenance and whose
+    /// eviction must not negate a valid Host match. Managed endpoints only;
+    /// unmanaged callers keep `pmtu_feedback`.
+    pub fn correlated_pmtu_feedback(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        report: CorrelatedPmtu,
+    ) -> Result<crate::PmtuFeedback, EndpointError> {
+        if self.managed_context.is_none() {
+            return Err(Error::InvalidState.into());
+        }
+        self.slot(id)?;
+        self.reject_if_output_reserved(id)?;
+        self.clock(now)?;
+        let outcome = self.slots[id.slot]
+            .as_mut()
+            .unwrap()
+            .connection
+            .correlated_pmtu_feedback(now, report)?;
+        self.refresh(id.slot);
+        Ok(outcome)
+    }
+
+    /// Host-correlated hard/soft error for an exact connection generation,
+    /// with the same TCP semantics as `network_error`. Source Quench is
+    /// discarded (RFC 6633).
+    pub fn correlated_network_error(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        segment: CorrelatedSegment,
+        error: crate::NetworkError,
+    ) -> Result<bool, EndpointError> {
+        if self.managed_context.is_none() {
+            return Err(Error::InvalidState.into());
+        }
+        self.slot(id)?;
+        self.reject_if_output_reserved(id)?;
+        self.clock(now)?;
+        if error == crate::NetworkError::SourceQuench {
+            return Ok(false);
+        }
+        self.deliver_network_error(id.slot, now, segment.start, error)
+    }
+
     /// Enable once, before any transport is constructed. Raw constructors then
     /// fail closed; existing-owner input and independently usable raw endpoints
     /// retain their lower-level contract.
@@ -25,6 +100,32 @@ impl Endpoint {
 
     pub fn managed_context(&self) -> Option<ntcp_path::ContextId> {
         self.managed_context
+    }
+
+    /// Address admission for a managed Host's datagram users: the same base
+    /// unicast/family checks and caller policy TCP applies to binds, opens and
+    /// received packets, so a datagram flow binds, sends and receives only
+    /// where a TCP connection in this network context could. Route requests
+    /// are TCP source-route policy and are never admitted here.
+    pub fn admits_datagram(&self, check: AddressValidation) -> bool {
+        let unicast = |address| valid_address(address) && !unzoned_link_local(address);
+        self.managed_context.is_some()
+            && match check {
+                AddressValidation::Bind { local } => unicast(local),
+                AddressValidation::Open { local, remote } => {
+                    unicast(local) && unicast(remote) && local.is_ipv4() == remote.is_ipv4()
+                }
+                AddressValidation::Incoming {
+                    source,
+                    destination,
+                } => {
+                    unicast(source)
+                        && unicast(destination)
+                        && source.is_ipv4() == destination.is_ipv4()
+                }
+                AddressValidation::Route { .. } => false,
+            }
+            && (self.address_policy)(check)
     }
 
     fn path_factory<P: PathProvider, T>(

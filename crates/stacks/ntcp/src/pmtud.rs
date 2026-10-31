@@ -13,6 +13,24 @@ pub struct PathMtuInfo {
     pub search_high: u32,
 }
 
+/// TCP policy's disposition of one correlated Packet Too Big report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PmtuFeedback {
+    /// Not acted on: wrong state/window, PMTUD disabled, malformed or
+    /// impossible candidate (no smaller than the dropped packet, or below
+    /// the IPv6 minimum).
+    Rejected,
+    /// A plausible drop that leaves the estimate unchanged; consumed as drop
+    /// advice only.
+    Unchanged,
+    /// Below previously proven delivery: held until the quoted data times out.
+    Deferred,
+    /// Applied immediately to this connection's estimate, which is now `mtu`
+    /// (under this connection's own plateau policy for an IPv4 report
+    /// without a next-hop MTU).
+    Decreased { mtu: u32 },
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Sent {
     start: Seq,
@@ -692,10 +710,7 @@ impl Pmtud {
         header: u16,
         candidate: u32,
     ) -> bool {
-        if (self.ipv4 && (!(20..=60).contains(&header) || !header.is_multiple_of(4)))
-            || (!self.ipv4 && header != 40)
-            || size < u32::from(header) + 20
-        {
+        if !self.plausible_quote(size, header) {
             return false;
         }
         let known = self.sent.iter().flatten().find(|p| {
@@ -709,6 +724,71 @@ impl Pmtud {
         let Some(known) = known else {
             return false;
         };
+        matches!(
+            self.report(now, *known, size, header, candidate, None),
+            PmtuFeedback::Deferred | PmtuFeedback::Decreased { .. }
+        )
+    }
+
+    fn plausible_quote(&self, size: u32, header: u16) -> bool {
+        !((self.ipv4 && (!(20..=60).contains(&header) || !header.is_multiple_of(4)))
+            || (!self.ipv4 && header != 40)
+            || size < u32::from(header) + 20)
+    }
+
+    /// Feedback whose physical submission a managed Host already proved
+    /// (exact span, size and header from its ledger), so the bounded `sent`
+    /// ring is not consulted a second time: its eviction must not negate a
+    /// valid Host match. TCP policy still applies in full. A report that
+    /// identifies a dropped packet without decreasing the estimate (equal or
+    /// larger than current, or about a path incarnation the connection no
+    /// longer uses) is consumed as drop advice only: the black-hole timeout
+    /// learns an ICMP message explained the loss, and nothing else changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn correlated_feedback(
+        &mut self,
+        now: Instant,
+        start: Seq,
+        end: Seq,
+        sent_size: u32,
+        header: u16,
+        quoted_size: u32,
+        candidate: u32,
+        current_path: bool,
+    ) -> PmtuFeedback {
+        if !self.plausible_quote(quoted_size, header) {
+            return PmtuFeedback::Rejected;
+        }
+        let known = Sent {
+            start,
+            end,
+            size: sent_size,
+            header,
+            ambiguous: false,
+        };
+        self.report(
+            now,
+            known,
+            quoted_size,
+            header,
+            candidate,
+            Some(current_path),
+        )
+    }
+
+    // `advice` is None for the legacy ring-matched entrypoint (no drop advice,
+    // no state change unless the estimate decreases or is deferred), or
+    // whether the Host-proven submission used the connection's current path.
+    fn report(
+        &mut self,
+        now: Instant,
+        known: Sent,
+        size: u32,
+        header: u16,
+        candidate: u32,
+        advice: Option<bool>,
+    ) -> PmtuFeedback {
+        let seq = known.start;
         let sent_size = known.size;
         // Only the exact original packet may retain probe classification. A
         // smaller repair or any other live packet is independent loss evidence.
@@ -719,7 +799,7 @@ impl Pmtud {
         //# If a node receives a Packet Too Big message reporting a next-hop MTU
         //# that is less than the IPv6 minimum link MTU, it must discard it.
         if !self.ipv4 && candidate < 1280 {
-            return false;
+            return PmtuFeedback::Rejected;
         }
         let mtu = if self.ipv4 && candidate == 0 {
             //= https://www.rfc-editor.org/rfc/rfc1191#section-5
@@ -750,8 +830,21 @@ impl Pmtud {
         //= https://www.rfc-editor.org/rfc/rfc8201#section-4
         //# A node must not increase its estimate of the Path MTU in response to
         //# the contents of a Packet Too Big message.
-        if mtu >= self.info.current_mtu || mtu >= sent_size || mtu >= self.max_sent {
-            return false;
+        // A hop cannot have dropped a packet no larger than its own MTU.
+        if mtu >= sent_size {
+            return PmtuFeedback::Rejected;
+        }
+        match advice {
+            None if mtu >= self.info.current_mtu || mtu >= self.max_sent => {
+                return PmtuFeedback::Rejected;
+            }
+            Some(current_path) if !current_path || mtu >= self.info.current_mtu => {
+                // RFC 4821 section 7.7: an ICMP message explained this loss.
+                // No estimate increase, hold restart, error or repair.
+                self.icmp_since_progress = true;
+                return PmtuFeedback::Unchanged;
+            }
+            _ => {}
         }
         //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
         //= reason=Informational mitigation selected as policy, not a TCP MUST. Exact bounded packet evidence strengthens the live-sequence gate; any cumulative progress clears a pending report.
@@ -776,10 +869,17 @@ impl Pmtud {
                     .filter(|(old_seq, _)| *old_seq == seq)
                     .map_or(mtu, |(_, old)| old.min(mtu)),
             ));
+            if advice.is_some() {
+                // The deferred size is suspect, the reported drop is not.
+                self.icmp_since_progress = true;
+            }
+            PmtuFeedback::Deferred
         } else {
             self.apply_ptb(mtu, now, original_probe);
+            PmtuFeedback::Decreased {
+                mtu: self.info.current_mtu,
+            }
         }
-        true
     }
 
     pub fn network_error(&mut self) {
@@ -1222,6 +1322,48 @@ mod tests {
 
     fn state(ipv4: bool) -> Pmtud {
         Pmtud::new(PmtudConfig::new(1500), 1500, ipv4, 600_000_000).unwrap()
+    }
+
+    // Host-correlated drop advice: consumed by black-hole classification
+    // without raising the estimate, restarting the hold or deferring.
+    #[test]
+    fn correlated_unchanged_report_is_consumed_as_drop_advice_only() {
+        for ipv4 in [true, false] {
+            let header = if ipv4 { 20 } else { 40 };
+            let report = |p: &mut Pmtud, now, mtu, current| {
+                p.correlated_feedback(now, Seq(1), Seq(1449), 1500, header, 1500, mtu, current)
+            };
+            let mut advised = state(ipv4);
+            let mut control = state(ipv4);
+            for p in [&mut advised, &mut control] {
+                // The ring is never consulted: nothing was recorded in it.
+                assert!(!p.feedback(1, Seq(1), 1500, header, 1400));
+                assert_eq!(report(p, 2, 1500, true), PmtuFeedback::Rejected);
+                if !ipv4 {
+                    assert_eq!(report(p, 2, 1279, true), PmtuFeedback::Rejected);
+                }
+                assert_eq!(
+                    report(p, 3, 1400, true),
+                    PmtuFeedback::Decreased { mtu: 1400 }
+                );
+                assert_eq!(p.info.current_mtu, 1400);
+                // ACK progress clears the ICMP explanation of later loss.
+                p.ack(Seq(1), 4, 1000, 1000);
+            }
+            let (info, deadline) = (advised.info, advised.deadline);
+            // Equal, larger-than-current and stale-incarnation reports.
+            assert_eq!(report(&mut advised, 5, 1400, true), PmtuFeedback::Unchanged);
+            assert_eq!(report(&mut advised, 6, 1450, true), PmtuFeedback::Unchanged);
+            assert_eq!(report(&mut advised, 7, 1300, false), PmtuFeedback::Unchanged);
+            assert_eq!((advised.info, advised.deadline), (info, deadline));
+            assert!(advised.pending.is_none() && advised.icmp_since_progress);
+            // The third consecutive RTO is explained by the ICMP drop; the
+            // control (no advice) treats it as a black hole.
+            advised.timeout(8, Seq(1), 3, 1000);
+            control.timeout(8, Seq(1), 3, 1000);
+            assert_eq!(advised.info.current_mtu, 1400);
+            assert!(control.info.current_mtu < 1400);
+        }
     }
 
     #[test]

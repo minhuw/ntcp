@@ -860,3 +860,321 @@ fn managed_scheduled_no_route_and_invalid_source_park_only_affected_lane_then_re
         assert!(a.egress.as_ref().unwrap().blocked(cid).is_none());
     }
 }
+
+// The validated quote a router would return for this exact physical frame.
+fn quote(frame: &[u8]) -> ntcp_host::QuoteKey {
+    let p = crate::ip::parse(ntcp_ethernet::parse_ethernet(frame).unwrap().payload).unwrap();
+    let header = crate::ip::header_len(p.ip.source);
+    ntcp_host::QuoteKey {
+        source: p.ip.source,
+        destination: p.ip.destination,
+        header_len: header as u16,
+        packet_len: (header + p.payload.len()) as u32,
+        protocol: p.protocol,
+        transport: ntcp_host::QuotedSelector::Tcp {
+            source_port: u16::from_be_bytes([p.payload[0], p.payload[1]]),
+            destination_port: u16::from_be_bytes([p.payload[2], p.payload[3]]),
+            sequence: u32::from_be_bytes(p.payload[4..8].try_into().unwrap()),
+        },
+    }
+}
+fn correlate(owner: &Owner, frame: &[u8]) -> ntcp_host::Correlation {
+    owner
+        .host
+        .as_ref()
+        .unwrap()
+        .correlate(owner.now(), &quote(frame))
+}
+// A router-originated Packet Too Big (the source is neither endpoint) quoting
+// the actual frame, as an Ethernet frame for the native receive path.
+fn router_ptb(frame: &[u8], mtu: u32) -> Vec<u8> {
+    let p = crate::ip::parse(ntcp_ethernet::parse_ethernet(frame).unwrap().payload).unwrap();
+    let header = crate::ip::header_len(p.ip.source);
+    let packet = &ntcp_ethernet::parse_ethernet(frame).unwrap().payload[..header + p.payload.len()];
+    // Addressed to the quoted packet's source: this host.
+    let (ip, ether_type) = match (p.ip.destination, p.ip.source) {
+        (IpAddr::V4(_), IpAddr::V4(destination)) => {
+            let quoted = &packet[..header + 8];
+            let mut ip = vec![0; 28 + quoted.len()];
+            ip[0] = 0x45;
+            let total = ip.len() as u16;
+            ip[2..4].copy_from_slice(&total.to_be_bytes());
+            ip[8] = 64;
+            ip[9] = 1;
+            ip[12..16].copy_from_slice(&[10, 73, 0, 1]);
+            ip[16..20].copy_from_slice(&destination.octets());
+            ip[20] = 3;
+            ip[21] = 4;
+            ip[26..28].copy_from_slice(&(mtu as u16).to_be_bytes());
+            ip[28..].copy_from_slice(quoted);
+            let checksum = ntcp_ip_common::checksum(&ip[20..]);
+            ip[22..24].copy_from_slice(&checksum.to_be_bytes());
+            let checksum = ntcp_ip_common::checksum(&ip[..20]);
+            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+            (ip, ntcp_ethernet::ETHERTYPE_IPV4)
+        }
+        (IpAddr::V6(_), IpAddr::V6(destination)) => {
+            let router: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+            let quoted = &packet[..packet.len().min(1280 - 48)];
+            let mut ip = vec![0; 48 + quoted.len()];
+            ip[0] = 0x60;
+            ip[4..6].copy_from_slice(&((8 + quoted.len()) as u16).to_be_bytes());
+            ip[6] = 58;
+            ip[7] = 64;
+            ip[8..24].copy_from_slice(&router.octets());
+            ip[24..40].copy_from_slice(&destination.octets());
+            ip[40] = 2;
+            ip[44..48].copy_from_slice(&mtu.to_be_bytes());
+            ip[48..].copy_from_slice(quoted);
+            let checksum = ntcp_icmp::icmpv6_checksum(
+                ntcp::IpMetadata {
+                    source: IpAddr::V6(router),
+                    destination: IpAddr::V6(destination),
+                },
+                &ip[40..],
+            )
+            .unwrap();
+            ip[42..44].copy_from_slice(&checksum.to_be_bytes());
+            (ip, ntcp_ethernet::ETHERTYPE_IPV6)
+        }
+        _ => unreachable!(),
+    };
+    let mut frame = vec![0; (14 + ip.len()).max(60)];
+    ntcp_ethernet::encode_ethernet(&mut frame, [2; 6], [4; 6], ether_type, &ip).unwrap();
+    frame
+}
+
+#[test]
+fn managed_native_transaction_seals_exactly_the_accepted_physical_segments() {
+    for v6 in [false, true] {
+        for (gso, shared) in [(false, false), (true, false), (true, true)] {
+            let (mut a, mut b, client, server, wa, wb) = pair_output(v6, gso, shared);
+            let cid = connection(&a, client);
+            let data: Vec<_> = (0..7000).map(|n| (n % 251) as u8).collect();
+            let registration =
+                crate::RegisteredPayload::register(ntcp_io::Payload::from_vec(data.clone()))
+                    .unwrap();
+            if shared {
+                a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+                    .unwrap();
+                let pointer = registration.as_slice().as_ptr() as usize;
+                a.execute(client, Op::Send(vec![(pointer, data.len())], MSG_ZEROCOPY))
+                    .unwrap();
+            } else {
+                a.execute(client, Op::Write(data.clone())).unwrap();
+            }
+            // Three WouldBlock calls of the same attempt record nothing.
+            wa.lock().unwrap().block = true;
+            for _ in 0..3 {
+                a.service_egress().unwrap();
+                tick(&mut a);
+            }
+            let blocked = wa.lock().unwrap().offered.last().unwrap().clone();
+            assert!(wa.lock().unwrap().sent.is_empty());
+            assert_eq!(correlate(&a, &blocked).matches, 0);
+            // The first physical segment is accepted, the next one blocks:
+            // one sealed record, nothing for the blocked suffix.
+            let port = a.endpoint.tuple(cid).unwrap().local.port();
+            {
+                let mut wire = wa.lock().unwrap();
+                wire.block = false;
+                wire.block_after = Some((port, 1));
+            }
+            a.service_egress().unwrap();
+            assert!(a.endpoint.is_output_reserved(cid));
+            let first = wa.lock().unwrap().sent[0].clone();
+            assert_eq!(first, blocked);
+            let suffix = wa.lock().unwrap().offered.last().unwrap().clone();
+            assert_ne!(suffix, first);
+            assert_eq!(correlate(&a, &suffix).matches, 0);
+            wa.lock().unwrap().block_after = None;
+            tick(&mut a);
+            a.service_egress().unwrap();
+            let sent: Vec<_> = wa.lock().unwrap().sent.iter().cloned().collect();
+            assert!(sent.len() >= 3);
+            // Every frame the backend accepted has exactly one sealed record
+            // of its owner generation and its complete physical size.
+            for frame in &sent {
+                let correlation = correlate(&a, frame);
+                assert_eq!(correlation.matches, 1);
+                let record = correlation.owner.unwrap();
+                assert_eq!(correlation.unique, Some(record));
+                assert!(!record.possibly_submitted);
+                assert_eq!(record.evidence.owner, ntcp_host::Owner::Tcp(cid));
+                assert_eq!(record.evidence.packet_len as usize, ip_size(frame));
+            }
+            complete(&mut a, &mut b, &wa, &wb, cid, data.len());
+            assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, data);
+            eprintln!(
+                "NATIVE_SEALED family={} gso={gso} shared={shared} blocked_calls=3 accepted={} sealed={} acknowledged={}",
+                if v6 { 6 } else { 4 },
+                sent.len(),
+                sent.len(),
+                data.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_native_unknown_outcome_seals_possibly_submitted_without_retry() {
+    let (mut a, _, client, _, wa, _) = pair_output(false, false, false);
+    let cid = connection(&a, client);
+    a.execute(client, Op::Write(vec![1; 100])).unwrap();
+    wa.lock().unwrap().output_error = Some(io::ErrorKind::Interrupted);
+    assert_eq!(a.service_egress(), Err(EIO));
+    let offered = wa.lock().unwrap().offered.clone();
+    assert_eq!(offered.len(), 1);
+    assert!(wa.lock().unwrap().sent.is_empty());
+    // Never success, never unsent: the reservation stays quarantined while
+    // the evidence remains correlatable.
+    assert!(a.endpoint.is_output_reserved(cid));
+    let record = correlate(&a, &offered[0]).owner.unwrap();
+    assert!(record.possibly_submitted);
+    assert_eq!(record.evidence.owner, ntcp_host::Owner::Tcp(cid));
+}
+
+#[test]
+fn managed_native_reserved_owner_ptb_is_retained_by_host_dispatch_then_replayed() {
+    for v6 in [false, true] {
+        let (mut a, mut b, client, server, wa, wb) = pair_output(v6, true, false);
+        let cid = connection(&a, client);
+        let data: Vec<_> = (0..7000).map(|n| (n % 241) as u8).collect();
+        a.execute(client, Op::Write(data.clone())).unwrap();
+        let port = a.endpoint.tuple(cid).unwrap().local.port();
+        wa.lock().unwrap().block_after = Some((port, 1));
+        a.service_egress().unwrap();
+        assert!(a.endpoint.is_output_reserved(cid));
+        let first = wa.lock().unwrap().sent[0].clone();
+        assert!(ip_size(&first) > 1300);
+        let mtu = if v6 { 1280 } else { 1000 };
+        let path = a
+            .host
+            .as_ref()
+            .unwrap()
+            .binding(cid)
+            .unwrap()
+            .snapshot
+            .path();
+        // A forged control quoting a frame that was never sent is discarded
+        // by correlation before any owner is consulted, so it is not retained.
+        let mut forged = first.clone();
+        let offset = 14 + crate::ip::header_len(a.local) + 4;
+        forged[offset + 3] ^= 1;
+        wa.lock()
+            .unwrap()
+            .incoming
+            .push_back(Ok(router_ptb(&forged, mtu)));
+        a.receive_batch(&mut [0; 65549]).unwrap();
+        assert!(!a.egress.as_ref().unwrap().retained_rx(cid));
+        // The genuine router report is correlated, then deferred unapplied
+        // for this exact reserved generation.
+        wa.lock()
+            .unwrap()
+            .incoming
+            .push_back(Ok(router_ptb(&first, mtu)));
+        a.receive_batch(&mut [0; 65549]).unwrap();
+        assert!(a.egress.as_ref().unwrap().retained_rx(cid));
+        let host = a.host.as_ref().unwrap();
+        assert_eq!(host.binding(cid).unwrap().snapshot.path(), path);
+        assert!(
+            host.binding(cid)
+                .unwrap()
+                .snapshot
+                .ip_packet_budget()
+                .unwrap()
+                > mtu
+        );
+        // The held suffix completes at the old size: nothing was applied.
+        wa.lock().unwrap().block_after = None;
+        tick(&mut a);
+        a.service_egress().unwrap();
+        assert!(!a.endpoint.is_output_reserved(cid));
+        let held: Vec<_> = wa.lock().unwrap().sent.drain(..).collect();
+        assert!(held.iter().any(|f| ip_size(f) > mtu as usize));
+        input_frames(&mut b, &held);
+        let offered = wa.lock().unwrap().offered.len();
+        // Replay revalidates for that generation; TCP accepts the immediate
+        // decrease, and the Host publishes it on the submission's path.
+        a.receive_batch(&mut [0; 65549]).unwrap();
+        assert!(!a.egress.as_ref().unwrap().retained_rx(cid));
+        let host = a.host.as_mut().unwrap();
+        host.refresh(&mut a.endpoint, cid).unwrap();
+        assert_eq!(
+            host.binding(cid).unwrap().snapshot.ip_packet_budget(),
+            Ok(mtu)
+        );
+        complete(&mut a, &mut b, &wa, &wb, cid, data.len());
+        assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, data);
+        let wire = wa.lock().unwrap();
+        assert!(wire.offered.len() > offered);
+        assert!(
+            wire.offered[offered..]
+                .iter()
+                .all(|f| ip_size(f) <= mtu as usize)
+        );
+        eprintln!(
+            "NATIVE_RETAINED_PTB family={} quoted_ip={} router_mtu={mtu} retained=true replay_published={mtu} later_offered={} acknowledged={}",
+            if v6 { 6 } else { 4 },
+            ip_size(&first),
+            wire.offered.len() - offered,
+            data.len()
+        );
+    }
+}
+fn input_frames(to: &mut Owner, frames: &[Vec<u8>]) {
+    for frame in frames {
+        let eth = ntcp_ethernet::parse_ethernet(frame).unwrap();
+        to.input_ip_metadata(eth.payload, Default::default(), None);
+    }
+    to.events();
+}
+
+#[test]
+fn managed_native_timestamp_fallback_and_msgsize_rejection_reuse_the_attempt_ticket() {
+    let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);
+    let cid = connection(&a, client);
+    // Zero completion capacity: the requested timestamps fall back to a
+    // plain transmission inside the same physical call.
+    flags(
+        &mut a,
+        client,
+        ts::TX_SOFTWARE | ts::TX_HARDWARE | ts::TX_ACK | ts::TX_SCHED,
+    );
+    let data: Vec<_> = (0..4000).map(|n| (n % 239) as u8).collect();
+    a.execute(client, Op::Write(data.clone())).unwrap();
+    {
+        let mut wire = wa.lock().unwrap();
+        wire.enforce_mtu = true;
+        wire.mtu = Some(1000);
+    }
+    // EMSGSIZE certainly did not submit: nothing is sealed, the Endpoint
+    // retains the reservation and its replacement attempt reuses the ticket.
+    a.service_egress().unwrap();
+    let rejected = wa.lock().unwrap().offered.clone();
+    assert_eq!(rejected.len(), 1);
+    assert!(wa.lock().unwrap().sent.is_empty());
+    assert!(wa.lock().unwrap().requests.is_empty());
+    assert_eq!(correlate(&a, &rejected[0]).matches, 0);
+    assert!(a.endpoint.is_output_reserved(cid));
+    budget(&mut a, cid, 1000, true);
+    tick(&mut a);
+    a.service_egress().unwrap();
+    let sent: Vec<_> = wa.lock().unwrap().sent.iter().cloned().collect();
+    assert!(!sent.is_empty());
+    assert!(wa.lock().unwrap().requests.is_empty());
+    for frame in &sent {
+        assert!(ip_size(frame) <= 1000);
+        let record = correlate(&a, frame).owner.unwrap();
+        assert!(!record.possibly_submitted);
+        assert_eq!(record.evidence.owner, ntcp_host::Owner::Tcp(cid));
+    }
+    complete(&mut a, &mut b, &wa, &wb, cid, data.len());
+    assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, data);
+    eprintln!(
+        "NATIVE_FALLBACK_MSGSIZE rejected_ip={} sealed_after_refresh={} acknowledged={}",
+        ip_size(&rejected[0]),
+        sent.len(),
+        data.len()
+    );
+}
