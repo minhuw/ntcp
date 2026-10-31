@@ -388,7 +388,10 @@ impl Listener {
 // context guessing from addresses.
 #[path = "endpoint_managed.rs"]
 mod managed;
-pub use managed::{CorrelatedPmtu, CorrelatedSegment};
+pub use managed::{
+    ConfirmedProbe, CorrelatedPmtu, CorrelatedSegment, PendingPmtuApplied, PhysicalReceipt,
+};
+pub(crate) use managed::ManagedResults;
 
 pub struct Endpoint {
     managed_context: Option<ntcp_path::ContextId>,
@@ -570,10 +573,10 @@ impl Endpoint {
     /// applies to all matching retained connections, atomically after preflight.
     /// This is not an OS route table or a notification of a different path.
     //= https://www.rfc-editor.org/rfc/rfc4821#section-4
-    //= reason=TCP destination-policy creation parameters are selected before active/passive allocation; no shared IP cache or other-protocol implementation claim.
+    //= reason=TCP destination-policy creation parameters are selected before active/passive allocation. This Endpoint policy is TCP-local; the shared IP-layer path cache and Host UDP budgets live in ntcp-path PathService and ntcp-host, and this annotation claims neither.
     //# Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
-    //= reason=TCP destination-policy creation parameters are selected before active/passive allocation; no shared IP cache or other-protocol implementation claim.
+    //= reason=TCP destination-policy creation parameters are selected before active/passive allocation. This Endpoint policy is TCP-local; the shared IP-layer path cache and Host UDP budgets live in ntcp-path PathService and ntcp-host, and this annotation claims neither.
     //# There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.
     pub fn set_destination_route(
         &mut self,

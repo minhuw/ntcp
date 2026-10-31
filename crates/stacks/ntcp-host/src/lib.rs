@@ -12,10 +12,12 @@ use ntcp_icmp::{FeedbackKind, QuotedTransport};
 pub use ntcp_path as path;
 mod ledger;
 use ledger::Ledger;
-pub use ledger::{
-    Correlation, Evidence, LedgerLimits, Owner, QuoteKey, QuotedSelector, Record, Selector,
-    feedback_horizon,
-};
+pub use ledger::{LedgerLimits, Owner, feedback_horizon};
+// Ledger inspection for the tests of crates that submit through a Host.
+#[cfg(any(test, feature = "test-support"))]
+pub use ledger::{Correlation, Evidence, QuoteKey, QuotedSelector, Record, Selector};
+#[cfg(not(any(test, feature = "test-support")))]
+use ledger::{Evidence, QuoteKey, QuotedSelector, Selector};
 mod udp;
 use path::{
     ContextId, Dscp, ForwarderId, InterfaceKey, LinkId, PathRequest, PathService, PathSnapshot,
@@ -23,7 +25,7 @@ use path::{
 };
 use udp::Udp;
 pub use udp::{
-    UdpEgress, UdpEvent, UdpFlowId, UdpLimits, UdpOptions, UdpSendError, UdpSent,
+    UdpEgress, UdpEvent, UdpFlowId, UdpLimits, UdpOptions, UdpPathLimits, UdpSendError, UdpSent,
     managed_udp_limits,
 };
 
@@ -294,8 +296,9 @@ pub enum Advice {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcmpOutcome {
     Discarded(IcmpDiscard),
-    /// `published` is present only when TCP accepted an immediate decrease
-    /// about its current path and the Host then published it.
+    /// `published` is present only when TCP decreased its estimate at once
+    /// or left it Unchanged for a report about its current path, and the
+    /// Host then published its own estimate (a decrease or a hold restart).
     Tcp {
         owner: ConnectionId,
         report: TcpReport,
@@ -332,6 +335,28 @@ impl DeferredIcmp {
 pub enum IcmpDispatch {
     Completed(IcmpOutcome),
     Deferred(DeferredIcmp),
+}
+
+/// One `Host::service_changes` pass. Counts and the first failure only, so a
+/// pass never allocates however many clients fail.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceReport {
+    /// Deferred reports, applied at their timeout, that lowered the shared
+    /// estimate.
+    pub decreased: usize,
+    /// Confirmed probes that raised the shared estimate.
+    pub raised: usize,
+    /// Dirty clients brought to their newest snapshot and acknowledged.
+    pub applied: usize,
+    /// Clients left dirty (or results left unpublished) by a failure.
+    pub failed: usize,
+    pub first_error: Option<Error>,
+}
+impl ServiceReport {
+    fn fail(&mut self, error: Error) {
+        self.failed += 1;
+        self.first_error.get_or_insert(error);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -570,9 +595,9 @@ impl Host {
     }
 
     /// Explicit trusted negative evidence, with RFC hold in the configured
-    /// caller timebase. Re-reading/equal reports do not restart the deadline.
-    /// Larger TCP probe proof stays connection-local: T10 must add validated
-    /// positive publication before this shared ordinary ceiling can rise.
+    /// caller timebase. A fresh equal report keeps the estimate but restarts
+    /// the deadline. Only `service_changes` publishing a definitely submitted
+    /// probe's delivery after the hold can raise this shared ordinary ceiling.
     pub fn trusted_decrease(
         &mut self,
         now: Instant,
@@ -699,6 +724,167 @@ impl Host {
         }
         first.map_or(Ok(()), Err)
     }
+
+    /// The change service: one bounded pass, run by an embedding before it
+    /// selects output. First publish each live connection's unpublished
+    /// results (an applied deferred decrease, a confirmed probe), then bring
+    /// every dirty client to its newest snapshot and acknowledge exactly that
+    /// stamp: a TCP binding by budget-only application (no repair; allowed
+    /// while its output is reserved, held frames still meet the submit-time
+    /// barrier), a UDP flow by updating its coalesced change notification.
+    /// Output leases stay lazy: `egress_context` refreshes them before use.
+    /// A failing client stays dirty and never stops service of the others.
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
+    //= reason=PathService marks every client of a path dirty on each trusted decrease and on link MTU, route, source, link or plateau changes. Host::service_changes, run on every native service_egress and MTU-refresh pass and every tun_echo transmit pass, brings each dirty TCP binding (reserved owners included, budget only, no repair) and each Host UDP flow (a coalesced per-flow change slot carrying MMS_S and the payload limit) to the newest snapshot and acknowledges exactly that version; a failing client stays dirty without stopping the others, and stateless leases and every physical submission revalidate against the current version. Dual-family Host tests (two TCP flows plus a UDP flow, held scalar, zero-copy and partial software GSO reservations, a randomized multi-client model), native reservation-race tests and the isolated namespace shared-fanout case, in which a real router PTB quotes only TCP flow A, verify it.
+    //# The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+    //= reason=PathService marks every client of a path dirty on each trusted decrease and on link MTU, route, source, link or plateau changes. Host::service_changes, run on every native service_egress and MTU-refresh pass and every tun_echo transmit pass, brings each dirty TCP binding (reserved owners included, budget only, no repair) and each Host UDP flow (a coalesced per-flow change slot carrying MMS_S and the payload limit) to the newest snapshot and acknowledges exactly that version; a failing client stays dirty without stopping the others, and stateless leases and every physical submission revalidate against the current version. Dual-family Host tests (two TCP flows plus a UDP flow, held scalar, zero-copy and partial software GSO reservations, a randomized multi-client model), native reservation-race tests and the isolated namespace shared-fanout case, in which a real router PTB quotes only TCP flow A, verify it.
+    //# The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
+    //= reason=A correlated router PTB quoting a Host UDP datagram publishes the decrease to the shared path, and Host::service_changes then applies it to every TCP connection bound to that path (budget only, no repair) on the next native or tun_echo service pass, before any TCP output. Dual-family Host tests and the tun_echo and isolated namespace udp-quoted cases verify it. Sentence continuation is preserved in 1191-060.
+    //# Note: even if the Datagram Too Big message contains an Original Datagram Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+    //= reason=A correlated router PTB quoting a Host UDP datagram publishes the decrease to the shared path, and Host::service_changes then applies it to every TCP connection bound to that path (budget only, no repair) on the next native or tun_echo service pass, before any TCP output. Dual-family Host tests and the tun_echo and isolated namespace udp-quoted cases verify it.
+    //# Note: even if the Packet Too Big message contains an Original Packet Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given path.
+    pub fn service_changes(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+    ) -> Result<ServiceReport, Error> {
+        self.collect(endpoint)?;
+        let mut report = ServiceReport::default();
+        for index in 0..self.bindings.len() {
+            let Some(owner) = self.bindings[index].and_then(|b| b.owner) else {
+                continue;
+            };
+            if let Err(error) = self.publish_results(endpoint, now, owner, &mut report) {
+                report.fail(error);
+            }
+        }
+        for index in 0..self.bindings.len() {
+            let Some(binding) = self.bindings[index] else {
+                continue;
+            };
+            let Some(owner) = binding.owner else {
+                continue;
+            };
+            if !self.paths.is_dirty(binding.prepared.client)? {
+                continue;
+            }
+            match self.refresh(endpoint, owner) {
+                Ok(_) => report.applied += 1,
+                Err(error) => report.fail(error),
+            }
+        }
+        for slot in 0..self.udp.limits.flows {
+            match self.udp_service(slot) {
+                Ok(true) => report.applied += 1,
+                Ok(false) => {}
+                Err(error) => report.fail(error),
+            }
+        }
+        Ok(report)
+    }
+
+    // Each result is taken exactly once; a stale one publishes nothing.
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
+    //= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the corrected quoted length, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests and real router PTBs in the isolated namespace gate verify it.
+    //# When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
+    fn publish_results(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        owner: ConnectionId,
+        report: &mut ServiceReport,
+    ) -> Result<(), Error> {
+        if let Some(Some(result)) = live(endpoint.take_pending_pmtu_applied(owner))?
+            && self.publish_applied(now, owner, result)? == Some(path::EstimateChange::Decreased)
+        {
+            report.decreased += 1;
+        }
+        if let Some(Some(probe)) = live(endpoint.take_confirmed_probe(owner))?
+            && self.publish_confirmed(now, owner, probe)?
+                == Some(path::DeliveryConfirmation::Raised)
+        {
+            report.raised += 1;
+        }
+        Ok(())
+    }
+
+    // A deferred report the connection applied at the quoted data's timeout
+    // becomes a shared fact only for the owner's unchanged binding and valid
+    // path incarnation, under the same rule as an immediate decrease: the
+    // larger of the Host estimate and the report's own policy-derived size,
+    // so a lower loss-inferred connection estimate never leaks. A
+    // decrease needs no negative-revision equality: it applies monotonically,
+    // and a result the current ceiling already subsumes is discarded rather
+    // than restarting the hold as a fresh report would.
+    fn publish_applied(
+        &mut self,
+        now: Instant,
+        owner: ConnectionId,
+        result: ntcp::PendingPmtuApplied,
+    ) -> Result<Option<path::EstimateChange>, Error> {
+        let (binding, origin) = (self.binding(owner)?, result.binding());
+        let path = origin.snapshot.path();
+        let Some(snapshot) = self
+            .paths
+            .path_snapshot(path)
+            .ok()
+            .filter(|s| s.status() == PathStatus::Valid)
+        else {
+            return Ok(None);
+        };
+        let mtu = result.host_estimate().max(result.applied_mtu());
+        if binding.client != origin.client
+            || binding.snapshot.path() != path
+            || mtu >= result.report().segment.ip_packet_len
+            || snapshot.learned_mtu().is_some_and(|learned| mtu >= learned)
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.trusted_decrease(now, path, mtu)?))
+    }
+
+    // Delivery of a definitely submitted, unfragmented probe of exactly the
+    // confirmed length, selected after the hold under the current negative
+    // revision on this owner's unchanged binding (RFC 4821 section 5.2: a
+    // network fact other packetization layers may share). The path service
+    // rechecks revision, hold and first hop at publication time. Other
+    // clients receive ordinary permission only, never local delivery proof.
+    fn publish_confirmed(
+        &mut self,
+        now: Instant,
+        owner: ConnectionId,
+        probe: ntcp::ConfirmedProbe,
+    ) -> Result<Option<path::DeliveryConfirmation>, Error> {
+        let (binding, intent) = (self.binding(owner)?, probe.intent());
+        let selected = intent.binding();
+        if binding.client != selected.client
+            || binding.snapshot.path() != selected.snapshot.path()
+            || probe.receipt().ip_packet_len != intent.ip_packet_len()
+        {
+            return Ok(None);
+        }
+        match self.paths.confirm_delivery(
+            selected.snapshot.path(),
+            intent.ip_packet_len(),
+            selected.snapshot.negative_revision(),
+            intent.selected_at(),
+            now,
+        ) {
+            Ok(outcome) => Ok(Some(outcome)),
+            // An invalidated or replaced path incarnation is stale evidence.
+            Err(
+                path::Error::Invalidated
+                | path::Error::StaleHandle
+                | path::Error::NoRoute
+                | path::Error::SelectionChanged,
+            ) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn collect(&mut self, endpoint: &Endpoint) -> Result<(), Error> {
         self.check_endpoint(endpoint)?;
         for binding in &mut self.bindings {
@@ -967,9 +1153,9 @@ impl Host {
     /// positive; lossy history only denies. Path-level effects require an
     /// exact match and every match and lossy hit to agree on one path
     /// incarnation; owner-level effects require one owner generation and one
-    /// submission (TCP: one span), with no lossy hit. A TCP owner's policy runs first and a shared decrease
-    /// is published only for its immediate, current-path decrease (never for
-    /// Deferred). A reserved owner is returned as Deferred before anything is
+    /// submission (TCP: one span), with no lossy hit. A TCP owner's policy runs first and a shared
+    /// estimate is published only for its current-path Decreased or
+    /// Unchanged disposition (never for Deferred). A reserved owner is returned as Deferred before anything is
     /// applied. Unmatched quotes are discarded; there is no fallback to the
     /// connection-local sent ring.
     pub fn input_icmp(
@@ -996,7 +1182,7 @@ impl Host {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
-    //= reason=The Host dispatcher notifies the specific correlated sender while processing the report: TCP consumes PmtuFeedback drop advice and a Host UDP flow receives UdpEvent::PacketTooBig, whether or not the estimate changes. Path-level change notification is separate: a shared decrease only marks path clients dirty, and other users adopt it at their next egress refresh or send-budget check. Dual-family TUN tests consume the UDP event immediately and observe the TCP flow adopt the shared decrease at its next egress.
+    //= reason=The Host dispatcher notifies the specific correlated sender while processing the report: TCP consumes PmtuFeedback drop advice and a Host UDP flow receives UdpEvent::PacketTooBig, whether or not the estimate changes. Path-level change notification is separate: a shared decrease marks the path's clients dirty, and Host::service_changes then brings every other user to the new budget (TCP budget application, the UDP flow change slot) on the next service pass. Dual-family TUN tests consume the UDP event immediately and observe the TCP flow adopt the shared decrease after the next service pass.
     //# It is important to understand that the notification of the packetization
     //# layer instances using the path about the change in the PMTU is distinct from
     //# the notification of a specific instance that a packet has been dropped. The
@@ -1222,12 +1408,30 @@ impl Host {
             candidate_mtu: candidate.unwrap_or(0),
             current_path: current.is_some(),
         };
-        let Some(outcome) = live(endpoint.correlated_pmtu_feedback(now, id, report))? else {
+        // A Deferred report carries the Host's estimate as its provenance, so
+        // that applying it at the quoted data's timeout can be published.
+        let estimate = current.and_then(|path| {
+            self.host_estimate(path, ipv4, &key, evidence.packet_len, candidate)
+        });
+        let feedback = match estimate {
+            Some(estimate) => {
+                endpoint.correlated_pmtu_feedback_with_estimate(now, id, report, estimate)
+            }
+            None => endpoint.correlated_pmtu_feedback(now, id, report),
+        };
+        let Some(outcome) = live(feedback)? else {
             return Ok(Completed(Discarded(IcmpDiscard::Stale)));
         };
-        // Publication strictly follows TCP's acceptance of an immediate
-        // decrease; a Deferred report must not be pre-empted through the
-        // shared estimate that the connection itself would then adopt.
+        // A Deferred report must not be pre-empted through the shared
+        // estimate that the connection itself would then adopt, nor restart
+        // the shared hold: TCP defers every current-path report below its
+        // proven delivery, whatever its loss-inferred estimate, and only that
+        // exact report's timeout authorizes publication (`publish_applied`).
+        // A current-path report TCP leaves Unchanged is at or above proven
+        // delivery with its own estimate already no larger, and is still a
+        // validated network fact about the shared path: the Host's estimate
+        // lowers a larger shared record or, when equal or larger, restarts
+        // the hold so that no client confirms or submits growth within it.
         let published = match (outcome, current) {
             (PmtuFeedback::Decreased { mtu }, Some(path)) => self.publish(
                 now,
@@ -1237,6 +1441,15 @@ impl Host {
                 evidence.packet_len,
                 candidate,
                 Some(mtu),
+            )?,
+            (PmtuFeedback::Unchanged, Some(path)) => self.publish(
+                now,
+                path,
+                ipv4,
+                &key,
+                evidence.packet_len,
+                candidate,
+                None,
             )?,
             _ => None,
         };
@@ -1270,42 +1483,44 @@ impl Host {
         candidate: Option<u32>,
         applied: Option<u32>,
     ) -> Result<Option<path::EstimateChange>, Error> {
-        let Some(snapshot) = self
-            .paths
-            .path_snapshot(path)
-            .ok()
-            .filter(|s| s.status() == PathStatus::Valid)
-        else {
+        let Some(mtu) = self.host_estimate(path, ipv4, key, dropped, candidate) else {
             return Ok(None);
         };
-        let mtu = match (candidate, ipv4) {
-            (None, true) => {
-                let Some(table) = snapshot.ipv4_plateaus() else {
-                    return Ok(None);
-                };
-                match table.legacy_fallback(
-                    snapshot.ip_packet_budget()?,
-                    key.packet_len,
-                    u32::from(key.header_len),
-                    dropped,
-                ) {
-                    Ok(mtu) => mtu,
-                    Err(_) => return Ok(None),
-                }
-            }
-            _ => match report_mtu(ipv4, dropped, candidate) {
-                Some(Some(mtu)) => {
-                    debug_assert!(applied.is_none_or(|applied| applied == mtu));
-                    mtu
-                }
-                _ => return Ok(None),
-            },
-        };
+        debug_assert!(candidate.is_none() || applied.is_none_or(|applied| applied == mtu));
         let mtu = applied.map_or(mtu, |applied| applied.max(mtu));
         if mtu >= dropped {
             return Ok(None);
         }
         Ok(Some(self.trusted_decrease(now, path, mtu)?))
+    }
+
+    // The Host's own normalized estimate for a correlated PTB about a valid
+    // path incarnation, before any owner policy.
+    fn host_estimate(
+        &self,
+        path: path::PathId,
+        ipv4: bool,
+        key: &QuoteKey,
+        dropped: u32,
+        candidate: Option<u32>,
+    ) -> Option<u32> {
+        let snapshot = self
+            .paths
+            .path_snapshot(path)
+            .ok()
+            .filter(|s| s.status() == PathStatus::Valid)?;
+        match (candidate, ipv4) {
+            (None, true) => snapshot
+                .ipv4_plateaus()?
+                .legacy_fallback(
+                    snapshot.ip_packet_budget().ok()?,
+                    key.packet_len,
+                    u32::from(key.header_len),
+                    dropped,
+                )
+                .ok(),
+            _ => report_mtu(ipv4, dropped, candidate).flatten(),
+        }
     }
 
     /// Obtain authority for a selected reservation. Keep this context with a
@@ -1521,7 +1736,6 @@ impl Host {
             Evidence {
                 link: live.link,
                 path: live.binding.snapshot.path(),
-                stamp: live.binding.snapshot.stamp(),
                 owner: packet.connection.map_or(Owner::Stateless, Owner::Tcp),
                 source: packet.ip.source,
                 destination: packet.ip.destination,
@@ -1625,7 +1839,13 @@ impl Host {
         match submit(live) {
             BackendOutcome::Submitted => {
                 self.ledger.seal(ticket.ticket, now, false);
-                let accepted = endpoint.accept_transmit(now, context.attempt);
+                // Only a definite submission certifies the exact bytes the
+                // backend took; validate_egress checked them just above.
+                let receipt = ntcp::PhysicalReceipt {
+                    ip_packet_len: (frame.len() + shared_payload_len) as u32,
+                    dont_fragment: frame[0] >> 4 != 4 || frame[6] & 0x40 != 0,
+                };
+                let accepted = endpoint.accept_transmit_submitted(now, context.attempt, receipt);
                 assert!(matches!(accepted, Ok(true)), "preflighted acceptance");
                 Ok(Submission::Submitted)
             }

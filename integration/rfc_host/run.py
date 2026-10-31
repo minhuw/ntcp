@@ -460,7 +460,7 @@ def main():
             for fd in fds:
                 os.close(fd)
     assert completed == len(cases) and stream_count > 0 and refusal_count == 12
-    assert icmp_completed == len(icmp_cases) == 6
+    assert icmp_completed == len(icmp_cases) == 8
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
                                     icmp_cases=icmp_completed,
                                     namespaces=namespace_ids, kernel=os.uname().release,

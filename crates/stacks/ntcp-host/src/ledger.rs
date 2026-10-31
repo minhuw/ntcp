@@ -11,7 +11,7 @@ use crate::Error;
 use alloc::vec::Vec;
 use core::net::IpAddr;
 use ntcp::{ConnectionId, Instant, TransmitAttempt};
-use ntcp_path::{ChangeStamp, LinkId, PathId};
+use ntcp_path::{LinkId, PathId};
 
 /// Explicit ledger storage, allocated once by `Host::new`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +78,8 @@ pub enum Selector {
         length: u16,
         checksum: u16,
     },
+    /// Another protocol; this Host submits only TCP and UDP.
+    #[cfg(any(test, feature = "test-support"))]
     Other,
 }
 
@@ -86,8 +88,6 @@ pub enum Selector {
 pub struct Evidence {
     pub link: LinkId,
     pub path: PathId,
-    /// Shared budget version the submission was validated against.
-    pub stamp: ChangeStamp,
     pub owner: Owner,
     pub source: IpAddr,
     /// Canonical final destination (not an IPv4 source-route hop).
@@ -154,6 +154,7 @@ pub struct Correlation {
     /// hit was submitted on this one path incarnation.
     pub path: Option<PathId>,
     /// Present only for exactly one live match and nothing else.
+    #[cfg(any(test, feature = "test-support"))]
     pub unique: Option<Record>,
     /// Owner-level identity: every live match belongs to one owner generation
     /// and one submission, no evicted signature or tombstone matches, and the
@@ -189,6 +190,7 @@ impl Correlation {
             matches,
             summarized: self.summarized || other.summarized,
             path: hits.flatten().filter(|_| matches != 0),
+            #[cfg(any(test, feature = "test-support"))]
             unique: None,
             owner: None,
             hits,
@@ -484,6 +486,7 @@ impl Cover {
                 max: length,
                 checksum: Some(checksum),
             },
+            #[cfg(any(test, feature = "test-support"))]
             Selector::Other => Self::Any,
         }
     }
@@ -550,6 +553,7 @@ fn ports(selector: Selector) -> Option<(u16, u16)> {
             destination_port,
             ..
         } => Some((source_port, destination_port)),
+        #[cfg(any(test, feature = "test-support"))]
         Selector::Other => None,
     }
 }
@@ -626,6 +630,7 @@ fn evidence_matches(e: &Evidence, quote: &QuoteKey) -> bool {
                     checksum: c,
                 },
             ) => (source_port, destination_port, length, checksum) == (s, d, l, c),
+            #[cfg(any(test, feature = "test-support"))]
             (Selector::Other, QuotedSelector::Other) => true,
             _ => false,
         }
@@ -1153,6 +1158,7 @@ impl Ledger {
 
     pub fn correlate(&self, now: Instant, quote: &QuoteKey) -> Correlation {
         let mut live = 0;
+        #[cfg(any(test, feature = "test-support"))]
         let mut unique = None;
         // The latest entry of the candidate owner and its record.
         let mut owner: Option<(Entry, usize)> = None;
@@ -1168,7 +1174,10 @@ impl Ledger {
         };
         for (record, entry) in self.live(now, quote) {
             live += 1;
-            unique = Some(entry.record);
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                unique = Some(entry.record);
+            }
             join(Some(entry.record.evidence.path));
             let e = entry.record.evidence;
             connection |= e.owner != Owner::Stateless;
@@ -1215,11 +1224,13 @@ impl Ledger {
             join(None);
         }
         let matches = live + signatures;
+        #[cfg(any(test, feature = "test-support"))]
         let alone = live == 1 && signatures == 0 && !summarized;
         Correlation {
             matches,
             summarized,
             path: path.flatten().filter(|_| matches != 0),
+            #[cfg(any(test, feature = "test-support"))]
             unique: unique.filter(|_| alone),
             owner: owner
                 .filter(|(_, record)| {

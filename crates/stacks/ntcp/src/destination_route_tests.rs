@@ -263,7 +263,7 @@ fn destination_configuration_validation_capacity_and_allocation_failure_are_atom
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=TCP actor: endpoint protocol defaults plus bounded destination policies independently select initial effective MTU/search bounds for active and passive peers in IPv4/IPv6. Connectionless-protocol defaults are outside this TCP implementation; no shared IP cache or OS route lookup claim.
+//= reason=TCP actor: endpoint protocol defaults plus bounded destination policies independently select initial effective MTU/search bounds for active and passive peers in IPv4/IPv6. Connectionless-protocol defaults are outside this TCP implementation; the shared IP-layer path cache (ntcp-path PathService) and OS route lookup are not claimed by this test.
 //# Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
 //= type=test

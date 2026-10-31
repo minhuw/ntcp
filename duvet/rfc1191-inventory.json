@@ -591,7 +591,7 @@
       "section": "6.1",
       "quote": "We therefore believe that the IP layer should store PMTU information and that the ICMP layer should process received Datagram Too Big messages. The packetization layers must still be able to respond to changes in the Path MTU, by changing the size of the datagrams they send, and must also be able to specify that datagrams are sent with the DF bit set. We do not want the IP layer to simply set the DF bit in every packet, since it is possible that a packetization layer, perhaps a UDP application outside the kernel, is unable to change its datagram size. Protocols involving intentional fragmentation, while inelegant, are sometimes successful (NFS being the primary example), and we do not want to break such protocols.",
       "status": "TODO",
-      "reason": "T7 PathService stores shared IP estimates; T8 Host binds actual native/TUN TCP factories and validates physical output. T9 Host ICMP dispatch (Host::input_icmp) correlates Datagram Too Big with its committed TCP/UDP submission ledger and publishes accepted decreases; TCP and Host UDP flows are held to the shared budget, and Host UDP datagrams are always sent unfragmented with DF (UdpSendError::TooBig reports the allowable payload); IPv4 TCP sets DF by default, and native sockets configured with IP_MTU_DISCOVER=IP_PMTUDISC_DONT clear it. Remaining: a per-packetization-layer DF choice with intentional source fragmentation and IPv4 identification for datagram users that cannot resize (T13), and datagram consumers notified of shared changes (T10).",
+      "reason": "T7 PathService stores shared IP estimates, T8 Host binds actual native/TUN TCP factories and T9 Host ICMP dispatch processes correlated Datagram Too Big messages. T10 lets packetization layers respond: TCP connections receive each shared change by budget application in Host::service_changes, and Host UDP flows read their payload limit (Host::udp_path_limits) and change notifications (Host::udp_path_change) to resize. Host UDP datagrams are always sent unfragmented with DF (UdpSendError::TooBig reports the allowable payload); IPv4 TCP sets DF by default, and native sockets configured with IP_MTU_DISCOVER=IP_PMTUDISC_DONT clear it. Remaining T13: a per-packetization-layer DF choice with intentional source fragmentation and IPv4 identification for datagram users that cannot resize.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
     },
     {
@@ -659,34 +659,38 @@
     {
       "id": "1191-057",
       "evidence": [
-        "crates/stacks/ntcp-path/src/service/cache.rs::    pub fn trusted_ipv4_fallback(",
-        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn live_policy_replacement_notifies_ipv4_only_and_preserves_all_learned_estimates("
+        "crates/stacks/ntcp-host/src/lib.rs::    fn publish_results(",
+        "crates/stacks/ntcp-host/src/tests/fanout.rs::fn applied_deferred_report_publishes_exactly_once_and_stale_results_never("
       ],
       "section": "6.2",
       "quote": "When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.",
-      "status": "TODO",
-      "reason": "T7 PathService stores per-host learned estimates and the legacy plateau fallback without changing first-hop routes; T8 Host binds actual native/TUN TCP owners. T9 Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section5 plateau below the corrected quoted length, requires correlation with committed submission evidence, and lowers the bound per-host record only when lower (immediate TCP decreases, UDP and path-level reports; real router PTBs in the isolated namespace gate). Stale or evicted path incarnations are never resurrected or changed. Remaining T10: a TCP report deferred below proven delivery is held connection-locally and never reaches the shared record, so the routing entry is not changed for it.",
+      "status": "covered",
+      "reason": "PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the corrected quoted length, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests and real router PTBs in the isolated namespace gate verify it.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
       "id": "1191-058",
       "evidence": [
-        "crates/stacks/ntcp-path/src/service/cache.rs::    fn mark_dirty(",
-        "crates/stacks/ntcp-path/tests/lifecycle.rs::fn independent_clients_share_network_decreases_and_coalesce_without_consuming_reads("
+        "crates/stacks/ntcp-host/src/lib.rs::    pub fn service_changes(",
+        "crates/stacks/ntcp-host/src/tests/fanout.rs::fn quoted_flow_decrease_reaches_every_subscriber_and_isolated_paths_stay_unchanged("
       ],
       "section": "6.2",
       "quote": "The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.",
-      "status": "TODO",
-      "reason": "T7 PathService coalesces dirty snapshots with exact acknowledgements. T8 Host refreshes actual native/TUN TCP owners, including reserved/released generations, without inventing repair or loss events; two-flow and held-output tests exercise trusted decreases. Generic validated ICMP producers and actual datagram consumers/fanout remain T9/T10.",
+      "status": "covered",
+      "reason": "PathService marks every client of a path dirty on each trusted decrease and on link MTU, route, source, link or plateau changes. Host::service_changes, run on every native service_egress and MTU-refresh pass and every tun_echo transmit pass, brings each dirty TCP binding (reserved owners included, budget only, no repair) and each Host UDP flow (a coalesced per-flow change slot carrying MMS_S and the payload limit) to the newest snapshot and acknowledges exactly that version; a failing client stays dirty without stopping the others, and stateless leases and every physical submission revalidate against the current version. Dual-family Host tests (two TCP flows plus a UDP flow, held scalar, zero-copy and partial software GSO reservations, a randomized multi-client model), native reservation-race tests and the isolated namespace shared-fanout case, in which a real router PTB quotes only TCP flow A, verify it.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
       "id": "1191-059",
       "section": "6.2",
       "quote": "Note: even if the Datagram Too Big message contains an Original Datagram Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given",
-      "status": "TODO",
-      "reason": "T9 Host correlates router PTBs quoting Host UDP datagrams with its committed ledger and publishes the decrease; every TCP binding on that path is marked dirty and adopts the budget at its next egress (tun_echo UDP-quoted test and isolated namespace udp-quoted cases). Native sockets submit no UDP datagrams. Remaining T10: verified fanout of one accepted decrease to several TCP flows and a UDP flow on one path, coalescing while clients are reserved, and datagram consumers of shared changes. Sentence continuation is preserved in 1191-060.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
+      "status": "covered",
+      "reason": "A correlated router PTB quoting a Host UDP datagram publishes the decrease to the shared path, and Host::service_changes then applies it to every TCP connection bound to that path (budget only, no repair) on the next native or tun_echo service pass, before any TCP output. Dual-family Host tests and the tun_echo and isolated namespace udp-quoted cases verify it. Sentence continuation is preserved in 1191-060.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2",
+      "evidence": [
+        "crates/stacks/ntcp-host/src/lib.rs::    pub fn service_changes(",
+        "crates/stacks/ntcp-host/src/tests/fanout.rs::fn udp_quoted_decrease_notifies_every_tcp_connection_on_the_path("
+      ]
     },
     {
       "id": "1191-060",
@@ -700,7 +704,7 @@
       "section": "6.2",
       "quote": "Also, the instance that sent the datagram that elicited the Datagram Too Big message should be notified that its datagram has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped datagram.",
       "status": "TODO",
-      "reason": "T9 delivers correlated drop notification independently of the estimate: an equal or nondecreasing but still-smaller-than-packet PTB is consumed by the correlated TCP owner as PmtuFeedback::Unchanged drop advice (black-hole classification without estimate increase, hold restart, error or head retry) and queued to the sending Host UDP flow as UdpEvent::PacketTooBig, which the tun_echo service consumes. Remaining T11: TCP retransmission of exactly the dropped range that advice names (non-head, partially acknowledged and wrapped ranges with duplicate suppression); normal loss recovery is distinct.",
+      "reason": "T9 delivers correlated drop notification independently of the estimate: an equal or nondecreasing but still-smaller-than-packet PTB not below the connection's proven delivery, or about an older path incarnation, is consumed by the correlated TCP owner as PmtuFeedback::Unchanged drop advice (black-hole classification without estimate increase, hold restart, error or head retry); one about the current path below proven delivery is PmtuFeedback::Deferred whatever the loss-inferred estimate, recording the same drop advice. A validated PTB quoting a Host UDP datagram is queued to that flow as UdpEvent::PacketTooBig whether or not the estimate decreases, which the tun_echo service consumes. Remaining T11: TCP retransmission of exactly the dropped range that advice names (non-head, partially acknowledged and wrapped ranges with duplicate suppression); normal loss recovery is distinct.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -813,7 +817,7 @@
       "section": "6.3",
       "quote": "PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.",
       "status": "TODO",
-      "reason": "T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners and gates held physical output; failed rebind preserves dirty authority and bounded backpressure. T9 correlation never lets a stale or invalidated path incarnation change an estimate. ICMP Redirect is decoded as unsupported because no production backend has an IP gateway route: Redirect-driven route changes and their notification are scheduled with the first real Gateway forwarding in T18 (topology evidence T19); full cross-protocol physical races remain T10.",
+      "reason": "T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners, and T10 Host::service_changes notifies every TCP binding and Host UDP flow of the replacement on the next service pass (a failed rebind stays dirty with bounded backpressure) while the submission barrier refuses held packets the current path no longer carries (dual-family Host and native reservation-race tests). T9 correlation never lets a stale or invalidated path incarnation change an estimate. Remaining T18: ICMP Redirect is decoded as unsupported because no production backend has an IP gateway route; Redirect-driven route changes and their notification arrive with the first real Gateway forwarding in T18, with topology evidence in T19.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {

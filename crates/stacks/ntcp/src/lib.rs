@@ -61,9 +61,9 @@ pub use connection::{
     KeepaliveConfig, NetworkError, PacingConfig, State, TimestampGranularity, TransportInfo, Tuple,
 };
 pub use endpoint::{
-    ActiveOpenOptions, AddressValidation, ConnectionId, CorrelatedPmtu, CorrelatedSegment,
-    Endpoint, EndpointConfig, EndpointError, Event, InputDisposition, ListenerId, PollTransmit,
-    Transmit,
+    ActiveOpenOptions, AddressValidation, ConfirmedProbe, ConnectionId, CorrelatedPmtu,
+    CorrelatedSegment, Endpoint, EndpointConfig, EndpointError, Event, InputDisposition,
+    ListenerId, PendingPmtuApplied, PhysicalReceipt, PollTransmit, Transmit,
 };
 pub use ipv4_options::{
     Ipv4Options, Ipv4OptionsError, Ipv4Timestamp, OutgoingIpv4Options, SourceRoute,

@@ -84,6 +84,7 @@ impl Owner {
         // Failed/unchanged queries must neither spin nor kill other connections.
         // Keep the rejected obligation parked until its original deadline.
         if let Ok(Some(mtu)) = result {
+            let now = self.now();
             let changed = if let (Some(host), Some(ingress)) = (&mut self.host, self.ingress) {
                 let changed = host
                     .paths()
@@ -93,7 +94,7 @@ impl Owner {
                     // Canonical physical state first; budget-only application
                     // also visits reserved/released generations. A failed
                     // rebind remains dirty and is retried during service.
-                    let _ = host.refresh_all(&mut self.endpoint);
+                    let _ = host.service_changes(&mut self.endpoint, now);
                     true
                 } else {
                     false

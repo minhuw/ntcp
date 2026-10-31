@@ -562,7 +562,6 @@ fn delivery_shrinks_evicted_tcp_history_so_live_segments_stay_attributable() {
         Evidence {
             link: ingress.link(),
             path: snapshot.path(),
-            stamp: snapshot.stamp(),
             owner: Owner::Tcp(id),
             source: local.ip(),
             destination: remote.ip(),
@@ -722,7 +721,6 @@ fn datagram_owner_group_reservation_identical_quotes_and_horizon() {
     let evidence = |length| Evidence {
         link: ingress.link(),
         path: snapshot.path(),
-        stamp: snapshot.stamp(),
         owner: Owner::Datagram {
             flow: 0,
             generation: 1,
@@ -810,7 +808,6 @@ fn evictions_of_other_owners_never_shadow_a_unique_live_quote() {
         let segment = |owner, from: SocketAddr, start: u32, end: u32| Evidence {
             link: ingress.link(),
             path: snapshot.path(),
-            stamp: snapshot.stamp(),
             owner,
             source: from.ip(),
             destination: remote.ip(),
@@ -916,7 +913,6 @@ fn discarded_summary_blinds_owners_that_could_reuse_its_key() {
     let datagram = |flow: usize, port: u16| Evidence {
         link: ingress.link(),
         path: snapshot.path(),
-        stamp: snapshot.stamp(),
         owner: Owner::Datagram {
             flow,
             generation: flow as u64 + 1,

@@ -55,6 +55,16 @@ pub(crate) struct Probe {
     repair_end: Seq,
 }
 
+/// One deferred report below proven delivery. Its identity changes exactly
+/// when the size that a later timeout would apply changes, so provenance
+/// attached to one report never describes a replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Pending {
+    seq: Seq,
+    mtu: u32,
+    id: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProbeOutcome {
     pub start: Seq,
@@ -84,7 +94,13 @@ pub(crate) struct Pmtud {
     outcome: Option<ProbeOutcome>,
     // Packetization boundary survives cancellation of the probe's search result.
     repair_range: Option<(Seq, Seq)>,
-    pending: Option<(Seq, u32)>,
+    pending: Option<Pending>,
+    pending_ids: u64,
+    // Exactly the pending report a quoted-data timeout applied, never inferred
+    // from current_mtu (loss inference changes that too).
+    applied_pending: Option<(u64, u32)>,
+    // Exact span and size of the latest probe whose delivery proved its size.
+    success: Option<(Seq, Seq, u32)>,
     icmp_since_progress: bool,
     max_sent: u32,
     max_acked: u32,
@@ -162,6 +178,9 @@ impl Pmtud {
             outcome: None,
             repair_range: None,
             pending: None,
+            pending_ids: 0,
+            applied_pending: None,
+            success: None,
             icmp_since_progress: false,
             max_sent: 0,
             max_acked: 0,
@@ -325,6 +344,8 @@ impl Pmtud {
         self.max_sent = 0;
         self.max_acked = 0;
         self.pending = None;
+        self.applied_pending = None;
+        self.success = None;
         self.discovered_high = None;
         self.info.search_low = self.initial_low.min(self.route_bound());
         self.info.search_high = self.search_ceiling();
@@ -341,6 +362,29 @@ impl Pmtud {
                 && self.info.current_mtu > ordinary)
                 .then_some(self.info.current_mtu)
         })
+    }
+
+    /// Identity of the report a quoted-data timeout would apply.
+    pub(crate) fn pending_id(&self) -> Option<u64> {
+        self.pending.map(|p| p.id)
+    }
+
+    /// The pending report identity and the size that report derived under
+    /// this connection's policy, which the last timeout applied.
+    pub(crate) fn take_applied_pending(&mut self) -> Option<(u64, u32)> {
+        self.applied_pending.take()
+    }
+
+    /// Exact span and size of a probe whose delivery the latest ACK proved.
+    pub(crate) fn take_probe_success(&mut self) -> Option<(Seq, Seq, u32)> {
+        self.success.take()
+    }
+
+    /// The outstanding probe while delivery could still prove its size.
+    pub(crate) fn provable_probe(&self) -> Option<(Seq, Seq, u32)> {
+        self.probe
+            .filter(|p| p.size_result_valid && !p.retried && !p.timeout)
+            .map(|p| (p.start, p.end, p.size))
     }
 
     pub fn start_probe(&mut self, start: Seq, payload: u32, trailing: u32, size: u32) {
@@ -741,9 +785,12 @@ impl Pmtud {
     /// ring is not consulted a second time: its eviction must not negate a
     /// valid Host match. TCP policy still applies in full. A report that
     /// identifies a dropped packet without decreasing the estimate (equal or
-    /// larger than current, or about a path incarnation the connection no
-    /// longer uses) is consumed as drop advice only: the black-hole timeout
-    /// learns an ICMP message explained the loss, and nothing else changes.
+    /// larger than current and not below proven delivery, or about a path
+    /// incarnation the connection no longer uses) is consumed as drop advice
+    /// only: the black-hole timeout learns an ICMP message explained the
+    /// loss, and nothing else changes. A current-path report below proven
+    /// delivery is Deferred whatever the current estimate, so a loss-inferred
+    /// local decrease never changes its outcome.
     #[allow(clippy::too_many_arguments)]
     pub fn correlated_feedback(
         &mut self,
@@ -838,7 +885,14 @@ impl Pmtud {
             None if mtu >= self.info.current_mtu || mtu >= self.max_sent => {
                 return PmtuFeedback::Rejected;
             }
-            Some(current_path) if !current_path || mtu >= self.info.current_mtu => {
+            // A current-path report below proven delivery is deferred below
+            // even when a loss-inferred decrease already took the local
+            // estimate under it: what it may change, here or for the Host's
+            // shared record, must not depend on connection-local inference.
+            Some(current_path)
+                if !current_path
+                    || (mtu >= self.info.current_mtu && mtu >= self.max_acked) =>
+            {
                 // RFC 4821 section 7.7: an ICMP message explained this loss.
                 // No estimate increase, hold restart, error or repair.
                 self.icmp_since_progress = true;
@@ -863,12 +917,14 @@ impl Pmtud {
             self.delay(now, self.hold);
             self.periodic_deadline = None;
             self.reset_search = true;
-            self.pending = Some((
-                seq,
-                self.pending
-                    .filter(|(old_seq, _)| *old_seq == seq)
-                    .map_or(mtu, |(_, old)| old.min(mtu)),
-            ));
+            if self.pending.is_none_or(|old| old.seq != seq || mtu < old.mtu) {
+                self.pending_ids += 1;
+                self.pending = Some(Pending {
+                    seq,
+                    mtu,
+                    id: self.pending_ids,
+                });
+            }
             if advice.is_some() {
                 // The deferred size is suspect, the reported drop is not.
                 self.icmp_since_progress = true;
@@ -1079,6 +1135,9 @@ impl Pmtud {
                 //# size.  If the probe size is larger than the eff_pmtu, raise eff_pmtu
                 //# to the probe size.
                 if p.size_result_valid {
+                    // Recorded even when local proof already exceeds it: the
+                    // probe still establishes a network fact for this size.
+                    self.success = Some((p.start, p.end, p.size));
                     self.info.search_low = self.info.search_low.max(p.size);
                     if p.size > self.info.current_mtu {
                         // Preserve the baseline across successive verified increases.
@@ -1265,14 +1324,18 @@ impl Pmtud {
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
     //# If there is a full-stop timeout and there was not an ICMP message indicating a reason (PTB, Net unreachable, etc., or the ICMP message was ignored for some reason), the RECOMMENDED first recovery action is to treat this as a detected ICMP black hole as defined in [RFC2923].
     pub fn timeout(&mut self, now: Instant, head: Seq, consecutive: u32, cooldown: u64) {
-        if let Some((seq, mtu)) = self.pending.take() {
+        if let Some(pending) = self.pending.take() {
             // Only the quoted data's timeout authorizes a deferred decrease.
-            if head == seq {
+            if head == pending.seq {
                 // Deferred feedback is applied only on timeout, which cannot
                 // qualify for an isolated-loss congestion exemption.
-                self.apply_ptb(mtu, now, false);
+                self.apply_ptb(pending.mtu, now, false);
+                // The report's own size, never the estimate now in force: a
+                // lower loss-inferred estimate stays connection-local, and the
+                // report never raises it.
+                self.applied_pending = Some((pending.id, pending.mtu));
             } else {
-                self.pending = Some((seq, mtu));
+                self.pending = Some(pending);
             }
         }
         if let Some(p) = &mut self.probe {
@@ -1363,6 +1426,56 @@ mod tests {
             control.timeout(8, Seq(1), 3, 1000);
             assert_eq!(advised.info.current_mtu, 1400);
             assert!(control.info.current_mtu < 1400);
+        }
+    }
+
+    // A current-path report below proven delivery is deferred whether or not
+    // black-hole timeouts already lowered the local estimate under it; its
+    // timeout never raises that estimate and reports the report's own size,
+    // never the loss-inferred one.
+    #[test]
+    fn below_proven_delivery_report_defers_regardless_of_loss_inferred_estimate() {
+        for ipv4 in [true, false] {
+            let (header, size, reported) = if ipv4 { (20, 1440, 1100) } else { (40, 1460, 1350) };
+            let (first, second, end) = (Seq(1), Seq(1401), Seq(2801));
+            let mut outcomes = [None, None];
+            for (index, inferred) in [false, true].into_iter().enumerate() {
+                for progress in [true, false] {
+                    let mut p = state(ipv4);
+                    p.sent(first, second, size, header, false);
+                    p.ack(second, 1, 1000, 1000);
+                    assert_eq!(p.max_acked, size);
+                    p.sent(second, end, size, header, false);
+                    let mut consecutive = 0;
+                    while inferred && p.info.current_mtu >= reported {
+                        consecutive += 1;
+                        p.timeout(2, second, consecutive, 1000);
+                    }
+                    assert_eq!(inferred, p.info.current_mtu < reported);
+                    let (local, deadline) = (p.info.current_mtu, p.deadline);
+                    assert_eq!(
+                        p.correlated_feedback(3, second, end, size, header, size, reported, true),
+                        PmtuFeedback::Deferred
+                    );
+                    assert_eq!(p.info.current_mtu, local);
+                    assert_ne!(p.deadline, deadline);
+                    let pending = p.pending_id().unwrap();
+                    if progress {
+                        // Cumulative progress clears it: nothing is applied.
+                        p.ack(end, 4, 1000, 1000);
+                        p.timeout(5, end, 1, 1000);
+                        assert_eq!((p.pending_id(), p.take_applied_pending()), (None, None));
+                        continue;
+                    }
+                    // The quoted data's timeout applies exactly that report.
+                    p.timeout(4, second, consecutive + 1, 1000);
+                    assert_eq!(p.info.current_mtu, local.min(reported));
+                    assert_eq!(p.take_applied_pending(), Some((pending, reported)));
+                    outcomes[index] = Some(p.info.current_mtu);
+                }
+            }
+            assert_eq!(outcomes[0], Some(reported));
+            assert!(outcomes[1].unwrap() < reported);
         }
     }
 

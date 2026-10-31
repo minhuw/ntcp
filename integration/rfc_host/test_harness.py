@@ -47,9 +47,9 @@ class IcmpScenario(unittest.TestCase):
                 run.child(dict(kind="icmp", family=4, scenario="udp-quoted"))
             setup.assert_not_called()
 
-    def test_cases_cover_both_families_both_quoted_transports_and_the_forged_control(self):
+    def test_cases_cover_both_families_both_quoted_transports_the_forged_control_and_fanout(self):
         self.assertEqual({(c["family"], c["scenario"]) for c in icmp.cases()},
-                         {(f, s) for f in (4, 6) for s in ("udp-quoted", "tcp-quoted", "forged")})
+                         {(f, s) for f in (4, 6) for s in ("udp-quoted", "tcp-quoted", "forged", "shared-fanout")})
         self.assertFalse(any(c in run.matrix() for c in icmp.cases()))
 
     def original(self, family):

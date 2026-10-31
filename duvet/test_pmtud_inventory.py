@@ -262,7 +262,7 @@ class PmtudInventory(unittest.TestCase):
         self.assertEqual(rows["1191-050"]["status"], "TODO")
         self.assertIn("T9", rows["1191-050"]["reason"])
         self.assertIn("T13", rows["1191-050"]["reason"])
-        self.assertEqual(rows["1191-059"]["status"], "TODO")
+        self.assertEqual(rows["1191-059"]["status"], "covered")
         self.assertEqual(rows["1191-060"]["status"], "context")
         self.assertEqual(rows["1191-060"]["quote"], "path.")
 
@@ -286,11 +286,8 @@ class PmtudInventory(unittest.TestCase):
             self.assertIn("ntcp-host/src/tests.rs::", rows[key]["evidence"][1])
             self.assertIn("before TCP construction", rows[key]["reason"])
         for key, dependencies in {
-            "1191-050": ("T8", "T9", "T10", "T13"),
-            "1191-057": ("T8", "T9", "T10"),
-            "1191-058": ("T8", "T9/T10"),
-            "1191-059": ("T9", "T10"),
-            "1191-074": ("T8", "T9", "T10", "T18"),
+            "1191-050": ("T8", "T9", "T10", "Remaining T13"),
+            "1191-074": ("T8", "T9", "T10", "Remaining T18", "T19"),
         }.items():
             self.assertEqual(rows[key]["status"], "TODO", key)
             self.assertNotIn("T7 phase2", rows[key]["reason"], key)
@@ -299,15 +296,50 @@ class PmtudInventory(unittest.TestCase):
         for key in ("1191-056", "1191-057", "1191-058", "1191-074"):
             self.assertEqual(len(rows[key]["evidence"]), 2, key)
         rows6 = {p["id"]: p for p in self.inventory(8201)["paragraphs"]}
-        for key in ("8201-049", "8201-050", "8201-052", "8201-062", "8201-063"):
+        for key in ("8201-050", "8201-052"):
             self.assertEqual(rows6[key]["status"], "TODO", key)
             self.assertIn("T7 PathService", rows6[key]["reason"], key)
+        # T10 closes whole notification, UDP-quoted, MMS_S, deferred-report
+        # and shared-cache obligations with Host change-service evidence.
+        rows4821 = {p["id"]: p for p in self.inventory(4821)["paragraphs"]}
+        for key, row in {**{k: rows[k] for k in ("1191-057", "1191-058", "1191-059")},
+                         **{k: rows6[k] for k in ("8201-049", "8201-062", "8201-063")},
+                         "4821-079": rows4821["4821-079"]}.items():
+            self.assertEqual(row["status"], "covered", key)
+            self.assertRegex(row["evidence"][0], r"^crates/stacks/ntcp-(host|path)/src/", key)
+            self.assertIn("ntcp-host/src/tests/fanout.rs::", row["evidence"][1], key)
+            self.assertNotRegex(row["reason"], r"\bRemaining\b|T9/T10", key)
+        for key in ("1191-058", "8201-062"):
+            self.assertIn("Host::service_changes", rows.get(key, rows6.get(key))["reason"], key)
+        # TCP reads and updates the cache and UDP reads it, but no datagram
+        # PLPMTUD writes probe-confirmed sizes, so 4821-019 stays open with
+        # owners: T13 the datagram probe send mode, T12 outcome reporting
+        # whose shared writes need Host-owner authority.
+        reason019 = rows4821["4821-019"]["reason"]
+        self.assertEqual(rows4821["4821-019"]["status"], "TODO")
+        self.assertIn("Host::service_changes", reason019)
+        self.assertIn("below proven delivery is deferred whatever", reason019)
+        self.assertIn("T13 adds the RFC 4821 section 9 datagram probe send mode", reason019)
+        self.assertIn("T12 adds probe-outcome reporting", reason019)
+        self.assertIn("authority granted by the Host owner", reason019)
+        self.assertNotIn("no planned task", reason019)
+        self.assertNotIn("Unchanged-for-TCP", reason019)
+        for key in ("4821-019", "4821-076", "4821-195"):
+            self.assertNotRegex(rows4821[key]["reason"], r"udp_send_probe|udp_confirm_delivery", key)
+        # Exceptions about sharing describe the shared cache that now exists.
+        for key in ("4821-069", "4821-076", "4821-077", "4821-080", "4821-081", "4821-083", "4821-195"):
+            row = rows4821[key]
+            self.assertEqual(row["status"], "exception", key)
+            self.assertIn("PathService", row["reason"], key)
+            self.assertNotRegex(row["reason"], r"independently TODO|remains TODO at 079|no sessions share|no cross-protocol", key)
         # T9 closes only the whole distinct-notification clause; the drop
         # notifications themselves still await exact T11 repair.
         self.assertEqual(rows6["8201-066"]["status"], "covered")
         self.assertIn("ntcp-host/src/lib.rs::", rows6["8201-066"]["evidence"][0])
-        for key, dependency in (("1191-061", "T11"), ("8201-064", "T11"), ("4821-019", "T10"), ("4821-079", "T10")):
-            row = (rows6 if key.startswith("8201") else {**rows, **{p["id"]: p for p in self.inventory(4821)["paragraphs"]}})[key]
+        self.assertIn("next service pass", rows6["8201-066"]["reason"])
+        self.assertNotIn("next egress refresh", rows6["8201-066"]["reason"])
+        for key, dependency in (("1191-061", "T11"), ("8201-064", "T11")):
+            row = (rows6 if key.startswith("8201") else rows)[key]
             self.assertEqual(row["status"], "TODO", key)
             self.assertIn(dependency, row["reason"], key)
 

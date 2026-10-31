@@ -908,9 +908,17 @@ mod linux {
         timestamp: u32,
         backend: &mut impl PacketIo,
     ) -> io::Result<()> {
-        // The bounded sweep retains dirty updates when authority cannot rebind.
+        // The change service publishes connection results and serves every
+        // dirty client; one that cannot rebind stays dirty for the next pass.
         // A blocked selected packet below exposes that failure and pauses output.
-        let _ = network.host.refresh_all(endpoint);
+        if let Ok(report) = network.host.service_changes(endpoint, time)
+            && let Some(error) = report.first_error
+        {
+            eprintln!(
+                "path change service left {} client(s) pending: {error:?}",
+                report.failed
+            );
+        }
         for _ in 0..BUDGET {
             if pending.is_none() {
                 let (polled, attempt) = endpoint
@@ -1047,9 +1055,18 @@ mod linux {
         packet: [u8; MTU],
         held: Option<(SocketAddr, usize)>,
         blocked: bool,
+        #[cfg(test)]
+        notes: Vec<String>,
     }
 
     impl UdpEcho {
+        // Operational reports go to stderr; tests also read them back.
+        fn note(&mut self, line: std::fmt::Arguments) {
+            eprintln!("{line}");
+            #[cfg(test)]
+            self.notes.push(line.to_string());
+        }
+
         fn open(
             network: &mut TunHost,
             endpoint: &Endpoint,
@@ -1074,6 +1091,8 @@ mod linux {
                 packet: [0; MTU],
                 held: None,
                 blocked: false,
+                #[cfg(test)]
+                notes: Vec::new(),
             })
         }
 
@@ -1093,14 +1112,40 @@ mod linux {
                         remote,
                         mtu,
                         dropped_len,
-                    }) => eprintln!(
+                    }) => self.note(format_args!(
                         "UDP echo reply to {remote} ({dropped_len} octets) dropped by the \
                          path (next-hop MTU {mtu:?}); later replies use the reduced budget"
-                    ),
+                    )),
                     Some(UdpEvent::NetworkError { remote, error }) => {
-                        eprintln!("UDP echo reply to {remote} failed: {error:?}")
+                        self.note(format_args!("UDP echo reply to {remote} failed: {error:?}"))
                     }
                     None => break,
+                }
+                progress = true;
+            }
+            // A shared change to the pinned path: report the new limit and
+            // reconsider a held reply against it. Echoes are indivisible, so
+            // one that no longer fits is refused, never truncated or split.
+            if let Some(change) = network
+                .host
+                .udp_path_change(self.flow)
+                .map_err(host_error)?
+            {
+                self.note(format_args!(
+                    "UDP echo path to {} changed: MMS_S {}, payload limit {}",
+                    change.destination, change.mms_s, change.max_payload
+                ));
+                if let Some((peer, len)) = self.held
+                    && peer.ip() == change.destination
+                    && len > change.max_payload
+                {
+                    self.note(format_args!(
+                        "UDP echo of {len} octets to {peer} refused: exceeds the changed \
+                         path payload limit of {}",
+                        change.max_payload
+                    ));
+                    self.held = None;
+                    self.blocked = false;
                 }
                 progress = true;
             }
@@ -1117,6 +1162,25 @@ mod linux {
                     progress = true;
                     continue;
                 };
+                // Size the reply against the current path before building it.
+                match network
+                    .host
+                    .udp_path_limits(endpoint, self.flow, Some(peer.ip()))
+                {
+                    Ok(limits) if len > limits.max_payload => {
+                        self.note(format_args!(
+                            "UDP echo of {len} octets to {peer} refused: exceeds the path \
+                             payload limit of {}; replies are never fragmented",
+                            limits.max_payload
+                        ));
+                        self.held = None;
+                        self.blocked = false;
+                        progress = true;
+                        continue;
+                    }
+                    // The send below reports any failure of this authority.
+                    _ => {}
+                }
                 let mut unusable = false;
                 let mut failure = None;
                 let port = network.ingress.link();
@@ -1144,10 +1208,13 @@ mod linux {
                             failure.unwrap_or_else(|| io::Error::other("unknown TUN outcome"))
                         );
                     }
-                    Err(UdpSendError::TooBig { max_payload }) => eprintln!(
-                        "UDP echo of {len} octets to {peer} exceeds the current path payload \
-                         of {max_payload}; replies are never fragmented, so it is dropped"
-                    ),
+                    // Nothing runs between the query above and this send, so
+                    // the query already refused whatever this would; this is
+                    // the send's own enforcement of the same limit.
+                    Err(UdpSendError::TooBig { max_payload }) => self.note(format_args!(
+                        "UDP echo of {len} octets to {peer} refused at send: exceeds the path \
+                         payload limit of {max_payload}; replies are never fragmented"
+                    )),
                     // Retry the same reply once the TUN or evidence storage frees.
                     Err(
                         UdpSendError::NotSubmitted(_)
@@ -1156,7 +1223,9 @@ mod linux {
                         self.blocked = true;
                         break;
                     }
-                    Err(error) => eprintln!("UDP echo reply to {peer} not sent: {error:?}"),
+                    Err(error) => {
+                        self.note(format_args!("UDP echo reply to {peer} not sent: {error:?}"))
+                    }
                 }
                 self.held = None;
                 self.blocked = false;

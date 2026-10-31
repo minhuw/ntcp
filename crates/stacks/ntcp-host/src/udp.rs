@@ -110,6 +110,20 @@ pub enum UdpEvent {
     },
 }
 
+/// What a flow may send to its pinned destination now: the path's MMS_S
+/// (RFC 1191 section 6.1: path MTU less the minimum IP header) and the
+/// largest UDP payload one unfragmented datagram may carry, with the path
+/// incarnation and shared version they were read from. Datagrams are indivisible, so an application
+/// sizes each one against this before building it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdpPathLimits {
+    pub destination: IpAddr,
+    pub path: ntcp_path::PathId,
+    pub version: u64,
+    pub mms_s: u32,
+    pub max_payload: usize,
+}
+
 /// Where the one physical call goes; the closure owns no other authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdpEgress {
@@ -151,6 +165,9 @@ struct Flow {
     remote: Option<SocketAddr>,
     options: UdpOptions,
     path: Option<PreparedPath>,
+    // Newest unconsumed shared change to the pinned path, replaced (never
+    // queued) by later ones, so a slow reader sees the current limits.
+    change: Option<UdpPathLimits>,
     received: Ring,
     events: Ring,
 }
@@ -166,7 +183,7 @@ struct Slot {
 }
 
 pub(crate) struct Udp {
-    limits: UdpLimits,
+    pub(crate) limits: UdpLimits,
     slots: Vec<Slot>,
     // Slot i owns entries [i * depth, (i + 1) * depth) of each table, and
     // payload bytes [i * depth * max_payload ..] in max_payload strides.
@@ -241,6 +258,25 @@ impl Udp {
     }
 }
 
+fn udp_limits(snapshot: ntcp_path::PathSnapshot) -> Result<UdpPathLimits, Error> {
+    let destination = snapshot.key().destination().address();
+    let header = if destination.is_ipv4() {
+        ntcp_ip::IPV4_HEADER
+    } else {
+        ntcp_ip6::IPV6_HEADER
+    };
+    let budget = snapshot.ip_packet_budget()? as usize;
+    Ok(UdpPathLimits {
+        destination,
+        path: snapshot.path(),
+        version: snapshot.version(),
+        mms_s: snapshot.mms_s()?,
+        max_payload: budget
+            .saturating_sub(header + ntcp_ip::UDP_HEADER)
+            .min(usize::from(u16::MAX) - ntcp_ip::UDP_HEADER),
+    })
+}
+
 fn supported(address: SocketAddr) -> bool {
     !matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
 }
@@ -302,6 +338,9 @@ impl Host {
                 let resolved = self.paths.resolve_via(request, via)?;
                 self.forwarding_resolved(resolved.key())?;
                 let (client, snapshot) = self.paths.acquire_via(request, via)?;
+                // The flow observes its initial path here (and through
+                // `udp_path_limits`); only later changes notify it.
+                self.paths.acknowledge(client, snapshot.stamp())?;
                 Some(PreparedPath { client, snapshot })
             }
             None => None,
@@ -314,6 +353,7 @@ impl Host {
                 remote,
                 options,
                 path,
+                change: None,
                 received: Ring::default(),
                 events: Ring::default(),
             }),
@@ -375,7 +415,7 @@ impl Host {
         {
             return Err(Error::from(EndpointError::InvalidAddress).into());
         }
-        let prepared = self.udp_path(id.slot, flow, remote.ip())?;
+        let (prepared, limits) = self.udp_path(id.slot, flow, remote.ip())?;
         let snapshot = prepared.snapshot;
         let ipv4 = remote.is_ipv4();
         let header = if ipv4 {
@@ -384,10 +424,7 @@ impl Host {
             ntcp_ip6::IPV6_HEADER
         };
         let overhead = header + ntcp_ip::UDP_HEADER;
-        let budget = snapshot.ip_packet_budget().map_err(Error::Path)? as usize;
-        let max_payload = budget
-            .saturating_sub(overhead)
-            .min(usize::from(u16::MAX) - ntcp_ip::UDP_HEADER);
+        let max_payload = limits.max_payload;
         if payload.len() > max_payload {
             return Err(UdpSendError::TooBig { max_payload });
         }
@@ -439,7 +476,6 @@ impl Host {
         let evidence = Evidence {
             link: snapshot.key().link(),
             path: snapshot.path(),
-            stamp: snapshot.stamp(),
             owner,
             source: ip.source,
             destination: ip.destination,
@@ -497,11 +533,73 @@ impl Host {
         }
     }
 
+    /// Pin `remote` (the fixed remote when None) as the flow's destination,
+    /// with the same checked rebind as a send, and report its current limits.
+    /// An unconsumed change notification survives this acknowledgement.
+    pub fn udp_path_limits(
+        &mut self,
+        endpoint: &Endpoint,
+        id: UdpFlowId,
+        remote: Option<IpAddr>,
+    ) -> Result<UdpPathLimits, Error> {
+        self.check_endpoint(endpoint)?;
+        let flow = self.udp.flow(id)?;
+        let remote = match (flow.remote.map(|r| r.ip()), remote) {
+            (Some(fixed), None) => fixed,
+            (Some(fixed), Some(remote)) if fixed == remote => fixed,
+            (None, Some(remote)) => remote,
+            _ => return Err(Error::InvalidContext),
+        };
+        Ok(self.udp_path(id.slot, flow, remote)?.1)
+    }
+
+    /// The newest shared change to the flow's pinned path since it was last
+    /// taken, consumed once. Sends and queries acknowledge the path service
+    /// but never consume this, so a change is not lost to a send that raced
+    /// with it.
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.1
+    //= reason=PathService stores IPv6 estimates and Host ICMPv6 dispatch processes correlated Packet Too Big messages. TCP learns MMS_S changes through Host::service_changes budget application; a Host UDP flow reads MMS_S and its payload limit with Host::udp_path_limits and receives each shared change through Host::udp_path_change (coalesced to the newest version and not consumed by sends), without a failed send. Dual-family Host tests, tun_echo and the isolated namespace shared-fanout case verify it.
+    //# It is therefore suggested that the IP layer store PMTU information and that the ICMPv6 layer process received Packet Too Big messages. The packetization layers may respond to changes in the PMTU by changing the size of the messages they send. To support this layering, packetization layers require a way to learn of changes in the value of MMS_S, the "maximum send transport-message size" [RFC1122].
+    pub fn udp_path_change(&mut self, id: UdpFlowId) -> Result<Option<UdpPathLimits>, Error> {
+        self.udp.flow(id)?;
+        Ok(self.udp.slots[id.slot].flow.as_mut().unwrap().change.take())
+    }
+
+    // Change service for one flow: a dirty pinned path is re-read (rebound
+    // when invalidated) and its newest limits replace the notification.
+    pub(crate) fn udp_service(&mut self, slot: usize) -> Result<bool, Error> {
+        let Some(flow) = self.udp.slots[slot].flow else {
+            return Ok(false);
+        };
+        let Some(prepared) = flow.path else {
+            return Ok(false);
+        };
+        if !self.paths.is_dirty(prepared.client)? {
+            return Ok(false);
+        }
+        let remote = prepared.snapshot.key().destination().address();
+        self.udp_path(slot, flow, remote)?;
+        Ok(true)
+    }
+
     // The flow's current authority for `remote`: the live snapshot when it
     // still selects the same request and forwarding destination, otherwise
     // a checked rebind (or first acquisition). Every send consumes the
-    // newest shared estimate, acknowledging what it observed.
-    fn udp_path(&mut self, slot: usize, flow: Flow, remote: IpAddr) -> Result<PreparedPath, Error> {
+    // newest shared estimate, acknowledging what it observed; a shared
+    // change it acknowledges is first recorded as the flow's notification,
+    // always naming the destination whose path changed.
+    fn udp_path(
+        &mut self,
+        slot: usize,
+        flow: Flow,
+        remote: IpAddr,
+    ) -> Result<(PreparedPath, UdpPathLimits), Error> {
+        let changed = match flow.path {
+            Some(prepared) if self.paths.is_dirty(prepared.client)? => {
+                Some(self.paths.snapshot(prepared.client)?)
+            }
+            _ => None,
+        };
         let request = self.request(flow.local.ip(), remote, Dscp::new(flow.options.dscp)?)?;
         let via = ScopedAddress::new(remote, None)?;
         let current = match flow.path {
@@ -532,10 +630,25 @@ impl Host {
                 PreparedPath { client, snapshot }
             }
         };
-        self.udp.slots[slot].flow.as_mut().unwrap().path = Some(prepared);
+        let limits = udp_limits(prepared.snapshot)?;
+        // Moving the pin to another destination is not a change of that
+        // destination's path: a pending change of the old one is reported
+        // with its own newest limits, or not at all once it is invalid.
+        let change = match changed {
+            Some(old) if old.key().destination() == prepared.snapshot.key().destination() => {
+                Some(limits)
+            }
+            Some(old) if old.status() == PathStatus::Valid => Some(udp_limits(old)?),
+            _ => None,
+        };
+        let record = self.udp.slots[slot].flow.as_mut().unwrap();
+        record.path = Some(prepared);
+        if change.is_some() {
+            record.change = change;
+        }
         self.paths
             .acknowledge(prepared.client, prepared.snapshot.stamp())?;
-        Ok(prepared)
+        Ok((prepared, limits))
     }
 
     /// Next queued datagram: its sender and length. A buffer smaller than the

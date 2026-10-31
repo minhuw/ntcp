@@ -179,6 +179,123 @@ fn managed_scheduled_held_physical_and_shared_decreases_preserve_submitted_prefi
     }
 }
 
+// Successive network decreases (two shared estimates, then a physical
+// first-hop decrease) arrive while the native owner keeps a partially
+// submitted reservation whose retries the backend blocks or rejects; a
+// first-hop increase then restores the learned estimate. Every offered retry
+// fits the budget current at that pass, nothing beyond the accepted prefix
+// is charged, and the receiver reads exactly the written stream once.
+#[test]
+fn managed_scheduled_successive_decreases_with_refused_retries_then_increase() {
+    for v6 in [false, true] {
+        for (gso, shared) in [(false, false), (true, false), (true, true)] {
+            let (mut a, mut b, client, server, wa, wb) = pair_output(v6, gso, shared);
+            let cid = connection(&a, client);
+            let data: Vec<_> = (0..7000).map(|n| (n % 251) as u8).collect();
+            let registration =
+                crate::RegisteredPayload::register(ntcp_io::Payload::from_vec(data.clone()))
+                    .unwrap();
+            if shared {
+                a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+                    .unwrap();
+                let pointer = registration.as_slice().as_ptr() as usize;
+                a.execute(client, Op::Send(vec![(pointer, data.len())], MSG_ZEROCOPY))
+                    .unwrap();
+            } else {
+                a.execute(client, Op::Write(data.clone())).unwrap();
+            }
+            let port = a.endpoint.tuple(cid).unwrap().local.port();
+            wa.lock().unwrap().block_after = Some((port, 1));
+            a.service_egress().unwrap();
+            assert_eq!(wa.lock().unwrap().sent.len(), 1);
+            assert!(a.endpoint.is_output_reserved(cid));
+            let first = wa.lock().unwrap().sent[0].clone();
+            {
+                let mut wire = wa.lock().unwrap();
+                wire.block_after = None;
+                wire.block_port = Some(port);
+            }
+            let before = a.endpoint.transport_info(cid).unwrap();
+            let progress = a.endpoint.send_progress(cid).unwrap();
+            let (m1, m2, l3) = if v6 {
+                (1420, 1350, 1280)
+            } else {
+                (1300, 1100, 1000)
+            };
+            let mut retries = 0;
+            for (limit, physical, reject) in
+                [(m1, false, false), (m2, false, true), (l3, true, false)]
+            {
+                wa.lock().unwrap().reject = reject;
+                let mark = wa.lock().unwrap().offered.len();
+                budget(&mut a, cid, limit, physical);
+                tick(&mut a);
+                a.service_egress().unwrap();
+                assert_eq!(
+                    a.endpoint.managed_path(cid).unwrap().ordinary_ip_budget,
+                    limit
+                );
+                let wire = wa.lock().unwrap();
+                assert_eq!(wire.sent.len(), 1, "only the accepted prefix left");
+                assert!(wire.offered.len() > mark, "a retry reached the backend");
+                assert!(
+                    wire.offered[mark..]
+                        .iter()
+                        .all(|p| ip_size(p) <= limit as usize)
+                );
+                retries += wire.offered.len() - mark;
+                drop(wire);
+                let info = a.endpoint.transport_info(cid).unwrap();
+                assert_eq!(
+                    (
+                        info.unacked,
+                        info.lost,
+                        info.retransmitted,
+                        info.ssthresh,
+                        info.recovery
+                    ),
+                    (
+                        before.unacked,
+                        before.lost,
+                        before.retransmitted,
+                        before.ssthresh,
+                        false
+                    )
+                );
+                assert_eq!(a.endpoint.send_progress(cid).unwrap(), progress);
+            }
+            budget(&mut a, cid, 1500, true);
+            assert_eq!(a.endpoint.managed_path(cid).unwrap().ordinary_ip_budget, m2);
+            let mark = {
+                let mut wire = wa.lock().unwrap();
+                wire.reject = false;
+                wire.block_port = None;
+                wire.offered.len()
+            };
+            complete(&mut a, &mut b, &wa, &wb, cid, data.len());
+            assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, data);
+            assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), EAGAIN);
+            let wire = wa.lock().unwrap();
+            assert!(
+                wire.offered[mark..]
+                    .iter()
+                    .all(|p| ip_size(p) <= m2 as usize)
+            );
+            let after = a.endpoint.transport_info(cid).unwrap();
+            assert_eq!(
+                (after.lost, after.retransmitted, after.recovery),
+                (0, 0, false)
+            );
+            eprintln!(
+                "NATIVE_RACE family={} gso={gso} shared={shared} prefix_ip={} budgets={m1}->{m2}->{l3}->{m2} refused_retries={retries} later_offered={} acknowledged=7000",
+                if v6 { 6 } else { 4 },
+                ip_size(&first),
+                wire.offered.len() - mark
+            );
+        }
+    }
+}
+
 #[test]
 fn managed_scheduled_harmless_stamp_preserves_held_attempt_and_real_rto_work() {
     let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);
@@ -236,8 +353,11 @@ fn managed_scheduled_harmless_stamp_preserves_held_attempt_and_real_rto_work() {
 
 #[test]
 fn managed_scheduled_genuine_probe_submits_but_new_negative_revision_rejects_held_intent() {
+    // Harmless: only a link increase changes the path version. Unchanged: a
+    // fresh equal report keeps the estimate but restarts the hold. Lower: a
+    // new negative revision. Only the harmless change may submit the probe.
     for v6 in [false, true] {
-        for stale in [false, true] {
+        for (stale, unchanged) in [(false, false), (true, true), (true, false)] {
             let (mut a, mut b, client, server, wa, wb) = pair_output(v6, false, false);
             let cid = connection(&a, client);
             let mtu = if v6 { 1350 } else { 1100 };
@@ -273,14 +393,27 @@ fn managed_scheduled_genuine_probe_submits_but_new_negative_revision_rejects_hel
             let selected = wa.lock().unwrap().offered.last().unwrap().clone();
             assert_eq!(intent.ip_packet_len() as usize, ip_size(&selected));
             assert!(ip_size(&selected) > mtu as usize);
-            let limit = if stale {
+            let limit = if unchanged {
+                let prior = a.host.as_ref().unwrap().binding(cid).unwrap().snapshot;
+                budget(&mut a, cid, mtu, false);
+                let current = a
+                    .host
+                    .as_ref()
+                    .unwrap()
+                    .paths()
+                    .path_snapshot(prior.path())
+                    .unwrap();
+                assert_eq!(current.learned_mtu(), Some(mtu));
+                assert_eq!(current.negative_revision(), prior.negative_revision());
+                assert!(current.retry_not_before() > prior.retry_not_before());
+                mtu
+            } else if stale {
                 let limit = if v6 { 1280 } else { 1050 };
                 budget(&mut a, cid, limit, false);
                 limit
             } else {
                 let prior = a.egress.as_ref().unwrap().context(cid).unwrap();
                 let deadline = a.endpoint.next_deadline();
-                budget(&mut a, cid, mtu, false); // Equal evidence cannot restart holdoff.
                 a.host
                     .as_mut()
                     .unwrap()
@@ -325,9 +458,30 @@ fn managed_scheduled_genuine_probe_submits_but_new_negative_revision_rejects_hel
                 b.execute(server, Op::Read(BYTES)).unwrap().bytes,
                 vec![7; 20000]
             );
-            assert!(a.endpoint.managed_path(cid).unwrap().ordinary_ip_budget <= limit);
+            // The runtime's change service publishes the delivered probe,
+            // selected after the hold and definitely submitted, as the new
+            // shared ceiling; a probe the stale cases rejected proves nothing, and
+            // their restarted hold outlasts the transfer.
+            let ordinary = a.endpoint.managed_path(cid).unwrap().ordinary_ip_budget;
+            let learned = a
+                .host
+                .as_ref()
+                .unwrap()
+                .binding(cid)
+                .unwrap()
+                .snapshot
+                .learned_mtu();
+            if stale {
+                assert!(ordinary <= limit);
+                assert_eq!(learned, Some(limit));
+            } else {
+                // Later probes of the same transfer may confirm more.
+                let learned = learned.unwrap();
+                assert!(learned >= ip_size(&selected) as u32);
+                assert!(ordinary > limit && ordinary <= learned);
+            }
             eprintln!(
-                "NATIVE_PROBE family={} stale={stale} selected_ip={} ordinary={limit} acknowledged=24000",
+                "NATIVE_PROBE family={} stale={stale} unchanged={unchanged} selected_ip={} ordinary={ordinary} learned={learned:?} acknowledged=24000",
                 if v6 { 6 } else { 4 },
                 ip_size(&selected)
             );

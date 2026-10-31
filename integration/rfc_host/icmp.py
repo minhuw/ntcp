@@ -38,9 +38,14 @@ ADDRESSES = {
             wrong="2001:db8:92::3", prefix="64"),
 }
 MACS = dict(t9ra="02:00:00:00:09:01", t9pa="02:00:00:00:09:02", t9rb="02:00:00:00:09:03", t9pb="02:00:00:00:09:04")
-SCENARIOS = ("udp-quoted", "tcp-quoted", "forged")
+SCENARIOS = ("udp-quoted", "tcp-quoted", "forged", "shared-fanout")
 # tun_echo's consumed per-flow UdpEvent::PacketTooBig: remote, dropped size, MTU.
 ADVICE = r"UDP echo reply to (\S+) \((\d+) octets\) dropped by the path \(next-hop MTU (?:Some\()?(\d+)"
+# The echo's local refusal of an oversize reply: by its path query before
+# encoding, on a change notification while held, or by the send's own check.
+# The echo's report of a shared path change it read without sending.
+CHANGED = r"UDP echo path to (\S+) changed: MMS_S (\d+), payload limit (\d+)"
+REFUSED = r"UDP echo of (\d+) octets to (\S+) refused(?: at send)?: exceeds the (?:changed )?path payload limit of (\d+)"
 
 
 def cases():
@@ -387,7 +392,72 @@ def child(case, proof, binary, Peer, command, emit):
         # Warm-up proves both routes before any oversize traffic.
         warm = udp(64, 1)
         assert warm["reply"] == 64 and warm["match"], warm
-        if scenario == "udp-quoted":
+        def stream(command, name, size, salt):
+            peer.send(f"{command} {name} {size} {salt}")
+            result = peer.read()
+            assert result["event"] == command and result["name"] == name and result["rx"] == size, result
+            return result
+
+        def inner(ptb):
+            """The quoted packet's transport tuple (the quote is truncated)."""
+            quoted = parse(ptb["quote"])
+            assert quoted is not None and quoted["source"] == a["ntcp"] and quoted["destination"] == a["peer"], public(ptb)
+            return dict(protocol=quoted["protocol"], sport=quoted.get("sport"), dport=quoted.get("dport"),
+                        seq=quoted.get("seq"), length=quoted["length"])
+
+        if scenario == "shared-fanout":
+            # A UDP client and TCP streams A and B, all established on the one
+            # path before any oversize packet. Only A then sends large data.
+            b_open = stream("open", "b", 64, 31)
+            a_open = stream("open", "a", 64, 32)
+            assert a_open["local_port"] != b_open["local_port"]
+            mark, line = capture.mark(), ntcp.mark()
+            a_done = stream("finish", "a", TCP_BYTES, 33)
+            assert a_done["hash"] == fnv(pattern(TCP_BYTES, 33)), a_done
+            # The UDP echo reports the shared change without sending.
+            changed = ntcp.wait(CHANGED, line, 5)
+            assert (changed.group(1), int(changed.group(2)), int(changed.group(3))) == (
+                a["peer"], 1280 - header_len(family), allowed), changed.group(0)
+            events = capture.since(mark)
+            assert not sent(events, 17), "UDP sent nothing while A was quoted"
+            b_quiet = [e for e in sent(events, 6) if b_open["local_port"] in (e["sport"], e["dport"])]
+            assert not b_quiet, ("B was quiescent", [public(e) for e in b_quiet[:4]])
+            data = [e for e in sent(events, 6) if e["payload"] and e["dport"] == a_open["local_port"]]
+            originals = [e for e in data if e["length"] == 1500]
+            assert originals, [public(e) for e in data[:8]]
+            # Every PTB the capture holds, from setup on, quotes A's TCP tuple:
+            # none quotes B or the UDP flow.
+            all_ptbs = ptbs(capture.since(0))
+            tuples = [inner(p) for p in all_ptbs]
+            assert tuples and all(t["protocol"] == 6 and (t["sport"], t["dport"]) == (PORT, a_open["local_port"])
+                                  for t in tuples), tuples
+            correlation = accepted_ptb(events, originals)
+            assert len(correlation) == len(all_ptbs), (correlation, tuples)
+            # B, never quoted, completes within the new limit with no PTB.
+            mark = capture.mark()
+            b_done = stream("finish", "b", TCP_BYTES, 34)
+            assert b_done["hash"] == fnv(pattern(TCP_BYTES, 34)), b_done
+            events = capture.since(mark)
+            b_data = [e for e in sent(events, 6) if e["payload"] and e["dport"] == b_open["local_port"]]
+            assert b_data and max(e["length"] for e in b_data) == 1280 and not ptbs(events), (
+                [public(e) for e in b_data[:8]], [public(e) for e in ptbs(events)])
+            # The UDP echo refuses an oversize reply locally and returns a
+            # fitting one exactly.
+            mark, line = capture.mark(), ntcp.mark()
+            refused_udp = udp(big, 35, 1.0)
+            assert refused_udp["reply"] is None, refused_udp
+            refused = ntcp.wait(REFUSED, line, 5)
+            assert (int(refused.group(1)), int(refused.group(3))) == (big, allowed), refused.group(0)
+            fitted = udp(allowed, 36)
+            assert fitted["reply"] == allowed and fitted["match"], fitted
+            later = sent(capture.since(mark), 17)
+            assert [e["length"] for e in later] == [1280] and not ptbs(capture.since(mark)), [public(e) for e in later]
+            evidence.update(a=dict(open=a_open, finish=a_done, large_segments=len(originals)),
+                            b=dict(open=b_open, finish=b_done, data_packets=len(b_data),
+                                   max_ip_length=max(e["length"] for e in b_data)),
+                            quoted_tuples=tuples, correlation=correlation, udp_change=changed.group(0),
+                            oversize_refusal=refused.group(0), fitting_udp=dict(reply=fitted, ip_length=later[0]["length"]))
+        elif scenario == "udp-quoted":
             mark, line = capture.mark(), ntcp.mark()
             dropped = udp(big, 2, 1.0)
             assert dropped["reply"] is None, dropped
@@ -403,8 +473,8 @@ def child(case, proof, binary, Peer, command, emit):
             mark, line = capture.mark(), ntcp.mark()
             again = udp(big, 3, 1.0)
             assert again["reply"] is None, again
-            refused = ntcp.wait(r"exceeds the current path payload of (\d+)", line, 5)
-            assert int(refused.group(1)) == allowed, refused.group(0)
+            refused = ntcp.wait(REFUSED, line, 5)
+            assert (int(refused.group(1)), int(refused.group(3))) == (big, allowed), refused.group(0)
             fitted = udp(allowed, 4)
             assert fitted["reply"] == allowed and fitted["match"], fitted
             later = sent(capture.since(mark), 17)
@@ -446,8 +516,8 @@ def child(case, proof, binary, Peer, command, emit):
             mark, line = capture.mark(), ntcp.mark()
             refused_udp = udp(big, 8, 1.0)
             assert refused_udp["reply"] is None, refused_udp
-            refused = ntcp.wait(r"exceeds the current path payload of (\d+)", line, 5)
-            assert int(refused.group(1)) == allowed, refused.group(0)
+            refused = ntcp.wait(REFUSED, line, 5)
+            assert (int(refused.group(1)), int(refused.group(3))) == (big, allowed), refused.group(0)
             fitted = udp(allowed, 9)
             assert fitted["reply"] == allowed and fitted["match"], fitted
             assert not [e for e in sent(capture.since(mark), 17) if e["length"] > 1280]
@@ -495,8 +565,8 @@ def child(case, proof, binary, Peer, command, emit):
             line = ntcp.mark()
             refused_udp = udp(big, 15, 1.0)
             assert refused_udp["reply"] is None, refused_udp
-            refused = ntcp.wait(r"exceeds the current path payload of (\d+)", line, 5)
-            assert int(refused.group(1)) == allowed, refused.group(0)
+            refused = ntcp.wait(REFUSED, line, 5)
+            assert (int(refused.group(1)), int(refused.group(3))) == (big, allowed), refused.group(0)
             evidence.update(rejected=rejected, unchanged_udp=after, unchanged_tcp=stream_after, stream=stream,
                             positive_control=dict(forged_hex=control[:96].hex(), advice=advice.group(0),
                                                   refusal=refused.group(0)))

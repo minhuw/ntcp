@@ -167,7 +167,7 @@
       "section": "2",
       "quote": "Most of the difficulty in implementing PLPMTUD arises because it needs to be implemented in several different places within a single node. In general, each Packetization Protocol needs to have its own implementation of PLPMTUD. Furthermore, the natural mechanism to share Path MTU information between concurrent or subsequent connections is a path information cache in the IP layer. The various Packetization Protocols need to have the means to access and update the shared cache in the IP layer. This memo describes PLPMTUD in terms of its primary subsystems without fully describing how they are assembled into a complete implementation.",
       "status": "TODO",
-      "reason": "T7 PathService is the IP-layer path cache and T8 Host binds TCP owners to it. T9 lets TCP (correlated immediate PTB decreases) and Host UDP flows (UDP-quoted PTB publication, budget-limited sends) update and read it through the Host. Remaining T10: TCP PLPMTUD probe-confirmed estimates stay connection-local without positive publication, and datagram consumers are not notified of shared changes. This is the same layering recommendation as 079.",
+      "reason": "PathService is the IP-layer path information cache shared by the Host's packetization protocols. TCP runs its own PLPMTUD, reads the cache through Host::service_changes budget application and updates it with correlated PTBs and with probe-confirmed sizes (a definitely submitted, unfragmented probe selected after the hold whose span the peer acknowledged, published through PathService::confirm_delivery). A correlated TCP report about the connection's current path at or above its proven delivery lowers the cache at once when lower and otherwise restarts its hold; one below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared until that exact report's quoted-data timeout applies it, when the larger of the Host estimate and the report's own policy-derived size is published; cumulative progress past the quoted data refutes it. Loss-inferred decreases stay connection-local. Host UDP flows read MMS_S and the payload limit (Host::udp_path_limits, Host::udp_path_change) and lower the cache only through correlated PTBs quoting their datagrams. Remaining: Host UDP has no datagram PLPMTUD, so no datagram protocol yet probes or writes probe-confirmed sizes. Owners: T13 adds the RFC 4821 section 9 datagram probe send mode (an application datagram larger than the current estimate, up to the first-hop link MTU, sent unfragmented with IPv4 DF); T12 adds probe-outcome reporting in which an ordinary flow's report changes only its own search state and a shared PathService write requires authority granted by the Host owner (4821-195).",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2"
     },
     {
@@ -564,7 +564,7 @@
       "section": "4",
       "quote": "If PLPMTUD updates the MTU for a particular path, all Packetization Layer sessions that share the path representation (as described in Section 5.2) SHOULD be notified to make use of the new MTU and make the required congestion control adjustments.",
       "status": "exception",
-      "reason": "Conditional cross-session notification is not activated: each Connection has its own path representation and no sessions share that state. This does not waive the independent IP-cache SHOULD gap at 079; adding shared state would require notification and congestion adjustment.",
+      "reason": "The condition is active: PathService is the shared path representation (079). When TCP PLPMTUD confirms a larger size with a definitely submitted, unfragmented probe selected after the 600-second hold, Host::service_changes publishes it through PathService::confirm_delivery and notifies every session on that path: TCP connections apply the raised ordinary budget, where Congestion::set_path_mss keeps byte cwnd and ssthresh so that the raise does not raise the window in bytes (the RFC 4821 section 4 rescaling rule), and Host UDP flows receive the coalesced Host::udp_path_change notification. Selected deviation: PLPMTUD's loss-inferred decreases (black-hole timeouts, failed probes) stay connection-local, because loss is not distinguishable from congestion and the shared representation holds only trusted network facts (Host-correlated PTBs and Host-certified probe receipts); correlated PTB decreases are shared with every session (a TCP report below the connection's proven delivery only once that exact report's quoted-data timeout applies it, whatever the connection's loss-inferred estimate).",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4"
     },
     {
@@ -630,7 +630,7 @@
       "section": "5.2",
       "quote": "This memo uses the concept of a \"flow\" to define the scope of the Path MTU Discovery algorithms. For many implementations, a flow would naturally correspond to an instance of each protocol (i.e., each connection or session). In such implementations, the algorithms described in this document are performed within each session for each protocol. The observed PMTU (eff_pmtu in Section 7.1) MAY be shared between different flows with a common path representation.",
       "status": "exception",
-      "reason": "Connection-local discovery is the expressly permitted flow model and is selected. Sharing observed PMTU between flows is MAY and is not selected; the separate IP-layer caching SHOULD remains TODO at 079.",
+      "reason": "Connection-local discovery is the selected flow model: each TCP connection performs its own PLPMTUD search. Sharing is selected for trusted network facts only: the PathService IP-layer cache (079) shares correlated PTB decreases (a TCP report below the connection's proven delivery only once that exact report's quoted-data timeout applies it, never through loss inference) and Host-certified, probe-confirmed TCP sizes among flows with a common path representation, and Host::service_changes notifies them, Host UDP flows included. A flow's own eff_pmtu search state (search bounds, probe and verification state, loss-inferred decreases) is not shared.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
     },
     {
@@ -638,7 +638,7 @@
       "section": "5.2",
       "quote": "Alternatively, PLPMTUD could be implemented such that its complete state is associated with the path representations. Such an implementation could use multiple connections or sessions for each probe sequence. This approach is likely to converge much more quickly in some environments, such as where an application uses many small connections, each of which is too short to complete the Path MTU Discovery process.",
       "status": "exception",
-      "reason": "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO.",
+      "reason": "Not selected: complete PLPMTUD state and every probe sequence stay with one flow, never spread over several connections. Only trusted network facts (correlated PTB decreases and Host-certified, probe-confirmed sizes) are associated with the path representation, in the PathService IP-layer cache (079).",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
     },
     {
@@ -652,16 +652,20 @@
       "id": "4821-079",
       "section": "5.2",
       "quote": "The IP layer SHOULD be used to store the cached PMTU value and other shared state such as MTU values reported by ICMP PTB messages. Ideally, this shared state should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path.",
-      "status": "TODO",
-      "reason": "T7 PathService stores per-path estimates keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation, and T9 Host stores correlated ICMP PTB MTUs there with a 600-second hold (TCP immediate decreases, UDP and path-level reports). Remaining T10: TCP's PLPMTUD-confirmed cached PMTU and deferred below-proven-delivery PTB values remain connection-local until positive and pending publication.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+      "status": "covered",
+      "reason": "PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference; UDP and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
+      "evidence": [
+        "crates/stacks/ntcp-path/src/service/cache.rs::    pub fn confirm_delivery(",
+        "crates/stacks/ntcp-host/src/tests/fanout.rs::fn delivered_probe_after_hold_raises_shared_ceiling_and_stale_proof_never("
+      ]
     },
     {
       "id": "4821-080",
       "section": "5.2",
       "quote": "An implementation MAY use the destination address as the local representation of a path. The PMTU value associated with a destination would be the minimum PMTU learned across the set of all paths in use to that destination. The set of paths in use to a",
       "status": "exception",
-      "reason": "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO.",
+      "reason": "Not selected: the local path representation is finer than the destination address. PathService (079) keys context, source, destination/scope, forwarding destination, routing DSCP, link, next hop and route generation, so distinct paths to one destination keep separate estimates.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
     },
     {
@@ -669,7 +673,7 @@
       "section": "5.2",
       "quote": "particular destination is expected to be small, in many cases consisting of a single path. This approach will result in the use of optimally sized packets on a per-destination basis, and integrates nicely with the conceptual model of a host as described in [RFC2461]: a PMTU value could be stored with the corresponding entry in the destination cache. Since Network Address Translators (NATs) and other forms of middle boxes may exhibit differing PMTUs simultaneously at a single IP address, the minimum value SHOULD be stored.",
       "status": "exception",
-      "reason": "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO.",
+      "reason": "Conditional on the per-destination representation of 080, which is not selected: each PathService path (079) stores its own learned estimate, lowered by trusted decreases and raised only by a Host-certified probe delivered on that path.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
     },
     {
@@ -689,7 +693,7 @@
       "section": "5.2",
       "quote": "For source-routed packets (i.e., packets containing an IPv6 routing header, or IPv4 Loose Source and Record Route (LSRR) or Strict Source and Record Route (SSRR) options), the source route MAY further qualify the local representation of a path. An implementation MAY use source route information in the local representation of a path.",
       "status": "exception",
-      "reason": "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO.",
+      "reason": "Selected only as far as forwarding: PathService (079) qualifies a path by the actual forwarding destination (the first source-route hop) in addition to context, source, destination, DSCP, link, next hop and route generation; the remaining source-route hops do not further qualify it.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
     },
     {
@@ -1694,7 +1698,7 @@
       "section": "11",
       "quote": "Since packetization protocols may share state with each other, if one packetization protocol (particularly an application) were hostile to other protocols on the same host, it could harm performance in the other protocols by reducing the effective MTU. If a packetization protocol is untrusted, it should not be allowed to write to shared state.",
       "status": "exception",
-      "reason": "Conditional shared-state trust rule is not activated: there is no cross-protocol shared PMTU cache or untrusted-application write API. Any future shared cache must enforce this rule; the IP-layer cache recommendation remains TODO at 079.",
+      "reason": "The condition is active, since the PathService IP-layer cache (079) is shared across protocols, and the rule is enforced: only the Host owner writes shared state. It accepts Host-correlated PTBs quoting a submission actually made on that path incarnation, TCP reports below the owner's proven delivery only after that exact report's quoted-data timeout applied it for the same live owner (never because of its loss-inferred estimate, and with no hold restart before), and, through Host::service_changes, TCP probe confirmations: a probe span the peer acknowledged, backed by the Host's receipt of its definitely submitted, unfragmented transmission, rechecked against the live owner, path incarnation, negative revision, hold and first hop. Endpoint connections and UDP flows have no write path of their own (a UDP flow contributes only Host-correlated PTBs quoting its datagrams), so a packetization protocol without Host authority cannot write shared state.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-11"
     },
     {

@@ -22,7 +22,6 @@ fn limits(datagram_evidence: usize) -> LedgerLimits {
 
 struct Fixture {
     link: LinkId,
-    stamp: path::ChangeStamp,
     paths: [PathId; 2],
     ids: Vec<ConnectionId>,
 }
@@ -63,7 +62,6 @@ fn fixture() -> Fixture {
     }
     Fixture {
         link: ingress.link(),
-        stamp: pa.stamp(),
         paths: [pa.path(), pb.path()],
         ids,
     }
@@ -87,7 +85,6 @@ fn evidence(
     Evidence {
         link: f.link,
         path,
-        stamp: f.stamp,
         owner,
         source: v4(1),
         destination,

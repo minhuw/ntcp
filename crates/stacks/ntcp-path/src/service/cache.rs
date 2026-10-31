@@ -169,6 +169,23 @@ pub enum EstimateChange {
     Unchanged,
 }
 
+/// Disposition of probe-confirmed delivery offered to `confirm_delivery`.
+/// Only `Raised` changes shared state; every other outcome is stale or
+/// non-informative evidence, never an error in the trusted producer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryConfirmation {
+    /// The learned ceiling rose to the confirmed length; clients are dirty.
+    Raised,
+    /// A decrease was learned after the probe was selected.
+    StaleNegativeRevision,
+    /// Selected or offered before the current conservative hold expired.
+    Held,
+    /// Larger than the current first-hop MTU or the family wire ceiling.
+    ExceedsFirstHop,
+    /// No larger than the current learned ceiling, or nothing was learned.
+    NotLarger,
+}
+
 impl PathService {
     /// Commit after the authority operation has preflighted its revision and
     /// generations. Re-resolve ALL valid paths, including still-live routes
@@ -176,7 +193,7 @@ impl PathService {
     /// remains here. Invalidations are sticky until rebind/release; later table
     /// changes can never revive an old path, even if its key resolves again.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
-    //= reason=T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners and gates held physical output; failed rebind preserves dirty authority and bounded backpressure. T9 correlation never lets a stale or invalidated path incarnation change an estimate. ICMP Redirect is decoded as unsupported because no production backend has an IP gateway route: Redirect-driven route changes and their notification are scheduled with the first real Gateway forwarding in T18 (topology evidence T19); full cross-protocol physical races remain T10.
+    //= reason=T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners, and T10 Host::service_changes notifies every TCP binding and Host UDP flow of the replacement on the next service pass (a failed rebind stays dirty with bounded backpressure) while the submission barrier refuses held packets the current path no longer carries (dual-family Host and native reservation-race tests). T9 correlation never lets a stale or invalidated path incarnation change an estimate. Remaining T18: ICMP Redirect is decoded as unsupported because no production backend has an IP gateway route; Redirect-driven route changes and their notification arrive with the first real Gateway forwarding in T18, with topology evidence in T19.
     //# PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.
     pub(super) fn commit_revision(&mut self, revision: u64) {
         self.revision = revision;
@@ -227,7 +244,7 @@ impl PathService {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
-    //= reason=T7 PathService coalesces dirty snapshots with exact acknowledgements. T8 Host refreshes actual native/TUN TCP owners, including reserved/released generations, without inventing repair or loss events; two-flow and held-output tests exercise trusted decreases. Generic validated ICMP producers and actual datagram consumers/fanout remain T9/T10.
+    //= reason=PathService marks every client of a path dirty on each trusted decrease and on link MTU, route, source, link or plateau changes. Host::service_changes, run on every native service_egress and MTU-refresh pass and every tun_echo transmit pass, brings each dirty TCP binding (reserved owners included, budget only, no repair) and each Host UDP flow (a coalesced per-flow change slot carrying MMS_S and the payload limit) to the newest snapshot and acknowledges exactly that version; a failing client stays dirty without stopping the others, and stateless leases and every physical submission revalidate against the current version. Dual-family Host tests (two TCP flows plus a UDP flow, held scalar, zero-copy and partial software GSO reservations, a randomized multi-client model), native reservation-race tests and the isolated namespace shared-fanout case, in which a real router PTB quotes only TCP flow A, verify it.
     //# The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
     fn mark_dirty(&mut self, path: PathId) {
         for slot in &mut self.clients.slots {
@@ -476,7 +493,9 @@ impl PathService {
     }
 
     /// Trusted producer supplies an absolute conservative discovery deadline.
-    /// Equal/larger observations preserve both revision and deadline.
+    /// Equal/larger observations preserve the learned estimate and negative
+    /// revision, but a later deadline still restarts the hold: growth selected
+    /// before this fresh report must not be confirmed or submitted.
     pub fn trusted_decrease_with_hold(
         &mut self,
         path: PathId,
@@ -497,6 +516,14 @@ impl PathService {
         // a temporary physical limit that can mask older-submission feedback.
         let estimate = cached.snapshot.learned_mtu.unwrap_or(cached.unlearned_mtu);
         if candidate >= estimate {
+            if retry_not_before > cached.snapshot.retry_not_before {
+                let revision = self.next_revision()?;
+                cached.snapshot.retry_not_before = retry_not_before;
+                cached.snapshot.stamp.version = revision;
+                self.paths.slots[path.0.slot].value = Some(cached);
+                self.revision = revision;
+                self.mark_dirty(path);
+            }
             return Ok(EstimateChange::Unchanged);
         }
         let revision = self.next_revision()?;
@@ -510,10 +537,60 @@ impl PathService {
         Ok(EstimateChange::Decreased)
     }
 
+    /// Trusted positive NETWORK fact: an unfragmented packet of exactly
+    /// `ip_len` complete IP octets, selected at `selected_at` under
+    /// `negative_revision` and definitely submitted on this path incarnation,
+    /// was delivered. The host proves that provenance; this checks it is
+    /// still current at `now` (caller timebase of the hold deadline). Raising
+    /// records `Some(ip_len)`, never the historical unlearned value, so a
+    /// later physical increase cannot lift past what was proven.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
+    //= reason=PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference; UDP and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.
+    //# The IP layer SHOULD be used to store the cached PMTU value and other shared state such as MTU values reported by ICMP PTB messages. Ideally, this shared state should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path.
+    pub fn confirm_delivery(
+        &mut self,
+        path: PathId,
+        ip_len: u32,
+        negative_revision: u64,
+        selected_at: u64,
+        now: u64,
+    ) -> Result<DeliveryConfirmation, Error> {
+        let mut cached = self.paths.get(self.context, path.0)?;
+        if cached.snapshot.status != PathStatus::Valid {
+            return Err(Error::Invalidated);
+        }
+        self.validate_selection(cached.snapshot.key)?;
+        let ipv4 = cached.snapshot.key.destination.address.is_ipv4();
+        let (floor, ceiling) = if ipv4 { (68, 65535) } else { (1280, 65575) };
+        if ip_len < floor {
+            return Err(Error::InvalidArgument);
+        }
+        let snapshot = cached.snapshot;
+        if negative_revision != snapshot.negative_revision {
+            return Ok(DeliveryConfirmation::StaleNegativeRevision);
+        }
+        if selected_at < snapshot.retry_not_before || now < snapshot.retry_not_before {
+            return Ok(DeliveryConfirmation::Held);
+        }
+        if ip_len > snapshot.first_hop_mtu.min(ceiling) {
+            return Ok(DeliveryConfirmation::ExceedsFirstHop);
+        }
+        if snapshot.learned_mtu.is_none_or(|learned| ip_len <= learned) {
+            return Ok(DeliveryConfirmation::NotLarger);
+        }
+        let revision = self.next_revision()?;
+        cached.snapshot.learned_mtu = Some(ip_len);
+        cached.snapshot.stamp.version = revision;
+        self.paths.slots[path.0.slot].value = Some(cached);
+        self.revision = revision;
+        self.mark_dirty(path);
+        Ok(DeliveryConfirmation::Raised)
+    }
+
     /// Apply the selected live fallback policy to checked caller evidence.
     /// Like trusted_decrease, this does not establish physical quote provenance.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
-    //= reason=T7 PathService stores per-host learned estimates and the legacy plateau fallback without changing first-hop routes; T8 Host binds actual native/TUN TCP owners. T9 Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section5 plateau below the corrected quoted length, requires correlation with committed submission evidence, and lowers the bound per-host record only when lower (immediate TCP decreases, UDP and path-level reports; real router PTBs in the isolated namespace gate). Stale or evicted path incarnations are never resurrected or changed. Remaining T10: a TCP report deferred below proven delivery is held connection-locally and never reaches the shared record, so the routing entry is not changed for it.
+    //= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the corrected quoted length, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests and real router PTBs in the isolated namespace gate verify it.
     //# When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
     pub fn trusted_ipv4_fallback(
         &mut self,

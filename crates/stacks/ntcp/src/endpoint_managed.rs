@@ -29,6 +29,77 @@ pub struct CorrelatedPmtu {
     pub current_path: bool,
 }
 
+/// The Host's certification, made only for a backend outcome of definitely
+/// Submitted (never a possible or unknown submission), of the exact complete
+/// IP length and IPv4 Don't Fragment bit of the physical packet it submitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalReceipt {
+    pub ip_packet_len: u32,
+    /// IPv6 sources never fragment in transit; Host reports `true` for them.
+    pub dont_fragment: bool,
+}
+
+/// A deferred report below proven delivery that the connection applied at
+/// the quoted data's timeout, with the provenance of exactly that report.
+/// Not network authority by itself: the Host publishes it only for the same
+/// live owner, client and valid path incarnation, and only while it still
+/// reduces the shared estimate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingPmtuApplied {
+    pub(crate) binding: PreparedPath,
+    pub(crate) report: CorrelatedPmtu,
+    pub(crate) host_estimate: u32,
+    pub(crate) applied_mtu: u32,
+}
+impl PendingPmtuApplied {
+    /// Client and path incarnation the report was accepted under.
+    pub const fn binding(self) -> PreparedPath {
+        self.binding
+    }
+    pub const fn report(self) -> CorrelatedPmtu {
+        self.report
+    }
+    /// The Host's normalized estimate supplied with the report.
+    pub const fn host_estimate(self) -> u32 {
+        self.host_estimate
+    }
+    /// The size the applied report derived under the connection's policy
+    /// (its plateau table for a legacy IPv4 report), never the connection's
+    /// estimate: a lower loss-inferred estimate stays connection-local.
+    pub const fn applied_mtu(self) -> u32 {
+        self.applied_mtu
+    }
+}
+
+/// Delivery of an authenticated probe proved its exact size: the selected
+/// departure's intent, the Host's definitely-submitted receipt retained with
+/// the active probe, and no retry, timeout or invalidated size result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfirmedProbe {
+    pub(crate) intent: crate::DiscoveryIntent,
+    pub(crate) receipt: PhysicalReceipt,
+}
+impl ConfirmedProbe {
+    /// Binding, exact IP length and selection time from the departure.
+    pub const fn intent(self) -> crate::DiscoveryIntent {
+        self.intent
+    }
+    pub const fn receipt(self) -> PhysicalReceipt {
+        self.receipt
+    }
+}
+
+/// Connection-local publication state: one pending provenance and one
+/// unpublished result of each kind. Newer results replace older ones; this is
+/// never a queue.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ManagedResults {
+    pub(crate) pending: Option<(u64, PendingPmtuApplied)>,
+    pub(crate) applied: Option<PendingPmtuApplied>,
+    pub(crate) receipt: Option<((Seq, Seq, u32), crate::DiscoveryIntent, PhysicalReceipt)>,
+    pub(crate) confirmed: Option<ConfirmedProbe>,
+}
+
 impl Endpoint {
     /// Host-correlated Packet Too Big for an exact connection generation.
     /// The Host's submission ledger is the authenticity check; this applies
@@ -46,6 +117,34 @@ impl Endpoint {
         if self.managed_context.is_none() {
             return Err(Error::InvalidState.into());
         }
+        self.correlated_pmtu_report(now, id, report, None)
+    }
+
+    /// `correlated_pmtu_feedback` with the Host's normalized estimate for the
+    /// report. A Deferred outcome attaches this provenance to exactly that
+    /// pending report; applying it at the quoted data's timeout yields one
+    /// `take_pending_pmtu_applied` result. Replacement, cumulative progress
+    /// and path replacement discard the provenance.
+    pub fn correlated_pmtu_feedback_with_estimate(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        report: CorrelatedPmtu,
+        host_estimate: u32,
+    ) -> Result<crate::PmtuFeedback, EndpointError> {
+        self.correlated_pmtu_report(now, id, report, Some(host_estimate))
+    }
+
+    fn correlated_pmtu_report(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        report: CorrelatedPmtu,
+        host_estimate: Option<u32>,
+    ) -> Result<crate::PmtuFeedback, EndpointError> {
+        if self.managed_context.is_none() {
+            return Err(Error::InvalidState.into());
+        }
         self.slot(id)?;
         self.reject_if_output_reserved(id)?;
         self.clock(now)?;
@@ -53,9 +152,66 @@ impl Endpoint {
             .as_mut()
             .unwrap()
             .connection
-            .correlated_pmtu_feedback(now, report)?;
+            .correlated_pmtu_feedback(now, report, host_estimate)?;
         self.refresh(id.slot);
         Ok(outcome)
+    }
+
+    /// Take the unpublished applied-pending result of a live owner generation.
+    pub fn take_pending_pmtu_applied(
+        &mut self,
+        id: ConnectionId,
+    ) -> Result<Option<PendingPmtuApplied>, EndpointError> {
+        self.slot(id)?;
+        Ok(self.slots[id.slot]
+            .as_mut()
+            .unwrap()
+            .connection
+            .managed_results
+            .applied
+            .take())
+    }
+
+    /// Take the unpublished confirmed-probe result of a live owner generation.
+    pub fn take_confirmed_probe(
+        &mut self,
+        id: ConnectionId,
+    ) -> Result<Option<ConfirmedProbe>, EndpointError> {
+        self.slot(id)?;
+        Ok(self.slots[id.slot]
+            .as_mut()
+            .unwrap()
+            .connection
+            .managed_results
+            .confirmed
+            .take())
+    }
+
+    /// `accept_transmit` for a backend outcome of definitely Submitted. When
+    /// the attempt is a whole authenticated probe and `receipt` matches its
+    /// intent (exact IP length, IPv4 DF, unchanged binding and negative
+    /// revision), the receipt is retained with the active probe so that the
+    /// probe's own delivery can later confirm its size.
+    pub fn accept_transmit_submitted(
+        &mut self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+        receipt: PhysicalReceipt,
+    ) -> Result<bool, EndpointError> {
+        let probe = self.transmit_discovery_intent(attempt).and_then(|intent| {
+            let r = self.reservations[attempt.reservation].current.as_ref()?;
+            (r.offset == 0).then_some((r.packet.connection?, r.departure?.start, intent))
+        });
+        if !self.accept_transmit(now, attempt)? {
+            return Ok(false);
+        }
+        if let Some((id, start, intent)) = probe
+            && let Ok(slot) = self.retained_slot_mut(id)
+        {
+            slot.connection
+                .retain_probe_receipt(Seq(start), intent, receipt);
+        }
+        Ok(true)
     }
 
     /// Host-correlated hard/soft error for an exact connection generation,

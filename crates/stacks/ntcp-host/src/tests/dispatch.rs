@@ -109,7 +109,7 @@ fn current_mtu(side: &Side, id: ConnectionId) -> u32 {
 fn drain_events(endpoint: &mut Endpoint) -> Vec<Event> {
     std::iter::from_fn(|| endpoint.next_event()).collect()
 }
-fn tcp_report(dispatch: IcmpDispatch) -> (TcpReport, Option<path::EstimateChange>) {
+pub(super) fn tcp_report(dispatch: IcmpDispatch) -> (TcpReport, Option<path::EstimateChange>) {
     match dispatch {
         IcmpDispatch::Completed(IcmpOutcome::Tcp {
             report, published, ..
@@ -353,11 +353,18 @@ fn unchanged_estimate_drop_advice_is_consumed_without_side_effects() {
             a.1.send_progress(id).unwrap(),
         );
         // Equal and still-smaller-than-the-packet reports identify a drop.
+        // Each is still a fresh validated report about the shared path: the
+        // shared estimate stays, its hold restarts from this report.
+        let units = cfg.connection.timebase.units_per_second;
         for candidate in [mtu, mtu + 50] {
             now += 1;
             let (report, published) = tcp_report(dispatch(&mut a, now, &ptb(&original, candidate)));
             assert_eq!(report, TcpReport::PacketTooBig(PmtuFeedback::Unchanged));
-            assert_eq!(published, None);
+            assert_eq!(published, Some(path::EstimateChange::Unchanged));
+            let shared = a.0.paths().path_snapshot(snapshot.path()).unwrap();
+            assert_eq!(shared.learned_mtu(), snapshot.learned_mtu());
+            assert_eq!(shared.negative_revision(), snapshot.negative_revision());
+            assert_eq!(shared.retry_not_before(), now + 600 * units);
         }
         // Impossible reports are rejected outright.
         let size = original.len() as u32;
@@ -376,12 +383,13 @@ fn unchanged_estimate_drop_advice_is_consumed_without_side_effects() {
         );
         assert_eq!(
             before, after,
-            "no increase, hold restart or progress change"
+            "no local increase, deadline or progress change"
         );
         assert!(selected(&mut a.1, now).is_none(), "no repeated head retry");
         assert!(drain_events(&mut a.1).is_empty(), "no fabricated error");
-        assert_eq!(a.0.binding(id).unwrap().snapshot, snapshot);
-        std::println!("v6={v6}: 2 unchanged reports consumed as advice, impossible rejected");
+        std::println!(
+            "v6={v6}: 2 unchanged reports consumed as advice restarting the shared hold, impossible rejected"
+        );
     }
 }
 

@@ -2,6 +2,7 @@ extern crate std;
 mod admission;
 mod correlation;
 mod dispatch;
+mod fanout;
 mod source_routes;
 mod submission;
 use super::*;
@@ -501,10 +502,12 @@ fn shared_decrease_two_real_flows_no_phantom_repair_and_held_frame_barrier() {
             a.0.trusted_decrease(now, path, mtu).unwrap(),
             path::EstimateChange::Unchanged
         );
-        assert_eq!(
-            a.0.paths().path_snapshot(path).unwrap().retry_not_before(),
-            snapshot.retry_not_before()
-        );
+        // A fresh unchanged report keeps the estimate and its decrease
+        // identity, but restarts the hold for growth selected before it.
+        let unchanged = a.0.paths().path_snapshot(path).unwrap();
+        assert_eq!(unchanged.learned_mtu(), snapshot.learned_mtu());
+        assert_eq!(unchanged.negative_revision(), snapshot.negative_revision());
+        assert!(unchanged.retry_not_before() > snapshot.retry_not_before());
         a.0.set_link_mtu(a.2.link(), 1600).unwrap();
         a.0.refresh_all(&mut a.1).unwrap();
         assert_eq!(

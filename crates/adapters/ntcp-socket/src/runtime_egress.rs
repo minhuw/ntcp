@@ -501,10 +501,13 @@ impl Owner {
     pub(super) fn service_egress(&mut self) -> Result<()> {
         let mut egress = self.egress.take().unwrap();
         let result = (|| {
+            let now = self.now();
             if let Some(host) = &mut self.host {
-                // Apply every subscriber's budget even when it has no output.
-                // refresh_all visits all bindings and retains failed updates.
-                let _ = host.refresh_all(&mut self.endpoint);
+                // Publish connection results and apply every dirty
+                // subscriber's budget even when it has no output. A failed
+                // client stays dirty for the next pass; submission below
+                // revalidates each physical packet regardless.
+                let _ = host.service_changes(&mut self.endpoint, now);
             }
             egress.candidates.clear();
             egress.candidates.extend(self.endpoint.ready_connections());

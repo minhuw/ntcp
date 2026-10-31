@@ -643,6 +643,7 @@ struct DeferredSyn {
 
 pub(crate) struct Connection {
     pub(crate) managed_path: Option<crate::PreparedPath>,
+    pub(crate) managed_results: crate::endpoint::ManagedResults,
     tuple: Tuple,
     config: ConnectionConfig,
     state: State,
@@ -997,6 +998,7 @@ impl Connection {
         let ack_ato = config.ack_timeout_floor();
         Ok(Self {
             managed_path,
+            managed_results: crate::endpoint::ManagedResults::default(),
             tuple,
             peer_mss: config.mss,
             receive_mss_offer: config.receive_mss_offer(),
@@ -3012,6 +3014,15 @@ impl Connection {
                 p.invalidate_probe_size_result();
             }
         }
+        if replaced || old.client != path.client {
+            // Results and provenance describe only the binding they arose on.
+            self.managed_results = crate::endpoint::ManagedResults::default();
+        } else if old.snapshot.negative_revision() != path.snapshot.negative_revision() {
+            // Newer negative evidence makes earlier delivery proof stale. An
+            // applied decrease stays: the Host discards it once subsumed.
+            self.managed_results.receipt = None;
+            self.managed_results.confirmed = None;
+        }
         self.managed_path = Some(path);
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
         let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
@@ -3029,6 +3040,66 @@ impl Connection {
     }
 
     pub(crate) fn ip_header_len(&self) -> u16 { self.ip_header_len }
+
+    /// Convert exactly identified Pmtud events into unpublished results and
+    /// drop provenance or receipts whose report or probe no longer exists.
+    fn observe_pmtud_results(&mut self) {
+        let Some(p) = &mut self.pmtud else {
+            return;
+        };
+        let results = &mut self.managed_results;
+        if let Some((id, mtu)) = p.take_applied_pending()
+            && let Some((pending, mut result)) = results.pending.take()
+            && pending == id
+        {
+            result.applied_mtu = mtu;
+            let shared = |r: crate::PendingPmtuApplied| r.host_estimate.max(r.applied_mtu);
+            // One slot: an unpublished smaller decrease is never lost.
+            if results.applied.is_none_or(|old| shared(result) < shared(old)) {
+                results.applied = Some(result);
+            }
+        }
+        if results.pending.is_some_and(|(id, _)| p.pending_id() != Some(id)) {
+            results.pending = None;
+        }
+        if let Some(success) = p.take_probe_success()
+            && let Some((probe, intent, receipt)) = results.receipt.take()
+            && probe == success
+        {
+            results.confirmed = Some(crate::ConfirmedProbe { intent, receipt });
+        }
+        if results
+            .receipt
+            .is_some_and(|(probe, ..)| p.provable_probe() != Some(probe))
+        {
+            results.receipt = None;
+        }
+    }
+
+    /// Retain a definitely-submitted receipt with the active probe it proves.
+    pub(crate) fn retain_probe_receipt(
+        &mut self,
+        start: Seq,
+        intent: crate::DiscoveryIntent,
+        receipt: crate::PhysicalReceipt,
+    ) {
+        let (Some(p), Some(binding)) = (&self.pmtud, self.managed_path) else {
+            return;
+        };
+        let selected = intent.binding.snapshot;
+        if let Some(probe) = p.provable_probe()
+            && probe.0 == start
+            && probe.2 == intent.ip_packet_len
+            && receipt.ip_packet_len == intent.ip_packet_len
+            && (receipt.dont_fragment || !self.tuple.local.is_ipv4())
+            && intent.binding.client == binding.client
+            && selected.path() == binding.snapshot.path()
+            && selected.negative_revision() == binding.snapshot.negative_revision()
+            && intent.selected_at >= binding.snapshot.retry_not_before()
+        {
+            self.managed_results.receipt = Some((probe, intent, receipt));
+        }
+    }
 
     pub(crate) fn set_ip_header_len(&mut self, len: u16) {
         if self.ip_header_len != len {
@@ -3218,6 +3289,7 @@ impl Connection {
         &mut self,
         now: Instant,
         report: crate::CorrelatedPmtu,
+        host_estimate: Option<u32>,
     ) -> Result<crate::PmtuFeedback, Error> {
         self.update_time(now)?;
         let segment = report.segment;
@@ -3240,6 +3312,25 @@ impl Connection {
             report.candidate_mtu,
             report.current_path,
         );
+        let id = p.pending_id();
+        if id != self.managed_results.pending.map(|(id, _)| id) {
+            // This report replaced the pending one (or none is pending): only
+            // its own provenance, never the replaced report's, may describe it.
+            self.managed_results.pending = match (outcome, id, host_estimate, self.managed_path) {
+                (crate::PmtuFeedback::Deferred, Some(id), Some(host_estimate), Some(binding)) => {
+                    Some((
+                        id,
+                        crate::PendingPmtuApplied {
+                            binding,
+                            report,
+                            host_estimate,
+                            applied_mtu: 0,
+                        },
+                    ))
+                }
+                _ => None,
+            };
+        }
         if matches!(
             outcome,
             crate::PmtuFeedback::Deferred | crate::PmtuFeedback::Decreased { .. }
@@ -6455,6 +6546,7 @@ impl Connection {
                 .as_mut()
                 .unwrap()
                 .ack(ack, self.now, cooldown, rto);
+            self.observe_pmtud_results();
             self.refresh_path_mss();
         }
         // When the ledger is available, only its newly delivered complete
@@ -10056,6 +10148,7 @@ impl Connection {
             if let Some(p) = &mut self.pmtud {
                 p.timeout(now, self.snd_una, self.consecutive_timeouts, cooldown);
             }
+            self.observe_pmtud_results();
             self.refresh_path_mss();
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
             //# (e) TCP implementations SHOULD inform the application of the delivery

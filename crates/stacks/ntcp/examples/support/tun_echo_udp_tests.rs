@@ -108,7 +108,7 @@ fn udp_echo_round_trip_both_families() {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
 //= type=test
-//= reason=The Host dispatcher notifies the specific correlated sender while processing the report: TCP consumes PmtuFeedback drop advice and a Host UDP flow receives UdpEvent::PacketTooBig, whether or not the estimate changes. Path-level change notification is separate: a shared decrease only marks path clients dirty, and other users adopt it at their next egress refresh or send-budget check. Dual-family TUN tests consume the UDP event immediately and observe the TCP flow adopt the shared decrease at its next egress.
+//= reason=The Host dispatcher notifies the specific correlated sender while processing the report: TCP consumes PmtuFeedback drop advice and a Host UDP flow receives UdpEvent::PacketTooBig, whether or not the estimate changes. Path-level change notification is separate: a shared decrease marks the path's clients dirty, and Host::service_changes then brings every other user to the new budget (TCP budget application, the UDP flow change slot) on the next service pass. Dual-family TUN tests consume the UDP event immediately and observe the TCP flow adopt the shared decrease after the next service pass.
 //# It is important to understand that the notification of the packetization
 //# layer instances using the path about the change in the PMTU is distinct from
 //# the notification of a specific instance that a packet has been dropped. The
@@ -183,6 +183,85 @@ fn udp_quoted_router_ptb_reaches_echo_and_shrinks_tcp_on_the_same_path() {
         assert!(frames.iter().any(|f| f.len() == mtu));
         assert_eq!(p.a.managed_path(p.aid).unwrap().ordinary_ip_budget, mtu as u32);
         println!("v6={v6}: UDP-quoted PTB {mtu}; {} TCP frames all <= {mtu}", frames.len());
+    }
+}
+
+// A shared decrease caused by the TCP flow's segment reaches the echo only
+// through its change notification: a reply held by a blocked TUN is
+// reconsidered and refused with the changed limit, a later oversize request
+// is refused by the path query before any encoding or backend call, and a
+// fitting reply still leaves byte-for-byte.
+#[test]
+fn udp_echo_sizes_replies_by_path_limits_and_reconsiders_held_reply_on_change() {
+    for v6 in [false, true] {
+        let mut p = Pair::new(v6, true);
+        let service = SocketAddr::new(p.local.ip(), p.local.port());
+        let mut echo = UdpEcho::open(&mut p.ahost, &p.a, service, &config(p.local.ip())).unwrap();
+        let client = p.bhost.host.udp_open(&p.b, p.remote, Some(service), OPTIONS).unwrap();
+        let (header, mtu) = if v6 { (IPV6_HEADER, 1280) } else { (IP_HEADER, 1006) };
+        let max_payload = mtu - header - 8;
+        let mut backend = Backend::default();
+        // A fitting echo pins the echo's path to the peer.
+        let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x41; 1400]);
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
+        assert_eq!(backend.frames.pop().unwrap().len(), header + 8 + 1400);
+        // The next reply is held: the TUN would block.
+        backend.blocked = true;
+        let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x42; 1400]);
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
+        let attempts = backend.attempts;
+        assert_eq!(echo.held, Some((p.remote, 1400)));
+        assert!(echo.blocked && echo.notes.is_empty());
+        // A router PTB quoting only a TCP segment lowers the shared path.
+        p.a.write(p.aid, &[0x5a; 3000]).unwrap();
+        let sent = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
+        assert!(sent[0].len() > mtu);
+        let path = p.ahost.host.binding(p.aid).unwrap().snapshot.path();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &ptb(&sent[0], mtu as u32), p.local.ip(), false, 0)
+            .unwrap();
+        assert_eq!(p.ahost.host.paths().path_snapshot(path).unwrap().learned_mtu(), Some(mtu as u32));
+        assert_eq!(p.ahost.host.udp_event(echo.flow).unwrap(), None, "no advice for the echo");
+        let report = p.ahost.host.service_changes(&mut p.a, p.time).unwrap();
+        assert!(report.applied >= 2 && report.failed == 0, "{report:?}");
+        backend.blocked = false;
+        echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
+        assert_eq!(backend.attempts, attempts, "the held reply is never submitted");
+        assert!(backend.frames.is_empty() && echo.held.is_none() && !echo.blocked);
+        assert_eq!(echo.notes, [
+            format!("UDP echo path to {} changed: MMS_S {}, payload limit {max_payload}",
+                p.remote.ip(), mtu - header),
+            format!("UDP echo of 1400 octets to {} refused: exceeds the changed path payload \
+                limit of {max_payload}", p.remote),
+        ]);
+        assert_eq!(p.ahost.host.udp_path_change(echo.flow).unwrap(), None, "consumed once");
+        // An oversize request is refused by the path query before encoding.
+        echo.notes.clear();
+        echo.packet = [0xa5; MTU];
+        let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x43; 1400]);
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        assert!(echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap());
+        assert_eq!(backend.attempts, attempts, "no backend call");
+        assert!(echo.packet.iter().all(|&b| b == 0xa5), "nothing encoded");
+        assert!(echo.held.is_none());
+        assert_eq!(echo.notes, [format!("UDP echo of 1400 octets to {} refused: exceeds the path \
+            payload limit of {max_payload}; replies are never fragmented", p.remote)]);
+        // A reply of exactly the limit is echoed byte-for-byte.
+        echo.notes.clear();
+        let payload: Vec<u8> = (0..max_payload).map(|n| (n * 13 + 5) as u8).collect();
+        let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &payload);
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
+        let reply = backend.frames.pop().unwrap();
+        assert!(backend.frames.is_empty() && echo.notes.is_empty());
+        assert_eq!(reply.len(), mtu);
+        input_frame(&mut p.bhost, &mut p.b, p.time, &reply, p.remote.ip(), false, 0).unwrap();
+        let mut bytes = [0; MTU];
+        assert_eq!(p.bhost.host.udp_receive(client, &mut bytes).unwrap(), Some((service, max_payload)));
+        assert_eq!(&bytes[..max_payload], payload);
+        println!("v6={v6}: held 1400 refused on change to {max_payload}; oversize refused \
+            before encoding; {max_payload}-octet echo exact");
     }
 }
 

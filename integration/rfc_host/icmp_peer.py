@@ -25,6 +25,7 @@ def main():
     emit(event="ready", namespace=os.stat("/proc/self/ns/net").st_ino,
          preload=os.environ.get("LD_PRELOAD", ""))
     udp = None
+    streams = {}
     for line in sys.stdin:
         fields = line.split()
         if not fields:
@@ -68,6 +69,36 @@ def main():
                     received.extend(chunk)
                 assert received == data, f"echo mismatch {len(received)}/{size}"
             emit(event="tcp", tx=size, rx=len(received), local_port=local_port, hash=fnv(received))
+        elif fields[0] == "open":
+            # An established stream kept open (quiescent) after one small
+            # echo, so it has real state on the ntcp side but sends nothing.
+            name, size, salt = fields[1], int(fields[2]), int(fields[3])
+            s = socket.create_connection((remote, port), timeout=25, source_address=(local, 0))
+            streams[name] = s
+            data = pattern(size, salt)
+            s.sendall(data)
+            received = bytearray()
+            while len(received) < size:
+                chunk = s.recv(size - len(received))
+                assert chunk, f"echo closed {len(received)}/{size}"
+                received.extend(chunk)
+            assert received == data, "echo mismatch"
+            emit(event="open", name=name, rx=len(received), local_port=s.getsockname()[1])
+        elif fields[0] == "finish":
+            name, size, salt = fields[1], int(fields[2]), int(fields[3])
+            with streams.pop(name) as s:
+                local_port = s.getsockname()[1]
+                data = pattern(size, salt)
+                s.sendall(data)
+                s.shutdown(socket.SHUT_WR)
+                received = bytearray()
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+                assert received == data, f"echo mismatch {len(received)}/{size}"
+            emit(event="finish", name=name, tx=size, rx=len(received), local_port=local_port, hash=fnv(received))
         else:
             raise ValueError(fields[0])
 

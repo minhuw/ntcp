@@ -504,3 +504,288 @@ fn managed_disabled_discovery_keeps_byte_window_and_real_retry_on_budget_growth(
     assert!(a.pmtud.is_none());
     assert!(a.retx_pending);
 }
+
+// Every packet `a` has ready reaches `b`; then `b`'s response reaches `a`.
+fn exchange(a: &mut Connection, b: &mut Connection, now: Instant) {
+    let mut out = vec![0; 65535];
+    while let Some(n) = a.transmit(now, &mut out).unwrap() {
+        b.input(now, &wire::parse(ip(a.tuple), &out[..n]).unwrap()).unwrap();
+    }
+    while let Some(n) = b.transmit(now, &mut out).unwrap() {
+        a.input(now, &wire::parse(ip(b.tuple), &out[..n]).unwrap()).unwrap();
+    }
+}
+
+// Proven full-size delivery, then one outstanding segment and its exact report.
+fn deferred_setup(ipv4: bool) -> (Connection, Connection, PathService, Route, crate::CorrelatedPmtu, Vec<u8>) {
+    let (mut a, mut b, service, route) = managed_pair(ipv4, 1_000_000);
+    a.write(&vec![7; a.mss]).unwrap();
+    exchange(&mut a, &mut b, 10);
+    assert_eq!(a.flight(), 0);
+    a.write(&vec![8; a.mss]).unwrap();
+    let bytes = packet(&mut a, 20);
+    let header = if ipv4 { 20 } else { 40 };
+    let seg = wire::parse(ip(a.tuple), &bytes).unwrap();
+    let len = bytes.len() as u32 + header;
+    let report = crate::CorrelatedPmtu {
+        segment: crate::CorrelatedSegment {
+            start: seg.header.sequence,
+            end: seg.header.sequence.wrapping_add(seg.payload.len() as u32),
+            ip_packet_len: len,
+            ip_header_len: header as u16,
+        },
+        quoted_packet_len: len,
+        candidate_mtu: if ipv4 { 1000 } else { 1280 },
+        current_path: true,
+    };
+    assert!(report.candidate_mtu < len);
+    (a, b, service, route, report, bytes)
+}
+
+fn rto(a: &mut Connection) -> Instant {
+    let deadline = a.rto_deadline.unwrap();
+    a.timeout(deadline).unwrap();
+    deadline
+}
+
+#[test]
+fn pending_report_applied_at_its_timeout_yields_exactly_one_result() {
+    for ipv4 in [true, false] {
+        let (mut a, _b, _service, _route, report, _) = deferred_setup(ipv4);
+        let binding = a.managed_path.unwrap();
+        let before = a.path_mtu_info().unwrap().current_mtu;
+        assert_eq!(
+            a.correlated_pmtu_feedback(21, report, Some(1100)),
+            Ok(crate::PmtuFeedback::Deferred)
+        );
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, before);
+        assert!(a.managed_results.applied.is_none());
+        rto(&mut a);
+        let applied = a.managed_results.applied.take().expect("applied pending report");
+        assert_eq!(applied.binding(), binding);
+        assert_eq!(applied.report(), report);
+        assert_eq!(applied.host_estimate(), 1100);
+        assert_eq!(applied.applied_mtu(), report.candidate_mtu);
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, report.candidate_mtu);
+        assert!(a.managed_results.pending.is_none());
+        // Later timeouts, whatever they infer locally, never fabricate another
+        // result: only the exact pending report's application records one.
+        for _ in 0..3 {
+            // Emit the retransmission that rearms the next real RTO.
+            let now = a.now;
+            packet(&mut a, now);
+            rto(&mut a);
+        }
+        assert!(a.managed_results.applied.is_none());
+    }
+}
+
+#[test]
+fn replaced_cancelled_rebound_or_unattributed_pending_reports_yield_nothing() {
+    for ipv4 in [true, false] {
+        let lower = |r: crate::CorrelatedPmtu| crate::CorrelatedPmtu {
+            candidate_mtu: if ipv4 { 900 } else { 1280 },
+            ..r
+        };
+        // A larger report for the same data does not replace the pending one.
+        let (mut a, _b, _s, _r, report, _) = deferred_setup(ipv4);
+        a.correlated_pmtu_feedback(21, report, Some(1100)).unwrap();
+        let larger = crate::CorrelatedPmtu {
+            candidate_mtu: report.candidate_mtu + 10,
+            ..report
+        };
+        assert_eq!(
+            a.correlated_pmtu_feedback(22, larger, Some(1200)),
+            Ok(crate::PmtuFeedback::Deferred)
+        );
+        rto(&mut a);
+        assert_eq!(a.managed_results.applied.take().unwrap().report(), report);
+
+        if ipv4 {
+            // A lower report without provenance replaces it: nothing publishes.
+            let (mut a, _b, _s, _r, report, _) = deferred_setup(ipv4);
+            a.correlated_pmtu_feedback(21, report, Some(1100)).unwrap();
+            a.correlated_pmtu_feedback(22, lower(report), None).unwrap();
+            assert!(a.managed_results.pending.is_none());
+            rto(&mut a);
+            assert_eq!(a.path_mtu_info().unwrap().current_mtu, 900);
+            assert!(a.managed_results.applied.is_none());
+            // With provenance the replacement alone describes the result.
+            let (mut a, _b, _s, _r, report, _) = deferred_setup(ipv4);
+            a.correlated_pmtu_feedback(21, report, Some(1100)).unwrap();
+            a.correlated_pmtu_feedback(22, lower(report), Some(950)).unwrap();
+            rto(&mut a);
+            let applied = a.managed_results.applied.take().unwrap();
+            assert_eq!((applied.report(), applied.host_estimate()), (lower(report), 950));
+        }
+
+        // Cumulative ACK of the quoted data cancels the pending report.
+        let (mut a, mut b, _s, _r, report, bytes) = deferred_setup(ipv4);
+        a.correlated_pmtu_feedback(21, report, Some(1100)).unwrap();
+        b.input(23, &wire::parse(ip(a.tuple), &bytes).unwrap()).unwrap();
+        a.write(&[9; 100]).unwrap();
+        deliver(&mut b, &mut a, 24);
+        assert!(a.managed_results.pending.is_none());
+        exchange(&mut a, &mut b, 25);
+        let _ = a.rto_deadline.map(|d| a.timeout(d).unwrap());
+        assert!(a.managed_results.applied.is_none());
+
+        // Path replacement discards both provenance and the local pending report.
+        let (mut a, _b, mut service, route, report, _) = deferred_setup(ipv4);
+        a.correlated_pmtu_feedback(21, report, Some(1100)).unwrap();
+        let old = a.managed_path.unwrap();
+        service.replace_route(old.snapshot.key().route(), route).unwrap();
+        let (client, snapshot) = service.rebind(old.client, old.snapshot.key().request()).unwrap();
+        a.apply_managed_budget(crate::PreparedPath { client, snapshot }).unwrap();
+        assert!(a.managed_results.pending.is_none());
+        rto(&mut a);
+        assert!(a.managed_results.applied.is_none());
+
+        // The legacy entry point attaches no provenance.
+        let (mut a, _b, _s, _r, report, _) = deferred_setup(ipv4);
+        a.correlated_pmtu_feedback(21, report, None).unwrap();
+        rto(&mut a);
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, report.candidate_mtu);
+        assert!(a.managed_results.applied.is_none());
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Receipt {
+    Exact,
+    Missing,
+    WrongLength,
+    Fragmentable,
+}
+
+// A real reserved upward probe after the shared hold, committed as Submitted.
+fn submitted_probe(
+    a: &mut Connection,
+    b: &mut Connection,
+    service: &mut PathService,
+    ipv4: bool,
+    converged: bool,
+) -> (Vec<u8>, crate::DiscoveryIntent, u64) {
+    let mtu = if ipv4 { 1100 } else { 1280 };
+    let hold = 600 * 1_000_000;
+    decrease(a, service, mtu, hold);
+    a.write(&[7; 1000]).unwrap();
+    exchange(a, b, hold - 1);
+    if converged {
+        // Local proof already exceeds the shared ceiling: only real data can
+        // challenge it, re-confirming the larger local size.
+        let p = a.pmtud.as_mut().unwrap();
+        p.info.search_low = p.info.search_high;
+    }
+    a.write(&[8; 20000]).unwrap();
+    let mut bytes = vec![0; 2048];
+    let n = a.transmit_selected(hold + 1, &mut bytes, true).unwrap().unwrap();
+    bytes.truncate(n);
+    let intent = a.last_departure.unwrap().discovery.expect("eligible upward probe");
+    assert!(intent.ip_packet_len() > mtu);
+    (bytes, intent, hold + 1)
+}
+
+fn accept_probe(a: &mut Connection, intent: crate::DiscoveryIntent, now: Instant, receipt: Receipt) {
+    let start = Seq(a.last_departure.unwrap().start);
+    test_support::commit_reserved(a, now);
+    let receipt = match receipt {
+        Receipt::Missing => return,
+        Receipt::Exact => crate::PhysicalReceipt { ip_packet_len: intent.ip_packet_len(), dont_fragment: true },
+        Receipt::WrongLength => crate::PhysicalReceipt { ip_packet_len: intent.ip_packet_len() + 1, dont_fragment: true },
+        Receipt::Fragmentable => crate::PhysicalReceipt { ip_packet_len: intent.ip_packet_len(), dont_fragment: false },
+    };
+    a.retain_probe_receipt(start, intent, receipt);
+}
+
+#[test]
+fn confirmed_probe_requires_exact_definitely_submitted_receipt() {
+    for ipv4 in [true, false] {
+        for converged in [false, true] {
+            for receipt in [Receipt::Exact, Receipt::Missing, Receipt::WrongLength, Receipt::Fragmentable] {
+                let (mut a, mut b, mut service, _) = managed_pair(ipv4, 1_000_000);
+                let (bytes, intent, now) = submitted_probe(&mut a, &mut b, &mut service, ipv4, converged);
+                let local = a.path_mtu_info().unwrap().current_mtu;
+                if converged {
+                    assert_eq!(intent.ip_packet_len(), local);
+                }
+                accept_probe(&mut a, intent, now, receipt);
+                b.input(now + 1, &wire::parse(ip(a.tuple), &bytes).unwrap()).unwrap();
+                // Submission alone confirms nothing: only the probe's ACK does.
+                assert!(a.managed_results.confirmed.is_none());
+                deliver(&mut b, &mut a, now + 2);
+                let confirmed = a.managed_results.confirmed.take();
+                let expected = receipt == Receipt::Exact || receipt == Receipt::Fragmentable && !ipv4;
+                assert_eq!(confirmed.is_some(), expected, "ipv4={ipv4} converged={converged}");
+                let Some(confirmed) = confirmed else { continue };
+                assert_eq!(confirmed.intent(), intent);
+                assert_eq!(confirmed.receipt().ip_packet_len, intent.ip_packet_len());
+                assert!(a.managed_results.receipt.is_none());
+                // Ordinary output stays capped until the shared fact is published.
+                let header = if ipv4 { 20 } else { 40 };
+                assert!(a.path_payload_limit() as u32 + header <= a.managed_path.unwrap().snapshot.ip_packet_budget().unwrap());
+                // The result satisfies the PathService rules with real data.
+                let binding = intent.binding();
+                assert_eq!(
+                    service.confirm_delivery(
+                        binding.snapshot.path(),
+                        intent.ip_packet_len(),
+                        binding.snapshot.negative_revision(),
+                        intent.selected_at(),
+                        now + 2,
+                    ),
+                    Ok(ntcp_path::DeliveryConfirmation::Raised)
+                );
+                // Ordinary ACKs afterwards record nothing further.
+                exchange(&mut a, &mut b, now + 3);
+                assert!(a.managed_results.confirmed.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn stale_probe_after_negative_revision_route_change_or_fresh_hold_yields_nothing() {
+    for ipv4 in [true, false] {
+        for case in 0..3 {
+            if case == 0 && !ipv4 {
+                continue; // IPv6 is already at its family floor.
+            }
+            let (mut a, mut b, mut service, route) = managed_pair(ipv4, 1_000_000);
+            let (bytes, intent, now) = submitted_probe(&mut a, &mut b, &mut service, ipv4, false);
+            let old = a.managed_path.unwrap();
+            match case {
+                0 => {
+                    // Newer negative evidence before the probe's ACK.
+                    accept_probe(&mut a, intent, now, Receipt::Exact);
+                    assert!(a.managed_results.receipt.is_some());
+                    decrease(&mut a, &mut service, 1050, now + 600 * 1_000_000);
+                    assert!(a.managed_results.receipt.is_none());
+                }
+                1 => {
+                    accept_probe(&mut a, intent, now, Receipt::Exact);
+                    service.replace_route(old.snapshot.key().route(), route).unwrap();
+                    let (client, snapshot) = service.rebind(old.client, old.snapshot.key().request()).unwrap();
+                    a.apply_managed_budget(crate::PreparedPath { client, snapshot }).unwrap();
+                    assert!(a.managed_results.receipt.is_none());
+                }
+                _ => {
+                    // A fresh unchanged report between selection and submission
+                    // restarts the hold: the selection is now early.
+                    service
+                        .trusted_decrease_with_hold(old.snapshot.path(), 1400, now + 600 * 1_000_000)
+                        .unwrap();
+                    let fresh = crate::PreparedPath { client: old.client, snapshot: service.snapshot(old.client).unwrap() };
+                    assert_eq!(fresh.snapshot.negative_revision(), old.snapshot.negative_revision());
+                    assert!(fresh.snapshot.retry_not_before() > intent.selected_at());
+                    a.apply_managed_budget(fresh).unwrap();
+                    accept_probe(&mut a, intent, now, Receipt::Exact);
+                    assert!(a.managed_results.receipt.is_none());
+                }
+            }
+            b.input(now + 1, &wire::parse(ip(a.tuple), &bytes).unwrap()).unwrap();
+            deliver(&mut b, &mut a, now + 2);
+            assert!(a.managed_results.confirmed.is_none(), "case {case}");
+        }
+    }
+}
