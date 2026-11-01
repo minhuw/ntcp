@@ -9,3 +9,9 @@ libc = "0.2"
 ntcp = { path = "../../crates/stacks/ntcp", features = ["tfo-linux-cookie"] }
 ntcp-socket = { path = "../../crates/adapters/ntcp-socket", features = ["tfo-linux-cookie"] }
 ntcp-io-af-packet = { path = "../../crates/io/ntcp-io-af-packet" }
+# The harness-only staged sender (src/bin/ptb_stage.rs) drives one Host.
+ntcp-host = { path = "../../crates/stacks/ntcp-host" }
+ntcp-io = { path = "../../crates/io/ntcp-io" }
+ntcp-io-tun = { path = "../../crates/io/ntcp-io-tun" }
+ntcp-ip = { path = "../../crates/stacks/ntcp-ip" }
+ntcp-ip6 = { path = "../../crates/stacks/ntcp-ip6" }

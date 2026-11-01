@@ -38,7 +38,7 @@ mod hystart;
 mod ipv4_options;
 mod pacing;
 mod pmtud;
-pub use pmtud::{PathMtuInfo, PmtuFeedback};
+pub use pmtud::{PathMtuInfo, PmtuFeedback, PmtuReport};
 mod pmtud_config;
 pub use pmtud_config::{Ipv4Plateaus, PmtudConfig, PmtudPolicy, SearchAging};
 mod route_policy;

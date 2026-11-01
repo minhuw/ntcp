@@ -47,9 +47,10 @@ class IcmpScenario(unittest.TestCase):
                 run.child(dict(kind="icmp", family=4, scenario="udp-quoted"))
             setup.assert_not_called()
 
-    def test_cases_cover_both_families_both_quoted_transports_the_forged_control_and_fanout(self):
+    def test_cases_cover_both_families_both_quoted_transports_the_forged_control_fanout_and_staged_repair(self):
         self.assertEqual({(c["family"], c["scenario"]) for c in icmp.cases()},
-                         {(f, s) for f in (4, 6) for s in ("udp-quoted", "tcp-quoted", "forged", "shared-fanout")})
+                         {(f, s) for f in (4, 6) for s in ("udp-quoted", "tcp-quoted", "forged", "shared-fanout",
+                                                            "tcp-staged", "tcp-burst")})
         self.assertFalse(any(c in run.matrix() for c in icmp.cases()))
 
     def original(self, family):
@@ -91,3 +92,24 @@ class IcmpScenario(unittest.TestCase):
         event = icmp.parse(bytes(header + body))
         self.assertTrue(event["ptb"] and event["checksum_valid"] and event["ip_checksum_valid"])
         self.assertEqual((event["mtu"], event["source"], event["quote"]), (1280, "198.18.1.1", quote))
+
+    def tcp(self, options):
+        header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40 + len(options), 0, 0x4000, 64, 6, 0,
+                             bytes([198, 18, 2, 2]), bytes([198, 18, 1, 2]))
+        tcp = bytearray(struct.pack("!HHIIBBHHH", 18082, 18081, 7, 9, (20 + len(options)) // 4 << 4, 0x10,
+                                    1000, 0, 0) + options)
+        pseudo = header[12:20] + bytes([0, 6]) + struct.pack("!H", len(tcp))
+        struct.pack_into("!H", tcp, 16, checksum(pseudo + bytes(tcp)))
+        return icmp.parse(header + bytes(tcp))
+
+    def test_decoder_reports_sack_blocks_after_other_options(self):
+        # NOP, NOP, timestamps, NOP, NOP, SACK with two blocks.
+        options = (b"\1\1" + struct.pack("!BBII", 8, 10, 5, 6) + b"\1\1"
+                   + struct.pack("!BBIIII", 5, 18, 100, 200, 0xfffffff0, 16))
+        event = self.tcp(options)
+        self.assertTrue(event["checksum_valid"])
+        self.assertEqual(event["sack"], [(100, 200), (0xfffffff0, 16)])
+        self.assertIsNone(self.tcp(b"")["sack"])
+        # A truncated or misaligned SACK option yields no blocks.
+        self.assertIsNone(self.tcp(struct.pack("!BBI", 5, 10, 1) + b"\0\0")["sack"])
+        self.assertIsNone(self.tcp(struct.pack("!BBII", 5, 9, 1, 2) + b"\0\0\0")["sack"])

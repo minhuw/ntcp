@@ -19585,6 +19585,12 @@ mod pmtud_isolated_cc;
 mod pmtud_lifecycle;
 #[path = "pmtud_tests.rs"]
 mod pmtud_policy;
+#[path = "connection_ptb_tests.rs"]
+mod ptb_repair;
+#[path = "connection_ptb_scheduler_tests.rs"]
+mod ptb_scheduler;
+#[path = "connection_ptb_boundary_tests.rs"]
+mod ptb_boundary;
 #[path = "connection_reservation_rtt_tests.rs"]
 mod reservation_rtt;
 

@@ -120,14 +120,6 @@ quote = '''
 The node then uses the value in the MTU field in the Packet Too Big message as a tentative PMTU value or the IPv6 minimum link MTU if that is larger, and compares the tentative PMTU to the existing PMTU. If the tentative PMTU is less than the existing PMTU estimate, the tentative PMTU replaces the existing PMTU as the PMTU value for the path.
 '''
 
-# 8201-064
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "T9 delivers correlated drop notification independently of the estimate: an equal or nondecreasing PTB at or above the IPv6 minimum and below the packet size, not below the connection's proven delivery or about an older path incarnation, is consumed by the correlated TCP owner as PmtuFeedback::Unchanged drop advice (black-hole classification without estimate increase, hold restart, error or head retry); one about the current path below proven delivery is PmtuFeedback::Deferred whatever the loss-inferred estimate, recording the same drop advice. A validated PTB quoting a Host UDP datagram is queued to that flow as UdpEvent::PacketTooBig whether or not the estimate decreases. Remaining T11: TCP retransmission of exactly the dropped data that advice names (non-head, partially acknowledged and wrapped ranges with duplicate suppression); normal retransmission is distinct."
-quote = '''
-Also, the instance that sent the packet that elicited the Packet Too Big message should be notified that its packet has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped data.
-'''
-
 # 8201-065
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
@@ -139,7 +131,7 @@ Note: An implementation can avoid the use of an asynchronous notification mechan
 # 8201-076
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
-reason = "Matching PTB now preserves finite isolated-probe proof and suppresses a congestion-loss response only after receiver delivery and recovery exit. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Thus the literal unchanged-cwnd obligation remains TODO despite the separate RFC4821 congestion-classification closure; required MSS rescaling is preserved."
+reason = "Implemented operative behavior: a PTB indicating a lost PMTU probe is not a congestion notification. Probe attribution invalidates the probe size for Unchanged, Deferred, Decreased and older-incarnation reports alike while finite isolated-probe proof survives, a congestion-loss response is suppressed only after receiver delivery and recovery exit, and neither the PTB nor its exact-range repair reduces cwnd or ssthresh, enters or extends recovery or starts PRR. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Remaining (T23, AC-27): only the standards decision whether that RFC 5681/RFC 4821 MSS-decrease rescaling conflicts with \"the congestion window may not change\"; required MSS rescaling is preserved."
 quote = '''
 A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.
 '''

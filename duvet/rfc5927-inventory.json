@@ -834,7 +834,7 @@
       "section": "7.2",
       "quote": "If, while there is a pending ICMP \"Packet Too Big\" error message, the TCP SEQ claimed by the pending message is acknowledged (i.e., an ACK that acknowledges that sequence number is received), then the \"pending error\" condition is cleared.",
       "status": "covered",
-      "reason": "Selected policy clears pending when the quoted sequence is acknowledged; the security test exercises advancing partial ACK and proves a later timeout does not apply the report. Additional clearing on any other progress is a deliberate deviation, not literal algorithm equivalence.",
+      "reason": "Selected policy clears pending once cumulative ACK passes the quoted packet's data; the security test proves a later timeout then does not apply the report. A partial ACK into the quoted packet deliberately does not clear it (its surviving bytes were still dropped) and that data's own timeout applies it, as the same test shows; this is a deliberate deviation, not literal algorithm equivalence.",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
         "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
@@ -1429,7 +1429,7 @@
       "section": "7.4",
       "quote": "else { if (claimedmtu > maxsizesent || claimedmtu >= current_mtu) drop_message();",
       "status": "covered",
-      "reason": "Selected gate rejects candidate>=current_mtu or >=max_sent, and additionally requires a smaller value than the exact quoted sent size. The security wire test rejects equal and larger reports; stricter rejection is not a missing historical branch.",
+      "reason": "Selected gate rejects a candidate not smaller than the exact quoted sent size (hence never above max_sent). A candidate >=current_mtu updates nothing but is deliberately kept as a drop notification of the quoted bytes, not dropped. The security wire test rejects equal and larger reports and shows nondecreasing ones never change the estimate.",
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.4",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",

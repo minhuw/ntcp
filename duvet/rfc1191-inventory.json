@@ -173,7 +173,7 @@
       "section": "3",
       "quote": "When a host receives a Datagram Too Big message, it MUST reduce its estimate of the PMTU for the relevant path, based on the value of the Next-Hop MTU field in the message (see section 4). We do not specify the precise behavior of a host in this circumstance, since different applications may have different requirements, and since different implementation architectures may favor different strategies.",
       "status": "covered",
-      "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
+      "reason": "Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
         "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
@@ -185,7 +185,7 @@
       "section": "3",
       "quote": "We do require that after receiving a Datagram Too Big message, a host MUST attempt to avoid eliciting more such messages in the near future. The host may either reduce the size of the datagrams it is sending along the path, or cease setting the Don't Fragment bit in the headers of those datagrams. Clearly, the former strategy may continue to elicit Datagram Too Big messages for a while, but since each of these messages (and the dropped datagrams they respond to) consume Internet resources, the host MUST force the PMTU Discovery process to converge.",
       "status": "covered",
-      "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
+      "reason": "Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
         "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
@@ -297,7 +297,7 @@
       "section": "3",
       "quote": "A host MUST never reduce its estimate of the Path MTU below 68 octets.",
       "status": "covered",
-      "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
+      "reason": "Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
         "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
@@ -309,7 +309,7 @@
       "section": "3",
       "quote": "A host MUST not increase its estimate of the Path MTU in response to the contents of a Datagram Too Big message. A message purporting to announce an increase in the Path MTU might be a stale datagram that has been floating around in the Internet, a false packet injected as part of a denial-of-service attack, or the result of having multiple paths to the destination.",
       "status": "covered",
-      "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
+      "reason": "Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
         "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
@@ -665,7 +665,7 @@
       "section": "6.2",
       "quote": "When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.",
       "status": "covered",
-      "reason": "PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the corrected quoted length, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests and real router PTBs in the isolated namespace gate verify it.",
+      "reason": "PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host-proven submitted length rather than the connection's estimate, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -703,9 +703,13 @@
       "id": "1191-061",
       "section": "6.2",
       "quote": "Also, the instance that sent the datagram that elicited the Datagram Too Big message should be notified that its datagram has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped datagram.",
-      "status": "TODO",
-      "reason": "T9 delivers correlated drop notification independently of the estimate: an equal or nondecreasing but still-smaller-than-packet PTB not below the connection's proven delivery, or about an older path incarnation, is consumed by the correlated TCP owner as PmtuFeedback::Unchanged drop advice (black-hole classification without estimate increase, hold restart, error or head retry); one about the current path below proven delivery is PmtuFeedback::Deferred whatever the loss-inferred estimate, recording the same drop advice. A validated PTB quoting a Host UDP datagram is queued to that flow as UdpEvent::PacketTooBig whether or not the estimate decreases, which the tun_echo service consumes. Remaining T11: TCP retransmission of exactly the dropped range that advice names (non-head, partially acknowledged and wrapped ranges with duplicate suppression); normal loss recovery is distinct.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
+      "status": "covered",
+      "reason": "Every accepted correlated report is a drop notification separate from the estimate policy (Connection::accept_pmtu_report): Host-correlated Unchanged reports about the current or an older path incarnation, Deferred and Decreased reports, and a ring-matched legacy pmtu_feedback report below the recorded submitted size whether or not the estimate falls, all add the quoted span's eligible outstanding, unSACKed, never-retransmitted bytes as exact repair work, which TCP retransmits at the currently authorized size; a Deferred report's suspicious size waits for authorization, its dropped range does not. The dual-family real-receiver scheduler test repairs the ranges of four successively smaller PTBs that, below proven delivery, leave the estimate unchanged; Host tests repair a deferred report replayed after ledger eviction and, as advice only, after path replacement; the isolated namespace tcp-burst case repairs every range named by real router PTBs, including those that left the estimate unchanged. A Host UDP flow receives the same advice as UdpEvent::PacketTooBig.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::    fn accept_pmtu_report(",
+        "crates/stacks/ntcp/src/connection_ptb_scheduler_tests.rs::fn successive_ptbs_admit_one_repair_until_useful_ack_then_ordinary_admission()"
+      ]
     },
     {
       "id": "1191-062",
@@ -726,9 +730,13 @@
       "id": "1191-064",
       "section": "6.2",
       "quote": "It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet. Retransmission should be done for only for those packets that are known to be dropped, as indicated by a Datagram Too Big message.",
-      "status": "TODO",
-      "reason": "Feedback rearms the connection head after an MSS change, rather than identifying only the exact ICMP-quoted dropped range for retransmission. No separate dropped-packet notification is provided for unchanged PMTU.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
+      "status": "covered",
+      "reason": "Drop notification is distinct from path-change notification: Host::input_icmp correlates a validated PTB with committed submission evidence and hands it to the quoting connection at once (a report for an owner whose output is reserved is deferred with its normalized evidence and replayed when the reservation ends, without the possibly evicted ledger record), while the PMTU change reaches other users of the path only through Host::service_changes before their next output. Only bytes a PTB names are retransmitted: repair work is the quoted span's intersection with outstanding, unSACKed, never-retransmitted bytes, reclipped at selection, including non-head, partially acknowledged, wrapped and SACK-split ranges, and a PTB-caused MSS decrease no longer schedules a head retry. Dual-family Host tests repair exactly the quoted range of the quoted connection while an unquoted connection on the same path only adopts the budget and never retransmits; the isolated namespace tcp-staged case shows from captured packets that the first PTB-driven retransmission lies inside the quoted non-head range milliseconds after the real router PTB, while the head is unacknowledged.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection_ptb.rs::    pub(super) fn note_ptb_drop(",
+        "crates/stacks/ntcp-host/src/tests/repair.rs::fn host_ptb_repairs_exact_quoted_range_of_the_quoted_connection_only()"
+      ]
     },
     {
       "id": "1191-065",
@@ -863,7 +871,7 @@
       "section": "6.4",
       "quote": "Alternatively, the retransmission could be done in immediate response to a notification that the Path MTU has changed, but only for the specific connection specified by the Datagram Too Big message. The datagram size used in the retransmission should, of course, be no larger than the new PMTU.",
       "status": "covered",
-      "reason": "Accepted feedback refreshes only the matched Connection; the family-floor test verifies retry sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; this does not close exact dropped-range notification or burst deduplication.",
+      "reason": "Accepted feedback repairs only the matched Connection's quoted range at once; the family-floor test verifies the repair's sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; exact dropped-range notification and burst non-amplification are audited in 1191-061, 1191-064 and 1191-080.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
@@ -874,16 +882,20 @@
       "id": "1191-080",
       "section": "6.4",
       "quote": "Note: One MUST not retransmit in response to every Datagram Too Big message, since a burst of several oversized segments will give rise to several such messages and hence several retransmissions of the same data. If the new estimated PMTU is still wrong, the process repeats, and there is an exponential growth in the number of superfluous segments sent!",
-      "status": "TODO",
-      "reason": "Equal/nondecreasing reports are rejected, but no exact burst test establishes absence of repeated retransmission of the same data for several successively decreasing PTBs before ACK progress.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
+      "status": "covered",
+      "reason": "A PTB never causes a retransmission by itself: it only adds eligible bytes to the connection's pending repair set, which duplicate, repair-copy, path-incarnation and size variants and reports about a flight an RTO took over never enlarge, and each pending byte is repaired at most once. A notification that adds new work enters Restart, which admits one accepted physical repair packet until useful ACK progress (a cumulative advance or newly SACKed bytes; DSACK-only, duplicate and window-only ACKs do not count); remaining work then follows ordinary congestion admission. The dual-family real-receiver scheduler test sends four successively decreasing PTBs, one per oversized original, across many output polls without an ACK and observes exactly one repair packet, then every remaining byte resent exactly once without a timeout; Host reservation tests keep one physical packet when a racing decrease splits the repair; the isolated namespace tcp-burst case shows one repair packet, within a quoted range, before the first useful ACK for three real router PTBs, and no range resent twice between ACK progress.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection_ptb.rs::    pub(super) fn ptb_segment(",
+        "crates/stacks/ntcp/src/connection_ptb_scheduler_tests.rs::fn successive_ptbs_admit_one_repair_until_useful_ack_then_ordinary_admission()"
+      ]
     },
     {
       "id": "1191-081",
       "section": "6.4",
       "quote": "This means that the TCP layer must be able to recognize when a Datagram Too Big notification actually decreases the PMTU that it has already used to send a datagram on the given connection, and should ignore any other notifications.",
       "status": "covered",
-      "reason": "Nondecreasing, stale and impossible exact-size quotes are rejected; decreasing accepted feedback alone reaches packetization refresh.",
+      "reason": "Only a report that decreases the connection's estimate reaches packetization refresh; a nondecreasing report changes no estimate or segment size (it is only a drop notification of the quoted bytes), and stale and impossible exact-size quotes are rejected.",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
         "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
@@ -895,7 +907,7 @@
       "section": "6.4",
       "quote": "Modern TCP implementations incorporate \"congestion advoidance\" and \"slow-start\" algorithms to improve performance [4]. Unlike a retransmission caused by a TCP retransmission timeout, a retransmission caused by a Datagram Too Big message should not change the congestion window. It should, however, trigger the slow-start mechanism (i.e., only one segment should be retransmitted until acknowledgements begin to arrive again).",
       "status": "TODO",
-      "reason": "PTB-driven refresh rescales cwnd through Congestion::set_mss and may rearm head retry; the exact unchanged-cwnd/one-retransmission-until-ACK recommendation is not established. RFC5681 decrease rescaling is separately tested; do not mistake that later rule for literal RFC1191 text.",
+      "reason": "Implemented operative behavior: a DTB-caused retransmission never reduces cwnd or ssthresh, enters or extends recovery, starts PRR or manufactures delivery credit, and it triggers slow start: a notification adding new repair work admits one accepted physical repair packet until acknowledgements show useful progress (a cumulative advance or newly SACKed bytes), then ordinary congestion admission; probe attribution invalidates a quoted probe's size in every accepted class without a congestion response. Dual-family real-receiver scheduler, SACK/RACK/PRR, NewReno and Host reservation tests verify it. Remaining (T23, AC-27): only the standards decision whether the RFC 5681/RFC 4821 rescaling of the byte congestion window by segment count on an MSS decrease (Congestion::set_mss, kept) conflicts with \"should not change the congestion window\".",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
     },
     {
@@ -1127,7 +1139,7 @@
       "section": "8",
       "quote": "In the other attack, the false message indicates a PMTU greater than reality. If believed, this could cause temporary blockage as the victim sends datagrams that will be dropped by some router. Within one round-trip time, the host would discover its mistake (receiving Datagram Too Big messages from that router), but frequent repetition of this attack could cause lots of datagrams to be dropped. A host, however, should never raise its estimate of the PMTU based on a Datagram Too Big message, so should not be vulnerable to this attack.",
       "status": "covered",
-      "reason": "IPv4 feedback rejects equal/larger and impossible candidates; exact-quote tests show these do not raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.",
+      "reason": "IPv4 feedback rejects candidates no smaller than the quoted packet and impossible ones, and an accepted nondecreasing report is only a drop notification; exact-quote tests show none of these raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-8",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",

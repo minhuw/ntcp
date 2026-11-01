@@ -341,7 +341,7 @@ fn pmtud_config_infinity_keeps_ptb_hold_and_failure_retry() {
 }
 
 #[test]
-fn pmtud_config_plateaus_bounded_validated_and_strictly_decreasing_feedback() {
+fn pmtud_config_plateaus_bounded_validated_and_feedback_never_raises_estimate() {
     for invalid in [
         &[][..],
         &[1500, 1500, 68],
@@ -375,8 +375,9 @@ fn pmtud_config_plateaus_bounded_validated_and_strictly_decreasing_feedback() {
         assert_eq!(p.info.current_mtu, expected);
         let before = p.info;
         p.set_policy(2, PmtudPolicy::default(), Some(600_000_000));
-        let accepted = p.feedback(3, Seq(0), size, 20, 0);
-        assert_eq!(accepted, size == 1500);
+        // Still a drop notification for the recorded packet; the estimate
+        // decreases only if the new policy derives a smaller size.
+        assert!(p.feedback(3, Seq(0), size, 20, 0));
         assert!(p.info.current_mtu <= before.current_mtu);
     }
     for plateaus in [Ipv4Plateaus::default(), custom] {

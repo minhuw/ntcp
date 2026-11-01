@@ -7,7 +7,9 @@ network namespace inside the same harness-owned user namespace. Requests use a
 whose MTU is 1280 (a veth drops frames larger than its receiving end's MTU, so
 one veth cannot carry 1500-octet requests in and limit replies to 1280). The
 router kernel therefore generates every real Packet Too Big in these cases;
-the harness only forges messages in the forged control.
+the harness only forges messages in the forged control. The staged cases
+replace tun_echo with the harness-only ptb_stage sender, which controls only
+when the application writes and when ingress is serviced.
 """
 import ipaddress
 import json
@@ -38,7 +40,19 @@ ADDRESSES = {
             wrong="2001:db8:92::3", prefix="64"),
 }
 MACS = dict(t9ra="02:00:00:00:09:01", t9pa="02:00:00:00:09:02", t9rb="02:00:00:00:09:03", t9pb="02:00:00:00:09:04")
-SCENARIOS = ("udp-quoted", "tcp-quoted", "forged", "shared-fanout")
+SCENARIOS = ("udp-quoted", "tcp-quoted", "forged", "shared-fanout", "tcp-staged", "tcp-burst")
+STAGED = ("tcp-staged", "tcp-burst")
+# The staged scenarios use the harness-only ptb_stage sender against a Linux
+# listener on this port; its ACKs to ntcp are delayed by netem on t9pa.
+STAGED_PORT = 18082
+ACK_DELAY_MS = 200
+# Router ICMP generation must not be rate limited: every oversized original
+# needs its own PTB. Linux 6.12 already exempts IPv4 fragmentation-needed from
+# the ratemask and the IPv6 default mask excludes type 2; both are recorded.
+ROUTER_ICMP_SYSCTLS = (("net/ipv4/icmp_ratelimit", "0"), ("net/ipv4/icmp_msgs_per_sec", "100000"),
+                       ("net/ipv4/icmp_msgs_burst", "100000"), ("net/ipv6/icmp/ratelimit", "0"),
+                       # Default 6168 without bit 3 (destination unreachable).
+                       ("net/ipv4/icmp_ratemask", "6160"), ("net/ipv6/icmp/ratemask", "0-1,3-127"))
 # tun_echo's consumed per-flow UdpEvent::PacketTooBig: remote, dropped size, MTU.
 ADVICE = r"UDP echo reply to (\S+) \((\d+) octets\) dropped by the path \(next-hop MTU (?:Some\()?(\d+)"
 # The echo's local refusal of an oversize reply: by its path query before
@@ -94,7 +108,7 @@ def parse(packet):
         offset = (body[12] >> 4) * 4
         sport, dport, seq, ack = struct.unpack_from("!HHII", body)
         info.update(sport=sport, dport=dport, seq=seq, ack=ack, flags=body[13], payload=len(body) - offset,
-                    checksum_valid=checksum(pseudo + body) == 0)
+                    checksum_valid=checksum(pseudo + body) == 0, sack=sack_blocks(body[20:offset]))
     elif protocol == 17 and len(body) >= 8:
         sport, dport, length, value = struct.unpack_from("!HHHH", body)
         info.update(sport=sport, dport=dport, udp_length=length, udp_checksum=value, payload=length - 8,
@@ -107,6 +121,27 @@ def parse(packet):
         elif (version, body[0]) == (6, 2):
             info.update(ptb=True, mtu=struct.unpack_from("!I", body, 4)[0], quote=body[8:])
     return info
+
+
+def sack_blocks(options):
+    """SACK option (kind 5) blocks as (left, right) pairs; None without one."""
+    i = 0
+    while i < len(options):
+        kind = options[i]
+        if kind == 0:
+            break
+        if kind == 1:
+            i += 1
+            continue
+        if i + 1 >= len(options) or options[i + 1] < 2 or i + options[i + 1] > len(options):
+            return None  # malformed options: no SACK information
+        length = options[i + 1]
+        if kind == 5:
+            if (length - 2) % 8:
+                return None
+            return [struct.unpack_from("!II", options, j) for j in range(i + 2, i + length - 7, 8)]
+        i += length
+    return None
 
 
 def quotes(quote, original):
@@ -236,6 +271,10 @@ def setup(family, egress_mtu, command, peer_pid):
             sysctl(run, f"net/ipv6/conf/{name}/accept_dad", 0)
             sysctl(run, f"net/ipv6/conf/{name}/addr_gen_mode", 1)  # no kernel link-local noise
     sysctl(lambda *x: command(list(x)), "net/ipv4/ip_forward", 1)
+    for path, value in ROUTER_ICMP_SYSCTLS:
+        sysctl(lambda *x: command(list(x)), path, value)
+    icmp_sysctls = {path: Path("/proc/sys/" + path).read_text().strip() for path, _ in ROUTER_ICMP_SYSCTLS}
+    assert icmp_sysctls == dict(ROUTER_ICMP_SYSCTLS), icmp_sysctls
     sysctl(lambda *x: command(list(x)), "net/ipv6/conf/all/forwarding", 1)
     router("link", "set", "lo", "up")
     router("tuntap", "add", "dev", TUN, "mode", "tun")
@@ -278,6 +317,7 @@ def setup(family, egress_mtu, command, peer_pid):
             + json.loads(peer("ip", "-j", "link", "show"))}
     return dict(addresses=a, router_to_peer=to_peer, router_to_ntcp=to_ntcp, peer_to_ntcp=from_peer, mtu=mtus,
                 ip_forward=1, ipv6_forwarding=1, offload="disabled on TUN and all four veth ends",
+                router_icmp_sysctls=icmp_sysctls,
                 peer_namespace=os.stat(f"/proc/{peer_pid}/ns/net").st_ino)
 
 
@@ -337,21 +377,139 @@ def mutate(family, original, name):
     return bytes(quote)
 
 
-def child(case, proof, binary, Peer, command, emit):
+def staged(family, scenario, a, capture, stager, peer, command, sent, ptbs, accepted_ptb):
+    """Causal attribution of PTB-driven repair from the TUN capture.
+
+    The staged sender writes each segment in its own output pass without
+    servicing ingress, while netem delays every peer-to-ntcp packet. A
+    retransmission captured before the first useful ACK progress can then
+    only be the response to a router PTB: TLP and RACK are off in this
+    profile and the 1 s minimum RTO is far beyond the observed delays.
+    """
+    mss = 1500 - header_len(family) - 20
+    ready = stager.ready
+    assert ready["sack"] and not ready["tlp"] and not ready["rack"] and ready["rto_min_us"] >= 1_000_000, ready
+    peer.send(f"listen {STAGED_PORT}")
+    listening = peer.read()
+    assert listening["event"] == "listening", listening
+    stager.send("connect")
+    established = stager.read()
+    assert established["event"] == "established", established
+    # The peer's ACK path only (t9pa); data toward the peer is undelayed.
+    peer_ns = ["nsenter", "-t", str(peer.p.pid), "-n"]
+    command([*peer_ns, "tc", "qdisc", "add", "dev", "t9pa", "root", "netem", "delay", f"{ACK_DELAY_MS}ms"])
+    qdisc = json.loads(command([*peer_ns, "tc", "-j", "qdisc", "show", "dev", "t9pa"]))
+    netem = [q for q in qdisc if q["kind"] == "netem"]
+    assert len(netem) == 1 and netem[0]["options"]["delay"]["delay"] == ACK_DELAY_MS / 1000, qdisc
+    # A fitting head, an oversized middle and a fitting tail; or several
+    # distinct oversized originals (the RFC 5681 initial window holds three).
+    sizes = [1000, mss, 600] if scenario == "tcp-staged" else [mss] * 3
+    mark = capture.mark()
+    stager.send("stage " + " ".join(map(str, sizes)))
+    result = stager.read()
+    assert result["event"] == "staged" and result["acknowledged"] == sum(sizes), result
+    stager.send("close")
+    closed = stager.read()
+    assert closed["event"] == "closed" and closed["written"] == sum(sizes), closed
+    peer.send(f"collect {sum(sizes)}")
+    collected = peer.read()
+    assert collected["event"] == "collect" and collected["rx"] == sum(sizes), collected
+    assert collected["hash"] == fnv(pattern(sum(sizes), closed["salt"])), collected
+    events = capture.since(mark)
+    ports = (established["local_port"], STAGED_PORT)
+    data = [e for e in sent(events, 6) if (e["sport"], e["dport"]) == ports and e["payload"]]
+    back = [e for e in events if e["direction"] == "to-ntcp" and e["protocol"] == 6
+            and (e["sport"], e["dport"]) == ports[::-1] and e["flags"] & 0x10]
+    base = data[0]["seq"]
+
+    def rel(seq):
+        return (seq - base) & 0xffffffff
+
+    def span(e):
+        return rel(e["seq"]), rel(e["seq"]) + e["payload"]
+
+    originals = data[:len(sizes)]
+    assert [e["payload"] for e in originals] == sizes, [public(e) for e in data[:8]]
+    assert [span(e)[0] for e in originals] == [sum(sizes[:i]) for i in range(len(sizes))], [public(e) for e in originals]
+    oversized = [e for e in originals if e["length"] == 1500]
+    assert len(oversized) == (1 if scenario == "tcp-staged" else 3), [public(e) for e in originals]
+    assert all(e["length"] <= 1280 for e in originals if e not in oversized)
+    # One router PTB per oversized original, each quoting exactly one of them.
+    correlation = accepted_ptb(events, oversized)
+    quoted = sorted({span(next(o for o in oversized if quotes(p["quote"], o["raw"])))
+                     for p in ptbs(events)})
+    assert len(correlation) == len(oversized) and quoted == sorted(span(o) for o in oversized), (correlation, quoted)
+    # Useful ACK progress: a cumulative advance or newly SACKed bytes.
+    progress, acked, sacked = [], 0, set()
+    for e in back:
+        cumulative = rel(e["ack"])
+        blocks = [(rel(l), rel(r)) for l, r in e["sack"] or [] if rel(l) < rel(r) <= sum(sizes)]
+        new = {b for l, r in blocks for b in range(l, r)} - sacked
+        if cumulative > acked and cumulative <= sum(sizes) or new - set(range(cumulative)):
+            progress.append(dict(time_ns=e["time_ns"], ack=cumulative, sack=blocks))
+        acked = max(acked, cumulative) if cumulative <= sum(sizes) else acked
+        sacked |= new
+    assert progress, "no ACK progress captured"
+    repairs = data[len(sizes):]
+    # Every later data packet resends staged bytes (nothing new was written).
+    assert all(span(e)[1] <= sum(sizes) for e in repairs), [public(e) for e in repairs]
+    early = [e for e in repairs if e["time_ns"] < progress[0]["time_ns"]]
+    assert len(early) == 1, ("exactly one PTB repair packet before useful ACK progress", [public(e) for e in early])
+    first = early[0]
+    within = next((q for q in quoted if q[0] <= span(first)[0] and span(first)[1] <= q[1]), None)
+    assert within is not None and first["length"] <= 1280, (span(first), quoted)
+    first_ptb = min(p["time_ns"] for p in ptbs(events))
+    # PTB-caused: after the router's PTB, within milliseconds of it, and
+    # long before the minimum RTO could have expired for any original.
+    assert first_ptb < first["time_ns"] < first_ptb + 100_000_000, (first_ptb, first["time_ns"])
+    assert first["time_ns"] - originals[0]["time_ns"] < ready["rto_min_us"] * 500, first
+    acked_before = [e for e in back if e["time_ns"] < first["time_ns"] and rel(e["ack"]) > 0]
+    if scenario == "tcp-staged":
+        # Non-head: inside the quoted middle while the head is unacknowledged.
+        assert within == span(oversized[0]) and span(first)[0] >= sizes[0] and not acked_before, (
+            span(first), [public(e) for e in acked_before])
+    # Between successive useful-progress events no byte is resent twice.
+    epochs = {}
+    for e in repairs:
+        epoch = sum(p["time_ns"] < e["time_ns"] for p in progress)
+        seen = epochs.setdefault(epoch, set())
+        resent = set(range(*span(e)))
+        assert not seen & resent, ("range retransmitted twice before ACK progress", epoch, span(e))
+        seen |= resent
+    # Repair stays inside the quoted ranges and completes them.
+    covered = {b for e in repairs for b in range(*span(e))}
+    assert covered == {b for l, r in quoted for b in range(l, r)}, (sorted(span(e) for e in repairs), quoted)
+    return dict(profile=ready, netem=netem[0], sizes=sizes, start_sequence=result["start_sequence"],
+                originals=[dict(span=span(e), ip_length=e["length"], time_ns=e["time_ns"]) for e in originals],
+                quoted_ranges=quoted, correlation=correlation,
+                first_repair=dict(span=span(first), ip_length=first["length"], time_ns=first["time_ns"],
+                                  after_first_ptb_ns=first["time_ns"] - first_ptb),
+                first_progress=progress[0], progress_events=len(progress),
+                repairs=[dict(span=span(e), ip_length=e["length"], time_ns=e["time_ns"]) for e in repairs],
+                head_acknowledged_before_first_repair=bool(acked_before), stream=collected,
+                path_mtu=result["path_mtu"])
+
+
+def child(case, proof, binary, Peer, command, emit, staged_binary=None):
     family, scenario = case["family"], case["scenario"]
     a = ADDRESSES[family]
     egress_mtu = 1500 if scenario == "forged" else 1280
     big, allowed = large_udp(family), allowed_udp(family)
     small_mss = 1280 - header_len(family) - 20
     peer = Peer(["unshare", "--net", sys.executable, "-B", HERE / "icmp_peer.py", a["peer"], a["ntcp"], PORT])
-    ntcp = capture = None
+    ntcp = capture = stager = None
     evidence = dict(case=case)
     try:
         assert peer.ready["namespace"] not in (proof["net"]["parent"], proof["net"]["current"]), peer.ready
         settings = setup(family, egress_mtu, command, peer.p.pid)
         assert settings["peer_namespace"] == peer.ready["namespace"]
         capture = Capture(TUN)
-        ntcp = Ntcp(binary, a["ntcp"])
+        if scenario in STAGED:
+            # The staged sender, not tun_echo, owns the TUN in these cases.
+            port = f"[{a['peer']}]:{STAGED_PORT}" if family == 6 else f"{a['peer']}:{STAGED_PORT}"
+            stager = Peer([staged_binary, TUN, a["ntcp"], port])
+        else:
+            ntcp = Ntcp(binary, a["ntcp"])
         kernel_before = counters(family)
 
         def udp(size, salt, wait=2.0):
@@ -390,8 +548,9 @@ def child(case, proof, binary, Peer, command, emit):
             return found
 
         # Warm-up proves both routes before any oversize traffic.
-        warm = udp(64, 1)
-        assert warm["reply"] == 64 and warm["match"], warm
+        if ntcp is not None:
+            warm = udp(64, 1)
+            assert warm["reply"] == 64 and warm["match"], warm
         def stream(command, name, size, salt):
             peer.send(f"{command} {name} {size} {salt}")
             result = peer.read()
@@ -405,7 +564,9 @@ def child(case, proof, binary, Peer, command, emit):
             return dict(protocol=quoted["protocol"], sport=quoted.get("sport"), dport=quoted.get("dport"),
                         seq=quoted.get("seq"), length=quoted["length"])
 
-        if scenario == "shared-fanout":
+        if scenario in STAGED:
+            evidence.update(staged(family, scenario, a, capture, stager, peer, command, sent, ptbs, accepted_ptb))
+        elif scenario == "shared-fanout":
             # A UDP client and TCP streams A and B, all established on the one
             # path before any oversize packet. Only A then sends large data.
             b_open = stream("open", "b", 64, 31)
@@ -575,11 +736,11 @@ def child(case, proof, binary, Peer, command, emit):
         if scenario != "forged":
             assert kernel_after - kernel_before == generated >= 1, (kernel_before, kernel_after, generated)
         evidence.update(settings=settings, kernel_ptb_counter=dict(before=kernel_before, after=kernel_after),
-                        router_generated_ptbs=generated, ntcp_stderr=ntcp.since(0)[-12:])
+                        router_generated_ptbs=generated, ntcp_stderr=ntcp.since(0)[-12:] if ntcp else None)
     finally:
         primary = sys.exc_info()[0] is not None
         errors = []
-        for close in (ntcp and ntcp.close, peer.close, capture and capture.close):
+        for close in (ntcp and ntcp.close, stager and stager.close, peer.close, capture and capture.close):
             if close:
                 try:
                     close()

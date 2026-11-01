@@ -82,7 +82,7 @@ fn receive(b: &mut Connection, now: u64, frame: &[u8]) {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-4
 //= type=test
-//= reason=Pmtud::feedback rejects nondecreasing candidates. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.
+//= reason=Pmtud::feedback never raises the estimate: candidates no smaller than the quoted packet are rejected, and an accepted nondecreasing report is only a drop notification. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.
 //# A node must not increase its estimate of the Path MTU in response to the
 //# contents of a Packet Too Big message. A message purporting to announce an
 //# increase in the Path MTU might be a stale packet that has been floating around
@@ -92,7 +92,7 @@ fn receive(b: &mut Connection, now: u64, frame: &[u8]) {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-6
 //= type=test
-//= reason=The strictly-decreasing feedback guard prevents the described increase attack. IPv6 base-header wire test from 819b8f2 rejects equal/larger MTUs before and after a valid decrease, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.
+//= reason=Feedback never raises the estimate, which prevents the described increase attack. IPv6 base-header wire test from 819b8f2 shows equal/larger MTUs before and after a valid decrease leave the estimate unchanged, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.
 //# In the second attack, the false message indicates a PMTU larger than reality. If
 //# believed, this could cause temporary blockage as the victim sends packets that
 //# will be dropped by some router. Within one round-trip time, the node would
@@ -145,7 +145,9 @@ fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes() {
         assert!(feedback(&mut a, 42, &valid));
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1400);
         for mtu in [1400, 1500, 2000] {
-            assert!(!feedback(&mut a, 43, &ptb(&frame[..48], mtu)));
+            // A repeated 1400 still reports the dropped 1500-byte packet; no
+            // report about it can raise the estimate.
+            assert_eq!(feedback(&mut a, 43, &ptb(&frame[..48], mtu)), mtu < 1500);
             assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1400);
         }
         receive(&mut b, 44, &frame);

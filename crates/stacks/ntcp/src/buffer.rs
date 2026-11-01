@@ -16,9 +16,18 @@ struct SharedSpan {
     payload: Payload,
 }
 
+// Per-byte metadata bits beside PUSH (bit 0) and EOR (bit 1).
+// A Packet Too Big notification reported this byte's original copy dropped.
+const PTB_PENDING: u8 = 1 << 2;
+// A copy of this byte was (possibly) submitted again after its original.
+const RETRANSMITTED: u8 = 1 << 3;
+// A PTB replacement copy of this byte is outstanding and RFC 6675 SetPipe's
+// HighRxt term did not count it when it was committed.
+const PTB_COPY: u8 = 1 << 4;
+
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
-    // Bounded PUSH/EOR bits per byte.
+    // Bounded PUSH/EOR and PTB-pending/retransmitted bits per byte.
     // ACK, truncation, and resize move metadata with the data.
     data: VecDeque<(u8, u8)>,
     capacity: usize,
@@ -149,6 +158,110 @@ impl SendBuffer {
             .take(count.saturating_sub(1))
             .rposition(|byte| byte.1 & 2 != 0)
             .map_or(offset, |n| offset + n + 1)
+    }
+
+    // Mark eligible bytes (never retransmitted, not already pending) of one
+    // range as PTB repair work; returns how many became pending.
+    pub(crate) fn mark_ptb(&mut self, offset: usize, count: usize) -> usize {
+        let mut marked = 0;
+        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
+            if byte.1 & (PTB_PENDING | RETRANSMITTED) == 0 {
+                byte.1 |= PTB_PENDING;
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    // Delivery or abandonment of one range: withdraw its PTB work and its
+    // outstanding PTB copies. Returns (pending, copies) cleared.
+    pub(crate) fn release_ptb(&mut self, offset: usize, count: usize) -> (usize, usize) {
+        let (mut pending, mut copies) = (0, 0);
+        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
+            pending += usize::from(byte.1 & PTB_PENDING != 0);
+            copies += usize::from(byte.1 & PTB_COPY != 0);
+            byte.1 &= !(PTB_PENDING | PTB_COPY);
+        }
+        (pending, copies)
+    }
+
+    // Mark an outstanding PTB copy on one range; returns how many bytes were
+    // newly marked.
+    pub(crate) fn mark_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
+        let mut marked = 0;
+        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
+            marked += usize::from(byte.1 & PTB_COPY == 0);
+            byte.1 |= PTB_COPY;
+        }
+        marked
+    }
+
+    // HighRxt moved over one range: SetPipe's retransmission term now counts
+    // its outstanding PTB copies. Returns how many marks were cleared.
+    pub(crate) fn clear_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
+        let mut cleared = 0;
+        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
+            cleared += usize::from(byte.1 & PTB_COPY != 0);
+            byte.1 &= !PTB_COPY;
+        }
+        cleared
+    }
+
+    // Record a (possibly) submitted retransmitted copy: those bytes lose any
+    // PTB work and never become eligible again. Returns the pending bytes it
+    // withdrew.
+    pub(crate) fn mark_retransmitted(&mut self, offset: usize, count: usize) -> usize {
+        let mut cleared = 0;
+        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
+            cleared += usize::from(byte.1 & PTB_PENDING != 0);
+            byte.1 = (byte.1 & !PTB_PENDING) | RETRANSMITTED;
+        }
+        cleared
+    }
+
+    // First contiguous run of PTB work in [offset, end): (offset, length).
+    pub(crate) fn next_ptb(&self, offset: usize, end: usize) -> Option<(usize, usize)> {
+        self.next_flagged(PTB_PENDING, offset, end)
+    }
+
+    // First contiguous run of outstanding PTB copies in [offset, end).
+    pub(crate) fn next_ptb_copy(&self, offset: usize, end: usize) -> Option<(usize, usize)> {
+        self.next_flagged(PTB_COPY, offset, end)
+    }
+
+    fn next_flagged(&self, flag: u8, offset: usize, end: usize) -> Option<(usize, usize)> {
+        let end = end.min(self.data.len());
+        let start = (offset..end).find(|&i| self.data[i].1 & flag != 0)?;
+        let len = self
+            .data
+            .range(start..end)
+            .take_while(|byte| byte.1 & flag != 0)
+            .count();
+        Some((start, len))
+    }
+
+    // Bytes of one range that carry PTB work.
+    pub(crate) fn count_ptb(&self, offset: usize, count: usize) -> usize {
+        self.data
+            .range(offset.min(self.data.len())..)
+            .take(count)
+            .filter(|byte| byte.1 & PTB_PENDING != 0)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptb_pending(&self, offset: usize) -> bool {
+        self.data.get(offset).is_some_and(|byte| byte.1 & PTB_PENDING != 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptb_copy(&self, offset: usize) -> bool {
+        self.data.get(offset).is_some_and(|byte| byte.1 & PTB_COPY != 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retransmitted(&self, offset: usize) -> bool {
+        self.data.get(offset).is_some_and(|byte| byte.1 & RETRANSMITTED != 0)
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {

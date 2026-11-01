@@ -117,7 +117,7 @@ pub(super) fn tcp_report(dispatch: IcmpDispatch) -> (TcpReport, Option<path::Est
         other => panic!("{other:?}"),
     }
 }
-fn quote_key(frame: &[u8]) -> QuoteKey {
+pub(super) fn quote_key(frame: &[u8]) -> QuoteKey {
     let quote = ntcp_icmp::decode_icmp(&ptb(frame, 1280)).unwrap().quoted;
     QuoteKey {
         source: quote.ip.source,
@@ -503,7 +503,7 @@ fn reserved_owner_defers_without_effect_and_replay_revalidates_generation() {
         assert_eq!((current_mtu(&a, id), learned(&a, id)), before);
         // Still reserved: replay defers again.
         assert!(matches!(
-            a.0.replay_icmp(&mut a.1, deferred, 103, &report).unwrap(),
+            a.0.replay_icmp(&mut a.1, deferred, 103).unwrap(),
             IcmpDispatch::Deferred(_)
         ));
         // The held attempt is submitted; the reservation resolves.
@@ -516,8 +516,7 @@ fn reserved_owner_defers_without_effect_and_replay_revalidates_generation() {
             .unwrap();
         assert!(result == Submission::Submitted);
         assert!(!a.1.is_output_reserved(id));
-        let (report_out, published) =
-            tcp_report(a.0.replay_icmp(&mut a.1, deferred, 104, &report).unwrap());
+        let (report_out, published) = tcp_report(a.0.replay_icmp(&mut a.1, deferred, 104).unwrap());
         assert!(matches!(
             report_out,
             TcpReport::PacketTooBig(PmtuFeedback::Decreased { .. })
@@ -528,7 +527,7 @@ fn reserved_owner_defers_without_effect_and_replay_revalidates_generation() {
         a.1.abort(id).unwrap();
         a.1.release(id).unwrap();
         assert_eq!(
-            a.0.replay_icmp(&mut a.1, deferred, 105, &report).unwrap(),
+            a.0.replay_icmp(&mut a.1, deferred, 105).unwrap(),
             IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Stale))
         );
         // Fresh input about the released generation is equally stale.
@@ -541,10 +540,10 @@ fn reserved_owner_defers_without_effect_and_replay_revalidates_generation() {
     }
 }
 
-// A deferred report acts only for its own generation even when the frame
-// replayed under it correlates with a different live, sealed generation:
-// here the retained frame quotes another connection's SYN, which a fresh
-// dispatch would apply to that connection.
+// A deferred report acts only for the generation it was correlated with,
+// never for a later one: after that owner is released, a new connection
+// reusing its slot on another tuple is untouched by the replay, while a
+// fresh report quoting the new connection's own SYN acts for it.
 #[test]
 fn replay_never_applies_a_deferred_report_to_another_live_generation() {
     for v6 in [false, true] {
@@ -566,31 +565,36 @@ fn replay_never_applies_a_deferred_report_to_another_live_generation() {
         })
         .unwrap();
         assert!(!a.1.is_output_reserved(id));
+        a.1.abort(id).unwrap();
+        a.1.release(id).unwrap();
+        a.0.collect(&a.1).unwrap();
+        while send(&mut a, 104).is_some() {}
         let second_local = SocketAddr::new(local.ip(), local.port() + 1);
         let other =
             a.1.connect_with_path_provider(104, second_local, remote, options(&cfg, 0), &mut a.0)
                 .unwrap();
+        assert_ne!(other, id);
         let syn = send(&mut a, 104).unwrap();
         drain_events(&mut a.1);
-        let unreachable = if v6 { (1, 4) } else { (3, 3) };
-        let report = icmp(&syn, unreachable, 0);
-        let before = (current_mtu(&a, id), learned(&a, id), learned(&a, other));
+        let before = (current_mtu(&a, other), learned(&a, other));
         assert_eq!(
-            a.0.replay_icmp(&mut a.1, deferred, 105, &report).unwrap(),
+            a.0.replay_icmp(&mut a.1, deferred, 105).unwrap(),
             IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Stale))
         );
         assert_eq!(a.1.state(other).unwrap(), State::SynSent);
         assert!(drain_events(&mut a.1).is_empty());
-        assert_eq!(
-            (current_mtu(&a, id), learned(&a, id), learned(&a, other)),
-            before
+        assert_eq!((current_mtu(&a, other), learned(&a, other)), before);
+        assert!(
+            selected(&mut a.1, 105).is_none(),
+            "no output for the new owner"
         );
-        // The same frame, dispatched fresh, does belong to the other owner.
+        // A fresh report quoting the new owner's own SYN does belong to it.
+        let unreachable = if v6 { (1, 4) } else { (3, 3) };
         assert!(matches!(
-            dispatch(&mut a, 106, &report),
+            dispatch(&mut a, 106, &icmp(&syn, unreachable, 0)),
             IcmpDispatch::Completed(IcmpOutcome::Tcp { owner, .. }) if owner == other
         ));
-        std::println!("v6={v6}: replay for {id:?} discarded a quote owned by {other:?}");
+        std::println!("v6={v6}: replay for released {id:?} stale; {other:?} untouched");
     }
 }
 

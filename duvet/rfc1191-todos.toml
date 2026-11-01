@@ -131,28 +131,12 @@ We therefore believe that the IP layer should store PMTU information and that th
 
 
 
-# 1191-061
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
-reason = "T9 delivers correlated drop notification independently of the estimate: an equal or nondecreasing but still-smaller-than-packet PTB not below the connection's proven delivery, or about an older path incarnation, is consumed by the correlated TCP owner as PmtuFeedback::Unchanged drop advice (black-hole classification without estimate increase, hold restart, error or head retry); one about the current path below proven delivery is PmtuFeedback::Deferred whatever the loss-inferred estimate, recording the same drop advice. A validated PTB quoting a Host UDP datagram is queued to that flow as UdpEvent::PacketTooBig whether or not the estimate decreases, which the tun_echo service consumes. Remaining T11: TCP retransmission of exactly the dropped range that advice names (non-head, partially acknowledged and wrapped ranges with duplicate suppression); normal loss recovery is distinct."
-quote = '''
-Also, the instance that sent the datagram that elicited the Datagram Too Big message should be notified that its datagram has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped datagram.
-'''
-
 # 1191-063
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
 reason = "Unselected alternative that defers PMTU-decrease notification until SEND fails, suggested especially for UDP. TCP uses validated feedback and immediate packetization refresh instead; shared-path fanout and dropped-packet notification are audited separately."
 quote = '''
 Alternatively, an implementation can avoid the use of an asynchronous notification mechanism for PMTU decreases by postponing notification until the next attempt to send a datagram larger than the PMTU estimate. In this approach, when an attempt is made to SEND a datagram with the DF bit set, and the datagram is larger than the PMTU estimate, the SEND function should fail and return a suitable error indication. This approach may be more suitable to a connectionless packetization layer (such as one using UDP), which (in some implementations) may be hard to "notify" from the ICMP layer. In this case, the normal timeout-based retransmission mechanisms would be used to recover from the dropped datagrams.
-'''
-
-# 1191-064
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
-reason = "Feedback rearms the connection head after an MSS change, rather than identifying only the exact ICMP-quoted dropped range for retransmission. No separate dropped-packet notification is provided for unchanged PMTU."
-quote = '''
-It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet. Retransmission should be done for only for those packets that are known to be dropped, as indicated by a Datagram Too Big message.
 '''
 
 # 1191-067
@@ -203,18 +187,10 @@ quote = '''
 PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.
 '''
 
-# 1191-080
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
-reason = "Equal/nondecreasing reports are rejected, but no exact burst test establishes absence of repeated retransmission of the same data for several successively decreasing PTBs before ACK progress."
-quote = '''
-Note: One MUST not retransmit in response to every Datagram Too Big message, since a burst of several oversized segments will give rise to several such messages and hence several retransmissions of the same data. If the new estimated PMTU is still wrong, the process repeats, and there is an exponential growth in the number of superfluous segments sent!
-'''
-
 # 1191-082
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
-reason = "PTB-driven refresh rescales cwnd through Congestion::set_mss and may rearm head retry; the exact unchanged-cwnd/one-retransmission-until-ACK recommendation is not established. RFC5681 decrease rescaling is separately tested; do not mistake that later rule for literal RFC1191 text."
+reason = "Implemented operative behavior: a DTB-caused retransmission never reduces cwnd or ssthresh, enters or extends recovery, starts PRR or manufactures delivery credit, and it triggers slow start: a notification adding new repair work admits one accepted physical repair packet until acknowledgements show useful progress (a cumulative advance or newly SACKed bytes), then ordinary congestion admission; probe attribution invalidates a quoted probe's size in every accepted class without a congestion response. Dual-family real-receiver scheduler, SACK/RACK/PRR, NewReno and Host reservation tests verify it. Remaining (T23, AC-27): only the standards decision whether the RFC 5681/RFC 4821 rescaling of the byte congestion window by segment count on an MSS decrease (Congestion::set_mss, kept) conflicts with \"should not change the congestion window\"."
 quote = '''
 Modern TCP implementations incorporate "congestion advoidance" and "slow-start" algorithms to improve performance [4]. Unlike a retransmission caused by a TCP retransmission timeout, a retransmission caused by a Datagram Too Big message should not change the congestion window. It should, however, trigger the slow-start mechanism (i.e., only one segment should be retransmitted until acknowledgements begin to arrive again).
 '''

@@ -140,7 +140,7 @@ fn ack(a: &mut Connection, now: u64, end: Seq) {
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
 //= type=test
-//= reason=Accepted feedback refreshes only the matched Connection; the family-floor test verifies retry sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; this does not close exact dropped-range notification or burst deduplication.
+//= reason=Accepted feedback repairs only the matched Connection's quoted range at once; the family-floor test verifies the repair's sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; exact dropped-range notification and burst non-amplification are audited in 1191-061, 1191-064 and 1191-080.
 //# Alternatively, the retransmission could be done in immediate response to a
 //# notification that the Path MTU has changed, but only for the specific connection
 //# specified by the Datagram Too Big message. The datagram size used in the
@@ -184,7 +184,7 @@ fn ack(a: &mut Connection, now: u64, end: Seq) {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-4
 //= type=test
-//= reason=Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports pass the same strictly decreasing path; no source fragmentation is used.
+//= reason=Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports decrease it the same way; no source fragmentation is used.
 //# After receiving a Packet Too Big message, a node must attempt to avoid eliciting
 //# more such messages in the near future. The node must reduce the size of the packets
 //# it is sending along the path. Using a PMTU estimate larger than the IPv6 minimum
@@ -205,7 +205,7 @@ fn ack(a: &mut Connection, now: u64, end: Seq) {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
 //= type=test
-//= reason=Validated feedback updates the matched Connection and emits a retry no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Exact dropped-range notification is distinct and remains open in 8201-064/066.
+//= reason=Validated feedback for the matched Connection immediately repairs its quoted range no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Notification of the dropped data is audited in 8201-064.
 //# Alternatively, the retransmission could be done in immediate response to a
 //# notification that the Path MTU was decreased, but only for the specific connection
 //# specified by the Packet Too Big message. The packet size used in the retransmission
@@ -296,7 +296,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-3
 //= type=test
-//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
 //# When a host receives a Datagram Too Big message, it MUST reduce its estimate of the PMTU
 //# for the relevant path, based on the value of the Next-Hop MTU field in the message (see
 //# section 4). We do not specify the precise behavior of a host in this circumstance, since
@@ -305,7 +305,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-3
 //= type=test
-//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
 //# We do require that after receiving a Datagram Too Big message, a host MUST attempt to
 //# avoid eliciting more such messages in the near future. The host may either reduce the
 //# size of the datagrams it is sending along the path, or cease setting the Don't Fragment
@@ -316,12 +316,12 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-3
 //= type=test
-//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
 //# A host MUST never reduce its estimate of the Path MTU below 68 octets.
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-3
 //= type=test
-//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
 //# A host MUST not increase its estimate of the Path MTU in response to the contents of a
 //# Datagram Too Big message. A message purporting to announce an increase in the Path MTU
 //# might be a stale datagram that has been floating around in the Internet, a false packet
@@ -330,7 +330,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
 //= type=test
-//= reason=Nondecreasing, stale and impossible exact-size quotes are rejected; decreasing accepted feedback alone reaches packetization refresh.
+//= reason=Only a report that decreases the connection's estimate reaches packetization refresh; a nondecreasing report changes no estimate or segment size (it is only a drop notification of the quoted bytes), and stale and impossible exact-size quotes are rejected.
 //# This means that the TCP layer must be able to recognize when a Datagram Too Big
 //# notification actually decreases the PMTU that it has already used to send a datagram on
 //# the given connection, and should ignore any other notifications.
@@ -366,7 +366,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
 //= type=test
-//= reason=Selected policy clears pending when the quoted sequence is acknowledged; the security test exercises advancing partial ACK and proves a later timeout does not apply the report. Additional clearing on any other progress is a deliberate deviation, not literal algorithm equivalence.
+//= reason=Selected policy clears pending once cumulative ACK passes the quoted packet's data; the security test proves a later timeout then does not apply the report. A partial ACK into the quoted packet deliberately does not clear it (its surviving bytes were still dropped) and that data's own timeout applies it, as the same test shows; this is a deliberate deviation, not literal algorithm equivalence.
 //# If, while there is a pending ICMP "Packet Too Big" error message, the TCP SEQ claimed by
 //# the pending message is acknowledged (i.e., an ACK that acknowledges that sequence number
 //# is received), then the "pending error" condition is cleared.
@@ -393,7 +393,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
 //= type=test
-//= reason=Selected gate rejects candidate>=current_mtu or >=max_sent, and additionally requires a smaller value than the exact quoted sent size. The security wire test rejects equal and larger reports; stricter rejection is not a missing historical branch.
+//= reason=Selected gate rejects a candidate not smaller than the exact quoted sent size (hence never above max_sent). A candidate >=current_mtu updates nothing but is deliberately kept as a drop notification of the quoted bytes, not dropped. The security wire test rejects equal and larger reports and shows nondecreasing ones never change the estimate.
 //# else { if (claimedmtu > maxsizesent || claimedmtu >= current_mtu) drop_message();
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-2
@@ -429,7 +429,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-8
 //= type=test
-//= reason=IPv4 feedback rejects equal/larger and impossible candidates; exact-quote tests show these do not raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.
+//= reason=IPv4 feedback rejects candidates no smaller than the quoted packet and impossible ones, and an accepted nondecreasing report is only a drop notification; exact-quote tests show none of these raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.
 //# In the other attack, the false message indicates a PMTU greater than reality. If
 //# believed, this could cause temporary blockage as the victim sends datagrams that
 //# will be dropped by some router. Within one round-trip time, the host would discover
@@ -471,10 +471,30 @@ fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate() {
         let seq = a.snd_una;
         assert!(a.pmtu_feedback(61, seq.0, 1500, 20, 68).unwrap());
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1500); // deferred
-        ack(&mut a, 62, seq.wrapping_add(1)); // even partial progress clears
+        let end = a.snd_nxt;
+        ack(&mut a, 62, end); // progress past the quoted data clears
+        a.write(&[4; 1448]).unwrap();
+        packet(&mut a, 63);
         let expiry = a.loss_timer.unwrap().1;
         a.timeout(expiry).unwrap();
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1500);
+
+        // A partial ACK into the quoted packet keeps the report: the timeout
+        // of its surviving quoted data still authorizes it.
+        let (mut a, _) = family_pair(cfg(1500), true, iss);
+        a.write(&[2; 1448]).unwrap();
+        packet(&mut a, 40);
+        let end = a.snd_nxt;
+        ack(&mut a, 50, end);
+        a.write(&[3; 1448]).unwrap();
+        packet(&mut a, 60);
+        let seq = a.snd_una;
+        assert!(a.pmtu_feedback(61, seq.0, 1500, 20, 68).unwrap());
+        ack(&mut a, 62, seq.wrapping_add(1));
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1500);
+        let expiry = a.loss_timer.unwrap().1;
+        a.timeout(expiry).unwrap();
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, 68);
 
         let (mut a, _) = family_pair(cfg(1500), true, iss);
         a.write(&[2; 1448]).unwrap();

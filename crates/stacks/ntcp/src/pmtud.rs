@@ -31,6 +31,26 @@ pub enum PmtuFeedback {
     Decreased { mtu: u32 },
 }
 
+/// One Host-correlated report: the local class together with the size the
+/// report itself derives under this connection's configured policy (next-hop
+/// MTU with family floor, or the plateau below an IPv4 quoted length
+/// corrected against the Host-proven submitted length). The derived size is
+/// independent of the connection's current, possibly loss-inferred, estimate;
+/// `feedback` only says whether that local estimate fell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PmtuReport {
+    pub feedback: PmtuFeedback,
+    /// `None` exactly when `feedback` is `Rejected`.
+    pub derived_mtu: Option<u32>,
+}
+
+impl PmtuReport {
+    const REJECTED: Self = Self {
+        feedback: PmtuFeedback::Rejected,
+        derived_mtu: None,
+    };
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Sent {
     start: Seq,
@@ -57,10 +77,14 @@ pub(crate) struct Probe {
 
 /// One deferred report below proven delivery. Its identity changes exactly
 /// when the size that a later timeout would apply changes, so provenance
-/// attached to one report never describes a replacement.
+/// attached to one report never describes a replacement. `live..end` is the
+/// quoted data still outstanding: a partial ACK into it neither clears the
+/// report nor moves its authorization to unrelated data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Pending {
     seq: Seq,
+    live: Seq,
+    end: Seq,
     mtu: u32,
     id: u64,
 }
@@ -535,9 +559,9 @@ impl Pmtud {
         true
     }
 
-    // Core also checks tuple and the live SND.UNA <= SEG.SEQ < SND.NXT window.
+    // Core also checks tuple and that the quoted span overlaps [SND.UNA, SND.NXT).
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3
-    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
     //# When a host receives a Datagram Too Big message, it MUST reduce its estimate of the
     //# PMTU for the relevant path, based on the value of the Next-Hop MTU field in the
     //# message (see section 4). We do not specify the precise behavior of a host in this
@@ -545,7 +569,7 @@ impl Pmtud {
     //# since different implementation architectures may favor different strategies.
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3
-    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
     //# We do require that after receiving a Datagram Too Big message, a host MUST attempt
     //# to avoid eliciting more such messages in the near future. The host may either reduce
     //# the size of the datagrams it is sending along the path, or cease setting the Don't
@@ -555,11 +579,11 @@ impl Pmtud {
     //# host MUST force the PMTU Discovery process to converge.
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3
-    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
     //# A host MUST never reduce its estimate of the Path MTU below 68 octets.
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3
-    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence and legal floor; only a candidate below the current estimate reduces it, and repeated/nondecreasing accepted reports are drop notifications that neither raise the estimate nor rearm the hold. Security-selected deferred updates are tested separately from immediate initial discovery.
     //# A host MUST not increase its estimate of the Path MTU in response to the contents of
     //# a Datagram Too Big message. A message purporting to announce an increase in the Path
     //# MTU might be a stale datagram that has been floating around in the Internet, a false
@@ -595,7 +619,7 @@ impl Pmtud {
     //# necessary, according to the Note above).
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
-    //= reason=Nondecreasing, stale and impossible exact-size quotes are rejected; decreasing accepted feedback alone reaches packetization refresh.
+    //= reason=Only a report that decreases the connection's estimate reaches packetization refresh; a nondecreasing report changes no estimate or segment size (it is only a drop notification of the quoted bytes), and stale and impossible exact-size quotes are rejected.
     //# This means that the TCP layer must be able to recognize when a Datagram Too Big
     //# notification actually decreases the PMTU that it has already used to send a datagram
     //# on the given connection, and should ignore any other notifications.
@@ -624,7 +648,7 @@ impl Pmtud {
     //# received error message, and delay the update of the assumed Path-MTU.
 
     //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
-    //= reason=Selected policy clears pending when the quoted sequence is acknowledged; the security test exercises advancing partial ACK and proves a later timeout does not apply the report. Additional clearing on any other progress is a deliberate deviation, not literal algorithm equivalence.
+    //= reason=Selected policy clears pending once cumulative ACK passes the quoted packet's data; the security test proves a later timeout then does not apply the report. A partial ACK into the quoted packet deliberately does not clear it (its surviving bytes were still dropped) and that data's own timeout applies it, as the same test shows; this is a deliberate deviation, not literal algorithm equivalence.
     //# If, while there is a pending ICMP "Packet Too Big" error message, the TCP SEQ
     //# claimed by the pending message is acknowledged (i.e., an ACK that acknowledges that
     //# sequence number is received), then the "pending error" condition is cleared.
@@ -638,7 +662,7 @@ impl Pmtud {
     //# implementations are more cautious with the errors being reported by the network.
 
     //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
-    //= reason=Selected gate rejects candidate>=current_mtu or >=max_sent, and additionally requires a smaller value than the exact quoted sent size. The security wire test rejects equal and larger reports; stricter rejection is not a missing historical branch.
+    //= reason=Selected gate rejects a candidate not smaller than the exact quoted sent size (hence never above max_sent). A candidate >=current_mtu updates nothing but is deliberately kept as a drop notification of the quoted bytes, not dropped. The security wire test rejects equal and larger reports and shows nondecreasing ones never change the estimate.
     //# else { if (claimedmtu > maxsizesent || claimedmtu >= current_mtu) drop_message();
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-2
@@ -683,7 +707,7 @@ impl Pmtud {
     //# data per datagram, progress could be slow.
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-8
-    //= reason=IPv4 feedback rejects equal/larger and impossible candidates; exact-quote tests show these do not raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.
+    //= reason=IPv4 feedback rejects candidates no smaller than the quoted packet and impossible ones, and an accepted nondecreasing report is only a drop notification; exact-quote tests show none of these raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.
     //# In the other attack, the false message indicates a PMTU greater than reality. If
     //# believed, this could cause temporary blockage as the victim sends datagrams that
     //# will be dropped by some router. Within one round-trip time, the host would
@@ -728,7 +752,7 @@ impl Pmtud {
     //# MTU Discovery must detect decreases in PMTU as fast as possible.
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-4
-    //= reason=Pmtud::feedback rejects nondecreasing candidates. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.
+    //= reason=Pmtud::feedback never raises the estimate: candidates no smaller than the quoted packet are rejected, and an accepted nondecreasing report is only a drop notification. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.
     //# A node must not increase its estimate of the Path MTU in response to the
     //# contents of a Packet Too Big message. A message purporting to announce an
     //# increase in the Path MTU might be a stale packet that has been floating around
@@ -737,7 +761,7 @@ impl Pmtud {
     //# different PMTU.
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-6
-    //= reason=The strictly-decreasing feedback guard prevents the described increase attack. IPv6 base-header wire test from 819b8f2 rejects equal/larger MTUs before and after a valid decrease, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.
+    //= reason=Feedback never raises the estimate, which prevents the described increase attack. IPv6 base-header wire test from 819b8f2 shows equal/larger MTUs before and after a valid decrease leave the estimate unchanged, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.
     //# In the second attack, the false message indicates a PMTU larger than reality. If
     //# believed, this could cause temporary blockage as the victim sends packets that
     //# will be dropped by some router. Within one round-trip time, the node would
@@ -746,6 +770,11 @@ impl Pmtud {
     //# node, however, must not raise its estimate of the PMTU based on a Packet Too Big
     //# message, so it should not be vulnerable to this attack.
 
+    /// Legacy ring-matched drop notification. `true` means accepted as a
+    /// notification that the exactly recorded transmission was dropped (its
+    /// candidate is below the submitted size), whether or not the estimate
+    /// decreases; a nondecreasing report never raises the estimate.
+    #[cfg(test)]
     pub fn feedback(
         &mut self,
         now: Instant,
@@ -754,24 +783,46 @@ impl Pmtud {
         header: u16,
         candidate: u32,
     ) -> bool {
-        if !self.plausible_quote(size, header) {
-            return false;
+        self.legacy_report(now, seq, size, header, candidate).derived_mtu.is_some()
+    }
+
+    pub(crate) fn legacy_report(
+        &mut self,
+        now: Instant,
+        seq: Seq,
+        size: u32,
+        header: u16,
+        candidate: u32,
+    ) -> PmtuReport {
+        match self.known(seq, size, header, candidate) {
+            Some(known) => self.report(now, known, size, header, candidate, None),
+            None => PmtuReport::REJECTED,
         }
-        let known = self.sent.iter().flatten().find(|p| {
+    }
+
+    /// Span of the recorded transmission a legacy quote identifies, if any.
+    pub(crate) fn quoted_span(
+        &self,
+        seq: Seq,
+        size: u32,
+        header: u16,
+        candidate: u32,
+    ) -> Option<(Seq, Seq)> {
+        self.known(seq, size, header, candidate).map(|p| (p.start, p.end))
+    }
+
+    fn known(&self, seq: Seq, size: u32, header: u16, candidate: u32) -> Option<Sent> {
+        if !self.plausible_quote(size, header) {
+            return None;
+        }
+        self.sent.iter().flatten().copied().find(|p| {
             p.start == seq
                 && p.header == header
                 && (p.size == size
                     || self.ipv4
                         && candidate == 0
                         && p.size.checked_add(u32::from(header)) == Some(size))
-        });
-        let Some(known) = known else {
-            return false;
-        };
-        matches!(
-            self.report(now, *known, size, header, candidate, None),
-            PmtuFeedback::Deferred | PmtuFeedback::Decreased { .. }
-        )
+        })
     }
 
     fn plausible_quote(&self, size: u32, header: u16) -> bool {
@@ -788,9 +839,10 @@ impl Pmtud {
     /// larger than current and not below proven delivery, or about a path
     /// incarnation the connection no longer uses) is consumed as drop advice
     /// only: the black-hole timeout learns an ICMP message explained the
-    /// loss, and nothing else changes. A current-path report below proven
-    /// delivery is Deferred whatever the current estimate, so a loss-inferred
-    /// local decrease never changes its outcome.
+    /// loss and probe attribution applies, but no estimate or hold changes.
+    /// A current-path report below proven delivery is Deferred whatever the
+    /// current estimate, so a loss-inferred local decrease never changes its
+    /// outcome, and the derived size never depends on that estimate either.
     #[allow(clippy::too_many_arguments)]
     pub fn correlated_feedback(
         &mut self,
@@ -802,9 +854,9 @@ impl Pmtud {
         quoted_size: u32,
         candidate: u32,
         current_path: bool,
-    ) -> PmtuFeedback {
+    ) -> PmtuReport {
         if !self.plausible_quote(quoted_size, header) {
-            return PmtuFeedback::Rejected;
+            return PmtuReport::REJECTED;
         }
         let known = Sent {
             start,
@@ -823,9 +875,9 @@ impl Pmtud {
         )
     }
 
-    // `advice` is None for the legacy ring-matched entrypoint (no drop advice,
-    // no state change unless the estimate decreases or is deferred), or
-    // whether the Host-proven submission used the connection's current path.
+    // `advice` is None for the legacy ring-matched entrypoint, or whether the
+    // Host-proven submission used the connection's current path. Every
+    // accepted class is a drop notification for `known`.
     fn report(
         &mut self,
         now: Instant,
@@ -834,7 +886,7 @@ impl Pmtud {
         header: u16,
         candidate: u32,
         advice: Option<bool>,
-    ) -> PmtuFeedback {
+    ) -> PmtuReport {
         let seq = known.start;
         let sent_size = known.size;
         // Only the exact original packet may retain probe classification. A
@@ -846,7 +898,7 @@ impl Pmtud {
         //# If a node receives a Packet Too Big message reporting a next-hop MTU
         //# that is less than the IPv6 minimum link MTU, it must discard it.
         if !self.ipv4 && candidate < 1280 {
-            return PmtuFeedback::Rejected;
+            return PmtuReport::REJECTED;
         }
         let mtu = if self.ipv4 && candidate == 0 {
             //= https://www.rfc-editor.org/rfc/rfc1191#section-5
@@ -854,7 +906,16 @@ impl Pmtud {
             //# not less than the current PMTU estimate, it must be reduced by
             //# 4 times the value of the returned Header Length field.
             // header is in bytes already, not the IHL field's 32-bit words.
-            let corrected = if size >= self.info.current_mtu {
+            // A Host-correlated report compares with the proven submitted
+            // length, the estimate that packet was actually sent under: the
+            // derived size must not depend on later loss inference. The
+            // uncorrelated legacy entrypoint keeps the current estimate.
+            let reference = if advice.is_some() {
+                sent_size
+            } else {
+                self.info.current_mtu
+            };
+            let corrected = if size >= reference {
                 size.saturating_sub(u32::from(header))
             } else {
                 size
@@ -879,40 +940,46 @@ impl Pmtud {
         //# the contents of a Packet Too Big message.
         // A hop cannot have dropped a packet no larger than its own MTU.
         if mtu >= sent_size {
-            return PmtuFeedback::Rejected;
+            return PmtuReport::REJECTED;
         }
-        match advice {
-            None if mtu >= self.info.current_mtu || mtu >= self.max_sent => {
-                return PmtuFeedback::Rejected;
-            }
+        // Probe attribution precedes and is independent of estimate policy.
+        // Only the exact original probe may retain its finite loss record,
+        // and a PTB about it always invalidates its size result. Any other
+        // dropped packet (including a repair copy) is independent loss.
+        if original_probe {
+            self.invalidate_probe_size_result();
+        } else {
+            self.probe = None;
+            self.outcome = None;
+        }
+        // RFC 4821 section 7.7: an ICMP message explained this loss.
+        self.icmp_since_progress = true;
+        let accepted = |feedback| PmtuReport {
+            feedback,
+            derived_mtu: Some(mtu),
+        };
+        let unchanged = match advice {
+            None => mtu >= self.info.current_mtu,
             // A current-path report below proven delivery is deferred below
             // even when a loss-inferred decrease already took the local
             // estimate under it: what it may change, here or for the Host's
             // shared record, must not depend on connection-local inference.
-            Some(current_path)
-                if !current_path
-                    || (mtu >= self.info.current_mtu && mtu >= self.max_acked) =>
-            {
-                // RFC 4821 section 7.7: an ICMP message explained this loss.
-                // No estimate increase, hold restart, error or repair.
-                self.icmp_since_progress = true;
-                return PmtuFeedback::Unchanged;
+            Some(current_path) => {
+                !current_path || (mtu >= self.info.current_mtu && mtu >= self.max_acked)
             }
-            _ => {}
+        };
+        if unchanged {
+            // Drop advice only: no estimate increase or hold restart.
+            return accepted(PmtuFeedback::Unchanged);
         }
         //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
-        //= reason=Informational mitigation selected as policy, not a TCP MUST. Exact bounded packet evidence strengthens the live-sequence gate; any cumulative progress clears a pending report.
+        //= reason=Informational mitigation selected as policy, not a TCP MUST. Exact bounded packet evidence strengthens the live-sequence gate; cumulative progress past the quoted data clears a pending report, while a partial ACK into it does not.
         //# A
         //# MAXSEGRTO of 1 provides enough protection for most cases.
         // RFC5927 policy: defer a decrease below previously proven delivery,
-        // until the quoted data times out; any cumulative progress clears it.
+        // until the quoted data times out; cumulative progress past the
+        // quoted data clears it.
         if mtu < self.max_acked {
-            if !original_probe {
-                // Deferring the size change does not make a report about other
-                // data evidence that the original probe alone was lost.
-                self.probe = None;
-                self.outcome = None;
-            }
             // Even deferred validated PTB feedback inhibits new upward probes.
             self.delay(now, self.hold);
             self.periodic_deadline = None;
@@ -921,20 +988,19 @@ impl Pmtud {
                 self.pending_ids += 1;
                 self.pending = Some(Pending {
                     seq,
+                    live: seq,
+                    end: known.end,
                     mtu,
                     id: self.pending_ids,
                 });
             }
-            if advice.is_some() {
-                // The deferred size is suspect, the reported drop is not.
-                self.icmp_since_progress = true;
-            }
-            PmtuFeedback::Deferred
+            // The deferred size is suspect, the reported drop is not.
+            accepted(PmtuFeedback::Deferred)
         } else {
             self.apply_ptb(mtu, now, original_probe);
-            PmtuFeedback::Decreased {
+            accepted(PmtuFeedback::Decreased {
                 mtu: self.info.current_mtu,
-            }
+            })
         }
     }
 
@@ -1098,7 +1164,15 @@ impl Pmtud {
         {
             self.repair_range = None;
         }
-        self.pending = None;
+        // Cumulative progress past the quoted data refutes a pending report;
+        // a partial ACK leaves its surviving quoted data outstanding.
+        if let Some(pending) = &mut self.pending {
+            if ack.at_or_after(pending.end) {
+                self.pending = None;
+            } else if ack.after(pending.live) {
+                pending.live = ack;
+            }
+        }
         self.icmp_since_progress = false;
         for entry in &mut self.sent {
             if let Some(packet) = entry
@@ -1325,8 +1399,9 @@ impl Pmtud {
     //# If there is a full-stop timeout and there was not an ICMP message indicating a reason (PTB, Net unreachable, etc., or the ICMP message was ignored for some reason), the RECOMMENDED first recovery action is to treat this as a detected ICMP black hole as defined in [RFC2923].
     pub fn timeout(&mut self, now: Instant, head: Seq, consecutive: u32, cooldown: u64) {
         if let Some(pending) = self.pending.take() {
-            // Only the quoted data's timeout authorizes a deferred decrease.
-            if head == pending.seq {
+            // Only the timeout of still-outstanding quoted data authorizes a
+            // deferred decrease, never that of unrelated earlier data.
+            if head.in_window(pending.live, pending.end.distance_from(pending.live)) == Some(true) {
                 // Deferred feedback is applied only on timeout, which cannot
                 // qualify for an isolated-loss congestion exemption.
                 self.apply_ptb(pending.mtu, now, false);
@@ -1395,6 +1470,7 @@ mod tests {
             let header = if ipv4 { 20 } else { 40 };
             let report = |p: &mut Pmtud, now, mtu, current| {
                 p.correlated_feedback(now, Seq(1), Seq(1449), 1500, header, 1500, mtu, current)
+                    .feedback
             };
             let mut advised = state(ipv4);
             let mut control = state(ipv4);
@@ -1455,7 +1531,10 @@ mod tests {
                     let (local, deadline) = (p.info.current_mtu, p.deadline);
                     assert_eq!(
                         p.correlated_feedback(3, second, end, size, header, size, reported, true),
-                        PmtuFeedback::Deferred
+                        PmtuReport {
+                            feedback: PmtuFeedback::Deferred,
+                            derived_mtu: Some(reported),
+                        }
                     );
                     assert_eq!(p.info.current_mtu, local);
                     assert_ne!(p.deadline, deadline);
@@ -1479,6 +1558,135 @@ mod tests {
         }
     }
 
+    // An exact original-probe report invalidates the probe's size result,
+    // and any other dropped packet (including a repair copy of the probe)
+    // removes its isolation, whichever class the estimate policy returns.
+    #[test]
+    fn probe_attribution_is_independent_of_the_accepted_class() {
+        let cases = [
+            (1100, true, false, PmtuFeedback::Decreased { mtu: 1100 }),
+            (1220, true, false, PmtuFeedback::Unchanged),
+            (1100, false, false, PmtuFeedback::Unchanged),
+            (1100, true, true, PmtuFeedback::Deferred),
+        ];
+        for (candidate, current, delivered, class) in cases {
+            for target in 0..3 {
+                let mut p = state(true);
+                if delivered {
+                    p.sent(Seq(0), Seq(1160), 1200, 20, false);
+                    p.ack(Seq(1160), 1, 1000, 1000);
+                    assert_eq!(p.max_acked, 1200);
+                }
+                p.info.current_mtu = 1200;
+                let start = Seq(1160);
+                let end = start.wrapping_add(1200);
+                p.start_probe(start, 1200, 3000, 1240);
+                p.sent(start, end, 1240, 20, false);
+                p.sent(end, end.wrapping_add(1200), 1240, 20, false);
+                let (s, e, size) = match target {
+                    0 => (start, end, 1240),
+                    1 => {
+                        let copy = start.wrapping_add(1160);
+                        p.sent(start, copy, 1200, 20, true);
+                        (start, copy, 1200)
+                    }
+                    _ => (end, end.wrapping_add(1200), 1240),
+                };
+                if candidate >= size {
+                    continue;
+                }
+                let report = p.correlated_feedback(2, s, e, size, 20, size, candidate, current);
+                assert_eq!(report.feedback, class);
+                assert_eq!(report.derived_mtu, Some(candidate));
+                if target == 0 {
+                    assert!(p.probe.is_some_and(|q| !q.size_result_valid));
+                } else {
+                    assert!(p.probe.is_none());
+                }
+                assert!(p.provable_probe().is_none());
+            }
+        }
+        // The legacy entrypoint attributes a nondecreasing report alike.
+        let mut p = state(true);
+        p.info.current_mtu = 1200;
+        p.start_probe(Seq(1), 1200, 3000, 1240);
+        p.sent(Seq(1), Seq(1201), 1240, 20, false);
+        assert!(p.feedback(2, Seq(1), 1240, 20, 1220));
+        assert_eq!(p.info.current_mtu, 1200);
+        assert!(p.probe.is_some_and(|q| !q.size_result_valid));
+    }
+
+    // A partial ACK into the quoted data neither clears a deferred report
+    // nor lets an unrelated head's timeout authorize it; the timeout of its
+    // surviving quoted data does, and progress past that data clears it.
+    #[test]
+    fn deferred_report_is_authorized_by_its_own_surviving_data_timeout() {
+        for ipv4 in [true, false] {
+            let (header, reported) = if ipv4 { (20, 1100) } else { (40, 1350) };
+            let payload = 1500 - u32::from(header) - 20;
+            for clear in [false, true] {
+                let mut p = state(ipv4);
+                let first = Seq(u32::MAX - 700);
+                let second = first.wrapping_add(payload);
+                let third = second.wrapping_add(payload);
+                let end = third.wrapping_add(payload);
+                p.sent(first, second, 1500, header, false);
+                p.ack(second, 1, 1000, 1000);
+                p.sent(second, third, 1500, header, false);
+                p.sent(third, end, 1500, header, false);
+                let report = p.correlated_feedback(2, third, end, 1500, header, 1500, reported, true);
+                assert_eq!(report.feedback, PmtuFeedback::Deferred);
+                let id = p.pending_id().unwrap();
+                p.timeout(3, second, 1, 1000);
+                assert_eq!((p.info.current_mtu, p.pending_id()), (1500, Some(id)));
+                let partial = third.wrapping_add(100);
+                p.ack(partial, 4, 1000, 1000);
+                assert_eq!(p.pending_id(), Some(id));
+                if clear {
+                    p.ack(end, 5, 1000, 1000);
+                    p.timeout(6, end, 1, 1000);
+                    assert_eq!((p.pending_id(), p.take_applied_pending()), (None, None));
+                    assert_eq!(p.info.current_mtu, 1500);
+                } else {
+                    p.timeout(5, partial, 2, 1000);
+                    assert_eq!(p.info.current_mtu, reported);
+                    assert_eq!(p.take_applied_pending(), Some((id, reported)));
+                }
+            }
+        }
+    }
+
+    // RFC 1191 section 5 for a Host-correlated legacy IPv4 report compares
+    // the quoted length with the proven submitted length, so the derived
+    // size never depends on a loss-inferred local estimate. The uncorrelated
+    // entrypoint keeps the current-estimate comparison.
+    #[test]
+    fn correlated_legacy_correction_is_independent_of_the_local_estimate() {
+        let below = |p: &Pmtud, v: u32| p.plateaus.as_slice().iter().copied().find(|&x| x < v).unwrap();
+        // (submitted, quoted): exact quotes are corrected against the
+        // submitted length, a header-inflated quote recovers it.
+        for (sent, quoted) in [(1010, 1010), (1010, 1030), (1452, 1452), (1452, 1472)] {
+            for inferred in [None, Some(1006), Some(576)] {
+                let mut p = state(true);
+                if let Some(mtu) = inferred {
+                    p.info.current_mtu = mtu;
+                }
+                let report = p.correlated_feedback(1, Seq(1), Seq(sent - 39), sent, 20, quoted, 0, true);
+                assert_ne!(report.feedback, PmtuFeedback::Rejected);
+                assert_eq!(report.derived_mtu, Some(below(&p, (quoted - 20).min(sent))));
+            }
+        }
+        // Uncorrelated: the comparison stays with the current estimate.
+        for (current, corrected) in [(1500, false), (1006, true)] {
+            let mut p = state(true);
+            p.sent(Seq(1), Seq(971), 1010, 20, false);
+            p.info.current_mtu = current;
+            let report = p.legacy_report(1, Seq(1), 1010, 20, 0);
+            let expected = below(&p, if corrected { 990 } else { 1010 });
+            assert_eq!(report.derived_mtu, Some(expected));
+        }
+    }
+
     #[test]
     fn matching_ptb_retains_finite_classification_and_repair_boundary() {
         for start in [Seq(1), Seq(u32::MAX - 499)] {
@@ -1496,9 +1704,12 @@ mod tests {
             let deadline = p.deadline;
             assert!(p.probe.is_some());
             assert!(!p.probe.unwrap().size_result_valid);
-            assert!(!p.feedback(12, start, 1390, 40, 1280));
-            assert!(!p.feedback(13, start, 1390, 40, 1389));
-            assert_eq!(p.deadline, deadline);
+            // Repeated and nondecreasing reports are still drop notifications
+            // for the original probe; they change no estimate or hold.
+            assert!(p.feedback(12, start, 1390, 40, 1280));
+            assert!(p.feedback(13, start, 1390, 40, 1389));
+            assert_eq!((p.info, p.deadline), (info, deadline));
+            assert!(p.probe.is_some_and(|p| !p.size_result_valid));
             assert_eq!(p.repair_limit(start, 1220), 1220);
             p.ack(partial, 20, 1000, 1000);
             p.ack(partial, 21, 1000, 1000); // duplicate progress cannot clear the tail
@@ -1613,7 +1824,10 @@ mod tests {
             p.sent(Seq(10), Seq(1470), 1500, 20, false);
             assert!(p.feedback(1, Seq(10), reported, 20, 0));
             assert_eq!(p.info.current_mtu, expected);
-            assert!(!p.feedback(2, Seq(10), 1500, 20, 1499));
+            // A nondecreasing report of the same packet is a drop notification
+            // that never raises the estimate.
+            assert!(p.feedback(2, Seq(10), 1500, 20, 1499));
+            assert_eq!(p.info.current_mtu, expected);
         }
         let mut p = state(true);
         p.sent(Seq(10), Seq(60), 90, 20, false);

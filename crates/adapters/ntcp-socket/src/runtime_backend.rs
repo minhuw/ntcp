@@ -462,8 +462,8 @@ impl Owner {
     /// Managed ICMP: the single Host dispatcher validates the error, admits
     /// it on this context, correlates its quote with the submission ledger and
     /// applies TCP policy or datagram advice. A report about a reserved owner
-    /// returns unapplied; the caller retains the frame and replays it with
-    /// `Host::replay_icmp` for that exact owner generation.
+    /// returns unapplied; the caller retains the returned token and replays it
+    /// with `Host::replay_icmp` for that exact owner generation.
     pub(super) fn input_icmp(&mut self, bytes: &[u8]) -> Option<ntcp_host::DeferredIcmp> {
         let now = self.now();
         let ingress = self.ingress?;

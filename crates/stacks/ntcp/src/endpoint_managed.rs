@@ -107,13 +107,17 @@ impl Endpoint {
     /// impossible candidates) without a second lookup in the connection's
     /// bounded sent ring, which cannot establish Host provenance and whose
     /// eviction must not negate a valid Host match. Managed endpoints only;
-    /// unmanaged callers keep `pmtu_feedback`.
+    /// unmanaged callers keep `pmtu_feedback`. The result pairs the local
+    /// class (whether this connection's estimate fell) with the size the
+    /// report itself derives under the connection's configured policy,
+    /// which never depends on that estimate. Every accepted class records
+    /// the quoted outstanding bytes as dropped.
     pub fn correlated_pmtu_feedback(
         &mut self,
         now: Instant,
         id: ConnectionId,
         report: CorrelatedPmtu,
-    ) -> Result<crate::PmtuFeedback, EndpointError> {
+    ) -> Result<crate::PmtuReport, EndpointError> {
         if self.managed_context.is_none() {
             return Err(Error::InvalidState.into());
         }
@@ -131,7 +135,7 @@ impl Endpoint {
         id: ConnectionId,
         report: CorrelatedPmtu,
         host_estimate: u32,
-    ) -> Result<crate::PmtuFeedback, EndpointError> {
+    ) -> Result<crate::PmtuReport, EndpointError> {
         self.correlated_pmtu_report(now, id, report, Some(host_estimate))
     }
 
@@ -141,7 +145,7 @@ impl Endpoint {
         id: ConnectionId,
         report: CorrelatedPmtu,
         host_estimate: Option<u32>,
-    ) -> Result<crate::PmtuFeedback, EndpointError> {
+    ) -> Result<crate::PmtuReport, EndpointError> {
         if self.managed_context.is_none() {
             return Err(Error::InvalidState.into());
         }

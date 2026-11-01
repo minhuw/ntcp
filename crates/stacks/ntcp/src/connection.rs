@@ -24,6 +24,9 @@ use crate::{
 #[path = "connection_local_repair.rs"]
 mod local_repair;
 use local_repair::RepairUndo;
+#[path = "connection_ptb.rs"]
+mod ptb;
+use ptb::PtbRepair;
 
 // Caller-owned ticks in CallerTimebase units; deadlines use the same unit.
 // The caller supplies monotonic, consistent-rate time in its real or simulated
@@ -764,6 +767,7 @@ pub(crate) struct Connection {
     // Optional timing evidence, separate from the retained output obligation.
     reserved_ledger: Option<crate::rack::DepartureSelection>,
     repair_undo: Option<RepairUndo>,
+    ptb: PtbRepair,
     local_resource: Option<LocalResource>,
     resource_probes: u32,
     reserved_retransmit_counts: Option<crate::rack::Counts>,
@@ -1099,6 +1103,7 @@ impl Connection {
             last_departure: None,
             reserved_ledger: None,
             repair_undo: None,
+            ptb: PtbRepair::default(),
             local_resource: None,
             resource_probes: 0,
             reserved_retransmit_counts: None,
@@ -1829,6 +1834,9 @@ impl Connection {
             && self.ecn_pause.is_none_or(|deadline| self.now >= deadline)
             && self.rack.packet_counts().sacked == 0
             && self.rack.deadline.is_none()
+            // A loss probe must not bypass the PTB Restart allowance or
+            // ordinary admission of known-dropped ranges.
+            && self.ptb_idle()
     }
 
     fn tlp_eligible(&self) -> bool {
@@ -2042,8 +2050,11 @@ impl Connection {
         if self.rack_enabled() {
             self.rack.pipe()
         } else {
+            // Outstanding PTB copies committed above HighRxt are in transit
+            // too, though SetPipe's HighRxt term does not see them.
             self.scoreboard
                 .pipe(self.snd_una, self.data_high(), high_rxt, self.mss as u32)
+                + self.ptb_copy_pipe()
         }
     }
 
@@ -2657,9 +2668,15 @@ impl Connection {
     //# Discovery probe transmissions as needed.
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
-    //= reason=Matching PTB now preserves finite isolated-probe proof and suppresses a congestion-loss response only after receiver delivery and recovery exit. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Thus the literal unchanged-cwnd obligation remains TODO despite the separate RFC4821 congestion-classification closure; required MSS rescaling is preserved.
+    //= reason=Implemented operative behavior: a PTB indicating a lost PMTU probe is not a congestion notification. Probe attribution invalidates the probe size for Unchanged, Deferred, Decreased and older-incarnation reports alike while finite isolated-probe proof survives, a congestion-loss response is suppressed only after receiver delivery and recovery exit, and neither the PTB nor its exact-range repair reduces cwnd or ssthresh, enters or extends recovery or starts PRR. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Remaining (T23, AC-27): only the standards decision whether that RFC 5681/RFC 4821 MSS-decrease rescaling conflicts with "the congestion window may not change"; required MSS rescaling is preserved.
     //# A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.
     fn refresh_path_mss(&mut self) {
+        self.refresh_path_mss_with(true);
+    }
+
+    // `repair` selects whether an MSS decrease schedules the generic head
+    // retry (non-PTB causes) or only updates the packet budget.
+    fn refresh_path_mss_with(&mut self, repair: bool) {
         let Some(link) = self.pmtud.as_ref().map(|p| p.info.first_hop_mtu) else {
             if self.managed_path.is_some() {
                 let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
@@ -2668,7 +2685,7 @@ impl Connection {
                     .min(self.config.user_mss.unwrap_or(u16::MAX)))
                     .min(self.scratch.len()).saturating_sub(options).max(1)
                     .min(self.path_payload_limit().saturating_sub(20 + if self.timestamps { 12 } else { 0 }).max(1));
-                self.set_path_mss(effective);
+                self.update_path_mss(effective, repair);
             }
             return;
         };
@@ -2699,7 +2716,10 @@ impl Connection {
         let budget = (self.config.send_ip_payload_limit as usize)
             .saturating_sub(20 + if self.timestamps { 12 } else { 0 })
             .max(1);
-        self.set_path_mss(mss.min(ceiling).min(budget).min(self.managed_payload_mss()));
+        self.update_path_mss(
+            mss.min(ceiling).min(budget).min(self.managed_payload_mss()),
+            repair,
+        );
         self.resolve_probe_response();
     }
 
@@ -2754,6 +2774,9 @@ impl Connection {
                 .record_fin_payload(start, start.wrapping_add(payload as u32));
     }
 
+    /// Returns whether the reservation ends at this fragment although its
+    /// suffix was not emitted: a PTB repair split during Restart, whose
+    /// never-charged suffix stays pending repair work.
     pub(crate) fn accept_reserved_output(
         &mut self,
         now: Instant,
@@ -2761,7 +2784,7 @@ impl Connection {
         offset: usize,
         count: usize,
         finished: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         self.validate_reserved_output(now, d, offset, count)?;
         if count != 0 {
             if let Some(resource) = self.local_resource.take() {
@@ -2813,6 +2836,7 @@ impl Connection {
         }
         self.update_time(now)?;
         if d.stream
+            && !d.ptb_repair
             && let Some(prr) = &mut self.prr
             && prr.timer_repair()
         {
@@ -2883,6 +2907,32 @@ impl Connection {
             self.record_fin_departure(Seq(d.start).wrapping_add(offset as u32), count);
             self.fin_sent_at = Some(now);
         }
+        // Accepted PTB repair coverage consumes the Restart allowance. In
+        // Restart a split repair ends at its first accepted fragment.
+        let mut withdrawn = false;
+        if d.ptb_repair && (count != 0 || d.fin && finished) {
+            withdrawn = !finished && self.ptb_in_restart();
+            self.ptb_repair_committed();
+        }
+        // Only this accepted coverage became a (possibly) submitted copy.
+        if d.retransmission {
+            self.record_retransmission(
+                Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32),
+                if d.stream { count } else { 0 },
+                d.fin && finished && d.fin_retransmission,
+                d.ptb_repair,
+            );
+        }
+        if d.ptb_repair {
+            self.commit_ptb_copy(
+                now,
+                d.selected_at,
+                Seq(d.start).wrapping_add(offset as u32),
+                count,
+                d.fin && finished,
+                finished || withdrawn,
+            );
+        }
         if sequence && d.rto {
             // A non-head retry cannot replace an ACK-restarted timer with
             // head.sent + RTO (nor defer an already overdue older flight).
@@ -2941,7 +2991,10 @@ impl Connection {
         } else {
             self.select_loss_timer();
         }
-        Ok(())
+        if withdrawn {
+            self.arm_work();
+        }
+        Ok(withdrawn)
     }
 
     pub(crate) fn abandon_reserved_output(&mut self) {
@@ -3227,7 +3280,7 @@ impl Connection {
     //# if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
-    //= reason=Accepted feedback refreshes only the matched Connection; the family-floor test verifies retry sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; this does not close exact dropped-range notification or burst deduplication.
+    //= reason=Accepted feedback repairs only the matched Connection's quoted range at once; the family-floor test verifies the repair's sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; exact dropped-range notification and burst non-amplification are audited in 1191-061, 1191-064 and 1191-080.
     //# Alternatively, the retransmission could be done in immediate response to a
     //# notification that the Path MTU has changed, but only for the specific connection
     //# specified by the Datagram Too Big message. The datagram size used in the
@@ -3241,7 +3294,7 @@ impl Connection {
     //# EMTU_S to cause the upper layer to reduce the size of IP packets it sends.
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-4
-    //= reason=Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports pass the same strictly decreasing path; no source fragmentation is used.
+    //= reason=Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports decrease it the same way; no source fragmentation is used.
     //# After receiving a Packet Too Big message, a node must attempt to avoid eliciting
     //# more such messages in the near future. The node must reduce the size of the
     //# packets it is sending along the path. Using a PMTU estimate larger than the IPv6
@@ -3249,7 +3302,7 @@ impl Connection {
     //# these messages (and
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
-    //= reason=Validated feedback updates the matched Connection and emits a retry no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Exact dropped-range notification is distinct and remains open in 8201-064/066.
+    //= reason=Validated feedback for the matched Connection immediately repairs its quoted range no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Notification of the dropped data is audited in 8201-064.
     //# Alternatively, the retransmission could be done in immediate response to a
     //# notification that the Path MTU was decreased, but only for the specific
     //# connection specified by the Packet Too Big message. The packet size used in the
@@ -3264,48 +3317,62 @@ impl Connection {
         mtu: u32,
     ) -> Result<bool, Error> {
         self.update_time(now)?;
-        if matches!(self.state, State::Closed | State::TimeWait)
-            || Seq(seq).in_window(self.snd_una, self.flight()) != Some(true)
-        {
+        if matches!(self.state, State::Closed | State::TimeWait) {
             return Ok(false);
         }
-        let accepted = self
+        let Some(span) = self
+            .pmtud
+            .as_ref()
+            .and_then(|p| p.quoted_span(Seq(seq), size, header, mtu))
+            .filter(|&(start, end)| self.quoted_outstanding(start, end).is_some())
+        else {
+            return Ok(false);
+        };
+        let outcome = self
             .pmtud
             .as_mut()
-            .is_some_and(|p| p.feedback(now, Seq(seq), size, header, mtu));
-        if accepted {
-            self.report_fast_open_failure();
-            self.refresh_path_mss();
-            self.arm_work();
-        }
-        Ok(accepted)
+            .unwrap()
+            .legacy_report(now, Seq(seq), size, header, mtu);
+        // `true` means accepted as a drop notification of that recorded
+        // transmission, whether or not the estimate decreased.
+        Ok(self.accept_pmtu_report(outcome.feedback, span))
     }
 
     /// Managed counterpart of `pmtu_feedback`: the Host already proved the
     /// physical submission (span and sizes), so only TCP policy runs here.
-    /// Deferred and Decreased keep the legacy local effects; Unchanged drop
-    /// advice touches nothing but the black-hole classification.
+    /// Every accepted class is a drop notification for the quoted span's
+    /// outstanding bytes; Deferred and Decreased keep their estimate effects.
     pub(crate) fn correlated_pmtu_feedback(
         &mut self,
         now: Instant,
         report: crate::CorrelatedPmtu,
         host_estimate: Option<u32>,
-    ) -> Result<crate::PmtuFeedback, Error> {
+    ) -> Result<crate::PmtuReport, Error> {
         self.update_time(now)?;
         let segment = report.segment;
-        let start = Seq(segment.start);
-        if matches!(self.state, State::Closed | State::TimeWait)
-            || start.in_window(self.snd_una, self.flight()) != Some(true)
-        {
-            return Ok(crate::PmtuFeedback::Rejected);
+        let (start, end) = (Seq(segment.start), Seq(segment.end));
+        let rejected = crate::PmtuReport {
+            feedback: crate::PmtuFeedback::Rejected,
+            derived_mtu: None,
+        };
+        // A sequence-bearing quote must overlap the outstanding window; a pure
+        // ACK/RST quote (empty span) keeps the in-flight start test and
+        // carries no stream work.
+        let live = if start == end {
+            start.in_window(self.snd_una, self.flight()) == Some(true)
+        } else {
+            self.quoted_outstanding(start, end).is_some()
+        };
+        if matches!(self.state, State::Closed | State::TimeWait) || !live {
+            return Ok(rejected);
         }
         let Some(p) = &mut self.pmtud else {
-            return Ok(crate::PmtuFeedback::Rejected);
+            return Ok(rejected);
         };
         let outcome = p.correlated_feedback(
             now,
             start,
-            Seq(segment.end),
+            end,
             segment.ip_packet_len,
             segment.ip_header_len,
             report.quoted_packet_len,
@@ -3316,30 +3383,60 @@ impl Connection {
         if id != self.managed_results.pending.map(|(id, _)| id) {
             // This report replaced the pending one (or none is pending): only
             // its own provenance, never the replaced report's, may describe it.
-            self.managed_results.pending = match (outcome, id, host_estimate, self.managed_path) {
-                (crate::PmtuFeedback::Deferred, Some(id), Some(host_estimate), Some(binding)) => {
-                    Some((
-                        id,
-                        crate::PendingPmtuApplied {
-                            binding,
-                            report,
-                            host_estimate,
-                            applied_mtu: 0,
-                        },
-                    ))
-                }
-                _ => None,
-            };
+            self.managed_results.pending =
+                match (outcome.feedback, id, host_estimate, self.managed_path) {
+                    (crate::PmtuFeedback::Deferred, Some(id), Some(host_estimate), Some(binding)) => {
+                        Some((
+                            id,
+                            crate::PendingPmtuApplied {
+                                binding,
+                                report,
+                                host_estimate,
+                                applied_mtu: 0,
+                            },
+                        ))
+                    }
+                    _ => None,
+                };
         }
-        if matches!(
-            outcome,
-            crate::PmtuFeedback::Deferred | crate::PmtuFeedback::Decreased { .. }
-        ) {
-            self.report_fast_open_failure();
-            self.refresh_path_mss();
-            self.arm_work();
-        }
+        self.accept_pmtu_report(outcome.feedback, (start, end));
         Ok(outcome)
+    }
+
+    // Local consequences of one report: the drop notification is separate
+    // from the estimate policy. Returns whether the report was accepted.
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
+    //= reason=Every accepted correlated report is a drop notification separate from the estimate policy (Connection::accept_pmtu_report): Host-correlated Unchanged reports about the current or an older path incarnation, Deferred and Decreased reports, and a ring-matched legacy pmtu_feedback report below the recorded submitted size whether or not the estimate falls, all add the quoted span's eligible outstanding, unSACKed, never-retransmitted bytes as exact repair work, which TCP retransmits at the currently authorized size; a Deferred report's suspicious size waits for authorization, its dropped range does not. The dual-family real-receiver scheduler test repairs the ranges of four successively smaller PTBs that, below proven delivery, leave the estimate unchanged; Host tests repair a deferred report replayed after ledger eviction and, as advice only, after path replacement; the isolated namespace tcp-burst case repairs every range named by real router PTBs, including those that left the estimate unchanged. A Host UDP flow receives the same advice as UdpEvent::PacketTooBig.
+    //# Also, the instance that sent the datagram that elicited the Datagram Too Big message should be notified that its datagram has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped datagram.
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+    //= reason=Every accepted correlated report is a drop notification separate from the estimate policy (Connection::accept_pmtu_report): Host-correlated Unchanged reports (at or above the IPv6 minimum and below the packet size) about the current or an older path incarnation, Deferred and Decreased reports, and a ring-matched legacy pmtu_feedback report below the recorded submitted size whether or not the estimate falls, all add the quoted span's eligible outstanding, unSACKed, never-retransmitted bytes as exact repair work, which TCP retransmits at the currently authorized size; a Deferred report's suspicious size waits for authorization, its dropped data does not. The dual-family real-receiver scheduler test repairs the ranges of four successively smaller PTBs that, below proven delivery, leave the estimate unchanged; Host tests repair a deferred report replayed after ledger eviction and, as advice only, after path replacement; the isolated namespace tcp-burst case repairs every range named by real router PTBs, including those that left the estimate unchanged. A Host UDP flow receives the same advice as UdpEvent::PacketTooBig.
+    //# Also, the instance that sent the packet that elicited the Packet Too Big message should be notified that its packet has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped data.
+    fn accept_pmtu_report(&mut self, feedback: crate::PmtuFeedback, span: (Seq, Seq)) -> bool {
+        match feedback {
+            crate::PmtuFeedback::Rejected => return false,
+            crate::PmtuFeedback::Unchanged => {
+                // Probe attribution may have changed the loss classification.
+                self.resolve_probe_response();
+            }
+            crate::PmtuFeedback::Deferred | crate::PmtuFeedback::Decreased { .. } => {
+                self.report_fast_open_failure();
+                // Budget only: the exact quoted range below is the repair,
+                // not a head retry from SND.UNA.
+                self.refresh_path_mss_with(false);
+            }
+        }
+        // SYN is a control position: whatever the estimate did, a dropped
+        // outstanding SYN (with any Fast Open data) is repaired by the
+        // existing handshake retry, which falls back to a regular SYN. As for
+        // stream bytes, only a never-retransmitted SYN is eligible: a minimal
+        // quote cannot name the copy, so duplicates never amplify retries.
+        if self.quote_covers_syn(span.0, span.1) && self.committed_syn_retransmissions == 0 {
+            self.report_fast_open_failure();
+            self.syn_pending = true;
+        }
+        self.note_ptb_drop(span.0, span.1);
+        self.arm_work();
+        true
     }
 
     fn note_probe_loss(&mut self, start: Seq, multiple: bool) {
@@ -3521,6 +3618,8 @@ impl Connection {
         }
         // An increase is not evidence of loss. Leave existing retry work alone;
         // only a decrease may require repacketizing outstanding bytes.
+        // PTB-caused decreases pass repair=false: their drop notification
+        // schedules exact-range repair instead of this head retry.
         if repair && decreased && self.flight() != 0 {
             if self.handshake_pending() {
                 self.syn_pending = true;
@@ -4037,6 +4136,7 @@ impl Connection {
         self.state = State::Closed;
         self.local_resource = None;
         self.repair_undo = None;
+        self.abandon_ptb();
         self.congestion.commit_probe_response();
         if let Some(p) = &mut self.pmtud {
             p.terminal();
@@ -5908,6 +6008,7 @@ impl Connection {
         // Never let a prior ACK's candidate leak into startup or RTO sampling.
         self.rack.ack_sample = None;
         let sack_evidence = if sack_allowed {
+            let ptb_sack = self.ptb_sack_candidates(&segment.options.sack_blocks);
             let update = self.scoreboard.update_with_packet_ack(
                 live_ack,
                 ack,
@@ -5943,6 +6044,9 @@ impl Connection {
                 update.dsack,
             );
             reo_grew = self.rack.reo_grew;
+            if update.newly_sacked != 0 {
+                self.ptb_sacked(&ptb_sack);
+            }
             // Capacity backing preserves timestamp splits. Advice fallback
             // cannot retain a PRR epoch based on the discarded scoreboard.
             if !self.rack.valid() {
@@ -6292,8 +6396,7 @@ impl Connection {
                 && self.sack_recovery.is_some_and(|r| {
                     !r.entry_pending
                         && self
-                            .scoreboard
-                            .lowest_hole(r.high_rxt, self.data_high(), self.mss as u32, false)
+                            .next_seg_hole(r.high_rxt, self.mss as u32, false)
                             .is_none()
                         && !(self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize
                             && self.snd_wnd > self.flight()
@@ -6603,6 +6706,7 @@ impl Connection {
         } else {
             0
         };
+        self.ptb_acknowledged(ack, bytes as usize);
         if bytes != 0 {
             self.initial_pacing_open = false;
             self.send
@@ -8084,12 +8188,7 @@ impl Connection {
                 //# NextSeg () MUST return the sequence number range of the next segment that is to be transmitted, per the following rules:
                 // RFC 6675 NextSeg: lost hole, new data, speculative hole,
                 // then one tail rescue. New data is selected by the live branch.
-                let lost = self.scoreboard.lowest_hole(
-                    recovery.high_rxt,
-                    self.data_high(),
-                    self.mss as u32,
-                    true,
-                );
+                let lost = self.next_seg_hole(recovery.high_rxt, self.mss as u32, true);
                 let unsent = self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize;
                 let new_allowed = unsent
                     && self.snd_wnd > self.flight()
@@ -8097,12 +8196,9 @@ impl Connection {
                 if let Some((left, right)) = lost {
                     sack_segment = Some((left, right, false, false));
                 } else if !new_allowed {
-                    if let Some((left, right)) = self.scoreboard.lowest_hole(
-                        recovery.high_rxt,
-                        self.data_high(),
-                        repair_packet_mss as u32,
-                        false,
-                    ) {
+                    if let Some((left, right)) =
+                        self.next_seg_hole(recovery.high_rxt, repair_packet_mss as u32, false)
+                    {
                         sack_segment = Some((left, right, false, false));
                     } else if recovery
                         .rescue_rxt
@@ -8172,12 +8268,30 @@ impl Connection {
         } else {
             None
         };
+        // Exact-range PTB repair: ahead of fresh data, behind control work and
+        // due ordinary recovery (RTO/NewReno head, SACK/RACK, post-RTO, TFO).
+        let ptb_segment = if reset.is_none()
+            && !syn
+            && !challenge
+            && data_live
+            && !retransmit
+            && !probe
+            && !keepalive
+            && sack_segment.is_none()
+            && post_rto_segment.is_none()
+            && self.fast_open_retry.is_none()
+        {
+            self.ptb_segment(repair_packet_mss)
+        } else {
+            None
+        };
         let mut seq = self.snd_nxt;
         let mut flags = ACK;
         let mut count = 0usize;
         let mut pmtu_probe = None;
         let mut new_fin = false;
         let mut retransmitted = false;
+        let mut ptb_repair = false;
         if let Some((reset_seq, with_ack)) = reset {
             seq = reset_seq;
             flags = RST | if with_ack { ACK } else { 0 };
@@ -8228,6 +8342,17 @@ impl Connection {
                     .min(credit as usize)],
             );
             retransmitted = count != 0;
+        } else if let Some((left, payload, fin)) = ptb_segment {
+            seq = left;
+            count = self.send.copy(
+                left.distance_from(self.send_base) as usize,
+                &mut self.scratch[..payload],
+            );
+            if fin {
+                flags |= FIN;
+            }
+            retransmitted = true;
+            ptb_repair = true;
         } else if tlp {
             let offset = self.snd_nxt.distance_from(self.send_base) as usize;
             let unsent = self.send.len().saturating_sub(offset);
@@ -9157,8 +9282,10 @@ impl Connection {
         // Only the first timer-entry repair has not charged PRR at selection.
         // Fixed receive-report metadata is journaled along with sender state.
         // FIN/URG outputs retain the existing immutable reservation contract.
+        // A reserved PTB repair charges nothing per byte before acceptance.
         self.repair_undo = if reserve
             && retransmitted
+            && !ptb_repair
             && !syn
             && !probe
             && !tlp
@@ -9257,6 +9384,9 @@ impl Connection {
                 && self.snd_wnd != 0
                 && self.flight() > self.snd_wnd,
             unanswered: probe && !urgent_probe && self.persist_unanswered_since.is_none(),
+            retransmission: retransmitted && !keepalive,
+            fin_retransmission: flags & FIN != 0 && !new_fin,
+            ptb_repair,
             bypass: probe
                 || tlp
                 || keepalive
@@ -9286,6 +9416,17 @@ impl Connection {
             }
         }
         self.resolve_probe_response();
+        // A retained reservation records its copy only on accepted
+        // (Submitted or PossiblySubmitted) coverage; direct output is
+        // committed here, after successful encoding.
+        if !reserve && retransmitted && !keepalive {
+            self.record_retransmission(
+                seq.wrapping_add(u32::from(syn)),
+                count,
+                flags & FIN != 0 && !new_fin,
+                ptb_repair,
+            );
+        }
         self.last_output_range = if count != 0 && !keepalive {
             let data_seq = seq.wrapping_add(u32::from(syn));
             let start = self.acknowledged + u64::from(data_seq.distance_from(self.send_base));
@@ -9402,11 +9543,19 @@ impl Connection {
             }
             self.sack_omit = false;
         }
+        // A reserved PTB repair defers its per-coverage charges (PRR, RACK
+        // copy, SACK pipe and HighRxt, post-RTO frontier, retransmission
+        // marker and RTO restart) to acceptance: a racing decrease that splits
+        // it must charge exactly the accepted fragments.
+        let deferred_ptb = reserve && ptb_repair;
         if count != 0 && !keepalive {
             let seq = seq.wrapping_add(u32::from(syn));
             // Strict recovery exits before persist; legacy probes retain their
             // separate policy. Record every real emission in the age ledger.
-            if !probe && let Some(prr) = &mut self.prr {
+            if !probe
+                && !deferred_ptb
+                && let Some(prr) = &mut self.prr
+            {
                 // Timer-entry credit belongs to this lost-head repair only.
                 // Reservations account actual accepted fragments, not selection.
                 if !reserve || !prr.timer_repair() {
@@ -9414,25 +9563,28 @@ impl Connection {
                     prr.finish_timer_repair();
                 }
             }
-            self.rack
-                .transmit(seq, seq.wrapping_add(count as u32), now, retransmitted);
             let end = seq.wrapping_add(count as u32);
-            if retransmitted && !probe {
-                self.rack.commit_retry_span(seq, end);
-            } else if !retransmitted {
-                self.rack.commit_original_window(
-                    seq,
-                    end,
-                    !probe
-                        && seq.distance_from(self.snd_una) < self.snd_wnd
-                        && end.distance_from(self.snd_una) <= self.snd_wnd,
-                );
-            }
-            if reserve {
-                self.reserved_ledger = self.rack.departure_selection();
-            } else if let Some(selection) = self.rack.departure_selection() {
-                let committed = self.rack.commit_departure(selection, seq, end, now);
-                debug_assert!(committed);
+            if deferred_ptb {
+                self.reserved_ledger = None;
+            } else {
+                self.rack.transmit(seq, end, now, retransmitted);
+                if retransmitted && !probe {
+                    self.rack.commit_retry_span(seq, end);
+                } else if !retransmitted {
+                    self.rack.commit_original_window(
+                        seq,
+                        end,
+                        !probe
+                            && seq.distance_from(self.snd_una) < self.snd_wnd
+                            && end.distance_from(self.snd_una) <= self.snd_wnd,
+                    );
+                }
+                if reserve {
+                    self.reserved_ledger = self.rack.departure_selection();
+                } else if let Some(selection) = self.rack.departure_selection() {
+                    let committed = self.rack.commit_departure(selection, seq, end, now);
+                    debug_assert!(committed);
+                }
             }
             if !self.rack.valid() {
                 self.congestion.end_ecn_prr();
@@ -9440,11 +9592,13 @@ impl Connection {
             }
         }
         if count != 0
+            && !deferred_ptb
             && let Some(mut recovery) = self.sack_recovery
         {
             if let Some((_, _, rescue, entry)) = sack_segment {
                 let end = seq.wrapping_add(count as u32);
                 if !rescue {
+                    self.ptb_high_rxt_crossed(recovery.high_rxt, seq);
                     recovery.high_rxt = end;
                 }
                 if entry {
@@ -9453,6 +9607,13 @@ impl Connection {
                 } else if rescue {
                     recovery.rescue_rxt = Some(recovery.recovery_point);
                 }
+            } else if ptb_repair
+                && !self.rack_enabled()
+                && self.ptb_extends_frontier(recovery.high_rxt, seq)
+            {
+                // Only a repair contiguous with HighRxt may advance it; an
+                // arbitrary non-head repair never skips unretransmitted holes.
+                recovery.high_rxt = seq.wrapping_add(count as u32);
             }
             recovery.pipe = if self.rack_enabled() {
                 self.rack.pipe()
@@ -9467,7 +9628,9 @@ impl Connection {
             && !syn
             && !probe
             && count != 0
+            && !deferred_ptb
             && let Some((old, boundary)) = self.sack_post_rto
+            && (!ptb_repair || self.ptb_extends_frontier(old, seq))
         {
             let end = seq.wrapping_add(count as u32);
             if end.after(old) {
@@ -9554,7 +9717,7 @@ impl Connection {
         if length != 0 && !keepalive {
             let end = seq.wrapping_add(length);
             if retransmitted {
-                if !syn && !probe {
+                if !syn && !probe && !deferred_ptb {
                     self.congestion.on_retransmit(end);
                 }
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
@@ -9572,9 +9735,16 @@ impl Connection {
             if end.after(self.snd_nxt) {
                 self.snd_nxt = end;
             }
-            if (self.rto_deadline.is_none() || retransmitted) && !probe {
+            // A non-head PTB repair cannot postpone an older head's deadline;
+            // a head repair keeps RFC 6298's one-RTO protection, measured
+            // from acceptance when reserved.
+            let restart = retransmitted && !(ptb_repair && (reserve || seq != self.snd_una));
+            if (self.rto_deadline.is_none() || restart) && !probe {
                 self.rto_deadline = Some(now.saturating_add(self.rto()));
             }
+        }
+        if ptb_repair && length != 0 && !reserve {
+            self.ptb_repair_committed();
         }
         if tlp && length != 0 {
             // A probe is not Limited Transmit: it must neither earn its
@@ -10128,6 +10298,7 @@ impl Connection {
             if !early_response {
                 self.rack.rto(now, self.snd_una, self.rtt.srtt());
             }
+            self.ptb_timeout();
             //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
             //= reason=Timeout discards advisory ranges and guards a fresh recovery phase until its exclusive data boundary is covered.
             //# RecoveryPoint MUST be set to HighData.

@@ -861,12 +861,12 @@ impl Owner {
                     continue;
                 }
                 if let Some(deferred) = slot.icmp.take() {
-                    // Revalidated from the frame for this exact generation;
-                    // anything else is discarded by the Host as stale.
+                    // The token carries the validated report for this exact
+                    // generation; the Host discards it as stale otherwise.
                     let now = self.now();
                     if let Some(host) = &mut self.host
                         && let Ok(ntcp_host::IcmpDispatch::Deferred(again)) =
-                            host.replay_icmp(&mut self.endpoint, deferred, now, &slot.bytes)
+                            host.replay_icmp(&mut self.endpoint, deferred, now)
                     {
                         slot.icmp = Some(again);
                         slot.owner = Some(again.owner());
@@ -912,7 +912,11 @@ impl Owner {
                     if bytes.len() > egress.packet_capacity {
                         return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
                     }
-                    slot.bytes.extend_from_slice(bytes);
+                    // A deferred report needs only its token; the slot still
+                    // bounds retention.
+                    if deferred.is_none() {
+                        slot.bytes.extend_from_slice(bytes);
+                    }
                     slot.owner = Some(owner);
                     slot.icmp = deferred;
                     slot.stamps = stamps;

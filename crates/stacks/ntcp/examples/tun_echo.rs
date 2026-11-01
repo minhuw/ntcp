@@ -57,7 +57,7 @@ mod linux {
 
     // Input whose owner's output is reserved. TCP segments are classified by
     // their tuple; ICMP errors only by the Host dispatcher's correlation with
-    // its own submission evidence, which also revalidates them on replay.
+    // its own submission evidence, whose deferred token the replay applies.
     #[derive(Clone, Copy)]
     enum Retained {
         Tcp(ConnectionId),
@@ -230,7 +230,11 @@ mod linux {
                 .free
                 .pop()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-            bytes.extend_from_slice(frame);
+            // A deferred ICMP report needs only its token; its buffer still
+            // bounds retention.
+            if let Retained::Tcp(_) = owner {
+                bytes.extend_from_slice(frame);
+            }
             self.received.push_back(RetainedIngress {
                 owner,
                 bytes,
@@ -257,15 +261,12 @@ mod linux {
                             self.dispatch(endpoint, time, &retained.bytes, retained.timestamp)?;
                         }
                     }
-                    // Revalidated from the frame for this exact generation;
-                    // anything else is discarded by the Host as stale.
+                    // The token carries the validated report for this exact
+                    // generation; the Host discards it as stale otherwise.
                     Retained::Icmp(deferred) => {
-                        if let Some(IcmpDispatch::Deferred(again)) = silent(self.host.replay_icmp(
-                            endpoint,
-                            deferred,
-                            time,
-                            &retained.bytes,
-                        ))? {
+                        if let Some(IcmpDispatch::Deferred(again)) =
+                            silent(self.host.replay_icmp(endpoint, deferred, time))?
+                        {
                             retained.owner = Retained::Icmp(again);
                             self.received.push_back(retained);
                             continue;

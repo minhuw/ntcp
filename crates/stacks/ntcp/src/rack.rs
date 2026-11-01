@@ -1175,6 +1175,44 @@ impl Rack {
             .sum()
     }
 
+    // Ranges inside [start, end) that pipe() no longer counts because they
+    // await retransmission. The ledger is ordered by sequence, so a binary
+    // search finds the first interval; cost follows the intervals visited.
+    pub(crate) fn lost_ranges(
+        &self,
+        start: Seq,
+        end: Seq,
+    ) -> impl Iterator<Item = (Seq, Seq)> + '_ {
+        let len = self.intervals.len();
+        let first = if let Some(base) = self.intervals.first().map(|r| r.start) {
+            let target = start.distance_from(base);
+            let (mut low, mut high) = (0, len);
+            if target < 1 << 31 {
+                while low < high {
+                    let mid = (low + high) / 2;
+                    if self.intervals[mid].end.distance_from(base) <= target {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+            }
+            low
+        } else {
+            0
+        };
+        self.intervals
+            .range(first, len)
+            .take_while(move |r| end.after(r.start))
+            .filter(|r| !r.sacked && r.needs_retransmit)
+            .map(move |r| {
+                (
+                    if r.start.after(start) { r.start } else { start },
+                    if end.after(r.end) { r.end } else { end },
+                )
+            })
+    }
+
     // SACK/ACK splits are not short wire packets: use the committed span.
     pub(crate) fn has_short_transmission(&self, mss: u32) -> bool {
         self.intervals

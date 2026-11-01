@@ -3737,6 +3737,12 @@ impl Endpoint {
     //# path, the destination address from the original packet would be used to
     //# determine which path the message applies to.
 
+    /// Uncorrelated Packet Too Big for the quoted tuple, validated against the
+    /// connection's exact recent-transmission ring (start, header and size),
+    /// family floors and a candidate below the submitted size. `true` means
+    /// accepted as a notification that the quoted transmission was dropped,
+    /// not that the estimate decreased: a nondecreasing accepted report
+    /// leaves the estimate unchanged.
     pub fn pmtu_feedback(
         &mut self,
         now: Instant,
@@ -4711,14 +4717,18 @@ impl Endpoint {
             r.finished,
         );
         self.clock(now)?;
+        let mut withdrawn = false;
         if let Some(id) = connection
             && let Some(d) = &mut departure
         {
-            self.retained_slot_mut(id)?
+            withdrawn = self
+                .retained_slot_mut(id)?
                 .connection
                 .accept_reserved_output(now, d, offset, count, finished)?;
         }
-        self.complete_reserved_accept(index, departure, finished);
+        // A withdrawn suffix was never submitted: release the reservation so
+        // the owner reselects that work under its current admission.
+        self.complete_reserved_accept(index, departure, finished || withdrawn);
         Ok(true)
     }
 
@@ -6552,6 +6562,10 @@ mod fast_open_key_tests;
 #[cfg(test)]
 #[path = "output_reservation_tests.rs"]
 mod output_reservation_tests;
+
+#[cfg(test)]
+#[path = "endpoint_ptb_reserved_tests.rs"]
+mod ptb_reserved_tests;
 
 #[cfg(test)]
 #[path = "endpoint_reset_defense_tests.rs"]

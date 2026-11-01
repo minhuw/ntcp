@@ -340,7 +340,7 @@
       "section": "4",
       "quote": "After receiving a Packet Too Big message, a node must attempt to avoid eliciting more such messages in the near future. The node must reduce the size of the packets it is sending along the path. Using a PMTU estimate larger than the IPv6 minimum link MTU may continue to elicit Packet Too Big messages. Because each of these messages (and",
       "status": "covered",
-      "reason": "Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports pass the same strictly decreasing path; no source fragmentation is used.",
+      "reason": "Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports decrease it the same way; no source fragmentation is used.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
@@ -376,7 +376,7 @@
       "section": "4",
       "quote": "A node must not increase its estimate of the Path MTU in response to the contents of a Packet Too Big message. A message purporting to announce an increase in the Path MTU might be a stale packet that has been floating around in the network, a false packet injected as part of a denial-of-service (DoS) attack, or the result of having multiple paths to the destination, each with a different PMTU.",
       "status": "covered",
-      "reason": "Pmtud::feedback rejects nondecreasing candidates. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.",
+      "reason": "Pmtud::feedback never raises the estimate: candidates no smaller than the quoted packet are rejected, and an accepted nondecreasing report is only a drop notification. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
@@ -594,9 +594,13 @@
       "id": "8201-064",
       "section": "5.2",
       "quote": "Also, the instance that sent the packet that elicited the Packet Too Big message should be notified that its packet has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped data.",
-      "status": "TODO",
-      "reason": "T9 delivers correlated drop notification independently of the estimate: an equal or nondecreasing PTB at or above the IPv6 minimum and below the packet size, not below the connection's proven delivery or about an older path incarnation, is consumed by the correlated TCP owner as PmtuFeedback::Unchanged drop advice (black-hole classification without estimate increase, hold restart, error or head retry); one about the current path below proven delivery is PmtuFeedback::Deferred whatever the loss-inferred estimate, recording the same drop advice. A validated PTB quoting a Host UDP datagram is queued to that flow as UdpEvent::PacketTooBig whether or not the estimate decreases. Remaining T11: TCP retransmission of exactly the dropped data that advice names (non-head, partially acknowledged and wrapped ranges with duplicate suppression); normal retransmission is distinct.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+      "status": "covered",
+      "reason": "Every accepted correlated report is a drop notification separate from the estimate policy (Connection::accept_pmtu_report): Host-correlated Unchanged reports (at or above the IPv6 minimum and below the packet size) about the current or an older path incarnation, Deferred and Decreased reports, and a ring-matched legacy pmtu_feedback report below the recorded submitted size whether or not the estimate falls, all add the quoted span's eligible outstanding, unSACKed, never-retransmitted bytes as exact repair work, which TCP retransmits at the currently authorized size; a Deferred report's suspicious size waits for authorization, its dropped data does not. The dual-family real-receiver scheduler test repairs the ranges of four successively smaller PTBs that, below proven delivery, leave the estimate unchanged; Host tests repair a deferred report replayed after ledger eviction and, as advice only, after path replacement; the isolated namespace tcp-burst case repairs every range named by real router PTBs, including those that left the estimate unchanged. A Host UDP flow receives the same advice as UdpEvent::PacketTooBig.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2",
+      "evidence": [
+        "crates/stacks/ntcp/src/connection.rs::    fn accept_pmtu_report(",
+        "crates/stacks/ntcp/src/connection_ptb_scheduler_tests.rs::fn successive_ptbs_admit_one_repair_until_useful_ack_then_ordinary_admission()"
+      ]
     },
     {
       "id": "8201-065",
@@ -697,7 +701,7 @@
       "section": "5.4",
       "quote": "Alternatively, the retransmission could be done in immediate response to a notification that the Path MTU was decreased, but only for the specific connection specified by the Packet Too Big message. The packet size used in the retransmission should be no larger than the new PMTU.",
       "status": "covered",
-      "reason": "Validated feedback updates the matched Connection and emits a retry no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Exact dropped-range notification is distinct and remains open in 8201-064/066.",
+      "reason": "Validated feedback for the matched Connection immediately repairs its quoted range no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Notification of the dropped data is audited in 8201-064.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
@@ -721,7 +725,7 @@
       "section": "5.4",
       "quote": "A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.",
       "status": "TODO",
-      "reason": "Matching PTB now preserves finite isolated-probe proof and suppresses a congestion-loss response only after receiver delivery and recovery exit. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Thus the literal unchanged-cwnd obligation remains TODO despite the separate RFC4821 congestion-classification closure; required MSS rescaling is preserved.",
+      "reason": "Implemented operative behavior: a PTB indicating a lost PMTU probe is not a congestion notification. Probe attribution invalidates the probe size for Unchanged, Deferred, Decreased and older-incarnation reports alike while finite isolated-probe proof survives, a congestion-loss response is suppressed only after receiver delivery and recovery exit, and neither the PTB nor its exact-range repair reduces cwnd or ssthresh, enters or extends recovery or starts PRR. Accepted lower PMTU still calls refresh_path_mss and Congestion::set_mss, rescaling the byte congestion window when MSS decreases; the dual-family receiver matrix asserts that ratio. Remaining (T23, AC-27): only the standards decision whether that RFC 5681/RFC 4821 MSS-decrease rescaling conflicts with \"the congestion window may not change\"; required MSS rescaling is preserved.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
@@ -840,7 +844,7 @@
       "section": "6",
       "quote": "In the second attack, the false message indicates a PMTU larger than reality. If believed, this could cause temporary blockage as the victim sends packets that will be dropped by some router. Within one round-trip time, the node would discover its mistake (receiving Packet Too Big messages from that router), but frequent repetition of this attack could cause lots of packets to be dropped. A node, however, must not raise its estimate of the PMTU based on a Packet Too Big message, so it should not be vulnerable to this attack.",
       "status": "covered",
-      "reason": "The strictly-decreasing feedback guard prevents the described increase attack. IPv6 base-header wire test from 819b8f2 rejects equal/larger MTUs before and after a valid decrease, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.",
+      "reason": "Feedback never raises the estimate, which prevents the described increase attack. IPv6 base-header wire test from 819b8f2 shows equal/larger MTUs before and after a valid decrease leave the estimate unchanged, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",

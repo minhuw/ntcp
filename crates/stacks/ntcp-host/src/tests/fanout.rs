@@ -959,7 +959,7 @@ enum Pending {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
 //= type=test
-//= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the corrected quoted length, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests and real router PTBs in the isolated namespace gate verify it.
+//= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host-proven submitted length rather than the connection's estimate, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.
 //# When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
 fn applied_deferred_report_publishes_exactly_once_and_stale_results_never() {
     use Pending::*;
@@ -1091,7 +1091,7 @@ enum Probe {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
 //= type=test
-//= reason=PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference; UDP and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.
+//= reason=PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference, with a derived size that is independent of the connection's estimate because a legacy IPv4 report without a Next-Hop MTU is corrected against the Host-proven submitted length; UDP and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.
 //# The IP layer SHOULD be used to store the cached PMTU value and other shared state such as MTU values reported by ICMP PTB messages. Ideally, this shared state should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path.
 fn delivered_probe_after_hold_raises_shared_ceiling_and_stale_proof_never() {
     use Probe::*;
@@ -1552,8 +1552,216 @@ fn below_proven_delivery_report_shared_outcome_ignores_loss_inference() {
     }
 }
 
+// RFC 1191 section 5 without a next-hop MTU: the size a correlated IPv4
+// report derives is corrected against the Host-proven submitted length, so
+// the derived size, deferral and shared publication are the same whether or
+// not black-hole timeouts first lowered A's own estimate (L) or not (C).
+// Only A's local label may differ (Decreased versus Unchanged). Scenarios:
+// A's explicit RFC 1191 table with no prior delivery (quoted 1452); the
+// default table after an acknowledged 1480-octet packet (quoted 1495); the
+// explicit table after acknowledged 1452 octets (quoted 1010), applied at
+// its timeout. Each with an exact and a header-inflated quote, and each also
+// after a previous shared decrease (a UDP flow's PTB first lowered the Host
+// record to 1000) and about a submission of an older path incarnation (A was
+// rebound to another DSCP after sending it: drop advice only, never
+// publication). Repair follows eligibility, never the label: in C the
+// quoted range is repaired at once (labelled Decreased or Unchanged); in L the
+// black-hole timeouts already retransmitted the quoted bytes and own their
+// flight, so the same report adds no repair work there.
+#[test]
+fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
+    const SHARED: u32 = 1000;
+    for (label, rfc1191, acked, written, stop) in [
+        ("immediate", true, None, 1400usize, 1006u32),
+        ("default-table", false, Some(1428usize), 1443usize, 1495u32),
+        ("deferred", true, Some(1400usize), 958usize, 1010u32),
+    ] {
+        for variant in ["plain", "shared-decrease", "older-path"] {
+            let older = variant == "older-path";
+            for inflated in [false, true] {
+                let mut outcomes = Vec::new();
+                for inferred in [false, true] {
+                    let mut cfg = config(4);
+                    if rfc1191 {
+                        cfg.connection.pmtud.as_mut().unwrap().policy.ipv4_plateaus =
+                            ntcp::Ipv4Plateaus::RFC1191;
+                    }
+                    let (local, remote) = addresses(false);
+                    let mut a = udp_side(local, 5500, &cfg);
+                    let mut b = managed(remote, 5600, cfg.clone());
+                    b.1.listen(remote, 4).unwrap();
+                    let flow_a = connect(&mut a, &cfg, 1000, 0);
+                    let _flow_b = connect(&mut a, &cfg, 1001, 0);
+                    let mut now = 0;
+                    pump(&mut a, &mut b, &mut now);
+                    let old = a.0.binding(flow_a).unwrap().snapshot.path();
+                    service(&mut a, now);
+                    if let Some(len) = acked {
+                        a.1.write(flow_a, &vec![2; len]).unwrap();
+                        pump(&mut a, &mut b, &mut now);
+                        assert_eq!(a.1.transport_info(flow_a).unwrap().unacked, 0);
+                    }
+                    a.1.write(flow_a, &vec![3; written]).unwrap();
+                    now += 10;
+                    let (quoted, _) = send(&mut a, now, BackendOutcome::Submitted).unwrap();
+                    for _ in 0..32 {
+                        if !inferred
+                            || a.1.path_mtu_info(flow_a).unwrap().unwrap().current_mtu < stop
+                        {
+                            break;
+                        }
+                        now = now.max(a.1.next_deadline().unwrap());
+                        a.1.on_timeout(now, 32).unwrap();
+                        while send(&mut a, now, BackendOutcome::Submitted).is_some() {}
+                    }
+                    let local_a = a.1.path_mtu_info(flow_a).unwrap().unwrap().current_mtu;
+                    assert_eq!(local_a < stop, inferred, "{label} {local_a}");
+                    if variant == "shared-decrease" {
+                        let udp = flow(&mut a, 5000, remote.ip(), 0);
+                        let mut packet = [0; 1600];
+                        let Ok(UdpSent::Submitted(n)) = a.0.udp_send(
+                            &a.1,
+                            now,
+                            udp,
+                            None,
+                            &[4; 1400],
+                            &mut packet,
+                            |_, _| BackendOutcome::Submitted,
+                        ) else {
+                            panic!("datagram not submitted");
+                        };
+                        assert!(matches!(
+                            a.0.input_icmp(&mut a.1, a.2, now, &ptb(&packet[..n], SHARED)),
+                            Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
+                                published: Some(path::EstimateChange::Decreased),
+                                ..
+                            }))
+                        ));
+                        service(&mut a, now);
+                        assert_eq!(
+                            a.1.managed_path(flow_a).unwrap().ordinary_ip_budget,
+                            local_a.min(SHARED)
+                        );
+                    }
+                    if older {
+                        a.0.rebind_dscp(&mut a.1, flow_a, 8).unwrap();
+                    }
+                    let path = a.0.binding(flow_a).unwrap().snapshot.path();
+                    assert_eq!(path != old, older);
+                    let mut copy = quoted.clone();
+                    if inflated {
+                        let total = u16::from_be_bytes([copy[2], copy[3]]) + 20;
+                        copy[2..4].copy_from_slice(&total.to_be_bytes());
+                        super::dispatch::seal_ipv4(&mut copy);
+                    }
+                    now += 1;
+                    let (report, published) =
+                        tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &ptb(&copy, 0)).unwrap());
+                    let TcpReport::PacketTooBig(class) = report else {
+                        panic!("{report:?}");
+                    };
+                    assert_ne!(class, PmtuFeedback::Rejected);
+                    service(&mut a, now + 1);
+                    let immediate = a.0.paths().path_snapshot(path).unwrap().learned_mtu();
+                    let start = u32::from_be_bytes(quoted[24..28].try_into().unwrap());
+                    let payload = quoted.len() - 20 - usize::from(quoted[32] >> 4) * 4;
+                    let end = start.wrapping_add(payload as u32 + u32::from(quoted[33] & 1));
+                    // The first output after the report, before any ACK.
+                    let repair = send(&mut a, now + 1, BackendOutcome::Submitted).map(|(f, _)| {
+                        let seq = u32::from_be_bytes(f[24..28].try_into().unwrap());
+                        (seq, f.len() - 20 - usize::from(f[32] >> 4) * 4)
+                    });
+                    if inferred {
+                        assert_eq!(repair, None, "{label} {variant}: L's RTO owns the quoted flight");
+                    } else {
+                        let (seq, len) = repair.expect("C repairs the quoted range");
+                        assert_eq!(seq, start, "{label} {variant}");
+                        assert!(0 < len && len <= payload, "{label} {variant} {len}");
+                    }
+                    // The report's own size, read back with an identical repeat.
+                    let derived = a
+                        .1
+                        .correlated_pmtu_feedback(
+                            now + 1,
+                            flow_a,
+                            ntcp::CorrelatedPmtu {
+                                segment: ntcp::CorrelatedSegment {
+                                    start,
+                                    end,
+                                    ip_packet_len: quoted.len() as u32,
+                                    ip_header_len: 20,
+                                },
+                                quoted_packet_len: quoted.len() as u32
+                                    + if inflated { 20 } else { 0 },
+                                candidate_mtu: 0,
+                                current_path: !older,
+                            },
+                        )
+                        .unwrap()
+                        .derived_mtu;
+                    let mut decreased = 0;
+                    for _ in 0..16 {
+                        let Some(deadline) = a.1.next_deadline() else { break };
+                        now = now.max(deadline);
+                        a.1.on_timeout(now, 32).unwrap();
+                        while send(&mut a, now, BackendOutcome::Submitted).is_some() {}
+                        decreased += service(&mut a, now + 1).decreased;
+                        if decreased > 0 {
+                            break;
+                        }
+                    }
+                    let eventual = a.0.paths().path_snapshot(path).unwrap().learned_mtu();
+                    if older && let Ok(snapshot) = a.0.paths().path_snapshot(old) {
+                        assert_eq!(snapshot.learned_mtu(), None);
+                    }
+                    std::println!(
+                        "LEGACY {label} {variant} inflated={inflated} inferred={inferred} quoted={} local_a={local_a} class={class:?} derived={derived:?} published={published:?} immediate={immediate:?} repair={repair:?} timeout_decreased={decreased} eventual={eventual:?}",
+                        quoted.len()
+                    );
+                    let deferred = class == PmtuFeedback::Deferred;
+                    // A's policy-derived size; the Host publishes the larger of
+                    // it and its own estimate (CONTEMPORARY table, shared
+                    // budget), never above an already lower shared record.
+                    let expected = match (label, inflated) {
+                        ("immediate", _) => (1006, false, 1006),
+                        ("default-table", false) => (1460, true, 1492),
+                        ("default-table", true) => (1492, false, 1492),
+                        ("deferred", false) => (508, true, 576),
+                        _ => (1006, true, 1006),
+                    };
+                    assert_eq!(derived, Some(expected.0), "{label} {variant}");
+                    match variant {
+                        "plain" => {
+                            assert_eq!((deferred, eventual), (expected.1, Some(expected.2)));
+                            assert_eq!(immediate.is_some(), !deferred);
+                            assert_eq!(decreased, usize::from(deferred));
+                        }
+                        "shared-decrease" => {
+                            assert_eq!(
+                                (deferred, immediate, eventual),
+                                (expected.1, Some(SHARED), Some(expected.2.min(SHARED)))
+                            );
+                            assert_eq!(decreased, usize::from(deferred && expected.2 < SHARED));
+                        }
+                        _ => {
+                            // Drop advice only: nothing deferred or published.
+                            assert_eq!(class, PmtuFeedback::Unchanged);
+                            assert_eq!((published, immediate, decreased, eventual), (None, None, 0, None));
+                        }
+                    }
+                    outcomes.push((derived, deferred, published, immediate, decreased, eventual));
+                }
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "{label} {variant} inflated={inflated}: C and L differ"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Held {
+pub(super) enum Held {
     Scalar,
     ZeroCopy,
     PartialGso,
@@ -1561,7 +1769,7 @@ enum Held {
 
 // One reserved packet of `id`: the encoded frame (zero-copy: headers only),
 // its external payload length, and the complete wire bytes for the peer.
-fn reserve(
+pub(super) fn reserve(
     side: &mut Side,
     id: ConnectionId,
     now: u64,
@@ -1844,7 +2052,7 @@ fn submit_or_repacketize(
     }
 }
 
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 impl Rng {
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
@@ -1852,10 +2060,10 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn below(&mut self, n: u64) -> u64 {
+    pub(super) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
-    fn pick<T: Copy>(&mut self, values: &[T]) -> T {
+    pub(super) fn pick<T: Copy>(&mut self, values: &[T]) -> T {
         values[self.below(values.len() as u64) as usize]
     }
 }

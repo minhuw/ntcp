@@ -261,8 +261,9 @@ fn managed_plateau_constructor_and_live_transport_override_precedence() {
             client: old.client, snapshot: service.snapshot(old.client).unwrap(),
         }).unwrap();
         assert_eq!((a.rto_deadline, a.pmtud.as_ref().unwrap().deadline), timers);
-        let accepted = a.pmtu_feedback(42, seq, 1500, 20, 0).unwrap();
-        assert_eq!(accepted, table == crate::Ipv4Plateaus::INHERIT);
+        // Every report about the still-outstanding packet is an accepted
+        // drop notification; only the policy decides whether the estimate falls.
+        assert!(a.pmtu_feedback(42, seq, 1500, 20, 0).unwrap());
         assert_eq!(a.path_mtu_info().unwrap().current_mtu,
             if table == crate::Ipv4Plateaus::INHERIT { 900 } else { expected });
         // A live explicit historical override wins immediately, including
@@ -270,11 +271,11 @@ fn managed_plateau_constructor_and_live_transport_override_precedence() {
         a.set_pmtud_policy(43, crate::PmtudPolicy {
             ipv4_plateaus: crate::Ipv4Plateaus::HISTORICAL, ..Default::default()
         }).unwrap();
-        assert_eq!(a.pmtu_feedback(44, seq, 1500, 20, 0).unwrap(), expected == 1300);
+        assert!(a.pmtu_feedback(44, seq, 1500, 20, 0).unwrap());
         assert_eq!(a.path_mtu_info().unwrap().current_mtu,
             if table == crate::Ipv4Plateaus::INHERIT { 900 } else { 1006 });
         a.set_pmtud_policy(45, crate::PmtudPolicy::default()).unwrap();
-        assert_eq!(a.pmtu_feedback(46, seq, 1500, 20, 0).unwrap(), table != crate::Ipv4Plateaus::INHERIT);
+        assert!(a.pmtu_feedback(46, seq, 1500, 20, 0).unwrap());
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 900);
     }
 }
@@ -555,7 +556,7 @@ fn pending_report_applied_at_its_timeout_yields_exactly_one_result() {
         let binding = a.managed_path.unwrap();
         let before = a.path_mtu_info().unwrap().current_mtu;
         assert_eq!(
-            a.correlated_pmtu_feedback(21, report, Some(1100)),
+            a.correlated_pmtu_feedback(21, report, Some(1100)).map(|r| r.feedback),
             Ok(crate::PmtuFeedback::Deferred)
         );
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, before);
@@ -595,7 +596,7 @@ fn replaced_cancelled_rebound_or_unattributed_pending_reports_yield_nothing() {
             ..report
         };
         assert_eq!(
-            a.correlated_pmtu_feedback(22, larger, Some(1200)),
+            a.correlated_pmtu_feedback(22, larger, Some(1200)).map(|r| r.feedback),
             Ok(crate::PmtuFeedback::Deferred)
         );
         rto(&mut a);

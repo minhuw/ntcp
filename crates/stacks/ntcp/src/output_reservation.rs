@@ -30,6 +30,12 @@ pub(crate) struct Departure {
     pub keepalive: bool,
     pub shrink: bool,
     pub unanswered: bool,
+    // A retransmitted copy of stream bytes and/or of an already sent FIN.
+    pub retransmission: bool,
+    pub fin_retransmission: bool,
+    // Exact-range Packet Too Big repair: every accepted fragment is a PTB
+    // replacement copy, charged (PRR, RACK, pipe, Restart) at acceptance.
+    pub ptb_repair: bool,
     pub bypass: bool,
     pub interval: Option<u128>,
     pub initial_burst: bool,

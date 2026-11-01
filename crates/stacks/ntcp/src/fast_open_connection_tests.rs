@@ -1196,6 +1196,65 @@ fn fast_open_negative_ptb_keeps_existing_validation() {
     assert!(a.fast_open_negative);
 }
 
+// A dropped SYN carrying Fast Open data is a control position: whatever the
+// estimate did (an older path incarnation's advice is Unchanged), the drop
+// notification uses the handshake retry, which falls back to a regular SYN,
+// and never becomes stream repair. A duplicate after that retry adds none.
+#[test]
+fn fast_open_syn_data_drop_retries_the_handshake_in_every_accepted_class() {
+    use crate::{CorrelatedPmtu, CorrelatedSegment, PmtuFeedback};
+    for current in [false, true] {
+        let template = client(100, 200);
+        let mut cfg = template.config.clone();
+        cfg.pmtud = Some(crate::PmtudConfig::new(1500));
+        let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+        a.fast_open = template.fast_open;
+        a.fast_open_initial = 200;
+        a.write(&[42; 200]).unwrap();
+        let bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(syn.payload.len(), 200);
+        let size = bytes.len() as u32 + 20;
+        let report = |a: &mut Connection, now| {
+            a.correlated_pmtu_feedback(
+                now,
+                CorrelatedPmtu {
+                    segment: CorrelatedSegment {
+                        start: 100,
+                        end: 301,
+                        ip_packet_len: size,
+                        ip_header_len: 20,
+                    },
+                    quoted_packet_len: size,
+                    candidate_mtu: 68,
+                    current_path: current,
+                },
+                None,
+            )
+            .unwrap()
+            .feedback
+        };
+        let feedback = report(&mut a, 1);
+        assert_eq!(
+            matches!(feedback, PmtuFeedback::Decreased { .. }),
+            current
+        );
+        assert_eq!(feedback == PmtuFeedback::Unchanged, !current);
+        assert!(a.fast_open_negative);
+        assert!(a.ptb_idle());
+        let retry = packet(&mut a, 2);
+        let retry = wire::parse(ip(tuple()), &retry).unwrap();
+        assert_eq!(retry.header.sequence, 100);
+        assert_ne!(retry.header.flags & SYN, 0);
+        assert!(retry.payload.is_empty());
+        // The original SYN-data copy may be quoted again; only a
+        // never-retransmitted SYN is eligible, so nothing more is sent.
+        report(&mut a, 3);
+        assert!(a.transmit(4, &mut [0; 2048]).unwrap().is_none());
+        assert!(a.ptb_idle());
+    }
+}
+
 #[test]
 fn fast_open_negative_terminal_deadline_precedence_with_late_service() {
     for units in [1_000_000, 1_000_000_000] {

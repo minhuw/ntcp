@@ -3,6 +3,7 @@ mod admission;
 mod correlation;
 mod dispatch;
 mod fanout;
+mod repair;
 mod source_routes;
 mod submission;
 use super::*;

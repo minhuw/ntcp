@@ -278,7 +278,16 @@ impl Scoreboard {
     fn holes(&self, ack: Seq, high_data: Seq) -> impl Iterator<Item = (Seq, Seq)> + '_ {
         let span = high_data.distance_from(ack);
         let mut cursor = 0;
-        let mut index = 0;
+        // Ranges ending at or below `ack` contribute nothing: start at the
+        // first one ending above it (ranges are ordered from the cumulative
+        // edge, all within half the sequence space of it).
+        let mut index = if ack.distance_from(self.ack) < HALF_SPACE {
+            self.ranges[..self.len].partition_point(|&(_, right)| {
+                right.distance_from(self.ack) <= ack.distance_from(self.ack)
+            })
+        } else {
+            0
+        };
         core::iter::from_fn(move || {
             if span >= HALF_SPACE {
                 return None;
@@ -309,6 +318,25 @@ impl Scoreboard {
                 None
             }
         })
+    }
+
+    /// Wholly unsacked subranges of [start, end), start at or after the
+    /// cumulative edge.
+    pub(crate) fn unsacked(&self, start: Seq, end: Seq) -> impl Iterator<Item = (Seq, Seq)> + '_ {
+        self.holes(start, end)
+    }
+
+    /// Unsacked subranges of [start, end) whose original copy SetPipe no
+    /// longer counts. IsLost is constant within a hole, so evaluating it at a
+    /// clipped start matches pipe(). Cost follows the holes inside the range.
+    pub(crate) fn lost_holes(
+        &self,
+        start: Seq,
+        end: Seq,
+        mss: u32,
+    ) -> impl Iterator<Item = (Seq, Seq)> + '_ {
+        self.holes(start, end)
+            .filter(move |&(left, _)| self.is_lost(left, mss))
     }
 
     pub(crate) fn unsacked_bytes(&self, start: Seq, end: Seq) -> u32 {

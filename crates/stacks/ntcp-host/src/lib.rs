@@ -314,13 +314,39 @@ pub enum IcmpOutcome {
 }
 
 /// An ICMP error for a TCP owner whose output is reserved. Nothing was
-/// applied or published; retain the frame and replay it with
-/// `Host::replay_icmp` once the reservation resolves. The replay is
-/// revalidated from the frame and acts only for this exact generation.
+/// applied or published. The token itself carries the report, normalized
+/// from the validated frame and the exact submission evidence it matched,
+/// bound to this Host context and the owner generation: `Host::replay_icmp`
+/// applies it once the reservation resolves, without the frame and without
+/// the submission ledger, whose bounded history may have evicted the record
+/// meanwhile. The replay revalidates the generation, the quote's overlap with
+/// outstanding data and the current authority of the quoted path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeferredIcmp {
     context: IngressContext,
     owner: ConnectionId,
+    report: Correlated,
+}
+
+// One validated report correlated with exactly one TCP submission: its
+// sequence span and submitted lengths, the path incarnation every match
+// agreed on, and the family-normalized report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Correlated {
+    segment: CorrelatedSegment,
+    path: Option<path::PathId>,
+    ipv4: bool,
+    kind: CorrelatedKind,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CorrelatedKind {
+    /// `quoted_packet_len` as returned (RFC 1191 legacy inflation included);
+    /// `candidate` None from an IPv4 router that reported no next-hop MTU.
+    PacketTooBig {
+        quoted_packet_len: u32,
+        candidate: Option<u32>,
+    },
+    NetworkError(NetworkError),
 }
 impl DeferredIcmp {
     pub const fn context(self) -> IngressContext {
@@ -788,7 +814,7 @@ impl Host {
 
     // Each result is taken exactly once; a stale one publishes nothing.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
-    //= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the corrected quoted length, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests and real router PTBs in the isolated namespace gate verify it.
+    //= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host-proven submitted length rather than the connection's estimate, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.
     //# When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
     fn publish_results(
         &mut self,
@@ -1155,8 +1181,8 @@ impl Host {
     /// incarnation; owner-level effects require one owner generation and one
     /// submission (TCP: one span), with no lossy hit. A TCP owner's policy runs first and a shared
     /// estimate is published only for its current-path Decreased or
-    /// Unchanged disposition (never for Deferred). A reserved owner is returned as Deferred before anything is
-    /// applied. Unmatched quotes are discarded; there is no fallback to the
+    /// Unchanged disposition (never for Deferred). A reserved owner is returned as Deferred, carrying
+    /// the normalized report, before anything is applied. Unmatched quotes are discarded; there is no fallback to the
     /// connection-local sent ring.
     pub fn input_icmp(
         &mut self,
@@ -1165,20 +1191,28 @@ impl Host {
         now: Instant,
         frame: &[u8],
     ) -> Result<IcmpDispatch, Error> {
-        self.dispatch_icmp(endpoint, context, now, frame, None)
+        self.dispatch_icmp(endpoint, context, now, frame)
     }
 
-    /// Replay a retained frame for its deferred owner generation. Everything
-    /// is revalidated (ingress, wire, correlation); if the quote no longer
-    /// identifies that exact generation, the frame is discarded as Stale.
+    /// Apply a deferred report to its owner generation, or defer it again
+    /// while that owner's output is still reserved. The report was validated
+    /// and correlated on arrival; it needs neither the frame nor the ledger
+    /// record. A generation that no longer exists makes it Stale; TCP rejects
+    /// a quote no longer overlapping outstanding data; a path incarnation that
+    /// is no longer the owner's valid binding leaves drop advice only, with
+    /// nothing published.
     pub fn replay_icmp(
         &mut self,
         endpoint: &mut Endpoint,
         deferred: DeferredIcmp,
         now: Instant,
-        frame: &[u8],
     ) -> Result<IcmpDispatch, Error> {
-        self.dispatch_icmp(endpoint, deferred.context, now, frame, Some(deferred.owner))
+        self.check_endpoint(endpoint)?;
+        if deferred.context.context() != self.paths.context() {
+            return Err(Error::InvalidContext);
+        }
+        self.now = self.now.max(now);
+        self.tcp_report(endpoint, now, deferred)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
@@ -1195,7 +1229,6 @@ impl Host {
         context: IngressContext,
         now: Instant,
         frame: &[u8],
-        expected: Option<ConnectionId>,
     ) -> Result<IcmpDispatch, Error> {
         use IcmpDispatch::Completed;
         use IcmpOutcome::Discarded;
@@ -1303,7 +1336,8 @@ impl Host {
                 key.protocol == ntcp_icmp::PROTOCOL_TCP,
             ) && let Some(mtu) = report_mtu(ipv4, dropped, candidate)
             {
-                let published = self.publish(now, path, ipv4, &key, dropped, candidate, None)?;
+                let published =
+                    self.publish(now, path, ipv4, quoted(&key), dropped, candidate, None)?;
                 return Ok(Completed(IcmpOutcome::Advice {
                     owner: None,
                     advice: Advice::PacketTooBig {
@@ -1334,7 +1368,7 @@ impl Host {
                     now,
                     path,
                     ipv4,
-                    &key,
+                    quoted(&key),
                     evidence.packet_len,
                     candidate,
                     None,
@@ -1366,36 +1400,79 @@ impl Host {
                 published,
             }));
         };
-        if expected.is_some_and(|owner| owner != id) || !endpoint.connection_exists(id) {
-            return Ok(Completed(Discarded(IcmpDiscard::Stale)));
-        }
-        if endpoint.is_output_reserved(id) {
-            return Ok(IcmpDispatch::Deferred(DeferredIcmp { context, owner: id }));
-        }
         let Selector::Tcp { start, end, .. } = evidence.transport else {
             return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
         };
-        let segment = CorrelatedSegment {
-            start,
-            end,
-            ip_packet_len: evidence.packet_len,
-            ip_header_len: evidence.header_len,
+        let report = Correlated {
+            segment: CorrelatedSegment {
+                start,
+                end,
+                ip_packet_len: evidence.packet_len,
+                ip_header_len: evidence.header_len,
+            },
+            path: correlation.path,
+            ipv4,
+            kind: match error {
+                Some(error) => CorrelatedKind::NetworkError(error),
+                None => CorrelatedKind::PacketTooBig {
+                    quoted_packet_len: key.packet_len,
+                    candidate,
+                },
+            },
         };
-        if let Some(error) = error {
-            let Some(accepted) = live(endpoint.correlated_network_error(now, id, segment, error))?
-            else {
-                return Ok(Completed(Discarded(IcmpDiscard::Stale)));
-            };
-            return Ok(Completed(IcmpOutcome::Tcp {
+        self.tcp_report(
+            endpoint,
+            now,
+            DeferredIcmp {
+                context,
                 owner: id,
-                report: TcpReport::NetworkError { error, accepted },
-                published: None,
-            }));
+                report,
+            },
+        )
+    }
+
+    // TCP policy for one correlated report, at arrival or at replay: deferred
+    // unapplied while the owner's output is reserved, then applied only to
+    // that exact generation.
+    fn tcp_report(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        deferred: DeferredIcmp,
+    ) -> Result<IcmpDispatch, Error> {
+        use IcmpDispatch::Completed;
+        use IcmpOutcome::Discarded;
+        let (id, report) = (deferred.owner, deferred.report);
+        if !endpoint.connection_exists(id) {
+            return Ok(Completed(Discarded(IcmpDiscard::Stale)));
         }
+        if endpoint.is_output_reserved(id) {
+            return Ok(IcmpDispatch::Deferred(deferred));
+        }
+        let (segment, ipv4) = (report.segment, report.ipv4);
+        let (quoted_packet_len, candidate) = match report.kind {
+            CorrelatedKind::PacketTooBig {
+                quoted_packet_len,
+                candidate,
+            } => (quoted_packet_len, candidate),
+            CorrelatedKind::NetworkError(error) => {
+                let Some(accepted) =
+                    live(endpoint.correlated_network_error(now, id, segment, error))?
+                else {
+                    return Ok(Completed(Discarded(IcmpDiscard::Stale)));
+                };
+                return Ok(Completed(IcmpOutcome::Tcp {
+                    owner: id,
+                    report: TcpReport::NetworkError { error, accepted },
+                    published: None,
+                }));
+            }
+        };
+        let quoted = (quoted_packet_len, segment.ip_header_len);
         // Only a path incarnation that is still valid and still this
         // connection's binding may change any estimate. Older submissions
         // remain drop advice for their outstanding data.
-        let current = correlation.path.filter(|path| {
+        let current = report.path.filter(|path| {
             self.binding(id).is_ok_and(|b| b.snapshot.path() == *path)
                 && self
                     .paths
@@ -1404,14 +1481,14 @@ impl Host {
         });
         let report = CorrelatedPmtu {
             segment,
-            quoted_packet_len: key.packet_len,
+            quoted_packet_len,
             candidate_mtu: candidate.unwrap_or(0),
             current_path: current.is_some(),
         };
         // A Deferred report carries the Host's estimate as its provenance, so
         // that applying it at the quoted data's timeout can be published.
         let estimate = current.and_then(|path| {
-            self.host_estimate(path, ipv4, &key, evidence.packet_len, candidate)
+            self.host_estimate(path, ipv4, quoted, segment.ip_packet_len, candidate)
         });
         let feedback = match estimate {
             Some(estimate) => {
@@ -1427,35 +1504,32 @@ impl Host {
         // the shared hold: TCP defers every current-path report below its
         // proven delivery, whatever its loss-inferred estimate, and only that
         // exact report's timeout authorizes publication (`publish_applied`).
-        // A current-path report TCP leaves Unchanged is at or above proven
-        // delivery with its own estimate already no larger, and is still a
-        // validated network fact about the shared path: the Host's estimate
-        // lowers a larger shared record or, when equal or larger, restarts
-        // the hold so that no client confirms or submits growth within it.
-        let published = match (outcome, current) {
-            (PmtuFeedback::Decreased { mtu }, Some(path)) => self.publish(
+        // Any other accepted current-path report is a validated network fact
+        // about the shared path, whether or not the connection's own estimate
+        // fell (that local label has no shared consequence): the larger of
+        // the Host's estimate and the report's own policy-derived size lowers
+        // a larger shared record or, when equal or larger, restarts the hold
+        // so that no client confirms or submits growth within it. Neither
+        // value depends on the connection's loss-inferred estimate.
+        let published = match (outcome.feedback, outcome.derived_mtu, current) {
+            (
+                PmtuFeedback::Decreased { .. } | PmtuFeedback::Unchanged,
+                Some(derived),
+                Some(path),
+            ) => self.publish(
                 now,
                 path,
                 ipv4,
-                &key,
-                evidence.packet_len,
+                quoted,
+                segment.ip_packet_len,
                 candidate,
-                Some(mtu),
-            )?,
-            (PmtuFeedback::Unchanged, Some(path)) => self.publish(
-                now,
-                path,
-                ipv4,
-                &key,
-                evidence.packet_len,
-                candidate,
-                None,
+                Some(derived),
             )?,
             _ => None,
         };
         Ok(Completed(IcmpOutcome::Tcp {
             owner: id,
-            report: TcpReport::PacketTooBig(outcome),
+            report: TcpReport::PacketTooBig(outcome.feedback),
             published,
         }))
     }
@@ -1466,28 +1540,30 @@ impl Host {
     // this Host's table. Never applied to an invalidated incarnation, never
     // larger than or equal to the dropped packet, and held for 600 seconds.
     //
-    // `applied` is the estimate a correlated TCP owner just decreased to.
-    // The larger of it and the Host's own estimate is published: a shared
-    // ceiling must not undercut a decrease the accepting owner applied under
-    // its configured policy (it would be clamped to it at its next egress),
-    // and one connection's plateau override must not lower other clients
-    // below the Host's table. Both readings agree for a next-hop report.
+    // `derived`, for a TCP owner, is the size its policy derives from
+    // the report itself, independent of its current estimate. The larger of
+    // it and the Host's own estimate is published: a shared ceiling must not
+    // undercut what the accepting owner's configured policy derives (it
+    // would be clamped to it at its next egress), and one connection's
+    // plateau override must not lower other clients below the Host's table.
+    // Both readings agree for a next-hop report. `quoted` is the returned
+    // packet length and header length.
     #[allow(clippy::too_many_arguments)]
     fn publish(
         &mut self,
         now: Instant,
         path: path::PathId,
         ipv4: bool,
-        key: &QuoteKey,
+        quoted: (u32, u16),
         dropped: u32,
         candidate: Option<u32>,
-        applied: Option<u32>,
+        derived: Option<u32>,
     ) -> Result<Option<path::EstimateChange>, Error> {
-        let Some(mtu) = self.host_estimate(path, ipv4, key, dropped, candidate) else {
+        let Some(mtu) = self.host_estimate(path, ipv4, quoted, dropped, candidate) else {
             return Ok(None);
         };
-        debug_assert!(candidate.is_none() || applied.is_none_or(|applied| applied == mtu));
-        let mtu = applied.map_or(mtu, |applied| applied.max(mtu));
+        debug_assert!(candidate.is_none() || derived.is_none_or(|derived| derived == mtu));
+        let mtu = derived.map_or(mtu, |derived| derived.max(mtu));
         if mtu >= dropped {
             return Ok(None);
         }
@@ -1500,7 +1576,7 @@ impl Host {
         &self,
         path: path::PathId,
         ipv4: bool,
-        key: &QuoteKey,
+        (quoted_len, header_len): (u32, u16),
         dropped: u32,
         candidate: Option<u32>,
     ) -> Option<u32> {
@@ -1514,8 +1590,8 @@ impl Host {
                 .ipv4_plateaus()?
                 .legacy_fallback(
                     snapshot.ip_packet_budget().ok()?,
-                    key.packet_len,
-                    u32::from(key.header_len),
+                    quoted_len,
+                    u32::from(header_len),
                     dropped,
                 )
                 .ok(),
@@ -1887,6 +1963,10 @@ fn live<T>(result: Result<T, EndpointError>) -> Result<Option<T>, Error> {
         Err(EndpointError::InvalidHandle) => Ok(None),
         result => Ok(Some(result?)),
     }
+}
+
+fn quoted(key: &QuoteKey) -> (u32, u16) {
+    (key.packet_len, key.header_len)
 }
 
 fn is_icmp(packet: &IngressPacket) -> bool {

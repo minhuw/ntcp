@@ -24,7 +24,7 @@ def main():
     family = socket.AF_INET6 if ":" in local else socket.AF_INET
     emit(event="ready", namespace=os.stat("/proc/self/ns/net").st_ino,
          preload=os.environ.get("LD_PRELOAD", ""))
-    udp = None
+    udp = listener = None
     streams = {}
     for line in sys.stdin:
         fields = line.split()
@@ -99,6 +99,28 @@ def main():
                     received.extend(chunk)
                 assert received == data, f"echo mismatch {len(received)}/{size}"
             emit(event="finish", name=name, tx=size, rx=len(received), local_port=local_port, hash=fnv(received))
+        elif fields[0] == "listen":
+            # A plain receiver for the staged ntcp sender; the kernel completes
+            # the handshake and receives into the backlog before accept.
+            listener = socket.socket(family, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((local, int(fields[1])))
+            listener.listen(1)
+            listener.settimeout(25)
+            emit(event="listening", port=int(fields[1]))
+        elif fields[0] == "collect":
+            size = int(fields[1])
+            s, _ = listener.accept()
+            with s:
+                s.settimeout(25)
+                received = bytearray()
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            listener.close()
+            emit(event="collect", rx=len(received), expected=size, hash=fnv(received))
         else:
             raise ValueError(fields[0])
 

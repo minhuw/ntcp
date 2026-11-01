@@ -332,16 +332,52 @@ class PmtudInventory(unittest.TestCase):
             self.assertEqual(row["status"], "exception", key)
             self.assertIn("PathService", row["reason"], key)
             self.assertNotRegex(row["reason"], r"independently TODO|remains TODO at 079|no sessions share|no cross-protocol", key)
-        # T9 closes only the whole distinct-notification clause; the drop
-        # notifications themselves still await exact T11 repair.
+        # T9 closes the whole distinct-notification clause.
         self.assertEqual(rows6["8201-066"]["status"], "covered")
         self.assertIn("ntcp-host/src/lib.rs::", rows6["8201-066"]["evidence"][0])
         self.assertIn("next service pass", rows6["8201-066"]["reason"])
         self.assertNotIn("next egress refresh", rows6["8201-066"]["reason"])
-        for key, dependency in (("1191-061", "T11"), ("8201-064", "T11")):
+        # T11 closes the whole drop-notification, prompt exact-range and
+        # non-amplification obligations; the unchanged-cwnd pair keeps only
+        # the T23 AC-27 standards decision on MSS-decrease rescaling.
+        closed = {
+            "1191-061": ("a488096526729f741570456d2e7c4bb71c0c66641a88485d11bcd6c5cfe30c3d",
+                         "connection.rs::    fn accept_pmtu_report(", "connection_ptb_scheduler_tests.rs::"),
+            "8201-064": ("63fdcfe2d5b9350b570797c4cd67f3d367904fcb3f4b17702bf2b7ed54003ecf",
+                         "connection.rs::    fn accept_pmtu_report(", "connection_ptb_scheduler_tests.rs::"),
+            "1191-064": ("3acf5bab03a3e2a46b282244619c2ec627af02f5a89e151ab02cb569d5f8cad8",
+                         "connection_ptb.rs::    pub(super) fn note_ptb_drop(", "ntcp-host/src/tests/repair.rs::"),
+            "1191-080": ("5dc1d51f767d1166c39060ad2db110746af28014f6904a76fa2246f5db18cf72",
+                         "connection_ptb.rs::    pub(super) fn ptb_segment(", "connection_ptb_scheduler_tests.rs::"),
+        }
+        for key, (digest, source, test) in closed.items():
+            row = (rows6 if key.startswith("8201") else rows)[key]
+            full_key = row["target"] + "\n" + " ".join(row["quote"].split())
+            self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(), digest, key)
+            self.assertEqual(row["status"], "covered", key)
+            self.assertEqual(len(row["evidence"]), 2, key)
+            self.assertIn(source, row["evidence"][0], key)
+            self.assertIn(test, row["evidence"][1], key)
+            self.assertNotRegex(row["reason"], r"\bRemaining\b|\bT11\b|head retry from|are rejected", key)
+        for key in ("1191-061", "8201-064"):
+            reason = (rows6 if key.startswith("8201") else rows)[key]["reason"]
+            self.assertIn("whether or not the estimate falls", reason)
+            self.assertIn("tcp-burst", reason)
+        self.assertIn("tcp-staged", rows["1191-064"]["reason"])
+        self.assertIn("one accepted physical repair packet until useful ACK progress", rows["1191-080"]["reason"])
+        for key in ("1191-082", "8201-076"):
             row = (rows6 if key.startswith("8201") else rows)[key]
             self.assertEqual(row["status"], "TODO", key)
-            self.assertIn(dependency, row["reason"], key)
+            remainder = row["reason"].split("Remaining (T23, AC-27): ", 1)
+            self.assertEqual(len(remainder), 2, key)
+            self.assertIn("Implemented operative behavior", remainder[0], key)
+            self.assertIn("MSS", remainder[1], key)
+            self.assertNotRegex(row["reason"], r"\bT11\b|head retry", key)
+        # Host-correlated derived sizes are independent of the local estimate,
+        # including the legacy RFC 1191 section 5 correction.
+        for key, row in {"1191-057": rows["1191-057"],
+                         **{k: rows4821[k] for k in ("4821-019", "4821-069", "4821-079", "4821-195")}}.items():
+            self.assertIn("corrected against the Host-proven submitted length", row["reason"], key)
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:
