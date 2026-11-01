@@ -68,7 +68,6 @@ fn base_fragment_upper_layer_round_trip_and_header_placement() {
         assert_eq!(fr.next_header, PROTOCOL_UDP);
         assert_eq!(fr.more_fragments, i + 1 < packets.len());
         assert_eq!(usize::from(fr.offset), i * 1232);
-        assert!(!fr.is_atomic());
         assert_eq!(p.header, &packet[..48]);
         assert_eq!((p.traffic_class, p.hop_limit), ((10 << 2) | 1, 3));
         assert_eq!(p.ip, ip());
@@ -146,13 +145,8 @@ fn received_reserved_bits_are_ignored_and_later_fragment_data_is_opaque() {
     // Atomic fragments (offset 0, M clear) are recognized on receive.
     let mut atomic = packets[0].clone();
     atomic[43] &= !1;
-    assert!(
-        parse_fragment(&atomic)
-            .unwrap()
-            .fragment
-            .unwrap()
-            .is_atomic()
-    );
+    let fr = parse_fragment(&atomic).unwrap().fragment.unwrap();
+    assert_eq!((fr.offset, fr.more_fragments), (0, false));
     // Truncated or impossible Fragment headers.
     let first = &packets[0];
     assert_eq!(parse_fragment(&first[..44]).unwrap_err(), Error::Truncated);

@@ -58,7 +58,7 @@
       "quote": "and sends all datagrams on that path with the DF bit set.",
       "parent": "1191-005",
       "status": "covered",
-      "reason": "The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.",
+      "reason": "The atomic IPv4 codec sets DF on every packet it encodes and ntcp_ip::Fragmenter sets DF on every Host-originated fragment; the codec's ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected behavior wherever the host performs Path MTU Discovery, not optional clear-DF termination. User disposition (recorded): a native connection whose application sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT does not perform Path MTU Discovery with its ordinary output, which it sends as IPv4 TCP packets without DF, each carrying an Identification leased from the Host allocator for its (source, destination, TCP) tuple; its PLPMTUD probes keep DF.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
       "evidence": [
         "crates/stacks/ntcp-ip/src/lib.rs::pub fn encode(",
@@ -100,7 +100,7 @@
       "quote": "Or, the host may elect to end the discovery process by ceasing to set the DF bit in the datagram headers; it may do so, for example, because it is willing to have datagrams fragmented in some circumstances.",
       "parent": "1191-006",
       "status": "exception",
-      "reason": "Optional clear-DF termination is not selected. TCP keeps DF and reduces packet size; not implementing this permission is not a missing feature.",
+      "reason": "Optional clear-DF termination is not selected: a connection performing Path MTU Discovery keeps DF and reduces packet size, and the host never ends discovery by clearing DF. User disposition (recorded): a native connection whose application sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT never performs Path MTU Discovery with its ordinary output, so it ends no discovery process; that output goes as IPv4 TCP packets without DF with Identifications leased from the Host allocator, and its PLPMTUD probes keep DF. Not implementing this permission is not a missing feature.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2"
     },
     {

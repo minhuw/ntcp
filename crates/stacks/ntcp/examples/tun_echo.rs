@@ -3345,7 +3345,7 @@ mod linux {
         //# ECN-capable packets MAY have the DF (Don't Fragment) bit set.
         //= https://www.rfc-editor.org/rfc/rfc1191#section-2
         //= type=test
-        //= reason=The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.
+        //= reason=The atomic IPv4 codec sets DF on every packet it encodes and ntcp_ip::Fragmenter sets DF on every Host-originated fragment; the codec's ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected behavior wherever the host performs Path MTU Discovery, not optional clear-DF termination. User disposition (recorded): a native connection whose application sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT does not perform Path MTU Discovery with its ordinary output, which it sends as IPv4 TCP packets without DF, each carrying an Identification leased from the Host allocator for its (source, destination, TCP) tuple; its PLPMTUD probes keep DF.
         //# and sends all datagrams on that path with the DF bit set.
 
         //= https://www.rfc-editor.org/rfc/rfc1191#section-2

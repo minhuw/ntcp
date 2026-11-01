@@ -201,9 +201,6 @@ impl Envelope {
     pub const fn context(self) -> IngressContext {
         self.context
     }
-    pub const fn reassembled(self) -> bool {
-        self.reassembled
-    }
     /// Rejoin retained bytes; None unless they have the datagram's length.
     pub fn datagram(self, bytes: &[u8]) -> Option<Datagram<'_>> {
         (bytes.len() == self.len).then_some(Datagram {

@@ -499,6 +499,31 @@ impl Reassembly {
         if !self.limits.enabled() {
             return Err(Discard::Assemblies);
         }
+        let key = Key {
+            source: p.source,
+            destination: p.destination,
+            zone: (is_link_local(p.source) || is_link_local(p.destination)).then_some(arrival.link),
+            protocol: (!ipv6).then_some(p.protocol),
+            identification: p.identification,
+        };
+        // RFC 5722 section 4:
+        //   When reassembling an IPv6 datagram, if one or more of its
+        //   constituent fragments is determined to be an overlapping
+        //   fragment, the entire datagram (and any constituent fragments,
+        //   including those not yet received) MUST be silently discarded.
+        // A live rejection marker therefore discards its datagram's later
+        // fragments before any check that could answer them with an ICMP
+        // error (RFC 8200 section 4.5: no ICMP error messages for an
+        // abandoned overlapping packet). After the marker's deadline the
+        // key is no longer that datagram's.
+        if self
+            .slots
+            .iter()
+            .flatten()
+            .any(|s| s.rejected && s.key == key && now < s.deadline)
+        {
+            return Err(Discard::Rejected);
+        }
         let len = u32::try_from(p.data.len()).map_err(|_| Discard::Oversize)?;
         if p.more && len == 0 {
             return Err(Discard::Empty);
@@ -532,13 +557,6 @@ impl Reassembly {
         if ipv6 && p.offset == 0 && !upper_layer_complete(p.protocol, p.data) {
             return Err(Discard::IncompleteHeader);
         }
-        let key = Key {
-            source: p.source,
-            destination: p.destination,
-            zone: (is_link_local(p.source) || is_link_local(p.destination)).then_some(arrival.link),
-            protocol: (!ipv6).then_some(p.protocol),
-            identification: p.identification,
-        };
         let copied = if ipv6 {
             None
         } else {
@@ -554,11 +572,9 @@ impl Reassembly {
         let index = match found {
             Some(index) => {
                 let slot = self.slots[index].as_ref().unwrap();
+                // A live rejection marker was answered above.
                 if slot.deadline <= now {
                     return Err(Discard::Late);
-                }
-                if slot.rejected {
-                    return Err(Discard::Rejected);
                 }
                 index
             }

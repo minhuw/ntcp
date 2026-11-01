@@ -464,6 +464,161 @@ fn reassembly_errors_reach_the_icmp_output_through_the_limiter() {
     }
 }
 
+// One IPv6 fragment as a peer may send it, without the source fragmenter's
+// validation: base -> Fragment -> `data`.
+fn raw_fragment6(
+    ip: IpMetadata,
+    next_header: u8,
+    identification: u32,
+    offset: u16,
+    more: bool,
+    data: &[u8],
+) -> Vec<u8> {
+    let (IpAddr::V6(source), IpAddr::V6(destination)) = (ip.source, ip.destination) else {
+        panic!("IPv6 addresses");
+    };
+    let mut b = vec![0; 48 + data.len()];
+    b[0] = 0x60;
+    b[4..6].copy_from_slice(&((8 + data.len()) as u16).to_be_bytes());
+    b[6] = 44;
+    b[7] = 64;
+    b[8..24].copy_from_slice(&source.octets());
+    b[24..40].copy_from_slice(&destination.octets());
+    b[40] = next_header;
+    b[42..44].copy_from_slice(&(offset | u16::from(more)).to_be_bytes());
+    b[44..48].copy_from_slice(&identification.to_be_bytes());
+    b[48..].copy_from_slice(data);
+    b
+}
+
+// RFC 5722 section 4 and RFC 8200 section 4.5: once an IPv6 datagram is
+// abandoned for overlap, its later fragments are discarded silently, even
+// those that would otherwise draw a Parameter Problem; without a marker,
+// and once the marker has expired (silently), they draw their errors.
+#[test]
+fn abandoned_ipv6_datagrams_draw_no_parameter_problems() {
+    let cfg = config(2);
+    let (local, remote) = addresses(true);
+    let mut a = side(local, 73, &cfg, OUTPUT);
+    let to_us = ip(remote.ip(), local.ip());
+    let second = cfg.connection.timebase.units_per_second;
+    let complete = udp(to_us, (remote.port(), local.port()), &[9; 2000]);
+    let checked = |id| {
+        [
+            // Non-final and not a multiple of 8: code 0 at Payload Length.
+            (raw_fragment6(to_us, 17, id, 1000, true, &[1; 999]), 0, 4),
+            // Ends beyond 65535: code 0 at the Fragment Offset.
+            (raw_fragment6(to_us, 17, id, 65528, false, &[1; 16]), 0, 42),
+            // Fragment zero without the whole TCP header: code 3, pointer 0.
+            (raw_fragment6(to_us, 6, id, 0, true, &[1; 8]), 3, 0),
+        ]
+    };
+    let mut out = vec![0; 8192];
+    let mut receive = |a: &mut Side, now, frame: &[u8]| match a
+        .0
+        .receive(a.2, now, frame, false, &mut out)
+        .unwrap()
+    {
+        Received::Held => "held",
+        Received::Discarded => "discarded",
+        Received::Datagram(_) => "datagram",
+    };
+    let problems = |a: &mut Side, now| -> Vec<(u8, u8, u32)> {
+        drain(a, now)
+            .iter()
+            .map(|packet| {
+                let (outer, message) = icmp_message(packet);
+                assert_eq!(outer, ip(local.ip(), remote.ip()));
+                assert_eq!(message[0], 4);
+                let pointer = u32::from_be_bytes(message[4..8].try_into().unwrap());
+                (message[0], message[1], pointer)
+            })
+            .collect()
+    };
+    // Without a marker each fragment draws its Parameter Problem.
+    for (frame, _, _) in checked(34) {
+        assert_eq!(receive(&mut a, 0, &frame), "discarded");
+    }
+    assert_eq!(problems(&mut a, 0), [(4, 0, 4), (4, 0, 42), (4, 3, 0)]);
+    // Overlap: the datagram is abandoned silently, leaving its marker.
+    assert_eq!(
+        receive(&mut a, 1, &fragments(&complete, 33, 1000)[0]),
+        "held"
+    );
+    assert_eq!(
+        receive(&mut a, 1, &fragments(&complete, 33, 504)[1]),
+        "discarded"
+    );
+    assert_eq!(a.0.reassembly_counters().discarded.overlap, 1);
+    // Its later fragments are discarded silently as rejected.
+    for (frame, _, _) in checked(33) {
+        assert_eq!(receive(&mut a, 2, &frame), "discarded");
+    }
+    assert_eq!(a.0.icmp_output_pending(), 0);
+    let discarded = a.0.reassembly_counters().discarded;
+    assert_eq!(
+        (
+            discarded.rejected,
+            discarded.misaligned,
+            discarded.oversize,
+            discarded.incomplete_header
+        ),
+        (3, 1, 1, 1)
+    );
+    // The marker expires at its original deadline without any message.
+    a.0.service_changes(&mut a.1, 1 + 60 * second).unwrap();
+    assert_eq!(a.0.reassembly_counters().expired, 1);
+    assert_eq!(a.0.icmp_output_pending(), 0);
+    // Afterwards the identity starts a new assembly; its checks apply again.
+    for (frame, _, _) in checked(33) {
+        assert_eq!(receive(&mut a, 2 + 60 * second, &frame), "discarded");
+    }
+    assert_eq!(
+        problems(&mut a, 2 + 60 * second),
+        [(4, 0, 4), (4, 0, 42), (4, 3, 0)]
+    );
+    assert_eq!(
+        receive(&mut a, 2 + 60 * second, &fragments(&complete, 33, 1000)[0]),
+        "held"
+    );
+    assert_eq!(a.0.reassembly_counters().discarded.rejected, 3);
+
+    // IPv4 keeps overlap support and defines none of these errors: the same
+    // overlap is held, a misaligned fragment is discarded silently, and the
+    // datagram still completes.
+    let (local, remote) = addresses(false);
+    let mut b = side(local, 74, &cfg, OUTPUT);
+    let to_us = ip(remote.ip(), local.ip());
+    let complete = udp(to_us, (remote.port(), local.port()), &[9; 2000]);
+    let wide = fragments(&complete, 33, 1000);
+    assert_eq!(receive(&mut b, 1, &wide[0]), "held");
+    assert_eq!(
+        receive(&mut b, 1, &fragments(&complete, 33, 504)[1]),
+        "held"
+    );
+    let mut misaligned = wide[1].clone();
+    misaligned.pop();
+    let len = misaligned.len();
+    misaligned[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+    misaligned[10..12].fill(0);
+    let sum = ntcp_ip_common::checksum(&misaligned[..20]);
+    misaligned[10..12].copy_from_slice(&sum.to_be_bytes());
+    assert_eq!(receive(&mut b, 2, &misaligned), "discarded");
+    assert_eq!(b.0.icmp_output_pending(), 0);
+    for piece in &wide[1..] {
+        receive(&mut b, 3, piece);
+    }
+    let counters = b.0.reassembly_counters();
+    assert_eq!(
+        (
+            counters.completed,
+            counters.discarded.misaligned,
+            counters.discarded.rejected
+        ),
+        (1, 1, 0)
+    );
+}
+
 #[test]
 fn completed_datagrams_own_their_bytes_for_retention() {
     for v6 in [false, true] {
@@ -483,7 +638,8 @@ fn completed_datagrams_own_their_bytes_for_retention() {
             match a.0.receive(a.2, 1, &piece, false, &mut out).unwrap() {
                 Received::Held => {}
                 Received::Datagram(datagram) => {
-                    assert!(datagram.envelope().reassembled());
+                    // Reconstructed by the engine, not a physical arrival.
+                    assert_eq!(a.0.reassembly_counters().completed, 1);
                     // Fragment zero's header, its Identification kept (and
                     // so the IPv4 header checksum differs).
                     let bytes = datagram.bytes();
@@ -529,12 +685,14 @@ fn completed_datagrams_own_their_bytes_for_retention() {
             atomic[40] = 17;
             atomic[44..48].copy_from_slice(&5u32.to_be_bytes());
             atomic[48..].copy_from_slice(&complete[40..]);
+            let before = a.0.reassembly_counters();
             let Received::Datagram(datagram) =
                 a.0.receive(a.2, 4, &atomic, false, &mut out).unwrap()
             else {
                 panic!("atomic fragment held");
             };
-            assert!(!datagram.envelope().reassembled());
+            // RFC 6946: it bypasses assembly state entirely.
+            assert_eq!(a.0.reassembly_counters(), before);
             assert!(datagram.bytes() == &complete[..]);
         }
     }

@@ -254,14 +254,6 @@ pub struct Fragment {
     pub offset: u16,
 }
 
-impl Fragment {
-    /// Offset zero and M clear: an atomic fragment, whose data is the whole
-    /// datagram and which bypasses reassembly (RFC 6946, RFC 8200 4.5).
-    pub fn is_atomic(&self) -> bool {
-        !self.more_fragments && self.offset == 0
-    }
-}
-
 /// One received IPv6 packet: base header, optionally followed by a Fragment
 /// header. Without one, it equals `parse`. With one, `protocol` is the
 /// Fragment header's Next Header and `payload` the fragment's data, which is

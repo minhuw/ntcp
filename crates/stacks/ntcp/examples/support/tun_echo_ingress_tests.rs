@@ -177,7 +177,8 @@ fn reserved_owner_retains_the_completed_datagram_never_a_fragment() {
         input_frame(&mut p.ahost, &mut p.a, p.time, &pieces[0], p.local.ip(), false, 0).unwrap();
         assert_eq!(p.ahost.received.len(), 1);
         let retained = &p.ahost.received[0];
-        assert!(retained.envelope.unwrap().reassembled());
+        // The complete segment, never one of its shorter fragments.
+        assert!(retained.envelope.is_some());
         assert_eq!(retained.bytes.len(), frames[0].len());
         // Once the reservation resolves, the retained datagram is dispatched.
         backend.blocked = false;

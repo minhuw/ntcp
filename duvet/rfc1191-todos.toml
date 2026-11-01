@@ -11,7 +11,7 @@ If any of the datagrams are too large to be forwarded without fragmentation by s
 # 1191-006a
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
-reason = "Optional clear-DF termination is not selected. TCP keeps DF and reduces packet size; not implementing this permission is not a missing feature."
+reason = "Optional clear-DF termination is not selected: a connection performing Path MTU Discovery keeps DF and reduces packet size, and the host never ends discovery by clearing DF. User disposition (recorded): a native connection whose application sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT never performs Path MTU Discovery with its ordinary output, so it ends no discovery process; that output goes as IPv4 TCP packets without DF with Identifications leased from the Host allocator, and its PLPMTUD probes keep DF. Not implementing this permission is not a missing feature."
 quote = '''
 Or, the host may elect to end the discovery process by ceasing to set the DF bit in the datagram headers; it may do so, for example, because it is willing to have datagrams fragmented in some circumstances.
 '''

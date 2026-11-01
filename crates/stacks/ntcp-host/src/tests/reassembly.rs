@@ -633,6 +633,95 @@ fn ipv6_overlap_leaves_an_unevictable_silent_rejection_marker() {
     );
 }
 
+// RFC 5722 section 4: the later fragments of an IPv6 datagram abandoned
+// for overlap are discarded silently, before the checks behind RFC 8200
+// section 4.5's Parameter Problems; the same fragments of a datagram
+// without a live marker are judged by those checks.
+#[test]
+fn rejection_markers_precede_every_error_producing_check() {
+    let f = fixture();
+    let d = data(64, 12);
+    let checked = |id| {
+        [
+            (frag(true, id, 8, true, &d[..13]), Discard::Misaligned),
+            (frag(true, id, 65528, false, &d[..16]), Discard::Oversize),
+            (
+                Frag {
+                    protocol: 6,
+                    ..frag(true, id, 0, true, &d[..8])
+                },
+                Discard::IncompleteHeader,
+            ),
+        ]
+    };
+    let mut r = engine();
+    for (fragment, discard) in checked(20) {
+        assert_eq!(feed(&mut r, &f, 0, fragment), Out::Discarded(discard));
+        assert!(ReassemblyError::for_discard(true, discard).is_some());
+    }
+    assert_eq!(
+        feed(&mut r, &f, 0, frag(true, 9, 0, true, &d[..32])),
+        Out::Held
+    );
+    assert_eq!(
+        feed(&mut r, &f, SECOND, frag(true, 9, 16, true, &d[16..48])),
+        Out::Discarded(Discard::Overlap)
+    );
+    for (fragment, _) in checked(9) {
+        assert_eq!(
+            feed(&mut r, &f, 2 * SECOND, fragment),
+            Out::Discarded(Discard::Rejected)
+        );
+    }
+    assert_eq!(ReassemblyError::for_discard(true, Discard::Rejected), None);
+    let counters = r.counters().discarded;
+    assert_eq!(
+        (
+            counters.rejected,
+            counters.misaligned,
+            counters.oversize,
+            counters.incomplete_header
+        ),
+        (3, 1, 1, 1)
+    );
+    // Only the marker holds a slot; the discarded fragments created none.
+    assert_eq!((r.assemblies(), r.buffered()), (1, 0));
+    // At its deadline the marker no longer names a live datagram: the
+    // fragments are judged again, a valid one is late until the expiry
+    // pass, which sends nothing, and then starts a new assembly.
+    for (fragment, discard) in checked(9) {
+        assert_eq!(
+            feed(&mut r, &f, 60 * SECOND, fragment),
+            Out::Discarded(discard)
+        );
+    }
+    assert_eq!(
+        feed(&mut r, &f, 60 * SECOND, frag(true, 9, 0, true, &d[..32])),
+        Out::Discarded(Discard::Late)
+    );
+    assert!(expire_all(&mut r, 60 * SECOND).is_empty());
+    assert_eq!(r.assemblies(), 0);
+    assert_eq!(
+        feed(&mut r, &f, 61 * SECOND, frag(true, 9, 0, true, &d[..32])),
+        Out::Held
+    );
+    // IPv4 keeps overlap support and has no markers: an identical overlap
+    // is held and a later misaligned fragment is judged as before.
+    assert_eq!(
+        feed(&mut r, &f, 0, frag(false, 9, 0, true, &d[..32])),
+        Out::Held
+    );
+    assert_eq!(
+        feed(&mut r, &f, 0, frag(false, 9, 16, true, &d[16..48])),
+        Out::Held
+    );
+    assert_eq!(
+        feed(&mut r, &f, 0, frag(false, 9, 48, true, &d[48..61])),
+        Out::Discarded(Discard::Misaligned)
+    );
+    assert_eq!(r.counters().discarded.rejected, 3);
+}
+
 #[test]
 fn first_fragment_header_rules_differ_by_family() {
     let f = fixture();
