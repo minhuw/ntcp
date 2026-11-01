@@ -327,7 +327,7 @@ impl ConnectionConfig {
     //# Moreover, doing this prevents PMTU Discovery from discovering PMTUs larger than 576, so hosts SHOULD no longer lower the value they send
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
-    //= reason=Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. This does not establish that configured receive sizing represents host MMS_R-40 or the permitted maximum connected-link MTU across multiple interfaces; a host receive/reassembly and topology contract remains necessary. The optional link-derived choice is not itself a required feature.
+    //= reason=Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. T13 supplies the host capacity: Host::reassembly_capacity states, per family and per Host context, EMTU_R (RFC 1122 section 3.3.2: the largest complete IP datagram, header included, that the configured, storage-backed reassembly engine accepts) and MMS_R (EMTU_R - 20 for IPv4, EMTU_R - 40 for IPv6). This paragraph calls the largest reassemblable datagram MMS_R, so its host MMS_R-40 is EMTU_R - 40, that is RFC 1122's MMS_R less TCP's 20-octet header for IPv4; the TCP payload unit (MSS) differs from both EMTU_R and MMS_R. Configured receive sizing is not yet derived from that capacity or from the permitted maximum connected-link MTU across multiple interfaces: a host receive/reassembly and topology contract remains necessary. Remaining: T16 owns the receive-MSS derivation from Host::reassembly_capacity and the connected links, and T19 the topology evidence. The optional link-derived choice is not itself a required feature.
     //# in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.
     fn receive_mss_offer(&self) -> u16 {
         self.mss
@@ -9224,7 +9224,7 @@ impl Connection {
         //# which will have one of the following results:
 
         //= https://www.rfc-editor.org/rfc/rfc4821#section-8
-        //= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. The UDP example does not require a host datagram fragmentation service.
+        //= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. For a UDP application that cannot change its message sizes, Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment (4821-155); tun_echo's UDP echo replies use it.
         //# Packetization Layers SHOULD avoid sending messages that will require fragmentation
         //# [Kent87] [frag-errors]. However, entirely preventing fragmentation is not always
         //# possible. Some Packetization Layers, such as a UDP application outside the kernel,

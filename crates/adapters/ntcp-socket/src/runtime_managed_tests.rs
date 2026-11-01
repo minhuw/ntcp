@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use super::*;
 use ntcp_host::path;
+#[path = "runtime_ingress_tests.rs"]
+mod ingress;
 #[path = "runtime_managed_io_tests.rs"]
 mod scheduled;
 

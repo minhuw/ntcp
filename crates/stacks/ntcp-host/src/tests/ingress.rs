@@ -1,0 +1,737 @@
+// The physical input pipeline through real Host/Endpoint owners: UDP, TCP
+// and ICMP datagrams arriving as fragments, the Echo service, reassembly
+// errors and the Host ICMP output drain.
+use super::*;
+
+type Side = (Host, Endpoint, IngressContext);
+
+const UDP: UdpLimits = UdpLimits {
+    flows: 1,
+    receive_datagrams: 1,
+    max_payload: 4000,
+    events: 1,
+    evicted_signatures: 1,
+};
+const OUTPUT: IcmpOutputLimits = IcmpOutputLimits {
+    messages: 3,
+    message_bytes: 4096,
+    hop_limit: 64,
+};
+
+fn reassembly() -> ReassemblyLimits {
+    ReassemblyLimits {
+        assemblies: 4,
+        fragments: 600,
+        buffered_bytes: 8192,
+        ipv4_datagram: 4096,
+        ipv6_datagram: 4136,
+        ipv4_timeout_seconds: 60,
+    }
+}
+
+fn side(local: SocketAddr, identity: u128, cfg: &EndpointConfig, output: IcmpOutputLimits) -> Side {
+    managed_limited(local, identity, cfg.clone(), false, None, None, |p, l| {
+        let (p, l) = managed_udp_limits(p, l, UDP).unwrap();
+        let (p, mut l) = managed_icmp_output_limits(p, l, output).unwrap();
+        l.reassembly = reassembly();
+        (p, l, 1)
+    })
+}
+
+fn ip(source: IpAddr, destination: IpAddr) -> IpMetadata {
+    IpMetadata {
+        source,
+        destination,
+    }
+}
+
+// A complete datagram of `protocol` carrying `data` (already checksummed).
+fn datagram(ip: IpMetadata, protocol: u8, data: &[u8]) -> Vec<u8> {
+    let v6 = ip.source.is_ipv6();
+    let header = if v6 { 40 } else { 20 };
+    let mut packet = vec![0; header + data.len()];
+    packet[header..].copy_from_slice(data);
+    let n = if v6 {
+        let h = ntcp_ip6::Header {
+            ip,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+        };
+        ntcp_ip6::encode_datagram(&mut packet, h, protocol, data.len()).unwrap()
+    } else {
+        let h = ntcp_ip::Header {
+            ip,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+        };
+        ntcp_ip::encode_datagram(&mut packet, h, protocol, data.len(), 0).unwrap()
+    };
+    assert_eq!(n, packet.len());
+    packet
+}
+
+fn udp(ip: IpMetadata, ports: (u16, u16), payload: &[u8]) -> Vec<u8> {
+    let mut message = vec![0; 8 + payload.len()];
+    message[8..].copy_from_slice(payload);
+    let n = ntcp_ip_common::encode_udp(
+        ip.source,
+        ip.destination,
+        ports.0,
+        ports.1,
+        &mut message,
+        payload.len(),
+    )
+    .unwrap();
+    datagram(ip, 17, &message[..n])
+}
+
+fn echo(ip: IpMetadata, identifier: u16, sequence: u16, data: &[u8]) -> Vec<u8> {
+    let mut message = vec![0; 8 + data.len()];
+    message[8..].copy_from_slice(data);
+    let n = ntcp_icmp::encode_echo(
+        ip,
+        ntcp_icmp::EchoKind::Request,
+        identifier,
+        sequence,
+        &mut message,
+        data.len(),
+    )
+    .unwrap();
+    datagram(ip, if ip.source.is_ipv4() { 1 } else { 58 }, &message[..n])
+}
+
+// Source fragments of a complete option-free datagram, `chunk` data octets
+// each (a multiple of 8), through the codecs' fragmenters.
+fn fragments(packet: &[u8], identification: u32, chunk: usize) -> Vec<Vec<u8>> {
+    let v6 = packet[0] >> 4 == 6;
+    let (parsed_ip, protocol, data) = if v6 {
+        let p = ntcp_ip6::parse(packet).unwrap();
+        (p.ip, p.protocol, p.payload)
+    } else {
+        let p = ntcp_ip::parse(packet, false).unwrap();
+        (p.ip, p.protocol, p.payload)
+    };
+    let mut out = Vec::new();
+    for offset in (0..data.len()).step_by(chunk) {
+        let piece = &data[offset..data.len().min(offset + chunk)];
+        let mut buffer = vec![0; 128 + piece.len()];
+        let n = if v6 {
+            let h = ntcp_ip6::Header {
+                ip: parsed_ip,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+            };
+            ntcp_ip6::Fragmenter::new(h, protocol, identification, data.len())
+                .unwrap()
+                .encode(&mut buffer, offset, piece)
+                .unwrap()
+        } else {
+            let h = ntcp_ip::Header {
+                ip: parsed_ip,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            };
+            ntcp_ip::Fragmenter::new(h, protocol, identification as u16, data.len(), 0)
+                .unwrap()
+                .encode(&mut buffer, offset, piece)
+                .unwrap()
+        };
+        buffer.truncate(n);
+        out.push(buffer);
+    }
+    out
+}
+
+fn input_frame(side: &mut Side, now: u64, frame: &[u8]) -> Result<ntcp::InputDisposition, Error> {
+    side.0.input_ip(
+        &mut side.1,
+        side.2,
+        now,
+        frame,
+        RxPacketMetadata::default(),
+        0,
+        None,
+    )
+}
+
+// Drain the Host ICMP output; every message is submitted.
+fn drain(side: &mut Side, now: u64) -> Vec<Vec<u8>> {
+    let mut sent = Vec::new();
+    loop {
+        let mut packet = vec![0; 8192];
+        let mut frame = None;
+        match side.0.icmp_output(now, &mut packet, |_, bytes| {
+            frame = Some(bytes.to_vec());
+            BackendOutcome::Submitted
+        }) {
+            Ok(None) => return sent,
+            Ok(Some(BackendOutcome::Submitted)) => sent.push(frame.unwrap()),
+            other => panic!("unexpected ICMP output {other:?}"),
+        }
+    }
+}
+
+fn icmp_message(packet: &[u8]) -> (IpMetadata, &[u8]) {
+    if packet[0] >> 4 == 6 {
+        let p = ntcp_ip6::parse(packet).unwrap();
+        assert_eq!(p.protocol, 58);
+        (p.ip, p.payload)
+    } else {
+        let p = ntcp_ip::parse(packet, false).unwrap();
+        assert_eq!(p.protocol, 1);
+        (p.ip, p.payload)
+    }
+}
+
+#[test]
+fn fragmented_udp_is_checked_and_queued_as_one_complete_datagram() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 61, &cfg, OUTPUT);
+        let options = UdpOptions {
+            dscp: 0,
+            hop_limit: 64,
+        };
+        let flow = a.0.udp_open(&a.1, local, None, options).unwrap();
+        let payload: Vec<u8> = (0..3000).map(|i| (i * 7) as u8).collect();
+        let to_us = ip(remote.ip(), local.ip());
+        let complete = udp(to_us, (remote.port(), local.port()), &payload);
+        // Larger than the 1500-octet link: it arrives only as fragments.
+        let pieces = fragments(&complete, 7, 1200);
+        assert_eq!(pieces.len(), 3);
+        let mut bytes = vec![0; 4000];
+        // Reversed arrival: nothing reaches the flow before completion.
+        for piece in pieces[1..].iter().rev() {
+            assert_eq!(
+                input_frame(&mut a, 1, piece),
+                Ok(ntcp::InputDisposition::Processed)
+            );
+            assert_eq!(a.0.udp_receive(flow, &mut bytes).unwrap(), None);
+        }
+        assert_eq!(
+            input_frame(&mut a, 2, &pieces[0]),
+            Ok(ntcp::InputDisposition::Processed)
+        );
+        assert_eq!(
+            a.0.udp_receive(flow, &mut bytes).unwrap(),
+            Some((remote, payload.len()))
+        );
+        assert_eq!(&bytes[..payload.len()], &payload[..]);
+        assert_eq!(a.0.reassembly_counters().completed, 1);
+
+        // The UDP checksum is verified once over the complete datagram.
+        let mut corrupt = complete.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        let pieces = fragments(&corrupt, 8, 1200);
+        for piece in &pieces[..2] {
+            input_frame(&mut a, 3, piece).unwrap();
+        }
+        assert_eq!(
+            input_frame(&mut a, 3, &pieces[2]),
+            Ok(ntcp::InputDisposition::Dropped)
+        );
+        assert_eq!(a.0.udp_receive(flow, &mut bytes).unwrap(), None);
+
+        // A full receive queue drops the completed datagram.
+        for id in [9, 10] {
+            for piece in fragments(&complete, id, 1200) {
+                input_frame(&mut a, 4, &piece).unwrap();
+            }
+        }
+        assert_eq!(a.0.reassembly_counters().completed, 4);
+        assert!(a.0.udp_receive(flow, &mut bytes).unwrap().is_some());
+        assert_eq!(a.0.udp_receive(flow, &mut bytes).unwrap(), None);
+    }
+}
+
+#[test]
+fn fragmented_tcp_segments_reach_the_endpoint_like_any_other() {
+    for v6 in [false, true] {
+        let cfg = config(4);
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 63, &cfg, OUTPUT);
+        let mut b = managed(remote, 64, cfg.clone());
+        let listener = a.1.listen(local, 4).unwrap();
+        let id =
+            b.1.connect_with_path_provider(0, remote, local, options(&cfg, 0), &mut b.0)
+                .unwrap();
+        let mut now = 0;
+        pump(&mut b, &mut a, &mut now);
+        let child = a.1.accept(listener).unwrap();
+        b.1.write(id, &[5; 1400]).unwrap();
+        let segment = emit(&mut b.0, &mut b.1, now + 10).unwrap();
+        // IPv6 fragment zero must hold the whole TCP header (RFC 7112); an
+        // IPv4 first fragment of 8 data octets is legal.
+        let chunk = if v6 { 512 } else { 8 };
+        let mut pieces = fragments(&segment, 11, chunk);
+        let first = pieces.remove(0);
+        pieces.push(first);
+        for piece in &pieces {
+            input_frame(&mut a, now + 11, piece).unwrap();
+        }
+        let mut bytes = [0; 2000];
+        assert_eq!(a.1.read(child, &mut bytes).unwrap(), 1400);
+        assert_eq!(&bytes[..1400], &[5; 1400][..]);
+        assert_eq!(a.0.reassembly_counters().completed, 1);
+    }
+}
+
+#[test]
+fn echo_requests_are_answered_exactly_whole_or_reassembled() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 65, &cfg, OUTPUT);
+        let to_us = ip(remote.ip(), local.ip());
+        let data: Vec<u8> = (0..900).map(|i| (i * 13) as u8).collect();
+        let request = echo(to_us, 0x1234, 77, &data);
+        assert_eq!(
+            input_frame(&mut a, 1, &request),
+            Ok(ntcp::InputDisposition::Processed)
+        );
+        // input_icmp answers an unfragmented request through the same service.
+        assert_eq!(
+            a.0.input_icmp(&mut a.1, a.2, 1, &request).unwrap(),
+            IcmpDispatch::Completed(IcmpOutcome::Echo(EchoDisposition::Queued))
+        );
+        // A fragmented request is reassembled and answered.
+        for piece in fragments(&request, 21, 304) {
+            input_frame(&mut a, 2, &piece).unwrap();
+        }
+        let replies = drain(&mut a, 3);
+        assert_eq!(replies.len(), 3);
+        for reply in &replies {
+            let (outer, message) = icmp_message(reply);
+            assert_eq!(outer, ip(local.ip(), remote.ip()));
+            let decoded = ntcp_icmp::decode_echo(outer, message).unwrap();
+            assert_eq!(
+                (
+                    decoded.kind,
+                    decoded.identifier,
+                    decoded.sequence,
+                    decoded.data
+                ),
+                (ntcp_icmp::EchoKind::Reply, 0x1234, 77, &data[..])
+            );
+            if !v6 {
+                assert_eq!(reply[6] & 0x40, 0x40, "unfragmented IPv4 replies keep DF");
+            }
+        }
+        let counters = a.0.icmp_output_counters();
+        assert_eq!((counters.echo_replies, counters.unsent), (3, 0));
+
+        // A full queue drops further requests; nothing is truncated.
+        for sequence in 0..4 {
+            input_frame(&mut a, 4, &echo(to_us, 1, sequence, &data)).unwrap();
+        }
+        assert_eq!(a.0.icmp_output_pending(), 3);
+        assert_eq!(a.0.icmp_output_counters().dropped, 1);
+        assert_eq!(drain(&mut a, 5).len(), 3);
+
+        // Without source fragmentation configured (no fragments, no
+        // identifiers), a reply larger than the path allows unfragmented
+        // is not sent rather than truncated.
+        let large: Vec<u8> = vec![3; 2000];
+        for piece in fragments(&echo(to_us, 2, 2, &large), 22, 1200) {
+            input_frame(&mut a, 6, &piece).unwrap();
+        }
+        let mut packet = vec![0; 8192];
+        assert_eq!(
+            a.0.icmp_output(7, &mut packet, |_, _| panic!("no backend call")),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(a.0.icmp_output_counters().unsent, 1);
+
+        // A corrupt request and an Echo Reply addressed to us are not answered.
+        let mut corrupt = echo(to_us, 3, 3, &data);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(input_frame(&mut a, 8, &corrupt).is_err());
+        assert_eq!(a.0.icmp_output_pending(), 0);
+    }
+}
+
+#[test]
+fn echo_service_without_output_and_blocked_backends() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (local, remote) = addresses(v6);
+        let to_us = ip(remote.ip(), local.ip());
+        let request = echo(to_us, 4, 4, &[1; 64]);
+        // Output disabled: requests are dropped, never queued.
+        let mut off = side(local, 67, &cfg, IcmpOutputLimits::default());
+        assert_eq!(
+            input_frame(&mut off, 1, &request),
+            Ok(ntcp::InputDisposition::Dropped)
+        );
+        assert_eq!(off.0.icmp_output_pending(), 0);
+        // WouldBlock keeps the reply queued for the next drain.
+        let mut a = side(local, 68, &cfg, OUTPUT);
+        input_frame(&mut a, 1, &request).unwrap();
+        let mut packet = vec![0; 8192];
+        assert_eq!(
+            a.0.icmp_output(2, &mut packet, |egress, _| {
+                assert_eq!(egress.link, a.2.link());
+                BackendOutcome::WouldBlock
+            }),
+            Ok(Some(BackendOutcome::WouldBlock))
+        );
+        assert_eq!(a.0.icmp_output_pending(), 1);
+        assert_eq!(drain(&mut a, 3).len(), 1);
+        // A removed source leaves nothing to answer from.
+        input_frame(&mut a, 4, &request).unwrap();
+        let source =
+            a.0.paths()
+                .local_source(ScopedAddress::new(local.ip(), None).unwrap(), a.2.link())
+                .unwrap();
+        a.0.remove_source_owner(source, a.2.link()).unwrap();
+        assert!(
+            a.0.icmp_output(5, &mut packet, |_, _| unreachable!())
+                .is_err()
+        );
+        assert_eq!(a.0.icmp_output_counters().unsent, 1);
+    }
+}
+
+#[test]
+fn reassembly_errors_reach_the_icmp_output_through_the_limiter() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 69, &cfg, OUTPUT);
+        let to_us = ip(remote.ip(), local.ip());
+        let complete = udp(to_us, (remote.port(), local.port()), &[9; 2000]);
+        let pieces = fragments(&complete, 31, 1000);
+        // Fragment zero only: its datagram expires without further traffic
+        // and draws a Time Exceeded (code 1) quoting fragment zero.
+        input_frame(&mut a, 0, &pieces[0]).unwrap();
+        // A later fragment alone expires silently.
+        input_frame(&mut a, 0, &fragments(&complete, 32, 1000)[1]).unwrap();
+        let second = cfg.connection.timebase.units_per_second;
+        a.0.service_changes(&mut a.1, 60 * second - 1).unwrap();
+        assert_eq!(a.0.icmp_output_pending(), 0);
+        assert_eq!(a.0.next_reassembly_deadline(), Some(60 * second));
+        a.0.service_changes(&mut a.1, 60 * second).unwrap();
+        assert_eq!(a.0.reassembly_counters().expired, 2);
+        let sent = drain(&mut a, 60 * second);
+        assert_eq!(sent.len(), 1);
+        let (outer, message) = icmp_message(&sent[0]);
+        assert_eq!(outer, ip(local.ip(), remote.ip()));
+        assert_eq!(&message[..2], if v6 { [3, 1] } else { [11, 1] });
+        assert_eq!(&message[8..8 + 40], &pieces[0][..40]);
+
+        // IPv6 only: a misaligned non-final fragment draws Parameter Problem
+        // code 0 pointing at Payload Length; a link-layer multicast arrival
+        // draws nothing (RFC 4443 section 2.4(e)).
+        let mut misaligned = pieces[0].clone();
+        misaligned.pop();
+        let len = misaligned.len();
+        if v6 {
+            misaligned[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+        } else {
+            misaligned[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+            misaligned[10..12].fill(0);
+            let sum = ntcp_ip_common::checksum(&misaligned[..20]);
+            misaligned[10..12].copy_from_slice(&sum.to_be_bytes());
+        }
+        let mut out = vec![0; 8192];
+        assert!(matches!(
+            a.0.receive(a.2, 1, &misaligned, true, &mut out),
+            Ok(Received::Discarded)
+        ));
+        assert_eq!(a.0.icmp_output_pending(), 0);
+        assert!(matches!(
+            a.0.receive(a.2, 1, &misaligned, false, &mut out),
+            Ok(Received::Discarded)
+        ));
+        if v6 {
+            let sent = drain(&mut a, 61 * second);
+            assert_eq!(sent.len(), 1);
+            let (_, message) = icmp_message(&sent[0]);
+            assert_eq!((message[0], message[1]), (4, 0));
+            assert_eq!(&message[4..8], &4u32.to_be_bytes());
+        } else {
+            assert_eq!(a.0.icmp_output_pending(), 0);
+        }
+    }
+}
+
+#[test]
+fn completed_datagrams_own_their_bytes_for_retention() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 71, &cfg, OUTPUT);
+        let options = UdpOptions {
+            dscp: 0,
+            hop_limit: 64,
+        };
+        let flow = a.0.udp_open(&a.1, local, None, options).unwrap();
+        let to_us = ip(remote.ip(), local.ip());
+        let complete = udp(to_us, (remote.port(), local.port()), &[6; 2500]);
+        let mut out = vec![0; 4200];
+        let mut retained = None;
+        for piece in fragments(&complete, 41, 1200) {
+            match a.0.receive(a.2, 1, &piece, false, &mut out).unwrap() {
+                Received::Held => {}
+                Received::Datagram(datagram) => {
+                    assert!(datagram.envelope().reassembled());
+                    // Fragment zero's header, its Identification kept (and
+                    // so the IPv4 header checksum differs).
+                    let bytes = datagram.bytes();
+                    let fixed = if v6 { 40 } else { 4 };
+                    assert_eq!(bytes.len(), complete.len());
+                    assert!(bytes[..fixed] == complete[..fixed]);
+                    assert!(
+                        bytes[if v6 { 40 } else { 12 }..] == complete[if v6 { 40 } else { 12 }..]
+                    );
+                    retained = Some((datagram.envelope(), datagram.bytes().to_vec()));
+                }
+                Received::Discarded => panic!("discarded"),
+            }
+        }
+        // Retained beyond the engine's next use, then dispatched.
+        let (envelope, bytes) = retained.unwrap();
+        for piece in fragments(&complete, 42, 1200).iter().take(1) {
+            input_frame(&mut a, 2, piece).unwrap();
+        }
+        assert!(envelope.datagram(&bytes[1..]).is_none());
+        let datagram = envelope.datagram(&bytes).unwrap();
+        assert_eq!(
+            a.0.decode_datagram(datagram).unwrap().protocol,
+            ntcp_ip::PROTOCOL_UDP
+        );
+        assert_eq!(
+            a.0.input_datagram(&mut a.1, 3, datagram, RxPacketMetadata::default(), 0, None),
+            Ok(ntcp::InputDisposition::Processed)
+        );
+        let mut payload = vec![0; 4000];
+        assert_eq!(
+            a.0.udp_receive(flow, &mut payload).unwrap(),
+            Some((remote, 2500))
+        );
+        // The physical limit still bounds every arriving packet.
+        assert!(a.0.decode_ingress(a.2, &complete).is_ok());
+        // An IPv6 atomic fragment is processed as a complete packet.
+        if v6 {
+            let mut atomic = vec![0; complete.len() + 8];
+            atomic[..40].copy_from_slice(&complete[..40]);
+            atomic[4..6].copy_from_slice(&((complete.len() - 32) as u16).to_be_bytes());
+            atomic[6] = 44;
+            atomic[40] = 17;
+            atomic[44..48].copy_from_slice(&5u32.to_be_bytes());
+            atomic[48..].copy_from_slice(&complete[40..]);
+            let Received::Datagram(datagram) =
+                a.0.receive(a.2, 4, &atomic, false, &mut out).unwrap()
+            else {
+                panic!("atomic fragment held");
+            };
+            assert!(!datagram.envelope().reassembled());
+            assert!(datagram.bytes() == &complete[..]);
+        }
+    }
+}
+
+#[test]
+fn retired_addresses_discard_their_assemblies_at_the_next_service_pass() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 73, &cfg, OUTPUT);
+        let to_us = ip(remote.ip(), local.ip());
+        let complete = udp(to_us, (remote.port(), local.port()), &[1; 2000]);
+        input_frame(&mut a, 0, &fragments(&complete, 51, 1000)[0]).unwrap();
+        a.0.service_changes(&mut a.1, 1).unwrap();
+        assert_eq!(a.0.reassembly_counters().retired, 0);
+        let source =
+            a.0.paths()
+                .local_source(ScopedAddress::new(local.ip(), None).unwrap(), a.2.link())
+                .unwrap();
+        a.0.remove_source_owner(source, a.2.link()).unwrap();
+        a.0.service_changes(&mut a.1, 2).unwrap();
+        assert_eq!(a.0.reassembly_counters().retired, 1);
+        assert_eq!(a.0.next_reassembly_deadline(), None);
+        assert_eq!(a.0.icmp_output_pending(), 0);
+    }
+}
+
+// Every physical packet of one ICMP output transaction.
+fn drain_packets(side: &mut Side, now: u64) -> Result<Option<Vec<Vec<u8>>>, Error> {
+    let mut packet = vec![0; 8192];
+    let mut frames = Vec::new();
+    match side.0.icmp_output(now, &mut packet, |_, bytes| {
+        frames.push(bytes.to_vec());
+        BackendOutcome::Submitted
+    })? {
+        None => Ok(None),
+        Some(BackendOutcome::Submitted) => Ok(Some(frames)),
+        other => panic!("unexpected ICMP output {other:?}"),
+    }
+}
+
+// Reassemble one originated datagram from its physical packets: the outer
+// addresses, its upper-layer bytes and each packet's (length, DF, id).
+fn reconstruct(frames: &[Vec<u8>]) -> (IpMetadata, Vec<u8>, Vec<(usize, bool, Option<u32>)>) {
+    let mut data = Vec::new();
+    let mut shape = Vec::new();
+    let mut outer = None;
+    for (i, frame) in frames.iter().enumerate() {
+        let (ip, offset, more, id, payload, df) = if frame[0] >> 4 == 6 {
+            let p = ntcp_ip6::parse_fragment(frame).unwrap();
+            let (offset, more, id) = p
+                .fragment
+                .map_or((0, false, None), |f| {
+                    (usize::from(f.offset), f.more_fragments, Some(f.identification))
+                });
+            (p.ip, offset, more, id, p.payload, false)
+        } else {
+            let p = ntcp_ip::parse_fragment(frame, false).unwrap();
+            let f = p.fragmentation;
+            let fragmented = f.more_fragments || f.offset != 0;
+            (
+                p.ip,
+                usize::from(f.offset),
+                f.more_fragments,
+                fragmented.then_some(u32::from(f.identification)),
+                p.payload,
+                f.dont_fragment,
+            )
+        };
+        assert_eq!(offset, data.len(), "in-order, contiguous fragments");
+        assert_eq!(more, i + 1 != frames.len());
+        outer = Some(ip);
+        data.extend_from_slice(payload);
+        shape.push((frame.len(), df, id));
+    }
+    (outer.unwrap(), data, shape)
+}
+
+fn fragmenting_side(local: SocketAddr, identity: u128, capacity: bool) -> Side {
+    let cfg = config(2);
+    let mut side = managed_limited(local, identity, cfg, false, None, None, |p, mut l| {
+        l.datagrams = DatagramLimits {
+            max_fragments: 8,
+            identifiers: IdentifierLimits {
+                lifetime_seconds: 120,
+                ipv4_tuples: 2,
+                ipv6_leases: 8,
+            },
+            connectionless: ConnectionlessSizing::default(),
+            // Deployment knowledge of the peer's reassembly capacity.
+            peer_reassembly_ipv4: capacity.then_some(4096),
+            peer_reassembly_ipv6: capacity.then_some(4136),
+            adjunct: AdjunctLimits::default(),
+        };
+        let (p, l) = managed_udp_limits(p, l, UDP).unwrap();
+        let (p, mut l) = managed_icmp_output_limits(p, l, OUTPUT).unwrap();
+        l.reassembly = reassembly();
+        (p, l, 1)
+    });
+    let mut counter = 0x11u8;
+    side.0.set_entropy(std::boxed::Box::new(move |out: &mut [u8]| {
+        for b in out.iter_mut() {
+            *b = counter;
+            counter = counter.wrapping_add(1);
+        }
+        Ok(())
+    }));
+    // The previous context stopped at 0: identifiers start one MDL later.
+    side.0.start_identifiers(Continuity::QuietSince(0)).unwrap();
+    side
+}
+
+#[test]
+fn fragmented_echo_requests_get_fragmented_replies_within_the_peer_capacity() {
+    const MDL: u64 = 120_000_000;
+    for v6 in [false, true] {
+        let (local, remote) = addresses(v6);
+        let to_us = ip(remote.ip(), local.ip());
+        let from_us = ip(local.ip(), remote.ip());
+        let data: Vec<u8> = (0..2000).map(|i| (i * 11) as u8).collect();
+        let request = echo(to_us, 0x4242, 9, &data);
+        let header = if v6 { 40 } else { 20 };
+
+        // With the peer's capacity and an identifier: the reassembled
+        // request is answered with fragments of the connectionless
+        // effective size (1024 IPv4, 1280 IPv6), each IPv4 one with DF.
+        let mut a = fragmenting_side(local, 75, true);
+        for piece in fragments(&request, 23, 1200) {
+            input_frame(&mut a, MDL + 1, &piece).unwrap();
+        }
+        let frames = drain_packets(&mut a, MDL + 2).unwrap().unwrap();
+        let (outer, message, shape) = reconstruct(&frames);
+        assert_eq!(outer, from_us);
+        let reply = ntcp_icmp::decode_echo(outer, &message).unwrap();
+        assert_eq!(
+            (reply.kind, reply.identifier, reply.sequence, reply.data),
+            (ntcp_icmp::EchoKind::Reply, 0x4242, 9, &data[..])
+        );
+        assert_eq!(shape.len(), if v6 { 2 } else { 3 });
+        let id = shape[0].2.unwrap();
+        for (i, &(len, df, fragment_id)) in shape.iter().enumerate() {
+            assert_eq!(fragment_id, Some(id));
+            assert!(len <= if v6 { 1280 } else { 1024 });
+            if i + 1 != shape.len() {
+                assert_eq!(len, if v6 { 1280 } else { 1020 });
+            }
+            if !v6 {
+                assert!(df, "DF on every IPv4 fragment");
+            }
+        }
+        assert_eq!(message.len() + header, request.len());
+
+        // Without an identifier (still within the quiet period) a reply
+        // the path carries whole goes out whole; a larger one is unsent.
+        let mut quiet = fragmenting_side(local, 76, true);
+        let medium: Vec<u8> = vec![4; 1300];
+        for piece in fragments(&echo(to_us, 1, 1, &medium), 24, 1200) {
+            input_frame(&mut quiet, 1, &piece).unwrap();
+        }
+        let frames = drain_packets(&mut quiet, 2).unwrap().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), header + 8 + medium.len());
+        if !v6 {
+            assert_eq!(frames[0][6] & 0x40, 0x40);
+        }
+        for piece in fragments(&request, 25, 1200) {
+            input_frame(&mut quiet, 3, &piece).unwrap();
+        }
+        assert_eq!(
+            drain_packets(&mut quiet, 4),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(quiet.0.icmp_output_counters().unsent, 1);
+
+        // Without the stated capacity only the receiver guarantee holds
+        // (576 IPv4, 1500 IPv6): the 2028/2048-octet reply exceeds it and
+        // the path budget, so it is counted unsent; a reply within the
+        // budget but beyond what may be fragmented goes out whole.
+        let mut plain = fragmenting_side(local, 77, false);
+        for piece in fragments(&request, 26, 1200) {
+            input_frame(&mut plain, MDL + 1, &piece).unwrap();
+        }
+        assert_eq!(drain_packets(&mut plain, MDL + 2), Err(Error::Unsupported));
+        assert_eq!(plain.0.icmp_output_counters().unsent, 1);
+        for piece in fragments(&echo(to_us, 2, 2, &medium), 27, 1200) {
+            input_frame(&mut plain, MDL + 3, &piece).unwrap();
+        }
+        let frames = drain_packets(&mut plain, MDL + 4).unwrap().unwrap();
+        let (_, message, shape) = reconstruct(&frames);
+        assert_eq!(&message[8..], &medium[..]);
+        if v6 {
+            // 1348 octets are within IPv6's 1500 guarantee: fragmented to
+            // the 1280 effective size.
+            assert_eq!(shape.len(), 2);
+        } else {
+            assert_eq!(shape, [(header + 8 + medium.len(), true, None)]);
+        }
+    }
+}

@@ -598,8 +598,17 @@ struct Owner {
     // Absent only during construction or in explicitly backend-less core fixtures.
     host: Option<ntcp_host::Host>,
     ingress: Option<ntcp_host::IngressContext>,
+    // Host input storage: the destination of each datagram reassembly
+    // completes, and the IP packet and wire frame of Host ICMP output. All
+    // are allocated with the Host; empty without one.
+    completed: Vec<u8>,
+    icmp_packet: Vec<u8>,
+    icmp_wire: Vec<u8>,
     defaults: EndpointConfig,
     socket_policy: crate::SocketPolicy,
+    // The operator's assertion about earlier emission from `local`
+    // (`io.source_quiet`), applied when the Host's allocator starts.
+    source_quiet: crate::SourceQuiet,
     tun: Option<Tun>,
     ethernet: Option<backend::EthernetBackend>,
     sockets: BTreeMap<u64, Socket>,
@@ -737,6 +746,7 @@ impl Owner {
         // with_config establishes the owner/endpoint monotonic origin at zero.
         // Startup setup consumes lease time; it must not shift that origin or
         // grant a fresh interval when backend initialization completes later.
+        self.source_quiet = config.io.source_quiet;
         self.apply_socket_config_at(config, 0)
     }
 
@@ -910,8 +920,12 @@ impl Owner {
             endpoint,
             host: None,
             ingress: None,
+            completed: Vec::new(),
+            icmp_packet: Vec::new(),
+            icmp_wire: Vec::new(),
             defaults,
             socket_policy: crate::SocketPolicy::default(),
+            source_quiet: crate::SourceQuiet::Unknown,
             tun,
             ethernet: None,
             sockets: BTreeMap::new(),
@@ -983,6 +997,9 @@ impl Owner {
                 FastOpenClientPolicy::ApplicationProtected;
         }
         owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
+        // The packet-test port is an in-process queue created with this
+        // Owner: nothing emitted before it existed can be in flight on it.
+        owner.source_quiet = crate::SourceQuiet::Never;
         owner.attach_backend_host(1)?;
         owner.enable_egress(options.egress_capacity, crate::packet_profile::gso(profile))?;
         Ok(owner)
@@ -995,9 +1012,14 @@ impl Owner {
         assert_eq!(self.host.as_ref().unwrap().binding_count(), 0);
         self.endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).map_err(engine)?;
         self.defaults = config;
-        self.host = None;
+        let previous = self
+            .host
+            .take()
+            .map(|mut host| host.take_identifiers())
+            .transpose()
+            .map_err(host_error)?;
         self.ingress = None;
-        self.attach_backend_host(1)
+        self.attach_backend_host_with(1, previous)
     }
     fn check_address(&self, addr: SocketAddr) -> Result<()> {
         if addr.is_ipv4() != self.local.is_ipv4() {

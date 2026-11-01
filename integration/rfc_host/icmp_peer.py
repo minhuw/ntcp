@@ -5,14 +5,75 @@ import hashlib
 import json
 import os
 import socket
+import struct
 import sys
+import time
 
 from linux_peer import fnv, pattern
 
 UDP_PORT = 18090
+# The fragmentation-enabled sender's own port, so its requests and replies
+# are distinct from the never-fragmenting socket's.
+FRAGMENT_UDP_PORT = 18091
 IP_MTU_DISCOVER = 10  # Linux values absent from the socket module
+IP_PMTUDISC_DONT = 0
 IP_PMTUDISC_DO = 2
+IPV6_MTU_DISCOVER = 23
+IPV6_PMTUDISC_DONT = 0
 IPV6_DONTFRAG = 62
+
+
+def fragmenting(s, family):
+    """Let the kernel source-fragment datagrams larger than the link MTU."""
+    if family == socket.AF_INET:
+        s.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
+    else:
+        s.setsockopt(socket.IPPROTO_IPV6, IPV6_MTU_DISCOVER, IPV6_PMTUDISC_DONT)
+        s.setsockopt(socket.IPPROTO_IPV6, IPV6_DONTFRAG, 0)
+
+
+def checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return ~total & 0xffff
+
+
+def ping(family, remote, size, salt, wait):
+    """One ICMP Echo Request with SIZE data octets through a raw socket the
+    kernel fragments; the reply must echo identifier, sequence and data."""
+    v4 = family == socket.AF_INET
+    s = socket.socket(family, socket.SOCK_RAW, socket.IPPROTO_ICMP if v4 else socket.IPPROTO_ICMPV6)
+    with s:
+        fragmenting(s, family)
+        identifier, sequence = (0x5100 + salt) & 0xffff, salt & 0xffff
+        data = pattern(size, salt)
+        message = bytearray(struct.pack("!BBHHH", 8 if v4 else 128, 0, 0, identifier, sequence) + data)
+        if v4:  # the kernel computes the ICMPv6 checksum of raw ICMPv6 sockets
+            struct.pack_into("!H", message, 2, checksum(bytes(message)))
+        assert s.sendto(bytes(message), (remote, 0)) == len(message)
+        deadline = time.monotonic() + wait
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return dict(event="ping", sent=size, salt=salt, reply=None)
+            s.settimeout(left)
+            try:
+                packet, source = s.recvfrom(65575)
+            except socket.timeout:
+                continue
+            # IPv4 raw sockets deliver the reassembled IP header too.
+            body = packet[(packet[0] & 15) * 4:] if v4 else packet
+            if source[0] != remote or len(body) < 8 or body[0] != (0 if v4 else 129):
+                continue
+            if struct.unpack_from("!HH", body, 4) != (identifier, sequence):
+                continue
+            valid = not v4 or checksum(bytes(body)) == 0
+            return dict(event="ping", sent=size, salt=salt, reply=len(body) - 8, match=body[8:] == data,
+                        checksum_valid=valid, identifier=identifier, sequence=sequence,
+                        sha256=hashlib.sha256(body[8:]).hexdigest())
 
 
 def emit(**data):
@@ -24,7 +85,7 @@ def main():
     family = socket.AF_INET6 if ":" in local else socket.AF_INET
     emit(event="ready", namespace=os.stat("/proc/self/ns/net").st_ino,
          preload=os.environ.get("LD_PRELOAD", ""))
-    udp = listener = None
+    udp = fudp = sink = listener = None
     streams = {}
     for line in sys.stdin:
         fields = line.split()
@@ -54,6 +115,45 @@ def main():
             assert source[:2] == (remote, port), source
             emit(event="udp", sent=size, salt=salt, reply=len(reply), match=reply == request,
                  sha256=hashlib.sha256(reply).hexdigest())
+        elif fields[0] == "fudp":
+            # One datagram from a fragmentation-enabled socket: the kernel
+            # source-fragments it when it exceeds the 1500-octet link.
+            size, salt, wait = int(fields[1]), int(fields[2]), float(fields[3])
+            if fudp is None:
+                fudp = socket.socket(family, socket.SOCK_DGRAM)
+                fragmenting(fudp, family)
+                fudp.bind((local, FRAGMENT_UDP_PORT))
+            request = pattern(size, salt)
+            assert fudp.sendto(request, (remote, port)) == size
+            fudp.settimeout(wait)
+            try:
+                reply, source = fudp.recvfrom(65536)
+            except socket.timeout:
+                emit(event="fudp", sent=size, salt=salt, reply=None)
+                continue
+            assert source[:2] == (remote, port), source
+            emit(event="fudp", sent=size, salt=salt, reply=len(reply), match=reply == request,
+                 sha256=hashlib.sha256(reply).hexdigest(), request_sha256=hashlib.sha256(request).hexdigest())
+        elif fields[0] == "sink":
+            # A receive-only socket for the harness datagram driver: the
+            # kernel reassembles fragmented datagrams before delivering them.
+            sink = socket.socket(family, socket.SOCK_DGRAM)
+            sink.bind((local, int(fields[1])))
+            emit(event="sinking", port=int(fields[1]))
+        elif fields[0] == "drain":
+            # Every complete datagram that arrives within WAIT seconds.
+            deadline, received = time.monotonic() + float(fields[1]), []
+            while (left := deadline - time.monotonic()) > 0:
+                sink.settimeout(left)
+                try:
+                    data, source = sink.recvfrom(65536)
+                except socket.timeout:
+                    break
+                received.append(dict(size=len(data), source=source[0], port=source[1],
+                                     sha256=hashlib.sha256(data).hexdigest()))
+            emit(event="drain", datagrams=received)
+        elif fields[0] == "ping":
+            emit(**ping(family, remote, int(fields[1]), int(fields[2]), float(fields[3])))
         elif fields[0] == "tcp":
             size, salt = int(fields[1]), int(fields[2])
             data = pattern(size, salt)

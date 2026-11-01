@@ -27,7 +27,10 @@ struct TxSlot {
     shared: ntcp_io::OwnedPacket,
 }
 struct RxSlot {
+    // A retained TCP segment is a complete datagram, never a fragment:
+    // its bytes and Host envelope (None in Host-less fixtures).
     bytes: Vec<u8>,
+    envelope: Option<ntcp_host::Envelope>,
     owner: Option<ConnectionId>,
     // A Host-dispatched ICMP report deferred for this exact owner generation.
     icmp: Option<ntcp_host::DeferredIcmp>,
@@ -41,6 +44,8 @@ pub(super) struct Egress {
     received: VecDeque<usize>,
     candidates: Vec<ConnectionId>,
     packet_capacity: usize,
+    // Largest retained input: a physical packet or a reassembled datagram.
+    rx_capacity: usize,
     cursor: usize,
     shared_segments: usize,
 }
@@ -53,7 +58,12 @@ impl Egress {
     pub(super) fn shared_enabled(&self) -> bool {
         self.shared_segments != 0
     }
-    fn new(capacity: usize, packet_capacity: usize, connections: usize) -> Result<Self> {
+    fn new(
+        capacity: usize,
+        packet_capacity: usize,
+        rx_capacity: usize,
+        connections: usize,
+    ) -> Result<Self> {
         let retained = capacity.checked_mul(packet_capacity).ok_or(EINVAL)?;
         let scheduler = Scheduler::new(
             1,
@@ -84,7 +94,8 @@ impl Egress {
                 shared: ntcp_io::OwnedPacket::default(),
             });
             rx.push(RxSlot {
-                bytes: buffer(packet_capacity)?,
+                bytes: buffer(rx_capacity)?,
+                envelope: None,
                 owner: None,
                 icmp: None,
                 stamps: ntcp::RxPacketTimestamps::default(),
@@ -98,6 +109,7 @@ impl Egress {
             received,
             candidates,
             packet_capacity,
+            rx_capacity,
             cursor: 0,
             shared_segments: 0,
         })
@@ -209,7 +221,15 @@ impl Owner {
                 .enable_output_reservations_with_capacity(capacity),
         }
         .map_err(engine)?;
-        let mut egress = Egress::new(capacity, packet_capacity, self.defaults.max_connections)?;
+        // Retention holds a completed datagram, up to the Host's
+        // reassembly capacity (attached before egress is enabled).
+        let rx_capacity = packet_capacity.max(self.completed.len());
+        let mut egress = Egress::new(
+            capacity,
+            packet_capacity,
+            rx_capacity,
+            self.defaults.max_connections,
+        )?;
         if let Some(caps) = self
             .ethernet
             .as_ref()
@@ -316,18 +336,68 @@ impl Owner {
         self.egress = Some(egress);
         result
     }
-    // IP_PMTUDISC_DONT sends without DF; the IPv4 codec always sets it.
-    pub(super) fn apply_pmtudisc_dont(&self, owner: Option<ConnectionId>, ip: &mut [u8]) {
-        if self.local.is_ipv4()
+    // IP_PMTUDISC_DONT, the application's request to send without DF (the
+    // user's disposition of RFC 4821's SHOULD set DF): the connection's
+    // ordinary IPv4 packets go without DF, which makes each one a
+    // non-atomic datagram (RFC 6864 section 4.1) whose Identification must
+    // not repeat for its (source, destination, TCP) tuple within the
+    // maximum datagram lifetime (RFC 6864 section 4.3). The IPv4 codec
+    // encodes atomic datagrams (DF, Identification 0), so the Identification
+    // is leased from the Host allocator when the packet is submitted, a
+    // fresh one for every physical attempt. PLPMTUD probes keep DF: a probe
+    // that a router fragmented would prove nothing (RFC 4821 section 1), so
+    // the attempt's discovery intent keeps the atomic encoding. TCP is never
+    // source-fragmented either way. Without a Host there is no allocator and
+    // the packet keeps DF rather than repeat an Identification.
+    pub(super) fn dont_identified(
+        &self,
+        owner: Option<ConnectionId>,
+        attempt: Option<ntcp::TransmitAttempt>,
+    ) -> bool {
+        self.local.is_ipv4()
+            && self.host.is_some()
             && owner
                 .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
                 .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
-        {
-            ip[6] = 0;
-            ip[10..12].fill(0);
-            let checksum = ntcp_ip_common::checksum(&ip[..20]);
-            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+            && attempt.is_none_or(|a| self.endpoint.transmit_discovery_intent(a).is_none())
+    }
+    // Clear DF on one encoded IPv4 header and give it a leased
+    // Identification. Backpressure (the RFC 6864 ceiling of 65536
+    // non-atomic datagrams per tuple per MDL, the quiet period after start,
+    // or entropy failure) leaves the packet unchanged and unsubmittable.
+    pub(super) fn lease_dont_identification(
+        &mut self,
+        now: u64,
+        ip: &mut [u8],
+    ) -> std::result::Result<(), ntcp_host::IdentifierBackpressure> {
+        let host = self
+            .host
+            .as_mut()
+            .ok_or(ntcp_host::IdentifierBackpressure::Unavailable { until: None })?;
+        let source = IpAddr::V4(Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]));
+        let destination = IpAddr::V4(Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]));
+        // Identification 0 is what every atomic datagram of this stack
+        // carries; a middlebox that clears DF turns those into non-atomic
+        // datagrams of the same tuple, so a leased 0 is passed over (it
+        // stays leased and is never sent).
+        let mut identification = 0;
+        for _ in 0..2 {
+            identification = host.lease_identification(now, source, destination, 6)? as u16;
+            if identification != 0 {
+                break;
+            }
         }
+        if identification == 0 {
+            return Err(ntcp_host::IdentifierBackpressure::Exhausted {
+                retry_at: now.saturating_add(1),
+            });
+        }
+        ip[4..6].copy_from_slice(&identification.to_be_bytes());
+        ip[6] = 0;
+        ip[10..12].fill(0);
+        let checksum = ntcp_ip_common::checksum(&ip[..usize::from(ip[0] & 0x0f) * 4]);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        Ok(())
     }
     // No TCP pacer here: core selected polling returns only currently eligible
     // packets. The scheduler's EDT is selection time, or a backend retry time.
@@ -437,8 +507,9 @@ impl Owner {
             tx.len - shared_len,
         )
         .map_err(|_| EIO)?;
-        self.apply_pmtudisc_dont(owner, &mut bytes[offset..]);
-        if shared_len == 0 {
+        // A packet identified at submission keeps its header open until then;
+        // its timestamp copy is taken from the submitted header.
+        if shared_len == 0 && !self.dont_identified(owner, Some(attempt)) {
             self.timestamp_packet(tx.tx_timestamp, &bytes[offset..offset + ip_len]);
         }
         bytes.truncate(offset + ip_len);
@@ -509,6 +580,8 @@ impl Owner {
                 // revalidates each physical packet regardless.
                 let _ = host.service_changes(&mut self.endpoint, now);
             }
+            // Echo Replies and errors the Host queued from input or expiry.
+            self.drain_icmp_output()?;
             egress.candidates.clear();
             egress.candidates.extend(self.endpoint.ready_connections());
             // Outstanding tickets are excluded from core readiness, but their
@@ -560,6 +633,47 @@ impl Owner {
                 };
                 let slot = &mut egress.tx[index];
                 let entry = slot.entry.as_mut().ok_or(EIO)?;
+                let offset = if self.ethernet.is_some() { 14 } else { 0 };
+                let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
+                if self.dont_identified(entry.owner, Some(entry.attempt)) {
+                    let header = &mut slot.bytes[offset..offset + entry.ip_len];
+                    match self.lease_dont_identification(now, header) {
+                        Ok(()) => {
+                            if shared_len == 0 {
+                                self.timestamp_packet(
+                                    entry.timestamp,
+                                    &slot.bytes[offset..offset + entry.ip_len],
+                                );
+                            }
+                        }
+                        Err(backpressure) => {
+                            // Certainly not submitted: the reservation is
+                            // held (bounded by the reservation timeout) and
+                            // retried once an identifier can be issued.
+                            entry.blocked = Some(ntcp_host::Error::Capacity);
+                            entry
+                                .deadline
+                                .get_or_insert(now.saturating_add(self.reservation_timeout_us));
+                            entry.not_before = match backpressure {
+                                ntcp_host::IdentifierBackpressure::Exhausted { retry_at }
+                                | ntcp_host::IdentifierBackpressure::Unavailable {
+                                    until: Some(retry_at),
+                                } => retry_at.max(now.saturating_add(1)),
+                                _ => now.saturating_add(1000),
+                            };
+                            egress
+                                .scheduler
+                                .resolve(
+                                    token,
+                                    Outcome::Retry {
+                                        not_before: entry.not_before,
+                                    },
+                                )
+                                .map_err(|_| EIO)?;
+                            continue;
+                        }
+                    }
+                }
                 let sources = entry
                     .timestamp
                     .map(|t| self.backend_sources(t))
@@ -574,8 +688,6 @@ impl Owner {
                         return Err(EIO);
                     }
                 }
-                let offset = if self.ethernet.is_some() { 14 } else { 0 };
-                let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
                 let ingress = self.ingress;
                 let mut link = Link {
                     ethernet: &mut self.ethernet,
@@ -875,9 +987,15 @@ impl Owner {
                     }
                 } else if self.ingress_owner(&slot.bytes) == Some(owner) {
                     // A retained generation never migrates to a tuple's new owner.
-                    self.input_ip_metadata(&slot.bytes, slot.stamps, slot.segment_size);
+                    match slot.envelope.and_then(|e| e.datagram(&slot.bytes)) {
+                        Some(datagram) => {
+                            self.input_datagram(datagram, slot.stamps, slot.segment_size)
+                        }
+                        None => self.input_ip_metadata(&slot.bytes, slot.stamps, slot.segment_size),
+                    }
                 }
                 slot.owner = None;
+                slot.envelope = None;
                 slot.bytes.clear();
             }
             for _ in 0..BUDGET {
@@ -885,49 +1003,168 @@ impl Owner {
                     // Full shared retention queue necessarily backpressures all RX.
                     break;
                 };
-                let (bytes, stamps, segment_size) = match self.receive_ip_packet(input)? {
-                    backend::BackendReceive::Packet {
-                        bytes,
-                        stamps,
-                        segment_size,
-                    } => (bytes, stamps, segment_size),
-                    backend::BackendReceive::Skipped => continue,
-                    backend::BackendReceive::Empty => break,
-                };
-                let retained = if let Some(owner) = self.ingress_owner(bytes)
-                    && self.endpoint.is_output_reserved(owner)
-                {
-                    Some((owner, None))
-                } else if self.host.is_some() && icmp(bytes) {
-                    // The single Host dispatcher classifies, correlates and
-                    // applies the report; one about a reserved owner comes
-                    // back unapplied, bound to that owner generation.
-                    self.input_icmp(bytes).map(|d| (d.owner(), Some(d)))
-                } else {
-                    self.input_ip_metadata(bytes, stamps, segment_size);
-                    None
-                };
-                if let Some((owner, deferred)) = retained {
-                    let slot = &mut egress.rx[index];
-                    if bytes.len() > egress.packet_capacity {
-                        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-                    }
-                    // A deferred report needs only its token; the slot still
-                    // bounds retention.
-                    if deferred.is_none() {
+                let (bytes, stamps, segment_size, link_multicast) =
+                    match self.receive_ip_packet(input)? {
+                        backend::BackendReceive::Packet {
+                            bytes,
+                            stamps,
+                            segment_size,
+                            link_multicast,
+                        } => (bytes, stamps, segment_size, link_multicast),
+                        backend::BackendReceive::Skipped => continue,
+                        backend::BackendReceive::Empty => break,
+                    };
+                if self.host.is_none() {
+                    // Explicit host-less Endpoint fixtures: the frame itself.
+                    if let Some(owner) = self.ingress_owner(bytes)
+                        && self.endpoint.is_output_reserved(owner)
+                    {
+                        let slot = &mut egress.rx[index];
+                        if bytes.len() > egress.rx_capacity {
+                            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                        }
                         slot.bytes.extend_from_slice(bytes);
+                        slot.owner = Some(owner);
+                        slot.stamps = stamps;
+                        slot.segment_size = segment_size;
+                        egress.received.push_back(index);
+                    } else {
+                        self.input_ip_metadata(bytes, stamps, segment_size);
                     }
-                    slot.owner = Some(owner);
-                    slot.icmp = deferred;
-                    slot.stamps = stamps;
-                    slot.segment_size = segment_size;
-                    egress.received.push_back(index);
+                    continue;
                 }
+                // Reassembly precedes classification: retention concerns a
+                // completed datagram (or its deferred ICMP token), never a
+                // fragment.
+                let mut completed = std::mem::take(&mut self.completed);
+                let outcome = (|| {
+                    let Some(datagram) =
+                        self.receive_datagram(bytes, link_multicast, &mut completed)
+                    else {
+                        return Ok(());
+                    };
+                    let retained = if let Some(owner) = self.ingress_owner(datagram.bytes())
+                        && self.endpoint.is_output_reserved(owner)
+                    {
+                        Some((owner, None))
+                    } else if icmp(datagram.bytes()) {
+                        // The single Host dispatcher classifies, correlates and
+                        // applies the report (or answers an Echo Request); one
+                        // about a reserved owner comes back unapplied, bound
+                        // to that owner generation.
+                        self.input_icmp(datagram).map(|d| (d.owner(), Some(d)))
+                    } else {
+                        self.input_datagram(datagram, stamps, segment_size);
+                        None
+                    };
+                    if let Some((owner, deferred)) = retained {
+                        let slot = &mut egress.rx[index];
+                        if datagram.bytes().len() > egress.rx_capacity {
+                            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                        }
+                        // A deferred report needs only its token; the slot still
+                        // bounds retention.
+                        if deferred.is_none() {
+                            slot.bytes.extend_from_slice(datagram.bytes());
+                            slot.envelope = Some(datagram.envelope());
+                        }
+                        slot.owner = Some(owner);
+                        slot.icmp = deferred;
+                        slot.stamps = stamps;
+                        slot.segment_size = segment_size;
+                        egress.received.push_back(index);
+                    }
+                    Ok(())
+                })();
+                self.completed = completed;
+                outcome?;
             }
             Ok(())
         })();
         self.egress = Some(egress);
         result
+    }
+}
+
+impl Owner {
+    /// Drain the Host's Echo Replies, reassembly errors and due Echo adjunct
+    /// probes (one unfragmented packet each): each message is
+    /// one unfragmented packet or, for a reply beyond the connectionless
+    /// effective size, its source fragments, each through the attached
+    /// port's one physical call, without a connection's packet mark. A
+    /// blocked or refusing backend before any packet left keeps the message
+    /// queued for the next pass; any other outcome consumes it (an ICMP
+    /// message carries no transport state to repair).
+    pub(super) fn drain_icmp_output(&mut self) -> Result<()> {
+        let now = self.now();
+        // Queued messages, or a due Echo adjunct probe.
+        if self
+            .host
+            .as_ref()
+            .is_none_or(|host| host.icmp_output_pending() == 0 && !host.adjunct_due(now))
+        {
+            return Ok(());
+        }
+        self.set_backend_mark(0)
+            .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        let ingress = self.ingress;
+        let local = self.local;
+        let Self {
+            host,
+            ethernet,
+            tun,
+            #[cfg(feature = "packet-test")]
+            packets,
+            icmp_packet,
+            icmp_wire,
+            ..
+        } = self;
+        let host = host.as_mut().ok_or(EIO)?;
+        for _ in 0..BUDGET {
+            let result = host.icmp_output(now, icmp_packet, |egress, packet| {
+                if ingress.is_none_or(|port| port.link() != egress.link)
+                    || egress.next_hop
+                        != ntcp_host::path::ResolvedNextHop::Forwarder(
+                            ntcp_host::path::ForwarderId(1),
+                        )
+                {
+                    return ntcp_host::BackendOutcome::NotSubmitted;
+                }
+                let result = if let Some(backend) = ethernet {
+                    let len = (14 + packet.len()).max(60);
+                    let Some(frame) = icmp_wire.get_mut(..len) else {
+                        return ntcp_host::BackendOutcome::NotSubmitted;
+                    };
+                    frame.fill(0);
+                    frame[..6].copy_from_slice(&backend.next_hop);
+                    frame[6..12].copy_from_slice(&backend.local);
+                    frame[12..14].copy_from_slice(&crate::ip::ether_type(local).to_be_bytes());
+                    frame[14..14 + packet.len()].copy_from_slice(packet);
+                    backend.transmit_frame(None, (false, false), frame)
+                } else {
+                    #[cfg(feature = "packet-test")]
+                    if let Some(packets) = packets {
+                        return backend_outcome(&packets.transmit(packet));
+                    }
+                    match tun {
+                        Some(tun) => tun.transmit(packet),
+                        None => return ntcp_host::BackendOutcome::NotSubmitted,
+                    }
+                };
+                backend_outcome(&result)
+            });
+            match result {
+                Ok(None)
+                | Ok(Some(
+                    ntcp_host::BackendOutcome::WouldBlock | ntcp_host::BackendOutcome::Rejected,
+                )) => break,
+                // Sent, possibly sent or consumed unsent (counted by the
+                // Host): a reply beyond the path budget that may not be
+                // fragmented, or one with no identifier available.
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
+        Ok(())
     }
 }
 

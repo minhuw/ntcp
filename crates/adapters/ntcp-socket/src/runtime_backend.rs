@@ -65,6 +65,9 @@ pub(super) enum BackendReceive<'a> {
         bytes: &'a [u8],
         stamps: ntcp::RxPacketTimestamps,
         segment_size: Option<core::num::NonZeroU16>,
+        // The Ethernet destination was a group (multicast or broadcast)
+        // address; the Host then originates no ICMP error about it.
+        link_multicast: bool,
     },
     // A transient backend error or a rejected Ethernet frame.
     Skipped,
@@ -119,11 +122,73 @@ pub(super) fn backend_config_family(
     Ok(config)
 }
 
+// Source fragmentation and identifiers for what this Host originates: Echo
+// Replies (and, IPv4 only, the Identification of every DF-clear packet of an
+// IP_PMTUDISC_DONT connection). TCP itself is never source-fragmented.
+fn native_datagrams(
+    ipv4: bool,
+    largest: usize,
+    connections: usize,
+) -> ntcp_host::DatagramLimits {
+    // Enough fragments for the largest reply the Host can reassemble a
+    // request for, cut to the smallest link each family must support (68
+    // and 1280 octets): a narrowed path never leaves such a reply unsent for
+    // want of fragments. Host ICMP output holds no ledger tickets.
+    let room = if ipv4 { 68 - 20 } else { 1280 - 48 };
+    let max_fragments = largest.div_ceil(room & !7);
+    // Every lease lives for the whole MDL. IPv4 tuples: one per remote of
+    // every connection (DONT) plus one receive batch of distinct Echo
+    // peers. IPv6 leases: one receive batch of fragmented replies per
+    // second, sustained over the MDL. Beyond them, a reply goes out whole
+    // when the path allows it and is otherwise counted unsent.
+    let lifetime = ntcp_host::DEFAULT_LIFETIME_SECONDS;
+    ntcp_host::DatagramLimits {
+        max_fragments,
+        identifiers: ntcp_host::IdentifierLimits {
+            lifetime_seconds: lifetime,
+            ipv4_tuples: if ipv4 { connections + BUDGET } else { 0 },
+            ipv6_leases: if ipv4 {
+                0
+            } else {
+                BUDGET * lifetime as usize
+            },
+        },
+        // The Echo adjunct confirms larger sizes for the paths of fragmented
+        // replies: one entry per receive batch of distinct Echo peers.
+        adjunct: ntcp_host::AdjunctLimits {
+            paths: BUDGET,
+            ..Default::default()
+        },
+        // No knowledge of any peer's reassembly capacity: the receiver
+        // guarantees of RFC 1122 and RFC 8200 hold.
+        ..Default::default()
+    }
+}
+
 impl Owner {
+    // What this Host can truthfully assert about earlier emission from its
+    // sources. Without the operator's `io.source_quiet` assertion an earlier
+    // process may have used the same addresses on a real link, so
+    // identifiers wait one full MDL after this Host starts (and DF-clear
+    // IP_PMTUDISC_DONT packets are held until then); with it, the
+    // allocator starts after the asserted quiet period (`QuietFor`).
+    fn identifier_continuity(&self) -> ntcp_host::Continuity {
+        self.source_quiet.continuity(self.now())
+    }
+
     // Complete the constructor using the actual configured one-port backend.
     // InterfaceKey is an embedding assignment within an independently minted
     // context; external ports need no fabricated kernel interface identity.
     pub(super) fn attach_backend_host(&mut self, interface: u64) -> Result<()> {
+        self.attach_backend_host_with(interface, None)
+    }
+    // A replacement Host for the same port and addresses receives the
+    // previous Host's identifier allocator, with every live lease.
+    pub(super) fn attach_backend_host_with(
+        &mut self,
+        interface: u64,
+        previous: Option<ntcp_host::IdentifierAllocator>,
+    ) -> Result<()> {
         if self.host.is_some() {
             return Err(EINVAL);
         }
@@ -167,12 +232,67 @@ impl Owner {
         // lane + one serialized live-class migration. No peer-created routes.
         let (paths, limits) =
             ntcp_host::managed_limits(&self.defaults, 1, 1, 1, 1, 1).map_err(host_error)?;
+        // Reassembly up to the largest packet this link delivers whole (at
+        // least each family's required minimum): the size TCP's receive
+        // limits derive from, so a segment some narrower path fragmented
+        // still arrives, as does an Echo Request of that size. One receive
+        // batch's worth of concurrent datagrams, the bytes of one largest
+        // datagram buffered at a time (an IPv6 first fragment also stores
+        // its Fragment header), and descriptors for it in 8-octet
+        // fragments, the worst conforming fragmentation. The IPv4 timeout
+        // is RFC 1122 section 3.3.2's lower bound.
+        let ipv4_datagram = max_ip_packet.clamp(576, 65535);
+        let ipv6_datagram = max_ip_packet.clamp(1500, 65575);
+        let reassembly = ntcp_host::ReassemblyLimits {
+            assemblies: BUDGET,
+            fragments: ipv6_datagram.div_ceil(8),
+            buffered_bytes: ipv6_datagram + 8,
+            ipv4_datagram,
+            ipv6_datagram,
+            ipv4_timeout_seconds: 60,
+        };
+        let largest = if self.local.is_ipv4() {
+            ipv4_datagram - 20
+        } else {
+            ipv6_datagram - 40
+        };
+        // Echo Replies and reassembly errors: one receive batch's worth of
+        // messages, each as large as a reassembled Echo Request (and never
+        // smaller than a maximal ICMPv6 error).
+        let (paths, mut limits) = ntcp_host::managed_icmp_output_limits(
+            paths,
+            limits,
+            ntcp_host::IcmpOutputLimits {
+                messages: BUDGET,
+                message_bytes: largest.max(ntcp_icmp::ICMPV6_ERROR_LIMIT),
+                hop_limit: self.defaults.hop_limit,
+            },
+        )
+        .map_err(host_error)?;
+        limits.reassembly = reassembly;
+        limits.datagrams = native_datagrams(
+            self.local.is_ipv4(),
+            largest,
+            self.defaults.max_connections,
+        );
+        let message_bytes = limits.icmp_output.message_bytes;
         let mut host = ntcp_host::Host::new(
             path::ContextId::new(u128::from_ne_bytes(identity)),
             paths,
             limits,
             self.endpoint.caller_timebase(),
         )
+        .map_err(host_error)?;
+        // Unpredictable identifiers draw on the same blocking kernel CSPRNG
+        // as ports and startup secrets; a failure is the Host's explicit
+        // backpressure, never a weaker source.
+        host.set_entropy(Box::new(|bytes: &mut [u8]| {
+            ports::fill(bytes).map_err(|_| ntcp_host::EntropyError)
+        }));
+        host.start_identifiers(match previous {
+            Some(allocator) => ntcp_host::Continuity::Transfer(allocator),
+            None => self.identifier_continuity(),
+        })
         .map_err(host_error)?;
         let forwarder = path::ForwarderId(1);
         let ingress = host
@@ -220,6 +340,23 @@ impl Owner {
         })
         .map_err(host_error)?;
         host.attach(&mut self.endpoint).map_err(host_error)?;
+        let capacity = host
+            .reassembly_capacity(self.local.is_ipv6())
+            .map_or(0, |c| c.emtu_r as usize);
+        let storage = |len: usize| -> Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+            bytes.resize(len, 0);
+            Ok(bytes)
+        };
+        self.completed = storage(capacity.max(max_ip_packet))?;
+        // A queued message is built whole in this buffer; a fragmented one
+        // keeps the complete message beside the fragment being cut, which is
+        // never larger than the connectionless effective size and so never
+        // larger than the link: the message, an IP header and the link MTU.
+        self.icmp_packet =
+            storage(message_bytes + crate::ip::header_len(self.local) + mtu as usize)?;
+        self.icmp_wire = storage(overhead + max_ip_packet.max(60))?;
         self.ingress = Some(ingress);
         self.host = Some(host);
         Ok(())
@@ -409,7 +546,8 @@ impl Owner {
                     bytes,
                     stamps,
                     segment_size,
-                } => self.input_ip_metadata(bytes, stamps, segment_size),
+                    link_multicast,
+                } => self.input_link(bytes, stamps, segment_size, link_multicast),
                 BackendReceive::Skipped => {}
                 BackendReceive::Empty => break,
             }
@@ -437,18 +575,20 @@ impl Owner {
             Err(error) => return Err(error),
         };
         let bytes = &input[..received.len];
-        let bytes = if self.ethernet.is_some() {
-            let Ok(frame) = ntcp_ethernet::parse_ethernet(bytes) else {
+        let (bytes, link_multicast) = if self.ethernet.is_some() {
+            let Ok(frame) = ntcp_ethernet::parse_ethernet_fragment(bytes) else {
                 return Ok(BackendReceive::Skipped);
             };
-            frame.payload
+            // IEEE 802 group bit: multicast, broadcast included.
+            (frame.payload, frame.destination[0] & 1 != 0)
         } else {
-            bytes
+            (bytes, false)
         };
         Ok(BackendReceive::Packet {
             bytes,
             stamps: core_stamps(received.timestamps),
             segment_size: received.tcp_segment_size,
+            link_multicast,
         })
     }
     //= https://www.rfc-editor.org/rfc/rfc1191#section-2
@@ -459,70 +599,127 @@ impl Owner {
     pub(super) fn input_ip(&mut self, bytes: &[u8], stamps: ntcp::RxPacketTimestamps) {
         self.input_ip_metadata(bytes, stamps, None);
     }
-    /// Managed ICMP: the single Host dispatcher validates the error, admits
-    /// it on this context, correlates its quote with the submission ledger and
-    /// applies TCP policy or datagram advice. A report about a reserved owner
-    /// returns unapplied; the caller retains the returned token and replays it
-    /// with `Host::replay_icmp` for that exact owner generation.
-    pub(super) fn input_icmp(&mut self, bytes: &[u8]) -> Option<ntcp_host::DeferredIcmp> {
+    /// Managed ICMP: the single Host dispatcher answers Echo Requests and
+    /// validates an error, admits it on this context, correlates its quote
+    /// with the submission ledger and applies TCP policy or datagram advice.
+    /// A report about a reserved owner returns unapplied; the caller retains
+    /// the returned token and replays it with `Host::replay_icmp` for that
+    /// exact owner generation.
+    pub(super) fn input_icmp(
+        &mut self,
+        datagram: ntcp_host::Datagram,
+    ) -> Option<ntcp_host::DeferredIcmp> {
         let now = self.now();
-        let ingress = self.ingress?;
         match self
             .host
             .as_mut()?
-            .input_icmp(&mut self.endpoint, ingress, now, bytes)
+            .input_icmp_datagram(&mut self.endpoint, now, datagram)
         {
             Ok(ntcp_host::IcmpDispatch::Deferred(deferred)) => Some(deferred),
             _ => None,
         }
     }
+    /// One received IP packet addressed to this link by unicast.
     pub(super) fn input_ip_metadata(
         &mut self,
         bytes: &[u8],
         stamps: ntcp::RxPacketTimestamps,
         segment_size: Option<core::num::NonZeroU16>,
     ) {
-        let p = if let Some(host) = &self.host {
-            let Some(ingress) = self.ingress else {
-                return;
-            };
-            let Ok(packet) = host.decode_ingress(ingress, bytes) else {
-                return;
-            };
-            if packet.protocol
-                == if packet.ip.destination.is_ipv4() {
-                    1
-                } else {
-                    58
-                }
-            {
-                // Without a retention queue a reserved owner's report is
-                // dropped unapplied, as the Endpoint entry used to refuse it.
-                let _ = self.input_icmp(bytes);
-                return;
+        self.input_link(bytes, stamps, segment_size, false);
+    }
+    /// Physical input. With a Host it passes framing, local authority and
+    /// reassembly first; only a complete datagram is dispatched.
+    pub(super) fn input_link(
+        &mut self,
+        bytes: &[u8],
+        stamps: ntcp::RxPacketTimestamps,
+        segment_size: Option<core::num::NonZeroU16>,
+        link_multicast: bool,
+    ) {
+        if self.host.is_some() {
+            let mut completed = std::mem::take(&mut self.completed);
+            if let Some(datagram) = self.receive_datagram(bytes, link_multicast, &mut completed) {
+                self.input_datagram(datagram, stamps, segment_size);
             }
-            if segment_size.is_some()
-                && !host
-                    .receive_capabilities(ingress)
-                    .is_ok_and(|caps| caps.gro)
-            {
-                return;
-            }
-            crate::ip::Packet {
-                ip: packet.ip,
-                traffic_class: packet.traffic_class,
-                protocol: packet.protocol,
-                // Keep the native adapter's existing known-option policy;
-                // complete destination processing remains a separate feature.
-                ipv4_options: packet.options.unrecognized(),
-                payload: packet.payload,
-            }
-        } else {
-            let Ok(packet) = crate::ip::parse(bytes) else {
-                return;
-            };
-            packet
+            self.completed = completed;
+            return;
+        }
+        let Ok(packet) = crate::ip::parse(bytes) else {
+            return;
         };
+        self.input_packet(packet, bytes, stamps, segment_size);
+    }
+    /// The Host pipeline for one physical packet: a complete datagram (in
+    /// `out` when reassembled), or None for a fragment held or discarded
+    /// and for anything the Host refuses.
+    pub(super) fn receive_datagram<'a>(
+        &mut self,
+        bytes: &'a [u8],
+        link_multicast: bool,
+        out: &'a mut [u8],
+    ) -> Option<ntcp_host::Datagram<'a>> {
+        let now = self.now();
+        let ingress = self.ingress?;
+        match self
+            .host
+            .as_mut()?
+            .receive(ingress, now, bytes, link_multicast, out)
+        {
+            Ok(ntcp_host::Received::Datagram(datagram)) => Some(datagram),
+            _ => None,
+        }
+    }
+    /// Dispatch one complete datagram exactly like an unfragmented packet.
+    pub(super) fn input_datagram(
+        &mut self,
+        datagram: ntcp_host::Datagram,
+        stamps: ntcp::RxPacketTimestamps,
+        segment_size: Option<core::num::NonZeroU16>,
+    ) {
+        let (Some(host), Some(ingress)) = (&self.host, self.ingress) else {
+            return;
+        };
+        let Ok(packet) = host.decode_datagram(datagram) else {
+            return;
+        };
+        if packet.protocol
+            == if packet.ip.destination.is_ipv4() {
+                1
+            } else {
+                58
+            }
+        {
+            // Without a retention queue a reserved owner's report is
+            // dropped unapplied, as the Endpoint entry used to refuse it.
+            let _ = self.input_icmp(datagram);
+            return;
+        }
+        if segment_size.is_some()
+            && !host
+                .receive_capabilities(ingress)
+                .is_ok_and(|caps| caps.gro)
+        {
+            return;
+        }
+        let packet = crate::ip::Packet {
+            ip: packet.ip,
+            traffic_class: packet.traffic_class,
+            protocol: packet.protocol,
+            // Keep the native adapter's existing known-option policy;
+            // complete destination processing remains a separate feature.
+            ipv4_options: packet.options.unrecognized(),
+            payload: packet.payload,
+        };
+        self.input_packet(packet, datagram.bytes(), stamps, segment_size);
+    }
+    fn input_packet(
+        &mut self,
+        p: crate::ip::Packet,
+        bytes: &[u8],
+        stamps: ntcp::RxPacketTimestamps,
+        segment_size: Option<core::num::NonZeroU16>,
+    ) {
         if p.ip.destination != self.local {
             return;
         }

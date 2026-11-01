@@ -50,8 +50,69 @@ class IcmpScenario(unittest.TestCase):
     def test_cases_cover_both_families_both_quoted_transports_the_forged_control_fanout_and_staged_repair(self):
         self.assertEqual({(c["family"], c["scenario"]) for c in icmp.cases()},
                          {(f, s) for f in (4, 6) for s in ("udp-quoted", "tcp-quoted", "forged", "shared-fanout",
-                                                            "tcp-staged", "tcp-burst")})
+                                                            "tcp-staged", "tcp-burst", "fragment", "probe-mode",
+                                                            "fragment-ptb", "adjunct-silence")})
         self.assertFalse(any(c in run.matrix() for c in icmp.cases()))
+        self.assertEqual(len(icmp.cases()), 20)
+
+    def test_driven_cases_state_their_deployment_configuration(self):
+        self.assertEqual(set(icmp.DRIVER_SETTINGS), set(icmp.DRIVEN))
+        # fragment-ptb's first fragments exceed the 1280 egress with nothing learned.
+        self.assertGreater(icmp.fragment_packet(4, icmp.DRIVER_SETTINGS["fragment-ptb"]["initial"]), 1280)
+        self.assertGreater(icmp.fragment_packet(6, icmp.DRIVER_SETTINGS["fragment-ptb"]["initial"]), 1280)
+        # Only the silence case enables the adjunct.
+        self.assertEqual({s for s, c in icmp.DRIVER_SETTINGS.items() if c["adjunct"]}, {"adjunct-silence"})
+
+    def test_silence_counters_sum_the_owned_drop_rules(self):
+        listing = {"nftables": [{"metainfo": {}}, {"table": {"name": icmp.SILENCE_TABLE}}] + [
+            {"rule": {"expr": [{"match": {}}, {"counter": {"packets": n, "bytes": 0}}, {"drop": None}]}}
+            for n in (3, 0)]}
+        result = icmp.silence_counters(lambda args: __import__("json").dumps(listing))
+        self.assertEqual((result["dropped"], len(result["rules"])), (3, 2))
+
+    def fragments(self, family, datagram, data_per_fragment, order):
+        """Physical fragments of DATAGRAM (atomic IP packet) as captured events."""
+        hl = 20 if family == 4 else 40
+        body = datagram[hl:]
+        pieces = []
+        for offset in range(0, len(body), data_per_fragment):
+            chunk, more = body[offset:offset + data_per_fragment], offset + data_per_fragment < len(body)
+            if family == 4:
+                header = bytearray(datagram[:20])
+                struct.pack_into("!HHH", header, 2, 20 + len(chunk), 0x77, 0x4000 | (0x2000 if more else 0) | offset // 8)
+                header[10:12] = b"\0\0"
+                struct.pack_into("!H", header, 10, checksum(bytes(header)))
+                packet = bytes(header) + chunk
+            else:
+                header = bytearray(datagram[:40])
+                struct.pack_into("!H", header, 4, 8 + len(chunk))
+                header[6] = 44
+                packet = bytes(header) + struct.pack("!BBHI", datagram[6], 0, offset | more, 0x12345678) + chunk
+            event = icmp.parse(packet)
+            event.update(direction="from-ntcp", time_ns=offset, raw=packet)
+            pieces.append(event)
+        return [pieces[i] for i in order(len(pieces))]
+
+    def test_capture_reassembles_fragments_before_transport_parsing(self):
+        for family in (4, 6):
+            original = bytearray(self.original(family))
+            hl = 20 if family == 4 else 40
+            pseudo = (original[12:20] + bytes([0, 17]) + struct.pack("!H", len(original) - hl) if family == 4
+                      else original[8:40] + struct.pack("!I", len(original) - hl) + bytes([0, 0, 0, 17]))
+            original[hl + 6:hl + 8] = b"\0\0"
+            struct.pack_into("!H", original, hl + 6, checksum(bytes(pseudo + original[hl:])))
+            for order in (lambda n: range(n), lambda n: reversed(range(n))):
+                pieces = self.fragments(family, bytes(original), 600, order)
+                self.assertTrue(all(p["fragmented"] and "sport" not in p for p in pieces))
+                (datagram, fragments), = icmp.reassemble(pieces)
+                self.assertEqual(datagram["payload"], len(original) - hl - 8)
+                self.assertTrue(datagram["checksum_valid"] and datagram["dport"] == 18090, family)
+                self.assertEqual([f["offset"] for f in fragments], [0, 600, 1200])
+            # A missing fragment leaves nothing complete.
+            self.assertEqual(icmp.reassemble(self.fragments(family, bytes(original), 600, lambda n: range(1, n))), [])
+        self.assertEqual(icmp.fragment_packet(4, 1024), 1020)
+        self.assertEqual(icmp.fragment_packet(4, 1280), 1276)
+        self.assertEqual(icmp.fragment_packet(6, 1280), 1280)
 
     def original(self, family):
         payload = bytes(range(200)) * 8

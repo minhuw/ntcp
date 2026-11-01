@@ -19,7 +19,7 @@ In the limiting case, all ICMP PTB messages might be unconditionally ignored, an
 # 4821-019
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "PathService is the IP-layer path information cache shared by the Host's packetization protocols. TCP runs its own PLPMTUD, reads the cache through Host::service_changes budget application and updates it with correlated PTBs and with probe-confirmed sizes (a definitely submitted, unfragmented probe selected after the hold whose span the peer acknowledged, published through PathService::confirm_delivery). A correlated TCP report about the connection's current path at or above its proven delivery lowers the cache at once when lower and otherwise restarts its hold; one below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared until that exact report's quoted-data timeout applies it, when the larger of the Host estimate and the report's own policy-derived size is published; cumulative progress past the quoted data refutes it. The report's derived size never depends on the connection's estimate: a legacy IPv4 report without a Next-Hop MTU is corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate. Loss-inferred decreases stay connection-local. Host UDP flows read MMS_S and the payload limit (Host::udp_path_limits, Host::udp_path_change) and lower the cache only through correlated PTBs quoting their datagrams. Remaining: Host UDP has no datagram PLPMTUD, so no datagram protocol yet probes or writes probe-confirmed sizes. Owners: T13 adds the RFC 4821 section 9 datagram probe send mode (an application datagram larger than the current estimate, up to the first-hop link MTU, sent unfragmented with IPv4 DF); T12 adds probe-outcome reporting in which an ordinary flow's report changes only its own search state and a shared PathService write requires authority granted by the Host owner (4821-195)."
+reason = "PathService is the IP-layer path information cache shared by the Host's packetization protocols. TCP runs its own PLPMTUD, reads the cache through Host::service_changes budget application and updates it with correlated PTBs and with probe-confirmed sizes (a definitely submitted, unfragmented probe selected after the hold whose span the peer acknowledged, published through PathService::confirm_delivery). A correlated TCP report about the connection's current path at or above its proven delivery lowers the cache at once when lower and otherwise restarts its hold; one below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared until that exact report's quoted-data timeout applies it, when the larger of the Host estimate and the report's own policy-derived size is published; cumulative progress past the quoted data refutes it. The report's derived size never depends on the connection's estimate: a legacy IPv4 report without a Next-Hop MTU is corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate. Loss-inferred decreases stay connection-local. Host UDP flows read MMS_S and the payload limit (Host::udp_path_limits, Host::udp_path_change), and their source fragments are sized from the shared ordinary budget; they lower the cache only through correlated PTBs quoting their datagrams or fragments. The Host-owned ICMP Echo adjunct is a Host-trusted writer: the forward delivery an exact, timely Echo Reply certifies for a definitely submitted, unfragmented probe is offered to PathService::confirm_delivery under its revision, hold and first-hop rules (4821-183). T13's Probe mode (Host::udp_send_datagram with UdpSendMode::Probe) lets a datagram application send its own probes above the estimate up to the first-hop MTU, unfragmented with IPv4 DF, but a probe submission writes nothing shared, so applications still have no shared-cache writer. Remaining (T12): probe-outcome reporting (4821-160) in which an ordinary flow's report changes only its own search state and a shared PathService write requires authority granted by the Host owner (4821-195)."
 quote = '''
 Most of the difficulty in implementing PLPMTUD arises because it needs to be implemented in several different places within a single node. In general, each Packetization Protocol needs to have its own implementation of PLPMTUD. Furthermore, the natural mechanism to share Path MTU information between concurrent or subsequent connections is a path information cache in the IP layer. The various Packetization Protocols need to have the means to access and update the shared cache in the IP layer. This memo describes PLPMTUD in terms of its primary subsystems without fully describing how they are assembled into a complete implementation.
 '''
@@ -32,14 +32,6 @@ quote = '''
 All links MUST enforce their MTU: links that might non- deterministically deliver packets that are larger than their rated MTU MUST consistently discard such packets.
 '''
 
-# 4821-062
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence."
-quote = '''
-All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
-'''
-
 # 4821-069
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
@@ -48,19 +40,11 @@ quote = '''
 If PLPMTUD updates the MTU for a particular path, all Packetization Layer sessions that share the path representation (as described in Section 5.2) SHOULD be notified to make use of the new MTU and make the required congestion control adjustments.
 '''
 
-# 4821-070
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
-quote = '''
-All implementations MUST include mechanisms for applications to selectively transmit packets larger than the current effective Path MTU, but smaller than the first-hop link MTU. This is necessary to implement PLPMTUD using a connectionless protocol within an application and to implement diagnostic tools that do not rely on the operating system's implementation of Path MTU Discovery. See Section 9 for further discussion.
-'''
-
 
 # 4821-076
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
-reason = "Connection-local discovery is the selected flow model: each TCP connection performs its own PLPMTUD search. Sharing is selected for trusted network facts only: the PathService IP-layer cache (079) shares correlated PTB decreases (a TCP report below the connection's proven delivery only once that exact report's quoted-data timeout applies it, never through loss inference) and Host-certified, probe-confirmed TCP sizes among flows with a common path representation, and Host::service_changes notifies them, Host UDP flows included. A flow's own eff_pmtu search state (search bounds, probe and verification state, loss-inferred decreases) is not shared."
+reason = "Connection-local discovery is the selected flow model: each TCP connection performs its own PLPMTUD search. Sharing is selected for trusted network facts only: the PathService IP-layer cache (079) shares correlated PTB decreases (a TCP report below the connection's proven delivery only once that exact report's quoted-data timeout applies it, never through loss inference), Host-certified, probe-confirmed TCP sizes and the forward delivery the Host's ICMP Echo adjunct certifies (offered through PathService::confirm_delivery) among flows with a common path representation, and Host::service_changes notifies them, Host UDP flows included. A flow's own eff_pmtu search state (search bounds, probe and verification state, loss-inferred decreases) is not shared, and the adjunct keeps its confirmed lower bound per path apart from the shared ceilings."
 quote = '''
 This memo uses the concept of a "flow" to define the scope of the Path MTU Discovery algorithms. For many implementations, a flow would naturally correspond to an instance of each protocol (i.e., each connection or session). In such implementations, the algorithms described in this document are performed within each session for each protocol. The observed PMTU (eff_pmtu in Section 7.1) MAY be shared between different flows with a common path representation.
 '''
@@ -237,47 +221,23 @@ The response to a detected black hole depends on the current values for search_l
 # 4821-154
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
-reason = "Unselected IPv4 fragmentation strategy: ntcp-ip always sets DF and never provides network/source fragmentation. The NOT RECOMMENDED alternative is not used; this is not missing host fragmentation support."
+reason = "NOT RECOMMENDED strategy, not used by default: the IPv4 encoders set DF on every atomic datagram (encode_present) and on every source fragment (ntcp_ip::Fragmenter, used by the Host datagram emitter of 4821-155), so a datagram larger than the effective size is fragmented in the host and never left to network fragmentation. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion)."
 quote = '''
 IPv4 permitted such applications to send packets without the DF bit set. Oversized packets without the DF bit set would be fragmented in the network or sending host when they encountered a link with an MTU smaller than the packet. In some case, packets could be fragmented more than once if there were cascaded links with progressively smaller MTUs. This approach is NOT RECOMMENDED.
-'''
-
-# 4821-155
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
-reason = "Host IP fragmentation of application datagrams is outside TCP stream packetization; ntcp does not provide a UDP/raw datagram fragmentation service. DF and TCP budget requirements remain in scope."
-quote = '''
-It is RECOMMENDED that IPv4 implementations use a strategy that mimics IPv6 functionality. When an application sends datagrams that are larger than the effective Path MTU, they SHOULD be fragmented to the Path MTU in the host IP layer even if they are smaller than the MTU of the first link, directly attached to the host. The DF bit SHOULD be set on the fragments, so they will not be fragmented again in the network. This technique will minimize the likelihood that applications will rely on IPv4 fragmentation in a way that cannot be implemented in IPv6. At least one major operating system already uses this strategy. Section 9 describes some exceptions to this rule when the application is sending oversized packets for probing or diagnostic purposes.
 '''
 
 # 4821-156
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
-reason = "Host policy for other non-PLPMTUD protocols is outside this TCP-only packetization API. TCP PLPMTUD already uses the supplied lower-layer bound (112); no safe-MTU cap for unrelated protocols is required here."
+reason = "The second sentence is met: protocols implementing PLPMTUD may use the full range the lower layer supports. TCP PLPMTUD searches up to the supplied first-hop bound (4821-112), Host UDP Probe mode sends up to the first-hop link MTU (4821-158) and the Host's ICMP Echo adjunct searches up to min(first-hop MTU, largest fragmented datagram) (4821-183). The optional safe-MTU policy of the first sentence is declined: no fixed safe cap such as 1280 is imposed on protocols that do not implement PLPMTUD; their unfragmented datagrams use the shared ordinary budget, which correlated PTBs lower, and their source fragments use the conservative connectionless initial eff_pmtu (1024 IPv4, 1280 IPv6; 4821-186) until the adjunct confirms more."
 quote = '''
 Since protocols that do not implement PLPMTUD are still subject to problems due to ICMP black holes, it may be desirable to limit to these protocols to "safe" MTUs likely to work on any path (e.g., 1280 bytes). Allow any protocol implementing PLPMTUD to operate over the full range supported by the lower layer.
 '''
 
-# 4821-158
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
-quote = '''
-All implementations MUST include a mechanism where applications using connectionless protocols can send their own probes. This is necessary to implement PLPMTUD in an application protocol as described in Section 10.4 or to implement diagnostic tools for debugging problems with PMTUD. There MUST be a mechanism that permits an application to send datagrams that are larger than eff_pmtu, the operating systems estimate of the Path MTU, without being fragmented. If these are IPv4 packets, they MUST have the DF bit set.
-'''
-
-# 4821-159
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
-quote = '''
-At this time, most operating systems support two modes for sending datagrams: one that silently fragments packets that are too large, and another that rejects packets that are too large. Neither of these modes is suitable for implementing PLPMTUD in an application or diagnosing problems with Path MTU Discovery. A third mode is REQUIRED where the datagram is sent even if it is larger than the current estimate of the Path MTU.
-'''
-
 # 4821-160
-[[exception]]
+[[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+reason = "Remaining (T12): probe-outcome reporting. T13's Probe mode (Host::udp_send_datagram with UdpSendMode::Probe, 4821-158) supplies the send side: one unfragmented datagram above the estimate whose ProbeRecord (definite or uncertain submission, flow generation, path incarnation and revision, size, times) proves submission, not delivery, and writes no shared state. No API lets an application inform the Host of a probe's outcome (Section 7.6) or set search_low, search_high or eff_pmtu. T12 adds that reporting with flow-local effect: an ordinary flow's report changes only its own search state, and a write to the shared PathService cache requires authority granted by the Host owner (4821-195)."
 quote = '''
 Implementing PLPMTUD in an application also requires a mechanism where the application can inform the operating system about the outcome of the probe as described in Section 7.6, or directly update search_low, search_high, and eff_pmtu, described in Section 7.1.
 '''
@@ -314,26 +274,10 @@ quote = '''
 SCTP MAY also probe with a method similar to TCP's described above, using inline data. Using such a method has the advantage that successful probes have no additional overhead; however, failed probes will require retransmission of data, which may impact flow performance.
 '''
 
-# 4821-183
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.3"
-reason = "IP-fragmentation/connectionless adjunct-protocol PLPMTUD is outside TCP in-band packetization."
-quote = '''
-To support IP fragmentation as a Packetization Layer under an unmodified application, an implementation SHOULD rely on the Path MTU sharing described in Section 5.2 plus an adjunct protocol to probe the Path MTU. There are a number of protocols that might be used for the purpose, such as ICMP ECHO and ECHO REPLY, or "traceroute" style UDP datagrams that trigger ICMP messages. Use of ICMP ECHO and ECHO REPLY will probe both forward and return paths, so the sender will only be able to take advantage of the minimum of the two. Other methods that probe only the forward path are preferred if available.
-'''
-
-# 4821-186
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.3"
-reason = "IP-fragmentation/connectionless adjunct-protocol PLPMTUD is outside TCP in-band packetization."
-quote = '''
-Since connectionless protocols might not keep enough state to effectively diagnose MTU black holes, it would be more robust to err on the side of using too small of an initial MTU (e.g., 1 kByte or less) prior to probing a path to measure the MTU. For this reason, implementations that use IP fragmentation SHOULD use an initial eff_pmtu, which is selected as described in Section 7.2, except using a separate global control for the default initial eff_mtu for connectionless protocols.
-'''
-
 # 4821-187
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.3"
-reason = "IP-fragmentation/connectionless adjunct-protocol PLPMTUD is outside TCP in-band packetization."
+reason = "Illustrative scheme, not implemented as described: there is no immutable default-path entry, no datagram-count threshold and no timer-deleted per-destination entry. The implemented bounded alternative: the connectionless initial eff_pmtu (4821-186) is every path's default; the ICMP Echo adjunct keeps a per-path demand table (AdjunctLimits::paths entries, at most one outstanding probe each) in which the first source-fragmented datagram on a path creates the entry, with no datagram-count threshold, and the demand is retained until a search services it after the path's hold even without further sends; a full table replaces the least recently used entry without an outstanding probe (demand that finds every entry probing is dropped and counted), and an entry is discarded when its path incarnation stops being valid. Adjunct-confirmed lower bounds stay in that table, separate from PathService's shared learned ceilings, whose own bounded cache reuses a matching valid path, then a free slot, then reclaims an idle (unpinned) slot."
 quote = '''
 Connectionless protocols also introduce an additional problem with maintaining the path information cache: there are no events corresponding to connection establishment and tear-down to use to manage the cache itself. A natural approach would be to keep an immutable cache entry for the "default path", which has a eff_pmtu that is fixed at the initial value for connectionless protocols. The adjunct Path MTU Discovery protocol would be invoked once the number of fragmented datagrams to any particular destination reaches some configurable threshold (e.g., 5 datagrams). A new path cache entry would be created when the adjunct protocol updates eff_pmtu, and deleted on the basis of a timer or a Least Recently Used cache replacement algorithm.
 '''
@@ -341,7 +285,7 @@ Connectionless protocols also introduce an additional problem with maintaining t
 # 4821-188
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+reason = "Application-protocol responsibility: generating probes in the application's own protocol and determining whether they were lost belong to the application. The Host supplies what such an application needs from the stack: Host UDP flows (Host::udp_open, Host::udp_send_datagram) and the RFC 4821 section 9 send primitive, Probe mode, which sends one unfragmented datagram above the current estimate up to the first-hop MTU (DF on IPv4) with a record of its submission (4821-158). Reporting a probe's outcome to the Host is 4821-160 (T12)."
 quote = '''
 The disadvantages of relying on IP fragmentation and an adjunct protocol to perform Path MTU Discovery can be overcome by implementing Path MTU Discovery within the application itself, using the application's own protocol. The application must have some suitable method for generating probes and have an accurate and timely mechanism to determine whether the probes were lost.
 '''
@@ -349,7 +293,7 @@ The disadvantages of relying on IP fragmentation and an adjunct protocol to perf
 # 4821-189
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+reason = "Application-protocol design recommendation: an echo-plus-pad function is part of an application protocol's message format, which the Host does not define. Host UDP and Probe mode let such an application send a padded probe as one unfragmented datagram above the current estimate (4821-158) and measure each direction itself. The Host's own ICMP Echo adjunct (4821-183) is a Host-level prober, not an application echo-plus-pad protocol."
 quote = '''
 Ideally, the application protocol includes a lightweight echo function that confirms message delivery, plus a mechanism for padding the messages out to the desired probe size, such that the padding is not echoed. This combination (akin to the SCTP HB plus PAD) is RECOMMENDED because an application can separately measure the MTU of each direction on a path with asymmetrical MTUs.
 '''
@@ -357,7 +301,7 @@ Ideally, the application protocol includes a lightweight echo function that conf
 # 4821-190
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+reason = "Application-protocol alternatives (a variable-length echo, padding real messages, alternate segmentation, new message types) are choices of each application protocol. Host UDP carries them, and Probe mode is the primitive for sending any such probe above the current estimate, unfragmented, up to the first-hop MTU (4821-158)."
 quote = '''
 For protocols that cannot implement PLPMTUD with "echo plus pad", there are often alternate methods for generating probes. For example, the protocol may have a variable length echo that effectively measures minimum MTU of both the forward and return path's, or there may be a way to add padding to regular messages carrying real application data. There may also be alternate ways to segment application data to generate probes, or as a last resort, it may be feasible to extend the protocol with new message types specifically to support MTU discovery.
 '''
@@ -365,17 +309,9 @@ For protocols that cannot implement PLPMTUD with "echo plus pad", there are ofte
 # 4821-191
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+reason = "Advice to application protocol designers about adding ECHO and PAD message types; the Host defines no application message types. Host UDP carries such messages, and Probe mode sends a padded probe unfragmented above the current estimate (4821-158)."
 quote = '''
 Note that if it is necessary to add new message types to support PLPMTUD, the most general approach is to add ECHO and PAD messages, which permit the greatest possible latitude in how an application- specific implementation of PLPMTUD interacts with other applications and protocols on the same end system.
-'''
-
-# 4821-192
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
-reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
-quote = '''
-All application probing techniques require the ability to send messages that are larger than the current eff_pmtu described in Section 9.
 '''
 
 # 4821-194
@@ -389,7 +325,7 @@ Since PLPMTUD is designed for robust operation without any ICMP or other message
 # 4821-195
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-11"
-reason = "The condition is active, since the PathService IP-layer cache (079) is shared across protocols, and the rule is enforced: only the Host owner writes shared state. It accepts Host-correlated PTBs quoting a submission actually made on that path incarnation, TCP reports below the owner's proven delivery only after that exact report's quoted-data timeout applied it for the same live owner (never because of its loss-inferred estimate, which also never sizes the report: a legacy IPv4 report without a Next-Hop MTU is corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate; and with no hold restart before), and, through Host::service_changes, TCP probe confirmations: a probe span the peer acknowledged, backed by the Host's receipt of its definitely submitted, unfragmented transmission, rechecked against the live owner, path incarnation, negative revision, hold and first hop. Endpoint connections and UDP flows have no write path of their own (a UDP flow contributes only Host-correlated PTBs quoting its datagrams), so a packetization protocol without Host authority cannot write shared state."
+reason = "The condition is active, since the PathService IP-layer cache (079) is shared across protocols, and the rule is enforced: only the Host owner writes shared state. It accepts Host-correlated PTBs quoting a submission actually made on that path incarnation, TCP reports below the owner's proven delivery only after that exact report's quoted-data timeout applied it for the same live owner (never because of its loss-inferred estimate, which also never sizes the report: a legacy IPv4 report without a Next-Hop MTU is corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate; and with no hold restart before), through Host::service_changes, TCP probe confirmations: a probe span the peer acknowledged, backed by the Host's receipt of its definitely submitted, unfragmented transmission, rechecked against the live owner, path incarnation, negative revision, hold and first hop, and the Host-owned ICMP Echo adjunct's confirmations: an exact, timely Echo Reply to a definitely submitted, unfragmented probe, offered to PathService::confirm_delivery under the same revision, hold and first-hop rules. Endpoint connections and UDP flows have no write path of their own (a UDP flow contributes only Host-correlated PTBs quoting its datagrams, and its Probe-mode sends write nothing shared), so a packetization protocol without Host authority cannot write shared state."
 quote = '''
 Since packetization protocols may share state with each other, if one packetization protocol (particularly an application) were hostile to other protocols on the same host, it could harm performance in the other protocols by reducing the effective MTU. If a packetization protocol is untrusted, it should not be allowed to write to shared state.
 '''

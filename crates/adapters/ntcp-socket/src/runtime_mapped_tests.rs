@@ -260,12 +260,19 @@ fn mapped_options_keep_independent_ip_classes_and_pmtu_settings() {
         16
     );
     a.execute(client, Op::Write(vec![3; 100])).unwrap();
+    // A DF-clear IPv4 packet needs a leased Identification; none is issued
+    // until one maximum datagram lifetime after this Host started, because
+    // an earlier process may have emitted from the same address.
+    a.service_egress().unwrap();
+    assert!(sa.lock().unwrap().sent.is_empty());
+    a.test_now = Some(121_000_000);
     a.service_egress().unwrap();
     let frame = sa.lock().unwrap().sent.pop_front().unwrap();
     let ip = ntcp_ip::parse(&frame[14..], false).unwrap();
     assert_eq!(ip.traffic_class >> 2, 4);
     assert_eq!(ip.traffic_class & 3, 2);
     assert_eq!(u16::from_be_bytes([frame[20], frame[21]]) & 0x4000, 0);
+    assert_ne!(u16::from_be_bytes([frame[18], frame[19]]), 0);
     b.input_ip_metadata(&frame[14..], Default::default(), None);
     exchange4(&mut a, &mut b, &sa, &sb);
     assert_eq!(

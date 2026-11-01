@@ -57,7 +57,8 @@ const IP_HEADER: usize = IPV4_HEADER;
 //= https://www.rfc-editor.org/rfc/rfc6864#section-4.1
 //# All devices that examine IPv4 headers MUST ignore the IPv4 ID field of
 //# atomic datagrams.
-// Selected endpoint codec only: options are exposed in Packet; no ID is exposed.
+// Atomic endpoint codec: options are exposed in Packet; no ID is exposed. Only
+// the structural fragment API below reports Identification, for reassembly.
 //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
 //= reason=Opaque TLVs now survive bounded parsing and real TCP handoff in core, codec, example and native input. Native and disabled example profiles still discard known RR/Timestamp metadata, and the ICMP feedback decoder does not expose option metadata to its consumer; complete all-option TCP/ICMP handoff needs those capability/interface contracts.
 //# All IP options (except NOP or END-OF-LIST) received in datagrams MUST be
@@ -114,6 +115,20 @@ fn v4(b: &[u8]) -> Ipv4Addr {
 //# A host MUST verify the IP header checksum on every received datagram and
 //# silently discard every datagram that has a bad checksum.
 pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
+    let (header, total, _) = bounds(b, false)?;
+    Ok((header, total))
+}
+
+/// `ipv4_bounds` for a packet that may be a fragment (MF or a nonzero
+/// offset): the validated header and total lengths with its fragmentation
+/// fields. Link framing uses it to delimit packets that reassembly accepts.
+pub fn ipv4_fragment_bounds(b: &[u8]) -> Result<(usize, usize, Fragmentation), Error> {
+    bounds(b, true)
+}
+
+// Shared header validation. The atomic entrypoints refuse every flag but DF
+// exactly as before; the fragment API admits MF and offsets.
+fn bounds(b: &[u8], fragments: bool) -> Result<(usize, usize, Fragmentation), Error> {
     if b.len() < 20 {
         return Err(Error::Truncated);
     }
@@ -128,14 +143,231 @@ pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
     if b.len() < header {
         return Err(Error::Truncated);
     }
-    if u16::from_be_bytes([b[6], b[7]]) & !0x4000 != 0 {
+    let flags = u16::from_be_bytes([b[6], b[7]]);
+    if !fragments && flags & !0x4000 != 0 {
         return Err(Error::FragmentationUnsupported);
+    }
+    // RFC 791 section 3.1: flag bit 0 is reserved and must be zero.
+    if flags & 0x8000 != 0 {
+        return Err(Error::Invalid);
     }
     if checksum(&b[..header]) != 0 {
         return Err(Error::Checksum);
     }
     // Destination packets and ICMP quotes may both have an expired TTL.
-    Ok((header, total))
+    Ok((
+        header,
+        total,
+        Fragmentation {
+            identification: u16::from_be_bytes([b[4], b[5]]),
+            dont_fragment: flags & 0x4000 != 0,
+            more_fragments: flags & 0x2000 != 0,
+            offset: (flags & 0x1fff) * 8,
+        },
+    ))
+}
+
+/// Fragmentation fields of one IPv4 header (RFC 791 section 3.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fragmentation {
+    /// Meaningful only for non-atomic datagrams (RFC 6864 section 4.1).
+    pub identification: u16,
+    pub dont_fragment: bool,
+    pub more_fragments: bool,
+    /// Position of this fragment's data in octets; the wire field counts
+    /// 8-octet units, so this is always a multiple of 8.
+    pub offset: u16,
+}
+
+impl Fragmentation {
+    /// No offset and no further fragments: the packet is a complete datagram
+    /// that bypasses reassembly whatever its DF bit.
+    pub fn is_complete(&self) -> bool {
+        !self.more_fragments && self.offset == 0
+    }
+}
+
+/// One received IPv4 datagram or fragment. `header` is the fragment's actual
+/// header including options: fragment zero's becomes the reassembled
+/// datagram's header (RFC 791 section 3.2, RFC 815) and is kept for quoting.
+/// `ipv4_options` are this fragment's options, structurally validated; later
+/// fragments carry only the copied subset.
+#[derive(Clone, Copy, Debug)]
+pub struct FragmentPacket<'a> {
+    pub ip: IpMetadata,
+    pub traffic_class: u8,
+    pub hop_limit: u8,
+    pub protocol: u8,
+    pub ipv4_options: Ipv4Options,
+    pub fragmentation: Fragmentation,
+    pub header: &'a [u8],
+    pub payload: &'a [u8],
+}
+
+/// Parse one complete IPv4 packet that may be a fragment. Validation equals
+/// `parse` except that MF and a nonzero offset are reported, not refused;
+/// alignment, overlap and reconstructed-size rules belong to reassembly,
+/// which sees every fragment of the datagram.
+pub fn parse_fragment(
+    bytes: &[u8],
+    source_routes_enabled: bool,
+) -> Result<FragmentPacket<'_>, Error> {
+    let (header, total, fragmentation) = bounds(bytes, true)?;
+    if total != bytes.len() {
+        return Err(Error::Length);
+    }
+    let options = Ipv4Options::parse(&bytes[20..header], source_routes_enabled)
+        .map_err(|_| Error::Options)?;
+    Ok(FragmentPacket {
+        ip: IpMetadata {
+            source: v4(&bytes[12..16]).into(),
+            destination: v4(&bytes[16..20]).into(),
+        },
+        traffic_class: bytes[1],
+        hop_limit: bytes[8],
+        protocol: bytes[9],
+        ipv4_options: options,
+        fragmentation,
+        header: &bytes[..header],
+        payload: &bytes[header..],
+    })
+}
+
+/// Source fragmentation of one complete IPv4 datagram (RFC 791 section 3.2).
+/// Built once from the datagram's header and encoded options: the first
+/// fragment carries every option, later fragments only the copied ones.
+/// Every fragment has DF set, so the network never fragments it again (RFC
+/// 4821 section 8 recommends host fragmentation mimicking IPv6), and all
+/// share the caller's Identification, which must be unique for the
+/// (source, destination, protocol) tuple within the maximum datagram lifetime
+/// (RFC 6864 section 4.3).
+#[derive(Clone, Copy, Debug)]
+pub struct Fragmenter {
+    first: [u8; 60],
+    first_len: u8,
+    later: [u8; 60],
+    later_len: u8,
+    data_len: u16,
+}
+
+impl Fragmenter {
+    /// `data_len` is the length of the complete datagram's data (transport
+    /// header and payload, whose checksum already covers all of it).
+    pub fn new(
+        header: Header,
+        protocol: u8,
+        identification: u16,
+        data_len: usize,
+        timestamp: u32,
+    ) -> Result<Self, Error> {
+        let Header {
+            ip,
+            hop_limit,
+            dscp,
+            ecn,
+            ipv4_options,
+        } = header;
+        let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
+            return Err(Error::Version);
+        };
+        if hop_limit == 0 || dscp > 63 || ecn > 3 {
+            return Err(Error::Invalid);
+        }
+        let mut options = [0; 40];
+        let (destination, option_len) = ipv4_options
+            .encode(source, destination, timestamp, &mut options)
+            .map_err(|_| Error::Options)?;
+        // The reassembled datagram's Total Length is at most 65535 octets.
+        if data_len > usize::from(u16::MAX) - IP_HEADER - option_len {
+            return Err(Error::Length);
+        }
+        let mut copied = [0; 40];
+        let copied_len = ntcp::copied_fragment_options(&options[..option_len], &mut copied)
+            .map_err(|_| Error::Options)?;
+        let template = |options: &[u8]| {
+            let mut h = [0; 60];
+            h[0] = 0x40 | ((IP_HEADER + options.len()) / 4) as u8;
+            h[1] = (dscp << 2) | ecn;
+            h[4..6].copy_from_slice(&identification.to_be_bytes());
+            h[8] = hop_limit;
+            h[9] = protocol;
+            h[12..16].copy_from_slice(&source.octets());
+            h[16..20].copy_from_slice(&destination.octets());
+            h[IP_HEADER..IP_HEADER + options.len()].copy_from_slice(options);
+            h
+        };
+        Ok(Self {
+            first: template(&options[..option_len]),
+            first_len: (IP_HEADER + option_len) as u8,
+            later: template(&copied[..copied_len]),
+            later_len: (IP_HEADER + copied_len) as u8,
+            data_len: data_len as u16,
+        })
+    }
+
+    /// Header length of the fragment whose data starts at `offset`.
+    pub fn header_len(&self, offset: usize) -> usize {
+        usize::from(if offset == 0 {
+            self.first_len
+        } else {
+            self.later_len
+        })
+    }
+
+    /// Data octets of the fragment starting at `offset` within packets of at
+    /// most `packet_limit` octets: all remaining data if it fits, otherwise
+    /// the largest multiple of 8, because every later fragment's offset
+    /// counts 8-octet units (RFC 791 section 3.2).
+    pub fn fragment_len(&self, offset: usize, packet_limit: usize) -> Result<usize, Error> {
+        let remaining = usize::from(self.data_len)
+            .checked_sub(offset)
+            .filter(|n| *n != 0 && offset.is_multiple_of(8))
+            .ok_or(Error::Invalid)?;
+        let room = packet_limit
+            .checked_sub(self.header_len(offset))
+            .ok_or(Error::Length)?;
+        if remaining <= room {
+            return Ok(remaining);
+        }
+        match room & !7 {
+            0 => Err(Error::Length),
+            len => Ok(len),
+        }
+    }
+
+    /// Write the fragment holding `data`, the complete datagram's data at
+    /// `offset`, into `packet`; returns the packet length. Header length,
+    /// Total Length, MF and the header checksum are computed per fragment.
+    /// A datagram that needs no fragmentation is not a fragment: encode it
+    /// with the atomic entrypoints instead.
+    pub fn encode(&self, packet: &mut [u8], offset: usize, data: &[u8]) -> Result<usize, Error> {
+        let end = offset.checked_add(data.len()).ok_or(Error::Length)?;
+        let total = usize::from(self.data_len);
+        let more = end < total;
+        if data.is_empty()
+            || end > total
+            || !offset.is_multiple_of(8)
+            || (more && !data.len().is_multiple_of(8))
+            || (offset == 0 && !more)
+        {
+            return Err(Error::Invalid);
+        }
+        let (template, header_len) = if offset == 0 {
+            (&self.first, usize::from(self.first_len))
+        } else {
+            (&self.later, usize::from(self.later_len))
+        };
+        let len = header_len + data.len();
+        let packet = packet.get_mut(..len).ok_or(Error::Length)?;
+        packet[..header_len].copy_from_slice(&template[..header_len]);
+        packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        let flags = 0x4000 | if more { 0x2000 } else { 0 } | (offset / 8) as u16;
+        packet[6..8].copy_from_slice(&flags.to_be_bytes());
+        let sum = checksum(&packet[..header_len]);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        packet[header_len..].copy_from_slice(data);
+        Ok(len)
+    }
 }
 //= https://www.rfc-editor.org/rfc/rfc1191#section-2
 //= reason=The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.
@@ -244,7 +476,7 @@ pub fn encode_shared_header(
 //# Originating sources MAY set the IPv4 ID field of atomic datagrams to any
 //# value.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
-//= reason=The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence.
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 fn encode_present(
     packet: &mut [u8],
@@ -316,7 +548,24 @@ fn encode_present(
 // Checked quoted header: returns metadata, header length, original packet
 // length, and protocol. Expired hop limits are valid in error quotes.
 pub fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
-    let (header, total) = ipv4_bounds(b)?;
+    let (ip, header, total, protocol, _) = quote(b, false)?;
+    Ok((ip, header, total, protocol))
+}
+
+/// `quote_header` for a quoted datagram that may be a fragment; also returns
+/// its fragmentation fields. Later fragments carry the copied source route,
+/// so the final destination is recovered the same way.
+pub fn quote_fragment_header(
+    b: &[u8],
+) -> Result<(IpMetadata, usize, usize, u8, Fragmentation), Error> {
+    quote(b, true)
+}
+
+fn quote(
+    b: &[u8],
+    fragments: bool,
+) -> Result<(IpMetadata, usize, usize, u8, Fragmentation), Error> {
+    let (header, total, fragmentation) = bounds(b, fragments)?;
     let mut destination = v4(&b[16..20]);
     // Quotes can catch source-routed datagrams before their final hop. Core
     // options parse intentionally rejects unfinished routes, so validate a
@@ -361,5 +610,6 @@ pub fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
         header,
         total,
         b[9],
+        fragmentation,
     ))
 }

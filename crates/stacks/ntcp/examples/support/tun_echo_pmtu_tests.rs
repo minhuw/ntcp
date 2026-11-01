@@ -67,11 +67,29 @@ fn addresses(v6: bool) -> (SocketAddr, SocketAddr) {
     (a.parse().unwrap(), b.parse().unwrap())
 }
 
+// Whole replies only, the UDP echo's behavior before source fragmentation:
+// evidence that relies on whole replies or the refusal wording selects it.
+fn refuse_settings() -> DatagramSettings {
+    DatagramSettings {
+        udp_mode: UdpSendMode::Refuse,
+        ..DatagramSettings::default()
+    }
+}
+
 fn endpoint(local: IpAddr, timestamps: bool) -> (Endpoint, TunHost) {
     endpoint_with_options(local, timestamps, false)
 }
 
 fn endpoint_with_options(local: IpAddr, timestamps: bool, options: bool) -> (Endpoint, TunHost) {
+    endpoint_with_settings(local, timestamps, options, &DatagramSettings::default())
+}
+
+fn endpoint_with_settings(
+    local: IpAddr,
+    timestamps: bool,
+    options: bool,
+    settings: &DatagramSettings,
+) -> (Endpoint, TunHost) {
     let backend = Backend::default();
     let config = runtime_config(&backend, local, timestamps, true, options).unwrap();
     assert_eq!(backend.queries.get(), 1);
@@ -80,7 +98,7 @@ fn endpoint_with_options(local: IpAddr, timestamps: bool, options: bool) -> (End
         IpAddr::V6(ip) => Box::new(tun_v6_policy(ip)),
     };
     let mut endpoint = Endpoint::new(config.clone(), [7; 32], 0, policy).unwrap();
-    let network = TunHost::attach(&mut endpoint, &config, local).unwrap();
+    let network = TunHost::attach_with(&mut endpoint, &config, local, settings, 0).unwrap();
     (endpoint, network)
 }
 
@@ -457,7 +475,12 @@ fn runtime_source_quench_discards_without_touching_reserved_owner_or_clock() {
     seal_feedback(&mut report);
     assert_eq!(ntcp_icmp::decode_icmp(&report).unwrap().kind,
         ntcp_icmp::FeedbackKind::SourceQuench);
-    assert_eq!(p.ahost.owner(&p.a, &report), None);
+    let Ok(Received::Datagram(datagram)) =
+        p.ahost.host.receive(p.ahost.ingress, p.time, &report, false, &mut [])
+    else {
+        panic!("an unfragmented report is a complete datagram");
+    };
+    assert_eq!(p.ahost.owner(&p.a, datagram), None);
     let before = (p.a.transport_info(p.aid).unwrap(), p.a.path_mtu_info(p.aid).unwrap(),
         p.a.next_deadline(), p.a.send_progress(p.aid).unwrap());
     // A discarded message must not advance the caller's clock either.
@@ -645,7 +668,7 @@ fn runtime_active_passive_without_timestamps_still_discovers() {
 //# that implements PAWS MUST also implement Path MTU Discovery.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence.
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 #[test]
 fn runtime_ptb_repairs_and_receiver_ack_progress() {
@@ -712,7 +735,7 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
 //# that implements PAWS MUST also implement Path MTU Discovery.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=The real IPv4 encode/parse path in tun_echo asserts DF on SYN/SYNACK/ACK, timestamp-bearing data, smaller same-sequence repairs and ACK-confirmed larger PLPMTUD probes after black-hole fallback, with receiver byte progress and checksum validation. encode_present emits only atomic DF datagrams and ipv4_bounds rejects fragments. Host source fragmentation/reassembly, including DF on originated fragments, is unsupported; the whole host-fragmentation recommendation remains TODO for that capability dependency. The manual core wire_packet wrapper is not codec evidence.
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 #[test]
 fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {

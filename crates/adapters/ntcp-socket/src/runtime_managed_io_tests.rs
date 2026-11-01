@@ -1332,3 +1332,128 @@ fn managed_native_timestamp_fallback_and_msgsize_rejection_reuse_the_attempt_tic
         data.len()
     );
 }
+
+// IP_PMTUDISC_DONT through production egress: every ordinary IPv4 packet is
+// DF-clear with its own leased Identification, a PLPMTUD probe of the same
+// connection keeps DF, and identifier backpressure (the quiet period after
+// start, then the per-tuple MDL ceiling) holds the reservation unsubmitted
+// until an identifier can be issued.
+#[test]
+fn managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling() {
+    fn fields(frame: &[u8]) -> (bool, u16) {
+        let ip = &ntcp_ethernet::parse_ethernet(frame).unwrap().payload[..20];
+        (ip[6] & 0x40 != 0, u16::from_be_bytes([ip[4], ip[5]]))
+    }
+    let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);
+    let cid = connection(&a, client);
+    let (source, destination) = (a.local, b.local);
+    let lease = |a: &mut Owner| {
+        let now = a.now();
+        a.host
+            .as_mut()
+            .unwrap()
+            .lease_identification(now, source, destination, 6)
+    };
+    let at = |a: &mut Owner, b: &mut Owner, time: u64| {
+        a.test_now = Some(time);
+        b.test_now = Some(time);
+    };
+    a.execute(client, Op::Set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT))
+        .unwrap();
+    // Quiet period: nothing is offered to the backend.
+    a.execute(client, Op::Write(vec![1; 100])).unwrap();
+    tick(&mut a);
+    a.service_egress().unwrap();
+    assert!(wa.lock().unwrap().offered.is_empty());
+    assert_eq!(
+        a.egress.as_ref().unwrap().blocked(cid),
+        Some(ntcp_host::Error::Capacity)
+    );
+    let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = lease(&mut a)
+    else {
+        panic!("identifiers wait for the quiet period");
+    };
+    at(&mut a, &mut b, until);
+    complete(&mut a, &mut b, &wa, &wb, cid, 100);
+    assert_eq!(b.execute(server, Op::Read(400)).unwrap().bytes, vec![1; 100]);
+
+    // A probe above a learned 1100 estimate keeps DF; ordinary packets
+    // around it are DF-clear with distinct identifiers.
+    budget(&mut a, cid, 1100, false);
+    a.service_egress().unwrap();
+    let hold = a
+        .host
+        .as_ref()
+        .unwrap()
+        .binding(cid)
+        .unwrap()
+        .snapshot
+        .retry_not_before();
+    let resume = hold.max(a.now());
+    at(&mut a, &mut b, resume);
+    a.execute(client, Op::Write(vec![6; 4000])).unwrap();
+    complete(&mut a, &mut b, &wa, &wb, cid, 4100);
+    b.execute(server, Op::Read(BYTES)).unwrap();
+    a.execute(client, Op::Write(vec![7; 20000])).unwrap();
+    wa.lock().unwrap().block = true;
+    a.service_egress().unwrap();
+    let attempt = a.egress.as_ref().unwrap().attempt(cid);
+    a.endpoint
+        .transmit_discovery_intent(attempt)
+        .expect("actual native selected upward probe");
+    let probe = wa.lock().unwrap().offered.last().unwrap().clone();
+    assert!(ip_size(&probe) > 1100);
+    assert_eq!(fields(&probe), (true, 0), "the probe is atomic: DF, Identification 0");
+    wa.lock().unwrap().block = false;
+    tick(&mut a);
+    a.service_egress().unwrap();
+    assert_eq!(wa.lock().unwrap().sent.front(), Some(&probe));
+    transfer(&wa, &mut b, &wb);
+    b.service_egress().unwrap();
+    transfer(&wb, &mut a, &wa);
+    complete(&mut a, &mut b, &wa, &wb, cid, 24100);
+    assert_eq!(
+        b.execute(server, Op::Read(BYTES)).unwrap().bytes,
+        vec![7; 20000]
+    );
+    // Later probes of the same search are atomic too; everything else,
+    // including every packet within the 1100 estimate, is DF-clear with its
+    // own Identification.
+    let mut identifiers = std::collections::HashSet::new();
+    let mut ordinary = 0;
+    for frame in wa.lock().unwrap().offered.iter() {
+        let (df, identification) = fields(frame);
+        if df {
+            assert_eq!(identification, 0);
+            assert!(ip_size(frame) > 1100, "only probes above the estimate keep DF");
+            continue;
+        }
+        assert_ne!(identification, 0);
+        assert!(identifiers.insert(identification), "one Identification per datagram");
+        ordinary += 1;
+    }
+    assert!(ordinary > 3);
+
+    // The ceiling: every value of the tuple is leased within the MDL.
+    let retry_at = loop {
+        match lease(&mut a) {
+            Ok(_) => {}
+            Err(ntcp_host::IdentifierBackpressure::Exhausted { retry_at }) => break retry_at,
+            Err(other) => panic!("{other:?}"),
+        }
+    };
+    wa.lock().unwrap().offered.clear();
+    a.execute(client, Op::Write(vec![8; 100])).unwrap();
+    tick(&mut a);
+    a.service_egress().unwrap();
+    assert!(wa.lock().unwrap().offered.is_empty(), "never a reused Identification");
+    assert_eq!(
+        a.egress.as_ref().unwrap().blocked(cid),
+        Some(ntcp_host::Error::Capacity)
+    );
+    at(&mut a, &mut b, retry_at);
+    complete(&mut a, &mut b, &wa, &wb, cid, 24200);
+    assert_eq!(b.execute(server, Op::Read(400)).unwrap().bytes, vec![8; 100]);
+    let (df, identification) = fields(&wa.lock().unwrap().offered[0]);
+    assert!(!df && identification != 0);
+}

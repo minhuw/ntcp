@@ -15,9 +15,39 @@ use ledger::Ledger;
 pub use ledger::{LedgerLimits, Owner, feedback_horizon};
 // Ledger inspection for the tests of crates that submit through a Host.
 #[cfg(any(test, feature = "test-support"))]
-pub use ledger::{Correlation, Evidence, QuoteKey, QuotedSelector, Record, Selector};
+pub use ledger::{
+    Correlation, Evidence, FragmentPrefix, QuoteKey, QuotedSelector, Record, Selector,
+};
 #[cfg(not(any(test, feature = "test-support")))]
-use ledger::{Evidence, QuoteKey, QuotedSelector, Selector};
+use ledger::{Evidence, FragmentPrefix, QuoteKey, QuotedSelector, Selector};
+mod icmp_error;
+use icmp_error::ErrorLimiter;
+pub use icmp_error::IcmpErrorLimits;
+mod ingress;
+use ingress::IcmpOutput;
+pub use ingress::{
+    Datagram, EchoDisposition, Envelope, IcmpOutputCounters, IcmpOutputLimits, Received,
+    managed_icmp_output_limits,
+};
+mod reassembly;
+use reassembly::Reassembly;
+pub use reassembly::{DiscardCounters, ReassemblyCounters, ReassemblyLimits};
+mod emitter;
+pub use emitter::{
+    ConnectionlessSizing, DatagramError, DatagramLimits, DatagramReport, IPV4_PEER_REASSEMBLY,
+    IPV6_PEER_REASSEMBLY, ProbeRecord, UdpDatagramLimits, UdpSend, UdpSendMode,
+};
+mod adjunct;
+use adjunct::Adjunct;
+pub use adjunct::{
+    AdjunctCounters, AdjunctLimits, DEFAULT_RESTART_SECONDS, MIN_RESTART_SECONDS, ProbeOutcome,
+};
+mod ident;
+use ident::IdentifierAllocator as Allocator;
+pub use ident::{
+    Continuity, DEFAULT_LIFETIME_SECONDS, Entropy, EntropyError, IdentifierAllocator,
+    IdentifierBackpressure, IdentifierLimits,
+};
 mod udp;
 use path::{
     ContextId, Dscp, ForwarderId, InterfaceKey, LinkId, PathRequest, PathService, PathSnapshot,
@@ -64,8 +94,11 @@ impl From<ManagedError<Error>> for Error {
     }
 }
 
-/// Actual codec/input-buffer capabilities. Neither profile supplies fragment
-/// reassembly, IPv6 extension traversal, derived MMS_R, or a standard clock.
+/// Actual codec/input-buffer capabilities of one link: `max_ip_packet` bounds
+/// each physical packet, fragments included. Reassembly is configured per
+/// Host (`Limits::reassembly`) and states its own reconstructed capacity
+/// (`Host::reassembly_capacity`). Neither profile supplies IPv6 extension
+/// traversal beyond the Fragment header or a standard clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiveCapabilities {
     pub max_ip_packet: usize,
@@ -107,6 +140,33 @@ pub struct Limits {
     pub ledger: LedgerLimits,
     /// Datagram flows; none unless added by `managed_udp_limits`.
     pub udp: UdpLimits,
+    /// Fragment reassembly; disabled by default.
+    pub reassembly: ReassemblyLimits,
+    /// The rate limit shared by every ICMP error this Host originates.
+    pub icmp_errors: IcmpErrorLimits,
+    /// Queue for ICMP messages this Host originates; disabled by default.
+    pub icmp_output: IcmpOutputLimits,
+    /// Source fragmentation and identifier allocation; nothing is
+    /// fragmented by default.
+    pub datagrams: DatagramLimits,
+}
+
+/// Fragmented datagrams this Host context can receive, per family: what it
+/// reassembles under the worst conforming fragmentation, with every bound
+/// backed by storage allocated when the Host was created. The values hold
+/// for the lifetime of this Host (`context`); a replacement Host states its
+/// own. Receive-MSS policy built on them is not decided here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReassemblyCapacity {
+    pub context: ContextId,
+    /// RFC 1122 section 3.3.2 EMTU_R: the largest complete IP datagram,
+    /// header included, that can be reassembled.
+    pub emtu_r: u32,
+    /// The largest transport message, transport header included: RFC 1122
+    /// MMS_R = EMTU_R - 20 for IPv4, and EMTU_R - 40 (the fixed header) for
+    /// IPv6. RFC 1191's MSS paragraph subtracts 40 from the datagram size
+    /// for IPv4, that is MMS_R less TCP's 20-octet header.
+    pub mms_r: u32,
 }
 
 /// Storage rationale: all occupied transport generations, one provisional
@@ -173,6 +233,10 @@ pub fn managed_limits(
             output_leases,
             ledger,
             udp: UdpLimits::default(),
+            reassembly: ReassemblyLimits::default(),
+            icmp_errors: IcmpErrorLimits::default(),
+            icmp_output: IcmpOutputLimits::default(),
+            datagrams: DatagramLimits::default(),
         },
     ))
 }
@@ -311,6 +375,11 @@ pub enum IcmpOutcome {
         advice: Advice,
         published: Option<path::EstimateChange>,
     },
+    /// An Echo Request addressed to this Host, answered by its Echo service.
+    Echo(EchoDisposition),
+    /// An Echo Reply, or an ICMP error quoting an Echo Request, considered
+    /// by the Echo adjunct.
+    Probe(ProbeOutcome),
 }
 
 /// An ICMP error for a TCP owner whose output is reserved. Nothing was
@@ -413,6 +482,16 @@ pub struct Host {
     leases: Vec<Option<Lease>>,
     ledger: Ledger,
     udp: Udp,
+    reassembly: Reassembly,
+    errors: ErrorLimiter,
+    icmp_output: IcmpOutput,
+    // Destination of datagrams that `input_ip` reassembles: one datagram of
+    // the reassembly capacity, empty while reassembly is disabled.
+    completed: Vec<u8>,
+    datagram_limits: DatagramLimits,
+    identifiers: Allocator,
+    adjunct: Adjunct,
+    entropy: Option<Entropy>,
     // Latest caller time seen by a submission or collection; only used to
     // skip burying history that has already expired.
     now: Instant,
@@ -444,11 +523,17 @@ impl Host {
             .bindings
             .checked_add(limits.output_leases)
             .and_then(|n| n.checked_add(limits.udp.flows))
+            .and_then(|n| n.checked_add(usize::from(limits.icmp_output.messages != 0)))
             .ok_or(Error::Capacity)?
             > path_limits.clients
             || !matches!(timebase.units_per_second, 1_000_000 | 1_000_000_000)
             || !(1..=255_000_000).contains(&timebase.max_segment_lifetime_us)
         {
+            return Err(Error::Capacity);
+        }
+        limits.datagrams.validate()?;
+        // Probes leave through the ICMP output drain and its path client.
+        if limits.datagrams.adjunct.paths != 0 && limits.icmp_output.messages == 0 {
             return Err(Error::Capacity);
         }
         Ok(Self {
@@ -458,6 +543,21 @@ impl Host {
             leases: table(limits.output_leases, None)?,
             ledger: Ledger::new(limits.ledger)?,
             udp: Udp::new(limits.udp)?,
+            reassembly: Reassembly::new(limits.reassembly, timebase.units_per_second)?,
+            errors: ErrorLimiter::new(limits.icmp_errors, timebase.units_per_second),
+            icmp_output: IcmpOutput::new(limits.icmp_output)?,
+            completed: table(
+                [false, true]
+                    .into_iter()
+                    .filter_map(|ipv6| limits.reassembly.datagram_capacity(ipv6))
+                    .max()
+                    .unwrap_or(0),
+                0u8,
+            )?,
+            datagram_limits: limits.datagrams,
+            identifiers: Allocator::new(limits.datagrams.identifiers, timebase.units_per_second)?,
+            adjunct: Adjunct::new(limits.datagrams.adjunct, timebase.units_per_second)?,
+            entropy: None,
             now: 0,
             timebase,
             attached: false,
@@ -499,6 +599,84 @@ impl Host {
     }
     pub fn set_ipv4_plateaus(&mut self, plateaus: path::Ipv4Plateaus) -> Result<(), Error> {
         Ok(self.paths.set_ipv4_plateaus(plateaus)?)
+    }
+    /// None while reassembly is disabled.
+    pub fn reassembly_capacity(&self, ipv6: bool) -> Option<ReassemblyCapacity> {
+        let emtu_r = self.reassembly.limits().datagram_capacity(ipv6)? as u32;
+        Some(ReassemblyCapacity {
+            context: self.paths.context(),
+            emtu_r,
+            mms_r: emtu_r - if ipv6 { 40 } else { 20 },
+        })
+    }
+    pub fn reassembly_counters(&self) -> ReassemblyCounters {
+        self.reassembly.counters()
+    }
+    /// The earliest reassembly deadline, at which a `service_changes` pass
+    /// discards the expired datagram (and may queue its Time Exceeded) even
+    /// when nothing else arrives.
+    pub fn next_reassembly_deadline(&self) -> Option<Instant> {
+        self.reassembly.next_deadline()
+    }
+    /// Supply the cryptographically secure entropy the Host draws on for
+    /// unpredictable identifiers. Without it (or when it fails) whatever
+    /// needs it is refused with backpressure; there is no weaker fallback.
+    pub fn set_entropy(&mut self, entropy: Entropy) {
+        self.entropy = Some(entropy);
+    }
+    /// Start issuing identifiers for non-atomic datagrams. Nothing is issued
+    /// before this: the Host cannot know on its own whether an earlier
+    /// context emitted from its sources within the maximum datagram
+    /// lifetime. A transferred allocator must come from a started Host
+    /// (`take_identifiers`) with the same timebase units; its leases and any
+    /// remaining quiet period carry over. Instants are this Host's caller
+    /// timebase, which the transferring embedding must share.
+    pub fn start_identifiers(&mut self, continuity: Continuity) -> Result<(), Error> {
+        if self.identifiers.running() {
+            return Err(Error::InvalidContext);
+        }
+        match continuity {
+            Continuity::QuietSince(stopped) => self.identifiers.start_quiet(stopped),
+            Continuity::QuietFor { at, seconds } => self.identifiers.start_quiet_for(at, seconds),
+            Continuity::Transfer(allocator) => {
+                if !allocator.running()
+                    || allocator.units_per_second() != self.timebase.units_per_second
+                {
+                    return Err(Error::InvalidContext);
+                }
+                self.identifiers = allocator;
+                self.datagram_limits.identifiers = self.identifiers.limits();
+            }
+        }
+        Ok(())
+    }
+    /// Move this Host's allocator out for a successor context, with every
+    /// live lease. This Host issues no identifier afterwards.
+    pub fn take_identifiers(&mut self) -> Result<IdentifierAllocator, Error> {
+        let empty = Allocator::new(
+            IdentifierLimits {
+                ipv4_tuples: 0,
+                ipv6_leases: 0,
+                ..self.datagram_limits.identifiers
+            },
+            self.timebase.units_per_second,
+        )?;
+        Ok(core::mem::replace(&mut self.identifiers, empty))
+    }
+    /// Lease an Identification for one non-atomic datagram (a DF-clear IPv4
+    /// packet is one, RFC 6864 section 4.1) of `protocol` from `source` to
+    /// `destination`, physically submitted no later than `now`. The value is
+    /// unique for that tuple within the maximum datagram lifetime; when none
+    /// is available the caller must hold the packet and retry, never reuse.
+    pub fn lease_identification(
+        &mut self,
+        now: Instant,
+        source: IpAddr,
+        destination: IpAddr,
+        protocol: u8,
+    ) -> Result<u32, IdentifierBackpressure> {
+        self.identifiers
+            .issue(now, source, destination, protocol, self.entropy.as_mut())
     }
     pub fn binding_count(&self) -> usize {
         self.bindings.iter().flatten().count()
@@ -778,6 +956,8 @@ impl Host {
         now: Instant,
     ) -> Result<ServiceReport, Error> {
         self.collect(endpoint)?;
+        self.expire_reassembly(now);
+        self.service_adjunct(now);
         let mut report = ServiceReport::default();
         for index in 0..self.bindings.len() {
             let Some(owner) = self.bindings[index].and_then(|b| b.owner) else {
@@ -1054,8 +1234,18 @@ impl Host {
         context: IngressContext,
         frame: &'a [u8],
     ) -> Result<IngressPacket<'a>, Error> {
+        self.parse_ingress_limited(context, frame, None)
+    }
+    // One complete (never fragmented) datagram: an arriving packet within
+    // the link's physical limit, or a reassembled one within `reassembled`.
+    fn parse_ingress_limited<'a>(
+        &self,
+        context: IngressContext,
+        frame: &'a [u8],
+        reassembled: Option<usize>,
+    ) -> Result<IngressPacket<'a>, Error> {
         let capabilities = self.port(context.link)?.receive;
-        if frame.len() > capabilities.max_ip_packet {
+        if frame.len() > reassembled.unwrap_or(capabilities.max_ip_packet) {
             return Err(Error::Unsupported);
         }
         let packet = match frame.first().ok_or(ntcp_ip::Error::Truncated)? >> 4 {
@@ -1093,6 +1283,11 @@ impl Host {
         Ok(packet)
     }
 
+    /// One physical packet arriving by link-layer unicast: `receive`
+    /// (framing, local authority, reassembly) and then, for a complete
+    /// datagram, `input_datagram`; a fragment held for reassembly is
+    /// Processed, one it discarded Dropped.
+    ///
     /// Complete outer metadata is validated before dispatch. Quoted options
     /// remain historical data inside the ICMP decoder and are never recorded
     /// as present-day destination options. Timestamp recording, when requested,
@@ -1109,25 +1304,39 @@ impl Host {
         timestamp: Option<u32>,
     ) -> Result<ntcp::InputDisposition, Error> {
         self.check_endpoint(endpoint)?;
-        let packet = self.parse_ingress(context, frame)?;
-        if is_icmp(&packet) {
-            // One dispatcher for every embedding. A reserved owner keeps this
-            // entrypoint's established OutputReserved contract, with nothing
-            // applied or published; callers that retain frames use input_icmp.
-            return match self.input_icmp(endpoint, context, now, frame)? {
-                IcmpDispatch::Deferred(_) => Err(EndpointError::OutputReserved.into()),
-                IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::SourceQuench)) => {
-                    Ok(ntcp::InputDisposition::Dropped)
-                }
-                IcmpDispatch::Completed(_) => Ok(ntcp::InputDisposition::Processed),
-            };
-        }
+        // The completion buffer leaves the Host for the dispatch below, which
+        // never reassembles, and is always restored.
+        let mut completed = core::mem::take(&mut self.completed);
+        let result = match self.receive(context, now, frame, false, &mut completed) {
+            Ok(Received::Datagram(datagram)) => {
+                self.input_datagram(endpoint, now, datagram, metadata, outgoing_dscp, timestamp)
+            }
+            Ok(Received::Held) => Ok(ntcp::InputDisposition::Processed),
+            Ok(Received::Discarded) => Ok(ntcp::InputDisposition::Dropped),
+            Err(error) => Err(error),
+        };
+        self.completed = completed;
+        result
+    }
+
+    // UDP and TCP input of one validated complete datagram.
+    #[allow(clippy::too_many_arguments)]
+    fn input_transport(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        context: IngressContext,
+        packet: &IngressPacket,
+        metadata: RxPacketMetadata,
+        outgoing_dscp: u8,
+        timestamp: Option<u32>,
+    ) -> Result<ntcp::InputDisposition, Error> {
         self.owned_on_link(context, packet.ip.destination)?;
         if metadata.tcp_segment_size.is_some() && !self.port(context.link)?.receive.gro {
             return Err(Error::Unsupported);
         }
         if packet.protocol == ntcp_ip::PROTOCOL_UDP && metadata.tcp_segment_size.is_none() {
-            return Ok(self.input_udp(endpoint, &packet));
+            return Ok(self.input_udp(endpoint, packet));
         }
         if packet.protocol == 6 {
             // Bindings cover every Endpoint slot plus one provisional factory,
@@ -1166,7 +1375,9 @@ impl Host {
     /// any registered link of this context when its destination is an
     /// unscoped registered source, then correlated with the submission ledger
     /// (context, family, canonical source/final destination, complete header
-    /// and packet lengths, protocol and transport selector). Quoted TTL/hop
+    /// and packet lengths, protocol and transport selector; for a quoted
+    /// source fragment, its UDP header at offset zero or else its offset, MF
+    /// and every recorded leading data octet, never ports). Quoted TTL/hop
     /// limit, ECN, DSCP and IPv4 identification are not compared: routers may
     /// rewrite the first three, and an atomic datagram's identification
     /// carries no meaning (RFC 6864 section 4.1). Options were validated
@@ -1183,7 +1394,8 @@ impl Host {
     /// estimate is published only for its current-path Decreased or
     /// Unchanged disposition (never for Deferred). A reserved owner is returned as Deferred, carrying
     /// the normalized report, before anything is applied. Unmatched quotes are discarded; there is no fallback to the
-    /// connection-local sent ring.
+    /// connection-local sent ring. `frame` is one unfragmented packet; an
+    /// Echo Request is answered by the Echo service (`input_icmp_datagram`).
     pub fn input_icmp(
         &mut self,
         endpoint: &mut Endpoint,
@@ -1191,7 +1403,10 @@ impl Host {
         now: Instant,
         frame: &[u8],
     ) -> Result<IcmpDispatch, Error> {
-        self.dispatch_icmp(endpoint, context, now, frame)
+        let datagram = Envelope::physical(context, frame.len())
+            .datagram(frame)
+            .ok_or(Error::Obsolete)?;
+        self.input_icmp_datagram(endpoint, now, datagram)
     }
 
     /// Apply a deferred report to its owner generation, or defer it again
@@ -1226,19 +1441,15 @@ impl Host {
     fn dispatch_icmp(
         &mut self,
         endpoint: &mut Endpoint,
-        context: IngressContext,
         now: Instant,
-        frame: &[u8],
+        datagram: Datagram<'_>,
+        packet: &IngressPacket,
     ) -> Result<IcmpDispatch, Error> {
         use IcmpDispatch::Completed;
         use IcmpOutcome::Discarded;
-        self.check_endpoint(endpoint)?;
-        let packet = self.parse_ingress(context, frame)?;
-        if !is_icmp(&packet) {
-            return Err(Error::Unsupported);
-        }
+        let context = datagram.context();
         self.owned_in_context(context, packet.ip.destination)?;
-        let feedback = ntcp_icmp::decode_icmp_quote(frame)?;
+        let feedback = ntcp_icmp::decode_icmp_quote(datagram.bytes())?;
         // RFC 6633: after wire validation, before correlation, clock
         // advancement or any access to a possibly reserved owner.
         if feedback.kind == FeedbackKind::SourceQuench {
@@ -1252,28 +1463,61 @@ impl Host {
             header_len: quote.ip_header_len,
             packet_len: quote.ip_packet_len,
             protocol: quote.protocol,
-            transport: match quote.transport {
-                QuotedTransport::Tcp {
-                    source_port,
-                    destination_port,
-                    sequence,
-                } => QuotedSelector::Tcp {
-                    source_port,
-                    destination_port,
-                    sequence,
-                },
-                QuotedTransport::Udp {
+            transport: match (quote.fragment, quote.transport) {
+                // A quoted fragment of a datagram this Host source-fragmented
+                // (RFC 4821 section 8). Fragment zero of a UDP datagram is
+                // correlated by its UDP header, which is its leading data;
+                // every other fragment only by its exact physical evidence,
+                // never by ports and never by the IPv4 Identification (RFC
+                // 6864 section 4.1). The Host never originates TCP fragments
+                // or IPv6 atomic fragments (RFC 8021), so their quotes find no
+                // evidence and never reach TCP repair.
+                (
+                    Some(f),
+                    QuotedTransport::Udp {
+                        source_port,
+                        destination_port,
+                        length,
+                        checksum,
+                    },
+                ) if f.offset == 0 && f.more_fragments => QuotedSelector::UdpFirstFragment {
                     source_port,
                     destination_port,
                     length,
                     checksum,
-                } => QuotedSelector::Udp {
+                },
+                (Some(f), _) => QuotedSelector::Fragment {
+                    offset: f.offset,
+                    more: f.more_fragments,
+                    prefix: FragmentPrefix::new(f.data()),
+                },
+                (
+                    None,
+                    QuotedTransport::Tcp {
+                        source_port,
+                        destination_port,
+                        sequence,
+                    },
+                ) => QuotedSelector::Tcp {
+                    source_port,
+                    destination_port,
+                    sequence,
+                },
+                (
+                    None,
+                    QuotedTransport::Udp {
+                        source_port,
+                        destination_port,
+                        length,
+                        checksum,
+                    },
+                ) => QuotedSelector::Udp {
                     source_port,
                     destination_port,
                     length,
                     checksum,
                 },
-                QuotedTransport::Other => QuotedSelector::Other,
+                (None, QuotedTransport::Other) => QuotedSelector::Other,
             },
         };
         let ptb = feedback.kind == FeedbackKind::PacketTooBig;
@@ -1304,6 +1548,11 @@ impl Host {
             correlation = correlation.either(corrected);
         }
         let Some(dropped) = dropped else {
+            // The Host's own Echo probes are not in the ledger: their
+            // identifier, sequence and exact length match the adjunct.
+            if let Some(outcome) = self.adjunct_error(now, datagram.bytes(), &feedback)? {
+                return Ok(Completed(IcmpOutcome::Probe(outcome)));
+            }
             return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
         };
         let scoped = matches!(quote.ip.source, IpAddr::V6(v) if v.is_unicast_link_local());
@@ -1376,9 +1625,18 @@ impl Host {
                 _ => None,
             };
             // A datagram flow consumes its advice from a bounded queue, after
-            // any shared decrease is in place for its next send.
+            // any shared decrease is in place for its next send. A fragment's
+            // advice names its datagram's remote; `dropped_len` is the
+            // dropped fragment's own length.
             if let Selector::Udp {
                 destination_port, ..
+            }
+            | Selector::UdpFirstFragment {
+                destination_port, ..
+            }
+            | Selector::Fragment {
+                logical_ports: (_, destination_port),
+                ..
             } = evidence.transport
             {
                 let remote = core::net::SocketAddr::new(evidence.destination, destination_port);
@@ -1924,7 +2182,7 @@ impl Host {
                 // backend took; validate_egress checked them just above.
                 let receipt = ntcp::PhysicalReceipt {
                     ip_packet_len: (frame.len() + shared_payload_len) as u32,
-                    dont_fragment: frame[0] >> 4 != 4 || frame[6] & 0x40 != 0,
+                    dont_fragment: unfragmentable(frame),
                 };
                 let accepted = endpoint.accept_transmit_submitted(now, context.attempt, receipt);
                 assert!(matches!(accepted, Ok(true)), "preflighted acceptance");
@@ -1941,6 +2199,18 @@ impl Host {
                 Ok(Submission::PossiblySubmitted)
             }
         }
+    }
+}
+
+// Whether the network may not fragment this physical packet: IPv4 with DF
+// set, or IPv6 without a Fragment header (routers never fragment IPv6, RFC
+// 8200 section 5). An IPv6 fragment, or IPv4 without DF, is not a probe of
+// the path's packet size.
+fn unfragmentable(frame: &[u8]) -> bool {
+    match frame.first().map(|b| b >> 4) {
+        Some(4) => frame.get(6).is_some_and(|f| f & 0x40 != 0),
+        Some(6) => frame.get(6).is_some_and(|n| *n != 44),
+        _ => false,
     }
 }
 

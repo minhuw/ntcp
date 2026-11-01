@@ -284,8 +284,17 @@ fn inner_header_and_extension_rules_apply_to_every_protocol() {
             if v6 {
                 let mut bad = base.clone();
                 bad[6] = 44;
+                // The UDP header now reads as a Fragment header at offset 48
+                // with M set: a later fragment, whose data is never parsed
+                // as transport fields whatever its opaque Next Header.
+                let quoted = decode_icmp_quote(&ptb(true, &bad)).unwrap().quoted;
+                assert_eq!(quoted.ip_header_len, 48);
+                assert_eq!(quoted.transport, QuotedTransport::Other);
+                let fragment = quoted.fragment.unwrap();
+                assert_eq!((fragment.offset, fragment.more_fragments), (48, true));
+                assert_eq!(fragment.data(), &[0x5a; 8]);
                 assert_eq!(
-                    decode_icmp_quote(&ptb(true, &bad)).unwrap_err(),
+                    decode_icmp(&ptb(true, &bad)).unwrap_err(),
                     Error::FragmentationUnsupported
                 );
                 for next in [0, 43, 50, 51, 60, 135, 139, 140] {
@@ -303,10 +312,25 @@ fn inner_header_and_extension_rules_apply_to_every_protocol() {
                     Error::Checksum
                 );
                 let mut bad = base.clone();
-                bad[6] = 0x20; // MF: fragments are not supported
+                bad[6] = 0x20; // MF without DF: a quoted first fragment
                 seal(&mut bad);
+                let quoted = decode_icmp_quote(&ptb(false, &bad)).unwrap().quoted;
+                let fragment = quoted.fragment.unwrap();
                 assert_eq!(
-                    decode_icmp_quote(&ptb(false, &bad)).unwrap_err(),
+                    (fragment.offset, fragment.more_fragments),
+                    (0, true),
+                    "protocol={protocol}"
+                );
+                assert_eq!(
+                    fragment.identification,
+                    FragmentIdentification::Ipv4 {
+                        identification: 0,
+                        dont_fragment: false
+                    }
+                );
+                assert_eq!(quoted.tcp(), None);
+                assert_eq!(
+                    decode_icmp(&ptb(false, &bad)).unwrap_err(),
                     Error::FragmentationUnsupported
                 );
             }

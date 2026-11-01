@@ -505,7 +505,7 @@
       "section": "5.2",
       "quote": "This error message indicates that an intermediate node needed to fragment a datagram, but the DF (Don't Fragment) bit in the IP header was set. It is considered a \"soft error\" when TCP implements PMTUD, and a \"hard error\" if TCP does not implement PMTUD. Those TCP/IP stacks that do not implement PMTUD (or have disabled it) but support IP fragmentation/reassembly should not be sending their IP packets with the DF bit set, and thus should not be receiving these ICMP error messages. Some TCP/IP stacks that do not implement PMTUD and that do not support IP fragmentation/ reassembly are known to send their packets with the DF bit set, and thus could legitimately receive these ICMP error messages.",
       "status": "context",
-      "reason": "Historical description of fragmentation-needed error interpretation with/without PMTUD. This stack implements PMTUD and does not offer host IP fragmentation; the hard-to-soft mitigation is not specified by this paragraph."
+      "reason": "Historical description of fragmentation-needed error interpretation with/without PMTUD. This stack implements PMTUD for TCP, and its Host also source-fragments datagrams (Host UDP Fragment mode, Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies)) with DF on every IPv4 fragment, so neither described non-PMTUD category applies; the hard-to-soft mitigation is not specified by this paragraph."
     },
     {
       "id": "5927-069",

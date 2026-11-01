@@ -56,7 +56,7 @@ fn udp_echo_round_trip_both_families() {
         let (mut a, mut ahost) = endpoint(local.ip(), true);
         let (mut b, mut bhost) = endpoint(remote.ip(), true);
         let service = SocketAddr::new(local.ip(), 7);
-        let mut echo = UdpEcho::open(&mut ahost, &a, service, &config(local.ip())).unwrap();
+        let mut echo = UdpEcho::open(&mut ahost, &a, service, &config(local.ip()), &refuse_settings()).unwrap();
         // Admission shares the Endpoint's address policy and Host authority.
         assert_eq!(
             ahost.host.udp_open(&a, service, None, OPTIONS),
@@ -120,7 +120,8 @@ fn udp_quoted_router_ptb_reaches_echo_and_shrinks_tcp_on_the_same_path() {
     for v6 in [false, true] {
         let mut p = Pair::new(v6, true);
         let service = SocketAddr::new(p.local.ip(), p.local.port());
-        let mut echo = UdpEcho::open(&mut p.ahost, &p.a, service, &config(p.local.ip())).unwrap();
+        let mut echo = UdpEcho::open(&mut p.ahost, &p.a, service, &config(p.local.ip()), &refuse_settings())
+            .unwrap();
         let client = p.bhost.host.udp_open(&p.b, p.remote, Some(service), OPTIONS).unwrap();
         let header = ip_header(v6);
         let mut packet = [0; MTU];
@@ -196,7 +197,8 @@ fn udp_echo_sizes_replies_by_path_limits_and_reconsiders_held_reply_on_change() 
     for v6 in [false, true] {
         let mut p = Pair::new(v6, true);
         let service = SocketAddr::new(p.local.ip(), p.local.port());
-        let mut echo = UdpEcho::open(&mut p.ahost, &p.a, service, &config(p.local.ip())).unwrap();
+        let mut echo = UdpEcho::open(&mut p.ahost, &p.a, service, &config(p.local.ip()), &refuse_settings())
+            .unwrap();
         let client = p.bhost.host.udp_open(&p.b, p.remote, Some(service), OPTIONS).unwrap();
         let (header, mtu) = if v6 { (IPV6_HEADER, 1280) } else { (IP_HEADER, 1006) };
         let max_payload = mtu - header - 8;
@@ -238,7 +240,7 @@ fn udp_echo_sizes_replies_by_path_limits_and_reconsiders_held_reply_on_change() 
         assert_eq!(p.ahost.host.udp_path_change(echo.flow).unwrap(), None, "consumed once");
         // An oversize request is refused by the path query before encoding.
         echo.notes.clear();
-        echo.packet = [0xa5; MTU];
+        echo.packet.fill(0xa5);
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x43; 1400]);
         input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
         assert!(echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap());
@@ -344,7 +346,7 @@ fn udp_receive_queue_backpressure_and_checksum_validation() {
         let (mut a, mut ahost) = endpoint(local.ip(), true);
         let (mut b, mut bhost) = endpoint(remote.ip(), true);
         let service = SocketAddr::new(local.ip(), 7);
-        let mut echo = UdpEcho::open(&mut ahost, &a, service, &config(local.ip())).unwrap();
+        let mut echo = UdpEcho::open(&mut ahost, &a, service, &config(local.ip()), &refuse_settings()).unwrap();
         let client = bhost
             .host
             .udp_open(&b, SocketAddr::new(remote.ip(), 5000), Some(service), OPTIONS)

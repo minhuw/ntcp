@@ -79,7 +79,9 @@ fn evidence(
     transport: Selector,
 ) -> Evidence {
     let (destination, protocol) = match transport {
-        Selector::Udp { .. } => (v4(2), 17),
+        Selector::Udp { .. } | Selector::UdpFirstFragment { .. } | Selector::Fragment { .. } => {
+            (v4(2), 17)
+        }
         _ => (v4(2), 6),
     };
     Evidence {
@@ -124,6 +126,29 @@ fn key(e: &Evidence) -> QuoteKey {
                 destination_port,
                 length,
                 checksum,
+            },
+            Selector::UdpFirstFragment {
+                source_port,
+                destination_port,
+                length,
+                checksum,
+            } => QuotedSelector::UdpFirstFragment {
+                source_port,
+                destination_port,
+                length,
+                checksum,
+            },
+            // A router's quote of a later fragment: its position, MF and the
+            // leading data octets, never ports.
+            Selector::Fragment {
+                offset,
+                more,
+                prefix,
+                ..
+            } => QuotedSelector::Fragment {
+                offset,
+                more,
+                prefix,
             },
             Selector::Other => QuotedSelector::Other,
         },
@@ -339,17 +364,53 @@ fn exact(e: &Evidence, q: &QuoteKey) -> bool {
                 checksum: y,
             },
         ) => (a, b, l, x) == (c, d, m, y),
+        (
+            Selector::UdpFirstFragment {
+                source_port: a,
+                destination_port: b,
+                length: l,
+                checksum: x,
+            },
+            QuotedSelector::UdpFirstFragment {
+                source_port: c,
+                destination_port: d,
+                length: m,
+                checksum: y,
+            },
+        ) => (a, b, l, x) == (c, d, m, y),
+        // Portless: position, MF and every recorded data octet present in
+        // the quote; the flow's logical ports never take part.
+        (
+            Selector::Fragment {
+                offset: a,
+                more: b,
+                prefix: recorded,
+                ..
+            },
+            QuotedSelector::Fragment {
+                offset: c,
+                more: d,
+                prefix: quoted,
+            },
+        ) => {
+            (a, b) == (c, d)
+                && quoted.as_slice().len() >= recorded.as_slice().len()
+                && quoted.as_slice()[..recorded.as_slice().len()] == *recorded.as_slice()
+        }
         (Selector::Other, QuotedSelector::Other) => true,
         _ => false,
     }
 }
 
 fn mutate(rng: &mut Rng, q: &mut QuoteKey) {
-    match rng.below(7) {
+    match rng.below(8) {
         0 => q.packet_len = q.packet_len.wrapping_add(rng.pick(&[1, u32::MAX, 100, 8])),
         1 => q.header_len += 4,
         2 => {
             if let QuotedSelector::Udp {
+                checksum, length, ..
+            }
+            | QuotedSelector::UdpFirstFragment {
                 checksum, length, ..
             } = &mut q.transport
             {
@@ -362,10 +423,10 @@ fn mutate(rng: &mut Rng, q: &mut QuoteKey) {
             }
         }
         3 => match &mut q.transport {
-            QuotedSelector::Tcp { source_port, .. } | QuotedSelector::Udp { source_port, .. } => {
-                *source_port ^= 1
-            }
-            QuotedSelector::Other => {}
+            QuotedSelector::Tcp { source_port, .. }
+            | QuotedSelector::Udp { source_port, .. }
+            | QuotedSelector::UdpFirstFragment { source_port, .. } => *source_port ^= 1,
+            QuotedSelector::Fragment { .. } | QuotedSelector::Other => {}
         },
         4 => {
             if let QuotedSelector::Tcp { sequence, .. } = &mut q.transport {
@@ -373,7 +434,31 @@ fn mutate(rng: &mut Rng, q: &mut QuoteKey) {
             }
         }
         5 => q.destination = v4(rng.pick(&[2, 3, 4])),
-        _ => q.source = v4(9),
+        6 => q.source = v4(9),
+        // A later fragment's own evidence: another offset, the other MF, a
+        // changed data octet, or a quote missing a recorded octet.
+        _ => {
+            if let QuotedSelector::Fragment {
+                offset,
+                more,
+                prefix,
+            } = &mut q.transport
+            {
+                let mut data = prefix.as_slice().to_vec();
+                match rng.below(4) {
+                    0 => *offset = offset.wrapping_add(rng.pick(&[8, 1000])),
+                    1 => *more = !*more,
+                    2 => {
+                        let at = rng.below(data.len() as u64) as usize;
+                        data[at] ^= 0x40
+                    }
+                    _ => {
+                        data.pop();
+                    }
+                }
+                *prefix = FragmentPrefix::new(&data);
+            }
+        }
     }
 }
 
@@ -424,6 +509,15 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
     let (mut quotes, mut actions, mut lossy, mut denied) = (0, 0, 0, 0);
     let (mut discards, mut signatures, mut shadowed, mut expired, mut both_readings) =
         (0, 0, 0, 0, 0);
+    // Fragment coverage: sealed fragments, quotes of later fragments, their
+    // owner advice, path-only actions, cross-flow aliases, portless lossy
+    // hits, exact signatures and discard shadows, rejected near misses, and
+    // owner advice for quoted first fragments.
+    let mut fragments = 0;
+    let (mut fragment_quotes, mut fragment_owner, mut fragment_path_only, mut cross_flow) =
+        (0, 0, 0, 0);
+    let (mut portless_lossy, mut fragment_signatures, mut fragment_shadowed) = (0, 0, 0);
+    let (mut fragment_rejected, mut first_owner) = (0, 0);
     for seed in 1..=seeds {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         // Two exact signatures: datagram evictions overflow into summaries.
@@ -563,6 +657,49 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
                 if rng.below(8) == 0 {
                     udp[flow].1 ^= 1;
                 }
+                if rng.below(3) == 0 {
+                    // A source-fragmented datagram cut to 1000 data octets
+                    // (1020-octet packets): fragment zero under the flow's UDP
+                    // selector, later fragments portless with their leading
+                    // data octets (four for a 2004-octet datagram's last
+                    // one). Both flows send the same fills to the same
+                    // remotes, so their later fragments are byte-identical
+                    // cross-flow aliases. A transaction may stop after any
+                    // fragment; only the submitted prefix is sealed.
+                    let length = rng.pick(&[2004u16, 2400, 2408]);
+                    let fill = rng.pick(&[0u8, 1]);
+                    let checksum = rng.pick(&[1, 2]);
+                    let destination = v4(rng.pick(&[2, 3, 4, 5, 6, 7]));
+                    let sealed = 1 + rng.below(3) as usize;
+                    let pieces = [
+                        (0u16, 1000u32, true),
+                        (1000, 1000, true),
+                        (2000, u32::from(length) - 2000, false),
+                    ];
+                    for &(offset, len, more) in &pieces[..sealed] {
+                        let ports = (5000 + flow as u16, 7);
+                        let transport = if offset == 0 {
+                            Selector::UdpFirstFragment {
+                                source_port: ports.0,
+                                destination_port: ports.1,
+                                length,
+                                checksum,
+                            }
+                        } else {
+                            Selector::Fragment {
+                                offset,
+                                more,
+                                prefix: FragmentPrefix::new(&vec![fill; len as usize]),
+                                logical_ports: ports,
+                            }
+                        };
+                        let mut e = evidence(&f, owner, f.paths[udp[flow].1], 20 + len, transport);
+                        e.destination = destination;
+                        record(&mut ledger, &mut model, e);
+                        fragments += 1;
+                    }
+                    continue;
+                }
                 let length = rng.pick(&[100u16, 108]);
                 let mut e = evidence(
                     &f,
@@ -613,11 +750,32 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
                 }
                 let base = model.sent[rng.below(model.sent.len() as u64) as usize];
                 let mut q = key(&base.e);
-                if rng.below(2) == 0 {
+                let mutated = rng.below(2) == 0;
+                if mutated {
                     mutate(&mut rng, &mut q);
                 }
                 let c = ledger.correlate(now, &q);
                 let (hits, shadow) = ledger.evicted_hits(now, &q);
+                if let QuotedSelector::Fragment { .. } = q.transport {
+                    let mut owners: Vec<Owner> =
+                        model.matching(&q, now).iter().map(|s| s.e.owner).collect();
+                    owners.sort_by_key(|o| match o {
+                        Owner::Datagram { flow, generation } => (*flow, *generation),
+                        _ => (usize::MAX, 0),
+                    });
+                    owners.dedup();
+                    fragment_quotes += 1;
+                    cross_flow += usize::from(owners.len() > 1);
+                    fragment_owner += usize::from(c.owner.is_some());
+                    fragment_path_only += usize::from(c.path.is_some() && c.owner.is_none());
+                    portless_lossy += usize::from(c.summarized);
+                    fragment_signatures += usize::from(hits != 0);
+                    fragment_shadowed += usize::from(shadow);
+                    fragment_rejected += usize::from(mutated && c.matches == 0);
+                }
+                if let QuotedSelector::UdpFirstFragment { .. } = q.transport {
+                    first_owner += usize::from(c.owner.is_some());
+                }
                 signatures += usize::from(hits != 0);
                 shadowed += usize::from(shadow);
                 expired += usize::from(model.expired(&q, now));
@@ -659,6 +817,28 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
         ("exact signature hits", signatures),
         ("expired-match quotes", expired),
         ("either hits under both readings", both_readings),
+    ] {
+        assert!(count > 0, "no {name}");
+    }
+    std::println!(
+        "FRAGMENT_CORRELATION fragments_sealed={fragments} fragment_quotes={fragment_quotes} \
+         fragment_owner_advice={fragment_owner} fragment_path_only={fragment_path_only} \
+         cross_flow_aliases={cross_flow} portless_lossy_hits={portless_lossy} \
+         fragment_signature_hits={fragment_signatures} \
+         fragment_discard_shadowed={fragment_shadowed} \
+         fragment_near_misses_rejected={fragment_rejected} first_fragment_owner_advice={first_owner}"
+    );
+    for (name, count) in [
+        ("sealed fragments", fragments),
+        ("later-fragment quotes", fragment_quotes),
+        ("later-fragment owner advice", fragment_owner),
+        ("later-fragment path-only actions", fragment_path_only),
+        ("cross-flow fragment aliases", cross_flow),
+        ("portless lossy hits", portless_lossy),
+        ("portless exact signature hits", fragment_signatures),
+        ("portless discard shadows", fragment_shadowed),
+        ("rejected fragment near misses", fragment_rejected),
+        ("first-fragment owner advice", first_owner),
     ] {
         assert!(count > 0, "no {name}");
     }

@@ -363,6 +363,44 @@ fn address(bytes: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
+/// Option area of every IPv4 fragment after the first. RFC 791 section 3.2
+/// keeps all options in the first fragment and copies into later fragments
+/// only those whose type has the copied flag (0x80) set: both source routes
+/// are copied, Record Route and Timestamp are not. End stops the scan and NOP
+/// is not copied. `encoded` is a complete option area (an encoded outgoing set
+/// may still hold an unconsumed source route, so it is walked structurally,
+/// not through the endpoint parser). Returns the zero-padded length in `out`.
+pub fn copied_fragment_options(encoded: &[u8], out: &mut [u8]) -> Result<usize, Ipv4OptionsError> {
+    use Ipv4OptionsError::*;
+    if encoded.len() > 40 {
+        return Err(Capacity);
+    }
+    let mut copied = [0u8; 40];
+    let mut len = 0;
+    let mut offset = 0;
+    while offset < encoded.len() {
+        match encoded[offset] {
+            0 => break,
+            1 => offset += 1,
+            kind => {
+                let size = usize::from(*encoded.get(offset + 1).ok_or(Malformed)?);
+                if size < 2 || size > encoded.len() - offset {
+                    return Err(Malformed);
+                }
+                if kind & 0x80 != 0 {
+                    copied[len..len + size].copy_from_slice(&encoded[offset..offset + size]);
+                    len += size;
+                }
+                offset += size;
+            }
+        }
+    }
+    let padded = (len + 3) & !3;
+    let out = out.get_mut(..padded).ok_or(Capacity)?;
+    out.copy_from_slice(&copied[..padded]);
+    Ok(padded)
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
 //# A TCP implementation MAY support the Timestamp (MAY-10) and Record
 //# Route (MAY-11) Options.
@@ -967,6 +1005,56 @@ mod tests {
     //# The IP layer must not crash as the result of an option length that is
     //# outside the possible range. For example, erroneous option lengths
     //# have been observed to put some IP implementations into infinite loops.
+    #[test]
+    fn fragment_copy_projection_keeps_only_copied_options() {
+        // Every known kind together: LSRR (copied), RR and TS (not copied).
+        for strict in [false, true] {
+            let options = OutgoingIpv4Options {
+                source_route: Some(SourceRoute::new(&[ip(3), ip(4)], strict).unwrap()),
+                record_route_slots: Some(2),
+                timestamp: Some(TimestampRequest::Times(2)),
+            };
+            let mut encoded = [0; 40];
+            let (_, len) = options.encode(ip(1), ip(2), 7, &mut encoded).unwrap();
+            let mut out = [0xa5; 40];
+            let copied = copied_fragment_options(&encoded[..len], &mut out).unwrap();
+            // The 11-octet route pads to 12; RR and TS vanish.
+            assert_eq!(copied, 12);
+            assert_eq!(&out[..11], &encoded[..11]);
+            assert_eq!(out[0], if strict { 137 } else { 131 });
+            assert_eq!(out[11], 0);
+            assert_eq!(out[12..], [0xa5; 28]);
+        }
+        // RR and TS alone leave later fragments without options.
+        let options = OutgoingIpv4Options {
+            source_route: None,
+            record_route_slots: Some(3),
+            timestamp: Some(TimestampRequest::AddressTimes(1)),
+        };
+        let mut encoded = [0; 40];
+        let (_, len) = options.encode(ip(1), ip(2), 7, &mut encoded).unwrap();
+        assert_eq!(
+            copied_fragment_options(&encoded[..len], &mut []).unwrap(),
+            0
+        );
+        // Opaque kinds follow their copied flag; NOP is dropped, End stops.
+        let bytes = [1, 158, 4, 9, 9, 30, 3, 0, 1, 0, 148, 2];
+        let mut out = [0; 40];
+        let copied = copied_fragment_options(&bytes, &mut out).unwrap();
+        assert_eq!(&out[..copied], &[158, 4, 9, 9]);
+        // Malformed lengths, oversize areas and short outputs are refused.
+        for bytes in [&[7][..], &[131, 1], &[131, 9, 4, 0], &[1; 41]] {
+            assert!(
+                copied_fragment_options(bytes, &mut [0; 40]).is_err(),
+                "{bytes:?}"
+            );
+        }
+        assert_eq!(
+            copied_fragment_options(&[131, 7, 4, 192, 0, 2, 3, 0], &mut [0; 7]),
+            Err(Ipv4OptionsError::Capacity)
+        );
+    }
+
     #[test]
     fn combined_bounds_atomic_output_and_malformed_options() {
         let mut options = OutgoingIpv4Options {

@@ -1,8 +1,13 @@
 extern crate std;
+mod adjunct;
 mod admission;
 mod correlation;
 mod dispatch;
+mod emitter;
 mod fanout;
+mod fragment_icmp;
+mod ingress;
+mod reassembly;
 mod repair;
 mod source_routes;
 mod submission;

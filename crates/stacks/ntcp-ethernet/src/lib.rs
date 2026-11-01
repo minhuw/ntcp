@@ -12,10 +12,19 @@ pub struct Ethernet<'a> {
     pub payload: &'a [u8],
 }
 fn ethernet_payload(ether_type: u16, payload: &[u8]) -> Result<usize, Error> {
-    let _ = payload;
+    ip_payload(ether_type, payload, false)
+}
+// The IP packet's length; `fragments` also delimits IPv4 fragments and IPv6
+// packets carrying a Fragment header.
+fn ip_payload(ether_type: u16, payload: &[u8], fragments: bool) -> Result<usize, Error> {
+    let _ = (payload, fragments);
     match ether_type {
         #[cfg(feature = "ipv4")]
+        ETHERTYPE_IPV4 if fragments => Ok(ntcp_ip::ipv4_fragment_bounds(payload)?.1),
+        #[cfg(feature = "ipv4")]
         ETHERTYPE_IPV4 => Ok(ntcp_ip::ipv4_bounds(payload)?.1),
+        #[cfg(feature = "ipv6")]
+        ETHERTYPE_IPV6 if fragments => ntcp_ip6::ipv6_fragment_bounds(payload),
         #[cfg(feature = "ipv6")]
         ETHERTYPE_IPV6 => ntcp_ip6::ipv6_bounds(payload),
         0x8100 | 0x88a8 | 0x9100 => Err(Error::VlanUnsupported),
@@ -24,12 +33,20 @@ fn ethernet_payload(ether_type: u16, payload: &[u8]) -> Result<usize, Error> {
 }
 // Accept exact IP bounds or minimum-size Ethernet padding; caller strips FCS.
 pub fn parse_ethernet(bytes: &[u8]) -> Result<Ethernet<'_>, Error> {
+    frame(bytes, false)
+}
+/// `parse_ethernet` for a host that reassembles: the IP packet may also be
+/// a fragment, which the IP layer validates and reassembles.
+pub fn parse_ethernet_fragment(bytes: &[u8]) -> Result<Ethernet<'_>, Error> {
+    frame(bytes, true)
+}
+fn frame(bytes: &[u8], fragments: bool) -> Result<Ethernet<'_>, Error> {
     if bytes.len() < ETHERNET_HEADER {
         return Err(Error::Truncated);
     }
     let ether_type = u16::from_be_bytes([bytes[12], bytes[13]]);
     let payload = &bytes[14..];
-    let total = ethernet_payload(ether_type, payload)?;
+    let total = ip_payload(ether_type, payload, fragments)?;
     if payload.len() < total {
         return Err(Error::Truncated);
     }

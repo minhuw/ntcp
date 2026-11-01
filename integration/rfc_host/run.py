@@ -24,6 +24,8 @@ BINARY = ROOT / "workbench/network-target/debug/ntcp-rfc-host"
 TUN_ECHO = ROOT / "workbench/network-target/debug/examples/tun_echo"
 # Harness-only staged sender for the PTB attribution cases (same build).
 STAGED = ROOT / "workbench/network-target/debug/ptb_stage"
+# Harness-only datagram driver for the driven Host UDP cases (same build).
+DRIVER = ROOT / "workbench/network-target/debug/datagram_drive"
 
 
 def emit(tag, data):
@@ -198,7 +200,7 @@ def wire_proof(events, direction, expectation):
 
 
 def icmp_child(case, proof):
-    evidence = icmp.child(case, proof, TUN_ECHO, Peer, command, emit, staged_binary=STAGED)
+    evidence = icmp.child(case, proof, TUN_ECHO, Peer, command, emit, staged_binary=STAGED, driver_binary=DRIVER)
     emit("T9_ICMP_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
                               kernel_version=os.uname().version, evidence=evidence,
                               build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
@@ -406,6 +408,7 @@ def main():
                                   icmp_command=echo_build, icmp_cases=icmp_cases,
                                   tun_echo_sha256=hashlib.sha256(TUN_ECHO.read_bytes()).hexdigest(),
                                   ptb_stage_sha256=hashlib.sha256(STAGED.read_bytes()).hexdigest(),
+                                  datagram_drive_sha256=hashlib.sha256(DRIVER.read_bytes()).hexdigest(),
                                   kernel=os.uname().release, kernel_version=os.uname().version,
                                   rustc=command(["rustc", "--version"]).strip(), packet_test=False,
                                   applicability=dict(partial_syn="Native server 128-byte receive admission, then public SO_RCVBUF growth after prefix read",
@@ -463,7 +466,7 @@ def main():
             for fd in fds:
                 os.close(fd)
     assert completed == len(cases) and stream_count > 0 and refusal_count == 12
-    assert icmp_completed == len(icmp_cases) == 12
+    assert icmp_completed == len(icmp_cases) == 20
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
                                     icmp_cases=icmp_completed,
                                     namespaces=namespace_ids, kernel=os.uname().release,

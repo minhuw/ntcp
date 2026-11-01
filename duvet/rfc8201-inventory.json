@@ -463,7 +463,7 @@
       "section": "5.1",
       "quote": "MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see \"Fragment Header\", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.",
       "status": "TODO",
-      "reason": "T7 PathService checks complete caller-provided IPv6 header budgets; T8 Host applies actual base-header budgets in native/TUN factories and reserved submission. Complete extension parsing/encoding remains T17, fragmentation/reassembly-aware EMTU_S remains T13/T16 and datagram integration remains T10. Source fragmentation is conditional in the preserved whole quote.",
+      "reason": "T7 PathService checks complete caller-provided IPv6 header budgets; T8 Host applies actual base-header budgets in native/TUN factories and reserved submission, and T10 Host UDP flows read MMS_S. T13 supplies source fragmentation and reassembly: Host::udp_send_datagram's Fragment mode bounds a datagram by the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and creates fragments each limited by the connectionless effective size (never above the PMTU); Refuse mode and TCP keep EMTU_S at the PMTU (TCP never source-fragments); Host::reassembly_capacity states this Host's own EMTU_R and MMS_R. Remaining: T17 owns complete IPv6 extension-header parsing and encoding, so MMS_S subtracts extension headers beyond the Fragment header, and T16 owns the receive-side indication by which this Host's upper layer states its capacity (the receive MSS derived from EMTU_R/MMS_R, whose TCP payload unit differs from both). Source fragmentation is conditional in the preserved whole quote.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
     },
     {
@@ -555,7 +555,7 @@
       "section": "5.2",
       "quote": "Note: if the original packet contained a Routing header, the Routing header should be used to determine the location of the destination address within the original packet. If Segments Left is equal to zero, the destination address is in the Destination Address field in the IPv6 header. If Segments Left is greater than zero, the destination address is the last address (Address[n]) in the Routing header.",
       "status": "TODO",
-      "reason": "The IPv6 quote decoder rejects extension headers and does not locate the final destination through a Routing Header/Segments Left. This is a concrete unsupported-header gap, not generic cache fanout.",
+      "reason": "The IPv6 quote decoder accepts no extension header other than a Fragment header directly after the base header and does not locate the final destination through a Routing Header/Segments Left. This is a concrete unsupported-header gap, not generic cache fanout.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -737,7 +737,7 @@
       "section": "5.5",
       "quote": "Some transport protocols are not allowed to repacketize when doing a retransmission. That is, once an attempt is made to transmit a segment of a certain size, the transport cannot split the contents of the segment into smaller segments for retransmission. In such a case, the original segment can be fragmented by the IP layer during retransmission. Subsequent segments, when transmitted for the first time, should be no larger than allowed by the Path MTU.",
       "status": "exception",
-      "reason": "Non-repacketizing transport protocol actor; TCP retransmissions can be split and no IP fragmentation service is provided.",
+      "reason": "Actor not implemented: no transport in this stack has a stack-managed non-repacketizing retransmission algorithm (TCP repacketizes its retransmissions and never enters source fragmentation). The Host IP layer does fragment: Host::udp_send_datagram's Fragment mode source-fragments a UDP datagram larger than the connectionless effective size (base header, Fragment header, upper layer; every fragment within that size), so a datagram application that resends a datagram unchanged has it fragmented by the Host.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
     },
     {
@@ -774,7 +774,7 @@
       "section": "5.6",
       "quote": "It is suggested that an implementation provides a way for a system utility program to:",
       "status": "TODO",
-      "reason": "Introduces the per-path utility controls in 8201-080/081; there is no system-utility path-control interface.",
+      "reason": "Introduces the per-path utility controls in 8201-080/081; there is no system-utility path-control interface. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the owner-authorized path administration API, native commands and the opt-in local control utility; T19 exercises the utility controls in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -782,7 +782,7 @@
       "section": "5.6",
       "quote": "- Specify that Path MTU Discovery not be done on a given path.",
       "status": "TODO",
-      "reason": "PMTUD is configured per connection at creation; no system-utility per-path discovery-disable control exists.",
+      "reason": "PMTUD is configured per connection at creation; no system-utility per-path discovery-disable control exists. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds per-path discovery disable through the owner-authorized administration API and utility; T19 exercises it in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -790,7 +790,7 @@
       "section": "5.6",
       "quote": "- Change the PMTU value associated with a given path.",
       "status": "TODO",
-      "reason": "Endpoint::set_destination_route and set_route_mtu configure same-path transport ceilings rather than an arbitrary learned path PMTU estimate. Removing or raising a ceiling does not raise effective PMTU without ACK proof, and no system-utility PMTU-cache setter is exposed; lower_mss is another independent send ceiling.",
+      "reason": "Endpoint::set_destination_route and set_route_mtu configure same-path transport ceilings rather than an arbitrary learned path PMTU estimate. Removing or raising a ceiling does not raise effective PMTU without ACK proof, and no system-utility PMTU-cache setter is exposed; lower_mss is another independent send ceiling. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the learned-estimate set API and utility; T19 exercises it in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -798,7 +798,7 @@
       "section": "5.6",
       "quote": "The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.",
       "status": "TODO",
-      "reason": "Connections configured with PMTUD disabled enforce the IPv6 minimum-MTU send ceiling, including options and retries. No administrative per-path discovery-disable flag or IP-layer path utility interface exists; the connection creation profile does not provide that missing path control.",
+      "reason": "Connections configured with PMTUD disabled enforce the IPv6 minimum-MTU send ceiling, including options and retries. No administrative per-path discovery-disable flag or IP-layer path utility interface exists; the connection creation profile does not provide that missing path control. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the per-path flag, applied to existing and future users through the owner-authorized administration API; T19 exercises it in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {

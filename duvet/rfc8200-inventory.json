@@ -42,7 +42,7 @@
       "id": "8200-next", "section": "3",
       "quote": "Next Header 8-bit selector. Identifies the type of header immediately following the IPv6 header. Uses the same values as the IPv4 Protocol field [IANA-PN].",
       "status": "covered",
-      "reason": "Encoder emits TCP protocol 6; parser and checked quotes expose the exact selector for non-extension protocols. Known extension/fragment selectors are rejected explicitly. This field-format evidence does not claim extension traversal, unknown-protocol ICMP generation or full host demultiplexing; No Next Header processing is separately traced.",
+      "reason": "Encoder emits TCP protocol 6; parser and checked quotes expose the exact selector for non-extension protocols. Known extension/fragment selectors are rejected explicitly by the atomic parser and quote decoder; only the separate fragment API admits a Fragment header. This field-format evidence does not claim extension traversal, unknown-protocol ICMP generation or full host demultiplexing; No Next Header processing is separately traced.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
       "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn quote_header(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
     },
@@ -82,7 +82,7 @@
       "id": "8200-extension-boundary", "section": "4",
       "quote": "A full implementation of IPv6 includes implementation of the following extension headers: Hop-by-Hop Options Fragment Destination Options Routing Authentication Encapsulating Security Payload",
       "status": "context",
-      "reason": "Explicit full-host boundary: the selected codec rejects these headers and does not claim a full IPv6 implementation. This context is not an exception closing a selected base-header defect. Fragmentation/reassembly, routing, security headers and jumbograms remain unsupported."
+      "reason": "Explicit full-host boundary: the selected codec rejects these headers, except that its fragment API parses and encodes a Fragment header directly after the base header, and does not claim a full IPv6 implementation. This context is not an exception closing a selected base-header defect. Host fragmentation/reassembly, routing, security headers and jumbograms remain unsupported."
     },
     {
       "id": "8200-traffic-context", "section": "7",

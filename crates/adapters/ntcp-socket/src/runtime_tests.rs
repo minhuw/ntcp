@@ -89,14 +89,15 @@ fn owner_with_config(last: u8, config: EndpointConfig) -> Owner {
 pub(super) fn new(o: &mut Owner, flags: i32) -> u64 {
     o.execute(0, Op::New(flags)).unwrap().value as u64
 }
-// Test transport: IP-encode one directly polled segment as egress does.
+// Test transport: IP-encode one directly polled segment as egress encodes
+// it. An IP_PMTUDISC_DONT Identification is leased only at submission
+// (`Owner::lease_dont_identification`), which callers that model it apply.
 pub(super) fn ip_packet(owner: &Owner, tx: ntcp::Transmit, tcp: &[u8]) -> Vec<u8> {
     let header = crate::ip::header_len(tx.ip.source);
     let mut packet = vec![0; header + tcp.len()];
     packet[header..].copy_from_slice(tcp);
     let n = crate::ip::encode(&mut packet, tx, (owner.now() / 1000) as u32, tx.len).unwrap();
     packet.truncate(n);
-    owner.apply_pmtudisc_dont(tx.connection, &mut packet);
     packet
 }
 // Test transport: one IP packet directly polled from a backend-less peer.

@@ -208,6 +208,40 @@ class RemainingTcpGaps(unittest.TestCase):
                         with self.assertRaises(AssertionError):
                             self.assert_retained_contract(records)
 
+    def test_reassembly_ecn_clauses_are_closed_by_the_host_engine_and_its_table_test(self):
+        # RFC 3168 section 5.3 keys G007..G011 and A020: complete quotes, the
+        # original SPEC kept, no TODO or exception left, and source plus test
+        # annotations on the engine's ECN table and its every-row test.
+        target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+        quotes = (
+            "Reassembly of a fragmented packet MUST NOT lose indications of congestion.",
+            "In other words, if any fragment of an IP packet to be reassembled has the CE codepoint set, "
+            "then one of two actions MUST be taken:",
+            "However, this MUST NOT occur if any of the other fragments contributing to this reassembly "
+            "carries the Not-ECT codepoint.",
+            "If both actions are applicable, either MAY be chosen.",
+            "Reassembly of a fragmented packet MUST NOT change the ECN codepoint when all of the fragments "
+            "carry the same codepoint.",
+            "* The packet is dropped, instead of being reassembled, for any other reason.",
+        )
+        for quote in quotes:
+            with self.subTest(quote=quote[:40]):
+                copies = [r for r in self.records
+                          if (r.get("target"), audit.norm(r["quote"])) == (target, audit.norm(quote))]
+                self.assertEqual(len([r for r in copies if r["kind"] == "SPEC"]), 1)
+                self.assertFalse([r for r in copies if r["kind"] in ("TODO", "EXCEPTION")])
+                self.assertTrue(any(r["kind"] == "CITATION" and r["path"] == "crates/stacks/ntcp-host/src/reassembly.rs"
+                                    and "fn ecn_result(" in r["attached"] for r in copies))
+                self.assertTrue(any(r["kind"] == "TEST" and r["path"] == "crates/stacks/ntcp-host/src/tests/reassembly.rs"
+                                    and "fn every_ecn_combination_follows_the_published_table(" in r["attached"]
+                                    and "assert" in r["attached"] for r in copies))
+        # G012 addresses protocol specification authors and stays excepted.
+        actor = [r for r in self.records if r["kind"] == "EXCEPTION" and r.get("target") == target
+                 and "protocol specifications SHOULD instead specify" in audit.norm(r["quote"])]
+        self.assertEqual(len(actor), 1)
+        self.assertIn("Actor: protocol specification author", actor[0]["reason"])
+        self.assertNotRegex(actor[0]["reason"], r"(?i)no (IP )?reassembl|does not reassemble")
+
     def test_unlisted_full_quote_copy_cannot_have_missing_or_stale_reason(self):
         # Reproduce the missed-fourth-copy failure class without a disk fixture.
         for obligation in OBLIGATIONS:

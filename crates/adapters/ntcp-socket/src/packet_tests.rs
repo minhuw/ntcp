@@ -477,7 +477,17 @@ fn poll_frame(owner: &mut Owner) -> Option<(ntcp::Transmit, Vec<u8>)> {
         .poll_transmit(owner.inner.now(), &mut tcp, BUDGET)
         .unwrap()
         .packet?;
-    Some((tx, ip_packet(owner, tx, &tcp[..tx.len])))
+    let mut bytes = ip_packet(owner, tx, &tcp[..tx.len]);
+    // A direct poll carries no transmit attempt: it is ordinary output,
+    // identified as production egress identifies it at submission.
+    if owner.inner.dont_identified(tx.connection, None) {
+        let now = owner.inner.now();
+        owner
+            .inner
+            .lease_dont_identification(now, &mut bytes)
+            .unwrap();
+    }
+    Some((tx, bytes))
 }
 
 fn packet_header(bytes: &[u8]) -> ntcp::wire::Header {
@@ -491,8 +501,15 @@ fn check_ip(bytes: &[u8], tos: u8, df: bool) {
         u16::from_be_bytes([bytes[6], bytes[7]]),
         if df { 0x4000 } else { 0 }
     );
+    // Atomic datagrams carry Identification 0; a DF-clear packet carries a
+    // leased, nonzero one (RFC 6864 section 4.3).
+    assert_eq!(identification(bytes) == 0, df);
     assert_eq!(ip_checksum(&bytes[..20]), 0);
     parse_frame(bytes).unwrap();
+}
+
+fn identification(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[4], bytes[5]])
 }
 
 fn reverse_ack(
@@ -1541,6 +1558,11 @@ fn ip_options_changes_preserve_sack_holes_and_data_ack() {
     let (mut write, _) = request(7, fd, 0, data.clone(), 0);
     owner.execute(&mut write).unwrap();
     let (_, bytes) = poll_frame(&mut owner).unwrap();
+    // Every DF-clear datagram of the tuple, retransmissions included, has
+    // its own Identification.
+    let mut identifiers = std::collections::HashSet::new();
+    check_ip(&bytes, 0, false);
+    assert!(identifiers.insert(identification(&bytes)));
     let first = packet_header(&bytes);
     let base = first.sequence;
     let (original_ip, original_tcp) = parse_frame(&bytes).unwrap();
@@ -1549,6 +1571,8 @@ fn ip_options_changes_preserve_sack_holes_and_data_ack() {
         .payload
         .len();
     while let Some((_, bytes)) = poll_frame(&mut owner) {
+        check_ip(&bytes, 0, false);
+        assert!(identifiers.insert(identification(&bytes)));
         let (ip, tcp) = parse_frame(&bytes).unwrap();
         original_bytes += ntcp::wire::parse(ip, tcp).unwrap().payload.len();
     }
@@ -1573,6 +1597,7 @@ fn ip_options_changes_preserve_sack_holes_and_data_ack() {
     let mut retransmitted = 0;
     while let Some((_, bytes)) = poll_frame(&mut owner) {
         check_ip(&bytes, 0, false);
+        assert!(identifiers.insert(identification(&bytes)));
         let (ip, tcp) = parse_frame(&bytes).unwrap();
         let segment = ntcp::wire::parse(ip, tcp).unwrap();
         if !segment.payload.is_empty() {
@@ -3117,4 +3142,104 @@ fn upstream_packet_tests(options: &str) -> crate::packet_profile::Profile {
     ))
     .unwrap()
     .1
+}
+
+// D16: the native runtime issues IP Identification only after the quiet
+// period its `io.source_quiet` assertion allows. Without the assertion the
+// Host waits one MDL after startup, so a DONT connection's DF-clear packets
+// are held (backpressure) rather than sent; with it they leave at once.
+#[test]
+fn dont_packets_follow_the_source_quiet_assertion() {
+    const MDL_US: u64 = ntcp_host::DEFAULT_LIFETIME_SECONDS as u64 * 1_000_000;
+    // A fresh Host for this port with the operator's assertion, started at
+    // the owner's current time (as at runtime startup).
+    fn restart(owner: &mut Owner, quiet: crate::SourceQuiet) {
+        let inner = &mut owner.inner;
+        let config = inner.defaults.clone();
+        inner.host = None;
+        inner.ingress = None;
+        inner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        inner.source_quiet = quiet;
+        inner.attach_backend_host(1).unwrap();
+    }
+    // The DONT connection's SYN, encoded but not yet identified.
+    fn dont_syn(owner: &mut Owner) -> (ntcp::Transmit, Vec<u8>) {
+        let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        execute_value(owner, 11, fd, 7, IP_PMTUDISC_DONT).unwrap();
+        let (mut connect, _) = request(
+            5,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+            0,
+        );
+        assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+        let mut tcp = vec![0; BYTES - 20];
+        let tx = owner
+            .inner
+            .endpoint
+            .poll_transmit(owner.inner.now(), &mut tcp, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        let bytes = ip_packet(owner, tx, &tcp[..tx.len]);
+        assert!(owner.inner.dont_identified(tx.connection, None));
+        (tx, bytes)
+    }
+    let start = 5_000_000;
+    // Asserted: never emitted from (an address created for this runtime).
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
+    owner.inner.test_now = Some(start);
+    restart(&mut owner, crate::SourceQuiet::Never);
+    let (_, mut bytes) = dont_syn(&mut owner);
+    owner
+        .inner
+        .lease_dont_identification(start, &mut bytes)
+        .unwrap();
+    check_ip(&bytes, 0, false);
+    // Unknown (the default): held for a full MDL after startup, then sent.
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
+    owner.inner.test_now = Some(start);
+    restart(&mut owner, crate::SourceQuiet::Unknown);
+    let (_, mut bytes) = dont_syn(&mut owner);
+    let held = bytes.clone();
+    assert_eq!(
+        owner.inner.lease_dont_identification(start, &mut bytes),
+        Err(ntcp_host::IdentifierBackpressure::Unavailable {
+            until: Some(start + MDL_US)
+        })
+    );
+    // Not submittable: the encoded packet is unchanged (DF, Identification 0).
+    assert_eq!(bytes, held);
+    check_ip(&bytes, 0, true);
+    let later = start + MDL_US - 1;
+    owner.inner.test_now = Some(later);
+    assert!(
+        owner
+            .inner
+            .lease_dont_identification(later, &mut bytes)
+            .is_err()
+    );
+    owner.inner.test_now = Some(start + MDL_US);
+    owner
+        .inner
+        .lease_dont_identification(start + MDL_US, &mut bytes)
+        .unwrap();
+    check_ip(&bytes, 0, false);
+    // Asserted: emission ceased 100 s before startup; 20 s remain.
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
+    owner.inner.test_now = Some(start);
+    restart(&mut owner, crate::SourceQuiet::Seconds(100));
+    let (_, mut bytes) = dont_syn(&mut owner);
+    assert_eq!(
+        owner.inner.lease_dont_identification(start, &mut bytes),
+        Err(ntcp_host::IdentifierBackpressure::Unavailable {
+            until: Some(start + MDL_US - 100_000_000)
+        })
+    );
+    owner
+        .inner
+        .lease_dont_identification(start + MDL_US - 100_000_000, &mut bytes)
+        .unwrap();
+    check_ip(&bytes, 0, false);
 }

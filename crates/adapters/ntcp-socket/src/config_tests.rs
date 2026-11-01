@@ -822,3 +822,51 @@ fn explicit_client_early_policy_parser_keeps_authenticated_default() {
         );
     }
 }
+
+#[test]
+fn source_quiet_assertion_is_validated_and_maps_to_continuity() {
+    assert_eq!(
+        SocketConfig::parse(BASE).unwrap().io.source_quiet,
+        SourceQuiet::Unknown
+    );
+    for (value, expected) in [
+        ("never", SourceQuiet::Never),
+        ("0", SourceQuiet::Seconds(0)),
+        ("300", SourceQuiet::Seconds(300)),
+        ("18446744073709551615", SourceQuiet::Seconds(u64::MAX)),
+    ] {
+        let config = SocketConfig::parse(&format!("{BASE}io.source_quiet={value}\n")).unwrap();
+        assert_eq!(config.io.source_quiet, expected, "{value}");
+    }
+    for value in [
+        "Never",
+        "forever",
+        "-1",
+        "+5",
+        "1.5",
+        "120s",
+        "18446744073709551616",
+        "never\nio.source_quiet=never",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}io.source_quiet={value}\n")).is_err(),
+            "{value}"
+        );
+    }
+    // Unknown keeps the strict default: a full MDL after startup.
+    assert!(matches!(
+        SourceQuiet::Unknown.continuity(7),
+        ntcp_host::Continuity::QuietSince(7)
+    ));
+    assert!(matches!(
+        SourceQuiet::Seconds(30).continuity(7),
+        ntcp_host::Continuity::QuietFor { at: 7, seconds: 30 }
+    ));
+    assert!(matches!(
+        SourceQuiet::Never.continuity(7),
+        ntcp_host::Continuity::QuietFor {
+            at: 7,
+            seconds: u64::MAX
+        }
+    ));
+}

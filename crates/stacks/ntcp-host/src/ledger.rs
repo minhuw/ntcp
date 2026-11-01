@@ -72,15 +72,71 @@ pub enum Selector {
         start: u32,
         end: u32,
     },
+    /// A complete (unfragmented) UDP datagram.
     Udp {
         source_port: u16,
         destination_port: u16,
         length: u16,
         checksum: u16,
     },
+    /// Fragment zero of a UDP datagram this Host source-fragmented (offset
+    /// zero, MF / M set). Its leading data octets are the UDP header of the
+    /// complete datagram, so these fields are its recorded data prefix;
+    /// `length` exceeds the fragment's own data.
+    UdpFirstFragment {
+        source_port: u16,
+        destination_port: u16,
+        length: u16,
+        checksum: u16,
+    },
+    /// A non-first fragment of a datagram this Host source-fragmented: no
+    /// transport field is on the wire (RFC 791 section 3.2, RFC 8200 section
+    /// 4.5), so the record is portless. `offset` is its data offset in
+    /// octets, `more` its MF / M flag and `prefix` its leading data octets.
+    /// `logical_ports` name the datagram's flow tuple for the owner's
+    /// advice only; they are not on the wire and never take part in
+    /// matching or in summary keys.
+    Fragment {
+        offset: u16,
+        more: bool,
+        prefix: FragmentPrefix,
+        logical_ports: (u16, u16),
+    },
     /// Another protocol; this Host submits only TCP and UDP.
     #[cfg(any(test, feature = "test-support"))]
     Other,
+}
+
+/// The first min(8, fragment data length) data octets of a non-first
+/// fragment: what every ICMPv4 error quotes beyond the header (RFC 792,
+/// RFC 1122 section 3.2.2), and the only content of such a fragment a quote
+/// can be checked against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentPrefix {
+    bytes: [u8; 8],
+    len: u8,
+}
+
+impl FragmentPrefix {
+    /// The leading octets of `data`, at most eight.
+    pub fn new(data: &[u8]) -> Self {
+        let len = data.len().min(8);
+        let mut bytes = [0; 8];
+        bytes[..len].copy_from_slice(&data[..len]);
+        Self {
+            bytes,
+            len: len as u8,
+        }
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+    /// Whether a quoted prefix contains every octet recorded here. A quote
+    /// that omits a recorded octet cannot be checked against it and so is
+    /// not exact evidence.
+    fn present_in(&self, quoted: &Self) -> bool {
+        quoted.len >= self.len && quoted.bytes[..usize::from(self.len)] == *self.as_slice()
+    }
 }
 
 /// Facts fixed at submission. The context is `link.context()`.
@@ -125,11 +181,29 @@ pub enum QuotedSelector {
         destination_port: u16,
         sequence: u32,
     },
+    /// A quoted complete UDP datagram.
     Udp {
         source_port: u16,
         destination_port: u16,
         length: u16,
         checksum: u16,
+    },
+    /// A quoted UDP fragment at offset zero with MF / M set; its UDP header
+    /// is the complete datagram's.
+    UdpFirstFragment {
+        source_port: u16,
+        destination_port: u16,
+        length: u16,
+        checksum: u16,
+    },
+    /// Any other quoted fragment: its position, MF / M flag and the leading
+    /// data octets present in the quote. Nothing in it is parsed as a
+    /// transport header, and its Identification is not part of it (RFC 6864
+    /// section 4.1 limits the IPv4 ID to fragmentation and reassembly).
+    Fragment {
+        offset: u16,
+        more: bool,
+        prefix: FragmentPrefix,
     },
     Other,
 }
@@ -280,6 +354,25 @@ impl Key {
                     ..
                 },
             ) => (a, p, port) == (b, q, other_port),
+            // A datagram flow's non-first fragments are recorded under the
+            // portless key of their addresses and protocol (see `seal`, which
+            // keeps the flow's own key), so any flow bound to that source
+            // and protocol may have submitted under it.
+            (
+                Owner::Datagram { .. },
+                Self::Flow {
+                    source: a,
+                    protocol: p,
+                    ports: Some(_),
+                    ..
+                },
+                Self::Flow {
+                    source: b,
+                    protocol: q,
+                    ports: None,
+                    ..
+                },
+            ) => (a, p) == (b, q),
             _ => self == other,
         }
     }
@@ -448,11 +541,21 @@ enum Cover {
     },
     // UDP lengths, and the checksum while every summarized datagram agrees
     // on it. Only datagrams that overflowed the exact signature store are
-    // summarized, and only within their own four-tuple.
+    // summarized, and only within their own four-tuple. Whole datagrams and
+    // first fragments of one flow share it (their four-tuple is one key).
     Length {
         min: u16,
         max: u16,
         checksum: Option<u16>,
+    },
+    // Non-first fragments of every flow between one address pair and
+    // protocol (their portless key): the offset range, and MF while every
+    // summarized fragment agrees on it. Data prefixes are not summarized,
+    // so any prefix is admitted.
+    Fragment {
+        min: u16,
+        max: u16,
+        more: Option<bool>,
     },
     Any,
 }
@@ -481,10 +584,18 @@ impl Cover {
             },
             Selector::Udp {
                 length, checksum, ..
+            }
+            | Selector::UdpFirstFragment {
+                length, checksum, ..
             } => Self::Length {
                 min: length,
                 max: length,
                 checksum: Some(checksum),
+            },
+            Selector::Fragment { offset, more, .. } => Self::Fragment {
+                min: offset,
+                max: offset,
+                more: Some(more),
             },
             #[cfg(any(test, feature = "test-support"))]
             Selector::Other => Self::Any,
@@ -519,6 +630,22 @@ impl Cover {
                 max: b.max(d),
                 checksum: merge(x, y),
             },
+            (
+                Self::Fragment {
+                    min: a,
+                    max: b,
+                    more: x,
+                },
+                Self::Fragment {
+                    min: c,
+                    max: d,
+                    more: y,
+                },
+            ) => Self::Fragment {
+                min: a.min(c),
+                max: b.max(d),
+                more: merge(x, y),
+            },
             _ => Self::Any,
         }
     }
@@ -534,8 +661,19 @@ impl Cover {
                     length,
                     checksum: quoted,
                     ..
+                }
+                | QuotedSelector::UdpFirstFragment {
+                    length,
+                    checksum: quoted,
+                    ..
                 },
             ) => (min..=max).contains(&length) && checksum.is_none_or(|c| c == quoted),
+            (
+                Self::Fragment { min, max, more },
+                QuotedSelector::Fragment {
+                    offset, more: m, ..
+                },
+            ) => (min..=max).contains(&offset) && more.is_none_or(|more| more == m),
             _ => false,
         }
     }
@@ -552,7 +690,13 @@ fn ports(selector: Selector) -> Option<(u16, u16)> {
             source_port,
             destination_port,
             ..
+        }
+        | Selector::UdpFirstFragment {
+            source_port,
+            destination_port,
+            ..
         } => Some((source_port, destination_port)),
+        Selector::Fragment { .. } => None,
         #[cfg(any(test, feature = "test-support"))]
         Selector::Other => None,
     }
@@ -568,8 +712,13 @@ fn quoted_ports(selector: QuotedSelector) -> Option<(u16, u16)> {
             source_port,
             destination_port,
             ..
+        }
+        | QuotedSelector::UdpFirstFragment {
+            source_port,
+            destination_port,
+            ..
         } => Some((source_port, destination_port)),
-        QuotedSelector::Other => None,
+        QuotedSelector::Fragment { .. } | QuotedSelector::Other => None,
     }
 }
 
@@ -630,6 +779,39 @@ fn evidence_matches(e: &Evidence, quote: &QuoteKey) -> bool {
                     checksum: c,
                 },
             ) => (source_port, destination_port, length, checksum) == (s, d, l, c),
+            // Fragment zero: the UDP selector is its recorded data prefix;
+            // offset zero and MF are implied by both sides.
+            (
+                Selector::UdpFirstFragment {
+                    source_port,
+                    destination_port,
+                    length,
+                    checksum,
+                },
+                QuotedSelector::UdpFirstFragment {
+                    source_port: s,
+                    destination_port: d,
+                    length: l,
+                    checksum: c,
+                },
+            ) => (source_port, destination_port, length, checksum) == (s, d, l, c),
+            // A later fragment carries no ports: only its exact physical
+            // evidence (the common fields above, offset, MF and every
+            // recorded data octet) identifies it, never its flow tuple and
+            // never the IPv4 Identification (RFC 6864 section 4.1).
+            (
+                Selector::Fragment {
+                    offset,
+                    more,
+                    prefix,
+                    ..
+                },
+                QuotedSelector::Fragment {
+                    offset: o,
+                    more: m,
+                    prefix: quoted,
+                },
+            ) => (offset, more) == (o, m) && prefix.present_in(&quoted),
             #[cfg(any(test, feature = "test-support"))]
             (Selector::Other, QuotedSelector::Other) => true,
             _ => false,
@@ -926,7 +1108,13 @@ impl Ledger {
             if let Some(owner) = self.owners[p.owner] {
                 self.blind[p.owner] = self.blind[p.owner].max(self.discarded.until(owner, key));
             }
-            self.keys[p.owner] = Some(key);
+            // A non-first fragment's portless key is shared by every flow
+            // between its addresses; the owner keeps the key of its flow
+            // (sealed with fragment zero, which always precedes it), which
+            // `may_share` relates to portless keys.
+            if ports(evidence.transport).is_some() || self.keys[p.owner].is_none() {
+                self.keys[p.owner] = Some(key);
+            }
             self.order += 1;
             *self.slot_mut(p.owner, slot) = Some(Entry {
                 record: Record {

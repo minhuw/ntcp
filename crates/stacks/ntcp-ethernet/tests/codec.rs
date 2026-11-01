@@ -248,3 +248,82 @@ fn disabled_families_are_rejected() {
         }
     }
 }
+
+// Fragments are delimited for a reassembling host only; the atomic parser
+// keeps refusing them.
+#[test]
+fn ethernet_fragment_framing_and_padding() {
+    for v6 in families() {
+        let ip = tx(v6, 0).ip;
+        let data = [9u8; 16];
+        let mut packet = [0u8; 128];
+        let len = if v6 {
+            let h = ntcp_ip6::Header {
+                ip,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+            };
+            ntcp_ip6::Fragmenter::new(h, 17, 7, 24)
+                .unwrap()
+                .encode(&mut packet, 0, &data[..8])
+        } else {
+            let h = ntcp_ip::Header {
+                ip,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            };
+            ntcp_ip::Fragmenter::new(h, 17, 7, 24, 0)
+                .unwrap()
+                .encode(&mut packet, 0, &data[..8])
+        }
+        .unwrap();
+        let mut frame = [0u8; 200];
+        frame[12..14]
+            .copy_from_slice(&if v6 { ETHERTYPE_IPV6 } else { ETHERTYPE_IPV4 }.to_be_bytes());
+        frame[14..14 + len].copy_from_slice(&packet[..len]);
+        let padded = &frame[..(14 + len).max(60)];
+        assert_eq!(
+            parse_ethernet(padded).unwrap_err(),
+            Error::FragmentationUnsupported
+        );
+        assert_eq!(
+            parse_ethernet_fragment(padded).unwrap().payload,
+            &packet[..len]
+        );
+        // Padding beyond the minimum frame is still a length error.
+        assert_eq!(
+            parse_ethernet_fragment(&frame[..(14 + len).max(60) + 1]).unwrap_err(),
+            Error::Length
+        );
+        // An unfragmented packet parses identically through both.
+        let mut whole = [0u8; 128];
+        let n = if v6 {
+            let h = ntcp_ip6::Header {
+                ip,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+            };
+            ntcp_ip6::encode_datagram(&mut whole[14..], h, 17, 8)
+        } else {
+            let h = ntcp_ip::Header {
+                ip,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            };
+            ntcp_ip::encode_datagram(&mut whole[14..], h, 17, 8, 0)
+        }
+        .unwrap();
+        whole[12..14].copy_from_slice(&frame[12..14]);
+        let whole = &whole[..(14 + n).max(60)];
+        assert_eq!(
+            parse_ethernet(whole).unwrap().payload,
+            parse_ethernet_fragment(whole).unwrap().payload
+        );
+    }
+}

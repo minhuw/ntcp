@@ -41,7 +41,11 @@ pub enum QuotedTransport {
 }
 
 /// Protocol-generic quote of the offending datagram. `ip.destination` is the
-/// final destination, recovered from an unfinished IPv4 source route.
+/// final destination, recovered from an unfinished IPv4 source route. For a
+/// quoted fragment, `ip_packet_len` and `ip_header_len` are that fragment's
+/// physical lengths (an IPv6 header length includes the Fragment header) and
+/// `protocol` is the fragment's own selector, which is opaque for a later
+/// IPv6 fragment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Quote {
     pub ip: IpMetadata,
@@ -49,11 +53,52 @@ pub struct Quote {
     pub ip_header_len: u16,
     pub protocol: u8,
     pub transport: QuotedTransport,
+    /// Present only when the quoted packet is a fragment.
+    pub fragment: Option<QuotedFragment>,
+}
+
+/// Identification of a quoted fragment. IPv4's is reported for structure
+/// only: RFC 6864 section 4.1 limits it to fragmentation and reassembly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FragmentIdentification {
+    Ipv4 {
+        identification: u16,
+        dont_fragment: bool,
+    },
+    Ipv6 {
+        identification: u32,
+    },
+}
+
+/// Position, flags and leading data of a quoted fragment. Transport fields
+/// are parsed only from the fragment at offset zero; a later fragment's data
+/// carries no transport header, so `transport` is then `Other` and only these
+/// octets describe its content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotedFragment {
+    pub identification: FragmentIdentification,
+    /// Data offset in octets.
+    pub offset: u16,
+    pub more_fragments: bool,
+    /// The first `data_len` fragment data octets present in the quote, at
+    /// most eight: the amount every IPv4 error quotes (RFC 1122 3.2.2).
+    pub data: [u8; 8],
+    pub data_len: u8,
+}
+
+impl QuotedFragment {
+    pub fn data(&self) -> &[u8] {
+        &self.data[..usize::from(self.data_len)]
+    }
 }
 
 impl Quote {
-    /// Exact projection used by TCP-only consumers.
+    /// Exact projection used by TCP-only consumers. TCP never sends
+    /// fragments, so a quoted fragment has no TCP projection.
     pub fn tcp(self) -> Option<TcpQuote> {
+        if self.fragment.is_some() {
+            return None;
+        }
         let QuotedTransport::Tcp {
             source_port,
             destination_port,
@@ -154,11 +199,16 @@ impl<Q: Copy> Feedback<Q> {
 //# attacks described in this document, as the ICMP error messages might legitimately come
 //# from an intermediate system.
 pub fn decode_icmp(bytes: &[u8]) -> Result<Feedback, Error> {
-    decode_icmp_quote(bytes)?.tcp().ok_or(Error::Quote)
+    let feedback = decode_icmp_quote(bytes)?;
+    if feedback.quoted.fragment.is_some() {
+        return Err(Error::FragmentationUnsupported);
+    }
+    feedback.tcp().ok_or(Error::Quote)
 }
 
 /// Decode an ICMP error quoting any protocol. Validation is identical to
-/// `decode_icmp` except that the quoted protocol is not required to be TCP.
+/// `decode_icmp` except that the quoted protocol is not required to be TCP
+/// and the quoted packet may be a fragment.
 pub fn decode_icmp_quote(bytes: &[u8]) -> Result<Feedback<Quote>, Error> {
     let (outer, protocol, icmp) = parse_outer(bytes)?;
     if icmp.len() < 8 {
@@ -195,15 +245,31 @@ pub fn decode_icmp_quote(bytes: &[u8]) -> Result<Feedback<Quote>, Error> {
     })
 }
 // Every quote carries the complete inner header (checksummed IPv4 with
-// recovered source-route destination, or an extension-free IPv6 base header)
-// and no more than the declared original packet. TCP and UDP additionally need
-// their first eight transport bytes: ports plus sequence or length/checksum.
+// recovered source-route destination, or an IPv6 base header followed at most
+// by a Fragment header) and no more than the declared original packet. A
+// complete datagram or the fragment at offset zero additionally needs TCP's or
+// UDP's first eight transport bytes: ports plus sequence or length/checksum.
+// A later fragment's data holds no transport header and is never parsed.
 fn quote(b: &[u8], ipv6: bool) -> Result<Quote, Error> {
-    let (ip, header, total, protocol) = quote_header(b, ipv6)?;
+    let (ip, header, total, protocol, fragment) = quote_header(b, ipv6)?;
     if b.len() > total {
         return Err(Error::Quote);
     }
+    let fragment = fragment.map(|(identification, offset, more_fragments)| {
+        let present = &b[header..];
+        let mut data = [0; 8];
+        let data_len = present.len().min(8);
+        data[..data_len].copy_from_slice(&present[..data_len]);
+        QuotedFragment {
+            identification,
+            offset,
+            more_fragments,
+            data,
+            data_len: data_len as u8,
+        }
+    });
     let transport = match protocol {
+        _ if fragment.is_some_and(|f| f.offset != 0) => QuotedTransport::Other,
         PROTOCOL_TCP => {
             if total < header + 20 || b.len() < header + 8 {
                 return Err(Error::Quote);
@@ -227,8 +293,11 @@ fn quote(b: &[u8], ipv6: bool) -> Result<Quote, Error> {
             let udp = &b[header..];
             let length = u16::from_be_bytes([udp[4], udp[5]]);
             // Same length rule as received datagrams: the header must fit
-            // and the datagram cannot exceed the original IP payload.
-            if usize::from(length) < 8 || header + usize::from(length) > total {
+            // and the datagram cannot exceed the original IP payload. A first
+            // fragment's datagram continues in later fragments, so only its
+            // header has to be present.
+            let continued = fragment.is_some_and(|f| f.more_fragments);
+            if usize::from(length) < 8 || (!continued && header + usize::from(length) > total) {
                 return Err(Error::Quote);
             }
             let destination_port = u16::from_be_bytes([udp[2], udp[3]]);
@@ -252,16 +321,61 @@ fn quote(b: &[u8], ipv6: bool) -> Result<Quote, Error> {
         ip_header_len: header as u16,
         protocol,
         transport,
+        fragment,
     })
 }
 
-fn quote_header(b: &[u8], ipv6: bool) -> Result<(IpMetadata, usize, usize, u8), Error> {
+// Checked quoted header with its fragment identity, offset and MF, present
+// only for an actual fragment: an IPv4 datagram with MF or an offset, or any
+// IPv6 packet with a Fragment header (an atomic fragment included).
+type QuotedHeader = (
+    IpMetadata,
+    usize,
+    usize,
+    u8,
+    Option<(FragmentIdentification, u16, bool)>,
+);
+
+fn quote_header(b: &[u8], ipv6: bool) -> Result<QuotedHeader, Error> {
     let _ = b;
     match ipv6 {
         #[cfg(feature = "ipv6")]
-        true => ntcp_ip6::quote_header(b),
+        true => {
+            let (ip, header, total, protocol, fragment) = ntcp_ip6::quote_fragment_header(b)?;
+            Ok((
+                ip,
+                header,
+                total,
+                protocol,
+                fragment.map(|f| {
+                    (
+                        FragmentIdentification::Ipv6 {
+                            identification: f.identification,
+                        },
+                        f.offset,
+                        f.more_fragments,
+                    )
+                }),
+            ))
+        }
         #[cfg(feature = "ipv4")]
-        false => ntcp_ip::quote_header(b),
+        false => {
+            let (ip, header, total, protocol, f) = ntcp_ip::quote_fragment_header(b)?;
+            Ok((
+                ip,
+                header,
+                total,
+                protocol,
+                (!f.is_complete()).then_some((
+                    FragmentIdentification::Ipv4 {
+                        identification: f.identification,
+                        dont_fragment: f.dont_fragment,
+                    },
+                    f.offset,
+                    f.more_fragments,
+                )),
+            ))
+        }
         #[allow(unreachable_patterns)]
         _ => Err(Error::Version),
     }
@@ -320,4 +434,171 @@ pub fn icmpv6_checksum(ip: IpMetadata, bytes: &[u8]) -> Result<u16, Error> {
         return Err(Error::Version);
     };
     ntcp_ip_common::pseudo_header_checksum(ip.source, ip.destination, 58, bytes)
+}
+
+// RFC 792 checksums the ICMP message alone; RFC 4443 section 2.3 prepends the
+// IPv6 pseudo-header. Both cover the complete (possibly reassembled) message.
+fn message_checksum(ip: IpMetadata, message: &[u8]) -> Result<u16, Error> {
+    match (ip.source, ip.destination) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => Ok(checksum(message)),
+        (IpAddr::V6(_), IpAddr::V6(_)) => icmpv6_checksum(ip, message),
+        _ => Err(Error::Version),
+    }
+}
+
+/// Echo Request or Echo Reply (RFC 792; RFC 4443 sections 4.1 and 4.2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EchoKind {
+    Request,
+    Reply,
+}
+
+impl EchoKind {
+    fn message_type(self, ipv6: bool) -> u8 {
+        match (self, ipv6) {
+            (Self::Request, false) => 8,
+            (Self::Reply, false) => 0,
+            (Self::Request, true) => 128,
+            (Self::Reply, true) => 129,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Echo<'a> {
+    pub kind: EchoKind,
+    pub identifier: u16,
+    pub sequence: u16,
+    pub data: &'a [u8],
+}
+
+/// Decode a complete ICMP message, received from `ip.source` for
+/// `ip.destination`, as an Echo Request or Reply. Unlike errors, an Echo is
+/// decoded from the IP payload so that a reassembled message is handled like
+/// an unfragmented one. Both families define only code 0.
+pub fn decode_echo(ip: IpMetadata, message: &[u8]) -> Result<Echo<'_>, Error> {
+    if message.len() < 8 {
+        return Err(Error::Truncated);
+    }
+    if message_checksum(ip, message)? != 0 {
+        return Err(Error::Checksum);
+    }
+    let ipv6 = ip.source.is_ipv6();
+    let kind = [EchoKind::Request, EchoKind::Reply]
+        .into_iter()
+        .find(|kind| kind.message_type(ipv6) == message[0])
+        .ok_or(Error::ProtocolUnsupported)?;
+    if message[1] != 0 {
+        return Err(Error::Invalid);
+    }
+    Ok(Echo {
+        kind,
+        identifier: u16::from_be_bytes([message[4], message[5]]),
+        sequence: u16::from_be_bytes([message[6], message[7]]),
+        data: &message[8..],
+    })
+}
+
+/// Encode an Echo message sent from `ip.source` to `ip.destination` whose
+/// `data_len` data octets are resident at `message[8..]`; returns the message
+/// length. The data is never modified, so a reply built over a request's data
+/// echoes it exactly (RFC 1122 section 3.2.2.6, RFC 4443 section 4.2). The
+/// message may later be fragmented: its checksum covers all of it.
+pub fn encode_echo(
+    ip: IpMetadata,
+    kind: EchoKind,
+    identifier: u16,
+    sequence: u16,
+    message: &mut [u8],
+    data_len: usize,
+) -> Result<usize, Error> {
+    message_checksum(ip, &[])?;
+    let len = data_len
+        .checked_add(8)
+        .filter(|len| *len <= usize::from(u16::MAX))
+        .ok_or(Error::Length)?;
+    let message = message.get_mut(..len).ok_or(Error::Length)?;
+    message[0] = kind.message_type(ip.source.is_ipv6());
+    message[1] = 0;
+    message[2..4].fill(0);
+    message[4..6].copy_from_slice(&identifier.to_be_bytes());
+    message[6..8].copy_from_slice(&sequence.to_be_bytes());
+    let sum = message_checksum(ip, message)?;
+    message[2..4].copy_from_slice(&sum.to_be_bytes());
+    Ok(len)
+}
+
+/// ICMP errors a host originates about fragments it could not reassemble.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorMessage {
+    /// Fragment reassembly time exceeded: ICMPv4 type 11 code 1 (RFC 792,
+    /// RFC 1122 section 3.3.2) or ICMPv6 type 3 code 1 (RFC 4443 section
+    /// 3.3, RFC 8200 section 4.5).
+    ReassemblyTimeExceeded,
+    /// ICMPv6 Parameter Problem (RFC 4443 section 3.4); code 3 is RFC 7112's
+    /// incomplete header chain in a first fragment. `pointer` is the octet
+    /// offset of the problem within the invoking packet.
+    Ipv6ParameterProblem { code: u8, pointer: u32 },
+}
+
+/// Largest ICMP error message (ICMP header plus quote) for each family. An
+/// ICMPv6 error carries as much of the invoking packet as fits without
+/// exceeding the IPv6 minimum MTU (RFC 4443 section 2.4(c)). An ICMPv4 error
+/// carries the invoking header and at least 8 data octets (RFC 1122 section
+/// 3.2.2); quoting up to a 576-octet datagram keeps it within the size every
+/// IPv4 host must accept (RFC 1122 section 3.3.3), so no error ever needs
+/// fragmentation. Both assume an option-free originating header.
+pub const ICMPV4_ERROR_LIMIT: usize = 576 - 20;
+pub const ICMPV6_ERROR_LIMIT: usize = 1280 - 40;
+
+/// Encode an error sent from `ip.source` to `ip.destination` about
+/// `invoking`, the received packet as it arrived (for reassembly errors, the
+/// fragment at offset zero). The quote is truncated to the family limit and
+/// to `message`'s length, never split; an ICMPv4 quote that would lose part
+/// of the invoking header or its first 8 data octets is refused. Returns the
+/// message length.
+pub fn encode_error(
+    ip: IpMetadata,
+    error: ErrorMessage,
+    invoking: &[u8],
+    message: &mut [u8],
+) -> Result<usize, Error> {
+    message_checksum(ip, &[])?;
+    let ipv6 = ip.source.is_ipv6();
+    let (kind, code, word) = match error {
+        ErrorMessage::ReassemblyTimeExceeded => (if ipv6 { 3 } else { 11 }, 1, 0),
+        ErrorMessage::Ipv6ParameterProblem { code, pointer } if ipv6 => {
+            if code > 3 {
+                return Err(Error::Invalid);
+            }
+            (4, code, pointer)
+        }
+        ErrorMessage::Ipv6ParameterProblem { .. } => return Err(Error::Version),
+    };
+    let limit = if ipv6 {
+        ICMPV6_ERROR_LIMIT
+    } else {
+        ICMPV4_ERROR_LIMIT
+    }
+    .min(message.len());
+    let quote = invoking.len().min(limit.saturating_sub(8));
+    if !ipv6 {
+        let required = invoking
+            .first()
+            .map_or(0, |b| usize::from(b & 15) * 4 + 8)
+            .min(invoking.len());
+        if quote < required {
+            return Err(Error::Length);
+        }
+    }
+    let len = 8 + quote;
+    let message = message.get_mut(..len).ok_or(Error::Length)?;
+    message[0] = kind;
+    message[1] = code;
+    message[2..4].fill(0);
+    message[4..8].copy_from_slice(&word.to_be_bytes());
+    message[8..].copy_from_slice(&invoking[..quote]);
+    let sum = message_checksum(ip, message)?;
+    message[2..4].copy_from_slice(&sum.to_be_bytes());
+    Ok(len)
 }

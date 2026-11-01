@@ -1,8 +1,24 @@
 // Run as: tun_echo TUN_NAME LOCAL_IP TCP_PORT [PEER_SOCKET_ADDR].
-// TCP_PORT also names a UDP echo service; UDP replies are never fragmented.
-// The caller must configure the TUN interface (MTU 1500) and routes beforehand.
-// This adapter exchanges IP packets, not Ethernet frames; it does not configure
-// the host or implement ARP, routing, IP fragmentation, or general ICMP services.
+// TCP_PORT also names a UDP echo service. Fragmented input is reassembled
+// (up to the largest IP datagram). UDP and ICMP Echo replies larger than the
+// connectionless effective size are source-fragmented (every IPv4 fragment
+// with DF) within the peers' reassembly capacity; TCP is never fragmented.
+// Operational settings (deployment knowledge, validated and reported at
+// startup):
+//   NTCP_UDP_ECHO_MODE=fragment|refuse  UDP echo replies are fragmented when
+//     needed (default) or, with refuse, only ever sent whole: a reply beyond
+//     the path's unfragmented payload limit is refused.
+//   NTCP_PEER_REASSEMBLY_IPV4 / NTCP_PEER_REASSEMBLY_IPV6=OCTETS  the
+//     complete reconstructed IP datagram the peers can reassemble, for the
+//     local family only; unset keeps the receiver guarantee (576 / 1500).
+//   NTCP_SOURCE_QUIET=SECONDS|never  earlier emission from LOCAL_IP ceased
+//     at least SECONDS before startup (never: there was none, for example a
+//     newly created address). Unset, no IP Identification is issued for one
+//     maximum datagram lifetime (120 s) after startup.
+// The caller must configure the TUN interface (MTU 1500) and routes
+// beforehand. This adapter exchanges IP packets, not Ethernet frames; it does
+// not configure the host or implement ARP, routing, or ICMP services beyond
+// Echo and reassembly errors.
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -13,8 +29,9 @@ mod linux {
     #[cfg(test)]
     use ntcp::{IpMetadata, Ipv4Options};
     use ntcp_host::{
-        BackendOutcome, DeferredIcmp, EgressContext, Host, IcmpDispatch, IngressContext,
-        Submission, SubmissionTicket, UdpEvent, UdpFlowId, UdpSendError, UdpSent, path,
+        BackendOutcome, Continuity, Datagram, DatagramError, DeferredIcmp, EgressContext,
+        Envelope, Host, IcmpDispatch, IngressContext, Received, Submission, SubmissionTicket,
+        UdpEvent, UdpFlowId, UdpSend, UdpSendError, UdpSendMode, UdpSent, path,
     };
     use ntcp_io::{PacketIo, TxOutcome};
     use ntcp_io_tun::Tun;
@@ -33,12 +50,169 @@ mod linux {
     const MAX_IP_PACKET: usize = 65575;
     const TICK_US: u64 = 10_000;
     const UDP_HEADER: usize = 8;
-    // The largest UDP payload the fixed 1500-octet TUN carries unfragmented
-    // (IPv4's smaller header gives the larger payload).
-    const UDP_PAYLOAD: usize = MTU - IP_HEADER - UDP_HEADER;
+    // The largest datagram each family can carry (IPv4 Total Length 65535;
+    // IPv6 Payload Length 65535 after the 40-octet header). The echo
+    // services accept any datagram a peer may send, so reassembly is sized
+    // for these, whatever the peer's fragmentation.
+    const IPV4_DATAGRAM: usize = 65535;
+    const IPV6_DATAGRAM: usize = 65575;
 
     fn host_error(error: ntcp_host::Error) -> io::Error {
         io::Error::other(format!("IP host: {error:?}"))
+    }
+
+    // How earlier emission from the local address relates to this process.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SourceQuiet {
+        // Unknown: an earlier process may have emitted from it until now.
+        Unknown,
+        // Asserted: it ceased at least this many seconds before startup.
+        Seconds(u64),
+        // Asserted: there was no earlier emission from it at all.
+        Never,
+    }
+
+    // Datagram service settings: deployment knowledge the Host cannot learn
+    // itself, so the operator states it (see the usage notes above).
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct DatagramSettings {
+        udp_mode: UdpSendMode,
+        // Complete reconstructed IP octets the peers reassemble, for the
+        // local family; None keeps RFC 1122 / RFC 8200's guarantee.
+        peer_reassembly: Option<u32>,
+        quiet: SourceQuiet,
+    }
+
+    impl Default for DatagramSettings {
+        fn default() -> Self {
+            Self {
+                udp_mode: UdpSendMode::Fragment,
+                peer_reassembly: None,
+                quiet: SourceQuiet::Unknown,
+            }
+        }
+    }
+
+    impl DatagramSettings {
+        // Each setting is validated before use; an unparsable or
+        // inapplicable value is refused at startup, never ignored.
+        fn parse(
+            local: IpAddr,
+            udp_mode: Option<&str>,
+            ipv4_capacity: Option<&str>,
+            ipv6_capacity: Option<&str>,
+            quiet: Option<&str>,
+        ) -> io::Result<Self> {
+            let udp_mode = match udp_mode {
+                None | Some("fragment") => UdpSendMode::Fragment,
+                Some("refuse") => UdpSendMode::Refuse,
+                Some(_) => return Err(invalid("NTCP_UDP_ECHO_MODE must be fragment or refuse")),
+            };
+            let (capacity, other, floor, ceiling, name) = if local.is_ipv4() {
+                (ipv4_capacity, ipv6_capacity, 576, IPV4_DATAGRAM, "NTCP_PEER_REASSEMBLY_IPV4")
+            } else {
+                (ipv6_capacity, ipv4_capacity, 1500, IPV6_DATAGRAM, "NTCP_PEER_REASSEMBLY_IPV6")
+            };
+            if other.is_some() {
+                return Err(invalid(
+                    "a peer reassembly capacity applies only to the local address family",
+                ));
+            }
+            let peer_reassembly = capacity
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (floor..=ceiling as u32).contains(n))
+                        .ok_or_else(|| {
+                            invalid(&format!(
+                                "{name} must be complete IP octets in {floor}..={ceiling}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            let quiet = match quiet {
+                None => SourceQuiet::Unknown,
+                Some("never") => SourceQuiet::Never,
+                Some(value) => SourceQuiet::Seconds(value.parse().map_err(|_| {
+                    invalid("NTCP_SOURCE_QUIET must be whole seconds or never")
+                })?),
+            };
+            Ok(Self {
+                udp_mode,
+                peer_reassembly,
+                quiet,
+            })
+        }
+
+        fn from_env(local: IpAddr) -> io::Result<Self> {
+            let var = |name: &str| match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(_) => Err(invalid(&format!("invalid {name}"))),
+            };
+            let (mode, v4, v6, quiet) = (
+                var("NTCP_UDP_ECHO_MODE")?,
+                var("NTCP_PEER_REASSEMBLY_IPV4")?,
+                var("NTCP_PEER_REASSEMBLY_IPV6")?,
+                var("NTCP_SOURCE_QUIET")?,
+            );
+            Self::parse(
+                local,
+                mode.as_deref(),
+                v4.as_deref(),
+                v6.as_deref(),
+                quiet.as_deref(),
+            )
+        }
+
+        // The allocator's start: one full MDL after earlier emission from
+        // the local address may have ceased (RFC 6864 section 4.3).
+        fn continuity(&self, started: u64) -> Continuity {
+            match self.quiet {
+                SourceQuiet::Unknown => Continuity::QuietSince(started),
+                SourceQuiet::Seconds(seconds) => Continuity::QuietFor {
+                    at: started,
+                    seconds,
+                },
+                SourceQuiet::Never => Continuity::QuietFor {
+                    at: started,
+                    seconds: u64::MAX,
+                },
+            }
+        }
+
+        fn report(&self, local: IpAddr) -> String {
+            let mode = match self.udp_mode {
+                UdpSendMode::Refuse => "refuse (whole replies only)",
+                _ => "fragment",
+            };
+            let capacity = match self.peer_reassembly {
+                Some(octets) => format!("{octets} octets (stated)"),
+                None => format!(
+                    "{} octets (receiver guarantee)",
+                    if local.is_ipv4() { 576 } else { 1500 }
+                ),
+            };
+            let lifetime = ntcp_host::DEFAULT_LIFETIME_SECONDS;
+            let identifiers = match self.quiet {
+                SourceQuiet::Unknown => format!(
+                    "none for {lifetime} s (earlier emission from {local} is unknown)"
+                ),
+                SourceQuiet::Seconds(seconds) => format!(
+                    "none for {} s (asserted: emission from {local} ceased {seconds} s before \
+                     startup)",
+                    u64::from(lifetime).saturating_sub(seconds)
+                ),
+                SourceQuiet::Never => {
+                    format!("immediately (asserted: no earlier emission from {local})")
+                }
+            };
+            format!(
+                "datagram settings: UDP echo mode {mode}; peer reassembly capacity {capacity}; \
+                 IP identifiers {identifiers}; MDL {lifetime} s"
+            )
+        }
     }
 
     // Malformed/unsupported wire input remains a silent discard; bounded
@@ -72,8 +246,11 @@ mod linux {
         }
     }
 
+    // A retained TCP segment is the complete datagram (never a fragment):
+    // its envelope and bytes. A deferred ICMP report needs only its token.
     struct RetainedIngress {
         owner: Retained,
+        envelope: Option<Envelope>,
         bytes: Vec<u8>,
         timestamp: u32,
     }
@@ -88,13 +265,27 @@ mod linux {
         options_enabled: bool,
         received: VecDeque<RetainedIngress>,
         free: Vec<Vec<u8>>,
+        // Destination of each datagram reassembly completes, owned until it
+        // is dispatched or copied into retention.
+        completed: Vec<u8>,
     }
 
     impl TunHost {
+        #[cfg(test)]
         fn attach(
             endpoint: &mut Endpoint,
             config: &EndpointConfig,
             local: IpAddr,
+        ) -> io::Result<Self> {
+            Self::attach_with(endpoint, config, local, &DatagramSettings::default(), 0)
+        }
+
+        fn attach_with(
+            endpoint: &mut Endpoint,
+            config: &EndpointConfig,
+            local: IpAddr,
+            settings: &DatagramSettings,
+            started: u64,
         ) -> io::Result<Self> {
             // Independent public lifetime identity, never derived from TCP's
             // confidential ISN/Fast Open key or an interface/address alone.
@@ -102,11 +293,12 @@ mod linux {
             // Occupied transport generations + one provisional factory and
             // stateless lease; one serialized rebind gets migration headroom.
             // Peer packets never create forwarding routes.
-            let (paths, limits) =
+            let (paths, mut limits) =
                 ntcp_host::managed_limits(config, 1, 1, 1, 1, 1).map_err(host_error)?;
+            limits.datagrams = tun_datagrams(local.is_ipv4(), settings.peer_reassembly);
             // One UDP echo flow. Its receive and advice queues match the
             // per-iteration read budget, so one loop drains what one read
-            // pass can deliver; slots hold the largest unfragmented payload.
+            // pass can deliver; slots hold the largest reassembled payload.
             // Evicted replies keep exact signatures for a client sustaining
             // one read budget of datagrams per second over the feedback
             // horizon, so its later ICMP stays attributable to the echo.
@@ -116,18 +308,54 @@ mod linux {
                 .ok()
                 .and_then(|seconds| seconds.checked_mul(BUDGET))
                 .ok_or_else(|| host_error(ntcp_host::Error::Capacity))?;
+            // Reassembly: one read pass's worth of concurrent datagrams, the
+            // bytes of one largest datagram buffered at a time (the IPv6
+            // first fragment also stores its Fragment header), and enough
+            // descriptors for that datagram in 8-octet fragments, the worst
+            // conforming fragmentation. The IPv4 timeout is RFC 1122
+            // section 3.3.2's lower bound, which loses no conforming
+            // datagram and holds incomplete state for the shortest time.
+            let reassembly = ntcp_host::ReassemblyLimits {
+                assemblies: BUDGET,
+                fragments: IPV4_DATAGRAM.div_ceil(8),
+                buffered_bytes: IPV6_DATAGRAM + 8,
+                ipv4_datagram: IPV4_DATAGRAM,
+                ipv6_datagram: IPV6_DATAGRAM,
+                ipv4_timeout_seconds: 60,
+            };
+            let datagram = if local.is_ipv4() {
+                IPV4_DATAGRAM - IP_HEADER
+            } else {
+                IPV6_DATAGRAM - IPV6_HEADER
+            };
+            // UDP receive slots hold the largest payload reassembly can
+            // complete; the flow's ledger attempts cover every fragment of
+            // one reply (`limits.datagrams.max_fragments`).
             let (paths, limits) = ntcp_host::managed_udp_limits(
                 paths,
                 limits,
                 ntcp_host::UdpLimits {
                     flows: 1,
                     receive_datagrams: BUDGET,
-                    max_payload: UDP_PAYLOAD,
+                    max_payload: datagram - UDP_HEADER,
                     events: BUDGET,
                     evicted_signatures,
                 },
             )
             .map_err(host_error)?;
+            // Echo Replies and reassembly errors: one read pass's worth of
+            // messages, each as large as a reassembled Echo Request.
+            let (paths, mut limits) = ntcp_host::managed_icmp_output_limits(
+                paths,
+                limits,
+                ntcp_host::IcmpOutputLimits {
+                    messages: BUDGET,
+                    message_bytes: datagram,
+                    hop_limit: config.hop_limit,
+                },
+            )
+            .map_err(host_error)?;
+            limits.reassembly = reassembly;
             let mut host = Host::new(
                 path::ContextId::new(u128::from_ne_bytes(identity[..16].try_into().unwrap())),
                 paths,
@@ -135,6 +363,14 @@ mod linux {
                 endpoint.caller_timebase(),
             )
             .map_err(host_error)?;
+            // Unpredictable identifiers from the same OS CSPRNG acquisition
+            // as the TCP secret; a failure is backpressure, never a weaker
+            // source.
+            host.set_entropy(Box::new(|bytes: &mut [u8]| {
+                os_entropy(bytes).map_err(|_| ntcp_host::EntropyError)
+            }));
+            host.start_identifiers(settings.continuity(started))
+                .map_err(host_error)?;
             let forwarder = path::ForwarderId(1);
             let ingress = host
                 .register_link(
@@ -199,6 +435,11 @@ mod linux {
             received
                 .try_reserve_exact(BUDGET)
                 .map_err(|_| host_error(ntcp_host::Error::Allocation))?;
+            let mut completed = Vec::new();
+            completed
+                .try_reserve_exact(MAX_IP_PACKET)
+                .map_err(|_| host_error(ntcp_host::Error::Allocation))?;
+            completed.resize(MAX_IP_PACKET, 0);
             endpoint.enable_output_reservations().map_err(engine)?;
             host.attach(endpoint).map_err(host_error)?;
             Ok(Self {
@@ -209,12 +450,13 @@ mod linux {
                 options_enabled: config.ipv4_options_enabled,
                 received,
                 free,
+                completed,
             })
         }
 
         // TCP segments only; ICMP ownership is the Host dispatcher's decision.
-        fn owner(&self, endpoint: &Endpoint, frame: &[u8]) -> Option<ConnectionId> {
-            let packet = self.host.decode_ingress(self.ingress, frame).ok()?;
+        fn owner(&self, endpoint: &Endpoint, datagram: Datagram) -> Option<ConnectionId> {
+            let packet = self.host.decode_datagram(datagram).ok()?;
             if packet.protocol != 6 {
                 return None;
             }
@@ -225,18 +467,26 @@ mod linux {
             })
         }
 
-        fn retain(&mut self, owner: Retained, frame: &[u8], timestamp: u32) -> io::Result<()> {
+        // Retention follows completion: a TCP owner keeps the complete
+        // datagram, never a fragment.
+        fn retain(
+            &mut self,
+            owner: Retained,
+            datagram: Option<Datagram>,
+            timestamp: u32,
+        ) -> io::Result<()> {
             let mut bytes = self
                 .free
                 .pop()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
             // A deferred ICMP report needs only its token; its buffer still
             // bounds retention.
-            if let Retained::Tcp(_) = owner {
-                bytes.extend_from_slice(frame);
+            if let Some(datagram) = datagram {
+                bytes.extend_from_slice(datagram.bytes());
             }
             self.received.push_back(RetainedIngress {
                 owner,
+                envelope: datagram.map(|d| d.envelope()),
                 bytes,
                 timestamp,
             });
@@ -257,8 +507,19 @@ mod linux {
                 match retained.owner {
                     // A tuple reused by another generation cannot inherit input.
                     Retained::Tcp(owner) => {
-                        if self.owner(endpoint, &retained.bytes) == Some(owner) {
-                            self.dispatch(endpoint, time, &retained.bytes, retained.timestamp)?;
+                        if let Some(datagram) = retained
+                            .envelope
+                            .and_then(|envelope| envelope.datagram(&retained.bytes))
+                            && self.owner(endpoint, datagram) == Some(owner)
+                        {
+                            silent(self.host.input_datagram(
+                                endpoint,
+                                time,
+                                datagram,
+                                ntcp::RxPacketMetadata::default(),
+                                self.dscp,
+                                self.options_enabled.then_some(retained.timestamp),
+                            ))?;
                         }
                     }
                     // The token carries the validated report for this exact
@@ -280,23 +541,76 @@ mod linux {
             Ok(())
         }
 
-        fn dispatch(
+        // Drain the Host's Echo Replies (source-fragmented when needed) and
+        // reassembly errors through the same one-call TUN backend. A blocked
+        // TUN before any packet left keeps the message queued.
+        fn icmp_output(
             &mut self,
-            endpoint: &mut Endpoint,
             time: u64,
-            frame: &[u8],
-            timestamp: u32,
-        ) -> io::Result<()> {
-            silent(self.host.input_ip(
-                endpoint,
-                self.ingress,
-                time,
-                frame,
-                ntcp::RxPacketMetadata::default(),
-                self.dscp,
-                self.options_enabled.then_some(timestamp),
-            ))?;
-            Ok(())
+            output: &mut [u8],
+            backend: &mut impl PacketIo,
+        ) -> io::Result<bool> {
+            let mut progress = false;
+            let port = self.ingress.link();
+            for _ in 0..BUDGET {
+                let mut failure = None;
+                match self.host.icmp_output(time, output, |egress, frame| {
+                    if !tun_egress(port, egress.link, egress.next_hop) {
+                        return BackendOutcome::NotSubmitted;
+                    }
+                    tun_transmit(backend, frame, &mut failure)
+                }) {
+                    Ok(None) => break,
+                    Ok(Some(BackendOutcome::WouldBlock)) => return Ok(progress),
+                    Ok(Some(BackendOutcome::Unknown)) => {
+                        return Err(
+                            failure.unwrap_or_else(|| io::Error::other("unknown TUN outcome"))
+                        );
+                    }
+                    Ok(Some(_)) => {}
+                    // Consumed unsent, counted by the Host: a reply beyond
+                    // the path budget that may not be fragmented, or one
+                    // with no identifier available.
+                    Err(error) => eprintln!("ICMP output not sent: {error:?}"),
+                }
+                progress = true;
+            }
+            Ok(progress)
+        }
+    }
+
+    // Source fragmentation for the replies this Host originates. Enough
+    // fragments for the largest reply reassembly can complete, cut to the
+    // smallest link each family must support (68 and 1280 octets), so a
+    // narrowed path never leaves a reply unsent for want of fragments.
+    // Identifier leases live for the whole MDL: IPv4 tuples for every TCP
+    // flow's remote plus one read pass of distinct echo peers; IPv6 leases
+    // for one read pass of fragmented replies per second over the MDL.
+    // Beyond them a reply is sent whole when it fits, otherwise not at all.
+    fn tun_datagrams(ipv4: bool, peer_reassembly: Option<u32>) -> ntcp_host::DatagramLimits {
+        let (largest, room) = if ipv4 {
+            (IPV4_DATAGRAM - IP_HEADER, 68 - IP_HEADER)
+        } else {
+            (IPV6_DATAGRAM - IPV6_HEADER, 1280 - IPV6_HEADER - 8)
+        };
+        let lifetime = ntcp_host::DEFAULT_LIFETIME_SECONDS;
+        ntcp_host::DatagramLimits {
+            max_fragments: largest.div_ceil(room & !7),
+            identifiers: ntcp_host::IdentifierLimits {
+                lifetime_seconds: lifetime,
+                ipv4_tuples: if ipv4 { MAX_FLOWS + BUDGET } else { 0 },
+                ipv6_leases: if ipv4 { 0 } else { BUDGET * lifetime as usize },
+            },
+            connectionless: ntcp_host::ConnectionlessSizing::default(),
+            peer_reassembly_ipv4: peer_reassembly.filter(|_| ipv4),
+            peer_reassembly_ipv6: peer_reassembly.filter(|_| !ipv4),
+            // The Echo adjunct (RFC 4821 section 10.3) confirms larger
+            // connectionless sizes for the destinations of fragmented
+            // replies: one entry per flow and per read pass of Echo peers.
+            adjunct: ntcp_host::AdjunctLimits {
+                paths: MAX_FLOWS + BUDGET,
+                ..Default::default()
+            },
         }
     }
 
@@ -308,8 +622,16 @@ mod linux {
         io::Error::other(format!("TCP engine: {error:?}"))
     }
 
-    fn fill_secret(mut read: impl FnMut(&mut [u8]) -> io::Result<usize>) -> io::Result<[u8; 32]> {
+    fn fill_secret(read: impl FnMut(&mut [u8]) -> io::Result<usize>) -> io::Result<[u8; 32]> {
         let mut secret = [0; 32];
+        fill_bytes(&mut secret, read)?;
+        Ok(secret)
+    }
+
+    fn fill_bytes(
+        secret: &mut [u8],
+        mut read: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    ) -> io::Result<()> {
         let mut filled = 0;
         while filled < secret.len() {
             match read(&mut secret[filled..]) {
@@ -330,7 +652,7 @@ mod linux {
                 Err(error) => return Err(error),
             }
         }
-        Ok(secret)
+        Ok(())
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
@@ -343,16 +665,23 @@ mod linux {
     // The runtime must provide a confidential, unpredictable key. Flags 0 waits
     // for Linux's CSPRNG to initialize; errors abort startup without fallback.
     fn acquire_secret() -> io::Result<[u8; 32]> {
-        fill_secret(|buffer| {
-            // SAFETY: buffer is exclusively borrowed and writable for exactly
-            // buffer.len() bytes throughout the syscall; getrandom retains no pointer.
-            let count = unsafe { libc::getrandom(buffer.as_mut_ptr().cast(), buffer.len(), 0) };
-            if count < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(count as usize)
-            }
-        })
+        fill_secret(getrandom)
+    }
+
+    // The Host's identifier entropy: the same blocking acquisition.
+    fn os_entropy(bytes: &mut [u8]) -> io::Result<()> {
+        fill_bytes(bytes, getrandom)
+    }
+
+    fn getrandom(buffer: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: buffer is exclusively borrowed and writable for exactly
+        // buffer.len() bytes throughout the syscall; getrandom retains no pointer.
+        let count = unsafe { libc::getrandom(buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+        if count < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(count as usize)
+        }
     }
 
     #[cfg(test)]
@@ -533,7 +862,7 @@ mod linux {
     //# or to ICMP for processing.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-5
     //= type=implementation
-    //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class; extension headers, fragmentation and jumbograms are scoped adapter limits.
+    //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class of each complete datagram (received fragments are first reassembled by the Host); extension headers other than Fragment, source fragmentation and jumbograms are scoped adapter limits.
     //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
     fn input_frame(
         network: &mut TunHost,
@@ -561,28 +890,58 @@ mod linux {
         } else {
             packet
         };
-        let Ok(decoded) = network.host.decode_ingress(network.ingress, packet) else {
+        // Reassembly precedes classification; the completed datagram's
+        // buffer is restored whatever the outcome.
+        let mut completed = std::mem::take(&mut network.completed);
+        let result = input_datagram(network, endpoint, time, packet, &mut completed, timestamp);
+        network.completed = completed;
+        result
+    }
+
+    fn input_datagram(
+        network: &mut TunHost,
+        endpoint: &mut Endpoint,
+        time: u64,
+        packet: &[u8],
+        completed: &mut [u8],
+        timestamp: u32,
+    ) -> io::Result<()> {
+        // A TUN carries IP packets only: no link-layer multicast arrival.
+        let Ok(Received::Datagram(datagram)) =
+            network
+                .host
+                .receive(network.ingress, time, packet, false, completed)
+        else {
+            return Ok(());
+        };
+        let Ok(decoded) = network.host.decode_datagram(datagram) else {
             return Ok(());
         };
         if decoded.protocol == if decoded.ip.source.is_ipv4() { 1 } else { 58 } {
             // The single Host dispatcher classifies, correlates and applies
-            // ICMP; a reserved owner's report comes back unapplied to retain.
-            if let Some(IcmpDispatch::Deferred(deferred)) = silent(network.host.input_icmp(
-                endpoint,
-                network.ingress,
-                time,
-                packet,
-            ))? {
-                network.retain(Retained::Icmp(deferred), packet, timestamp)?;
+            // ICMP and answers Echo Requests; a reserved owner's report comes
+            // back unapplied to retain.
+            if let Some(IcmpDispatch::Deferred(deferred)) =
+                silent(network.host.input_icmp_datagram(endpoint, time, datagram))?
+            {
+                network.retain(Retained::Icmp(deferred), None, timestamp)?;
             }
             return Ok(());
         }
-        if let Some(owner) = network.owner(endpoint, packet)
+        if let Some(owner) = network.owner(endpoint, datagram)
             && endpoint.is_output_reserved(owner)
         {
-            return network.retain(Retained::Tcp(owner), packet, timestamp);
+            return network.retain(Retained::Tcp(owner), Some(datagram), timestamp);
         }
-        network.dispatch(endpoint, time, packet, timestamp)
+        silent(network.host.input_datagram(
+            endpoint,
+            time,
+            datagram,
+            ntcp::RxPacketMetadata::default(),
+            network.dscp,
+            network.options_enabled.then_some(timestamp),
+        ))?;
+        Ok(())
     }
 
     fn build_frame(
@@ -1049,11 +1408,17 @@ mod linux {
     // bounded flow queue; at most one reply is held here, so a blocked TUN
     // stops reading requests instead of growing storage. Every reply is a
     // real application datagram through the Host's submission transaction,
-    // and the flow's correlated ICMP advice is consumed on every pass.
+    // and the flow's correlated ICMP advice is consumed on every pass. In
+    // Fragment mode (the default) a reply larger than the connectionless
+    // effective size is source-fragmented within the peers' stated
+    // reassembly capacity; Refuse mode sends replies whole or not at all.
     struct UdpEcho {
         flow: UdpFlowId,
-        reply: [u8; UDP_PAYLOAD],
-        packet: [u8; MTU],
+        send: UdpSend,
+        // Holds the largest request the Host can reassemble.
+        reply: Vec<u8>,
+        // The largest reply, plus room for one fragment when it is split.
+        packet: Vec<u8>,
         held: Option<(SocketAddr, usize)>,
         blocked: bool,
         #[cfg(test)]
@@ -1073,6 +1438,7 @@ mod linux {
             endpoint: &Endpoint,
             local: SocketAddr,
             config: &EndpointConfig,
+            settings: &DatagramSettings,
         ) -> io::Result<Self> {
             let flow = network
                 .host
@@ -1086,10 +1452,25 @@ mod linux {
                     },
                 )
                 .map_err(host_error)?;
+            let datagram = if local.is_ipv4() {
+                IPV4_DATAGRAM - IP_HEADER
+            } else {
+                IPV6_DATAGRAM - IPV6_HEADER
+            };
+            // The flow's default: the operator's mode and stated capacity.
+            let send = UdpSend {
+                mode: settings.udp_mode,
+                peer_capability: settings.peer_reassembly,
+            };
+            network
+                .host
+                .udp_set_send(flow, send)
+                .map_err(host_error)?;
             Ok(Self {
                 flow,
-                reply: [0; UDP_PAYLOAD],
-                packet: [0; MTU],
+                send,
+                reply: vec![0; datagram - UDP_HEADER],
+                packet: vec![0; datagram + MTU],
                 held: None,
                 blocked: false,
                 #[cfg(test)]
@@ -1125,8 +1506,9 @@ mod linux {
                 progress = true;
             }
             // A shared change to the pinned path: report the new limit and
-            // reconsider a held reply against it. Echoes are indivisible, so
-            // one that no longer fits is refused, never truncated or split.
+            // reconsider a held reply against it. Echoes are never
+            // truncated: one that no longer fits what the mode can send (in
+            // Refuse mode the unfragmented limit) is refused.
             if let Some(change) = network
                 .host
                 .udp_path_change(self.flow)
@@ -1138,15 +1520,32 @@ mod linux {
                 ));
                 if let Some((peer, len)) = self.held
                     && peer.ip() == change.destination
-                    && len > change.max_payload
                 {
-                    self.note(format_args!(
-                        "UDP echo of {len} octets to {peer} refused: exceeds the changed \
-                         path payload limit of {}",
-                        change.max_payload
-                    ));
-                    self.held = None;
-                    self.blocked = false;
+                    if self.send.mode == UdpSendMode::Refuse {
+                        if len > change.max_payload {
+                            self.note(format_args!(
+                                "UDP echo of {len} octets to {peer} refused: exceeds the \
+                                 changed path payload limit of {}",
+                                change.max_payload
+                            ));
+                            self.held = None;
+                            self.blocked = false;
+                        }
+                    } else if let Ok(limits) = network.host.udp_datagram_limits(
+                        endpoint,
+                        self.flow,
+                        Some(peer.ip()),
+                        None,
+                    ) && len > limits.max_payload
+                    {
+                        self.note(format_args!(
+                            "UDP echo of {len} octets to {peer} refused: exceeds the changed \
+                             datagram limit of {} (peer reassembly capacity {})",
+                            limits.max_payload, limits.guarantee
+                        ));
+                        self.held = None;
+                        self.blocked = false;
+                    }
                 }
                 progress = true;
             }
@@ -1163,35 +1562,143 @@ mod linux {
                     progress = true;
                     continue;
                 };
-                // Size the reply against the current path before building it.
-                match network
-                    .host
-                    .udp_path_limits(endpoint, self.flow, Some(peer.ip()))
-                {
-                    Ok(limits) if len > limits.max_payload => {
-                        self.note(format_args!(
-                            "UDP echo of {len} octets to {peer} refused: exceeds the path \
-                             payload limit of {}; replies are never fragmented",
-                            limits.max_payload
-                        ));
-                        self.held = None;
-                        self.blocked = false;
-                        progress = true;
-                        continue;
+                let sent = if self.send.mode == UdpSendMode::Refuse {
+                    self.send_whole(network, endpoint, time, backend, peer, len)?
+                } else {
+                    self.send_datagram(network, endpoint, time, backend, peer, len)?
+                };
+                match sent {
+                    Sent::Done => {}
+                    Sent::Blocked => {
+                        self.blocked = true;
+                        break;
                     }
-                    // The send below reports any failure of this authority.
-                    _ => {}
                 }
+                self.held = None;
+                self.blocked = false;
+                progress = true;
+            }
+            Ok(progress)
+        }
+
+        // Refuse mode: one unfragmented datagram through `udp_send`, refused
+        // with the path's unfragmented payload limit.
+        fn send_whole(
+            &mut self,
+            network: &mut TunHost,
+            endpoint: &Endpoint,
+            time: u64,
+            backend: &mut impl PacketIo,
+            peer: SocketAddr,
+            len: usize,
+        ) -> io::Result<Sent> {
+            // Size the reply against the current path before building it.
+            match network
+                .host
+                .udp_path_limits(endpoint, self.flow, Some(peer.ip()))
+            {
+                Ok(limits) if len > limits.max_payload => {
+                    self.note(format_args!(
+                        "UDP echo of {len} octets to {peer} refused: exceeds the path \
+                         payload limit of {}; replies are never fragmented",
+                        limits.max_payload
+                    ));
+                    return Ok(Sent::Done);
+                }
+                // The send below reports any failure of this authority.
+                _ => {}
+            }
+            let mut unusable = false;
+            let mut failure = None;
+            let port = network.ingress.link();
+            let result = network.host.udp_send(
+                endpoint,
+                time,
+                self.flow,
+                Some(peer),
+                &self.reply[..len],
+                &mut self.packet,
+                |egress, frame| {
+                    if !tun_egress(port, egress.link, egress.next_hop) {
+                        unusable = true;
+                        return BackendOutcome::NotSubmitted;
+                    }
+                    tun_transmit(backend, frame, &mut failure)
+                },
+            );
+            match result {
+                Ok(UdpSent::Submitted(_)) => {}
+                // Same contract as TCP output: an unknown outcome ends
+                // the runtime rather than claiming or repeating it.
+                Ok(UdpSent::PossiblySubmitted(_)) => {
+                    return Err(failure.unwrap_or_else(|| io::Error::other("unknown TUN outcome")));
+                }
+                // Nothing runs between the query above and this send, so
+                // the query already refused whatever this would; this is
+                // the send's own enforcement of the same limit.
+                Err(UdpSendError::TooBig { max_payload }) => self.note(format_args!(
+                    "UDP echo of {len} octets to {peer} refused at send: exceeds the path \
+                     payload limit of {max_payload}; replies are never fragmented"
+                )),
+                // Retry the same reply once the TUN or evidence storage frees.
+                Err(
+                    UdpSendError::NotSubmitted(_) | UdpSendError::Host(ntcp_host::Error::Capacity),
+                ) if !unusable => return Ok(Sent::Blocked),
+                Err(error) => {
+                    self.note(format_args!("UDP echo reply to {peer} not sent: {error:?}"))
+                }
+            }
+            Ok(Sent::Done)
+        }
+
+        // Fragment mode: the Host's datagram transaction. A reply within the
+        // connectionless effective size goes whole; a larger one is cut into
+        // fragments of that size (each IPv4 fragment with DF) within the
+        // peers' reassembly capacity; a reply that may not be fragmented
+        // still goes whole within the path budget.
+        fn send_datagram(
+            &mut self,
+            network: &mut TunHost,
+            endpoint: &Endpoint,
+            time: u64,
+            backend: &mut impl PacketIo,
+            peer: SocketAddr,
+            len: usize,
+        ) -> io::Result<Sent> {
+            let limits = match network.host.udp_datagram_limits(
+                endpoint,
+                self.flow,
+                Some(peer.ip()),
+                None,
+            ) {
+                Ok(limits) if len > limits.max_payload => {
+                    self.note(format_args!(
+                        "UDP echo of {len} octets to {peer} refused: exceeds the datagram \
+                         limit of {} (peer reassembly capacity {})",
+                        limits.max_payload, limits.guarantee
+                    ));
+                    return Ok(Sent::Done);
+                }
+                Ok(limits) => limits,
+                Err(error) => {
+                    self.note(format_args!("UDP echo reply to {peer} not sent: {error:?}"));
+                    return Ok(Sent::Done);
+                }
+            };
+            let mut send = self.send;
+            for _ in 0..2 {
                 let mut unusable = false;
                 let mut failure = None;
                 let port = network.ingress.link();
-                let result = network.host.udp_send(
+                let buffer = limits.buffer_len(len).min(self.packet.len());
+                let result = network.host.udp_send_datagram(
                     endpoint,
                     time,
                     self.flow,
                     Some(peer),
+                    Some(send),
                     &self.reply[..len],
-                    &mut self.packet,
+                    &mut self.packet[..buffer],
                     |egress, frame| {
                         if !tun_egress(port, egress.link, egress.next_hop) {
                             unusable = true;
@@ -1201,39 +1708,60 @@ mod linux {
                     },
                 );
                 match result {
-                    Ok(UdpSent::Submitted(_)) => {}
-                    // Same contract as TCP output: an unknown outcome ends
-                    // the runtime rather than claiming or repeating it.
-                    Ok(UdpSent::PossiblySubmitted(_)) => {
-                        return Err(
-                            failure.unwrap_or_else(|| io::Error::other("unknown TUN outcome"))
-                        );
+                    Ok(report) => match report.terminal {
+                        None => {}
+                        // An unknown outcome ends the runtime, as for TCP.
+                        Some(BackendOutcome::Unknown) => {
+                            return Err(failure
+                                .unwrap_or_else(|| io::Error::other("unknown TUN outcome")));
+                        }
+                        // A submitted prefix is never reported unsent, and
+                        // a retry would be a new datagram: the reply ends.
+                        Some(outcome) => self.note(format_args!(
+                            "UDP echo reply to {peer}: {} of {} fragments submitted before \
+                             {outcome:?}; not repeated",
+                            report.submitted, report.fragments
+                        )),
+                    },
+                    Err(DatagramError::TooBig { max_payload })
+                    | Err(DatagramError::PeerLimit { max_payload, .. }) => {
+                        self.note(format_args!(
+                            "UDP echo of {len} octets to {peer} refused at send: exceeds the \
+                             datagram limit of {max_payload}"
+                        ))
                     }
-                    // Nothing runs between the query above and this send, so
-                    // the query already refused whatever this would; this is
-                    // the send's own enforcement of the same limit.
-                    Err(UdpSendError::TooBig { max_payload }) => self.note(format_args!(
-                        "UDP echo of {len} octets to {peer} refused at send: exceeds the path \
-                         payload limit of {max_payload}; replies are never fragmented"
+                    // No identifier (quiet period, MDL ceiling, entropy):
+                    // a reply the path carries whole still goes whole.
+                    Err(DatagramError::Backpressure(_))
+                        if send.mode == UdpSendMode::Fragment
+                            && len <= limits.unfragmented_payload =>
+                    {
+                        send.mode = UdpSendMode::Refuse;
+                        continue;
+                    }
+                    Err(DatagramError::Backpressure(why)) => self.note(format_args!(
+                        "UDP echo of {len} octets to {peer} not sent: no IP identifier \
+                         available ({why:?})"
                     )),
-                    // Retry the same reply once the TUN or evidence storage frees.
+                    // Retry the same reply once the TUN or storage frees.
                     Err(
-                        UdpSendError::NotSubmitted(_)
-                        | UdpSendError::Host(ntcp_host::Error::Capacity),
-                    ) if !unusable => {
-                        self.blocked = true;
-                        break;
-                    }
+                        DatagramError::NotSubmitted(_)
+                        | DatagramError::Host(ntcp_host::Error::Capacity),
+                    ) if !unusable => return Ok(Sent::Blocked),
                     Err(error) => {
                         self.note(format_args!("UDP echo reply to {peer} not sent: {error:?}"))
                     }
                 }
-                self.held = None;
-                self.blocked = false;
-                progress = true;
+                break;
             }
-            Ok(progress)
+            Ok(Sent::Done)
         }
+    }
+
+    // Whether a reply left (or was finally refused) or waits for the TUN.
+    enum Sent {
+        Done,
+        Blocked,
     }
 
     fn wait(tun: &Tun, timeout_ms: i32, pending: bool, readable: bool) -> io::Result<()> {
@@ -1361,6 +1889,7 @@ mod linux {
             Err(std::env::VarError::NotPresent) => false,
             _ => return Err(invalid("NTCP_SACK must be exactly 1 or unset")),
         };
+        let settings = DatagramSettings::from_env(local)?;
         let secret = acquire_secret()?;
         let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
@@ -1380,7 +1909,8 @@ mod linux {
         };
         let mut endpoint =
             Endpoint::new(config.clone(), secret, now(start), address_policy).map_err(engine)?;
-        let mut network = TunHost::attach(&mut endpoint, &config, local)?;
+        let mut network =
+            TunHost::attach_with(&mut endpoint, &config, local, &settings, now(start))?;
         let listener = endpoint
             .listen(SocketAddr::new(local, port), MAX_FLOWS)
             .map_err(engine)?;
@@ -1389,6 +1919,7 @@ mod linux {
             &endpoint,
             SocketAddr::new(local, port),
             &config,
+            &settings,
         )?;
         let mut flows = Vec::with_capacity(MAX_FLOWS);
         if let Some(peer) = peer {
@@ -1409,12 +1940,25 @@ mod linux {
         let mut input = [0u8; 65576];
         // Storage precedes selection; only actual Submitted accepts a reservation.
         let mut output = [0u8; MTU];
+        // Separate from `output`, which keeps a held TCP frame across passes.
+        // A queued message is built whole here; a fragmented one keeps the
+        // complete message beside the fragment being cut: the largest
+        // message, an IP header and one link-sized packet.
+        let mut icmp_output = vec![
+            0u8;
+            if local.is_ipv4() {
+                IPV4_DATAGRAM
+            } else {
+                IPV6_DATAGRAM
+            } + MTU
+        ];
         let mut pending = None;
         let mut accepting = false;
         eprintln!(
             "echo listening on {local}:{port} via {} (caller-configured TUN)",
             args[1]
         );
+        eprintln!("{}", settings.report(local));
         loop {
             let mut immediate = false;
             network.replay(&mut endpoint, now(start))?;
@@ -1505,12 +2049,22 @@ mod linux {
                 &mut tun,
             )?;
             immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
+            immediate |= network.icmp_output(now(start), &mut icmp_output, &mut tun)?;
             network.host.collect(&endpoint).map_err(host_error)?;
             immediate |= pending.is_none() && endpoint.has_pending_output();
             let current = now(start);
-            let delay = endpoint.next_deadline().map_or(TICK_US, |deadline| {
-                deadline.saturating_sub(current).min(TICK_US)
-            });
+            // Reassembly expiry runs in the change service even without
+            // traffic; adjunct probes and their reply deadlines in the ICMP
+            // output drain.
+            let delay = endpoint
+                .next_deadline()
+                .into_iter()
+                .chain(network.host.next_reassembly_deadline())
+                .chain(network.host.next_adjunct_deadline())
+                .min()
+                .map_or(TICK_US, |deadline| {
+                    deadline.saturating_sub(current).min(TICK_US)
+                });
             let timeout_ms = if immediate {
                 0
             } else {
@@ -1535,6 +2089,9 @@ mod linux {
     #[cfg(test)]
     mod pmtu_tests {
         include!("support/tun_echo_pmtu_tests.rs");
+        mod ingress {
+            include!("support/tun_echo_ingress_tests.rs");
+        }
         mod udp {
             include!("support/tun_echo_udp_tests.rs");
         }

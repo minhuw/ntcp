@@ -9,8 +9,11 @@ one veth cannot carry 1500-octet requests in and limit replies to 1280). The
 router kernel therefore generates every real Packet Too Big in these cases;
 the harness only forges messages in the forged control. The staged cases
 replace tun_echo with the harness-only ptb_stage sender, which controls only
-when the application writes and when ingress is serviced.
+when the application writes and when ingress is serviced; the driven cases
+replace it with the harness-only datagram_drive driver (one Host UDP flow),
+which controls only each send's mode and size and how long it is serviced.
 """
+import hashlib
 import ipaddress
 import json
 import os
@@ -40,8 +43,38 @@ ADDRESSES = {
             wrong="2001:db8:92::3", prefix="64"),
 }
 MACS = dict(t9ra="02:00:00:00:09:01", t9pa="02:00:00:00:09:02", t9rb="02:00:00:00:09:03", t9pb="02:00:00:00:09:04")
-SCENARIOS = ("udp-quoted", "tcp-quoted", "forged", "shared-fanout", "tcp-staged", "tcp-burst")
+# The driven scenarios use the harness-only datagram_drive driver.
+DRIVEN = ("probe-mode", "fragment-ptb", "adjunct-silence")
+SCENARIOS = ("udp-quoted", "tcp-quoted", "forged", "shared-fanout", "tcp-staged", "tcp-burst", "fragment") + DRIVEN
+# The fragment scenario's Linux peer port (fragmentation-enabled socket),
+# request size (larger than the 1500-octet links) and the peer reassembly
+# capacity stated to tun_echo: Linux reassembles complete IP datagrams of up
+# to 65535 octets (deployment knowledge of this topology's peer).
+PEER_FRAGMENT_PORT = 18091
+FRAGMENTED_REQUEST = 3000
+PEER_REASSEMBLY = 65535
+# The connectionless initial effective PMTU tun_echo uses (ntcp-host
+# ConnectionlessSizing::default, RFC 4821 section 7.2).
+CONNECTIONLESS_INITIAL = {4: 1024, 6: 1280}
+# The adjunct's real waits: its first probe follows the first fragmented
+# send, each probe waits up to the 3 s reply timeout.
+ADJUNCT_WAIT = 30
 STAGED = ("tcp-staged", "tcp-burst")
+# The driver's peer: a receive-only socket (kernel reassembly) on this port.
+SINK_PORT = 18092
+# The driven cases' deployment configuration, stated per case and recorded:
+# the connectionless initial effective PMTU (None: the ntcp-host default,
+# CONNECTIONLESS_INITIAL) and the Echo adjunct's path table (0: disabled).
+# fragment-ptb states 1500 so that, with nothing learned, its first
+# fragments are cut to the 1500-octet first hop and exceed the 1280 egress.
+DRIVER_SETTINGS = {"probe-mode": dict(initial=None, adjunct=0), "fragment-ptb": dict(initial=1500, adjunct=0),
+                   "adjunct-silence": dict(initial=None, adjunct=4)}
+# The owned drop rule of adjunct-silence: Echo Requests arriving from ntcp
+# are dropped at the router's prerouting hook, before forwarding, so a
+# probe draws neither an Echo Reply nor a router PTB.
+SILENCE_TABLE = "t13silence"
+# Real adjunct waits for two lost probes (3 s reply timeout each).
+SILENCE_WAIT = 30
 # The staged scenarios use the harness-only ptb_stage sender against a Linux
 # listener on this port; its ACKs to ntcp are delayed by netem on t9pa.
 STAGED_PORT = 18082
@@ -83,7 +116,11 @@ def u16(data, offset):
 
 
 def parse(packet):
-    """Decode one raw IP packet; every checksum must be valid unless reported."""
+    """Decode one raw IP packet; every checksum must be valid unless reported.
+
+    A fragment (IPv4 MF or nonzero offset; IPv6 Fragment header) reports its
+    fragment fields only: transport fields exist only in the reassembled
+    datagram (`reassemble`)."""
     version = packet[0] >> 4
     if version == 4:
         hl = (packet[0] & 15) * 4
@@ -93,17 +130,30 @@ def parse(packet):
         fragment = u16(packet, 6)
         info = dict(family=4, df=bool(fragment & 0x4000), fragmented=bool(fragment & 0x3fff),
                     ip_checksum_valid=checksum(packet[:hl]) == 0)
+        if info["fragmented"]:
+            info.update(ident=u16(packet, 4), offset=(fragment & 0x1fff) * 8, more=bool(fragment & 0x2000))
         pseudo = source + destination + bytes([0, protocol]) + struct.pack("!H", total - hl)
     elif version == 6:
         hl, total, protocol = 40, 40 + u16(packet, 4), packet[6]
         source, destination = packet[8:24], packet[24:40]
         info = dict(family=6, df=None, fragmented=protocol == 44, ip_checksum_valid=True)
+        if protocol == 44 and total >= 48:
+            # RFC 8200 section 4.5: base header -> Fragment header -> data.
+            field = u16(packet, 42)
+            info.update(ident=struct.unpack_from("!I", packet, 44)[0], offset=field & 0xfff8,
+                        more=bool(field & 1), inner=packet[40])
+            hl = 48
         pseudo = source + destination + struct.pack("!I", total - hl) + bytes([0, 0, 0, protocol])
     else:
         return None
     body = packet[hl:total]
     info.update(length=total, captured=len(packet), protocol=protocol, header_len=hl,
                 source=str(ipaddress.ip_address(source)), destination=str(ipaddress.ip_address(destination)))
+    if info["fragmented"]:
+        info.update(data=len(body))
+        if version == 6:
+            info.update(protocol=info["inner"])
+        return info
     if protocol == 6 and len(body) >= 20:
         offset = (body[12] >> 4) * 4
         sport, dport, seq, ack = struct.unpack_from("!HHII", body)
@@ -116,11 +166,65 @@ def parse(packet):
     elif (protocol, version) in ((1, 4), (58, 6)) and len(body) >= 8:
         valid = checksum(body if version == 4 else pseudo + body) == 0
         info.update(icmp_type=body[0], icmp_code=body[1], checksum_valid=valid)
+        if body[0] in ((0, 8) if version == 4 else (128, 129)):
+            info.update(echo=body[0] in (8, 128), identifier=u16(body, 4), sequence=u16(body, 6), data=body[8:])
         if (version, body[0], body[1]) == (4, 3, 4):
             info.update(ptb=True, mtu=u16(body, 6), quote=body[8:])
         elif (version, body[0]) == (6, 2):
             info.update(ptb=True, mtu=struct.unpack_from("!I", body, 4)[0], quote=body[8:])
     return info
+
+
+def reassemble(events):
+    """Reconstruct complete datagrams from captured fragments before any
+    transport parsing (RFC 791 section 3.2, RFC 8200 section 4.5).
+
+    Fragments are keyed by direction, family, addresses, Identification and
+    (IPv4) protocol. A datagram is complete when offset zero and a final
+    fragment are present and the data is contiguous; overlapping fragments
+    must carry identical bytes. Returns (datagram, fragments) pairs, where
+    the datagram is `parse` of the reconstructed packet (so transport
+    checksums cover the complete datagram)."""
+    groups = {}
+    for e in events:
+        if not e["fragmented"]:
+            continue
+        key = (e["direction"], e["family"], e["source"], e["destination"], e["ident"],
+               e["protocol"] if e["family"] == 4 else None)
+        groups.setdefault(key, []).append(e)
+    complete = []
+    for fragments in groups.values():
+        first = next((f for f in fragments if f["offset"] == 0), None)
+        last = next((f for f in fragments if not f["more"]), None)
+        if first is None or last is None:
+            continue
+        size = last["offset"] + last["data"]
+        data, filled = bytearray(size), set()
+        for f in fragments:
+            raw = f["raw"][f["header_len"]:f["length"]]
+            for i, byte in enumerate(raw):
+                at = f["offset"] + i
+                assert at < size and (at not in filled or data[at] == byte), ("inconsistent fragments", public(f))
+                data[at] = byte
+                filled.add(at)
+        if len(filled) != size:
+            continue
+        raw = first["raw"]
+        if first["family"] == 4:
+            header = bytearray(raw[:first["header_len"]])
+            struct.pack_into("!HH", header, 4, first["ident"], 0)
+            struct.pack_into("!H", header, 2, len(header) + size)
+            header[10:12] = b"\0\0"
+            struct.pack_into("!H", header, 10, checksum(bytes(header)))
+        else:
+            header = bytearray(raw[:40])
+            header[6] = first["inner"]
+            struct.pack_into("!H", header, 4, size)
+        datagram = parse(bytes(header) + bytes(data))
+        datagram.update(direction=first["direction"], time_ns=max(f["time_ns"] for f in fragments),
+                        raw=bytes(header) + bytes(data), sha256=None)
+        complete.append((datagram, sorted(fragments, key=lambda f: f["offset"])))
+    return sorted(complete, key=lambda c: c[0]["time_ns"])
 
 
 def sack_blocks(options):
@@ -152,7 +256,7 @@ def quotes(quote, original):
 
 
 def public(event):
-    return {k: v for k, v in event.items() if k not in ("raw", "quote")}
+    return {k: v for k, v in event.items() if k not in ("raw", "quote", "data") or k == "data" and type(v) is int}
 
 
 class Capture:
@@ -206,8 +310,13 @@ class Capture:
 class Ntcp:
     """The unmodified tun_echo example: TCP and UDP echo through one Host."""
 
-    def __init__(self, binary, local):
+    def __init__(self, binary, local, udp_mode, settings=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("NTCP_") and k != "LD_PRELOAD"}
+        # The UDP echo's send mode is selected explicitly per case; other
+        # operational settings (deployment knowledge) are per case too.
+        env["NTCP_UDP_ECHO_MODE"] = udp_mode
+        env.update(settings or {})
+        self.udp_mode, self.settings = udp_mode, dict(settings or {})
         self.p = subprocess.Popen([str(binary), TUN, local, str(PORT)], env=env, stdin=subprocess.DEVNULL,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
         self.lines = []
@@ -377,6 +486,332 @@ def mutate(family, original, name):
     return bytes(quote)
 
 
+def fragment_packet(family, effective):
+    """The non-final fragment size the Host cuts at effective size E: the
+    largest multiple of 8 data octets after the header (RFC 791, RFC 8200
+    section 4.5)."""
+    header = 20 if family == 4 else 48
+    return header + ((effective - header) & ~7)
+
+
+def fragmented(family, a, capture, ntcp, peer, ptbs):
+    """Fragmented UDP and ICMP Echo in both directions plus the Echo adjunct.
+
+    Linux sends fragmented >1500-octet requests; tun_echo (Fragment mode,
+    stated peer capacity) reassembles them and source-fragments its replies
+    to the connectionless effective size E. The capture keeps ntcp's physical
+    fragments separate from the reconstructed messages. The adjunct's probes
+    then run on the real path: a real Echo Reply is the only thing that may
+    raise E above its configured initial value, and a probe above the
+    1280-octet egress draws a real router PTB."""
+    def reply_fragments(start, protocol, dport=None):
+        events = capture.since(start)
+        found = []
+        for datagram, fragments in reassemble(events):
+            if datagram["direction"] != "from-ntcp" or datagram["protocol"] != protocol:
+                continue
+            if (datagram["source"], datagram["destination"]) != (a["ntcp"], a["peer"]):
+                continue
+            if dport is not None and datagram.get("dport") != dport:
+                continue
+            assert datagram["checksum_valid"], ("reassembled transport checksum", public(datagram))
+            for f in fragments:
+                # DF on every originated IPv4 fragment; no IPv6 atomic fragment.
+                assert f["ip_checksum_valid"] and (family == 6 or f["df"]), ("IPv4 DF", public(f))
+                assert f["offset"] or f["more"], ("atomic fragment", public(f))
+            found.append((datagram, fragments))
+        return events, found
+
+    def received(start, protocol):
+        return [(d, f) for d, f in reassemble(capture.since(start)) if d["direction"] == "to-ntcp"
+                and d["protocol"] == protocol and d["source"] == a["peer"] and d["destination"] == a["ntcp"]]
+
+    def probes(events):
+        return [e for e in events if e["direction"] == "from-ntcp" and not e["fragmented"]
+                and e["protocol"] == (1 if family == 4 else 58) and e.get("echo") is True
+                and (e["source"], e["destination"]) == (a["ntcp"], a["peer"])]
+
+    def answers(events, probe):
+        return [e for e in events if e["direction"] == "to-ntcp" and e.get("echo") is False
+                and e["source"] == a["peer"] and (e["identifier"], e["sequence"]) == (probe["identifier"], probe["sequence"])
+                and e["data"] == probe["data"] and e["checksum_valid"] and e["time_ns"] > probe["time_ns"]]
+
+    def sizes(fragments):
+        return [f["length"] for f in fragments]
+
+    start = capture.mark()
+    peer.send(f"fudp {FRAGMENTED_REQUEST} 41 5")
+    first = peer.read()
+    assert first["event"] == "fudp" and first["reply"] == FRAGMENTED_REQUEST and first["match"], first
+    assert first["sha256"] == first["request_sha256"], first
+    requests = received(start, 17)
+    assert len(requests) == 1 and len(requests[0][1]) > 1, ("Linux fragmented the request", len(requests))
+    assert requests[0][0]["payload"] == FRAGMENTED_REQUEST and requests[0][0]["checksum_valid"]
+    events, replies = reply_fragments(start, 17, PEER_FRAGMENT_PORT)
+    assert len(replies) == 1, [public(e) for e in events if e["direction"] == "from-ntcp"][:8]
+    reply, pieces = replies[0]
+    assert reply["payload"] == FRAGMENTED_REQUEST and reply["raw"][reply["header_len"] + 8:] == requests[0][0]["raw"][
+        requests[0][0]["header_len"] + 8:], "reassembled reply differs from the request"
+    # The first fragmented send precedes any probe: E is the configured
+    # initial value (1020-octet IPv4 / 1280-octet IPv6 fragments).
+    initial = fragment_packet(family, CONNECTIONLESS_INITIAL[family])
+    assert all(size == initial for size in sizes(pieces)[:-1]) and sizes(pieces)[-1] <= initial, sizes(pieces)
+    assert not probes([e for e in events if e["time_ns"] < pieces[0]["time_ns"]])
+
+    # ICMP Echo: a fragmented request answered exactly with a fragmented reply.
+    mark = capture.mark()
+    peer.send(f"ping {FRAGMENTED_REQUEST} 42 5")
+    echo = peer.read()
+    assert echo["event"] == "ping" and echo["reply"] == FRAGMENTED_REQUEST and echo["match"], echo
+    assert echo["checksum_valid"], echo
+    echo_requests = received(mark, 1 if family == 4 else 58)
+    assert len(echo_requests) == 1 and len(echo_requests[0][1]) > 1, "Linux fragmented the Echo Request"
+    _, echo_replies = reply_fragments(mark, 1 if family == 4 else 58)
+    echo_replies = [(d, f) for d, f in echo_replies if d.get("echo") is False]
+    assert len(echo_replies) == 1 and echo_replies[0][0]["identifier"] == echo["identifier"], len(echo_replies)
+    assert echo_replies[0][0]["data"] == echo_requests[0][0]["data"], "Echo Reply data differs"
+
+    # The adjunct, driven by the retained demand of those fragmented sends
+    # (no further sends): wait for a probe above 1280 drawing a real PTB.
+    deadline = time.monotonic() + ADJUNCT_WAIT
+    while True:
+        events = capture.since(start)
+        sent_probes = probes(events)
+        drawn = [(p, q) for p in sent_probes if p["length"] > 1280 for q in ptbs(events)
+                 if quotes(q["quote"], p["raw"])]
+        if drawn:
+            break
+        assert time.monotonic() < deadline, ("no probe above 1280 drew a PTB", [public(p) for p in sent_probes])
+        time.sleep(0.2)
+    time.sleep(1)
+    events = capture.since(start)
+    sent_probes = probes(events)
+    for p in sent_probes:
+        assert p["checksum_valid"] and (family == 6 or p["df"]) and p["length"] <= 1500, public(p)
+    confirmed = [(p, answers(events, p)) for p in sent_probes]
+    confirmed = [(p, r[0]) for p, r in confirmed if r]
+    for p, q in drawn:
+        assert q["source"] == a["router"] and q["mtu"] == 1280 and q["checksum_valid"], public(q)
+        assert not answers(events, p), "a probe beyond the egress MTU was answered"
+    # Only a real Echo Reply raises E: the largest answered probe, under the
+    # learned 1280 ceiling of the PTB.
+    raised = max([CONNECTIONLESS_INITIAL[family]] + [p["length"] for p, _ in confirmed])
+    effective = min(1280, raised)
+    if family == 4:
+        assert confirmed and effective > CONNECTIONLESS_INITIAL[4], [public(p) for p in sent_probes]
+
+    # A later fragmented reply is cut to the raised E (IPv4) or stays at the
+    # configured initial value where no reply could confirm more (IPv6 on a
+    # 1280 path); never below it.
+    mark = capture.mark()
+    peer.send(f"fudp {FRAGMENTED_REQUEST} 43 5")
+    later = peer.read()
+    assert later["event"] == "fudp" and later["reply"] == FRAGMENTED_REQUEST and later["match"], later
+    _, replies = reply_fragments(mark, 17, PEER_FRAGMENT_PORT)
+    assert len(replies) == 1, len(replies)
+    expected = fragment_packet(family, effective)
+    later_sizes = sizes(replies[0][1])
+    assert all(size == expected for size in later_sizes[:-1]) and later_sizes[-1] <= expected, (later_sizes, expected)
+    if confirmed:
+        first_confirmation = min(r["time_ns"] for _, r in confirmed)
+        assert first_confirmation < replies[0][1][0]["time_ns"]
+    return dict(peer_reassembly=PEER_REASSEMBLY, connectionless_initial=CONNECTIONLESS_INITIAL[family],
+                fragmented_udp=dict(result=first, request_fragments=sizes(requests[0][1]), reply_fragments=sizes(pieces)),
+                fragmented_echo=dict(result=echo, request_fragments=sizes(echo_requests[0][1]),
+                                     reply_fragments=sizes(echo_replies[0][1])),
+                adjunct=dict(probes=[dict(length=p["length"], df=p["df"], answered=bool(answers(events, p)))
+                                     for p in sent_probes],
+                             confirmed=[p["length"] for p, _ in confirmed],
+                             ptb=[dict(probe=p["length"], mtu=q["mtu"], ptb_hex=q["raw"][:96].hex()) for p, q in drawn]),
+                effective_after=effective, later_udp=dict(result=later, reply_fragments=later_sizes))
+
+
+def silence_rule(command):
+    """Install the owned drop rule in the router namespace; return its JSON."""
+    nft = lambda *args: command(["nft", *args])
+    nft("add", "table", "inet", SILENCE_TABLE)
+    nft("add", "chain", "inet", SILENCE_TABLE, "pre", "{ type filter hook prerouting priority -300; }")
+    nft("add", "rule", "inet", SILENCE_TABLE, "pre", "iifname", TUN, "icmp", "type", "echo-request", "counter", "drop")
+    nft("add", "rule", "inet", SILENCE_TABLE, "pre", "iifname", TUN, "icmpv6", "type", "echo-request", "counter", "drop")
+    return silence_counters(command)
+
+
+def silence_counters(command):
+    ruleset = json.loads(command(["nft", "-j", "list", "table", "inet", SILENCE_TABLE]))["nftables"]
+    rules = [item["rule"] for item in ruleset if "rule" in item]
+    drops = sum(next(e["counter"]["packets"] for e in r["expr"] if "counter" in e) for r in rules)
+    return dict(rules=rules, dropped=drops)
+
+
+def driven(family, scenario, a, capture, driver, peer, command, ptbs):
+    """Host UDP send modes and the adjunct, attributed from the TUN capture.
+
+    The driver reports each send's DatagramReport (and ProbeRecord), the
+    flow's UdpDatagramLimits before and after, the consumed UdpEvents, the
+    connectionless effective size, the shared learned estimate and the
+    adjunct counters; the capture shows what physically left."""
+    hl = header_len(family)
+    ready = driver.ready
+    initial = ready["connectionless_initial"]
+    remote = f"[{a['peer']}]:{SINK_PORT}" if family == 6 else f"{a['peer']}:{SINK_PORT}"
+    assert ready["learned_mtu"] is None and ready["budget"] == 1500, ready
+    assert ready["effective_size"] == min(1500, initial) and ready["limits"]["guarantee_stated"], ready
+    peer.send(f"sink {SINK_PORT}")
+    assert peer.read()["event"] == "sinking"
+
+    def send(mode, size, salt, wait=1000):
+        mark = capture.mark()
+        driver.send(f"send {mode} {size} {salt} {wait}")
+        result = driver.read()
+        assert result["event"] == "sent" and result["size"] == size, result
+        time.sleep(0.2)
+        return result, capture.since(mark)
+
+    def own(events):
+        """ntcp's physical UDP packets to the peer."""
+        items = [e for e in events if e["direction"] == "from-ntcp" and e["protocol"] == 17
+                 and (e["source"], e["destination"]) == (a["ntcp"], a["peer"])]
+        for e in items:
+            assert e["ip_checksum_valid"] and (family == 6 or e["df"]), ("IPv4 DF", public(e))
+        return items
+
+    def quoting(events, packet):
+        found = [q for q in ptbs(events) if quotes(q["quote"], packet["raw"])]
+        for q in found:
+            assert q["checksum_valid"] and q["source"] == a["router"] and q["mtu"] == 1280, public(q)
+        return found
+
+    def too_big(result, length):
+        return [e for e in result["events"] if e["kind"] == "packet_too_big" and e["remote"] == remote
+                and e["dropped_len"] == length and e["mtu"] == 1280]
+
+    def drain(wait=1.0):
+        peer.send(f"drain {wait}")
+        result = peer.read()
+        assert result["event"] == "drain", result
+        return result["datagrams"]
+
+    def digest(size, salt):
+        return hashlib.sha256(pattern(size, salt)).hexdigest()
+
+    def sizes(packets):
+        return [p["length"] for p in sorted(packets, key=lambda p: p.get("offset", 0))]
+
+    if scenario == "probe-mode":
+        # A real router PTB for an ordinary whole datagram teaches 1280.
+        big = 1500 - hl - 8
+        taught, events = send("refuse", big, 51)
+        assert taught["report"] and taught["report"]["fragments"] == 1 and taught["report"]["probe"] is None, taught
+        whole = own(events)
+        assert sizes(whole) == [1500] and not whole[0]["fragmented"], [public(e) for e in whole]
+        assert len(quoting(events, whole[0])) == 1 and too_big(taught, 1500), taught
+        assert taught["learned_before"] is None and taught["learned_mtu"] == 1280 and taught["budget"] == 1280, taught
+        probes = []
+        for length, salt in ((1400, 52), (1500, 53)):
+            probe, events = send("probe", length - hl - 8, salt)
+            report, record = probe["report"], probe["report"] and probe["report"]["probe"]
+            assert record and record["definite"] and record["size"] == length and record["above"] == 1280, probe
+            assert (report["fragments"], report["submitted"], report["possibly_submitted"]) == (1, 1, 0), report
+            assert probe["learned_before"] == 1280 and probe["limits_before"]["max_payload"] == 1500 - hl - 8, probe
+            packets = own(events)
+            # One unfragmented packet: IPv4 with DF, IPv6 without a Fragment header.
+            assert sizes(packets) == [length] and not packets[0]["fragmented"] and packets[0]["checksum_valid"], (
+                [public(e) for e in packets])
+            # The submission raised nothing shared; the router's PTB for it
+            # is an ordinary report to the flow.
+            assert probe["learned_mtu"] == 1280 and probe["budget"] == 1280, probe
+            assert probe["limits"]["unfragmented_payload"] == 1280 - hl - 8, probe
+            drawn = quoting(events, packets[0])
+            assert len(drawn) == 1 and too_big(probe, length), probe
+            probes.append(dict(record=record, report=report, ip_length=length, df=packets[0]["df"],
+                               fragment_header=packets[0]["fragmented"], events=probe["events"],
+                               learned_after=probe["learned_mtu"], ptb_hex=drawn[0]["raw"][:96].hex()))
+        # The learned estimate still governs ordinary sends.
+        refused, events = send("refuse", big, 54)
+        assert refused["report"] is None and refused["error"] == f"TooBig {{ max_payload: {1280 - hl - 8} }}", refused
+        assert not own(events)
+        return dict(taught=dict(report=taught["report"], events=taught["events"], learned=taught["learned_mtu"]),
+                    probes=probes, refused_after=refused["error"], peer_received=drain(0.5))
+    if scenario == "fragment-ptb":
+        size = 2000
+        first, events = send("fragment", size, 61)
+        report, lengths = first["report"], first["submitted_lengths"]
+        assert report and report["fragments"] == report["submitted"] == 2 and report["identification"] is not None, first
+        assert first["limits_before"]["effective_size"] == 1500 and first["learned_before"] is None, first
+        assert lengths[0] == fragment_packet(family, 1500) > 1280, lengths
+        pieces = [e for e in own(events) if e["fragmented"] and e["ident"] == report["identification"]]
+        assert sorted(sizes(pieces)) == sorted(lengths) and len(own(events)) == 2, [public(e) for e in own(events)]
+        head = next(p for p in pieces if p["offset"] == 0)
+        assert head["more"] and head["length"] == lengths[0] and head["header_len"] == (20 if family == 4 else 48)
+        drawn = quoting(events, head)
+        # The real router PTB quotes the first fragment; the Host correlated
+        # it to the UDP owner and lowered the shared estimate.
+        assert len(drawn) == 1 and too_big(first, head["length"]), first
+        assert first["learned_mtu"] == 1280 and first["effective_size"] == 1280, first
+        later, events = send("fragment", size, 62)
+        expected = fragment_packet(family, 1280)
+        later_lengths = later["submitted_lengths"]
+        assert len(later_lengths) > 1 and all(n == expected for n in later_lengths[:-1]), (later_lengths, expected)
+        assert later_lengths[-1] <= expected and not ptbs(events), later_lengths
+        assert sorted(sizes(own(events))) == sorted(later_lengths)
+        (datagram, _), = reassemble(own(events))
+        assert datagram["checksum_valid"] and datagram["payload"] == size, public(datagram)
+        received = drain(1.0)
+        # The first datagram lost its first fragment; the later one arrives.
+        assert [(d["size"], d["sha256"]) for d in received] == [(size, digest(size, 62))], received
+        return dict(first=dict(report=report, fragments=lengths, events=first["events"], learned_after=first["learned_mtu"],
+                               effective_after=first["effective_size"], ptb_hex=drawn[0]["raw"][:96].hex(),
+                               quoted_fragment=public(head)),
+                    later=dict(report=later["report"], fragments=later_lengths, effective=later["effective_size"]),
+                    peer_received=received)
+    # adjunct-silence: fragmented sends create demand; the drop rule makes
+    # every probe go unanswered.
+    rule = silence_rule(command)
+    assert rule["dropped"] == 0 and len(rule["rules"]) == 2, rule
+    start = capture.mark()
+    expected = fragment_packet(family, initial)
+    size = 3000
+    states = []
+    first, events = send("fragment", size, 71, 200)
+    assert first["report"]["fragments"] == first["report"]["submitted"] > 1, first
+    assert all(n == expected for n in first["submitted_lengths"][:-1]), first["submitted_lengths"]
+    states.append(first)
+    deadline = time.monotonic() + SILENCE_WAIT
+    while states[-1]["adjunct"]["lost"] < 2:
+        assert time.monotonic() < deadline, ("probes were not lost", states[-1])
+        driver.send("serve 1000")
+        served = driver.read()
+        assert served["event"] == "served", served
+        states.append(served)
+    later, _ = send("fragment", size, 72, 200)
+    assert later["submitted_lengths"] == first["submitted_lengths"], (later["submitted_lengths"], first["submitted_lengths"])
+    states.append(later)
+    for state in states:
+        # Silence never lowers E or anything shared.
+        assert state["effective_size"] == initial and state["learned_mtu"] is None and state["budget"] == 1500, state
+        assert not state["events"], state
+    counters = later["adjunct"]
+    assert counters["lost"] >= 2 and counters["confirmed"] == counters["too_big"] == 0, counters
+    time.sleep(0.3)
+    events = capture.since(start)
+    probes = [e for e in events if e["direction"] == "from-ntcp" and not e["fragmented"] and e.get("echo") is True
+              and (e["source"], e["destination"]) == (a["ntcp"], a["peer"])]
+    assert len(probes) == counters["probes"] >= 2, ([public(p) for p in probes], counters)
+    for p in probes:
+        assert p["checksum_valid"] and (family == 6 or p["df"]) and initial < p["length"] <= 1500, public(p)
+    replies = [e for e in events if e["direction"] == "to-ntcp" and (e.get("echo") is False or e.get("ptb"))]
+    assert not replies, [public(e) for e in replies]
+    dropped = silence_counters(command)
+    assert dropped["dropped"] == len(probes), (dropped, len(probes))
+    received = drain(1.0)
+    assert [(d["size"], d["sha256"]) for d in received] == [(size, digest(size, 71)), (size, digest(size, 72))], received
+    return dict(drop_rule=dict(rule, dropped=dropped["dropped"], hook="inet prerouting priority -300", namespace="router"),
+                probes=[dict(length=p["length"], df=p["df"], time_ns=p["time_ns"]) for p in probes],
+                adjunct=counters, fragments=first["submitted_lengths"], later_fragments=later["submitted_lengths"],
+                effective=[s["effective_size"] for s in states], learned=[s["learned_mtu"] for s in states],
+                peer_received=received)
+
+
 def staged(family, scenario, a, capture, stager, peer, command, sent, ptbs, accepted_ptb):
     """Causal attribution of PTB-driven repair from the TUN capture.
 
@@ -490,14 +925,14 @@ def staged(family, scenario, a, capture, stager, peer, command, sent, ptbs, acce
                 path_mtu=result["path_mtu"])
 
 
-def child(case, proof, binary, Peer, command, emit, staged_binary=None):
+def child(case, proof, binary, Peer, command, emit, staged_binary=None, driver_binary=None):
     family, scenario = case["family"], case["scenario"]
     a = ADDRESSES[family]
     egress_mtu = 1500 if scenario == "forged" else 1280
     big, allowed = large_udp(family), allowed_udp(family)
     small_mss = 1280 - header_len(family) - 20
     peer = Peer(["unshare", "--net", sys.executable, "-B", HERE / "icmp_peer.py", a["peer"], a["ntcp"], PORT])
-    ntcp = capture = stager = None
+    ntcp = capture = stager = driver = None
     evidence = dict(case=case)
     try:
         assert peer.ready["namespace"] not in (proof["net"]["parent"], proof["net"]["current"]), peer.ready
@@ -508,8 +943,32 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None):
             # The staged sender, not tun_echo, owns the TUN in these cases.
             port = f"[{a['peer']}]:{STAGED_PORT}" if family == 6 else f"{a['peer']}:{STAGED_PORT}"
             stager = Peer([staged_binary, TUN, a["ntcp"], port])
+        elif scenario in DRIVEN:
+            # The datagram driver owns the TUN: one Host UDP flow to the
+            # peer's sink, with the case's stated deployment configuration.
+            config = DRIVER_SETTINGS[scenario]
+            initial = config["initial"] or CONNECTIONLESS_INITIAL[family]
+            port = f"[{a['peer']}]:{SINK_PORT}" if family == 6 else f"{a['peer']}:{SINK_PORT}"
+            driver = Peer([driver_binary, TUN, a["ntcp"], port, initial, PEER_REASSEMBLY, config["adjunct"]])
+            evidence.update(driver_configuration=dict(
+                connectionless_initial=initial, peer_reassembly=PEER_REASSEMBLY, adjunct_paths=config["adjunct"],
+                stated="deployment configuration of this case (Linux peer reassembles 65535-octet datagrams)",
+                identifier_continuity=driver.ready["continuity"], mdl_seconds=driver.ready["mdl_seconds"],
+                source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission"))
+        elif scenario == "fragment":
+            # Fragment mode with the Linux peer's reassembly capacity stated
+            # (deployment knowledge). The harness created the ntcp address in
+            # a fresh namespace for this case, so it asserts that nothing
+            # emitted from it before (decision D14; recorded as evidence).
+            ntcp = Ntcp(binary, a["ntcp"], "fragment", {
+                f"NTCP_PEER_REASSEMBLY_IPV{family}": str(PEER_REASSEMBLY), "NTCP_SOURCE_QUIET": "never"})
+            evidence.update(tun_echo_udp_mode=ntcp.udp_mode, tun_echo_settings=ntcp.settings,
+                            source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission")
         else:
-            ntcp = Ntcp(binary, a["ntcp"])
+            # These cases' evidence is whole UDP replies and the refusal of
+            # oversize ones (the path payload limit wording): Refuse mode.
+            ntcp = Ntcp(binary, a["ntcp"], "refuse")
+            evidence.update(tun_echo_udp_mode=ntcp.udp_mode)
         kernel_before = counters(family)
 
         def udp(size, salt, wait=2.0):
@@ -529,7 +988,7 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None):
             items = [e for e in events if e["direction"] == "from-ntcp" and e["protocol"] == protocol
                      and e["source"] == a["ntcp"] and e["destination"] == a["peer"]]
             for e in items:
-                assert e["checksum_valid"] and e["ip_checksum_valid"] and not e["fragmented"], public(e)
+                assert not e["fragmented"] and e["checksum_valid"] and e["ip_checksum_valid"], public(e)
                 assert family == 6 or e["df"], ("IPv4 DF is required", public(e))
             return items
 
@@ -564,7 +1023,11 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None):
             return dict(protocol=quoted["protocol"], sport=quoted.get("sport"), dport=quoted.get("dport"),
                         seq=quoted.get("seq"), length=quoted["length"])
 
-        if scenario in STAGED:
+        if scenario == "fragment":
+            evidence.update(fragmented(family, a, capture, ntcp, peer, ptbs))
+        elif scenario in DRIVEN:
+            evidence.update(driven(family, scenario, a, capture, driver, peer, command, ptbs))
+        elif scenario in STAGED:
             evidence.update(staged(family, scenario, a, capture, stager, peer, command, sent, ptbs, accepted_ptb))
         elif scenario == "shared-fanout":
             # A UDP client and TCP streams A and B, all established on the one
@@ -733,14 +1196,18 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None):
                                                   refusal=refused.group(0)))
         kernel_after = counters(family)
         generated = len(ptbs(capture.since(0))) if scenario != "forged" else 0
-        if scenario != "forged":
+        if scenario == "adjunct-silence":
+            # Silence: the drop rule precedes forwarding, so no PTB at all.
+            assert kernel_after - kernel_before == generated == 0, (kernel_before, kernel_after, generated)
+        elif scenario != "forged":
             assert kernel_after - kernel_before == generated >= 1, (kernel_before, kernel_after, generated)
         evidence.update(settings=settings, kernel_ptb_counter=dict(before=kernel_before, after=kernel_after),
                         router_generated_ptbs=generated, ntcp_stderr=ntcp.since(0)[-12:] if ntcp else None)
     finally:
         primary = sys.exc_info()[0] is not None
         errors = []
-        for close in (ntcp and ntcp.close, stager and stager.close, peer.close, capture and capture.close):
+        for close in (ntcp and ntcp.close, stager and stager.close, driver and driver.close, peer.close,
+                      capture and capture.close):
             if close:
                 try:
                     close()

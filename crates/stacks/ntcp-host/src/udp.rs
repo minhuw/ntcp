@@ -7,7 +7,11 @@
 //! datagrams are correlated by the single Host dispatcher and become bounded,
 //! consumed events. All storage is allocated once by `Host::new`.
 
-use crate::ledger::{Evidence, Owner, Selector};
+use crate::emitter::{
+    DatagramError, DatagramReport, IPV4_PEER_REASSEMBLY, IPV6_PEER_REASSEMBLY, Piece, Plan,
+    ProbeRecord, UdpDatagramLimits, UdpSend, UdpSendMode, family_max, header_len,
+};
+use crate::ledger::{Evidence, FragmentPrefix, Owner, Selector};
 use crate::{BackendOutcome, Error, Host, IngressPacket};
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -43,16 +47,21 @@ pub struct UdpLimits {
 
 /// Add UDP capacity to limits from `managed_limits`: one path client and
 /// cache entry per flow (a flow pins the path it currently sends on), one
-/// ledger owner per flow, one concurrent attempt, because a datagram's
-/// reservation lives only inside a single `udp_send` call, and each flow's
-/// evicted-signature budget.
+/// ledger owner per flow, concurrent attempts for one datagram (a
+/// datagram's reservation lives only inside a single send call: one ticket,
+/// or one per fragment up to `limits.datagrams.max_fragments`), and each
+/// flow's evicted-signature budget.
 pub fn managed_udp_limits(
     paths: ntcp_path::Limits,
     limits: crate::Limits,
     udp: UdpLimits,
 ) -> Result<(ntcp_path::Limits, crate::Limits), Error> {
     let add = |a: usize, b: usize| a.checked_add(b).ok_or(Error::Capacity);
-    let attempts = usize::from(udp.flows != 0);
+    let attempts = if udp.flows == 0 {
+        0
+    } else {
+        limits.datagrams.max_fragments.max(1)
+    };
     Ok((
         ntcp_path::Limits {
             paths: add(paths.paths, udp.flows)?,
@@ -113,8 +122,10 @@ pub enum UdpEvent {
 /// What a flow may send to its pinned destination now: the path's MMS_S
 /// (RFC 1191 section 6.1: path MTU less the minimum IP header) and the
 /// largest UDP payload one unfragmented datagram may carry, with the path
-/// incarnation and shared version they were read from. Datagrams are indivisible, so an application
-/// sizes each one against this before building it.
+/// incarnation and shared version they were read from. `udp_send` never
+/// divides a datagram, so an application using it sizes each one against
+/// this before building it; `udp_datagram_limits` reports what the
+/// fragmenting and probing modes of `udp_send_datagram` accept.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdpPathLimits {
     pub destination: IpAddr,
@@ -142,10 +153,11 @@ pub enum UdpSent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UdpSendError {
-    /// The datagram exceeds what the current path allows. This Host sends
-    /// only unfragmented datagrams (IPv4 always with DF), so it is refused
-    /// rather than split; `max_payload` is the largest UDP payload this flow
-    /// may send to that destination now.
+    /// The datagram exceeds what the current path allows unfragmented.
+    /// `udp_send` never splits a datagram (IPv4 always with DF); it is
+    /// refused, and `max_payload` is the largest UDP payload this flow may
+    /// send unfragmented to that destination now. Fragmentation and probes
+    /// are selected through `udp_send_datagram`.
     TooBig {
         max_payload: usize,
     },
@@ -164,6 +176,8 @@ struct Flow {
     local: SocketAddr,
     remote: Option<SocketAddr>,
     options: UdpOptions,
+    // Default send mode and stated peer capability (Refuse until set).
+    send: UdpSend,
     path: Option<PreparedPath>,
     // Newest unconsumed shared change to the pinned path, replaced (never
     // queued) by later ones, so a slow reader sees the current limits.
@@ -265,7 +279,7 @@ fn udp_limits(snapshot: ntcp_path::PathSnapshot) -> Result<UdpPathLimits, Error>
     } else {
         ntcp_ip6::IPV6_HEADER
     };
-    let budget = snapshot.ip_packet_budget()? as usize;
+    let budget = snapshot.ip_packet_budget().map_err(Error::from)? as usize;
     Ok(UdpPathLimits {
         destination,
         path: snapshot.path(),
@@ -352,6 +366,7 @@ impl Host {
                 local,
                 remote,
                 options,
+                send: UdpSend::default(),
                 path,
                 change: None,
                 received: Ring::default(),
@@ -753,4 +768,377 @@ impl Host {
         self.udp.slots[slot].flow.as_mut().unwrap().received.len += 1;
         InputDisposition::Processed
     }
+}
+
+impl Host {
+    /// Set the flow's default send mode and the peer reassembly capability
+    /// it states (complete reconstructed IP octets, from explicit
+    /// application, protocol or deployment knowledge; None keeps the
+    /// receiver guarantee). A send may override both.
+    pub fn udp_set_send(&mut self, id: UdpFlowId, send: UdpSend) -> Result<(), Error> {
+        self.udp.flow(id)?;
+        check_capability(send)?;
+        self.udp.slots[id.slot].flow.as_mut().unwrap().send = send;
+        Ok(())
+    }
+
+    /// The limits `udp_send_datagram` applies to `remote` under `send` (the
+    /// flow default when None): the unfragmented payload limit, the size
+    /// fragments are cut to, the largest logical datagram the mode accepts
+    /// and the peer guarantee in force. Pins the destination like
+    /// `udp_path_limits`.
+    pub fn udp_datagram_limits(
+        &mut self,
+        endpoint: &Endpoint,
+        id: UdpFlowId,
+        remote: Option<IpAddr>,
+        send: Option<UdpSend>,
+    ) -> Result<UdpDatagramLimits, Error> {
+        self.check_endpoint(endpoint)?;
+        let flow = self.udp.flow(id)?;
+        let send = send.unwrap_or(flow.send);
+        check_capability(send)?;
+        let remote = match (flow.remote.map(|r| r.ip()), remote) {
+            (Some(fixed), None) => fixed,
+            (Some(fixed), Some(remote)) if fixed == remote => fixed,
+            (None, Some(remote)) => remote,
+            _ => return Err(Error::InvalidContext),
+        };
+        let (prepared, limits) = self.udp_path(id.slot, flow, remote)?;
+        self.datagram_limits(prepared.snapshot, limits, send)
+    }
+
+    fn datagram_limits(
+        &self,
+        snapshot: ntcp_path::PathSnapshot,
+        path: UdpPathLimits,
+        send: UdpSend,
+    ) -> Result<UdpDatagramLimits, Error> {
+        let ipv4 = path.destination.is_ipv4();
+        let overhead = header_len(ipv4) + ntcp_ip::UDP_HEADER;
+        let udp_max = usize::from(u16::MAX) - ntcp_ip::UDP_HEADER;
+        let floor = if ipv4 {
+            IPV4_PEER_REASSEMBLY
+        } else {
+            IPV6_PEER_REASSEMBLY
+        };
+        let guarantee = send.peer_capability.map_or(floor, |c| c.max(floor));
+        let effective_size = self.connectionless_size(snapshot)?;
+        let effective_payload = (effective_size as usize)
+            .saturating_sub(overhead)
+            .min(udp_max);
+        // The fragment budget: every fragment but the last carries a
+        // multiple of 8 data octets (RFC 791 section 3.2, RFC 8200 section
+        // 4.5); `fragment_count` applies the same cut when sending.
+        let fragmentable_payload = if send.mode == UdpSendMode::Fragment {
+            let per = header_len(ipv4) + if ipv4 { 0 } else { ntcp_ip6::FRAGMENT_HEADER };
+            let room = (effective_size as usize).saturating_sub(per);
+            let fragments = self.datagram_limits.max_fragments;
+            let data = if fragments == 0 || room < 8 {
+                0
+            } else {
+                (fragments - 1) * (room & !7) + room
+            };
+            (header_len(ipv4) + data)
+                .min(guarantee as usize)
+                .min(family_max(ipv4))
+                .saturating_sub(overhead)
+                .min(udp_max)
+        } else {
+            0
+        };
+        let max_payload = match send.mode {
+            UdpSendMode::Refuse => path.max_payload,
+            UdpSendMode::Probe => (snapshot.first_hop_mtu() as usize)
+                .min(family_max(ipv4))
+                .saturating_sub(overhead)
+                .min(udp_max),
+            UdpSendMode::Fragment => fragmentable_payload.max(path.max_payload),
+        };
+        Ok(UdpDatagramLimits {
+            path,
+            send,
+            unfragmented_payload: path.max_payload,
+            effective_size,
+            effective_payload,
+            fragmentable_payload,
+            max_payload,
+            guarantee,
+            guarantee_stated: send.peer_capability.is_some(),
+        })
+    }
+
+    /// Send one datagram under `send` (the flow default when None):
+    ///
+    /// - Refuse: exactly `udp_send`'s contract, reported as one packet.
+    /// - Fragment: a datagram within the connectionless effective size goes
+    ///   out unfragmented; a larger one within the peer guarantee (or stated
+    ///   capability) and `max_fragments` is fragmented to that size even
+    ///   below the first-hop MTU (RFC 4821 section 8), each IPv4 fragment
+    ///   with DF; one that may not be fragmented still goes whole within the
+    ///   shared ordinary budget; beyond both the send is refused with
+    ///   `PeerLimit` (RFC 1122 section 3.3.3, RFC 8200 section 5) or
+    ///   `TooBig`. `UdpDatagramLimits::fragments` states the same decision.
+    /// - Probe: one unfragmented datagram up to the first-hop MTU (RFC 4821
+    ///   section 9); only the learned-size admission is bypassed, and the
+    ///   returned record proves submission, not delivery.
+    ///
+    /// The UDP checksum is computed once over the complete datagram.
+    /// `packet` must hold `UdpDatagramLimits::buffer_len(payload.len())`
+    /// octets. `submit` is called once per physical packet, in order; the
+    /// transaction stops at the first outcome that is not Submitted.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-8
+    //= reason=Host::udp_send_datagram's Fragment mode (crates/stacks/ntcp-host/src/udp.rs) fragments, in the host IP layer, an application datagram larger than the connectionless effective Path MTU E = min(shared ordinary budget, max(connectionless initial eff_pmtu, adjunct-confirmed lower bound)) to E even when it is smaller than the first-hop MTU, within the receiver reassembly guarantee (IPv4 576, IPv6 1500) or a capability the application states; a datagram the guarantee forbids fragmenting still goes whole within the shared budget. Every IPv4 fragment carries DF and a leased Identification, and IPv6 uses the same emitter, so the behavior is the same in both families. Host tests cut a 3000-octet datagram at E = 1280 below a 1500 first hop into 1276-octet IPv4 and 1280-octet IPv6 fragments with DF on each IPv4 fragment and one complete-datagram checksum; the integration/rfc_host fragment case captures tun_echo replies cut to E below the 1500 first hop, and fragment-ptb shows a real router PTB for an oversized DF first fragment lowering the path so the next datagram is refragmented at 1280. Section 9's exception is Probe mode (4821-158).
+    //# It is RECOMMENDED that IPv4 implementations use a strategy that mimics IPv6 functionality. When an application sends datagrams that are larger than the effective Path MTU, they SHOULD be fragmented to the Path MTU in the host IP layer even if they are smaller than the MTU of the first link, directly attached to the host. The DF bit SHOULD be set on the fragments, so they will not be fragmented again in the network. This technique will minimize the likelihood that applications will rely on IPv4 fragmentation in a way that cannot be implemented in IPv6. At least one major operating system already uses this strategy. Section 9 describes some exceptions to this rule when the application is sending oversized packets for probing or diagnostic purposes.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-4
+    //= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+    //# All implementations MUST include mechanisms for applications to selectively transmit packets larger than the current effective Path MTU, but smaller than the first-hop link MTU. This is necessary to implement PLPMTUD using a connectionless protocol within an application and to implement diagnostic tools that do not rely on the operating system's implementation of Path MTU Discovery. See Section 9 for further discussion.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-9
+    //= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+    //# All implementations MUST include a mechanism where applications using connectionless protocols can send their own probes. This is necessary to implement PLPMTUD in an application protocol as described in Section 10.4 or to implement diagnostic tools for debugging problems with PMTUD. There MUST be a mechanism that permits an application to send datagrams that are larger than eff_pmtu, the operating systems estimate of the Path MTU, without being fragmented. If these are IPv4 packets, they MUST have the DF bit set.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-9
+    //= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+    //# At this time, most operating systems support two modes for sending datagrams: one that silently fragments packets that are too large, and another that rejects packets that are too large. Neither of these modes is suitable for implementing PLPMTUD in an application or diagnosing problems with Path MTU Discovery. A third mode is REQUIRED where the datagram is sent even if it is larger than the current estimate of the Path MTU.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-10.4
+    //= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+    //# All application probing techniques require the ability to send messages that are larger than the current eff_pmtu described in Section 9.
+    #[allow(clippy::too_many_arguments)]
+    pub fn udp_send_datagram(
+        &mut self,
+        endpoint: &Endpoint,
+        now: Instant,
+        id: UdpFlowId,
+        remote: Option<SocketAddr>,
+        send: Option<UdpSend>,
+        payload: &[u8],
+        packet: &mut [u8],
+        submit: impl FnMut(UdpEgress, &[u8]) -> BackendOutcome,
+    ) -> Result<DatagramReport, DatagramError> {
+        self.check_endpoint(endpoint)?;
+        let flow = self.udp.flow(id)?;
+        let send = send.unwrap_or(flow.send);
+        check_capability(send)?;
+        let remote = match (flow.remote, remote) {
+            (Some(fixed), None) => fixed,
+            (Some(fixed), Some(remote)) if fixed == remote => fixed,
+            (None, Some(remote)) => remote,
+            _ => return Err(Error::InvalidContext.into()),
+        };
+        if remote.port() == 0
+            || !supported(remote)
+            || !endpoint.admits_datagram(AddressValidation::Open {
+                local: flow.local.ip(),
+                remote: remote.ip(),
+            })
+        {
+            return Err(Error::from(EndpointError::InvalidAddress).into());
+        }
+        let (prepared, path) = self.udp_path(id.slot, flow, remote.ip())?;
+        let snapshot = prepared.snapshot;
+        let limits = self.datagram_limits(snapshot, path, send)?;
+        let ipv4 = remote.is_ipv4();
+        let header = header_len(ipv4);
+        let data_len = ntcp_ip::UDP_HEADER + payload.len();
+        let complete = header + data_len;
+        let budget = snapshot.ip_packet_budget().map_err(Error::from)? as usize;
+        // Whether to cut the datagram, and to what size.
+        let ip = IpMetadata {
+            source: flow.local.ip(),
+            destination: remote.ip(),
+        };
+        let fragment_size = match send.mode {
+            UdpSendMode::Refuse => {
+                if payload.len() > path.max_payload {
+                    return Err(DatagramError::TooBig {
+                        max_payload: path.max_payload,
+                    });
+                }
+                None
+            }
+            UdpSendMode::Probe => {
+                if payload.len() > limits.max_payload {
+                    return Err(DatagramError::TooBig {
+                        max_payload: limits.max_payload,
+                    });
+                }
+                None
+            }
+            UdpSendMode::Fragment => {
+                // The decision `UdpDatagramLimits` reports: within the
+                // effective size whole, then fragments within the peer
+                // guarantee and `max_fragments`.
+                if limits.fragments(payload.len()) {
+                    Some(limits.effective_size as usize)
+                } else if payload.len() <= limits.effective_payload
+                    || payload.len() <= path.max_payload
+                {
+                    // Never refused within the path's unfragmented limit.
+                    None
+                } else if complete > limits.guarantee as usize {
+                    return Err(DatagramError::PeerLimit {
+                        max_payload: limits.max_payload,
+                        guarantee: limits.guarantee,
+                    });
+                } else {
+                    return Err(DatagramError::TooBig {
+                        max_payload: limits.max_payload,
+                    });
+                }
+            }
+        };
+        let (dscp, hop_limit) = (flow.options.dscp, flow.options.hop_limit);
+        let (source_port, destination_port) = (flow.local.port(), remote.port());
+        match fragment_size {
+            None => {
+                let packet = packet.get_mut(..complete).ok_or(Error::Capacity)?;
+                packet[header + ntcp_ip::UDP_HEADER..].copy_from_slice(payload);
+                let encoded = if ipv4 {
+                    ntcp_ip::encode_udp(
+                        packet,
+                        ntcp_ip::Header {
+                            ip,
+                            hop_limit,
+                            dscp,
+                            ecn: 0,
+                            ipv4_options: Default::default(),
+                        },
+                        source_port,
+                        destination_port,
+                        payload.len(),
+                        0,
+                    )
+                } else {
+                    ntcp_ip6::encode_udp(
+                        packet,
+                        ntcp_ip6::Header {
+                            ip,
+                            hop_limit,
+                            dscp,
+                            ecn: 0,
+                        },
+                        source_port,
+                        destination_port,
+                        payload.len(),
+                    )
+                };
+                if encoded.map_err(Error::Codec)? != complete {
+                    return Err(Error::Obsolete.into());
+                }
+            }
+            Some(size) => {
+                let data = packet
+                    .get_mut(size..size + data_len)
+                    .ok_or(Error::Capacity)?;
+                data[ntcp_ip::UDP_HEADER..].copy_from_slice(payload);
+                ntcp_ip_common::encode_udp(
+                    ip.source,
+                    ip.destination,
+                    source_port,
+                    destination_port,
+                    data,
+                    payload.len(),
+                )
+                .map_err(Error::Codec)?;
+            }
+        }
+        let owner = Owner::Datagram {
+            flow: id.slot,
+            generation: id.generation,
+        };
+        // Per-fragment evidence (RFC 4821 section 8 host fragmentation): the
+        // ICMP dispatcher correlates a quoted first fragment by its UDP
+        // selector and a later one only by its exact physical evidence.
+        let evidence = |piece: Piece, data: &[u8]| {
+            let transport = if piece.offset == 0 {
+                // Fragment zero (or the whole datagram) starts with the UDP
+                // header of the complete datagram.
+                let (udp, first) = match fragment_size {
+                    Some(_) => (data, piece.more),
+                    None => (&data[header..], false),
+                };
+                let (length, checksum) = (
+                    u16::from_be_bytes([udp[4], udp[5]]),
+                    u16::from_be_bytes([udp[6], udp[7]]),
+                );
+                if first {
+                    Selector::UdpFirstFragment {
+                        source_port,
+                        destination_port,
+                        length,
+                        checksum,
+                    }
+                } else {
+                    Selector::Udp {
+                        source_port,
+                        destination_port,
+                        length,
+                        checksum,
+                    }
+                }
+            } else {
+                Selector::Fragment {
+                    offset: piece.offset as u16,
+                    more: piece.more,
+                    prefix: FragmentPrefix::new(data),
+                    logical_ports: (source_port, destination_port),
+                }
+            };
+            Some(Evidence {
+                link: snapshot.key().link(),
+                path: snapshot.path(),
+                owner,
+                source: ip.source,
+                destination: ip.destination,
+                dscp,
+                header_len: piece.header_len as u16,
+                packet_len: piece.packet_len as u32,
+                protocol: ntcp_ip::PROTOCOL_UDP,
+                transport,
+            })
+        };
+        let plan = Plan {
+            ip,
+            protocol: ntcp_ip::PROTOCOL_UDP,
+            dscp,
+            hop_limit,
+            data_len,
+            fragment_size,
+            snapshot,
+            client: Some(prepared.client),
+        };
+        let mut report = self.transmit(
+            now,
+            plan,
+            packet,
+            evidence,
+            Some(owner),
+            Some(endpoint),
+            submit,
+        )?;
+        if send.mode == UdpSendMode::Probe {
+            report.probe = Some(ProbeRecord {
+                definite: report.submitted == 1,
+                flow_generation: id.generation,
+                path: snapshot.path(),
+                version: snapshot.version(),
+                negative_revision: snapshot.negative_revision(),
+                size: complete as u32,
+                above: (complete > budget).then_some(budget as u32),
+                submitted_at: now,
+            });
+        }
+        Ok(report)
+    }
+}
+
+fn check_capability(send: UdpSend) -> Result<(), Error> {
+    // A stated capability is a complete reconstructed datagram; one below
+    // the family's receiver guarantee states nothing more than it.
+    if send
+        .peer_capability
+        .is_some_and(|c| !(IPV4_PEER_REASSEMBLY..=65575).contains(&c))
+    {
+        return Err(Error::Capacity);
+    }
+    Ok(())
 }

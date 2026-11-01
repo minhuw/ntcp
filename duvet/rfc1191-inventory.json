@@ -383,7 +383,7 @@
       "section": "3.1",
       "quote": "in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.",
       "status": "TODO",
-      "reason": "Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. This does not establish that configured receive sizing represents host MMS_R-40 or the permitted maximum connected-link MTU across multiple interfaces; a host receive/reassembly and topology contract remains necessary. The optional link-derived choice is not itself a required feature.",
+      "reason": "Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. T13 supplies the host capacity: Host::reassembly_capacity states, per family and per Host context, EMTU_R (RFC 1122 section 3.3.2: the largest complete IP datagram, header included, that the configured, storage-backed reassembly engine accepts) and MMS_R (EMTU_R - 20 for IPv4, EMTU_R - 40 for IPv6). This paragraph calls the largest reassemblable datagram MMS_R, so its host MMS_R-40 is EMTU_R - 40, that is RFC 1122's MMS_R less TCP's 20-octet header for IPv4; the TCP payload unit (MSS) differs from both EMTU_R and MMS_R. Configured receive sizing is not yet derived from that capacity or from the permitted maximum connected-link MTU across multiple interfaces: a host receive/reassembly and topology contract remains necessary. Remaining: T16 owns the receive-MSS derivation from Host::reassembly_capacity and the connected links, and T19 the topology evidence. The optional link-derived choice is not itself a required feature.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    fn receive_mss_offer(",
@@ -591,7 +591,7 @@
       "section": "6.1",
       "quote": "We therefore believe that the IP layer should store PMTU information and that the ICMP layer should process received Datagram Too Big messages. The packetization layers must still be able to respond to changes in the Path MTU, by changing the size of the datagrams they send, and must also be able to specify that datagrams are sent with the DF bit set. We do not want the IP layer to simply set the DF bit in every packet, since it is possible that a packetization layer, perhaps a UDP application outside the kernel, is unable to change its datagram size. Protocols involving intentional fragmentation, while inelegant, are sometimes successful (NFS being the primary example), and we do not want to break such protocols.",
       "status": "TODO",
-      "reason": "T7 PathService stores shared IP estimates, T8 Host binds actual native/TUN TCP factories and T9 Host ICMP dispatch processes correlated Datagram Too Big messages. T10 lets packetization layers respond: TCP connections receive each shared change by budget application in Host::service_changes, and Host UDP flows read their payload limit (Host::udp_path_limits) and change notifications (Host::udp_path_change) to resize. Host UDP datagrams are always sent unfragmented with DF (UdpSendError::TooBig reports the allowable payload); IPv4 TCP sets DF by default, and native sockets configured with IP_MTU_DISCOVER=IP_PMTUDISC_DONT clear it. Remaining T13: a per-packetization-layer DF choice with intentional source fragmentation and IPv4 identification for datagram users that cannot resize.",
+      "reason": "T7 PathService stores shared IP estimates, T8 Host binds actual native/TUN TCP factories and T9 Host ICMP dispatch processes correlated Datagram Too Big messages. T10 lets packetization layers respond: TCP connections receive each shared change by budget application in Host::service_changes, and Host UDP flows read their payload limit (Host::udp_path_limits) and change notifications (Host::udp_path_change) to resize. Host::udp_send still sends each UDP datagram unfragmented with DF (UdpSendError::TooBig reports the allowable payload); T13's Host::udp_send_datagram adds an explicit per-flow default and per-send mode: Fragment source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability (every IPv4 fragment keeps DF and carries an Identification from the Host allocator), Refuse keeps udp_send's contract, and Probe sends one unfragmented datagram above the estimate. The integration/rfc_host fragment and fragment-ptb cases show datagram users that do not resize served by intentional source fragmentation on a real path (tun_echo replies and a driven Host UDP flow, refragmented at 1280 after a real router PTB). IPv4 TCP sets DF by default; native sockets configured with IP_MTU_DISCOVER=IP_PMTUDISC_DONT clear it on ordinary output, each such packet carrying an Identification leased from the same allocator, while their PLPMTUD probes keep DF. Remaining (T12): the IP layer still sets DF on every UDP datagram and fragment, so a datagram protocol that relies on fragmentation in the network has no DF-clear choice; T12's administrative IPv4 DF override (the route flag of 1191-093), whose precedence over DF-bearing fragments and probes is decided when T12 is planned, supplies it.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
     },
     {
@@ -935,7 +935,7 @@
       "section": "6.5",
       "quote": "Some transport protocols (such as ISO TP4 [3]) are not allowed to repacketize when doing a retransmission. That is, once an attempt is made to transmit a datagram of a certain size, its contents cannot be split into smaller datagrams for retransmission. In such a case, the original datagram should be retransmitted without the DF bit set, allowing it to be fragmented as necessary to reach its destination. Subsequent datagrams, when transmitted for the first time, should be no larger than allowed by the Path MTU, and should have the DF bit set.",
       "status": "exception",
-      "reason": "ISO TP4/NFS/UDP packetization actors are not implemented by this TCP library; TCP can and does repacketize retransmissions.",
+      "reason": "Actor not implemented: ISO TP4 and NFS are not implemented, and no transport in this stack has a stack-managed non-repacketizing retransmission algorithm (TCP repacketizes its retransmissions). Host UDP is a datagram service whose applications own retransmission and datagram sizes, and the Host IP layer does fragment: Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment (4821-155), so an application that cannot split or shrink a datagram is served by host fragmentation rather than by clearing DF; Host::udp_datagram_limits reports the sizes it may use. A DF-clear route override is T12's (1191-093).",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.5"
     },
     {
@@ -950,7 +950,7 @@
       "section": "6.5",
       "quote": "We recommend that NFS implementations use PMTU Discovery whenever",
       "status": "exception",
-      "reason": "ISO TP4/NFS/UDP packetization actors are not implemented by this TCP library; TCP can and does repacketize retransmissions.",
+      "reason": "Actor not implemented: ISO TP4 and NFS are not implemented, and no transport in this stack has a stack-managed non-repacketizing retransmission algorithm (TCP repacketizes its retransmissions). Host UDP is a datagram service whose applications own retransmission and datagram sizes, and the Host IP layer does fragment: Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment (4821-155), so an application that cannot split or shrink a datagram is served by host fragmentation rather than by clearing DF; Host::udp_datagram_limits reports the sizes it may use. A DF-clear route override is T12's (1191-093).",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.5"
     },
     {
@@ -958,7 +958,7 @@
       "section": "6.5",
       "quote": "routers are involved. Most NFS implementations allow the RPC datagram size to be changed at mount-time (indirectly, by changing the effective file system block size), but might require some modification to support changes later on.",
       "status": "exception",
-      "reason": "ISO TP4/NFS/UDP packetization actors are not implemented by this TCP library; TCP can and does repacketize retransmissions.",
+      "reason": "Actor not implemented: ISO TP4 and NFS are not implemented, and no transport in this stack has a stack-managed non-repacketizing retransmission algorithm (TCP repacketizes its retransmissions). Host UDP is a datagram service whose applications own retransmission and datagram sizes, and the Host IP layer does fragment: Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment (4821-155), so an application that cannot split or shrink a datagram is served by host fragmentation rather than by clearing DF; Host::udp_datagram_limits reports the sizes it may use. A DF-clear route override is T12's (1191-093).",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.5"
     },
     {
@@ -966,7 +966,7 @@
       "section": "6.5",
       "quote": "Also, since a single NFS operation cannot be split across several UDP datagrams, certain operations (primarily, those operating on file names and directories) require a minimum datagram size that may be larger than the PMTU. NFS implementations should not reduce the datagram size below this threshold, even if PMTU Discovery suggests a lower value. (Of course, in this case datagrams should not be sent with DF set.)",
       "status": "exception",
-      "reason": "ISO TP4/NFS/UDP packetization actors are not implemented by this TCP library; TCP can and does repacketize retransmissions.",
+      "reason": "Actor not implemented: ISO TP4 and NFS are not implemented, and no transport in this stack has a stack-managed non-repacketizing retransmission algorithm (TCP repacketizes its retransmissions). Host UDP is a datagram service whose applications own retransmission and datagram sizes, and the Host IP layer does fragment: Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment (4821-155), so an application that cannot split or shrink a datagram is served by host fragmentation rather than by clearing DF; Host::udp_datagram_limits reports the sizes it may use. A DF-clear route override is T12's (1191-093).",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.5"
     },
     {
@@ -974,7 +974,7 @@
       "section": "6.6",
       "quote": "We suggest that an implementation provide a way for a system utility program to:",
       "status": "TODO",
-      "reason": "Introduces the per-route administrative controls in 1191-091/092; no system-utility route-control interface exists.",
+      "reason": "Introduces the per-route administrative controls in 1191-091/092; no system-utility route-control interface exists. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the owner-authorized path administration API, native commands and the opt-in local control utility; T19 exercises the utility controls in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -982,7 +982,7 @@
       "section": "6.6",
       "quote": "- Specify that PMTU Discovery not be done on a given route.",
       "status": "TODO",
-      "reason": "PMTUD is configured per connection at creation, but no system-utility control disables discovery on a given route.",
+      "reason": "PMTUD is configured per connection at creation, but no system-utility control disables discovery on a given route. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds per-path discovery disable through the owner-authorized administration API and utility; T19 exercises it in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -990,7 +990,7 @@
       "section": "6.6",
       "quote": "- Change the PMTU value associated with a given route.",
       "status": "TODO",
-      "reason": "Endpoint::set_destination_route and set_route_mtu expose same-path transport ceilings, and lower_mss supplies a send ceiling. None sets an arbitrary learned per-route IP PMTU estimate or exposes the suggested system-utility route-cache control; relaxing a ceiling still requires ACK proof for growth.",
+      "reason": "Endpoint::set_destination_route and set_route_mtu expose same-path transport ceilings, and lower_mss supplies a send ceiling. None sets an arbitrary learned per-route IP PMTU estimate or exposes the suggested system-utility route-cache control; relaxing a ceiling still requires ACK proof for growth. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the learned-estimate set API and utility; T19 exercises it in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -998,7 +998,7 @@
       "section": "6.6",
       "quote": "The former can be accomplished by associating a flag with the routing entry; when a packet is sent via a route with this flag set, the IP layer leaves the DF bit clear no matter what the upper layer requests.",
       "status": "TODO",
-      "reason": "The suggested route flag to override DF is not provided; the IPv4 codec always sets DF.",
+      "reason": "The suggested route flag that leaves DF clear is not provided. IPv4 packets carry DF (the atomic encoder and every source fragment); the only DF-clear packets are the application-requested IP_PMTUDISC_DONT TCP output, each with an Identification leased from the Host allocator. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. A DF-clear datagram is non-atomic, so such a route needs exactly these leased Identifications (RFC 6864). Remaining: T12 adds the administrative IPv4 DF override for existing and future users and decides its precedence over DF-bearing fragments and PLPMTUD probes; T19 exercises it in namespace topologies.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {

@@ -347,57 +347,10 @@ inconsistency between multicast duplication procedures and IP tunnels
 with full ECN functionality is resolved.
 '''
 
-# 3168-G007 | IP reassembler | fragment reassembly
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "Actor: IP reassembler. No IP reassembler is provided: crates/stacks/ntcp/examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
-quote = '''
-Reassembly of a fragmented packet MUST NOT lose indications of
-congestion.
-'''
-
-# 3168-G008 | IP reassembler | fragment reassembly
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "Actor: IP reassembler. No IP reassembler is provided: crates/stacks/ntcp/examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
-quote = '''
-In other words, if any fragment of an IP packet to be
-reassembled has the CE codepoint set, then one of two actions MUST be
-taken:
-'''
-
-# 3168-G009 | IP reassembler | fragment reassembly
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "Actor: IP reassembler. No IP reassembler is provided: crates/stacks/ntcp/examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
-quote = '''
-However, this
-MUST NOT occur if any of the other fragments contributing to
-this reassembly carries the Not-ECT codepoint.
-'''
-
-# 3168-G010 | IP reassembler | fragment reassembly
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "Actor: IP reassembler. No IP reassembler is provided: crates/stacks/ntcp/examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
-quote = '''
-If both actions are applicable, either MAY be chosen.
-'''
-
-# 3168-G011 | IP reassembler | fragment reassembly
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "Actor: IP reassembler. No IP reassembler is provided: crates/stacks/ntcp/examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
-quote = '''
-Reassembly of
-a fragmented packet MUST NOT change the ECN codepoint when all of the
-fragments carry the same codepoint.
-'''
-
 # 3168-G012 | protocol specification author | protocol requires more precise mixed-fragment semantics
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "Actor: protocol specification author. No IP reassembler is provided: crates/stacks/ntcp/examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
+reason = "Actor: protocol specification author. This SHOULD addresses authors of protocol specifications, not an implementation. The Host reassembly engine (crates/stacks/ntcp-host/src/reassembly.rs) applies an explicit ECN table to mixed fragments; Host::receive routes every received fragment through that engine before demultiplexing."
 quote = '''
 In situations
 where more precise reassembly behavior would be required, protocol
@@ -846,14 +799,6 @@ target = "https://www.rfc-editor.org/rfc/rfc3168#section-12"
 reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
 quote = '''
 When ECN (Explicit Congestion Notification) is used, it is required that congestion indications generated within an IP tunnel not be lost at the tunnel egress.
-'''
-
-# 3168-A020 | IP reassembler | CE-bearing fragment reassembly alternative
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "No reassembler is provided; adapter rejects IP fragments rather than offering reassembly. This alternative is not an implemented TCP reassembly guarantee."
-quote = '''
-* The packet is dropped, instead of being reassembled, for any other reason.
 '''
 
 # 3168-A034 | IANA | publication registry allocation

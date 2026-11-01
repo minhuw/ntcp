@@ -1,6 +1,6 @@
 // The change service through real Host/Endpoint owners: shared fanout,
 // failed-client isolation, coalescing, and publication of connection results.
-use super::dispatch::{ptb, tcp_report};
+use super::dispatch::{ptb, seal_ipv4, tcp_report};
 use super::*;
 
 type Side = (Host, Endpoint, IngressContext);
@@ -681,6 +681,101 @@ fn udp_quoted_decrease_notifies_every_tcp_connection_on_the_path() {
     }
 }
 
+// A quoted fragment is evidence only of a fragment this Host submitted: one
+// built from an unfragmented datagram (a first fragment with its UDP header,
+// or a later fragment carrying its bytes) matches nothing even when its
+// addresses and leading bytes match a live datagram, and changes nothing;
+// the unfragmented quote still correlates afterwards.
+#[test]
+fn fragment_quotes_of_unfragmented_datagrams_do_not_correlate() {
+    for v6 in [false, true] {
+        let cfg = config(4);
+        let (local, remote) = addresses(v6);
+        let mut a = udp_side(local, 4170 + u128::from(v6), &cfg);
+        let udp = flow(&mut a, 5000, remote.ip(), 0);
+        let path = limits(&mut a, udp).path;
+        let mut packet = [0; 1600];
+        let Ok(UdpSent::Submitted(n)) =
+            a.0.udp_send(&a.1, 0, udp, None, &[3; 1400], &mut packet, |_, _| {
+                BackendOutcome::Submitted
+            })
+        else {
+            panic!("datagram not submitted");
+        };
+        let sent = &packet[..n];
+        let fragment = if v6 {
+            // The same bytes behind a Fragment header: a later fragment.
+            let mut f = sent[..40].to_vec();
+            f[6] = 44;
+            let payload = u16::from_be_bytes([f[4], f[5]]) + 8;
+            f[4..6].copy_from_slice(&payload.to_be_bytes());
+            f.extend_from_slice(&[17, 0, 0, 8 | 1, 0, 0, 0, 1]);
+            f.extend_from_slice(&sent[40..]);
+            f
+        } else {
+            // MF set: a first fragment with the datagram's UDP header.
+            let mut f = sent.to_vec();
+            f[6] |= 0x20;
+            seal_ipv4(&mut f);
+            f
+        };
+        let mtu: u32 = if v6 { 1280 } else { 1000 };
+        // A router error quoting the fragment's header and 8 data octets.
+        let quote = &fragment[..if v6 { 56 } else { 28 }];
+        let outer = IpMetadata {
+            source: if v6 { "2001:db8::fe" } else { "192.0.2.254" }
+                .parse()
+                .unwrap(),
+            destination: local.ip(),
+        };
+        let mut message = vec![0; 8 + quote.len()];
+        message[0] = if v6 { 2 } else { 3 };
+        message[1] = if v6 { 0 } else { 4 };
+        message[4..8].copy_from_slice(&mtu.to_be_bytes());
+        message[8..].copy_from_slice(quote);
+        let sum = if v6 {
+            ntcp_icmp::icmpv6_checksum(outer, &message).unwrap()
+        } else {
+            ntcp_icmp::checksum(&message)
+        };
+        message[2..4].copy_from_slice(&sum.to_be_bytes());
+        let mut report = vec![0; 40 + message.len()];
+        let n = if v6 {
+            report[40..].copy_from_slice(&message);
+            let h = ntcp_ip6::Header {
+                ip: outer,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+            };
+            ntcp_ip6::encode_datagram(&mut report, h, 58, message.len()).unwrap()
+        } else {
+            report[20..20 + message.len()].copy_from_slice(&message);
+            let h = ntcp_ip::Header {
+                ip: outer,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            };
+            ntcp_ip::encode_datagram(&mut report, h, 1, message.len(), 0).unwrap()
+        };
+        assert_eq!(
+            a.0.input_icmp(&mut a.1, a.2, 1, &report[..n]).unwrap(),
+            IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Uncorrelated))
+        );
+        assert_eq!(a.0.paths().path_snapshot(path).unwrap().learned_mtu(), None);
+        assert_eq!(a.0.udp_event(udp).unwrap(), None);
+        assert!(matches!(
+            a.0.input_icmp(&mut a.1, a.2, 2, &ptb(sent, mtu)),
+            Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
+                published: Some(path::EstimateChange::Decreased),
+                ..
+            }))
+        ));
+    }
+}
+
 // A client whose rebind fails stays dirty and reports the failure without
 // stopping service of the others; it converges once authority returns.
 #[test]
@@ -1091,7 +1186,7 @@ enum Probe {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
 //= type=test
-//= reason=PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference, with a derived size that is independent of the connection's estimate because a legacy IPv4 report without a Next-Hop MTU is corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate; UDP and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.
+//= reason=PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference, with a derived size that is independent of the connection's estimate because a legacy IPv4 report without a Next-Hop MTU is corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate; UDP datagram and fragment, Echo adjunct probe and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof; the Host's ICMP Echo adjunct offers the forward delivery an exact Echo Reply certifies through the same confirm_delivery rules. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.
 //# The IP layer SHOULD be used to store the cached PMTU value and other shared state such as MTU values reported by ICMP PTB messages. Ideally, this shared state should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path.
 fn delivered_probe_after_hold_raises_shared_ceiling_and_stale_proof_never() {
     use Probe::*;
