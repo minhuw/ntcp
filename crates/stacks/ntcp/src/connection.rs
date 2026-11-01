@@ -3378,6 +3378,7 @@ impl Connection {
             report.quoted_packet_len,
             report.candidate_mtu,
             report.current_path,
+            report.path_estimate,
         );
         let id = p.pending_id();
         if id != self.managed_results.pending.map(|(id, _)| id) {

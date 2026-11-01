@@ -34,9 +34,10 @@ pub enum PmtuFeedback {
 /// One Host-correlated report: the local class together with the size the
 /// report itself derives under this connection's configured policy (next-hop
 /// MTU with family floor, or the plateau below an IPv4 quoted length
-/// corrected against the Host-proven submitted length). The derived size is
-/// independent of the connection's current, possibly loss-inferred, estimate;
-/// `feedback` only says whether that local estimate fell.
+/// corrected per RFC 1191 section 5 against the Host's shared path estimate,
+/// the IP layer's current PMTU estimate). The derived size is independent of
+/// the connection's current, possibly loss-inferred, estimate; `feedback`
+/// only says whether that local estimate fell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmtuReport {
     pub feedback: PmtuFeedback,
@@ -795,7 +796,10 @@ impl Pmtud {
         candidate: u32,
     ) -> PmtuReport {
         match self.known(seq, size, header, candidate) {
-            Some(known) => self.report(now, known, size, header, candidate, None),
+            Some(known) => {
+                let reference = self.info.current_mtu;
+                self.report(now, known, size, header, candidate, None, reference)
+            }
             None => PmtuReport::REJECTED,
         }
     }
@@ -842,7 +846,13 @@ impl Pmtud {
     /// loss and probe attribution applies, but no estimate or hold changes.
     /// A current-path report below proven delivery is Deferred whatever the
     /// current estimate, so a loss-inferred local decrease never changes its
-    /// outcome, and the derived size never depends on that estimate either.
+    /// outcome, and the derived size never depends on that estimate either:
+    /// RFC 1191 section 5's "current PMTU estimate" for a legacy IPv4 quote
+    /// is `path_estimate`, the Host's shared estimate of the current path
+    /// incarnation. Without one (an older incarnation, whose report is drop
+    /// advice only) the reference is the submitted length: every estimate
+    /// the packet could have been sent under was at least that large, so it
+    /// reduces every quote any of them would, and it uses no local state.
     #[allow(clippy::too_many_arguments)]
     pub fn correlated_feedback(
         &mut self,
@@ -854,6 +864,7 @@ impl Pmtud {
         quoted_size: u32,
         candidate: u32,
         current_path: bool,
+        path_estimate: Option<u32>,
     ) -> PmtuReport {
         if !self.plausible_quote(quoted_size, header) {
             return PmtuReport::REJECTED;
@@ -865,6 +876,7 @@ impl Pmtud {
             header,
             ambiguous: false,
         };
+        let reference = path_estimate.filter(|_| current_path).unwrap_or(sent_size);
         self.report(
             now,
             known,
@@ -872,12 +884,15 @@ impl Pmtud {
             header,
             candidate,
             Some(current_path),
+            reference,
         )
     }
 
     // `advice` is None for the legacy ring-matched entrypoint, or whether the
-    // Host-proven submission used the connection's current path. Every
+    // Host-proven submission used the connection's current path. `reference`
+    // is the PMTU estimate a legacy IPv4 quote is compared with. Every
     // accepted class is a drop notification for `known`.
+    #[allow(clippy::too_many_arguments)]
     fn report(
         &mut self,
         now: Instant,
@@ -886,6 +901,7 @@ impl Pmtud {
         header: u16,
         candidate: u32,
         advice: Option<bool>,
+        reference: u32,
     ) -> PmtuReport {
         let seq = known.start;
         let sent_size = known.size;
@@ -906,15 +922,13 @@ impl Pmtud {
             //# not less than the current PMTU estimate, it must be reduced by
             //# 4 times the value of the returned Header Length field.
             // header is in bytes already, not the IHL field's 32-bit words.
-            // A Host-correlated report compares with the proven submitted
-            // length, the estimate that packet was actually sent under: the
-            // derived size must not depend on later loss inference. The
-            // uncorrelated legacy entrypoint keeps the current estimate.
-            let reference = if advice.is_some() {
-                sent_size
-            } else {
-                self.info.current_mtu
-            };
+            // A Host-correlated report compares with the Host's shared path
+            // estimate, the IP layer's current PMTU estimate, so the derived
+            // size never depends on connection-local loss inference, and an
+            // exact and a header-inflated quote of a packet smaller than that
+            // estimate derive the same size. A quote not less than it is
+            // reduced as the rule mandates. The uncorrelated legacy
+            // entrypoint has no shared estimate and keeps its own.
             let corrected = if size >= reference {
                 size.saturating_sub(u32::from(header))
             } else {
@@ -1469,8 +1483,18 @@ mod tests {
         for ipv4 in [true, false] {
             let header = if ipv4 { 20 } else { 40 };
             let report = |p: &mut Pmtud, now, mtu, current| {
-                p.correlated_feedback(now, Seq(1), Seq(1449), 1500, header, 1500, mtu, current)
-                    .feedback
+                p.correlated_feedback(
+                    now,
+                    Seq(1),
+                    Seq(1449),
+                    1500,
+                    header,
+                    1500,
+                    mtu,
+                    current,
+                    None,
+                )
+                .feedback
             };
             let mut advised = state(ipv4);
             let mut control = state(ipv4);
@@ -1530,7 +1554,9 @@ mod tests {
                     assert_eq!(inferred, p.info.current_mtu < reported);
                     let (local, deadline) = (p.info.current_mtu, p.deadline);
                     assert_eq!(
-                        p.correlated_feedback(3, second, end, size, header, size, reported, true),
+                        p.correlated_feedback(
+                            3, second, end, size, header, size, reported, true, None
+                        ),
                         PmtuReport {
                             feedback: PmtuFeedback::Deferred,
                             derived_mtu: Some(reported),
@@ -1595,7 +1621,8 @@ mod tests {
                 if candidate >= size {
                     continue;
                 }
-                let report = p.correlated_feedback(2, s, e, size, 20, size, candidate, current);
+                let report =
+                    p.correlated_feedback(2, s, e, size, 20, size, candidate, current, None);
                 assert_eq!(report.feedback, class);
                 assert_eq!(report.derived_mtu, Some(candidate));
                 if target == 0 {
@@ -1634,7 +1661,8 @@ mod tests {
                 p.ack(second, 1, 1000, 1000);
                 p.sent(second, third, 1500, header, false);
                 p.sent(third, end, 1500, header, false);
-                let report = p.correlated_feedback(2, third, end, 1500, header, 1500, reported, true);
+                let report =
+                    p.correlated_feedback(2, third, end, 1500, header, 1500, reported, true, None);
                 assert_eq!(report.feedback, PmtuFeedback::Deferred);
                 let id = p.pending_id().unwrap();
                 p.timeout(3, second, 1, 1000);
@@ -1657,23 +1685,59 @@ mod tests {
     }
 
     // RFC 1191 section 5 for a Host-correlated legacy IPv4 report compares
-    // the quoted length with the proven submitted length, so the derived
-    // size never depends on a loss-inferred local estimate. The uncorrelated
-    // entrypoint keeps the current-estimate comparison.
+    // the quoted length with the Host's shared path estimate, the IP layer's
+    // current PMTU estimate, so the derived size never depends on a
+    // loss-inferred local estimate. A packet smaller than that estimate
+    // derives the same size from an exact and a header-inflated quote; for
+    // one not smaller, section 5 mandates reducing both quotes, which the
+    // rule then cannot tell apart. An older incarnation's report compares
+    // with the submitted length. The uncorrelated entrypoint keeps the
+    // current-estimate comparison.
     #[test]
     fn correlated_legacy_correction_is_independent_of_the_local_estimate() {
         let below = |p: &Pmtud, v: u32| p.plateaus.as_slice().iter().copied().find(|&x| x < v).unwrap();
-        // (submitted, quoted): exact quotes are corrected against the
-        // submitted length, a header-inflated quote recovers it.
-        for (sent, quoted) in [(1010, 1010), (1010, 1030), (1452, 1452), (1452, 1472)] {
+        // (table, shared estimate, submitted, exact-quote and inflated-quote
+        // sizes), each the plateau below the quote, reduced by its header
+        // when not less than the estimate, and capped by the submitted size.
+        let cases = [
+            (Ipv4Plateaus::RFC1191, 1500, 1010, 1006, 1006),
+            (Ipv4Plateaus::RFC1191, 1500, 1452, 1006, 1006),
+            (Ipv4Plateaus::RFC1191, 1500, 1500, 1006, 1492),
+            (Ipv4Plateaus::RFC1191, 1000, 1010, 508, 1006),
+            (Ipv4Plateaus::CONTEMPORARY, 1500, 1010, 576, 576),
+            (Ipv4Plateaus::CONTEMPORARY, 1500, 1495, 1492, 1492),
+            (Ipv4Plateaus::CONTEMPORARY, 1500, 1500, 1460, 1492),
+            (Ipv4Plateaus::CONTEMPORARY, 1000, 1010, 576, 576),
+        ];
+        for (table, estimate, sent, exact, inflated) in cases {
             for inferred in [None, Some(1006), Some(576)] {
-                let mut p = state(true);
-                if let Some(mtu) = inferred {
-                    p.info.current_mtu = mtu;
+                let derive = |quoted, current, shared| {
+                    let mut p = state(true);
+                    p.set_plateaus(table);
+                    if let Some(mtu) = inferred {
+                        p.info.current_mtu = mtu;
+                    }
+                    let end = Seq(sent - 39);
+                    let report =
+                        p.correlated_feedback(1, Seq(1), end, sent, 20, quoted, 0, current, shared);
+                    assert_ne!(report.feedback, PmtuFeedback::Rejected);
+                    let rule = if quoted >= shared.filter(|_| current).unwrap_or(sent) {
+                        quoted - 20
+                    } else {
+                        quoted
+                    };
+                    assert_eq!(report.derived_mtu, Some(below(&p, rule.min(sent))));
+                    report.derived_mtu.unwrap()
+                };
+                assert_eq!(derive(sent, true, Some(estimate)), exact);
+                assert_eq!(derive(sent + 20, true, Some(estimate)), inflated);
+                if sent < estimate {
+                    assert_eq!(exact, inflated);
                 }
-                let report = p.correlated_feedback(1, Seq(1), Seq(sent - 39), sent, 20, quoted, 0, true);
-                assert_ne!(report.feedback, PmtuFeedback::Rejected);
-                assert_eq!(report.derived_mtu, Some(below(&p, (quoted - 20).min(sent))));
+                // Older incarnation: drop advice compared with the submitted
+                // length, whatever estimate accompanies it.
+                derive(sent, false, Some(estimate));
+                derive(sent + 20, false, None);
             }
         }
         // Uncorrelated: the comparison stays with the current estimate.

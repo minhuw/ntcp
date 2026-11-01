@@ -538,6 +538,7 @@ fn deferred_setup(ipv4: bool) -> (Connection, Connection, PathService, Route, cr
         quoted_packet_len: len,
         candidate_mtu: if ipv4 { 1000 } else { 1280 },
         current_path: true,
+        path_estimate: None,
     };
     assert!(report.candidate_mtu < len);
     (a, b, service, route, report, bytes)

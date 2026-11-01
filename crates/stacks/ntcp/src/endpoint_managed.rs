@@ -27,6 +27,12 @@ pub struct CorrelatedPmtu {
     /// Whether the segment's path incarnation is still the connection's
     /// current one. Feedback about an older one is drop advice only.
     pub current_path: bool,
+    /// The Host's shared estimate (complete IP packet budget) of that current,
+    /// valid path incarnation when the report is applied: RFC 1191 section
+    /// 5's "current PMTU estimate", against which a legacy IPv4 quote is
+    /// corrected, never the connection's own estimate. `None` for an older
+    /// incarnation; TCP then compares with the submitted length.
+    pub path_estimate: Option<u32>,
 }
 
 /// The Host's certification, made only for a backend outcome of definitely

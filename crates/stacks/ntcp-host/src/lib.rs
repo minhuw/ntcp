@@ -814,7 +814,7 @@ impl Host {
 
     // Each result is taken exactly once; a stale one publishes nothing.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
-    //= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host-proven submitted length rather than the connection's estimate, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.
+    //= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.
     //# When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
     fn publish_results(
         &mut self,
@@ -1479,11 +1479,16 @@ impl Host {
                     .path_snapshot(*path)
                     .is_ok_and(|s| s.status() == PathStatus::Valid)
         });
+        // RFC 1191 section 5's current PMTU estimate is the shared one that
+        // `host_estimate` reads from the same snapshot, at arrival or replay.
+        let path_estimate =
+            current.and_then(|path| self.paths.path_snapshot(path).ok()?.ip_packet_budget().ok());
         let report = CorrelatedPmtu {
             segment,
             quoted_packet_len,
             candidate_mtu: candidate.unwrap_or(0),
             current_path: current.is_some(),
+            path_estimate,
         };
         // A Deferred report carries the Host's estimate as its provenance, so
         // that applying it at the quoted data's timeout can be published.

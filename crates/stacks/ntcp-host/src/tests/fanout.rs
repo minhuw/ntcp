@@ -959,7 +959,7 @@ enum Pending {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
 //= type=test
-//= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host-proven submitted length rather than the connection's estimate, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.
+//= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate, requires correlation with committed submission evidence and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.
 //# When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.
 fn applied_deferred_report_publishes_exactly_once_and_stale_results_never() {
     use Pending::*;
@@ -1091,7 +1091,7 @@ enum Probe {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
 //= type=test
-//= reason=PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference, with a derived size that is independent of the connection's estimate because a legacy IPv4 report without a Next-Hop MTU is corrected against the Host-proven submitted length; UDP and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.
+//= reason=PathService is the IP-layer store of per-path state, keyed by context, source, destination/scope, routing DSCP, link, next hop and route generation. Host stores correlated ICMP PTB MTUs there (TCP reports at or above the connection's proven delivery at once; reports below it only when that exact report's quoted-data timeout applies it, never because of loss inference, with a derived size that is independent of the connection's estimate because a legacy IPv4 report without a Next-Hop MTU is corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate; UDP and path-level reports) with a 600-second hold, and Host::service_changes publishes TCP's PLPMTUD-confirmed size through PathService::confirm_delivery only for a definitely submitted, unfragmented probe selected after the hold under an unchanged negative revision, raising other flows' ordinary ceiling without local delivery proof. Loss-inferred decreases and probe state stay connection-local. Dual-family Host tests with real probes across the 600-second deadline verify it.
 //# The IP layer SHOULD be used to store the cached PMTU value and other shared state such as MTU values reported by ICMP PTB messages. Ideally, this shared state should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path.
 fn delivered_probe_after_hold_raises_shared_ceiling_and_stale_proof_never() {
     use Probe::*;
@@ -1552,10 +1552,18 @@ fn below_proven_delivery_report_shared_outcome_ignores_loss_inference() {
     }
 }
 
-// RFC 1191 section 5 without a next-hop MTU: the size a correlated IPv4
-// report derives is corrected against the Host-proven submitted length, so
-// the derived size, deferral and shared publication are the same whether or
-// not black-hole timeouts first lowered A's own estimate (L) or not (C).
+// RFC 1191 section 5 without a next-hop MTU: a correlated IPv4 quote is
+// reduced by its header when not less than the Host's shared path estimate
+// (the IP layer's current PMTU estimate, never A's own estimate), so the
+// derived size, deferral and shared publication are the same whether or not
+// black-hole timeouts first lowered A's own estimate (L) or not (C). Every
+// plain submitted packet is smaller than the 1500-octet shared estimate, so
+// its exact and header-inflated quotes derive the same size. After the
+// shared decrease to 1000 every submitted packet is not smaller than the
+// estimate: section 5 then mandates reducing both quotes, and an exact quote
+// of a packet derives what a smaller inflated packet would. An older
+// incarnation has no current shared estimate: its quote is compared with
+// the submitted length, for drop advice only.
 // Only A's local label may differ (Decreased versus Unchanged). Scenarios:
 // A's explicit RFC 1191 table with no prior delivery (quoted 1452); the
 // default table after an acknowledged 1480-octet packet (quoted 1495); the
@@ -1578,6 +1586,7 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
     ] {
         for variant in ["plain", "shared-decrease", "older-path"] {
             let older = variant == "older-path";
+            let mut by_quote = Vec::new();
             for inflated in [false, true] {
                 let mut outcomes = Vec::new();
                 for inferred in [false, true] {
@@ -1654,6 +1663,14 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                         copy[2..4].copy_from_slice(&total.to_be_bytes());
                         super::dispatch::seal_ipv4(&mut copy);
                     }
+                    // The shared estimate the Host corrects the quote against.
+                    let estimate = (!older).then(|| {
+                        a.0.paths()
+                            .path_snapshot(path)
+                            .unwrap()
+                            .ip_packet_budget()
+                            .unwrap()
+                    });
                     now += 1;
                     let (report, published) =
                         tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &ptb(&copy, 0)).unwrap());
@@ -1678,7 +1695,8 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                         assert_eq!(seq, start, "{label} {variant}");
                         assert!(0 < len && len <= payload, "{label} {variant} {len}");
                     }
-                    // The report's own size, read back with an identical repeat.
+                    // The report's own size, read back with an identical repeat
+                    // under the shared estimate it was dispatched with.
                     let derived = a
                         .1
                         .correlated_pmtu_feedback(
@@ -1695,6 +1713,7 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                                     + if inflated { 20 } else { 0 },
                                 candidate_mtu: 0,
                                 current_path: !older,
+                                path_estimate: estimate,
                             },
                         )
                         .unwrap()
@@ -1719,14 +1738,26 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                         quoted.len()
                     );
                     let deferred = class == PmtuFeedback::Deferred;
-                    // A's policy-derived size; the Host publishes the larger of
-                    // it and its own estimate (CONTEMPORARY table, shared
-                    // budget), never above an already lower shared record.
-                    let expected = match (label, inflated) {
-                        ("immediate", _) => (1006, false, 1006),
-                        ("default-table", false) => (1460, true, 1492),
-                        ("default-table", true) => (1492, false, 1492),
-                        ("deferred", false) => (508, true, 576),
+                    // (A's policy-derived size, deferred, the size its
+                    // publication carries). The Host publishes the larger of
+                    // the derived size and its own estimate (CONTEMPORARY
+                    // table, same shared reference), never above an already
+                    // lower shared record. Plain: 1452 and 1010 are below
+                    // 1500, so both quotes give RFC 1191's 1006; 1495 gives
+                    // the default table's 1492, at or above the delivered
+                    // 1480. After the decrease to 1000, and for an older
+                    // incarnation (reference: the submitted length), exact
+                    // quotes are reduced by 20: 1432 -> 1006, 1475 -> 1460
+                    // (below 1480: deferred, timeout publishes max(1460,
+                    // 1460)), 990 -> 508 (timeout publishes max(576, 508));
+                    // inflated quotes recover 1452, 1495 and 1010.
+                    let expected = match (variant, label, inflated) {
+                        (_, "immediate", _) => (1006, false, 1006),
+                        ("plain", "default-table", _) => (1492, false, 1492),
+                        ("plain", _, _) => (1006, true, 1006),
+                        (_, "default-table", false) => (1460, true, 1460),
+                        (_, "default-table", true) => (1492, false, 1492),
+                        (_, _, false) => (508, true, 576),
                         _ => (1006, true, 1006),
                     };
                     assert_eq!(derived, Some(expected.0), "{label} {variant}");
@@ -1734,6 +1765,10 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                         "plain" => {
                             assert_eq!((deferred, eventual), (expected.1, Some(expected.2)));
                             assert_eq!(immediate.is_some(), !deferred);
+                            assert_eq!(
+                                published,
+                                (!deferred).then_some(path::EstimateChange::Decreased)
+                            );
                             assert_eq!(decreased, usize::from(deferred));
                         }
                         "shared-decrease" => {
@@ -1754,6 +1789,13 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                 assert_eq!(
                     outcomes[0], outcomes[1],
                     "{label} {variant} inflated={inflated}: C and L differ"
+                );
+                by_quote.push(outcomes[0]);
+            }
+            if variant == "plain" {
+                assert_eq!(
+                    by_quote[0], by_quote[1],
+                    "{label}: exact and inflated quotes differ"
                 );
             }
         }

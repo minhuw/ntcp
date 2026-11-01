@@ -52,6 +52,7 @@ pub(super) fn report(a: &mut Connection, now: Instant, s: Span, candidate: u32) 
             quoted_packet_len: s.2,
             candidate_mtu: candidate,
             current_path: true,
+            path_estimate: None,
         },
         None,
     )
@@ -628,6 +629,7 @@ pub(super) fn report_on(
             quoted_packet_len: s.2,
             candidate_mtu: candidate,
             current_path: current,
+            path_estimate: None,
         },
         None,
     )

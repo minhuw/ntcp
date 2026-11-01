@@ -68,6 +68,7 @@ fn report(a: &mut Connection, now: Instant, s: Span, candidate: u32, current: bo
             quoted_packet_len: s.2,
             candidate_mtu: candidate,
             current_path: current,
+            path_estimate: None,
         },
         None,
     )

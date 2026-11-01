@@ -377,7 +377,7 @@ class PmtudInventory(unittest.TestCase):
         # including the legacy RFC 1191 section 5 correction.
         for key, row in {"1191-057": rows["1191-057"],
                          **{k: rows4821[k] for k in ("4821-019", "4821-069", "4821-079", "4821-195")}}.items():
-            self.assertIn("corrected against the Host-proven submitted length", row["reason"], key)
+            self.assertIn("corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate", row["reason"], key)
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:
