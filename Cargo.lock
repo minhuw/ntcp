@@ -103,6 +103,7 @@ dependencies = [
  "ntcp-ip-common",
  "ntcp-ip6",
  "ntcp-path",
+ "ntcp-path-control",
  "sha2",
  "siphasher",
  "subtle",
@@ -228,6 +229,15 @@ name = "ntcp-path"
 version = "0.0.1"
 
 [[package]]
+name = "ntcp-path-control"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "ntcp",
+ "ntcp-host",
+]
+
+[[package]]
 name = "ntcp-rfc-host"
 version = "0.0.1"
 dependencies = [
@@ -239,6 +249,7 @@ dependencies = [
  "ntcp-io-tun",
  "ntcp-ip",
  "ntcp-ip6",
+ "ntcp-path-control",
  "ntcp-socket",
 ]
 
@@ -259,6 +270,7 @@ dependencies = [
  "ntcp-ip",
  "ntcp-ip-common",
  "ntcp-ip6",
+ "ntcp-path-control",
 ]
 
 [[package]]

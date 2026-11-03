@@ -32,6 +32,10 @@ pub struct SocketConfig {
     pub fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
     pub io: IoConfig,
     pub routes: Vec<(IpAddr, ntcp::RoutePolicy)>,
+    /// The owner's local path control socket (`control.socket`,
+    /// `control.allow_uids`), separate from the `route.*` transport
+    /// policies: None (the default) serves nothing.
+    pub control: Option<ntcp_path_control::ControlConfig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +138,7 @@ impl SocketConfig {
             fast_open_cookie_lifetime: Default::default(),
             fast_open_key_lease: None,
             routes: Vec::new(),
+            control: None,
             io: IoConfig {
                 backend: Backend::Tun,
                 interface: interface.into(),
@@ -235,6 +240,12 @@ impl SocketConfig {
                 .validate(&route_defaults, self.io.address.is_ipv4())
                 .map_err(|_| invalid())?;
         }
+        if let Some(control) = &self.control
+            && (!control.socket.is_absolute()
+                || control.allow_uids.len() > ntcp_path_control::server::MAX_ALLOWED_UIDS)
+        {
+            return Err(invalid());
+        }
         self.tcp.validate().map_err(|_| invalid())?;
         let c = &self.tcp.connection;
         c.validate(self.io.address.is_ipv4())
@@ -271,6 +282,7 @@ impl SocketConfig {
         let mut pacing_enabled = false;
         let mut pacing = ntcp::PacingConfig::default();
         let mut tuned = false;
+        let mut control_uids = None;
         let mut seen = BTreeSet::new();
         for line in text.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
@@ -423,6 +435,18 @@ impl SocketConfig {
                     pacing.max_burst_segments = number(value)?;
                     tuned = true;
                 }
+                "control.socket" => {
+                    config.control = Some(ntcp_path_control::ControlConfig {
+                        socket: value.into(),
+                        allow_uids: Vec::new(),
+                    })
+                }
+                "control.allow_uids" => {
+                    control_uids = Some(
+                        ntcp_path_control::ControlConfig::parse_uids(value)
+                            .map_err(|_| invalid())?,
+                    )
+                }
                 _ => return Err(invalid()),
             }
         }
@@ -454,6 +478,12 @@ impl SocketConfig {
             _ => return Err(invalid()),
         };
         config.tcp.connection.pacing = pacing_enabled.then_some(pacing);
+        // An allow-list without a socket would be inert configuration.
+        match (&mut config.control, control_uids) {
+            (Some(control), Some(uids)) => control.allow_uids = uids,
+            (None, Some(_)) => return Err(invalid()),
+            _ => {}
+        }
         config.validate()?;
         Ok(config)
     }

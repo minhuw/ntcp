@@ -361,6 +361,24 @@ impl Owner {
                 .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
             && attempt.is_none_or(|a| self.endpoint.transmit_discovery_intent(a).is_none())
     }
+    // Whether the packet leaves without DF: the connection asked for it
+    // (IP_PMTUDISC_DONT), or its IPv4 route or path is one whose owner
+    // disabled discovery, where the IP layer leaves DF clear whatever the
+    // socket requests (RFC 1191 section 6.6; the route disable dominates
+    // IP_PMTUDISC_DO/WANT and needs no per-socket request).
+    pub(super) fn df_cleared(
+        &self,
+        owner: Option<ConnectionId>,
+        attempt: ntcp::TransmitAttempt,
+        context: Option<ntcp_host::EgressContext>,
+    ) -> bool {
+        self.dont_identified(owner, Some(attempt))
+            || self
+                .host
+                .as_ref()
+                .zip(context)
+                .is_some_and(|(host, context)| host.clears_dont_fragment(context))
+    }
     // Clear DF on one encoded IPv4 header and give it a leased
     // Identification. Backpressure (the RFC 6864 ceiling of 65536
     // non-atomic datagrams per tuple per MDL, the quiet period after start,
@@ -374,30 +392,7 @@ impl Owner {
             .host
             .as_mut()
             .ok_or(ntcp_host::IdentifierBackpressure::Unavailable { until: None })?;
-        let source = IpAddr::V4(Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]));
-        let destination = IpAddr::V4(Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]));
-        // Identification 0 is what every atomic datagram of this stack
-        // carries; a middlebox that clears DF turns those into non-atomic
-        // datagrams of the same tuple, so a leased 0 is passed over (it
-        // stays leased and is never sent).
-        let mut identification = 0;
-        for _ in 0..2 {
-            identification = host.lease_identification(now, source, destination, 6)? as u16;
-            if identification != 0 {
-                break;
-            }
-        }
-        if identification == 0 {
-            return Err(ntcp_host::IdentifierBackpressure::Exhausted {
-                retry_at: now.saturating_add(1),
-            });
-        }
-        ip[4..6].copy_from_slice(&identification.to_be_bytes());
-        ip[6] = 0;
-        ip[10..12].fill(0);
-        let checksum = ntcp_ip_common::checksum(&ip[..usize::from(ip[0] & 0x0f) * 4]);
-        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
-        Ok(())
+        host.lease_df_clear(now, ip).map(|_| ())
     }
     // No TCP pacer here: core selected polling returns only currently eligible
     // packets. The scheduler's EDT is selection time, or a backend retry time.
@@ -509,7 +504,7 @@ impl Owner {
         .map_err(|_| EIO)?;
         // A packet identified at submission keeps its header open until then;
         // its timestamp copy is taken from the submitted header.
-        if shared_len == 0 && !self.dont_identified(owner, Some(attempt)) {
+        if shared_len == 0 && !self.df_cleared(owner, attempt, context) {
             self.timestamp_packet(tx.tx_timestamp, &bytes[offset..offset + ip_len]);
         }
         bytes.truncate(offset + ip_len);
@@ -635,10 +630,21 @@ impl Owner {
                 let entry = slot.entry.as_mut().ok_or(EIO)?;
                 let offset = if self.ethernet.is_some() { 14 } else { 0 };
                 let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
-                if self.dont_identified(entry.owner, Some(entry.attempt)) {
+                if entry.context.is_none()
+                    && let Some(host) = &mut self.host
+                {
+                    entry.context = host.egress_context(&mut self.endpoint, entry.attempt).ok();
+                }
+                if self.df_cleared(entry.owner, entry.attempt, entry.context) {
                     let header = &mut slot.bytes[offset..offset + entry.ip_len];
                     match self.lease_dont_identification(now, header) {
                         Ok(()) => {
+                            if shared_len != 0 {
+                                // The zero-copy header is a copy of the
+                                // resident bytes: it carries the rewrite too.
+                                slot.shared.header[offset..offset + entry.ip_len]
+                                    .copy_from_slice(&slot.bytes[offset..offset + entry.ip_len]);
+                            }
                             if shared_len == 0 {
                                 self.timestamp_packet(
                                     entry.timestamp,
@@ -672,6 +678,25 @@ impl Owner {
                                 .map_err(|_| EIO)?;
                             continue;
                         }
+                    }
+                } else if ntcp_host::Host::restore_atomic_header(
+                    &mut slot.bytes[offset..offset + entry.ip_len],
+                ) {
+                    // The final bytes follow the current decision: a packet
+                    // rewritten DF clear for an earlier attempt that did not
+                    // leave (WouldBlock) no longer needs it after the owner
+                    // re-enabled discovery and its socket does not ask for
+                    // IP_PMTUDISC_DONT, so it leaves with the atomic header
+                    // (DF set, Identification 0) like any packet of the
+                    // enabled path.
+                    if shared_len != 0 {
+                        slot.shared.header[offset..offset + entry.ip_len]
+                            .copy_from_slice(&slot.bytes[offset..offset + entry.ip_len]);
+                    } else {
+                        self.timestamp_packet(
+                            entry.timestamp,
+                            &slot.bytes[offset..offset + entry.ip_len],
+                        );
                     }
                 }
                 let sources = entry

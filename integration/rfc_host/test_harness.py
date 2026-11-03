@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from bridge import checksum
+import admin
 import icmp
 import run
 
@@ -40,6 +41,55 @@ class NamespaceGuard(unittest.TestCase):
                     self.assertTrue(required <= actual)
 
 
+class AdminScenario(unittest.TestCase):
+    def test_admin_cases_without_inherited_proof_cannot_reach_setup(self):
+        for kind, scenario in (("admin", "utility"), ("native-admin", "utility"), ("admin", "refuse"),
+                               ("admin", "reenable")):
+            with patch.dict(os.environ, {}, clear=True), patch.object(icmp, "setup") as setup, \
+                    patch.object(run, "setup") as native_setup:
+                with self.assertRaises(KeyError):
+                    run.child(dict(kind=kind, family=4, scenario=scenario))
+                setup.assert_not_called()
+                native_setup.assert_not_called()
+
+    def test_cases_cover_both_embeddings_and_families(self):
+        self.assertEqual({(c["kind"], c["family"], c["scenario"]) for c in admin.cases()},
+                         {(k, f, "utility") for k in ("admin", "native-admin") for f in (4, 6)}
+                         | {("admin", 4, "refuse")} | {("admin", f, "reenable") for f in (4, 6)})
+        self.assertEqual(len(admin.cases()), 7)
+        self.assertFalse(any(c in icmp.cases() or c in run.matrix() for c in admin.cases()))
+        # The reenable case's waits fit the per-case limit with its setup.
+        self.assertLess(admin.DISABLED_WAIT + admin.PROBE_WAIT + admin.REPLY_WAIT, 60)
+        # IPv6 administrative values are never below its minimum link MTU;
+        # downward is below the 1500 accepted estimate, upward above it.
+        for family, values in admin.VALUES.items():
+            self.assertTrue(values["downward"] < values["upward"] < 1500, family)
+            self.assertTrue(family == 4 or min(values.values()) >= 1280, family)
+        self.assertTrue(admin.IPV4_OFFLINK < admin.VALUES[4]["disabled"] < admin.VALUES[4]["downward"])
+
+    def test_utility_records_are_parsed_per_kind(self):
+        text = "route token=00ab generation=3 disabled=1 estimate=-\npath token=01 destination=198.18.2.2\n"
+        self.assertEqual(admin.parse_records(text, "route"),
+                         [dict(token="00ab", generation="3", disabled="1", estimate="-")])
+        self.assertEqual(admin.parse_records(text, "path"), [dict(token="01", destination="198.18.2.2")])
+
+    def test_identification_check_requires_one_nonzero_unrepeated_id_per_datagram(self):
+        whole = lambda t, i: dict(fragmented=False, protocol=6, time_ns=t, ip_id=i)
+        piece = lambda i: dict(fragmented=True, protocol=17, time_ns=0, ip_id=i)
+        self.assertEqual(admin.check_ids([whole(1, 5), whole(2, 6), piece(7), piece(7)]), 3)
+        with self.assertRaisesRegex(AssertionError, "repeated"):
+            admin.check_ids([whole(1, 5), whole(2, 5)])
+        with self.assertRaisesRegex(AssertionError, "zero"):
+            admin.check_ids([whole(1, 0)])
+
+    def test_capture_reports_the_whole_packet_identification(self):
+        header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 28, 0xbeef, 0, 64, 17, 0,
+                             bytes([198, 18, 1, 2]), bytes([198, 18, 2, 2]))
+        header = header[:10] + struct.pack("!H", checksum(header)) + header[12:]
+        event = icmp.parse(header + struct.pack("!HHHH", 1, 2, 8, 0))
+        self.assertEqual((event["ip_id"], event["df"], event["fragmented"]), (0xbeef, False, False))
+
+
 class IcmpScenario(unittest.TestCase):
     def test_icmp_case_without_inherited_proof_cannot_reach_setup(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(icmp, "setup") as setup:
@@ -51,9 +101,10 @@ class IcmpScenario(unittest.TestCase):
         self.assertEqual({(c["family"], c["scenario"]) for c in icmp.cases()},
                          {(f, s) for f in (4, 6) for s in ("udp-quoted", "tcp-quoted", "forged", "shared-fanout",
                                                             "tcp-staged", "tcp-burst", "fragment", "probe-mode",
-                                                            "fragment-ptb", "adjunct-silence")})
+                                                            "fragment-ptb", "adjunct-silence", "probe-report")}
+                         | {(4, "route-isolation")})
         self.assertFalse(any(c in run.matrix() for c in icmp.cases()))
-        self.assertEqual(len(icmp.cases()), 20)
+        self.assertEqual(len(icmp.cases()), 23)
 
     def test_driven_cases_state_their_deployment_configuration(self):
         self.assertEqual(set(icmp.DRIVER_SETTINGS), set(icmp.DRIVEN))

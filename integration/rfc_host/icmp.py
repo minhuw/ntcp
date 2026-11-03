@@ -44,7 +44,7 @@ ADDRESSES = {
 }
 MACS = dict(t9ra="02:00:00:00:09:01", t9pa="02:00:00:00:09:02", t9rb="02:00:00:00:09:03", t9pb="02:00:00:00:09:04")
 # The driven scenarios use the harness-only datagram_drive driver.
-DRIVEN = ("probe-mode", "fragment-ptb", "adjunct-silence")
+DRIVEN = ("probe-mode", "fragment-ptb", "adjunct-silence", "probe-report", "route-isolation")
 SCENARIOS = ("udp-quoted", "tcp-quoted", "forged", "shared-fanout", "tcp-staged", "tcp-burst", "fragment") + DRIVEN
 # The fragment scenario's Linux peer port (fragmentation-enabled socket),
 # request size (larger than the 1500-octet links) and the peer reassembly
@@ -68,7 +68,14 @@ SINK_PORT = 18092
 # fragment-ptb states 1500 so that, with nothing learned, its first
 # fragments are cut to the 1500-octet first hop and exceed the 1280 egress.
 DRIVER_SETTINGS = {"probe-mode": dict(initial=None, adjunct=0), "fragment-ptb": dict(initial=1500, adjunct=0),
-                   "adjunct-silence": dict(initial=None, adjunct=4)}
+                   "adjunct-silence": dict(initial=None, adjunct=4), "probe-report": dict(initial=None, adjunct=0),
+                   "route-isolation": dict(initial=None, adjunct=0)}
+# route-isolation's neighbor route and flow: selected by this DSCP (AF11).
+NEIGHBOR_DSCP = 10
+# RFC 1122 3.3.3: EMTU_S <= 576 off the connected network (Forwarder route).
+IPV4_OFFLINK = 576
+# The scenarios whose subject (the RFC 1191 6.6 DF policy) is IPv4-only.
+IPV4_ONLY = ("route-isolation",)
 # The owned drop rule of adjunct-silence: Echo Requests arriving from ntcp
 # are dropped at the router's prerouting hook, before forwarding, so a
 # probe draws neither an Echo Reply nor a router PTB.
@@ -96,7 +103,8 @@ REFUSED = r"UDP echo of (\d+) octets to (\S+) refused(?: at send)?: exceeds the 
 
 
 def cases():
-    return [dict(kind="icmp", family=family, scenario=scenario) for family in (4, 6) for scenario in SCENARIOS]
+    return [dict(kind="icmp", family=family, scenario=scenario) for family in (4, 6) for scenario in SCENARIOS
+            if family == 4 or scenario not in IPV4_ONLY]
 
 
 def header_len(family):
@@ -128,8 +136,9 @@ def parse(packet):
         protocol = packet[9]
         source, destination = packet[12:16], packet[16:20]
         fragment = u16(packet, 6)
+        # ip_id: the whole-packet Identification field, whatever DF says.
         info = dict(family=4, df=bool(fragment & 0x4000), fragmented=bool(fragment & 0x3fff),
-                    ip_checksum_valid=checksum(packet[:hl]) == 0)
+                    ip_checksum_valid=checksum(packet[:hl]) == 0, ip_id=u16(packet, 4))
         if info["fragmented"]:
             info.update(ident=u16(packet, 4), offset=(fragment & 0x1fff) * 8, more=bool(fragment & 0x2000))
         pseudo = source + destination + bytes([0, protocol]) + struct.pack("!H", total - hl)
@@ -732,6 +741,10 @@ def driven(family, scenario, a, capture, driver, peer, command, ptbs):
         assert not own(events)
         return dict(taught=dict(report=taught["report"], events=taught["events"], learned=taught["learned_mtu"]),
                     probes=probes, refused_after=refused["error"], peer_received=drain(0.5))
+    if scenario == "route-isolation":
+        return route_isolation(a, capture, driver, drain, digest)
+    if scenario == "probe-report":
+        return probe_report(family, hl, send, own, quoting, drain, digest, sizes, driver)
     if scenario == "fragment-ptb":
         size = 2000
         first, events = send("fragment", size, 61)
@@ -810,6 +823,108 @@ def driven(family, scenario, a, capture, driver, peer, command, ptbs):
                 adjunct=counters, fragments=first["submitted_lengths"], later_fragments=later["submitted_lengths"],
                 effective=[s["effective_size"] for s in states], learned=[s["learned_mtu"] for s in states],
                 peer_received=received)
+
+
+def route_isolation(a, capture, driver, drain, digest):
+    """RFC 1191 6.6 route flag isolation between two routes on the wire.
+
+    The driver's Host has its default route and a neighbor route on the same
+    link and Forwarder next hop, selected by DSCP; one Fragment-mode flow to
+    the peer resolves through each. After the owner disables discovery on
+    the default route (one Host administration transaction through the
+    owner's capability), that route's source fragments leave DF clear with
+    one nonzero leased Identification per datagram, at most 576 octets
+    (RFC 1122 3.3.3 EMTU_S off the connected network), while the neighbor
+    route keeps DF on its fragments. The peer reassembles both."""
+    driver.send(f"neighbor {NEIGHBOR_DSCP}")
+    added = driver.read()
+    assert added["event"] == "neighbor" and added["separate_route"] and added["resolved_neighbor_route"], added
+
+    def sendvia(flow, salt):
+        mark = capture.mark()
+        driver.send(f"sendvia {flow} fragment {FRAGMENTED_REQUEST} {salt} 1000")
+        result = driver.read()
+        assert result["event"] == "sent" and result["error"] is None and result["report"], result
+        time.sleep(0.2)
+        packets = [e for e in capture.since(mark) if e["direction"] == "from-ntcp" and e["protocol"] == 17
+                   and (e["source"], e["destination"]) == (a["ntcp"], a["peer"])]
+        assert packets and all(e["fragmented"] and e["ip_checksum_valid"] for e in packets), [public(e) for e in packets]
+        assert len({e["ident"] for e in packets}) == 1, "one Identification per datagram"
+        offsets = sorted((e["offset"], e["data"], e["more"]) for e in packets)
+        assert offsets[0][0] == 0 and not offsets[-1][2] and all(
+            o + d == n for (o, d, _), (n, _, _) in zip(offsets, offsets[1:])), offsets
+        return [dict(length=e["length"], df=e["df"], ident=e["ident"], offset=e["offset"], more=e["more"])
+                for e in sorted(packets, key=lambda e: e["offset"])]
+
+    before = dict(main=sendvia("main", 81), neighbor=sendvia("neighbor", 82))
+    for name, packets in before.items():
+        assert all(p["df"] for p in packets), (name, packets)
+    driver.send("disable main")
+    disabled = driver.read()
+    assert disabled["event"] == "disabled" and disabled["route"] == "main", disabled
+    after = dict(main=sendvia("main", 83), neighbor=sendvia("neighbor", 84))
+    assert all(not p["df"] and p["ident"] != 0 and p["length"] <= IPV4_OFFLINK for p in after["main"]), after["main"]
+    assert all(p["df"] for p in after["neighbor"]), after["neighbor"]
+    assert after["main"][0]["ident"] != before["main"][0]["ident"], (before, after)
+    received = drain(1.0)
+    expected = sorted((port, FRAGMENTED_REQUEST, digest(FRAGMENTED_REQUEST, salt))
+                      for port, salt in ((18083, 81), (18084, 82), (18083, 83), (18084, 84)))
+    assert sorted((d["port"], d["size"], d["sha256"]) for d in received) == expected, received
+    return dict(neighbor=added, disabled=disabled, before=before, after=after,
+                peer_received=[dict(port=d["port"], size=d["size"]) for d in received])
+
+
+def probe_report(family, hl, send, own, quoting, drain, digest, sizes, driver):
+    """RFC 4821 section 9 outcome reports from a real receiver (T12).
+
+    The application learns each probe's fate from the Linux sink (the
+    receiver), then reports it with the probe's receipt. Success raises only
+    this flow's confirmed size, which then drives its Fragment sizing on the
+    wire; nothing shared changes (no shared-writer grant). A replayed
+    receipt is refused. A probe the 1280 egress drops draws a router PTB
+    that lowers the shared estimate after the submission, so its receipt is
+    stale and the late report changes nothing."""
+    def report(index, outcome):
+        driver.send(f"report {index} {outcome}")
+        result = driver.read()
+        assert result["event"] == "reported", result
+        return result
+
+    delivered = 1200 if family == 4 else 1280
+    probe, events = send("probe", delivered - hl - 8, 71)
+    record = probe["report"] and probe["report"]["probe"]
+    assert record and record["definite"] and record["size"] == delivered and probe["receipts"] == 1, probe
+    packets = own(events)
+    assert sizes(packets) == [delivered] and not packets[0]["fragmented"] and not quoting(events, packets[0])
+    received = drain(1.0)
+    assert [(d["size"], d["sha256"]) for d in received] == [(delivered - hl - 8, digest(delivered - hl - 8, 71))], received
+    before = probe["limits"]["effective_size"]
+    success = report(0, "success")
+    assert success["report_error"] is None and success["confirmed"] == delivered, success
+    assert success["shared"] == "NotOffered", success
+    assert success["learned_mtu"] is None and success["budget"] == 1500, ("shared state unchanged", success)
+    assert success["limits"]["effective_size"] == max(before, delivered), (before, success["limits"])
+    replay = report(0, "success")
+    assert replay["report_error"] == "Consumed" and replay["limits"] == success["limits"], replay
+    # The flow-local bound drives this flow's Fragment sizing on the wire.
+    fragmented, events = send("fragment", 3000, 72)
+    pieces = own(events)
+    assert fragmented["report"] and len(pieces) == fragmented["report"]["fragments"] > 1, fragmented
+    assert all(length == fragment_packet(family, delivered) for length in sizes(pieces)[:-1]), sizes(pieces)
+    assert [(d["size"], d["sha256"]) for d in drain(1.0)] == [(3000, digest(3000, 72))]
+    # Lost at the 1280 egress: the router's PTB (a shared decrease after the
+    # submission) makes the receipt stale.
+    lost, events = send("probe", 1400 - hl - 8, 73)
+    assert lost["receipts"] == 2 and sizes(own(events)) == [1400], lost
+    assert len(quoting(events, own(events)[0])) == 1 and lost["learned_mtu"] == 1280, lost
+    assert drain(0.5) == [], "the receiver got nothing"
+    stale = report(1, "isolated-loss")
+    assert stale["report_error"] == "StaleRevision" and stale["limits"]["effective_size"] == min(
+        1280, success["limits"]["effective_size"]), stale
+    return dict(probe=record, received=received, success={k: success[k] for k in ("confirmed", "upper", "shared",
+                                                                                  "learned_mtu", "limits")},
+                effective_before=before, replay=replay["report_error"], fragment_sizes=sizes(pieces),
+                lost=lost["report"]["probe"], stale=stale["report_error"])
 
 
 def staged(family, scenario, a, capture, stager, peer, command, sent, ptbs, accepted_ptb):
@@ -1196,8 +1311,10 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None, driver_b
                                                   refusal=refused.group(0)))
         kernel_after = counters(family)
         generated = len(ptbs(capture.since(0))) if scenario != "forged" else 0
-        if scenario == "adjunct-silence":
-            # Silence: the drop rule precedes forwarding, so no PTB at all.
+        if scenario in ("adjunct-silence", "route-isolation"):
+            # Silence: the drop rule precedes forwarding; route-isolation's
+            # fragments (at most the 1024-octet connectionless size) fit the
+            # 1280 egress. Neither draws a PTB.
             assert kernel_after - kernel_before == generated == 0, (kernel_before, kernel_after, generated)
         elif scenario != "forged":
             assert kernel_after - kernel_before == generated >= 1, (kernel_before, kernel_after, generated)

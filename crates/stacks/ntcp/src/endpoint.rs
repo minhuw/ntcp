@@ -3790,6 +3790,57 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Read-only: whether `set_search_aging(now, id, aging)` succeeds now
+    /// (live connection with PLPMTUD, monotonic time, aging of at least 300
+    /// seconds or infinity representable in the caller timebase).
+    pub fn validate_search_aging(
+        &self,
+        now: Instant,
+        id: ConnectionId,
+        aging: crate::SearchAging,
+    ) -> Result<(), EndpointError> {
+        self.check_clock(now)?;
+        let connection = &self.slot(id)?.connection;
+        let policy = connection.pmtud_policy().ok_or(Error::InvalidArgument)?;
+        connection.validate_pmtud_policy(
+            now,
+            crate::PmtudPolicy {
+                search_aging: aging,
+                ..policy
+            },
+        )?;
+        Ok(())
+    }
+
+    /// One connection's current PLPMTUD policy; None without PLPMTUD.
+    pub fn pmtud_policy(&self, id: ConnectionId) -> Result<Option<crate::PmtudPolicy>, EndpointError> {
+        Ok(self.slot(id)?.connection.pmtud_policy())
+    }
+
+    /// Change only the RFC 4821 section 7.3 search aging of one connection,
+    /// keeping its plateau table; mandatory PTB holds and failure cooldowns
+    /// are independent and unchanged.
+    pub fn set_search_aging(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        aging: crate::SearchAging,
+    ) -> Result<(), EndpointError> {
+        let policy = self
+            .slot(id)?
+            .connection
+            .pmtud_policy()
+            .ok_or(Error::InvalidArgument)?;
+        self.set_pmtud_policy(
+            now,
+            id,
+            crate::PmtudPolicy {
+                search_aging: aging,
+                ..policy
+            },
+        )
+    }
+
     /// Change one connection's administrative MTU ceiling on the same path.
     /// None removes this ceiling, still respecting interface/peer/allocation
     /// limits and network-discovered evidence. Does not signal a new path,

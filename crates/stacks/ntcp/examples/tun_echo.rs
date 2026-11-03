@@ -15,6 +15,12 @@
 //     at least SECONDS before startup (never: there was none, for example a
 //     newly created address). Unset, no IP Identification is issued for one
 //     maximum datagram lifetime (120 s) after startup.
+//   NTCP_CONTROL_SOCKET=PATH  opt-in local path control socket (absolute
+//     pathname in a private 0700 directory owned by this uid) for
+//     ntcp-pathctl: route and path query, discovery disable/enable,
+//     administrative estimates, plateaus and search aging. Unset, none.
+//   NTCP_CONTROL_ALLOW_UIDS=UID[,UID...]  peer uids allowed on the control
+//     socket (SO_PEERCRED); unset, only this process's effective uid.
 // The caller must configure the TUN interface (MTU 1500) and routes
 // beforehand. This adapter exchanges IP packets, not Ethernet frames; it does
 // not configure the host or implement ARP, routing, or ICMP services beyond
@@ -268,6 +274,8 @@ mod linux {
         // Destination of each datagram reassembly completes, owned until it
         // is dispatched or copied into retention.
         completed: Vec<u8>,
+        // TCP frames waiting for an IPv4 Identification.
+        identifier_held: IdentifierHeld,
     }
 
     impl TunHost {
@@ -340,6 +348,9 @@ mod linux {
                     max_payload: datagram - UDP_HEADER,
                     events: BUDGET,
                     evicted_signatures,
+                    // The echo flow sends no Probe-mode datagrams; one
+                    // receipt is the minimum a flow holds.
+                    probe_receipts: 1,
                 },
             )
             .map_err(host_error)?;
@@ -440,7 +451,14 @@ mod linux {
                 .try_reserve_exact(MAX_IP_PACKET)
                 .map_err(|_| host_error(ntcp_host::Error::Allocation))?;
             completed.resize(MAX_IP_PACKET, 0);
-            endpoint.enable_output_reservations().map_err(engine)?;
+            // One output reservation per connection and the stateless lane:
+            // an owner whose frame waits for an IPv4 Identification keeps
+            // its reservation while every other owner still finds one.
+            let owners = config.max_connections.saturating_add(1);
+            endpoint
+                .enable_output_reservations_with_capacity(owners)
+                .map_err(engine)?;
+            let identifier_held = IdentifierHeld::new(owners)?;
             host.attach(endpoint).map_err(host_error)?;
             Ok(Self {
                 host,
@@ -451,6 +469,7 @@ mod linux {
                 received,
                 free,
                 completed,
+                identifier_held,
             })
         }
 
@@ -1225,6 +1244,95 @@ mod linux {
         ntcp::Ipv4Timestamp::nonstandard(start.elapsed().as_millis() as u32).wire_value()
     }
 
+    // TCP frames on a discovery-disabled IPv4 route or path that wait for an
+    // Identification (the allocator's start quiet period, or the RFC 6864
+    // ceiling of their tuple). Only such a frame waits: it keeps its owner's
+    // reservation, evidence ticket and bytes and is retried at its own time
+    // while other owners' output continues, as the native runtime's
+    // scheduler retries only the affected entry. An owner has at most one
+    // reserved frame, so the connections plus the stateless lane bound the
+    // set; its storage precedes selection.
+    struct IdentifierHeld {
+        frames: Vec<HeldFrame>,
+        free: Vec<Vec<u8>>,
+    }
+
+    struct HeldFrame {
+        frame: PendingFrame,
+        bytes: Vec<u8>,
+        retry_at: u64,
+    }
+
+    impl IdentifierHeld {
+        fn new(owners: usize) -> io::Result<Self> {
+            let allocation = |_| host_error(ntcp_host::Error::Allocation);
+            let mut frames = Vec::new();
+            frames.try_reserve_exact(owners).map_err(allocation)?;
+            let mut free = Vec::new();
+            free.try_reserve_exact(owners).map_err(allocation)?;
+            for _ in 0..owners {
+                let mut bytes = Vec::new();
+                bytes.try_reserve_exact(MTU).map_err(allocation)?;
+                free.push(bytes);
+            }
+            Ok(Self { frames, free })
+        }
+
+        // When an identifier is withheld: at the allocator's stated time,
+        // otherwise (none stated) at the loop's next tick.
+        fn retry_at(time: u64, backpressure: ntcp_host::IdentifierBackpressure) -> u64 {
+            match backpressure {
+                ntcp_host::IdentifierBackpressure::Exhausted { retry_at }
+                | ntcp_host::IdentifierBackpressure::Unavailable {
+                    until: Some(retry_at),
+                } => retry_at.max(time.saturating_add(1)),
+                _ => time.saturating_add(TICK_US),
+            }
+        }
+
+        // Set `frame` (its bytes in `bytes`) aside; returned when no storage
+        // is left.
+        fn hold(
+            &mut self,
+            frame: PendingFrame,
+            bytes: &[u8],
+            retry_at: u64,
+        ) -> Result<(), PendingFrame> {
+            let Some(mut storage) = self.free.pop() else {
+                return Err(frame);
+            };
+            if bytes.len() > storage.capacity() {
+                self.free.push(storage);
+                return Err(frame);
+            }
+            storage.clear();
+            storage.extend_from_slice(bytes);
+            self.frames.push(HeldFrame {
+                frame,
+                bytes: storage,
+                retry_at,
+            });
+            Ok(())
+        }
+
+        // The oldest frame due at `time`, its bytes copied back to `output`.
+        fn due(&mut self, time: u64, output: &mut [u8]) -> Option<PendingFrame> {
+            let index = self.frames.iter().position(|held| held.retry_at <= time)?;
+            let held = self.frames.remove(index);
+            output[..held.bytes.len()].copy_from_slice(&held.bytes);
+            self.free.push(held.bytes);
+            Some(held.frame)
+        }
+
+        fn is_empty(&self) -> bool {
+            self.frames.is_empty()
+        }
+
+        fn next_retry(&self) -> Option<u64> {
+            self.frames.iter().map(|held| held.retry_at).min()
+        }
+    }
+
     struct PendingFrame {
         attempt: ntcp::TransmitAttempt,
         context: Option<EgressContext>,
@@ -1267,7 +1375,7 @@ mod linux {
         header_len: usize,
         timestamp: u32,
         backend: &mut impl PacketIo,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         // The change service publishes connection results and serves every
         // dirty client; one that cannot rebind stays dirty for the next pass.
         // A blocked selected packet below exposes that failure and pauses output.
@@ -1279,14 +1387,34 @@ mod linux {
                 report.failed
             );
         }
+        // True when the budget ended the pass with output possibly left.
         for _ in 0..BUDGET {
-            if pending.is_none() {
-                let (polled, attempt) = endpoint
-                    .poll_reserved_transmit(time, &mut output[header_len..], 1)
-                    .map_err(engine)?;
+            if let Some(frame) = pending
+                .is_none()
+                .then(|| network.identifier_held.due(time, output))
+                .flatten()
+            {
+                // A frame waiting for an identifier is tried again first.
+                *pending = Some(frame);
+            } else if pending.is_none() {
+                let (polled, attempt) =
+                    match endpoint.poll_reserved_transmit(time, &mut output[header_len..], 1) {
+                        Ok(polled) => polled,
+                        // Every reservation is held by a frame waiting for an
+                        // identifier: nothing else can be selected now.
+                        Err(EndpointError::OutputReserved)
+                            if !network.identifier_held.is_empty() =>
+                        {
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(engine(error)),
+                    };
                 let Some(packet) = polled.packet else {
-                    if !polled.more_work {
-                        break;
+                    // Held frames keep their owners' reservations, which
+                    // count as pending output: only their retry time wakes
+                    // the loop for them.
+                    if !polled.more_work || !network.identifier_held.is_empty() {
+                        return Ok(false);
                     }
                     continue;
                 };
@@ -1322,6 +1450,41 @@ mod linux {
             };
             let refused: Result<(), _> = match prepared {
                 Ok((context, ticket)) => {
+                    // RFC 1191 section 6.6: on an IPv4 route or path whose
+                    // owner disabled discovery the packet leaves without DF,
+                    // with an Identification leased for this physical
+                    // attempt. Without one only this frame is held, never
+                    // sent with a reused value; other owners' output goes on.
+                    if network.host.clears_dont_fragment(context)
+                        && let Err(backpressure) =
+                            network.host.lease_df_clear(time, &mut output[..held.len])
+                    {
+                        held.context = Some(context);
+                        held.ticket = Some(ticket);
+                        if !held.blocked {
+                            eprintln!("TUN output held for an IPv4 Identification: {backpressure:?}");
+                        }
+                        held.blocked = true;
+                        let len = held.len;
+                        let frame = pending.take().unwrap();
+                        let retry_at = IdentifierHeld::retry_at(time, backpressure);
+                        match network.identifier_held.hold(frame, &output[..len], retry_at) {
+                            Ok(()) => continue,
+                            // No storage left (not expected: one frame per
+                            // owner): the frame stays selected.
+                            Err(frame) => {
+                                *pending = Some(frame);
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    // A frame rewritten DF clear for an attempt that did not
+                    // leave (the backend would block) goes back to the
+                    // atomic header (DF set, Identification 0) when the
+                    // owner re-enabled discovery before this retry.
+                    if !network.host.clears_dont_fragment(context) {
+                        ntcp_host::Host::restore_atomic_header(&mut output[..held.len]);
+                    }
                     let mut live = None;
                     let mut unusable = false;
                     let mut failure = None;
@@ -1352,7 +1515,7 @@ mod linux {
                             held.ticket = Some(ticket);
                             if !unusable {
                                 held.blocked = false;
-                                break;
+                                return Ok(false);
                             }
                             Err(ntcp_host::Error::Unsupported)
                         }
@@ -1397,11 +1560,11 @@ mod linux {
                         );
                     }
                     held.blocked = true;
-                    break;
+                    return Ok(false);
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     // Bounded UDP echo beside the TCP echo. Requests wait in the Host's
@@ -1639,6 +1802,12 @@ mod linux {
                 Err(UdpSendError::TooBig { max_payload }) => self.note(format_args!(
                     "UDP echo of {len} octets to {peer} refused at send: exceeds the path \
                      payload limit of {max_payload}; replies are never fragmented"
+                )),
+                // A DF-clear reply on a discovery-disabled IPv4 route found
+                // no Identification; it ends, as in Fragment mode.
+                Err(UdpSendError::Backpressure(why)) => self.note(format_args!(
+                    "UDP echo of {len} octets to {peer} not sent: no IP identifier \
+                     available ({why:?})"
                 )),
                 // Retry the same reply once the TUN or evidence storage frees.
                 Err(
@@ -1911,6 +2080,12 @@ mod linux {
             Endpoint::new(config.clone(), secret, now(start), address_policy).map_err(engine)?;
         let mut network =
             TunHost::attach_with(&mut endpoint, &config, local, &settings, now(start))?;
+        let mut control = control_server(
+            &mut network.host,
+            &endpoint,
+            std::env::var_os("NTCP_CONTROL_SOCKET"),
+            std::env::var_os("NTCP_CONTROL_ALLOW_UIDS"),
+        )?;
         let listener = endpoint
             .listen(SocketAddr::new(local, port), MAX_FLOWS)
             .map_err(engine)?;
@@ -2038,7 +2213,7 @@ mod linux {
                     index += 1;
                 }
             }
-            transmit_frames(
+            immediate |= transmit_frames(
                 &mut network,
                 &mut endpoint,
                 now(start),
@@ -2051,7 +2226,16 @@ mod linux {
             immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
             immediate |= network.icmp_output(now(start), &mut icmp_output, &mut tun)?;
             network.host.collect(&endpoint).map_err(host_error)?;
-            immediate |= pending.is_none() && endpoint.has_pending_output();
+            // Bounded control pass; the wait below is at most TICK_US, so
+            // an administrator is served within one tick even when idle.
+            if let Some(server) = &mut control {
+                server.service(&mut network.host, &mut endpoint, now(start));
+            }
+            // Frames waiting for an identifier keep their reservations
+            // (pending output) and wake the loop at their retry time.
+            immediate |= pending.is_none()
+                && network.identifier_held.is_empty()
+                && endpoint.has_pending_output();
             let current = now(start);
             // Reassembly expiry runs in the change service even without
             // traffic; adjunct probes and their reply deadlines in the ICMP
@@ -2061,6 +2245,7 @@ mod linux {
                 .into_iter()
                 .chain(network.host.next_reassembly_deadline())
                 .chain(network.host.next_adjunct_deadline())
+                .chain(network.identifier_held.next_retry())
                 .min()
                 .map_or(TICK_US, |deadline| {
                     deadline.saturating_sub(current).min(TICK_US)
@@ -2072,7 +2257,7 @@ mod linux {
             };
             // Held-owner deadlines cannot be serviced until submission; avoid
             // spinning on an already expired transport deadline while blocked.
-            let timeout_ms = if pending.is_some() {
+            let timeout_ms = if pending.is_some() || !network.identifier_held.is_empty() {
                 timeout_ms.max(1)
             } else {
                 timeout_ms
@@ -2084,6 +2269,45 @@ mod linux {
                 network.can_receive(),
             )?;
         }
+    }
+
+    // The opt-in control server (NTCP_CONTROL_SOCKET), bound with this
+    // Host's administration capability. An allow-list without a socket is
+    // refused rather than ignored.
+    fn control_server(
+        host: &mut Host,
+        endpoint: &Endpoint,
+        socket: Option<std::ffi::OsString>,
+        allow_uids: Option<std::ffi::OsString>,
+    ) -> io::Result<Option<ntcp_path_control::Server>> {
+        let allow_uids = match allow_uids {
+            None => Vec::new(),
+            Some(text) => ntcp_path_control::ControlConfig::parse_uids(
+                text.to_str()
+                    .ok_or_else(|| invalid("invalid NTCP_CONTROL_ALLOW_UIDS"))?,
+            )?,
+        };
+        let Some(socket) = socket else {
+            if !allow_uids.is_empty() {
+                return Err(invalid("NTCP_CONTROL_ALLOW_UIDS needs NTCP_CONTROL_SOCKET"));
+            }
+            return Ok(None);
+        };
+        let server = ntcp_path_control::Server::bind(
+            &ntcp_path_control::ControlConfig {
+                socket: socket.into(),
+                allow_uids,
+            },
+            host.administration(),
+            endpoint.caller_timebase(),
+        )?;
+        eprintln!("path control socket at {}", server.path().display());
+        Ok(Some(server))
+    }
+
+    #[cfg(test)]
+    mod control_tests {
+        include!("support/tun_echo_control_tests.rs");
     }
 
     #[cfg(test)]
@@ -2176,6 +2400,262 @@ mod linux {
 
             // Exercise the real OS path, not a statistical entropy test.
             let _secret = acquire_secret().unwrap();
+        }
+
+        // Identifier backpressure holds only the frame that needs one.
+        // Inside the allocator's start quiet period (the default: earlier
+        // emission from the address is unknown), the SYN of a connection
+        // whose exact path the owner made discovery-disabled must leave DF
+        // clear with a leased Identification, so it waits with its own
+        // reservation, while a connection to a neighbor destination still
+        // sends its SYN with DF. Once identifiers can be issued, the held SYN
+        // leaves DF clear with a nonzero leased Identification.
+        #[test]
+        fn identifier_backpressure_holds_only_the_df_clear_frame() {
+            use ntcp_io::{PacketIo, PacketLayer};
+            const MDL_US: u64 = 120_000_000;
+            struct Mock {
+                submitted: Vec<Vec<u8>>,
+            }
+            impl PacketIo for Mock {
+                fn layer(&self) -> PacketLayer {
+                    PacketLayer::Ip
+                }
+                fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+                    Ok(None)
+                }
+                fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+                    self.submitted.push(packet.to_vec());
+                    Ok(TxOutcome::Submitted)
+                }
+            }
+            let (_, _, local) = packet();
+            let mut output = [0; MTU];
+            let mut pending = None;
+            let mut backend = Mock {
+                submitted: Vec::new(),
+            };
+            let config = EndpointConfig::default();
+            let mut endpoint =
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
+            let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
+            let options = || ntcp::ManagedOpenOptions {
+                transport: ntcp::ActiveOpenOptions::from(&config.connection),
+                dscp: config.dscp,
+                ipv4_options: Default::default(),
+                receive_authority: None,
+            };
+            let disabled: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+            let neighbor: SocketAddr = "10.0.0.3:8080".parse().unwrap();
+            let held = endpoint
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(local.into(), 1234),
+                    disabled,
+                    options(),
+                    &mut network.host,
+                )
+                .unwrap();
+            let capability = network.host.administration();
+            let target = network
+                .host
+                .admin_paths(&capability)
+                .unwrap()
+                .find(|p| p.snapshot.key().destination().address() == disabled.ip())
+                .unwrap();
+            let candidate = network
+                .host
+                .admin_validate(
+                    &capability,
+                    0,
+                    path::AdminChange {
+                        target: path::AdminTarget::Path(target.snapshot.path()),
+                        expected: target.generation,
+                        policy: path::AdminPolicy {
+                            discovery_disabled: true,
+                            estimate: None,
+                        },
+                    },
+                )
+                .unwrap();
+            network
+                .host
+                .admin_apply(&capability, &mut endpoint, candidate)
+                .unwrap();
+            let other = endpoint
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(local.into(), 1235),
+                    neighbor,
+                    options(),
+                    &mut network.host,
+                )
+                .unwrap();
+            let to = |packet: &Vec<u8>, peer: SocketAddr| {
+                IpAddr::from([packet[16], packet[17], packet[18], packet[19]]) == peer.ip()
+            };
+            for time in [1, MDL_US - 1] {
+                transmit_frames(
+                    &mut network,
+                    &mut endpoint,
+                    time,
+                    &mut output,
+                    &mut pending,
+                    IP_HEADER,
+                    0,
+                    &mut backend,
+                )
+                .unwrap();
+                assert!(pending.is_none(), "no frame blocks selection");
+                assert!(endpoint.is_output_reserved(held), "the held SYN keeps its reservation");
+                assert!(!endpoint.is_output_reserved(other));
+                assert!(!backend.submitted.iter().any(|p| to(p, disabled)));
+            }
+            let neighbor_syn = backend.submitted.first().unwrap();
+            assert!(to(neighbor_syn, neighbor));
+            assert_ne!(neighbor_syn[6] & 0x40, 0, "DF on the enabled path");
+            let sent = backend.submitted.len();
+            transmit_frames(
+                &mut network,
+                &mut endpoint,
+                MDL_US,
+                &mut output,
+                &mut pending,
+                IP_HEADER,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            assert!(!endpoint.is_output_reserved(held));
+            let syn: Vec<_> = backend.submitted[sent..]
+                .iter()
+                .filter(|p| to(p, disabled))
+                .collect();
+            assert_eq!(syn.len(), 1, "the held SYN, once");
+            assert_eq!(syn[0][6] & 0x40, 0, "DF clear on the disabled path");
+            assert_ne!(u16::from_be_bytes([syn[0][4], syn[0][5]]), 0);
+            assert_eq!(checksum(&syn[0][..20]), 0);
+        }
+
+        // The final bytes follow the decision current at each submission:
+        // a SYN rewritten DF clear with a leased Identification on a
+        // discovery-disabled path, whose submission the backend refuses
+        // with WouldBlock, leaves after the owner re-enables discovery with
+        // the atomic header (DF set, Identification 0, valid checksum).
+        #[test]
+        fn blocked_df_clear_frame_follows_a_reenable() {
+            use ntcp_io::{PacketIo, PacketLayer};
+            const MDL_US: u64 = 120_000_000;
+            struct Mock {
+                offered: Vec<Vec<u8>>,
+                submitted: Vec<Vec<u8>>,
+            }
+            impl PacketIo for Mock {
+                fn layer(&self) -> PacketLayer {
+                    PacketLayer::Ip
+                }
+                fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+                    Ok(None)
+                }
+                fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+                    self.offered.push(packet.to_vec());
+                    if self.offered.len() == 1 {
+                        return Ok(TxOutcome::WouldBlock);
+                    }
+                    self.submitted.push(packet.to_vec());
+                    Ok(TxOutcome::Submitted)
+                }
+            }
+            let (_, _, local) = packet();
+            let mut output = [0; MTU];
+            let mut pending = None;
+            let mut backend = Mock {
+                offered: Vec::new(),
+                submitted: Vec::new(),
+            };
+            let config = EndpointConfig::default();
+            let mut endpoint =
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
+            let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
+            let remote: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+            let id = endpoint
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(local.into(), 1234),
+                    remote,
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&config.connection),
+                        dscp: config.dscp,
+                        ipv4_options: Default::default(),
+                        receive_authority: None,
+                    },
+                    &mut network.host,
+                )
+                .unwrap();
+            let capability = network.host.administration();
+            let set = |network: &mut TunHost, endpoint: &mut Endpoint, disabled: bool| {
+                let target = network
+                    .host
+                    .admin_paths(&capability)
+                    .unwrap()
+                    .find(|p| p.snapshot.key().destination().address() == remote.ip())
+                    .unwrap();
+                let candidate = network
+                    .host
+                    .admin_validate(
+                        &capability,
+                        0,
+                        path::AdminChange {
+                            target: path::AdminTarget::Path(target.snapshot.path()),
+                            expected: target.generation,
+                            policy: path::AdminPolicy {
+                                discovery_disabled: disabled,
+                                estimate: None,
+                            },
+                        },
+                    )
+                    .unwrap();
+                network
+                    .host
+                    .admin_apply(&capability, endpoint, candidate)
+                    .unwrap();
+            };
+            set(&mut network, &mut endpoint, true);
+            // After the start quiet period the DF-clear lease succeeds.
+            transmit_frames(
+                &mut network,
+                &mut endpoint,
+                MDL_US,
+                &mut output,
+                &mut pending,
+                IP_HEADER,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            assert!(backend.submitted.is_empty());
+            let blocked = backend.offered[0].clone();
+            assert_eq!(blocked[6] & 0x40, 0, "offered DF clear while disabled");
+            assert_ne!(u16::from_be_bytes([blocked[4], blocked[5]]), 0);
+            assert!(pending.is_some() && endpoint.is_output_reserved(id));
+            set(&mut network, &mut endpoint, false);
+            transmit_frames(
+                &mut network,
+                &mut endpoint,
+                MDL_US + 1,
+                &mut output,
+                &mut pending,
+                IP_HEADER,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            assert!(!endpoint.is_output_reserved(id));
+            let syn = &backend.submitted[0];
+            assert_eq!(&syn[20..], &blocked[20..], "the same held segment");
+            assert_ne!(syn[6] & 0x40, 0, "DF set on the enabled path");
+            assert_eq!(u16::from_be_bytes([syn[4], syn[5]]), 0, "atomic Identification");
+            assert_eq!(checksum(&syn[..20]), 0);
         }
 
         #[test]
@@ -3345,7 +3825,7 @@ mod linux {
         //# ECN-capable packets MAY have the DF (Don't Fragment) bit set.
         //= https://www.rfc-editor.org/rfc/rfc1191#section-2
         //= type=test
-        //= reason=The atomic IPv4 codec sets DF on every packet it encodes and ntcp_ip::Fragmenter sets DF on every Host-originated fragment; the codec's ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected behavior wherever the host performs Path MTU Discovery, not optional clear-DF termination. User disposition (recorded): a native connection whose application sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT does not perform Path MTU Discovery with its ordinary output, which it sends as IPv4 TCP packets without DF, each carrying an Identification leased from the Host allocator for its (source, destination, TCP) tuple; its PLPMTUD probes keep DF.
+        //= reason=The atomic IPv4 codec sets DF on every packet it encodes and ntcp_ip::Fragmenter sets DF on every fragment, which every Host-originated fragment keeps outside owner-disabled routes; the codec's ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected behavior wherever the host performs Path MTU Discovery, not optional clear-DF termination. On an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, the user's recorded decision B, 1191-093) the host performs none, and its TCP, Host::udp_send_datagram and Echo reply packets, source fragments included, leave DF clear with leased Identifications. User disposition (recorded): a native connection whose application sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT does not perform Path MTU Discovery with its ordinary output, which it sends as IPv4 TCP packets without DF, each carrying an Identification leased from the Host allocator for its (source, destination, TCP) tuple; its PLPMTUD probes keep DF.
         //# and sends all datagrams on that path with the DF bit set.
 
         //= https://www.rfc-editor.org/rfc/rfc1191#section-2

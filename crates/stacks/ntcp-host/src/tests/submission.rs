@@ -985,3 +985,68 @@ fn discarded_summary_blinds_owners_that_could_reuse_its_key() {
     let after = ledger.correlate(10 + horizon, &quote(6000));
     assert_eq!(after.owner.map(|r| r.evidence.owner), Some(reuse.owner));
 }
+
+// RFC 4821 implicit probes need unfragmented delivery: the final submitted
+// bytes decide. An IPv4 packet whose embedding cleared DF before submission
+// (the native IP_PMTUDISC_DONT rewrite), or any packet whose submission is
+// uncertain, is delivered and acknowledged normally but never raises the
+// connection's search_low; definitely submitted DF/IPv6 output does.
+#[test]
+fn only_definitely_submitted_unfragmentable_bytes_prove_size() {
+    // 0: DF kept, Submitted. 1: DF cleared, Submitted. 2: Unknown outcome.
+    for v6 in [false, true] {
+        for case in 0..3 {
+            if v6 && case == 1 {
+                continue; // IPv6 has no DF bit to clear.
+            }
+            let cfg = config(2);
+            let (mut a, mut b, id, child) = connected(v6, &cfg, 2000 + case);
+            let before = a.1.path_mtu_info(id).unwrap().unwrap();
+            assert!(before.search_low < 1500, "initial search_low below a full packet");
+            a.1.write(id, &[9; 1448]).unwrap();
+            let mut now = 100;
+            let (attempt, _, mut frame) = selected(&mut a.1, now).unwrap();
+            assert_eq!(frame.len(), 1500);
+            if case == 1 {
+                // As the native runtime does: DF clear, leased Identification,
+                // recomputed header checksum.
+                frame[4..6].copy_from_slice(&7u16.to_be_bytes());
+                frame[6] &= !0x40;
+                frame[10..12].fill(0);
+                let checksum = ntcp_ip_common::checksum(&frame[..20]);
+                frame[10..12].copy_from_slice(&checksum.to_be_bytes());
+            }
+            let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+            let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
+            let outcome = if case == 2 {
+                BackendOutcome::Unknown
+            } else {
+                BackendOutcome::Submitted
+            };
+            let result =
+                a.0.submit(&mut a.1, now, ticket, context, &frame, 0, |_| outcome)
+                    .unwrap();
+            if case == 2 {
+                assert_eq!(result, Submission::PossiblySubmitted);
+                // The embedding accepts an uncertain outcome without a receipt.
+                assert!(a.1.accept_transmit(now, attempt).unwrap());
+            } else {
+                assert_eq!(result, Submission::Submitted);
+            }
+            input(&mut b.0, &mut b.1, b.2, now + 1, &frame, 0);
+            pump(&mut b, &mut a, &mut now);
+            // Delivery and ACK accounting are unaffected.
+            let progress = a.1.send_progress(id).unwrap();
+            assert_eq!(progress.acknowledged, progress.queued_end);
+            let mut received = [0; 2048];
+            assert_eq!(b.1.read(child, &mut received).unwrap(), 1448);
+            let after = a.1.path_mtu_info(id).unwrap().unwrap();
+            if case == 0 {
+                assert_eq!(after.search_low, 1500, "v6={v6}");
+            } else {
+                assert_eq!(after.search_low, before.search_low, "v6={v6} case={case}");
+            }
+            assert_eq!(after.current_mtu, before.current_mtu);
+        }
+    }
+}

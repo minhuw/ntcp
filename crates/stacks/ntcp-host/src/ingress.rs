@@ -21,6 +21,7 @@ use ntcp_path::{Dscp, LinkId, PathStatus, ScopedAddress, SourceId};
 
 use crate::emitter::{DatagramError, Plan, header_len};
 use crate::icmp_error::{ReassemblyError, originate};
+use crate::ident::IdentifierBackpressure;
 use crate::reassembly::{Arrival, Input, Piece, admissible_source};
 use crate::{BackendOutcome, Error, Host, IcmpDispatch, IcmpOutcome, IngressContext, UdpEgress};
 
@@ -171,10 +172,28 @@ impl IcmpOutput {
         let stride = self.limits.message_bytes;
         Some((queued, &self.bytes[self.head * stride..][..queued.len]))
     }
+    fn queued(&self) -> impl Iterator<Item = Queued> + '_ {
+        (0..self.len).filter_map(|i| self.entries[(self.head + i) % self.limits.messages])
+    }
     fn pop(&mut self) {
         self.entries[self.head] = None;
         self.head = (self.head + 1) % self.limits.messages;
         self.len -= 1;
+    }
+    // Move the oldest message behind the others, keeping the relative order
+    // of the rest; storage stays within the fixed slots.
+    fn rotate(&mut self) {
+        if self.len < 2 {
+            return;
+        }
+        let tail = (self.head + self.len) % self.limits.messages;
+        if tail != self.head {
+            let stride = self.limits.message_bytes;
+            self.bytes
+                .copy_within(self.head * stride..(self.head + 1) * stride, tail * stride);
+            self.entries[tail] = self.entries[self.head].take();
+        }
+        self.head = (self.head + 1) % self.limits.messages;
     }
 }
 
@@ -625,6 +644,29 @@ impl Host {
         Ok(EchoDisposition::Queued)
     }
 
+    // Whether the queued message is routed over the path with `key` now.
+    fn icmp_routed(&self, queued: Queued, key: ntcp_path::PathKey) -> bool {
+        let ip = queued.ip;
+        self.request(ip.source, ip.destination, Dscp::new(0).unwrap())
+            .and_then(|request| {
+                let via = ScopedAddress::new(ip.destination, None)?;
+                Ok(self.paths.resolve_via(request, via)?)
+            })
+            .is_ok_and(|resolved| resolved.key() == key)
+    }
+
+    /// Whether the Host answers Echo Requests (its ICMP output is
+    /// configured), and how many queued ICMP messages leave over the path
+    /// with `key`.
+    pub(crate) fn icmp_output_on(&self, key: ntcp_path::PathKey) -> Option<usize> {
+        (self.icmp_output.limits.messages != 0).then(|| {
+            self.icmp_output
+                .queued()
+                .filter(|&queued| self.icmp_routed(queued, key))
+                .count()
+        })
+    }
+
     pub fn icmp_output_counters(&self) -> IcmpOutputCounters {
         self.icmp_output.counters
     }
@@ -648,27 +690,65 @@ impl Host {
     /// is consumed and the returned outcome is the one that stopped the
     /// transaction (Submitted when every packet went out). None when the
     /// queue is empty. An error consumes the message unsent (counted).
+    /// On a discovery-disabled IPv4 route every message leaves DF clear and
+    /// needs a leased Identification (RFC 1191 section 6.6, RFC 6864): while
+    /// the allocator's start quiet period or the RFC 6864 ceiling withholds
+    /// one, the message stays queued (nothing submitted) and is sized again
+    /// at the next attempt; an identifier is never reused. Only that message
+    /// waits: it moves behind the other queued messages and the call goes on
+    /// with the next one, so output to other destinations is not held behind
+    /// it. WouldBlock when every queued message waits for an identifier and
+    /// no adjunct probe is due.
     /// `packet` holds the complete datagram plus, when it is fragmented, one
     /// fragment: `message_bytes` + 40 + the link MTU suffices.
     ///
-    /// When the queue is empty the call sends the Echo adjunct's next due
-    /// probe instead (`Host::adjunct_due`), one unfragmented packet; None
-    /// when there is neither.
+    /// When the queue is empty, or holds only messages waiting for an
+    /// identifier, the call sends the Echo adjunct's next due probe instead
+    /// (`Host::adjunct_due`), one unfragmented packet; None when the queue
+    /// is empty and no probe is due.
     pub fn icmp_output(
         &mut self,
         now: Instant,
         packet: &mut [u8],
         submit: impl FnMut(UdpEgress, &[u8]) -> BackendOutcome,
     ) -> Result<Option<BackendOutcome>, Error> {
-        let Some((queued, _)) = self.icmp_output.front() else {
+        if self.icmp_output.len == 0 {
             // With nothing queued, the Echo adjunct's next due probe.
             return self.adjunct_probe(now, packet, submit);
-        };
+        }
         self.now = self.now.max(now);
         let mut submit = submit;
+        // Each queued message is tried at most once per call.
+        for _ in 0..self.icmp_output.len {
+            let Some((queued, _)) = self.icmp_output.front() else {
+                break;
+            };
+            match self.icmp_output_head(now, queued, packet, &mut submit)? {
+                Some(outcome) => return Ok(Some(outcome)),
+                None => self.icmp_output.rotate(),
+            }
+        }
+        // Every queued message waits for an identifier.
+        Ok(Some(
+            self.adjunct_probe(now, packet, &mut submit)?
+                .unwrap_or(BackendOutcome::WouldBlock),
+        ))
+    }
+
+    // Send the oldest queued message (as `icmp_output` describes); None when
+    // it waits for an identifier on a DF-clear route and stays queued.
+    fn icmp_output_head(
+        &mut self,
+        now: Instant,
+        queued: Queued,
+        packet: &mut [u8],
+        submit: &mut impl FnMut(UdpEgress, &[u8]) -> BackendOutcome,
+    ) -> Result<Option<BackendOutcome>, Error> {
         let mut result = Err(DatagramError::Host(Error::Obsolete));
-        // A message that the path budget carries whole is never lost for
-        // want of an identifier: without one it goes out unfragmented.
+        // On a route that keeps DF, a message that the path budget carries
+        // whole is never lost for want of an identifier: without one it goes
+        // out unfragmented. On a DF-clear route the whole packet needs one
+        // too, so a retryable shortage holds the message instead.
         for fragments in [true, false] {
             let plan = match self.plan_icmp_output(queued, packet, fragments) {
                 Ok(plan) => plan,
@@ -679,7 +759,20 @@ impl Host {
                 }
             };
             let fragmented = plan.fragment_size.is_some();
-            result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut submit);
+            let clears_df = plan.snapshot.clears_dont_fragment();
+            result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut *submit);
+            if let Err(DatagramError::Backpressure(backpressure)) = result
+                && clears_df
+                && matches!(
+                    backpressure,
+                    IdentifierBackpressure::Unavailable { until: Some(_) }
+                        | IdentifierBackpressure::Exhausted { .. }
+                )
+            {
+                // Nothing was submitted (the lease precedes every packet):
+                // held output, retried on a later pass.
+                return Ok(None);
+            }
             if !(fragmented && matches!(result, Err(DatagramError::Backpressure(_)))) {
                 break;
             }
@@ -703,9 +796,11 @@ impl Host {
                 self.icmp_output.pop();
                 Err(match error {
                     DatagramError::Host(error) => error,
-                    // No identifier (quiet period, MDL ceiling, entropy):
-                    // the message is not sent rather than held at the head
-                    // of the queue.
+                    // No identifier on a route that keeps DF for a message
+                    // the budget cannot carry whole (quiet period, MDL
+                    // ceiling), or none can ever be issued (no allocator,
+                    // entropy failure): the message is not sent rather than
+                    // held at the head of the queue.
                     _ => Error::Capacity,
                 })
             }

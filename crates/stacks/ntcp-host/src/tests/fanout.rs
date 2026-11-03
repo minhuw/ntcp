@@ -11,6 +11,7 @@ const UDP: UdpLimits = UdpLimits {
     max_payload: 1500,
     events: 2,
     evicted_signatures: 1,
+    probe_receipts: 2,
 };
 
 fn udp_side(local: SocketAddr, identity: u128, cfg: &EndpointConfig) -> Side {
@@ -1763,7 +1764,7 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                         a.0.paths()
                             .path_snapshot(path)
                             .unwrap()
-                            .ip_packet_budget()
+                            .pmtu_estimate()
                             .unwrap()
                     });
                     now += 1;
@@ -1906,6 +1907,153 @@ pub(super) enum Held {
 
 // One reserved packet of `id`: the encoded frame (zero-copy: headers only),
 // its external payload length, and the complete wire bytes for the peer.
+// Set `route`'s owner policy through the Host administration capability.
+fn set_route_policy(a: &mut Side, route: path::RouteId, policy: path::AdminPolicy, now: u64) {
+    let capability = a.0.administration();
+    let expected = a
+        .0
+        .admin_routes(&capability)
+        .unwrap()
+        .find(|r| r.route == route)
+        .unwrap()
+        .generation;
+    let candidate = a
+        .0
+        .admin_validate(
+            &capability,
+            now,
+            path::AdminChange {
+                target: path::AdminTarget::Route(route),
+                expected,
+                policy,
+            },
+        )
+        .unwrap();
+    a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+    assert_eq!(service(a, now).failed, 0);
+}
+
+// RFC 1191 section 5's current PMTU estimate is the accepted network
+// estimate, never the discovery-policy sending limit (RFC 1122 section
+// 3.3.3's 576 octets through the default Forwarder route, IPv6's 1280): a
+// validated PTB for a DF-set segment submitted before the owner disabled
+// discovery, arriving after the disable, gives the same TCP feedback and
+// derived size, the same shared learned estimate and the same hold as on
+// an enabled route. The disabled route's packet budget stays the sending
+// limit while disabled and is the learned value after re-enabling, with no
+// new hold. `estimate` is an owner value set with the policy in both runs.
+// The local TCP state (current size, search lower bound) is compared too:
+// nothing in the connection's own sending state differs between the runs.
+fn disabled_route_ptb_matches_enabled(
+    v6: bool,
+    table: ntcp::Ipv4Plateaus,
+    written: usize,
+    quoted_len: usize,
+    learned: u32,
+    estimate: Option<u32>,
+) {
+    let limit = if v6 { 1280 } else { 576 };
+    let mut outcomes = Vec::new();
+    for disable in [false, true] {
+        let case = std::format!("v6={v6} {table:?} estimate={estimate:?} disable={disable}");
+        let mut cfg = config(4);
+        cfg.connection.pmtud.as_mut().unwrap().policy.ipv4_plateaus = table;
+        let (local, remote) = addresses(v6);
+        let mut a = managed_identified(local, 7700, cfg.clone());
+        let mut b = managed(remote, 7800, cfg.clone());
+        b.1.listen(remote, 4).unwrap();
+        let tcp = a
+            .1
+            .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+            .unwrap();
+        let mut now = 0;
+        pump(&mut a, &mut b, &mut now);
+        service(&mut a, now);
+        a.1.write(tcp, &vec![3; written]).unwrap();
+        now += 10;
+        let (quoted, _) = send(&mut a, now, BackendOutcome::Submitted).unwrap();
+        assert_eq!(quoted.len(), quoted_len, "{case}");
+        if !v6 {
+            assert_ne!(quoted[6] & 0x40, 0, "submitted with DF");
+        }
+        let snapshot = a.0.binding(tcp).unwrap().snapshot;
+        let (route, path) = (snapshot.key().route(), snapshot.path());
+        now += 10;
+        if disable || estimate.is_some() {
+            let policy = path::AdminPolicy {
+                discovery_disabled: disable,
+                estimate,
+            };
+            set_route_policy(&mut a, route, policy, now);
+        }
+        if disable {
+            let disabled = a.0.paths().path_snapshot(path).unwrap();
+            assert_eq!(disabled.ip_packet_budget(), Ok(limit), "{case}");
+            assert_eq!(disabled.pmtu_estimate(), Ok(estimate.unwrap_or(1500)), "{case}");
+        }
+        now += 10;
+        let report = ptb(&quoted, if v6 { learned } else { 0 });
+        let (report, published) = tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &report).unwrap());
+        assert_eq!(
+            report,
+            TcpReport::PacketTooBig(PmtuFeedback::Decreased { mtu: learned }),
+            "{case}"
+        );
+        service(&mut a, now);
+        let shared = a.0.paths().path_snapshot(path).unwrap();
+        assert_eq!(shared.learned_mtu(), Some(learned), "{case}");
+        assert_eq!(
+            shared.ip_packet_budget(),
+            Ok(if disable { limit } else { learned }),
+            "{case}: the sending limit holds while disabled"
+        );
+        let hold = shared.retry_not_before();
+        let info = a.1.path_mtu_info(tcp).unwrap().unwrap();
+        if disable {
+            now += 10;
+            let policy = path::AdminPolicy {
+                discovery_disabled: false,
+                estimate,
+            };
+            set_route_policy(&mut a, route, policy, now);
+            let enabled = a.0.paths().path_snapshot(path).unwrap();
+            assert_eq!(enabled.ip_packet_budget(), Ok(learned), "{case}: not {limit}");
+            assert_eq!(enabled.learned_mtu(), Some(learned), "{case}");
+            assert_eq!(enabled.retry_not_before(), hold, "{case}: no new hold");
+            let after = a.1.path_mtu_info(tcp).unwrap().unwrap();
+            assert_eq!(
+                (after.current_mtu, after.search_low),
+                (info.current_mtu, info.search_low),
+                "{case}"
+            );
+        }
+        outcomes.push((report, published, shared.learned_mtu(), hold, info.current_mtu, info.search_low));
+    }
+    assert_eq!(outcomes[0], outcomes[1], "v6={v6} {table:?}: enabled and disabled differ");
+}
+
+// IPv4 legacy reports (Next-Hop MTU 0) on the default Forwarder route:
+// TCP's RFC 1191 table reads a 1010-octet quote as 1006 (the Host's
+// CONTEMPORARY table gives 576, so TCP's larger size is published), and the
+// CONTEMPORARY table reads a 1480-octet quote as 1460, against the network
+// estimate of 1500, not the 576-octet sending limit.
+#[test]
+fn ipv4_legacy_ptb_after_disable_learns_the_network_value() {
+    disabled_route_ptb_matches_enabled(false, ntcp::Ipv4Plateaus::RFC1191, 958, 1010, 1006, None);
+    disabled_route_ptb_matches_enabled(false, ntcp::Ipv4Plateaus::CONTEMPORARY, 1428, 1480, 1460, None);
+}
+
+// IPv6: a 1400-octet PTB for a 1500-octet segment learns 1400 on a disabled
+// path as on an enabled one, without and with an owner value of 1450 above
+// the 1280-octet sending limit (the value, not the sending limit, is the
+// conservative TCP search baseline the policy lowers to).
+#[test]
+fn ipv6_ptb_after_disable_learns_the_network_value() {
+    for estimate in [None, Some(1450)] {
+        disabled_route_ptb_matches_enabled(true, ntcp::Ipv4Plateaus::CONTEMPORARY, 1428, 1500, 1400, estimate);
+    }
+}
+
 pub(super) fn reserve(
     side: &mut Side,
     id: ConnectionId,

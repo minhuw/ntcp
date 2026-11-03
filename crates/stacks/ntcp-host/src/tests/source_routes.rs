@@ -8,7 +8,7 @@ const LATER: [u8; 2] = [10, 11];
 fn hop(last: u8) -> Ipv4Addr {
     Ipv4Addr::new(192, 0, 2, last)
 }
-fn routed(local: SocketAddr, identity: u128, cfg: EndpointConfig) -> Peer {
+pub(super) fn routed(local: SocketAddr, identity: u128, cfg: EndpointConfig) -> Peer {
     let mut peer = managed(local, identity, cfg);
     peer.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Options {
         source_routes: true,
@@ -44,7 +44,7 @@ fn received(frame: &[u8], recorded: &[u8]) -> Vec<u8> {
     ntcp::wire::parse(packet.ip, packet.payload).unwrap();
     result
 }
-fn receive(peer: &mut Peer, now: u64, frame: &[u8], recorded: &[u8]) {
+pub(super) fn receive(peer: &mut Peer, now: u64, frame: &[u8], recorded: &[u8]) {
     input(
         &mut peer.0,
         &mut peer.1,

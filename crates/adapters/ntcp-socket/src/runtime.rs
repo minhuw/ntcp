@@ -179,7 +179,7 @@ impl Runtime {
         let factory = crate::PACKET_IO_FACTORY.lock().map_err(|_| EIO)?.take();
         Self::spawn(
             std::panic::AssertUnwindSafe(move || {
-                if let Some(factory) = factory {
+                let mut owner = if let Some(factory) = factory {
                     Owner::external_backend(
                         &config,
                         factory().map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
@@ -189,7 +189,9 @@ impl Runtime {
                         Backend::Tun => Owner::new(&config),
                         Backend::AfPacket => Owner::af_packet(&config),
                     }
-                }
+                }?;
+                owner.start_control(config.control.as_ref())?;
+                Ok(owner)
             }),
             false,
         )
@@ -361,11 +363,16 @@ fn host_error(error: ntcp_host::Error) -> i32 {
         H::Path(P::SourceNotOwned) => EADDRNOTAVAIL,
         H::InvalidContext
         | H::Obsolete
-        | H::Path(P::ForeignContext | P::StaleHandle | P::Invalidated | P::SelectionChanged) => {
-            ESTALE
-        }
+        | H::Path(
+            P::ForeignContext
+            | P::StaleHandle
+            | P::Invalidated
+            | P::SelectionChanged
+            | P::StaleGeneration,
+        ) => ESTALE,
         H::Unsupported => EOPNOTSUPP,
-        H::Codec(_) | H::Path(P::InvalidArgument | P::Duplicate) => EINVAL,
+        H::Unauthorized => EPERM,
+        H::Codec(_) | H::Path(P::InvalidArgument | P::Duplicate | P::Ambiguous) => EINVAL,
     }
 }
 fn managed_error(error: ntcp::ManagedError<ntcp_host::Error>) -> i32 {
@@ -597,6 +604,9 @@ struct Owner {
     endpoint: Endpoint,
     // Absent only during construction or in explicitly backend-less core fixtures.
     host: Option<ntcp_host::Host>,
+    // The opt-in local path control server (`control.socket`), served on
+    // this owner thread with native descriptors and direct system calls.
+    control: Option<ntcp_path_control::Server>,
     ingress: Option<ntcp_host::IngressContext>,
     // Host input storage: the destination of each datagram reassembly
     // completes, and the IP packet and wire frame of Host ICMP output. All
@@ -931,6 +941,7 @@ impl Owner {
             sockets: BTreeMap::new(),
             local,
             epoch: Instant::now(),
+            control: None,
             #[cfg(test)]
             test_now: None,
             #[cfg(feature = "packet-test")]
@@ -1308,6 +1319,10 @@ impl Owner {
             if self.collect_paths().is_err() {
                 break 'run;
             }
+            // Before the held-output early continue below: administration
+            // stays reachable while output is held (a restriction may be
+            // what releases it).
+            self.service_control();
             // Bounded owner work and a 1ms ceiling also cover shared wakefd consumers.
             let wait = self.output_wait();
             // Keep admission open while teardown has room; packet capture must
@@ -1360,6 +1375,29 @@ impl Owner {
                 Err(error)
             };
             let _ = request.reply.send(result);
+        }
+    }
+    // Create the opt-in control server on the owner thread once the Host
+    // exists, with the Host-bound administration capability.
+    fn start_control(&mut self, config: Option<&ntcp_path_control::ControlConfig>) -> Result<()> {
+        let Some(config) = config else {
+            return Ok(());
+        };
+        let host = self.host.as_mut().ok_or(EINVAL)?;
+        let server = ntcp_path_control::Server::bind(
+            config,
+            host.administration(),
+            self.endpoint.caller_timebase(),
+        )
+        .map_err(|e| e.raw_os_error().unwrap_or(EINVAL))?;
+        self.control = Some(server);
+        Ok(())
+    }
+    // One bounded control pass at the owner clock.
+    fn service_control(&mut self) {
+        let now = self.now();
+        if let (Some(server), Some(host)) = (&mut self.control, &mut self.host) {
+            server.service(host, &mut self.endpoint, now);
         }
     }
     fn collect_paths(&mut self) -> Result<()> {

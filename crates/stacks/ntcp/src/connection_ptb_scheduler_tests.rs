@@ -38,6 +38,13 @@ pub(super) fn span(a: &Connection, bytes: &[u8]) -> Span {
     )
 }
 
+// What a Host supplies with a correlated report: its shared estimate of the
+// current path incarnation (here, the estimate every applied decrease
+// lowered), and none for an older incarnation.
+pub(super) fn host_estimate(a: &Connection, current: bool) -> Option<u32> {
+    current.then(|| a.path_mtu_info().unwrap().current_mtu)
+}
+
 pub(super) fn report(a: &mut Connection, now: Instant, s: Span, candidate: u32) -> PmtuFeedback {
     let header = header(a);
     a.correlated_pmtu_feedback(
@@ -52,7 +59,7 @@ pub(super) fn report(a: &mut Connection, now: Instant, s: Span, candidate: u32) 
             quoted_packet_len: s.2,
             candidate_mtu: candidate,
             current_path: true,
-            path_estimate: None,
+            path_estimate: host_estimate(a, true),
         },
         None,
     )
@@ -629,7 +636,7 @@ pub(super) fn report_on(
             quoted_packet_len: s.2,
             candidate_mtu: candidate,
             current_path: current,
-            path_estimate: None,
+            path_estimate: host_estimate(a, current),
         },
         None,
     )

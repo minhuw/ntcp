@@ -59,6 +59,16 @@ fn managed_pair_configured(
     units: u64,
     configure: impl FnOnce(&mut ConnectionConfig),
 ) -> (Connection, Connection, PathService, Route) {
+    managed_pair_with_peer(ipv4, units, configure, |_| {})
+}
+
+// `peer` adjusts only the passive side's configuration (e.g. its MSS offer).
+fn managed_pair_with_peer(
+    ipv4: bool,
+    units: u64,
+    configure: impl FnOnce(&mut ConnectionConfig),
+    peer: impl FnOnce(&mut ConnectionConfig),
+) -> (Connection, Connection, PathService, Route) {
     let tuple = if ipv4 {
         tuple()
     } else {
@@ -94,6 +104,8 @@ fn managed_pair_configured(
     .unwrap();
     let syn_bytes = packet(&mut a, 1);
     let syn = wire::parse(ip(tuple), &syn_bytes).unwrap();
+    let mut cfg = cfg;
+    peer(&mut cfg);
     let mut b = Connection::passive(reverse(tuple), cfg, 900, 2, &syn).unwrap();
     deliver(&mut b, &mut a, 3);
     deliver(&mut a, &mut b, 4);
@@ -538,7 +550,7 @@ fn deferred_setup(ipv4: bool) -> (Connection, Connection, PathService, Route, cr
         quoted_packet_len: len,
         candidate_mtu: if ipv4 { 1000 } else { 1280 },
         current_path: true,
-        path_estimate: None,
+        path_estimate: a.managed_path.unwrap().snapshot.pmtu_estimate().ok(),
     };
     assert!(report.candidate_mtu < len);
     (a, b, service, route, report, bytes)
@@ -689,7 +701,8 @@ fn submitted_probe(
 }
 
 fn accept_probe(a: &mut Connection, intent: crate::DiscoveryIntent, now: Instant, receipt: Receipt) {
-    let start = Seq(a.last_departure.unwrap().start);
+    let departure = a.last_departure.unwrap();
+    let start = Seq(departure.start);
     test_support::commit_reserved(a, now);
     let receipt = match receipt {
         Receipt::Missing => return,
@@ -697,6 +710,8 @@ fn accept_probe(a: &mut Connection, intent: crate::DiscoveryIntent, now: Instant
         Receipt::WrongLength => crate::PhysicalReceipt { ip_packet_len: intent.ip_packet_len() + 1, dont_fragment: true },
         Receipt::Fragmentable => crate::PhysicalReceipt { ip_packet_len: intent.ip_packet_len(), dont_fragment: false },
     };
+    // As Endpoint::accept_transmit_submitted: final-byte provenance first.
+    a.certify_submission(&departure, 0, departure.payload, receipt);
     a.retain_probe_receipt(start, intent, receipt);
 }
 
@@ -788,6 +803,171 @@ fn stale_probe_after_negative_revision_route_change_or_fresh_hold_yields_nothing
             b.input(now + 1, &wire::parse(ip(a.tuple), &bytes).unwrap()).unwrap();
             deliver(&mut b, &mut a, now + 2);
             assert!(a.managed_results.confirmed.is_none(), "case {case}");
+        }
+    }
+}
+
+// T12 search transition through a real managed binding: the owner's
+// administrative estimate arrives as a PathService snapshot through
+// apply_managed_budget (caller time, production 600-second hold).
+const ADMIN_HOLD: u64 = 600 * 1_000_000;
+
+fn administer(a: &mut Connection, service: &mut PathService, now: Instant, policy: ntcp_path::AdminPolicy) {
+    let old = a.managed_path.unwrap();
+    let path = old.snapshot.path();
+    let expected = service.path_administration(path).unwrap().generation;
+    let plan = service
+        .prepare_admin(
+            ntcp_path::AdminChange { target: ntcp_path::AdminTarget::Path(path), expected, policy },
+            now,
+            ADMIN_HOLD,
+        )
+        .unwrap();
+    service.commit_admin(plan).unwrap();
+    a.apply_managed_budget(crate::PreparedPath { client: old.client, snapshot: service.snapshot(old.client).unwrap() })
+        .unwrap();
+}
+
+fn estimate(value: u32) -> ntcp_path::AdminPolicy {
+    ntcp_path::AdminPolicy { discovery_disabled: false, estimate: Some(value) }
+}
+
+// A validated decrease to 1300 with its hold, an RTT sample inside the hold,
+// then the upward administrative value 1450 (cached only).
+fn admin_setup(a: &mut Connection, b: &mut Connection, service: &mut PathService) {
+    decrease(a, service, 1300, ADMIN_HOLD);
+    administer(a, service, 20, estimate(1450));
+    a.write(&[7; 1000]).unwrap();
+    exchange(a, b, ADMIN_HOLD - 1);
+}
+
+fn pending(deferred: Option<crate::AdministrativeDeferral>) -> Option<crate::AdministrativeSearch> {
+    Some(crate::AdministrativeSearch::Pending { target: 1450, deferred })
+}
+
+#[test]
+fn administrative_cap_arrives_through_budget_and_targets_the_first_probe_on_the_wire() {
+    for ipv4 in [true, false] {
+        let header = if ipv4 { 20 } else { 40 };
+        let (mut a, mut b, mut service, _) = managed_pair(ipv4, 1_000_000);
+        decrease(&mut a, &mut service, 1300, ADMIN_HOLD);
+        let before = a.path_mtu_info().unwrap();
+        let snapshot = a.managed_path.unwrap().snapshot;
+        assert_eq!(a.administrative_search(), None);
+        administer(&mut a, &mut service, 20, estimate(1450));
+        // Delivered with the snapshot: a search cap, not an estimate change.
+        let delivered = a.managed_path.unwrap().snapshot;
+        assert_eq!(delivered.administrative_estimate(), Some(1450));
+        assert_eq!(delivered.ip_packet_budget(), snapshot.ip_packet_budget());
+        assert_eq!(delivered.retry_not_before(), snapshot.retry_not_before());
+        assert_eq!(delivered.negative_revision(), snapshot.negative_revision());
+        let info = a.path_mtu_info().unwrap();
+        assert_eq!(info.search_high, before.search_high.min(1450));
+        assert_eq!(info.search_low, before.search_low);
+        // The conservative baseline case: the budget-only decrease left the
+        // unvalidated working size (1500) at or above the administrative
+        // value, so it is lowered to the shared budget for revalidation;
+        // nothing is raised.
+        assert_eq!((before.current_mtu, info.current_mtu), (1500, 1300));
+        assert_eq!(a.administrative_search(), pending(None));
+        // Real output inside the hold stays ordinary and records the hold.
+        a.write(&[7; 1000]).unwrap();
+        let bytes = deliver(&mut a, &mut b, 30);
+        assert!(bytes.len() + header <= 1300);
+        assert_eq!(a.administrative_search(), pending(Some(crate::AdministrativeDeferral::Hold)));
+        deliver(&mut b, &mut a, 31);
+        exchange(&mut a, &mut b, ADMIN_HOLD - 1);
+        // First eligible probe after the hold: the administrative value, not
+        // the midpoint, as one complete IP packet on the wire.
+        a.write(&[8; 20000]).unwrap();
+        let mut out = vec![0; 2048];
+        let n = a.transmit_selected(ADMIN_HOLD, &mut out, true).unwrap().unwrap();
+        let intent = a.last_departure.unwrap().discovery.expect("targeted probe");
+        assert_eq!(n + header, 1450, "ipv4={ipv4}");
+        assert_eq!(intent.ip_packet_len(), 1450);
+        assert_eq!(
+            a.administrative_search(),
+            Some(crate::AdministrativeSearch::Attempted { target: 1450, size: 1450, clipped: None })
+        );
+        assert_eq!(a.pmtud.as_ref().unwrap().administrative_target(), None);
+    }
+}
+
+#[test]
+fn administrative_deferral_reasons_are_recorded_during_real_output() {
+    use crate::AdministrativeDeferral::{Cooldown, DataOrWindow, LossRecovery};
+    for ipv4 in [true, false] {
+        let mut out = vec![0; 2048];
+        // Too little queued data for a probe and its trailing segments.
+        let (mut a, mut b, mut service, _) = managed_pair(ipv4, 1_000_000);
+        admin_setup(&mut a, &mut b, &mut service);
+        a.write(&[9; 1000]).unwrap();
+        packet(&mut a, ADMIN_HOLD + 1);
+        assert_eq!(a.administrative_search(), pending(Some(DataOrWindow)), "ipv4={ipv4}");
+
+        // An outstanding (midpoint) probe blocks the targeted one.
+        let (mut a, mut b, mut service, _) = managed_pair(ipv4, 1_000_000);
+        decrease(&mut a, &mut service, 1300, ADMIN_HOLD);
+        a.write(&[7; 1000]).unwrap();
+        exchange(&mut a, &mut b, ADMIN_HOLD - 1);
+        a.write(&[8; 20000]).unwrap();
+        a.transmit_selected(ADMIN_HOLD + 1, &mut out, true).unwrap().unwrap();
+        assert!(a.pmtud.as_ref().unwrap().probe.is_some());
+        test_support::commit_reserved(&mut a, ADMIN_HOLD + 1);
+        administer(&mut a, &mut service, ADMIN_HOLD + 2, estimate(1450));
+        assert_eq!(a.administrative_search(), pending(None));
+        packet(&mut a, ADMIN_HOLD + 3);
+        assert_eq!(a.administrative_search(), pending(Some(Cooldown)), "ipv4={ipv4}");
+
+        // Loss recovery: the first of a flight sent inside the hold is lost;
+        // the duplicate ACKs arrive after the hold.
+        let (mut a, mut b, mut service, _) = managed_pair(ipv4, 1_000_000);
+        admin_setup(&mut a, &mut b, &mut service);
+        a.write(&[8; 20000]).unwrap();
+        let flight: Vec<_> = (0..8).map(|_| packet(&mut a, ADMIN_HOLD - 1)).collect();
+        for bytes in &flight[1..] {
+            b.input(ADMIN_HOLD + 2, &wire::parse(ip(a.tuple), bytes).unwrap()).unwrap();
+            deliver(&mut b, &mut a, ADMIN_HOLD + 2);
+            while a.transmit(ADMIN_HOLD + 2, &mut out).unwrap().is_some() {}
+        }
+        assert!(a.congestion.in_recovery());
+        assert_eq!(a.administrative_search(), pending(Some(LossRecovery)), "ipv4={ipv4}");
+        assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+    }
+}
+
+// The targeted size is clipped by a transport ceiling, the user's or the
+// peer's MSS, and the diagnostic names it; the wire carries the clip.
+#[test]
+fn administrative_target_clipped_by_user_or_peer_mss_reports_transport() {
+    for ipv4 in [true, false] {
+        let header = if ipv4 { 20 } else { 40 };
+        for user in [true, false] {
+            let (mut a, mut b, mut service, _) =
+                managed_pair_with_peer(ipv4, 1_000_000, |_| {}, |cfg| {
+                    if !user {
+                        cfg.mss = 1360;
+                    }
+                });
+            if user {
+                a.set_user_mss(Some(1350)).unwrap();
+            }
+            let expected = if user { 1350 } else { 1360 } + header + 20;
+            admin_setup(&mut a, &mut b, &mut service);
+            a.write(&[8; 20000]).unwrap();
+            let mut out = vec![0; 2048];
+            let n = a.transmit_selected(ADMIN_HOLD, &mut out, true).unwrap().unwrap();
+            assert!(a.last_departure.unwrap().discovery.is_some());
+            assert_eq!(n as u32 + header, expected, "ipv4={ipv4} user={user}");
+            assert_eq!(
+                a.administrative_search(),
+                Some(crate::AdministrativeSearch::Attempted {
+                    target: 1450,
+                    size: expected,
+                    clipped: Some(crate::AdministrativeClip::Transport)
+                }),
+                "ipv4={ipv4} user={user}"
+            );
         }
     }
 }

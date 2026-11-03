@@ -5,7 +5,12 @@
 //! RFC 4821 section 8 recommends that IPv4 hosts mimic IPv6: datagrams
 //! larger than the effective Path MTU are fragmented in the host, even when
 //! smaller than the first-hop MTU, and DF is set on the fragments (RFC 4821
-//! 4821-062/155). Every IPv4 fragment therefore carries DF; IPv6 fragments
+//! 4821-062/155). Every IPv4 fragment therefore carries DF, except on a
+//! route or path whose owner disabled discovery: there the IP layer leaves
+//! DF clear on every packet whatever the upper layer requests (RFC 1191
+//! section 6.6, the user's recorded disposition for administratively
+//! flagged routes), source fragments and whole datagrams alike, each whole
+//! DF-clear datagram with its own leased Identification. IPv6 fragments
 //! use base header -> Fragment header -> upper layer only (RFC 8200 section
 //! 4.5), so source and final destination are the header addresses and the
 //! upper-layer checksum, computed once over the complete datagram, stays
@@ -20,6 +25,8 @@
 //! sealed one by one; only the unattempted suffix is cancelled. A sent
 //! prefix is never reported as unsent, and a whole retry is a new datagram
 //! with a new identifier.
+
+use core::net::IpAddr;
 
 use ntcp::{Instant, IpMetadata};
 use ntcp_path::{PathSnapshot, PathStatus};
@@ -154,10 +161,11 @@ pub struct UdpDatagramLimits {
     /// above `effective_payload` is still fragmented when the peer guarantee
     /// allows it.
     pub unfragmented_payload: usize,
-    /// The connectionless effective size (complete IP octets): min(shared
-    /// ordinary budget, max(connectionless initial PMTU, the adjunct's
-    /// confirmed lower bound)). Fragments are cut to it (RFC 4821 sections
-    /// 7.2, 8 and 10.3).
+    /// The flow's connectionless effective size (complete IP octets):
+    /// min(shared ordinary budget, the flow's probe upper bound,
+    /// max(connectionless initial PMTU, the adjunct's confirmed lower bound,
+    /// the flow's confirmed probe size)). Fragments are cut to it (RFC 4821
+    /// sections 7.2, 8, 9 and 10.3).
     pub effective_size: u32,
     /// Largest UDP payload whose datagram fits `effective_size` whole.
     pub effective_payload: usize,
@@ -174,6 +182,9 @@ pub struct UdpDatagramLimits {
     /// whether it was stated by the application.
     pub guarantee: u32,
     pub guarantee_stated: bool,
+    /// The flow's own probe-outcome bounds for this path (all None when its
+    /// application reported no outcome on this path incarnation).
+    pub probe: crate::UdpProbeBounds,
 }
 
 impl UdpDatagramLimits {
@@ -199,7 +210,9 @@ impl UdpDatagramLimits {
 }
 
 /// The record of a Probe-mode submission. It proves no delivery and writes
-/// no shared state (RFC 4821 section 9; outcome reporting is separate).
+/// no shared state (RFC 4821 section 9). A definite submission carries the
+/// one receipt its application reports the outcome with
+/// (`Host::udp_report_probe`); an uncertain one carries none.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProbeRecord {
     /// False when the backend outcome was unknown.
@@ -214,6 +227,7 @@ pub struct ProbeRecord {
     pub size: u32,
     pub above: Option<u32>,
     pub submitted_at: Instant,
+    pub receipt: Option<crate::ProbeReceipt>,
 }
 
 /// The outcome of a datagram transaction that submitted at least one packet.
@@ -243,6 +257,17 @@ pub enum DatagramError {
     PeerLimit { max_payload: usize, guarantee: u32 },
     /// No identifier can be leased now; nothing was submitted.
     Backpressure(IdentifierBackpressure),
+    /// Probe mode on a path whose owner disabled discovery (RFC 1191
+    /// section 6.6, RFC 8201 section 5.6); nothing was submitted.
+    DiscoveryDisabled,
+    /// Probe mode while the flow already holds its configured number of
+    /// unreported, still usable receipts (`UdpLimits::probe_receipts`);
+    /// nothing was submitted. Reporting outcomes, or their expiry, frees them.
+    ReceiptsExhausted,
+    /// Probe mode at or above `size` complete IP octets before `until`: the
+    /// flow's application reported a timeout failure at that size (RFC 4821
+    /// section 7.6.3); nothing was submitted. Smaller probes are accepted.
+    RetrySuppressed { size: u32, until: Instant },
     /// The first packet was certainly not submitted; nothing was recorded.
     NotSubmitted(BackendOutcome),
     Host(Error),
@@ -422,7 +447,7 @@ impl Host {
     /// built in `packet[..size]`. `evidence` yields each piece's record, or
     /// None for messages the ledger does not track (Host ICMP output).
     //= https://www.rfc-editor.org/rfc/rfc4821#section-4
-    //= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion).
+    //= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
     //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn transmit(
@@ -452,9 +477,25 @@ impl Host {
                 (Some(owner), Some(e)) => Some(self.reserve_fragments(endpoint, owner, &[e])?),
                 _ => None,
             };
+            let mut identification = None;
+            if plan.snapshot.clears_dont_fragment() {
+                // The whole packet leaves without DF, a non-atomic datagram
+                // that needs its own leased Identification.
+                match self.lease_df_clear(now, &mut packet[..len]) {
+                    Ok(id) => identification = Some(u32::from(id)),
+                    Err(backpressure) => {
+                        if let Some(ticket) = ticket {
+                            self.ledger.cancel(ticket);
+                        }
+                        return Err(DatagramError::Backpressure(backpressure));
+                    }
+                }
+            }
             self.now = self.now.max(now);
             let outcome = submit(egress, &packet[..len]);
-            return self.finish_single(now, ticket, outcome, len);
+            let mut report = self.finish_single(now, ticket, outcome, len)?;
+            report.identification = identification;
+            return Ok(report);
         };
         if size > packet.len() {
             return Err(Error::Capacity.into());
@@ -541,6 +582,12 @@ impl Host {
                 let packet_len = cutter
                     .encode(scratch, offset, &data[offset..offset + len])
                     .map_err(DatagramError::Host)?;
+                if plan.snapshot.clears_dont_fragment() {
+                    // RFC 1191 section 6.6: DF clear on every packet of a
+                    // discovery-disabled route, source fragments included;
+                    // MF, the offset and the datagram's Identification stay.
+                    clear_dont_fragment(&mut scratch[..packet_len]);
+                }
                 submit(egress, &scratch[..packet_len])
             };
             let ticket = tickets.get(index).copied();
@@ -588,6 +635,73 @@ impl Host {
             ));
         }
         Ok(report)
+    }
+
+    /// Clear DF on one atomically encoded IPv4 packet (DF set,
+    /// Identification 0) and give it an Identification leased for its
+    /// (source, destination, protocol) tuple, recomputing the header
+    /// checksum. A leased 0 is passed over: every atomic datagram of this
+    /// stack carries 0, and a middlebox that clears their DF would make
+    /// them collide with this one (it stays leased and is never sent).
+    /// Backpressure (the RFC 6864 ceiling or the start quiet period) leaves
+    /// the packet unchanged: the caller holds it, never reusing a value.
+    pub fn lease_df_clear(
+        &mut self,
+        now: Instant,
+        ip: &mut [u8],
+    ) -> Result<u16, IdentifierBackpressure> {
+        if ip.len() < ntcp_ip::IPV4_HEADER || ip[0] >> 4 != 4 {
+            return Err(IdentifierBackpressure::Unavailable { until: None });
+        }
+        let source = IpAddr::V4(core::net::Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]));
+        let destination = IpAddr::V4(core::net::Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]));
+        let mut identification = 0;
+        for _ in 0..2 {
+            identification = self.lease_identification(now, source, destination, ip[9])? as u16;
+            if identification != 0 {
+                break;
+            }
+        }
+        if identification == 0 {
+            return Err(IdentifierBackpressure::Exhausted {
+                retry_at: now.saturating_add(1),
+            });
+        }
+        ip[4..6].copy_from_slice(&identification.to_be_bytes());
+        clear_dont_fragment(ip);
+        Ok(identification)
+    }
+
+    /// The inverse of `lease_df_clear` for a held packet whose final bytes
+    /// must no longer leave DF clear: an embedding rewrote it for a
+    /// DF-clear submission that did not happen (the backend would block),
+    /// and before its retry the owner re-enabled discovery on its path
+    /// while its connection does not ask for IP_PMTUDISC_DONT. When the
+    /// packet is a whole IPv4 datagram (MF clear, offset 0) with DF clear,
+    /// this restores the atomic header the encoder produced (DF set,
+    /// Identification 0, header checksum recomputed) and returns true; the
+    /// unused leased Identification stays leased and is never reissued
+    /// early. Its submission then proves size like any DF-set packet.
+    /// Anything else (IPv6, DF already set, a fragment, a short buffer) is
+    /// left unchanged and returns false.
+    pub fn restore_atomic_header(ip: &mut [u8]) -> bool {
+        if ip.len() < ntcp_ip::IPV4_HEADER
+            || ip[0] >> 4 != 4
+            || ip[0] & 0x0f < 5
+            || usize::from(ip[0] & 0x0f) * 4 > ip.len()
+            || ip[6] & 0x40 != 0
+            || ip[6] & 0x3f != 0
+            || ip[7] != 0
+        {
+            return false;
+        }
+        let header = usize::from(ip[0] & 0x0f) * 4;
+        ip[4..6].fill(0);
+        ip[6] |= 0x40;
+        ip[10..12].fill(0);
+        let checksum = ntcp_ip_common::checksum(&ip[..header]);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        true
     }
 
     fn finish_single(
@@ -650,4 +764,14 @@ impl Host {
             (result, _) => result,
         }
     }
+}
+
+// Clear DF on one encoded IPv4 header, keeping MF, the fragment offset and
+// the Identification, and recompute the header checksum.
+pub(crate) fn clear_dont_fragment(ip: &mut [u8]) {
+    let header = usize::from(ip[0] & 0x0f) * 4;
+    ip[6] &= !0x40;
+    ip[10..12].fill(0);
+    let checksum = ntcp_ip_common::checksum(&ip[..header]);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
 }

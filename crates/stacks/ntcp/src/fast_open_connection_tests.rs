@@ -1228,7 +1228,7 @@ fn fast_open_syn_data_drop_retries_the_handshake_in_every_accepted_class() {
                     quoted_packet_len: size,
                     candidate_mtu: 68,
                     current_path: current,
-                    path_estimate: None,
+                    path_estimate: current.then(|| a.path_mtu_info().unwrap().current_mtu),
                 },
                 None,
             )

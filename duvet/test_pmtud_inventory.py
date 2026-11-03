@@ -149,7 +149,7 @@ class PmtudInventory(unittest.TestCase):
             self.assertIn("Selected Informational policy deviation:", row["reason"])
             self.assertIn("historical algorithm is deliberately not selected", row["reason"])
 
-    def test_disabled_ipv6_safety_does_not_close_the_administrative_path_interface(self):
+    def test_disabled_ipv6_safety_and_the_administrative_path_flag_are_separate_controls(self):
         rows = {p["id"]: p for p in self.inventory(8201)["paragraphs"]}
         disabled = rows["8201-004"]
         self.assertEqual(disabled["status"], "covered")
@@ -159,13 +159,22 @@ class PmtudInventory(unittest.TestCase):
             "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive_path(",
             "crates/stacks/ntcp-ip6/tests/disabled_pmtud.rs::fn disabled_ipv6_codec_peer_boundaries_options_loss_and_output_modes()",
         ])
+        # The creation profile is not the path control: the owner's flag on
+        # a path closes 8201-082 with its own source and test evidence.
         path = rows["8201-082"]
-        self.assertEqual(path["status"], "TODO")
+        self.assertEqual(path["status"], "covered")
         self.assertEqual(path["quote"],
                          "The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.")
-        self.assertIn("No administrative per-path discovery-disable flag", path["reason"])
-        self.assertIn("Connections configured with PMTUD disabled enforce", path["reason"])
-        self.assertEqual(rows["8201-080"]["status"], "TODO")
+        self.assertEqual(path["evidence"], [
+            "crates/stacks/ntcp-path/src/service/cache.rs::    pub fn ip_packet_budget(",
+            "crates/stacks/ntcp-host/src/tests/admin.rs::fn ipv6_discovery_disable_caps_existing_and_future_tcp_at_1280()",
+        ])
+        for fragment in ("caps that path's IPv6 packet budget at the IPv6 minimum link MTU of 1280 octets",
+                         "set through Host::administration and by the ntcp-pathctl utility",
+                         "Connections created with PMTUD disabled enforce the same ceiling on their own (8201-004)",
+                         "each physical software-GSO segment", "integration/rfc_host admin and native-admin cases"):
+            self.assertIn(fragment, path["reason"])
+        self.assertEqual(rows["8201-080"]["status"], "covered")
 
     def test_matching_ptb_closures_keep_full_quotes_and_all_canonical_copies(self):
         quotes = {
@@ -267,9 +276,12 @@ class PmtudInventory(unittest.TestCase):
         ])
         self.assertIn("AWS EC2 and Google VPC", plateau["reason"])
         self.assertIn("historical defaults and Error compatibility", plateau["reason"])
-        # Table policy does not establish validated ICMP dispatch, fragmentation
-        # or actual cross-protocol consumers at the managed host boundary.
-        self.assertEqual(rows["1191-050"]["status"], "TODO")
+        self.assertIn("Host::admin_set_ipv4_plateaus", plateau["reason"])
+        self.assertIn("ntcp-pathctl utility's plateaus command", plateau["reason"])
+        self.assertNotIn("independently T12", plateau["reason"])
+        # Table policy alone does not close 1191-050: it closes with validated
+        # ICMP dispatch, fragmentation and the owner route flag (T9-T13, T12).
+        self.assertEqual(rows["1191-050"]["status"], "covered")
         self.assertIn("T9", rows["1191-050"]["reason"])
         self.assertIn("T13", rows["1191-050"]["reason"])
         self.assertEqual(rows["1191-059"]["status"], "covered")
@@ -296,10 +308,13 @@ class PmtudInventory(unittest.TestCase):
             self.assertIn("ntcp-host/src/tests.rs::", rows[key]["evidence"][1])
             self.assertIn("before TCP construction", rows[key]["reason"])
         for key, dependencies in {
-            "1191-050": ("T8", "T9", "T10", "T13", "Remaining (T12)"),
+            "1191-050": ("T8", "T9", "T10", "T13", "integration/rfc_host admin cases",
+                         "nonzero leased Identification",
+                         "every Host::udp_send and Host::udp_send_datagram UDP datagram and source fragment",
+                         "with DF except on an owner-flagged route", "integration/rfc_host admin refuse case"),
             "1191-074": ("T8", "T9", "T10", "Remaining T18", "T19"),
         }.items():
-            self.assertEqual(rows[key]["status"], "TODO", key)
+            self.assertEqual(rows[key]["status"], "covered" if key == "1191-050" else "TODO", key)
             self.assertNotIn("T7 phase2", rows[key]["reason"], key)
             for dependency in dependencies:
                 self.assertIn(dependency, rows[key]["reason"], key)
@@ -322,19 +337,33 @@ class PmtudInventory(unittest.TestCase):
         for key in ("1191-058", "8201-062"):
             self.assertIn("Host::service_changes", rows.get(key, rows6.get(key))["reason"], key)
         # TCP reads and updates the cache, UDP reads it and the Host's Echo
-        # adjunct is a Host-trusted writer, but applications still have no
-        # shared-cache writer: T13 supplies the datagram probe send mode, and
-        # 4821-019 stays open for T12 outcome reporting whose shared writes
-        # need Host-owner authority.
+        # adjunct is a Host-trusted writer. T13 supplies the datagram probe
+        # send mode and T12 the outcome report, whose shared writes need the
+        # Host owner's flow-scoped grant; with both, 4821-019 closes.
         reason019 = rows4821["4821-019"]["reason"]
-        self.assertEqual(rows4821["4821-019"]["status"], "TODO")
+        self.assertEqual(rows4821["4821-019"]["status"], "covered")
+        self.assertEqual(rows4821["4821-019"]["evidence"], [
+            "crates/stacks/ntcp-host/src/udp/receipts.rs::    pub fn udp_report_probe(",
+            "crates/stacks/ntcp-host/src/tests/probe_receipts.rs::fn owner_granted_writer_offers_success_to_the_shared_estimate_separately()",
+        ])
+        self.assertIn("Each packetization protocol therefore has its own PLPMTUD", reason019)
+        self.assertNotRegex(reason019, r"\bRemaining\b")
         self.assertIn("Host::service_changes", reason019)
         self.assertIn("below proven delivery is deferred whatever", reason019)
         self.assertIn("T13's Probe mode (Host::udp_send_datagram with UdpSendMode::Probe)", reason019)
         self.assertIn("ICMP Echo adjunct is a Host-trusted writer", reason019)
-        self.assertIn("applications still have no shared-cache writer", reason019)
-        self.assertIn("Remaining (T12): probe-outcome reporting (4821-160)", reason019)
+        self.assertNotIn("applications still have no shared-cache writer", reason019)
+        self.assertIn("Host::udp_report_probe", reason019)
+        self.assertIn("owner-granted, flow-scoped UdpSharedWriter", reason019)
+        self.assertIn("owner-trusted application evidence", reason019)
+        self.assertIn("The integration/rfc_host probe-report case reports outcomes observed by a real receiver (4821-160)",
+                      reason019)
         self.assertIn("authority granted by the Host owner", reason019)
+        # Only an owner grant lets an application write shared state.
+        reason195 = rows4821["4821-195"]["reason"]
+        self.assertIn("Host::udp_grant_shared_writer", reason195)
+        self.assertIn("never as Host-observed proof", reason195)
+        self.assertNotIn("its Probe-mode sends write nothing shared), so", reason195)
         self.assertNotIn("Host UDP has no datagram PLPMTUD", reason019)
         self.assertNotIn("no planned task", reason019)
         self.assertNotIn("Unchanged-for-TCP", reason019)
@@ -420,7 +449,8 @@ class PmtudInventory(unittest.TestCase):
             canonical[(row["target"], normalize(row["quote"]))] = row
         for key in ("4821-070", "4821-158", "4821-159", "4821-192"):
             self.assertIn("Probe mode (UdpSendMode::Probe", rows[key]["reason"], key)
-            self.assertIn("writes no shared state (outcome reporting is 4821-160, owned by T12)", rows[key]["reason"], key)
+            self.assertIn("writes no shared state (the application reports the outcome through Host::udp_report_probe, 4821-160)",
+                          rows[key]["reason"], key)
             self.assertIn("integration/rfc_host probe-mode case", rows[key]["reason"], key)
         self.assertIn("even when it is smaller than the first-hop MTU", rows["4821-155"]["reason"])
         self.assertIn("despite the preference for forward-only methods", rows["4821-183"]["reason"])
@@ -436,12 +466,28 @@ class PmtudInventory(unittest.TestCase):
                     kinds[key].add(annotation["kind"])
         for key, seen in kinds.items():
             self.assertEqual(seen, {"CITATION", "TEST"}, canonical[key]["id"])
-        # Probe-outcome reporting is T12's open obligation, not an actor exception.
-        self.assertEqual(rows["4821-160"]["status"], "TODO")
+        # Probe-outcome reporting is T12's obligation, not an actor
+        # exception: closed by Host::udp_report_probe with Host evidence and
+        # the receiver-backed namespace report.
+        self.assertEqual(rows["4821-160"]["status"], "covered")
+        self.assertEqual(rows["4821-160"]["evidence"], [
+            "crates/stacks/ntcp-host/src/udp/receipts.rs::    pub fn udp_report_probe(",
+            "crates/stacks/ntcp-host/src/tests/probe_receipts.rs::fn each_outcome_changes_only_the_reporting_flows_bounds_and_sizing()",
+        ])
+        self.assertNotRegex(rows["4821-160"]["reason"], r"\bRemaining\b")
         self.assertEqual(hashlib.sha256((rows["4821-160"]["target"] + "\n" + " ".join(rows["4821-160"]["quote"].split())).encode()).hexdigest(),
                          "f615a0be418316eb0f2da0a07f944efca2d0a26b229df687daa1bae12ef9843c")
-        for fragment in ("Remaining (T12)", "T13's Probe mode", "authority granted by the Host owner"):
+        for fragment in ("T13's Probe mode", "authority granted by the Host owner",
+                         "Host::udp_report_probe", "Success, IsolatedLoss, TimeoutFailure and Inconclusive",
+                         "UdpLimits::probe_receipts", "feedback horizon", "changes only the reporting flow's own bounds",
+                         "PathService::confirm_delivery_as", "owner-trusted application evidence",
+                         "tests/probe_receipts.rs", "integration/rfc_host probe-report case",
+                         "real Linux receiver", "refused as Consumed", "refused as StaleRevision"):
             self.assertIn(fragment, rows["4821-160"]["reason"])
+        self.assertNotIn("No API lets an application inform the Host", rows["4821-160"]["reason"])
+        self.assertIn("Host::udp_report_probe", rows["4821-188"]["reason"])
+        self.assertNotIn("is 4821-160 (T12)", rows["4821-188"]["reason"])
+        self.assertIn("raise or bound for that flow only", rows["4821-155"]["reason"])
         # 187 stays an exception that states the implemented bounded alternative.
         self.assertEqual(rows["4821-187"]["status"], "exception")
         for fragment in ("not implemented as described", "no datagram-count threshold", "least recently used entry without an outstanding probe",
@@ -461,9 +507,62 @@ class PmtudInventory(unittest.TestCase):
             self.assertEqual(rows[key]["status"], "exception", key)
             self.assertIn("stack-managed non-repacketizing retransmission algorithm", rows[key]["reason"], key)
             self.assertIn("Fragment mode", rows[key]["reason"], key)
-        for key in ("1191-090", "1191-091", "1191-092", "1191-093", "8201-079", "8201-080", "8201-081", "8201-082"):
-            self.assertEqual(rows[key]["status"], "TODO", key)
-            for fragment in ("IdentifierAllocator", "fragmenting datagram emitter", "Probe mode", "Remaining: T12", "T19"):
+        # Superseded claims: upward values cached without any search
+        # transition, a discovery flag with no effect at all, (parent decision
+        # D17) queued ICMP or stateless output making a change Busy, and the
+        # status reconciliation left to stage 8.
+        superseded = ("equal or above it, it is cached only", "stored and reported only",
+                      "does not yet suppress probes", "stages 3-8", "does not yet clear IPv4 DF", "Busy when final output",
+                      "control-segment, software-GSO-segment and Echo-reply evidence",
+                      "no system-utility", "not yet by a system utility", "stages 5-8",
+                      "utility interface exists yet", "stages 7-8", "T12 stage 8 reconciles status")
+        # Closed: every IPv4 packet of a flagged route, Host::udp_send's whole
+        # datagrams included, leaves DF clear, so the IPv4 route flag and its
+        # utility lead-in are covered with no remainder.
+        for key in ("1191-090", "1191-091", "1191-093"):
+            self.assertEqual(rows[key]["status"], "covered", key)
+            self.assertEqual(len(rows[key]["evidence"]), 2, key)
+            self.assertNotRegex(rows[key]["reason"], r"\bRemaining\b", key)
+            for fragment in ("IdentifierAllocator", "fragmenting datagram emitter", "Probe mode", "route-isolation case",
+                             "defines a search transition", "a failed targeted probe is not reopened",
+                             "DF-clear IP_PMTUDISC_DONT output proves no size", "one serialized Host::admin_apply transaction",
+                             "The discovery-disable flag is enforced",
+                             "whole UDP datagrams of Host::udp_send and Host::udp_send_datagram and Host source fragments",
+                             "RFC 1122 section 3.3.3 EMTU_S",
+                             "best-effort output never blocks a change",
+                             "each physical software-GSO segment",
+                             "T12 stage 6 adds the system utility", "SO_PEERCRED",
+                             "real utility process round trips", "Namespace evidence (integration/rfc_host admin",
+                             "Host::udp_send, the T9 whole-datagram API", "UdpSendError::Backpressure",
+                             "disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams",
+                             "integration/rfc_host admin refuse case"):
+                self.assertIn(fragment, rows[key]["reason"], key)
+            for stale in (*superseded, "leaves DF clear on every packet of the route or path", "T12 repair",
+                          "except those of Host::udp_send", "with DF set and without a leased Identification"):
+                self.assertNotIn(stale, rows[key]["reason"], key)
+        self.assertIn("the user's recorded decision B", rows["1191-093"]["reason"])
+        # Closed: the route PMTU value and the whole RFC 8201 section 5.6
+        # path utility, with the utility (or the 1280 budget) and its tests.
+        for key in ("1191-092", "8201-079", "8201-080", "8201-081", "8201-082"):
+            row = rows[key]
+            self.assertEqual(row["status"], "covered", key)
+            self.assertEqual(len(row["evidence"]), 2, key)
+            for fragment in ("ntcp-pathctl", "integration/rfc_host admin"):
+                self.assertIn(fragment, row["reason"], key)
+            self.assertNotRegex(row["reason"], r"\bRemaining\b", key)
+            for stale in superseded:
+                self.assertNotIn(stale, row["reason"], key)
+        for key in ("1191-092", "8201-079", "8201-080", "8201-081"):
+            self.assertEqual(rows[key]["evidence"], [
+                "crates/adapters/ntcp-path-control/src/cli.rs::fn run(",
+                "crates/adapters/ntcp-path-control/tests/control.rs::fn utility_process_round_trips_both_families()",
+            ], key)
+            self.assertIn("SO_PEERCRED", rows[key]["reason"], key)
+            self.assertIn("one serialized Host::admin_apply transaction", rows[key]["reason"], key)
+        for key in ("1191-092", "8201-081"):
+            for fragment in ("compared with the path's accepted network estimate", "a fresh negative revision",
+                             "an identical value is a no-op", "a failed targeted probe is not reopened",
+                             "Clearing removes the cap and keeps every hold"):
                 self.assertIn(fragment, rows[key]["reason"], key)
         self.assertEqual(rows["8201-050"]["status"], "TODO")
         for fragment in ("T13 supplies source fragmentation and reassembly", "T17 owns", "T16"):
@@ -482,6 +581,67 @@ class PmtudInventory(unittest.TestCase):
             self.assertNotRegex(reason, stale)
             if "Echo Replies" in reason:
                 self.assertIn("carrying a source route until T14", reason)
+
+    def test_t12_closures_keep_full_keys_and_every_annotation_copy(self):
+        # Whole-obligation closures: the original full target + quote, the
+        # source and test evidence, and every annotation copy's reason.
+        closed = {
+            "1191-092": "f615dc529b2101e513cbbc25aa34ef54fba85bc172c7e5390676d3e87f02cf63",
+            "8201-079": "baa2c5e8f29c538a4bc72a3e0114eb38e01ad1705d7501833fbf6ba48b97f84c",
+            "8201-080": "38b723ebea0b7eb93b9d7e1d6c027ee79ba299d760ee61e4ddbdd897b861da6e",
+            "8201-081": "ab44a19971efe13bd7d5c5b85479b07c8b7468922ba1b91c3334aa9ca4ed37d8",
+            "8201-082": "6f688de8256452cdfae1421cc70b0b9875daeba6b234f2f160b6ff18874d93bf",
+            "4821-019": "0fc57e6e68a7bb7985d393a66226d3cd93d351f9089dae2b39063de8864274a1",
+            "4821-160": "f615a0be418316eb0f2da0a07f944efca2d0a26b229df687daa1bae12ef9843c",
+            "1191-050": "a6f118cde6ed60255175e2018dcd6f0d1575f98b73f11edc919a3c195dc5152f",
+            "1191-090": "b75cc8c75c9b1c475b34a1f69261b4f9c0d9887caaf21b30e8e185ffe216b3f0",
+            "1191-091": "a45f51957f49fdbfdd921463a3bc00f25182e15ecda353f5df6c33d0529c9065",
+            "1191-093": "356cde6ba94f574f39842209e74feac7da48ff8553b172b8245cfb95dae4b5f9",
+        }
+        rows = {p["id"]: p for n in (1191, 8201, 4821, 5927, 6864) for p in self.inventory(n)["paragraphs"]}
+        canonical = {}
+        for key, digest in closed.items():
+            row = rows[key]
+            full_key = row["target"] + "\n" + " ".join(row["quote"].split())
+            self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(), digest, key)
+            self.assertEqual(row["status"], "covered", key)
+            self.assertEqual(len(row["evidence"]), 2, key)
+            self.assertNotIn("T12 repair", row["reason"], key)
+            canonical[(row["target"], normalize(row["quote"]))] = row
+        kinds = {key: set() for key in canonical}
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in source_annotations(path.read_text()):
+                key = (annotation["target"], normalize(annotation["quote"]))
+                if key in canonical:
+                    self.assertEqual(annotation["reason"], canonical[key]["reason"],
+                                     (canonical[key]["id"], str(path), annotation["line"]))
+                    kinds[key].add(annotation["kind"])
+        for key, seen in kinds.items():
+            self.assertEqual(seen, {"CITATION", "TEST"}, canonical[key]["id"])
+        # Reasons that T12 made false: absent owner integration of plateaus
+        # and aging, outcome reporting still to come, stage-8 placeholders,
+        # and claims that every IPv4 fragment carries DF without the owner's
+        # flagged-route disposition.
+        stale = (r"owned by T12|No route/cache or socket-parser integration|Owner-authorized utility integration is independently T12"
+                 r"|status reconciliation \(stage 8\)|T12 stage 8|leaves DF clear on every packet, source fragments included"
+                 r"|DF on every IPv4 fragment \(4821-155\);|neither described non-PMTUD category applies"
+                 r"|only for non-atomic datagrams \(source fragments and DF-clear IP_PMTUDISC_DONT TCP packets\)")
+        reasons = [p["reason"] for p in rows.values()]
+        for n in (1191, 8201, 4821, 5927, 6864):
+            todos = tomllib.loads((ROOT / f"duvet/rfc{n}-todos.toml").read_text())
+            reasons += [t["reason"] for kind in ("TODO", "exception") for t in todos.get(kind, [])]
+        for path in (ROOT / "crates").rglob("*.rs"):
+            reasons += [a["reason"] for a in source_annotations(path.read_text())]
+        for reason in reasons:
+            self.assertNotRegex(reason, stale)
+        for key in ("1191-068", "1191-095", "8201-069", "8201-084"):
+            self.assertIn("Host::admin_set_search_aging", rows[key]["reason"], key)
+            self.assertIn("ntcp-pathctl utility's aging command", rows[key]["reason"], key)
+        for key in ("1191-005b", "1191-006a", "4821-062", "4821-154", "4821-153", "5927-068", "6864-id-purpose"):
+            self.assertRegex(rows[key]["reason"], r"owner-disabled|owner disabled discovery", key)
+        self.assertEqual(rows["1191-006a"]["status"], "exception")
+        self.assertEqual(rows["6864-nonatomic-boundary"]["status"], "context")
+        self.assertIn("owner-disabled IPv4 route or path", rows["6864-nonatomic-boundary"]["reason"])
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:

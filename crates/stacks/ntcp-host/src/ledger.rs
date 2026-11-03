@@ -848,6 +848,11 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
+    /// How long network evidence about a submission can still arrive.
+    pub(crate) fn feedback_horizon(&self) -> Instant {
+        self.limits.feedback_horizon
+    }
+
     pub fn new(limits: LedgerLimits) -> Result<Self, Error> {
         if limits.owners == 0 || limits.history_per_owner == 0 || limits.concurrent_attempts == 0 {
             return Err(Error::Capacity);

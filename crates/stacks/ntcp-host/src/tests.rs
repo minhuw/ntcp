@@ -1,5 +1,6 @@
 extern crate std;
 mod adjunct;
+mod admin;
 mod admission;
 mod correlation;
 mod dispatch;
@@ -7,6 +8,8 @@ mod emitter;
 mod fanout;
 mod fragment_icmp;
 mod ingress;
+mod ipv4_policy;
+mod probe_receipts;
 mod reassembly;
 mod repair;
 mod source_routes;
@@ -56,6 +59,34 @@ fn managed(
     cfg: EndpointConfig,
 ) -> (Host, Endpoint, IngressContext) {
     managed_configured(local, identity, cfg, false, None)
+}
+// A managed Host whose identifier allocator runs (no earlier emission from
+// these sources), so DF-clear IPv4 output of a discovery-disabled route can
+// lease Identifications.
+fn managed_identified(
+    local: SocketAddr,
+    identity: u128,
+    cfg: EndpointConfig,
+) -> (Host, Endpoint, IngressContext) {
+    let mut side = managed_limited(local, identity, cfg, false, None, None, |p, mut l| {
+        l.datagrams.identifiers = IdentifierLimits {
+            lifetime_seconds: DEFAULT_LIFETIME_SECONDS,
+            ipv4_tuples: 2,
+            ipv6_leases: 2,
+        };
+        (p, l, 1)
+    });
+    side.0.set_entropy(std::boxed::Box::new(|out: &mut [u8]| {
+        out.fill(0x5a);
+        Ok(())
+    }));
+    side.0
+        .start_identifiers(Continuity::QuietFor {
+            at: 0,
+            seconds: u64::MAX,
+        })
+        .unwrap();
+    side
 }
 fn managed_configured(
     local: SocketAddr,
@@ -224,8 +255,12 @@ fn selected(endpoint: &mut Endpoint, now: u64) -> Option<(TransmitAttempt, Trans
     Some((token.unwrap(), packet, frame))
 }
 fn emit(host: &mut Host, endpoint: &mut Endpoint, now: u64) -> Option<Vec<u8>> {
-    let (attempt, _, frame) = selected(endpoint, now)?;
+    let (attempt, _, mut frame) = selected(endpoint, now)?;
     let context = host.egress_context(endpoint, attempt).unwrap();
+    // As the embeddings do: DF clear on a discovery-disabled IPv4 path.
+    if host.clears_dont_fragment(context) {
+        host.lease_df_clear(now, &mut frame).unwrap();
+    }
     let ticket = host.submission_ticket(endpoint, context).unwrap();
     let submitted = host
         .submit(endpoint, now, ticket, context, &frame, 0, |_| {

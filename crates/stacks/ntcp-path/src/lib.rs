@@ -21,4 +21,9 @@ pub enum Error {
     SourceNotOwned,
     SelectionChanged,
     Invalidated,
+    /// A compare-and-set named a generation that is no longer current, or a
+    /// validated plan met a changed service.
+    StaleGeneration,
+    /// A selector matched more than one administered object.
+    Ambiguous,
 }

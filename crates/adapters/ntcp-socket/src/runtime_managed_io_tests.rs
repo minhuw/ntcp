@@ -952,6 +952,116 @@ fn managed_scheduled_indivisible_held_tfo_reports_no_submission_and_only_fails_i
     );
 }
 
+// An administrative budget reduction is never refused as busy: an owner
+// value below a held TFO SYN, set alone or together with a discovery
+// disable (whose IPv4 sending limit is then that value), is applied like a
+// trusted PTB decrease. The indivisible SYN fails only its owner, exactly
+// as in the test above, with nothing submitted, and another connection on
+// the route connects within the value.
+#[test]
+fn managed_scheduled_held_tfo_above_an_owner_value_fails_its_owner_with_or_without_disable() {
+    use ntcp_host::path::{AdminChange, AdminPolicy, AdminTarget};
+    const VALUE: u32 = 200;
+    for disable in [false, true] {
+        let (mut a, wa) = native_output(false, 2, 3, 1500, false, false);
+        let (mut b, wb) = native_output(false, 3, 3, 1500, false, false);
+        let listen = listener(&mut b);
+        b.execute(
+            listen,
+            Op::SetListenerFastOpenEarlyDataPolicy(FastOpenEarlyDataPolicy::ApplicationProtected),
+        )
+        .unwrap();
+        let client = new(&mut a, SOCK_NONBLOCK);
+        let remote = SocketAddr::new(b.local, 8080);
+        a.execute(
+            client,
+            Op::SetFastOpenClientPolicy(Some((remote, FastOpenClientPolicy::ApplicationProtected))),
+        )
+        .unwrap();
+        let data = [7; 300];
+        a.execute(
+            client,
+            Op::SendTo(
+                vec![(data.as_ptr() as usize, data.len())],
+                MSG_FASTOPEN,
+                Some(remote),
+                None,
+            ),
+        )
+        .unwrap();
+        let cid = connection(&a, client);
+        wa.lock().unwrap().block = true;
+        a.service_egress().unwrap();
+        assert!(a.endpoint.is_output_reserved(cid));
+        assert!(ip_size(wa.lock().unwrap().offered.last().unwrap()) > VALUE as usize);
+        let route = a.host.as_ref().unwrap().binding(cid).unwrap().snapshot.key().route();
+        let now = a.now();
+        let host = a.host.as_mut().unwrap();
+        let capability = host.administration();
+        let expected = host
+            .admin_routes(&capability)
+            .unwrap()
+            .find(|r| r.route == route)
+            .unwrap()
+            .generation;
+        let candidate = host
+            .admin_validate(
+                &capability,
+                now,
+                AdminChange {
+                    target: AdminTarget::Route(route),
+                    expected,
+                    policy: AdminPolicy {
+                        discovery_disabled: disable,
+                        estimate: Some(VALUE),
+                    },
+                },
+            )
+            .unwrap();
+        host.admin_apply(&capability, &mut a.endpoint, candidate)
+            .unwrap();
+        let offers = wa.lock().unwrap().offered.len();
+        wa.lock().unwrap().block = false;
+        tick(&mut a);
+        if disable {
+            // DF-clear output waits for the start quiet period first.
+            let (source, destination, at) = (a.local, b.local, a.now());
+            if let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = a
+                .host
+                .as_mut()
+                .unwrap()
+                .lease_identification(at, source, destination, 6)
+            {
+                a.test_now = Some(until);
+                b.test_now = Some(until);
+            }
+        }
+        a.service_egress().unwrap();
+        assert_eq!(wa.lock().unwrap().offered.len(), offers, "disable={disable}");
+        assert!(wa.lock().unwrap().sent.is_empty());
+        assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::Closed));
+        assert!(!a.endpoint.is_output_reserved(cid));
+        let sibling = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(sibling, Op::Connect(remote)).unwrap_err(),
+            EINPROGRESS
+        );
+        exchange(&mut a, &mut b, &wa, &wb);
+        assert_eq!(
+            a.endpoint.state(connection(&a, sibling)),
+            Ok(ntcp::State::Established),
+            "disable={disable}"
+        );
+        let offered = wa.lock().unwrap().offered[offers..].to_vec();
+        assert!(!offered.is_empty());
+        for frame in &offered {
+            assert!(ip_size(frame) <= VALUE as usize);
+            let ip = ntcp_ethernet::parse_ethernet(frame).unwrap().payload;
+            assert_eq!(ip[6] & 0x40 == 0, disable, "DF follows the policy");
+        }
+    }
+}
+
 #[test]
 fn managed_scheduled_no_route_and_invalid_source_park_only_affected_lane_then_recover() {
     for remove_source in [false, true] {
@@ -1456,4 +1566,177 @@ fn managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling()
     assert_eq!(b.execute(server, Op::Read(400)).unwrap().bytes, vec![8; 100]);
     let (df, identification) = fields(&wa.lock().unwrap().offered[0]);
     assert!(!df && identification != 0);
+}
+
+// RFC 1191 section 6.6 through the native egress: after the owner disables
+// discovery on the IPv4 route, every packet of a connection that never asked
+// for IP_PMTUDISC_DONT (and then one that asks for IP_PMTUDISC_DO) leaves
+// without DF, with its own leased Identification and a recomputed header
+// checksum, within the 576-octet sending limit of the forwarder next hop;
+// the start quiet period holds it unsubmitted first.
+#[test]
+fn route_disable_clears_df_on_native_output_whatever_the_socket_requests() {
+    use ntcp_host::path::{AdminChange, AdminPolicy, AdminTarget};
+    let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);
+    let cid = connection(&a, client);
+    let route = a.host.as_ref().unwrap().binding(cid).unwrap().snapshot.key().route();
+    let host = a.host.as_mut().unwrap();
+    let capability = host.administration();
+    let expected = host
+        .admin_routes(&capability)
+        .unwrap()
+        .find(|r| r.route == route)
+        .unwrap()
+        .generation;
+    let now = a.now();
+    let host = a.host.as_mut().unwrap();
+    let candidate = host
+        .admin_validate(
+            &capability,
+            now,
+            AdminChange {
+                target: AdminTarget::Route(route),
+                expected,
+                policy: AdminPolicy {
+                    discovery_disabled: true,
+                    estimate: None,
+                },
+            },
+        )
+        .unwrap();
+    host.admin_apply(&capability, &mut a.endpoint, candidate).unwrap();
+    // The quiet period after start holds the DF-clear packet unsubmitted.
+    a.execute(client, Op::Write(vec![1; 3000])).unwrap();
+    tick(&mut a);
+    a.service_egress().unwrap();
+    assert!(wa.lock().unwrap().offered.is_empty());
+    assert_eq!(
+        a.egress.as_ref().unwrap().blocked(cid),
+        Some(ntcp_host::Error::Capacity)
+    );
+    let (source, destination) = (a.local, b.local);
+    let at = a.now();
+    let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = a
+        .host
+        .as_mut()
+        .unwrap()
+        .lease_identification(at, source, destination, 6)
+    else {
+        panic!("identifiers wait for the quiet period");
+    };
+    a.test_now = Some(until);
+    b.test_now = Some(until);
+    complete(&mut a, &mut b, &wa, &wb, cid, 3000);
+    a.execute(client, Op::Set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO))
+        .unwrap();
+    a.execute(client, Op::Write(vec![2; 3000])).unwrap();
+    complete(&mut a, &mut b, &wa, &wb, cid, 6000);
+    let mut received = b.execute(server, Op::Read(BYTES)).unwrap().bytes;
+    while received.len() < 6000 {
+        let more = b.execute(server, Op::Read(BYTES)).unwrap().bytes;
+        assert!(!more.is_empty());
+        received.extend(more);
+    }
+    assert_eq!(&received[..3000], &[1; 3000][..]);
+    assert_eq!(&received[3000..], &[2; 3000][..]);
+    let mut identifiers = std::collections::HashSet::new();
+    let offered = wa.lock().unwrap().offered.clone();
+    assert!(offered.len() > 10);
+    for frame in &offered {
+        let ip = ntcp_ethernet::parse_ethernet(frame).unwrap().payload;
+        assert!(ip_size(frame) <= 576, "{}", ip_size(frame));
+        assert_eq!(ip[6] & 0x40, 0, "DF clear");
+        let header = usize::from(ip[0] & 0x0f) * 4;
+        assert_eq!(ntcp_ip_common::checksum(&ip[..header]), 0);
+        let identification = u16::from_be_bytes([ip[4], ip[5]]);
+        assert_ne!(identification, 0);
+        assert!(identifiers.insert(identification), "one Identification per packet");
+    }
+}
+
+// The final bytes follow the decision current at each submission: a packet
+// rewritten DF clear (with a leased Identification) while the route was
+// disabled, whose submission the backend refused with WouldBlock, leaves
+// after the owner re-enables discovery with the atomic header (DF set,
+// Identification 0, valid checksum). A connection that asked for
+// IP_PMTUDISC_DONT keeps DF clear across the same sequence.
+#[test]
+fn held_df_clear_packet_follows_a_reenable_unless_the_socket_asks_for_dont() {
+    use ntcp_host::path::{AdminChange, AdminPolicy, AdminTarget};
+    fn set_route(a: &mut Owner, cid: ConnectionId, discovery_disabled: bool) {
+        let route = a.host.as_ref().unwrap().binding(cid).unwrap().snapshot.key().route();
+        let now = a.now();
+        let host = a.host.as_mut().unwrap();
+        let capability = host.administration();
+        let expected = host
+            .admin_routes(&capability)
+            .unwrap()
+            .find(|r| r.route == route)
+            .unwrap()
+            .generation;
+        let candidate = host
+            .admin_validate(
+                &capability,
+                now,
+                AdminChange {
+                    target: AdminTarget::Route(route),
+                    expected,
+                    policy: AdminPolicy {
+                        discovery_disabled,
+                        estimate: None,
+                    },
+                },
+            )
+            .unwrap();
+        host.admin_apply(&capability, &mut a.endpoint, candidate)
+            .unwrap();
+    }
+    fn header(frame: &[u8]) -> Vec<u8> {
+        let ip = ntcp_ethernet::parse_ethernet(frame).unwrap().payload;
+        ip[..usize::from(ip[0] & 0x0f) * 4].to_vec()
+    }
+    for dont in [false, true] {
+        let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);
+        let cid = connection(&a, client);
+        if dont {
+            a.execute(client, Op::Set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT))
+                .unwrap();
+        }
+        set_route(&mut a, cid, true);
+        // Past the start quiet period, so the DF-clear lease succeeds.
+        let (source, destination, now) = (a.local, b.local, a.now());
+        if let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = a
+            .host
+            .as_mut()
+            .unwrap()
+            .lease_identification(now, source, destination, 6)
+        {
+            a.test_now = Some(until);
+            b.test_now = Some(until);
+        }
+        wa.lock().unwrap().block = true;
+        a.execute(client, Op::Write(vec![3; 400])).unwrap();
+        a.service_egress().unwrap();
+        assert!(wa.lock().unwrap().sent.is_empty());
+        let blocked = header(wa.lock().unwrap().offered.last().unwrap());
+        let identification = u16::from_be_bytes([blocked[4], blocked[5]]);
+        assert_eq!(blocked[6] & 0x40, 0, "offered DF clear while disabled");
+        assert_ne!(identification, 0);
+        assert!(a.endpoint.is_output_reserved(cid));
+        set_route(&mut a, cid, false);
+        wa.lock().unwrap().block = false;
+        tick(&mut a);
+        a.service_egress().unwrap();
+        let sent = header(wa.lock().unwrap().sent.front().unwrap());
+        assert_eq!(ntcp_ip_common::checksum(&sent), 0, "valid header checksum");
+        if dont {
+            assert_eq!(sent[6] & 0x40, 0, "IP_PMTUDISC_DONT keeps DF clear");
+            assert_ne!(u16::from_be_bytes([sent[4], sent[5]]), 0);
+        } else {
+            assert_ne!(sent[6] & 0x40, 0, "DF set on the enabled route");
+            assert_eq!(u16::from_be_bytes([sent[4], sent[5]]), 0, "atomic Identification");
+        }
+        complete(&mut a, &mut b, &wa, &wb, cid, 400);
+        assert_eq!(b.execute(server, Op::Read(1000)).unwrap().bytes, vec![3; 400]);
+    }
 }

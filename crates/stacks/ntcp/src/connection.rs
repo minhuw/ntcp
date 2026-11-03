@@ -951,6 +951,15 @@ impl Connection {
                     tuple.local.is_ipv4(),
                     config.timebase.ticks_from_us(600_000_000),
                 )
+                .map(|mut pmtud| {
+                    // The binding delivers the path's administrative policy.
+                    if let Some(path) = managed_path {
+                        pmtud.set_policy_revision(path.snapshot.discovery_revision());
+                        pmtud.set_discovery_disabled(path.snapshot.discovery_disabled());
+                        pmtud.set_administrative(path.snapshot.administrative_estimate());
+                    }
+                    pmtud
+                })
             })
             .transpose()?;
         let mss = config
@@ -2828,6 +2837,9 @@ impl Connection {
                 self.ip_header_len,
                 false,
             );
+            if self.managed_path.is_some() {
+                p.defer_proof_latest();
+            }
         }
         if d.deferred_fresh && count != 0 && !finished {
             // The unsubmitted suffix is reserved sequence space, not another
@@ -3040,10 +3052,16 @@ impl Connection {
         })
     }
 
-    /// Network authority changes packetization, never loss/retry classification.
-    /// Safe while a reservation is held: its immutable bytes are checked again
-    /// by the serialized submission barrier and split only after nonsubmission.
-    pub(crate) fn apply_managed_budget(&mut self, path: crate::PreparedPath) -> Result<(), Error> {
+    /// Whether `budget` complete IP octets still carry this connection's IP
+    /// header (options included), its TCP header with every option it sends
+    /// and one payload octet.
+    pub(crate) fn represents_budget(&self, budget: u32) -> bool {
+        budget >= u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 } + 1
+    }
+
+    /// Read-only check that `apply_managed_budget(path)` succeeds (the same
+    /// binding authority). Returns the current binding.
+    pub(crate) fn check_managed_budget(&self, path: crate::PreparedPath) -> Result<crate::PreparedPath, Error> {
         let old = self.managed_path.ok_or(Error::InvalidState)?;
         if path.snapshot.status() != ntcp_path::PathStatus::Valid
             || old.snapshot.key().context() != path.snapshot.key().context()
@@ -3053,6 +3071,14 @@ impl Connection {
         {
             return Err(Error::InvalidArgument);
         }
+        Ok(old)
+    }
+
+    /// Network authority changes packetization, never loss/retry classification.
+    /// Safe while a reservation is held: its immutable bytes are checked again
+    /// by the serialized submission barrier and split only after nonsubmission.
+    pub(crate) fn apply_managed_budget(&mut self, path: crate::PreparedPath) -> Result<(), Error> {
+        let old = self.check_managed_budget(path)?;
         if old == path {
             return Ok(());
         }
@@ -3065,6 +3091,17 @@ impl Connection {
                 p.replace_network_authority();
             } else if old.snapshot.negative_revision() != path.snapshot.negative_revision() {
                 p.invalidate_probe_size_result();
+            }
+            // Owner policy delivered with the snapshot: stale-policy size
+            // results lose eligibility; the administrative value caps the
+            // search and arms its targeted attempt; a working baseline at or
+            // above it is lowered to a smaller shared network estimate (not
+            // the discovery-policy sending limit, which is no estimate).
+            p.set_policy_revision(path.snapshot.discovery_revision());
+            p.set_discovery_disabled(path.snapshot.discovery_disabled());
+            p.set_administrative(path.snapshot.administrative_estimate());
+            if let Ok(budget) = path.snapshot.pmtu_estimate() {
+                p.lower_baseline(budget);
             }
         }
         if replaced || old.client != path.client {
@@ -3129,6 +3166,32 @@ impl Connection {
         }
     }
 
+    /// Final-byte provenance for the physical packet of reserved output that
+    /// was definitely submitted as `receipt` (accepted at `offset`, `count`
+    /// payload octets): an unfragmentable packet becomes size evidence; a
+    /// DF-clear IPv4 packet stays ineligible.
+    pub(crate) fn certify_submission(
+        &mut self,
+        d: &Departure,
+        offset: usize,
+        count: usize,
+        receipt: crate::PhysicalReceipt,
+    ) {
+        let unfragmented = receipt.dont_fragment || !self.tuple.local.is_ipv4();
+        let Some(p) = &mut self.pmtud else {
+            return;
+        };
+        let (start, end) = if d.segmentation.is_some() || d.deferred_fresh {
+            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
+            (start, start.wrapping_add(count as u32))
+        } else {
+            let start = Seq(d.start);
+            let length = d.payload as u32 + u32::from(d.syn) + u32::from(d.fin);
+            (start, start.wrapping_add(length))
+        };
+        p.certify(start, end, receipt.ip_packet_len, unfragmented);
+    }
+
     /// Retain a definitely-submitted receipt with the active probe it proves.
     pub(crate) fn retain_probe_receipt(
         &mut self,
@@ -3161,6 +3224,10 @@ impl Connection {
         }
     }
 
+    pub(crate) fn administrative_search(&self) -> Option<crate::AdministrativeSearch> {
+        self.pmtud.as_ref().and_then(|p| p.administrative_search())
+    }
+
     pub(crate) fn path_mtu_info(&self) -> Option<crate::PathMtuInfo> {
         self.pmtud.as_ref().map(|p| p.info)
     }
@@ -3178,6 +3245,11 @@ impl Connection {
             .search_aging
             .ticks(self.config.timebase.units_per_second)?;
         Ok(())
+    }
+
+    /// The connection's creation (or last set) PLPMTUD policy, if enabled.
+    pub(crate) fn pmtud_policy(&self) -> Option<crate::PmtudPolicy> {
+        self.config.pmtud.map(|p| p.policy)
     }
 
     pub(crate) fn set_pmtud_policy(
@@ -3348,6 +3420,11 @@ impl Connection {
         report: crate::CorrelatedPmtu,
         host_estimate: Option<u32>,
     ) -> Result<crate::PmtuReport, Error> {
+        // A current-path report is corrected against the Host's shared
+        // estimate (RFC 1191 section 5); without one it is malformed input.
+        if report.current_path && report.path_estimate.is_none() {
+            return Err(Error::InvalidArgument);
+        }
         self.update_time(now)?;
         let segment = report.segment;
         let (start, end) = (Seq(segment.start), Seq(segment.end));
@@ -3514,6 +3591,18 @@ impl Connection {
 
     pub(crate) fn user_mss(&self) -> Option<u16> {
         self.config.user_mss
+    }
+
+    pub(crate) fn transport_ceilings(&self) -> crate::TransportCeilings {
+        crate::TransportCeilings {
+            peer_mss: self.peer_mss,
+            user_mss: self.config.user_mss,
+            local_mss: self.send_mss_limit,
+            allocation: self.scratch.len(),
+            send_ip_payload_limit: self.config.send_ip_payload_limit,
+            destination_mtu: self.pmtud.as_ref().and_then(|p| p.info.route_mtu),
+            effective_mss: self.mss,
+        }
     }
 
     pub(crate) fn set_user_mss(&mut self, mss: Option<u16>) -> Result<(), Error> {
@@ -8636,31 +8725,75 @@ impl Connection {
             //# Before sending a probe, the flow MUST meet at least the following conditions:
             //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
             //# o It has no outstanding probes or losses.
+            // The administrative target (armed once per administrative value)
+            // passes every existing admission condition; when it does not
+            // leave, the blocking precondition is recorded.
+            let admin_target = self.pmtud.as_ref().and_then(|p| p.administrative_target());
+            let mut admin_deferral = None;
             let candidate = self.pmtud.as_ref().and_then(|p| {
-                if let Some(path) = self.managed_path {
-                    if now < path.snapshot.retry_not_before() { return None; }
+                let target = if let Some(path) = self.managed_path {
+                    if p.discovery_disabled() {
+                        admin_deferral = Some(crate::pmtud::AdministrativeDeferral::DiscoveryDisabled);
+                        return None;
+                    }
+                    if now < path.snapshot.retry_not_before() {
+                        admin_deferral = Some(crate::pmtud::AdministrativeDeferral::Hold);
+                        return None;
+                    }
                     p.target_for_network(path.snapshot.ip_packet_budget().ok()?)
                 } else {
                     p.target()
+                };
+                if target.is_none() {
+                    admin_deferral = Some(crate::pmtud::AdministrativeDeferral::Cooldown);
                 }
+                target
             }).filter(|&size| {
                 self.managed_path.is_none_or(|path| size <= path.snapshot.first_hop_mtu())
             }).filter(|_| {
+                let recovering = self.congestion.in_recovery()
+                    || self.sack_recovery.is_some()
+                    || self.sack_post_rto.is_some()
+                    || self.prr.is_some()
+                    || self.consecutive_timeouts != 0
+                    || self.rack.counts().lost != 0
+                    || self.retx_pending
+                    || self.limited_pending;
+                if recovering {
+                    admin_deferral = Some(crate::pmtud::AdministrativeDeferral::LossRecovery);
+                }
                 !early_response
                     && self.rtt.srtt().is_some()
                     && !pacing_blocked
-                    && !self.congestion.in_recovery()
-                    && self.sack_recovery.is_none()
-                    && self.sack_post_rto.is_none()
-                    && self.prr.is_none()
-                    && self.consecutive_timeouts == 0
-                    && self.rack.counts().lost == 0
-                    && !self.retx_pending
-                    && !self.limited_pending
+                    && !recovering
                     && !self.shutdown
                     && self.ecn_pause.is_none()
                     && !self.cork
                     && !self.more
+            });
+            // The targeted size is clipped (not dropped) by transport bounds:
+            // peer and user MSS, the configured payload limit, allocation.
+            let candidate = candidate.and_then(|size| {
+                // Pmtud::target yields the armed administrative target first.
+                let targeted = admin_target.is_some()
+                    && self.pmtud.as_ref().and_then(|p| p.target()) == Some(size);
+                if !targeted {
+                    return Some(size);
+                }
+                let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
+                let transport = (u32::from(
+                    self.peer_mss
+                        .min(self.send_mss_limit)
+                        .min(self.config.user_mss.unwrap_or(u16::MAX)),
+                ) + base + 20)
+                    .min(u32::from(self.config.send_ip_payload_limit) + u32::from(self.ip_header_len))
+                    .min(self.scratch.len() as u32 + u32::from(self.ip_header_len) + 20 + option_len as u32);
+                let low = self.pmtud.as_ref().map_or(0, |p| p.info.search_low);
+                if size <= transport {
+                    Some(size)
+                } else {
+                    (transport > low).then_some(transport)
+                }
             });
             //= https://www.rfc-editor.org/rfc/rfc4821#section-6.2
             //= reason=TCP probes use real queued stream bytes, respecting record boundary and allocation; no synthetic padding or control-only TCP size probe.
@@ -8738,6 +8871,14 @@ impl Connection {
             let descriptor_limited = selected < count;
             count = selected;
             pmtu_probe = candidate.filter(|(_, payload, _)| count == *payload);
+            if admin_target.is_some()
+                && pmtu_probe.is_none()
+                && let Some(p) = &mut self.pmtud
+            {
+                p.defer_administrative(
+                    admin_deferral.unwrap_or(crate::pmtud::AdministrativeDeferral::DataOrWindow),
+                );
+            }
             let flush_credit = self
                 .cork_flush
                 .filter(|&end| end.after(self.snd_nxt))
@@ -9224,7 +9365,7 @@ impl Connection {
         //# which will have one of the following results:
 
         //= https://www.rfc-editor.org/rfc/rfc4821#section-8
-        //= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. For a UDP application that cannot change its message sizes, Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment (4821-155); tun_echo's UDP echo replies use it.
+        //= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. For a UDP application that cannot change its message sizes, Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment outside owner-disabled routes (4821-155, 1191-093); tun_echo's UDP echo replies use it.
         //# Packetization Layers SHOULD avoid sending messages that will require fragmentation
         //# [Kent87] [frag-errors]. However, entirely preventing fragmentation is not always
         //# possible. Some Packetization Layers, such as a UDP application outside the kernel,
@@ -9414,6 +9555,11 @@ impl Connection {
                     self.ip_header_len,
                     retransmitted,
                 );
+                // A managed embedding may rewrite reserved bytes (DF) before
+                // submission: only the Host's receipt can prove their size.
+                if reserve && self.managed_path.is_some() {
+                    p.defer_proof_latest();
+                }
             }
         }
         self.resolve_probe_response();

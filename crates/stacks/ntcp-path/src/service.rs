@@ -394,9 +394,12 @@ pub struct PathService {
     routes: Table<Route>,
     paths: Table<CachedPath>,
     clients: Table<Client>,
+    // Owner policy per route slot, preallocated beside the route table.
+    route_admin: Vec<RouteAdmin>,
     // A shared nonwrapping generation domain prevents reuse after deletion.
     generation: u64,
     revision: u64,
+    admin_revision: u64,
     plateaus: Ipv4Plateaus,
 }
 
@@ -412,6 +415,7 @@ impl PathService {
             (limits.routes, size_of::<Slot<Route>>()),
             (limits.paths, size_of::<Slot<CachedPath>>()),
             (limits.clients, size_of::<Slot<Client>>()),
+            (limits.routes, size_of::<RouteAdmin>()),
         ] {
             bytes = bytes
                 .checked_add(count.checked_mul(size).ok_or(Error::Capacity)?)
@@ -426,8 +430,17 @@ impl PathService {
             routes: Table::new(limits.routes)?,
             paths: Table::new(limits.paths)?,
             clients: Table::new(limits.clients)?,
+            route_admin: {
+                let mut records = Vec::new();
+                records
+                    .try_reserve_exact(limits.routes)
+                    .map_err(|_| Error::Allocation)?;
+                records.resize(limits.routes, RouteAdmin::default());
+                records
+            },
             generation: 0,
             revision: 0,
+            admin_revision: 0,
             plateaus: Ipv4Plateaus::CONTEMPORARY,
         })
     }
@@ -734,12 +747,23 @@ impl PathService {
 
     /// Replacement always creates fresh authority, even for identical text.
     /// The occupied slot is reused, so replacement works at route capacity.
+    /// Owner administrative policy moves to the replacement; learned path
+    /// state does not (paths through the old generation are invalidated).
+    /// A replacement whose destination family differs from the old route's
+    /// is an unrelated route for administration, like a removal followed by
+    /// an addition: it inherits no policy, hold or restriction. A
+    /// same-family replacement keeps the record, also onto a link of
+    /// another MTU; a carried estimate above the new first hop then means
+    /// exactly what a stored estimate means after `set_link_mtu` lowers its
+    /// link: it caps nothing above the first hop, and search targets are
+    /// clipped by the first hop.
     pub fn replace_route(&mut self, old: RouteId, route: Route) -> Result<RouteId, Error> {
         self.route(old)?;
         self.validate_route(route)?;
         self.check_duplicate(route, Some(old))?;
         let generation = self.next_generation()?;
         let revision = self.next_revision()?;
+        self.transfer_route_admin(old, generation, route);
         let id = RouteId(
             self.routes
                 .insert(self.context, old.0.slot, generation, route),
@@ -759,10 +783,28 @@ impl PathService {
 
     /// Atomic full replacement. Caller-owned input is validated completely
     /// before changing any slot, generation or revision. No temporary allocation.
+    /// Administrative policy is dropped; see `replace_routes_mapped`.
     pub fn replace_routes(&mut self, routes: &[Route]) -> Result<(), Error> {
+        self.replace_routes_mapped(routes, &[])
+    }
+
+    /// Full replacement that carries owner policy only along explicit
+    /// `(old route, index into routes)` mappings; every unmapped route's
+    /// policy is dropped. New routes occupy slots `0..routes.len()`, so the
+    /// replacement of `routes[i]` is the live route in slot `i`. A mapping
+    /// onto a route of the other destination family is invalid input
+    /// (`InvalidArgument`, nothing changed): that replacement is an
+    /// unrelated route. A carried estimate above a smaller new first hop
+    /// has the meaning described for `replace_route`.
+    pub fn replace_routes_mapped(
+        &mut self,
+        routes: &[Route],
+        carry: &[(RouteId, usize)],
+    ) -> Result<(), Error> {
         if routes.len() > self.routes.slots.len() {
             return Err(Error::Capacity);
         }
+        self.check_route_mapping(routes, carry)?;
         for (i, &route) in routes.iter().enumerate() {
             self.validate_route(route)?;
             if routes[..i].iter().any(|r| r.ambiguous(route)) {
@@ -772,6 +814,7 @@ impl PathService {
         let count = u64::try_from(routes.len()).map_err(|_| Error::Exhausted)?;
         let generation = self.generation.checked_add(count).ok_or(Error::Exhausted)?;
         let revision = self.next_revision()?;
+        self.stage_route_mapping(carry);
         for slot in &mut self.routes.slots {
             slot.value = None;
         }
@@ -779,6 +822,7 @@ impl PathService {
             self.routes
                 .insert(self.context, i, self.generation + i as u64 + 1, route);
         }
+        self.install_route_mapping();
         self.generation = generation;
         self.commit_revision(revision);
         Ok(())
@@ -889,7 +933,7 @@ impl PathService {
 
     /// Source-free live policy update, independent of forwarding identity.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-7
-    //= reason=T7 canonical bounded16 IPv4 policy selects nine contemporary values from AWS EC2 and Google VPC MTU documentation, RFC2516 PPPoE and RFC791 wire/fallback/floor limits. PathService defaults to this compact policy and atomically replaces validated tables at runtime without source changes; public tests exercise historical/custom/contemporary replacement and fallback. The low-level ntcp adapter preserves historical defaults and Error compatibility. Owner-authorized utility integration is independently T12, not a prerequisite imposed by this example ioctl advice.
+    //= reason=T7 canonical bounded16 IPv4 policy selects nine contemporary values from AWS EC2 and Google VPC MTU documentation, RFC2516 PPPoE and RFC791 wire/fallback/floor limits. PathService defaults to this compact policy and atomically replaces validated tables at runtime without source changes; public tests exercise historical/custom/contemporary replacement and fallback. The low-level ntcp adapter preserves historical defaults and Error compatibility. The Host owner also replaces the table at runtime through Host::admin_set_ipv4_plateaus (the Administration capability, the same validated PathService replacement), which the ntcp-pathctl utility's plateaus command reaches through the opt-in local control socket of the native runtime and tun_echo, the counterpart of the suggested ioctl (ntcp-path-control tests/control.rs).
     //# We do not expect that the values in the table, especially for higher MTU levels, are going to be valid forever. The values given here are an implementation suggestion, NOT a specification or requirement. Implementors should use up-to-date references to pick a set of plateaus; it is important that the table not contain too many entries or the process of searching for a PMTU might waste Internet resources. Implementors should also make it convenient for customers without source code to update the table values in their systems (for example, the table in a BSD-derived Unix kernel could be changed using a new "ioctl" command).
     pub fn set_ipv4_plateaus(&mut self, table: Ipv4Plateaus) -> Result<(), Error> {
         if self.plateaus == table {
@@ -944,6 +988,43 @@ mod tests {
         );
         assert_eq!(service.ipv4_plateaus(), policy);
         assert_eq!(service.revision(), u64::MAX);
+    }
+
+    #[test]
+    fn exhausted_admin_revision_fails_before_change() {
+        let mut service = service();
+        let link = service.register_link(InterfaceKey(1), 1500).unwrap();
+        let id = service
+            .add_route(Route {
+                destination: IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap(),
+                source: None,
+                dscp: None,
+                link,
+                next_hop: NextHop::OnLink,
+                metric: 0,
+            })
+            .unwrap();
+        service.admin_revision = u64::MAX;
+        let change = AdminChange {
+            target: AdminTarget::Route(id),
+            expected: 0,
+            policy: AdminPolicy {
+                discovery_disabled: true,
+                estimate: None,
+            },
+        };
+        assert_eq!(service.prepare_admin(change, 0, 600), Err(Error::Exhausted));
+        assert_eq!(service.route_administration(id).unwrap().policy, AdminPolicy::default());
+        // An identical (empty) policy needs no generation and still succeeds.
+        let noop = service
+            .prepare_admin(AdminChange {
+                policy: AdminPolicy::default(),
+                ..change
+            }, 0, 600)
+            .unwrap();
+        assert!(noop.is_noop());
+        service.commit_admin(noop).unwrap();
+        assert_eq!(service.admin_revision(), u64::MAX);
     }
 
     #[test]

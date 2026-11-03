@@ -1090,7 +1090,7 @@ fn pmtud_eor_and_allocation_free_probe_feedback_retry() {
 
 //= https://www.rfc-editor.org/rfc/rfc4821#section-8
 //= type=test
-//= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. For a UDP application that cannot change its message sizes, Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment (4821-155); tun_echo's UDP echo replies use it.
+//= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. For a UDP application that cannot change its message sizes, Host::udp_send_datagram's Fragment mode source-fragments a datagram larger than the connectionless effective size within the peer reassembly guarantee or a stated capability, with DF on every IPv4 fragment outside owner-disabled routes (4821-155, 1191-093); tun_echo's UDP echo replies use it.
 //# Packetization Layers SHOULD avoid sending messages that will require fragmentation
 //# [Kent87] [frag-errors]. However, entirely preventing fragmentation is not always
 //# possible. Some Packetization Layers, such as a UDP application outside the kernel,

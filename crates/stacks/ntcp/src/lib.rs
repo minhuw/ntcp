@@ -29,7 +29,7 @@ mod fast_open_policy_tests;
 #[cfg(test)]
 mod fast_open_tests;
 mod managed_path;
-pub use managed_path::{DiscoveryIntent, FactoryRole, ManagedError, ManagedOpenOptions, ManagedPathInfo, PathFactoryRequest, PathProvider, PreparedPath};
+pub use managed_path::{DiscoveryIntent, FactoryRole, ManagedError, ManagedOpenOptions, ManagedPathInfo, PathFactoryRequest, PathProvider, PreparedPath, TransportCeilings};
 mod output_reservation;
 pub use output_reservation::{GsoLimits, TransmitAttempt, TransmitSegmentation};
 #[cfg(test)]
@@ -38,7 +38,10 @@ mod hystart;
 mod ipv4_options;
 mod pacing;
 mod pmtud;
-pub use pmtud::{PathMtuInfo, PmtuFeedback, PmtuReport};
+pub use pmtud::{
+    AdministrativeClip, AdministrativeDeferral, AdministrativeSearch, PathMtuInfo, PmtuFeedback,
+    PmtuReport,
+};
 mod pmtud_config;
 pub use pmtud_config::{Ipv4Plateaus, PmtudConfig, PmtudPolicy, SearchAging};
 mod route_policy;

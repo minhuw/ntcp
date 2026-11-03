@@ -900,6 +900,7 @@ fn randomized_host_dispatch_never_acts_beyond_the_reference_model() {
                 max_payload: 1500,
                 events: 2,
                 evicted_signatures: 1,
+                probe_receipts: 2,
             };
             let mut side = managed_limited(
                 local,

@@ -13,6 +13,20 @@
 //                                octets (MODE fragment|refuse|probe), then
 //                                WAIT_MS of ordinary service
 //   serve WAIT_MS                ordinary service only
+//   neighbor DSCP                add a second route (same link and next hop,
+//                                selected by DSCP) and open a second flow to
+//                                the peer with that DSCP, in Fragment mode
+//                                with the stated peer reassembly capacity
+//   sendvia FLOW MODE SIZE SALT WAIT_MS
+//                                as send, through flow main|neighbor
+//   disable ROUTE                disable discovery on route main|neighbor
+//                                through the Host owner's administration
+//                                capability (one admin_apply transaction)
+//   report N OUTCOME             report the outcome (success|isolated-loss|
+//                                timeout|inconclusive) of the Nth Probe-mode
+//                                receipt (from 0, in issue order) with
+//                                Host::udp_report_probe, as an application
+//                                that learned it from its own receiver would
 //   quit
 // INITIAL is the connectionless initial effective PMTU for the local family
 // and PEER_REASSEMBLY the peer's reassembly capacity, both complete IP
@@ -25,8 +39,9 @@
 // earlier emission) and reports the assertion in its ready line.
 use ntcp::{Endpoint, EndpointConfig, EndpointError};
 use ntcp_host::{
-    AdjunctCounters, BackendOutcome, Continuity, DatagramReport, Host, IngressContext, ProbeRecord,
-    Received, UdpDatagramLimits, UdpEvent, UdpFlowId, UdpSend, UdpSendMode, path,
+    AdjunctCounters, BackendOutcome, Continuity, DatagramReport, Host, IngressContext,
+    ProbeReceipt, ProbeRecord, Received, UdpDatagramLimits, UdpEvent, UdpFlowId, UdpProbeOutcome,
+    UdpSend, UdpSendMode, path,
 };
 use ntcp_io::{PacketIo, TxOutcome};
 use ntcp_io_tun::Tun;
@@ -178,6 +193,10 @@ struct Network {
     tun: Tun,
     flow: UdpFlowId,
     send: UdpSend,
+    // The default route, and the neighbor route and flow once added.
+    route: path::RouteId,
+    neighbor: Option<(path::RouteId, UdpFlowId)>,
+    administration: ntcp_host::Administration,
     start: Instant,
     frame: Vec<u8>,
     completed: Vec<u8>,
@@ -186,6 +205,9 @@ struct Network {
     events: Vec<UdpEvent>,
     // UDP datagrams the flow received from the peer (none are expected).
     datagrams: usize,
+    // Every receipt a definite Probe-mode submission returned, in order
+    // (bounded by the commands the harness sends).
+    receipts: Vec<ProbeReceipt>,
 }
 
 impl Network {
@@ -209,7 +231,7 @@ impl Network {
         let mut identity = [0u8; 16];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut identity)?;
         let (paths, mut limits) =
-            ntcp_host::managed_limits(config, 1, 1, 1, 1, 1).map_err(host_error)?;
+            ntcp_host::managed_limits(config, 1, 1, 1, 2, 1).map_err(host_error)?;
         let (largest, header) = if ipv4 {
             (IPV4_DATAGRAM, 20)
         } else {
@@ -244,11 +266,15 @@ impl Network {
             paths,
             limits,
             ntcp_host::UdpLimits {
-                flows: 1,
+                // The flow, and the neighbor flow of `neighbor`.
+                flows: 2,
                 receive_datagrams: BUDGET,
                 max_payload: largest - header - 8,
                 events: BUDGET,
                 evicted_signatures: 256,
+                // One receipt per probe a run sends before its outcome is
+                // known; unreported ones are reclaimed after expiry.
+                probe_receipts: BUDGET,
             },
         )
         .map_err(host_error)?;
@@ -320,7 +346,7 @@ impl Network {
         } else {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         };
-        host.add_route(path::Route {
+        let route = host.add_route(path::Route {
             destination: path::IpPrefix::new(any, 0).map_err(|e| host_error(e.into()))?,
             source: None,
             dscp: None,
@@ -348,12 +374,16 @@ impl Network {
             peer_capability: Some(peer_reassembly),
         };
         host.udp_set_send(flow, send).map_err(host_error)?;
+        let administration = host.administration();
         Ok(Self {
             host,
             ingress,
             tun,
             flow,
             send,
+            route,
+            neighbor: None,
+            administration,
             start,
             frame: vec![0; MAX_IP_PACKET + 1],
             completed: vec![0; MAX_IP_PACKET],
@@ -361,6 +391,7 @@ impl Network {
             received: vec![0; largest],
             events: Vec::new(),
             datagrams: 0,
+            receipts: Vec::new(),
         })
     }
 
@@ -435,6 +466,15 @@ impl Network {
             self.host.collect(endpoint).map_err(host_error)?;
             while let Some(event) = self.host.udp_event(self.flow).map_err(host_error)? {
                 self.events.push(event);
+            }
+            if let Some((_, flow)) = self.neighbor {
+                while self.host.udp_event(flow).map_err(host_error)?.is_some() {}
+                while self
+                    .host
+                    .udp_receive(flow, &mut self.received)
+                    .map_err(host_error)?
+                    .is_some()
+                {}
             }
             while self
                 .host
@@ -515,9 +555,101 @@ impl Network {
         ))
     }
 
+    // The second route (same link and Forwarder next hop, selected by DSCP)
+    // and a Fragment-mode flow to the same peer that resolves through it.
+    fn add_neighbor(&mut self, endpoint: &mut Endpoint, dscp: u8, peer: SocketAddr, local: IpAddr) -> io::Result<String> {
+        let default = self.host.paths().route(self.route).map_err(|e| host_error(e.into()))?;
+        let route = self
+            .host
+            .add_route(path::Route {
+                dscp: Some(path::Dscp::new(dscp).map_err(|e| host_error(e.into()))?),
+                ..default
+            })
+            .map_err(host_error)?;
+        let flow = self
+            .host
+            .udp_open(
+                endpoint,
+                SocketAddr::new(local, LOCAL_PORT + 1),
+                Some(peer),
+                ntcp_host::UdpOptions {
+                    dscp,
+                    hop_limit: config(local).hop_limit,
+                },
+            )
+            .map_err(host_error)?;
+        self.host.udp_set_send(flow, self.send).map_err(host_error)?;
+        self.neighbor = Some((route, flow));
+        let limits = self
+            .host
+            .udp_datagram_limits(endpoint, flow, None, None)
+            .map_err(host_error)?;
+        let resolved = self
+            .host
+            .paths()
+            .path_snapshot(limits.path.path)
+            .map_err(|e| host_error(e.into()))?
+            .key()
+            .route();
+        Ok(format!(
+            "\"dscp\":{dscp},\"local_port\":{},\"separate_route\":{},\"resolved_neighbor_route\":{}",
+            LOCAL_PORT + 1,
+            route != self.route,
+            resolved == route
+        ))
+    }
+
+    // Disable discovery on one route: one owner administration transaction.
+    fn disable(&mut self, endpoint: &mut Endpoint, which: &str) -> io::Result<String> {
+        let route = match which {
+            "main" => self.route,
+            "neighbor" => self.neighbor.ok_or_else(|| other("no neighbor route".into()))?.0,
+            _ => return Err(other(format!("invalid route {which}"))),
+        };
+        let expected = self
+            .host
+            .admin_routes(&self.administration)
+            .map_err(host_error)?
+            .find(|r| r.route == route)
+            .ok_or_else(|| other("route vanished".into()))?
+            .generation;
+        let candidate = self
+            .host
+            .admin_validate(
+                &self.administration,
+                self.now(),
+                path::AdminChange {
+                    target: path::AdminTarget::Route(route),
+                    expected,
+                    policy: path::AdminPolicy {
+                        discovery_disabled: true,
+                        estimate: None,
+                    },
+                },
+            )
+            .map_err(host_error)?;
+        let generation = self
+            .host
+            .admin_apply(&self.administration, endpoint, candidate)
+            .map_err(host_error)?;
+        Ok(format!("\"route\":\"{which}\",\"generation\":{generation}"))
+    }
+
     fn send(
         &mut self,
         endpoint: &mut Endpoint,
+        mode: UdpSendMode,
+        size: usize,
+        salt: usize,
+    ) -> io::Result<String> {
+        let flow = self.flow;
+        self.send_on(endpoint, flow, mode, size, salt)
+    }
+
+    fn send_on(
+        &mut self,
+        endpoint: &mut Endpoint,
+        flow: UdpFlowId,
         mode: UdpSendMode,
         size: usize,
         salt: usize,
@@ -526,7 +658,10 @@ impl Network {
             mode,
             peer_capability: self.send.peer_capability,
         };
-        let before = self.limits(endpoint, Some(send))?;
+        let before = self
+            .host
+            .udp_datagram_limits(endpoint, flow, None, Some(send))
+            .map_err(host_error)?;
         let learned_before = self
             .host
             .paths()
@@ -537,7 +672,6 @@ impl Network {
         let now = self.now();
         let buffer = before.buffer_len(size).min(self.output.len());
         let mut lengths = Vec::new();
-        let flow = self.flow;
         let Self {
             host, tun, output, ..
         } = self;
@@ -554,8 +688,20 @@ impl Network {
                 transmit(tun, frame)
             },
         );
+        if let Some(receipt) = result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.probe.as_ref())
+            .and_then(|p| p.receipt)
+        {
+            self.receipts.push(receipt);
+        }
+        let receipts = self.receipts.len();
         let result = match result {
-            Ok(report) => format!("\"report\":{},\"error\":null", report_json(&report)),
+            Ok(report) => format!(
+                "\"report\":{},\"error\":null,\"receipts\":{receipts}",
+                report_json(&report)
+            ),
             // Refusals (TooBig, PeerLimit), backpressure and certain
             // non-submission: nothing left, reported as is.
             Err(error) => format!("\"report\":null,\"error\":{}", text(error)),
@@ -569,6 +715,46 @@ impl Network {
             opt(learned_before),
             packets.join(",")
         ))
+    }
+}
+
+impl Network {
+    // One application outcome report for receipt N (consumed exactly once
+    // by the Host; a replay or a stale receipt is reported as its error).
+    fn report(&mut self, index: usize, outcome: &str) -> io::Result<String> {
+        let outcome = match outcome {
+            "success" => UdpProbeOutcome::Success,
+            "isolated-loss" => UdpProbeOutcome::IsolatedLoss,
+            "timeout" => UdpProbeOutcome::TimeoutFailure,
+            "inconclusive" => UdpProbeOutcome::Inconclusive,
+            other => return Err(self::other(format!("invalid outcome {other}"))),
+        };
+        let receipt = *self
+            .receipts
+            .get(index)
+            .ok_or_else(|| other(format!("no receipt {index}")))?;
+        let now = self.now();
+        Ok(
+            match self
+                .host
+                .udp_report_probe(now, self.flow, receipt, outcome, None)
+            {
+                Ok(report) => format!(
+                    "\"receipt_size\":{},\"confirmed\":{},\"upper\":{},\"suppressed\":{},\
+                     \"shared\":{},\"report_error\":null",
+                    receipt.size(),
+                    opt(report.bounds.confirmed),
+                    opt(report.bounds.upper),
+                    text(report.bounds.suppressed),
+                    text(report.shared)
+                ),
+                Err(error) => format!(
+                    "\"receipt_size\":{},\"report_error\":{}",
+                    receipt.size(),
+                    text(error)
+                ),
+            },
+        )
     }
 }
 
@@ -682,6 +868,33 @@ fn run() -> io::Result<()> {
                 network.serve(&mut endpoint, field(4)?)?;
                 let state = network.state(&endpoint)?;
                 emit(format!("{{\"event\":\"sent\",{sent},{state}}}"));
+            }
+            Some("report") => {
+                let report =
+                    network.report(field(1)? as usize, fields.get(2).copied().unwrap_or(""))?;
+                let state = network.state(&endpoint)?;
+                emit(format!("{{\"event\":\"reported\",{report},{state}}}"));
+            }
+            Some("neighbor") => {
+                let added = network.add_neighbor(&mut endpoint, field(1)? as u8, peer, local)?;
+                network.serve(&mut endpoint, 100)?;
+                emit(format!("{{\"event\":\"neighbor\",{added}}}"));
+            }
+            Some("disable") => {
+                let disabled = network.disable(&mut endpoint, fields.get(1).copied().unwrap_or(""))?;
+                network.serve(&mut endpoint, 100)?;
+                emit(format!("{{\"event\":\"disabled\",{disabled}}}"));
+            }
+            Some("sendvia") => {
+                let flow = match fields.get(1).copied() {
+                    Some("main") => network.flow,
+                    Some("neighbor") => network.neighbor.ok_or_else(|| other("no neighbor flow".into()))?.1,
+                    _ => return Err(other(format!("invalid command {line}"))),
+                };
+                let mode = mode(fields.get(2).copied().unwrap_or(""))?;
+                let sent = network.send_on(&mut endpoint, flow, mode, field(3)? as usize, field(4)? as usize)?;
+                network.serve(&mut endpoint, field(5)?)?;
+                emit(format!("{{\"event\":\"sent\",{sent}}}"));
             }
             Some("serve") => {
                 network.serve(&mut endpoint, field(1)?)?;

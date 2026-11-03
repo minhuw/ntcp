@@ -31,7 +31,8 @@ pub struct CorrelatedPmtu {
     /// valid path incarnation when the report is applied: RFC 1191 section
     /// 5's "current PMTU estimate", against which a legacy IPv4 quote is
     /// corrected, never the connection's own estimate. `None` for an older
-    /// incarnation; TCP then compares with the submitted length.
+    /// incarnation; TCP then compares with the submitted length. A report
+    /// with `current_path` and no estimate is rejected as invalid input.
     pub path_estimate: Option<u32>,
 }
 
@@ -155,6 +156,10 @@ impl Endpoint {
         if self.managed_context.is_none() {
             return Err(Error::InvalidState.into());
         }
+        // Rejected before any clock or connection change.
+        if report.current_path && report.path_estimate.is_none() {
+            return Err(Error::InvalidArgument.into());
+        }
         self.slot(id)?;
         self.reject_if_output_reserved(id)?;
         self.clock(now)?;
@@ -197,7 +202,11 @@ impl Endpoint {
             .take())
     }
 
-    /// `accept_transmit` for a backend outcome of definitely Submitted. When
+    /// `accept_transmit` for a backend outcome of definitely Submitted. The
+    /// receipt is the final-byte provenance of the physical packet: only an
+    /// unfragmentable one (IPv4 DF, or IPv6) becomes size evidence for the
+    /// connection's search; plain `accept_transmit` (an uncertain outcome)
+    /// proves no size on a managed connection. When
     /// the attempt is a whole authenticated probe and `receipt` matches its
     /// intent (exact IP length, IPv4 DF, unchanged binding and negative
     /// revision), the receipt is retained with the active probe so that the
@@ -212,8 +221,25 @@ impl Endpoint {
             let r = self.reservations[attempt.reservation].current.as_ref()?;
             (r.offset == 0).then_some((r.packet.connection?, r.departure?.start, intent))
         });
+        // The exact physical packet this attempt submits, read before
+        // acceptance advances or clears the reservation.
+        let physical = self.reservations[attempt.reservation]
+            .current
+            .as_ref()
+            .filter(|r| r.attempt == Some(attempt))
+            .and_then(|r| {
+                let d = r.departure?;
+                let count = if r.repaired { r.emitted_bytes } else { d.payload };
+                Some((r.packet.connection?, d, r.offset, count))
+            });
         if !self.accept_transmit(now, attempt)? {
             return Ok(false);
+        }
+        if let Some((id, departure, offset, count)) = physical
+            && let Ok(slot) = self.retained_slot_mut(id)
+        {
+            slot.connection
+                .certify_submission(&departure, offset, count, receipt);
         }
         if let Some((id, start, intent)) = probe
             && let Ok(slot) = self.retained_slot_mut(id)
@@ -494,6 +520,25 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Transport ceilings of a retained connection, for administrative
+    /// reporting. A pure read.
+    pub fn transport_ceilings(
+        &self,
+        id: ConnectionId,
+    ) -> Result<crate::TransportCeilings, EndpointError> {
+        Ok(self.retained_slot(id)?.connection.transport_ceilings())
+    }
+
+    /// The connection's administrative search transition (the targeted
+    /// attempt, its deferral reason or clipping bound), for administrative
+    /// reporting. A pure read.
+    pub fn administrative_search(
+        &self,
+        id: ConnectionId,
+    ) -> Result<Option<crate::AdministrativeSearch>, EndpointError> {
+        Ok(self.retained_slot(id)?.connection.administrative_search())
+    }
+
     pub fn retained_tuple(&self, id: ConnectionId) -> Result<Tuple, EndpointError> {
         Ok(self.retained_slot(id)?.connection.tuple())
     }
@@ -514,6 +559,20 @@ impl Endpoint {
             ordinary_ip_budget: connection.path_payload_limit() as u32
                 + u32::from(connection.ip_header_len()),
         })
+    }
+
+    /// Read-only: whether `apply_path_budget(id, path)` would succeed now
+    /// (binding authority and a budget that carries the connection's
+    /// complete headers and one payload octet). Changes nothing, so a
+    /// provider can validate every client before committing a change.
+    pub fn validate_path_budget(&self, id: ConnectionId, path: PreparedPath) -> Result<(), EndpointError> {
+        let connection = &self.retained_slot(id)?.connection;
+        connection.check_managed_budget(path)?;
+        let budget = path.snapshot.ip_packet_budget().map_err(|_| EndpointError::from(crate::Error::InvalidArgument))?;
+        if !connection.represents_budget(budget) {
+            return Err(crate::Error::InvalidArgument.into());
+        }
+        Ok(())
     }
 
     /// Apply without refreshing local PMTU search or creating repair work.

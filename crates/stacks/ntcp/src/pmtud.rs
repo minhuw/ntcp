@@ -52,6 +52,62 @@ impl PmtuReport {
     };
 }
 
+/// Why the administrative search target is not being probed yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdministrativeDeferral {
+    /// The path's conservative hold (retry_not_before) has not expired.
+    Hold,
+    /// A failure cooldown, convergence timer, outstanding probe or probe
+    /// repair blocks explicit probing (for the Echo adjunct: an outstanding
+    /// probe, its local retry deadline or the restart interval).
+    Cooldown,
+    /// Loss recovery (or another loss/timeout condition) is in progress.
+    LossRecovery,
+    /// Not enough queued data or window for the probe and its trailing
+    /// segments, or another output condition (pacing, cork, shutdown); for
+    /// the Host's Echo adjunct, no fragmentation demand since its search
+    /// converged.
+    DataOrWindow,
+    /// The path's owner disabled discovery; the target is kept for when
+    /// discovery is enabled again.
+    DiscoveryDisabled,
+}
+
+/// Which bound clipped the administrative search target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdministrativeClip {
+    /// The network side of the search upper bound: the first hop, the
+    /// configured search ceiling, or negative evidence from an earlier
+    /// failure.
+    SearchHigh,
+    /// A transport ceiling: the peer, local or user MSS, the configured
+    /// payload limit, allocation or an Endpoint destination policy.
+    Transport,
+    /// Nothing above search_low remains: the value is already validated
+    /// (for the Echo adjunct, also when it lies within the 8-octet fragment
+    /// granularity above the validated size).
+    SearchLow,
+}
+
+/// Bounded diagnostic of the administrative search transition: the latest
+/// administrative value's first explicit attempt, deferred or clipped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdministrativeSearch {
+    /// The next eligible explicit probe targets `target`; `deferred` names
+    /// the precondition that blocked the latest opportunity.
+    Pending {
+        target: u32,
+        deferred: Option<AdministrativeDeferral>,
+    },
+    /// The targeted probe was sent at `size`, smaller than `target` when
+    /// `clipped` names the bound.
+    Attempted {
+        target: u32,
+        size: u32,
+        clipped: Option<AdministrativeClip>,
+    },
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Sent {
     start: Seq,
@@ -59,6 +115,16 @@ struct Sent {
     size: u32,
     header: u16,
     ambiguous: bool,
+    // Unfragmented-size provenance (RFC 4821 implicit probes need unfragmented
+    // delivery). True when the bytes were final at selection; reserved
+    // managed output stays unproven until the Host's definitely-submitted
+    // receipt shows DF set (IPv4) or no Fragment header (IPv6). DF-clear,
+    // uncertain or missing provenance never proves size; ACK, loss and
+    // retry accounting are independent of it.
+    proven: bool,
+    // Discovery-policy revision of the path at selection; a record from an
+    // older revision is never size evidence.
+    policy: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +140,9 @@ pub(crate) struct Probe {
     other_loss: bool,
     timeout: bool,
     repair_end: Seq,
+    // Same provenance rule as `Sent::proven` for the probe's own size.
+    proven: bool,
+    policy: u64,
 }
 
 /// One deferred report below proven delivery. Its identity changes exactly
@@ -135,6 +204,18 @@ pub(crate) struct Pmtud {
     sent: [Option<Sent>; 64],
     next: usize,
     verification: Option<(u32, Instant, u64, u64)>,
+    // The path's effective owner administrative estimate: a search cap
+    // independent of transport limits (RFC 1191 6.6 / RFC 8201 5.6).
+    admin_cap: Option<u32>,
+    // Armed once per administrative value: the next eligible explicit probe
+    // targets it instead of the midpoint.
+    admin_target: Option<u32>,
+    admin_search: Option<AdministrativeSearch>,
+    // Discovery-policy revision of the bound path.
+    policy: u64,
+    // The bound path's owner disabled discovery (RFC 1191 6.6, RFC 8201
+    // 5.6): no probes and no size-search changes; loss recovery continues.
+    disabled: bool,
 }
 
 fn overlaps(a: Seq, b: Seq, c: Seq, d: Seq) -> bool {
@@ -212,6 +293,11 @@ impl Pmtud {
             sent: [None; 64],
             next: 0,
             verification: None,
+            admin_cap: None,
+            admin_target: None,
+            admin_search: None,
+            policy: 0,
+            disabled: false,
         })
     }
 
@@ -324,7 +410,8 @@ impl Pmtud {
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
     //# o If the last probe failed or was inconclusive, then the probe timeout has expired (see Section 7.6.2).
     pub fn target(&self) -> Option<u32> {
-        if self.deadline.is_some()
+        if self.disabled
+            || self.deadline.is_some()
             || self.periodic_deadline.is_some()
             || self.probe.is_some()
             || self.repair_range.is_some()
@@ -332,7 +419,144 @@ impl Pmtud {
         {
             return None;
         }
+        // Once per administrative value, the first eligible probe targets
+        // that value within search_high (which carries the first-hop,
+        // family, transport and negative-evidence bounds).
+        if let Some(target) = self.admin_target
+            && target.min(self.info.search_high) > self.info.search_low
+        {
+            return Some(target.min(self.info.search_high));
+        }
         Some(self.info.search_low + (self.info.search_high - self.info.search_low).div_ceil(2))
+    }
+
+    /// Apply the path's effective administrative estimate. It caps the
+    /// search (search_high never exceeds it) independently of transport
+    /// limits and arms one targeted attempt per distinct value; an
+    /// identical value changes nothing. Never delivery evidence: search_low,
+    /// current_mtu and max_acked are unchanged, and a value above earlier
+    /// negative evidence is clipped by it.
+    pub(crate) fn set_administrative(&mut self, estimate: Option<u32>) {
+        if estimate == self.admin_cap {
+            return;
+        }
+        let old_ceiling = self.search_ceiling();
+        self.admin_cap = estimate;
+        self.info.search_high = self.info.search_high.min(self.search_ceiling());
+        if self.search_ceiling() > old_ceiling {
+            let high = self
+                .search_ceiling()
+                .min(self.discovered_high.unwrap_or(u32::MAX));
+            if high > self.info.search_high {
+                self.info.search_high = high;
+                if self.info.search_low < high {
+                    // New admissible space; cooldowns stay in `deadline`.
+                    self.periodic_deadline = None;
+                }
+            }
+        }
+        if self.probe.is_some_and(|p| estimate.is_some_and(|e| p.size > e)) {
+            self.invalidate_probe_size_result();
+        }
+        self.admin_target = estimate;
+        self.admin_search = estimate.map(|target| {
+            if target.min(self.info.search_high) > self.info.search_low {
+                AdministrativeSearch::Pending {
+                    target,
+                    deferred: None,
+                }
+            } else {
+                // Nothing to probe: already validated, or clipped below it
+                // by negative evidence or another search bound.
+                self.admin_target = None;
+                AdministrativeSearch::Attempted {
+                    target,
+                    size: self.info.search_low,
+                    clipped: if target <= self.info.search_low {
+                        Some(AdministrativeClip::SearchLow)
+                    } else {
+                        self.administrative_clip(target, self.info.search_low)
+                    },
+                }
+            }
+        });
+    }
+
+    /// The pending administrative target, if any.
+    pub(crate) fn administrative_target(&self) -> Option<u32> {
+        self.admin_target
+    }
+
+    /// Record why the pending administrative attempt was not made.
+    pub(crate) fn defer_administrative(&mut self, reason: AdministrativeDeferral) {
+        if self.admin_target.is_some()
+            && let Some(AdministrativeSearch::Pending { deferred, .. }) = &mut self.admin_search
+        {
+            *deferred = Some(reason);
+        }
+    }
+
+    pub(crate) fn administrative_search(&self) -> Option<AdministrativeSearch> {
+        self.admin_search
+    }
+
+    /// The bound path reports another discovery-policy revision: every
+    /// outstanding record and probe selected under the older one loses
+    /// size-result eligibility (checked by revision on ACK and on
+    /// certification, so a disable then re-enable cannot revive them). ACK,
+    /// loss, repair and congestion accounting are unchanged.
+    pub(crate) fn set_policy_revision(&mut self, revision: u64) {
+        if revision != self.policy {
+            self.policy = revision;
+            self.invalidate_probe_size_result();
+        }
+    }
+
+    /// The bound path's owner discovery policy. While disabled no probe is
+    /// selected (`target` is None) and the size search stops: delivery no
+    /// longer raises search_low or confirms a probe, isolated probe loss
+    /// narrows no bound, MTU verification and black-hole fallback change no
+    /// size. Every ACK, loss, repair and congestion outcome is still
+    /// accounted. Outstanding size results lose eligibility through the
+    /// policy revision delivered with the same change; enabling again
+    /// restores the creation configuration's search from its retained
+    /// bounds, never revived proof.
+    pub(crate) fn set_discovery_disabled(&mut self, disabled: bool) {
+        if disabled != self.disabled {
+            self.disabled = disabled;
+            self.invalidate_probe_size_result();
+            self.verification = None;
+        }
+    }
+
+    pub(crate) fn discovery_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Keep the working baseline under the administrative value. When the
+    /// shared budget fell below the value while this connection's working
+    /// baseline is at or above it, lower search_low and current_mtu to the
+    /// budget for revalidation; when the budget is at the value (a downward
+    /// set), a baseline above it is lowered to the value, since the value
+    /// caps the search and every probe (including the challenge of
+    /// `target_for_network`). Not delivery evidence; historical max_acked
+    /// is kept.
+    pub(crate) fn lower_baseline(&mut self, budget: u32) {
+        let Some(admin) = self.admin_cap else {
+            return;
+        };
+        let budget = if budget >= admin {
+            admin
+        } else if self.info.search_low < admin && self.info.current_mtu < admin {
+            return;
+        } else {
+            budget
+        };
+        if self.info.current_mtu > budget {
+            self.verification = None;
+        }
+        self.info.current_mtu = self.info.current_mtu.min(budget);
+        self.info.search_low = self.info.search_low.min(budget);
     }
 
     /// A shared decrease revokes permission to publish this probe's size;
@@ -382,9 +606,12 @@ impl Pmtud {
     /// is larger than the shared estimate. Positive publication is separate.
     pub(crate) fn target_for_network(&self, ordinary: u32) -> Option<u32> {
         self.target().or_else(|| {
-            (self.deadline.is_none() && self.periodic_deadline.is_none()
+            // The owner's administrative value caps every probe, the
+            // challenge included; a disabled path sends none.
+            (!self.disabled && self.deadline.is_none() && self.periodic_deadline.is_none()
                 && self.probe.is_none() && self.repair_range.is_none()
-                && self.info.current_mtu > ordinary)
+                && self.info.current_mtu > ordinary
+                && self.admin_cap.is_none_or(|admin| self.info.current_mtu <= admin))
                 .then_some(self.info.current_mtu)
         })
     }
@@ -426,7 +653,76 @@ impl Pmtud {
             other_loss: false,
             timeout: false,
             repair_end: start,
+            proven: true,
+            policy: self.policy,
         });
+        if let Some(target) = self.admin_target.take() {
+            self.admin_search = Some(AdministrativeSearch::Attempted {
+                target,
+                size,
+                clipped: self.administrative_clip(target, size),
+            });
+        }
+    }
+
+    // Which bound kept `size` below the administrative `target`. Transport
+    // ceilings (peer and local MSS, payload limit, allocation, destination
+    // policy) also cap the search through `bound`, so search_high alone
+    // cannot tell them from network bounds: only the first hop, the
+    // configured search ceiling and negative evidence are network bounds.
+    fn administrative_clip(&self, target: u32, size: u32) -> Option<AdministrativeClip> {
+        let network = self
+            .info
+            .first_hop_mtu
+            .min(self.high_limit.unwrap_or(u32::MAX))
+            .min(self.discovered_high.unwrap_or(u32::MAX));
+        if size >= target {
+            None
+        } else if size >= network {
+            Some(AdministrativeClip::SearchHigh)
+        } else {
+            Some(AdministrativeClip::Transport)
+        }
+    }
+
+    /// The latest recorded packet (and the probe it starts, if any) leaves
+    /// through an embedding that may still rewrite its bytes: it proves no
+    /// size until `certify` sees the final submitted bytes.
+    pub(crate) fn defer_proof_latest(&mut self) {
+        let index = (self.next + self.sent.len() - 1) % self.sent.len();
+        if let Some(packet) = &mut self.sent[index] {
+            packet.proven = false;
+            if let Some(p) = &mut self.probe
+                && p.start == packet.start
+            {
+                p.proven = false;
+            }
+        }
+    }
+
+    /// Final-byte provenance of one definitely submitted physical packet:
+    /// its exact span and complete IP length, and whether the network may
+    /// not fragment it. A DF-clear packet stays unproven.
+    pub(crate) fn certify(&mut self, start: Seq, end: Seq, size: u32, unfragmented: bool) {
+        for k in 1..=self.sent.len() {
+            let index = (self.next + self.sent.len() - k) % self.sent.len();
+            if let Some(packet) = &mut self.sent[index]
+                && packet.start == start
+                && packet.end == end
+                && packet.size == size
+                && !packet.proven
+            {
+                packet.proven = unfragmented && packet.policy == self.policy;
+                break;
+            }
+        }
+        if let Some(p) = &mut self.probe
+            && p.start == start
+            && p.size == size
+            && !p.proven
+        {
+            p.proven = unfragmented && p.policy == self.policy;
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
@@ -538,6 +834,8 @@ impl Pmtud {
             size,
             header,
             ambiguous: retry,
+            proven: true,
+            policy: self.policy,
         });
         self.next = (self.next + 1) % self.sent.len();
     }
@@ -875,6 +1173,8 @@ impl Pmtud {
             size: sent_size,
             header,
             ambiguous: false,
+            proven: true,
+            policy: self.policy,
         };
         let reference = path_estimate.filter(|_| current_path).unwrap_or(sent_size);
         self.report(
@@ -1192,8 +1492,14 @@ impl Pmtud {
             if let Some(packet) = entry
                 && ack.at_or_after(packet.end)
             {
-                if !packet.ambiguous {
+                // Only unfragmented, unambiguous delivery selected under the
+                // current discovery policy is size evidence.
+                if !packet.ambiguous && packet.proven && packet.policy == self.policy {
                     self.max_acked = self.max_acked.max(packet.size);
+                    if self.disabled {
+                        *entry = None;
+                        continue;
+                    }
                     // Ordinary delivery validates only the current non-probe
                     // range. Old larger flight must not undo a PTB/link bound,
                     // and explicit probes retain their own timeout/verification rules.
@@ -1222,7 +1528,7 @@ impl Pmtud {
                 //# Set search_low to the probe
                 //# size.  If the probe size is larger than the eff_pmtu, raise eff_pmtu
                 //# to the probe size.
-                if p.size_result_valid {
+                if p.size_result_valid && p.proven && p.policy == self.policy && !self.disabled {
                     // Recorded even when local proof already exceeds it: the
                     // probe still establishes a network fact for this size.
                     self.success = Some((p.start, p.end, p.size));
@@ -1242,7 +1548,7 @@ impl Pmtud {
                     end: p.trailing_end,
                     isolated: p.retried && !p.other_loss && !p.timeout,
                 });
-                if p.size_result_valid && p.retried && !p.other_loss && !p.timeout {
+                if p.size_result_valid && !self.disabled && p.retried && !p.other_loss && !p.timeout {
                     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
                     //= reason=Wait for cumulative delivery of the trailing window and exclude timeout or nearby loss. Only conclusive size evidence narrows this bound; congestion outcome consumption is separate.
                     //# In the absence of other indications, set search_high to the probe
@@ -1306,6 +1612,7 @@ impl Pmtud {
     fn search_ceiling(&self) -> u32 {
         self.route_bound()
             .min(self.high_limit.unwrap_or(self.bound))
+            .min(self.admin_cap.unwrap_or(u32::MAX))
     }
 
     fn schedule_aging(&mut self, now: Instant) {
@@ -1325,7 +1632,7 @@ impl Pmtud {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
-    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
     //# Note: an implementation should provide a means for changing the timeout
     //# duration, including setting it to "infinity". For example, hosts attached to an
     //# FDDI network which is then attached to the rest of the Internet via a slow
@@ -1333,12 +1640,12 @@ impl Pmtud {
     //# have to put up with dropped datagrams every 10 minutes.
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
-    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
     //# The implementation should also provide a way to change the timeout period for
     //# aging stale PMTU information.
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
-    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
     //# Note: an implementation should provide a means for changing the timeout
     //# duration, including setting it to "infinity". For example, nodes attached to a
     //# link with a large MTU that is then attached to the rest of the Internet via a
@@ -1346,7 +1653,7 @@ impl Pmtud {
     //# should not have to put up with dropped packets every 10 minutes.
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
-    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
     //# The implementation should also provide a way to change the timeout period for
     //# aging stale PMTU information.
 
@@ -1441,7 +1748,7 @@ impl Pmtud {
         //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
         //# For TCP, this occurs when the R1 timeout threshold described by
         //# [RFC1122] expires.
-        if consecutive >= 3 && !self.icmp_since_progress {
+        if consecutive >= 3 && !self.icmp_since_progress && !self.disabled {
             // An explicit conservative transport bound is not an undersized
             // physical link or PTB. Recovery must never raise packet size or
             // exceed a current administrative ceiling. Unconfigured IPv6
@@ -1474,6 +1781,197 @@ mod tests {
 
     fn state(ipv4: bool) -> Pmtud {
         Pmtud::new(PmtudConfig::new(1500), 1500, ipv4, 600_000_000).unwrap()
+    }
+
+    // The administrative value caps search_high; once per value the first
+    // eligible probe targets it instead of the midpoint; an isolated failure
+    // (search_high = probe - 1) is not reopened by the same value, later
+    // probes use the midpoint below the cap, and a different value is
+    // clipped by the negative evidence.
+    #[test]
+    fn administrative_value_caps_search_and_targets_the_first_probe_once() {
+        for ipv4 in [true, false] {
+            let header = if ipv4 { 20 } else { 40 };
+            let mut p = state(ipv4);
+            let low = p.info.search_low;
+            let midpoint = low + (1500 - low).div_ceil(2);
+            assert_eq!(p.target(), Some(midpoint));
+            let before = (p.info.search_low, p.info.current_mtu, p.max_acked);
+            p.set_administrative(Some(1400));
+            // A search cap, never delivery evidence.
+            assert_eq!((p.info.search_low, p.info.current_mtu, p.max_acked), before);
+            assert_eq!(p.info.search_high, 1400);
+            assert_eq!(p.target(), Some(1400));
+            assert_eq!(
+                p.administrative_search(),
+                Some(AdministrativeSearch::Pending { target: 1400, deferred: None })
+            );
+            p.defer_administrative(AdministrativeDeferral::LossRecovery);
+            assert_eq!(
+                p.administrative_search(),
+                Some(AdministrativeSearch::Pending {
+                    target: 1400,
+                    deferred: Some(AdministrativeDeferral::LossRecovery)
+                })
+            );
+            // The targeted probe and its isolated loss.
+            let payload = 1400 - header - 20;
+            let end = Seq(1).wrapping_add(payload);
+            p.start_probe(Seq(1), payload, 3000, 1400);
+            p.sent(Seq(1), end, 1400, header as u16, false);
+            assert_eq!(
+                p.administrative_search(),
+                Some(AdministrativeSearch::Attempted { target: 1400, size: 1400, clipped: None })
+            );
+            p.sent(end, end.wrapping_add(3000), 1100, header as u16, false);
+            p.loss(Seq(1), false);
+            p.sent(Seq(1), end, 1100, header as u16, true);
+            p.ack(end.wrapping_add(3000), 10, 1000, 1000);
+            assert_eq!(p.info.search_high, 1399);
+            assert!(p.deadline.is_some());
+            // The same value reopens nothing.
+            p.set_administrative(Some(1400));
+            assert_eq!(p.info.search_high, 1399);
+            assert_eq!(p.administrative_target(), None);
+            // After the cooldown: the midpoint below the cap.
+            p.tick(10 + 1000);
+            let low = p.info.search_low;
+            assert_eq!(p.target(), Some(low + (1399 - low).div_ceil(2)));
+            // A different value is a new attempt, clipped by the failure.
+            p.set_administrative(Some(1450));
+            assert_eq!(p.info.search_high, 1399);
+            assert_eq!(p.target(), Some(1399));
+            p.start_probe(Seq(9000), 1399 - header - 20, 3000, 1399);
+            assert_eq!(
+                p.administrative_search(),
+                Some(AdministrativeSearch::Attempted {
+                    target: 1450,
+                    size: 1399,
+                    clipped: Some(AdministrativeClip::SearchHigh)
+                })
+            );
+            // A value at or below the validated search_low has nothing to
+            // probe and records why.
+            let mut q = state(ipv4);
+            let low = q.info.search_low;
+            q.set_administrative(Some(low));
+            assert_eq!(q.administrative_target(), None);
+            assert_eq!(
+                q.administrative_search(),
+                Some(AdministrativeSearch::Attempted {
+                    target: low,
+                    size: low,
+                    clipped: Some(AdministrativeClip::SearchLow)
+                })
+            );
+            assert_eq!(q.target(), None);
+        }
+    }
+
+    // Records and probes selected under an older discovery-policy revision
+    // never prove size: no max_acked, search_low or probe success, also
+    // after certification and after disable then re-enable.
+    #[test]
+    fn stale_discovery_policy_revision_loses_size_eligibility() {
+        for ipv4 in [true, false] {
+            let header = if ipv4 { 20u16 } else { 40 };
+            let mut p = state(ipv4);
+            let low = p.info.search_low;
+            // Ordinary record (final bytes) and a managed record awaiting
+            // its receipt, then a probe.
+            p.sent(Seq(1), Seq(1001), low + 10, header, false);
+            p.sent(Seq(1001), Seq(2001), low + 20, header, false);
+            p.defer_proof_latest();
+            p.start_probe(Seq(2001), 1000, 3000, low + 100);
+            p.sent(Seq(2001), Seq(3001), low + 100, header, false);
+            // Disable then re-enable: two newer revisions.
+            p.set_policy_revision(3);
+            p.set_policy_revision(4);
+            p.certify(Seq(1001), Seq(2001), low + 20, true);
+            p.ack(Seq(3001), 5, 1000, 1000);
+            assert_eq!(p.max_acked, 0);
+            assert_eq!(p.info.search_low, low);
+            assert!(p.take_probe_success().is_none());
+            // Records selected under the current revision still count.
+            p.sent(Seq(3001), Seq(4001), low + 30, header, false);
+            p.ack(Seq(4001), 6, 1000, 1000);
+            assert_eq!(p.max_acked, low + 30);
+        }
+    }
+
+    // Owner discovery disable (RFC 1191 6.6, RFC 8201 5.6): no probe target,
+    // an outstanding probe's success publishes nothing, ordinary delivery
+    // raises no search_low and a full-stop timeout changes no size (loss
+    // recovery is the caller's), while ACK accounting continues. Enabling
+    // again resumes the search from the retained bounds.
+    #[test]
+    fn discovery_disabled_stops_probing_and_size_search_changes() {
+        for ipv4 in [true, false] {
+            let header = if ipv4 { 20u16 } else { 40 };
+            let mut p = state(ipv4);
+            let low = p.info.search_low;
+            assert!(p.target().is_some());
+            p.start_probe(Seq(1), 1000, 3000, low + 100);
+            p.sent(Seq(1), Seq(1001), low + 100, header, false);
+            p.set_discovery_disabled(true);
+            assert_eq!(p.target(), None);
+            p.sent(Seq(1001), Seq(2001), low + 10, header, false);
+            p.ack(Seq(2001), 5, 1000, 1000);
+            assert!(p.take_probe_success().is_none());
+            assert!(p.probe.is_none());
+            assert_eq!(p.info.search_low, low);
+            let mtu = p.info.current_mtu;
+            for consecutive in 1..=4 {
+                p.timeout(10, Seq(2001), consecutive, 1000);
+            }
+            assert_eq!(p.info.current_mtu, mtu);
+            assert_eq!(p.target(), None);
+            p.set_discovery_disabled(false);
+            // The probe timeout's cooldown still applies; then search resumes.
+            p.tick(u64::MAX / 2);
+            assert!(p.target().is_some_and(|t| t > low));
+        }
+    }
+
+    // A shared budget below the administrative value lowers a working
+    // baseline at or above that value, keeping historical max_acked.
+    #[test]
+    fn baseline_lowered_below_administrative_value_keeps_max_acked() {
+        for ipv4 in [true, false] {
+            let header = if ipv4 { 20u16 } else { 40 };
+            let mut p = state(ipv4);
+            p.sent(Seq(1), Seq(1001), 1450, header, false);
+            p.ack(Seq(1001), 1, 1000, 1000);
+            assert_eq!((p.info.search_low, p.max_acked), (1450, 1450));
+            p.set_administrative(Some(1450));
+            // Budget at the value and the baseline not above it: nothing to
+            // revalidate.
+            p.lower_baseline(1450);
+            assert_eq!(p.info.search_low, 1450);
+            p.lower_baseline(1300);
+            assert_eq!((p.info.search_low, p.info.current_mtu), (1300, 1300));
+            assert_eq!(p.max_acked, 1450);
+            // Without an administrative value this is not the transition.
+            let mut q = state(ipv4);
+            q.sent(Seq(1), Seq(1001), 1450, header, false);
+            q.ack(Seq(1001), 1, 1000, 1000);
+            q.lower_baseline(1300);
+            assert_eq!(q.info.search_low, 1450);
+            // A downward set leaves the budget at the value: a baseline
+            // above it is lowered to the value, so no challenge exceeds it.
+            let mut r = state(ipv4);
+            r.sent(Seq(1), Seq(1001), 1450, header, false);
+            r.ack(Seq(1001), 1, 1000, 1000);
+            r.tick(u64::MAX / 2);
+            assert!(r.target_for_network(1300).is_some_and(|t| t > 1300), "probing without a value");
+            r.set_administrative(Some(1300));
+            assert_eq!(r.target_for_network(1300), None, "capped before the baseline update");
+            r.lower_baseline(1300);
+            assert_eq!((r.info.search_low, r.info.current_mtu), (1300, 1300));
+            assert_eq!(r.max_acked, 1450);
+            r.tick(u64::MAX / 2);
+            assert_eq!(r.target_for_network(1300), None);
+        }
     }
 
     // Host-correlated drop advice: consumed by black-hole classification

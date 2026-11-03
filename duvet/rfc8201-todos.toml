@@ -152,34 +152,3 @@ quote = '''
 Since then, [RFC7530] states that the supported transport layer between NFS and IP must be an IETF standardized transport protocol that is specified to avoid network congestion; such transports include TCP, Stream Control Transmission Protocol (SCTP) [RFC4960], and the Datagram Congestion Control Protocol (DCCP) [RFC4340].
 '''
 
-# 8201-079
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
-reason = "Introduces the per-path utility controls in 8201-080/081; there is no system-utility path-control interface. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the owner-authorized path administration API, native commands and the opt-in local control utility; T19 exercises the utility controls in namespace topologies."
-quote = '''
-It is suggested that an implementation provides a way for a system utility program to:
-'''
-
-# 8201-080
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
-reason = "PMTUD is configured per connection at creation; no system-utility per-path discovery-disable control exists. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds per-path discovery disable through the owner-authorized administration API and utility; T19 exercises it in namespace topologies."
-quote = '''
-- Specify that Path MTU Discovery not be done on a given path.
-'''
-
-# 8201-081
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
-reason = "Endpoint::set_destination_route and set_route_mtu configure same-path transport ceilings rather than an arbitrary learned path PMTU estimate. Removing or raising a ceiling does not raise effective PMTU without ACK proof, and no system-utility PMTU-cache setter is exposed; lower_mss is another independent send ceiling. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the learned-estimate set API and utility; T19 exercises it in namespace topologies."
-quote = '''
-- Change the PMTU value associated with a given path.
-'''
-
-# 8201-082
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
-reason = "Connections configured with PMTUD disabled enforce the IPv6 minimum-MTU send ceiling, including options and retries. No administrative per-path discovery-disable flag or IP-layer path utility interface exists; the connection creation profile does not provide that missing path control. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. Remaining: T12 adds the per-path flag, applied to existing and future users through the owner-authorized administration API; T19 exercises it in namespace topologies."
-quote = '''
-The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.
-'''

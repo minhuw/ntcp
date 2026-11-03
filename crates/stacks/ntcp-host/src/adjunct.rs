@@ -38,9 +38,33 @@
 //! Silence and ICMP errors other than a Packet Too Big lower only the
 //! search's upper bound, never E or a shared ceiling; a correlated Packet Too
 //! Big for a probe is an ordinary trusted decrease of the probe's path.
+//!
+//! The owner's administrative estimate of the path (RFC 1191 section 6.6,
+//! RFC 8201 section 5.6: actual knowledge of its PMTU) replaces the largest
+//! fragmented datagram as the search's upper bound, intersected with the
+//! first hop and the search's negative evidence. It is never delivery
+//! evidence: it changes neither E nor the confirmed lower bound. Once per
+//! administrative value, the first probe the existing demand, hold,
+//! outstanding-probe, retry and restart rules allow targets the value
+//! (within those bounds) instead of the midpoint; a failure lowers the
+//! search's upper bound as any other, and a later value is clipped by that
+//! negative evidence until the search restarts. The latest value's attempt
+//! (deferred, or sent and possibly clipped) is reported with the TCP
+//! diagnostic vocabulary through the administration query. A discovery
+//! disable makes the outstanding probe ineligible for size results in the
+//! administration transaction itself (a later re-enable does not revive it)
+//! and no probe leaves while it holds: a reply to a probe sent before a
+//! disable proves no size and narrows nothing, while a correlated Packet Too
+//! Big for it is still the ordinary trusted shared decrease (the router's
+//! report is a network fact about a packet definitely sent). The ineligible
+//! probe stays correlatable until its reply deadline, then lapses without
+//! loss evidence.
 
 use alloc::vec::Vec;
-use ntcp::{Instant, IpMetadata, NetworkError};
+use ntcp::{
+    AdministrativeClip, AdministrativeDeferral, AdministrativeSearch, Instant, IpMetadata,
+    NetworkError,
+};
 use ntcp_icmp::EchoKind;
 use ntcp_path::{
     DeliveryConfirmation, Dscp, EstimateChange, PathId, PathSnapshot, PathStatus, ScopedAddress,
@@ -171,6 +195,10 @@ struct Probe {
     // Only a definitely submitted probe is certified by its reply.
     definite: bool,
     negative_revision: u64,
+    // False once the path's discovery policy changed after submission: the
+    // probe's reply or loss is no size result (RFC 1191 6.6 / RFC 8201
+    // 5.6); a PTB for it is still a trusted shared decrease.
+    eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +218,91 @@ struct Entry {
     // Local retry deadline: no probe before it. Silence never touches the
     // shared hold.
     not_before: Instant,
+    // Negative evidence of the current search: the largest size not yet
+    // shown undeliverable (a lost or too-big probe minus one). Cleared when
+    // a search (re)starts from its initial upper bound.
+    negative: Option<u32>,
+    // The path's effective administrative estimate as last observed, the
+    // armed once-per-value target and the latest value's diagnostic.
+    admin: Option<u32>,
+    admin_target: Option<u32>,
+    admin_search: Option<AdministrativeSearch>,
+    // The path's owner disabled discovery: no probe leaves for it.
+    disabled: bool,
+}
+
+impl Entry {
+    // The search's initial upper bound: the first hop, capped by the
+    // administrative estimate when one is set and otherwise by the largest
+    // fragmented datagram (no larger size is needed without other
+    // knowledge of the path).
+    fn ceiling(&self, first_hop: u32) -> u32 {
+        first_hop.min(self.admin.unwrap_or(self.demand))
+    }
+
+    // Take in the path's current administrative estimate: a new value caps
+    // an active search afresh (with its negative evidence kept) and arms
+    // one targeted attempt; an unchanged value changes nothing.
+    fn observe(&mut self, snapshot: PathSnapshot) {
+        self.disabled = snapshot.discovery_disabled();
+        if self.disabled
+            && let Some(probe) = &mut self.probe
+        {
+            // RFC 1191 6.6 / RFC 8201 5.6: discovery is not done on this
+            // path. The outstanding probe loses size-result eligibility
+            // (its reply publishes nothing and its loss narrows nothing)
+            // but stays correlatable until its reply deadline, so a PTB for
+            // it still lowers the shared estimate. Demand and the confirmed
+            // bound are kept.
+            probe.eligible = false;
+        }
+        let value = snapshot.administrative_estimate();
+        if value == self.admin {
+            return;
+        }
+        self.admin = value;
+        self.admin_target = value;
+        self.admin_search = value.map(|target| AdministrativeSearch::Pending {
+            target,
+            deferred: None,
+        });
+        if let Search::Active { low, .. } = self.search {
+            self.search = Search::Active {
+                low,
+                high: self
+                    .ceiling(snapshot.first_hop_mtu())
+                    .min(self.negative.unwrap_or(u32::MAX)),
+            };
+        }
+    }
+
+    fn defer(&mut self, reason: AdministrativeDeferral) {
+        if self.admin_target.is_some()
+            && let Some(AdministrativeSearch::Pending { deferred, .. }) = &mut self.admin_search
+        {
+            *deferred = Some(reason);
+        }
+    }
+
+    // The armed target was attempted at `size` (`low` when nothing above
+    // the search's lower bound remained), below the reachable `high`.
+    fn attempted(&mut self, size: u32, low: u32, high: u32) {
+        let Some(target) = self.admin_target.take() else {
+            return;
+        };
+        let clipped = if size >= target {
+            None
+        } else if target <= low || high >= target {
+            Some(AdministrativeClip::SearchLow)
+        } else {
+            Some(AdministrativeClip::SearchHigh)
+        };
+        self.admin_search = Some(AdministrativeSearch::Attempted {
+            target,
+            size,
+            clipped,
+        });
+    }
 }
 
 pub(crate) struct Adjunct {
@@ -228,14 +341,56 @@ impl Adjunct {
             .find(|e| e.path == path)
             .map_or(0, |e| e.confirmed)
     }
+    /// Whether the adjunct keeps state for `path`, and the diagnostic of its
+    /// latest administrative target.
+    pub fn administrative_search(&self, path: PathId) -> Option<Option<AdministrativeSearch>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|e| e.path == path)
+            .map(|e| e.admin_search)
+    }
     fn deadline(&self, probe: &Probe) -> Instant {
         probe.sent_at.saturating_add(self.timeout)
+    }
+    // What keeps `entry` from probing at `now`, if anything: the path's
+    // hold, an outstanding probe, the local retry deadline or the restart
+    // interval (Cooldown), or no demand since convergence (nothing to send).
+    fn deferral(
+        &self,
+        entry: &Entry,
+        snapshot: PathSnapshot,
+        now: Instant,
+    ) -> Option<AdministrativeDeferral> {
+        if entry.disabled {
+            return Some(AdministrativeDeferral::DiscoveryDisabled);
+        }
+        if entry.probe.is_some() {
+            return Some(AdministrativeDeferral::Cooldown);
+        }
+        if now < snapshot.retry_not_before() {
+            return Some(AdministrativeDeferral::Hold);
+        }
+        match entry.search {
+            Search::Converged(at) if entry.demand_at <= at => {
+                Some(AdministrativeDeferral::DataOrWindow)
+            }
+            Search::Converged(at) if now < at.saturating_add(self.restart) => {
+                Some(AdministrativeDeferral::Cooldown)
+            }
+            _ => (now < entry.not_before).then_some(AdministrativeDeferral::Cooldown),
+        }
     }
     // Earliest instant at which `entry` may send its next probe, ignoring the
     // shared hold; None while nothing is to be done.
     fn ready_at(&self, entry: &Entry) -> Option<Instant> {
+        // An outstanding probe (even an ineligible one on a disabled path)
+        // is settled at its reply deadline.
         if let Some(probe) = &entry.probe {
             return Some(self.deadline(probe));
+        }
+        if entry.disabled {
+            return None;
         }
         match entry.search {
             Search::Pending | Search::Active { .. } => Some(entry.not_before),
@@ -317,11 +472,17 @@ impl Host {
                     search: Search::Pending,
                     probe: None,
                     not_before: now,
+                    negative: None,
+                    admin: None,
+                    admin_target: None,
+                    admin_search: None,
+                    disabled: false,
                 });
                 slot
             }
         };
         let entry = adjunct.entries[index].as_mut().unwrap();
+        entry.observe(snapshot);
         entry.demand = entry.demand.max(ip_len);
         entry.demand_at = entry.demand_at.max(now);
         entry.used_at = entry.used_at.max(now);
@@ -357,31 +518,55 @@ impl Host {
             .min()
     }
 
-    /// Drop the state of paths that are no longer valid incarnations and
-    /// count every probe whose reply deadline passed as lost: RFC 4821
-    /// section 7.6.2 sets search_high to the probe size minus one. Neither
-    /// lowers E or any shared value.
+    /// Drop the state of paths that are no longer valid incarnations, take
+    /// in each path's administrative estimate and count every probe whose
+    /// reply deadline passed as lost: RFC 4821 section 7.6.2 sets
+    /// search_high to the probe size minus one. Neither lowers E or any
+    /// shared value. An armed administrative target that cannot be probed
+    /// at `now` records the precondition blocking it.
+    // Deliver each tracked path's current snapshot (administrative estimate
+    // and discovery policy) to its entry at once, without a time step.
+    pub(crate) fn adjunct_observe(&mut self) {
+        for index in 0..self.adjunct.entries.len() {
+            let Some(mut entry) = self.adjunct.entries[index] else {
+                continue;
+            };
+            if let Ok(snapshot) = self.paths.path_snapshot(entry.path)
+                && snapshot.status() == PathStatus::Valid
+            {
+                entry.observe(snapshot);
+                self.adjunct.entries[index] = Some(entry);
+            }
+        }
+    }
+
     pub(crate) fn service_adjunct(&mut self, now: Instant) {
         for index in 0..self.adjunct.entries.len() {
             let Some(mut entry) = self.adjunct.entries[index] else {
                 continue;
             };
-            if self
-                .paths
-                .path_snapshot(entry.path)
-                .map_or(true, |s| s.status() != PathStatus::Valid)
-            {
-                self.adjunct.entries[index] = None;
-                continue;
-            }
+            let snapshot = match self.paths.path_snapshot(entry.path) {
+                Ok(snapshot) if snapshot.status() == PathStatus::Valid => snapshot,
+                _ => {
+                    self.adjunct.entries[index] = None;
+                    continue;
+                }
+            };
+            entry.observe(snapshot);
             if let Some(probe) = entry.probe
                 && now >= self.adjunct.deadline(&probe)
             {
-                self.adjunct.counters.lost += 1;
-                lower(&mut entry, probe.size);
+                // An ineligible probe lapses without loss evidence.
+                if probe.eligible {
+                    self.adjunct.counters.lost += 1;
+                    lower(&mut entry, probe.size);
+                }
                 entry.probe = None;
                 // The reply deadline was the local retry deadline.
                 entry.not_before = now;
+            }
+            if let Some(reason) = self.adjunct.deferral(&entry, snapshot, now) {
+                entry.defer(reason);
             }
             self.adjunct.entries[index] = Some(entry);
         }
@@ -445,31 +630,44 @@ impl Host {
         };
         // Demand is serviced after the shared hold (RFC 1191 section 6.3,
         // RFC 8201 section 4: no attempt to increase within it).
+        entry.observe(snapshot);
         if now < snapshot.retry_not_before() {
             entry.not_before = snapshot.retry_not_before();
+            entry.defer(AdministrativeDeferral::Hold);
             self.adjunct.entries[index] = Some(entry);
             return Ok(None);
         }
         let ipv4 = entry.ip.source.is_ipv4();
         let effective = self.connectionless_size(snapshot)?;
-        let ceiling = || snapshot.first_hop_mtu().min(entry.demand);
+        let ceiling = entry.ceiling(snapshot.first_hop_mtu());
         let (low, high) = match entry.search {
-            Search::Pending => (effective, ceiling()),
+            Search::Pending => {
+                entry.negative = None;
+                (effective, ceiling)
+            }
             // RFC 4821 section 7.3: when the timer expires, search_high is
             // reset to its initial value so probing can resume.
             Search::Converged(at)
                 if entry.demand_at > at && now >= at.saturating_add(self.adjunct.restart) =>
             {
-                (effective, ceiling())
+                entry.negative = None;
+                (effective, ceiling)
             }
-            Search::Converged(_) => {
+            Search::Converged(at) => {
+                entry.defer(if entry.demand_at > at {
+                    AdministrativeDeferral::Cooldown
+                } else {
+                    AdministrativeDeferral::DataOrWindow
+                });
                 entry.not_before = now;
                 self.adjunct.entries[index] = Some(entry);
                 return Ok(None);
             }
-            Search::Active { low, high } => {
-                (low.max(effective), high.min(snapshot.first_hop_mtu()))
-            }
+            Search::Active { low, high } => (
+                low.max(effective),
+                high.min(snapshot.first_hop_mtu())
+                    .min(entry.admin.unwrap_or(u32::MAX)),
+            ),
         };
         // RFC 4821 section 7.3: each packetization layer MUST determine when
         // probing has converged. Fragments carry their data in multiples of
@@ -478,14 +676,20 @@ impl Host {
         if high < low.saturating_add(8) {
             entry.search = Search::Converged(now);
             entry.not_before = now;
+            entry.attempted(low, low, high);
             self.adjunct.counters.converged += 1;
             self.adjunct.entries[index] = Some(entry);
             return Ok(None);
         }
         // Halve the range (RFC 4821 section 7.3's binary search): a lost
         // Echo costs one packet, never retransmitted data. Integer progress:
-        // low < size <= high.
-        let size = low + (high - low).div_ceil(2);
+        // low < size <= high. An armed administrative target is probed
+        // instead, within the same bounds (high carries the first hop, the
+        // value itself and negative evidence).
+        let size = match entry.admin_target {
+            Some(target) => target.min(high),
+            None => low + (high - low).div_ceil(2),
+        };
         entry.search = Search::Active { low, high };
         let mut nonce = [0u8; NONCE + 4];
         let drawn = self
@@ -574,7 +778,9 @@ impl Host {
                     sent_at: now,
                     definite: report.submitted == 1,
                     negative_revision: snapshot.negative_revision(),
+                    eligible: true,
                 });
+                entry.attempted(size, low, high);
                 report.terminal.unwrap_or(BackendOutcome::Submitted)
             }
             Err(DatagramError::NotSubmitted(outcome)) => {
@@ -660,11 +866,20 @@ impl Host {
             self.adjunct.counters.unmatched_replies += 1;
             return Ok(ProbeOutcome::Unmatched);
         }
-        let valid = self
+        if !probe.eligible {
+            // Sent before a discovery-policy change: its exact reply settles
+            // the probe and proves no size.
+            entry.probe = None;
+            entry.not_before = now;
+            self.adjunct.entries[index] = Some(entry);
+            self.adjunct.counters.unmatched_replies += 1;
+            return Ok(ProbeOutcome::Unmatched);
+        }
+        if !self
             .paths
             .path_snapshot(entry.path)
-            .is_ok_and(|s| s.status() == PathStatus::Valid);
-        if !valid {
+            .is_ok_and(|snapshot| snapshot.status() == PathStatus::Valid)
+        {
             self.adjunct.entries[index] = None;
             self.adjunct.counters.unmatched_replies += 1;
             return Ok(ProbeOutcome::Unmatched);
@@ -787,10 +1002,14 @@ impl Host {
                 probe.size,
                 feedback.candidate_mtu,
             );
-            lower(
-                &mut entry,
-                estimate.map_or(probe.size, |e| e.saturating_add(1)),
-            );
+            // An ineligible probe's search result is void: only the shared
+            // trusted decrease applies.
+            if probe.eligible {
+                lower(
+                    &mut entry,
+                    estimate.map_or(probe.size, |e| e.saturating_add(1)),
+                );
+            }
             self.adjunct.entries[index] = Some(entry);
             let published = self.publish(
                 now,
@@ -811,8 +1030,10 @@ impl Host {
                 .ipv4_network_error()
                 .or_else(|| feedback.ipv6_network_error())
                 .unwrap_or(NetworkError::ParameterProblem);
-            self.adjunct.counters.lost += 1;
-            lower(&mut entry, probe.size);
+            if probe.eligible {
+                self.adjunct.counters.lost += 1;
+                lower(&mut entry, probe.size);
+            }
             self.adjunct.entries[index] = Some(entry);
             ProbeOutcome::Failed {
                 size: probe.size,
@@ -846,9 +1067,11 @@ impl Host {
 // silence and errors are never a decrease.
 fn lower(entry: &mut Entry, size: u32) {
     if let Search::Active { low, high } = entry.search {
+        let bound = size.saturating_sub(1);
+        entry.negative = Some(entry.negative.map_or(bound, |n| n.min(bound)));
         entry.search = Search::Active {
             low,
-            high: high.min(size.saturating_sub(1)),
+            high: high.min(bound),
         };
     }
 }

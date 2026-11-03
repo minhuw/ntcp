@@ -175,7 +175,7 @@ fn pmtud_config_peer_caps_apply_to_defaults_and_explicit_initial_settings() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# Note: an implementation should provide a means for changing the timeout
 //# duration, including setting it to "infinity". For example, hosts attached to an
 //# FDDI network which is then attached to the rest of the Internet via a slow
@@ -184,13 +184,13 @@ fn pmtud_config_peer_caps_apply_to_defaults_and_explicit_initial_settings() {
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# The implementation should also provide a way to change the timeout period for
 //# aging stale PMTU information.
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# Note: an implementation should provide a means for changing the timeout
 //# duration, including setting it to "infinity". For example, nodes attached to a
 //# link with a large MTU that is then attached to the rest of the Internet via a
@@ -199,7 +199,7 @@ fn pmtud_config_peer_caps_apply_to_defaults_and_explicit_initial_settings() {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# The implementation should also provide a way to change the timeout period for
 //# aging stale PMTU information.
 
@@ -264,7 +264,7 @@ fn pmtud_config_checked_aging_timebases_and_live_rearming() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# Note: an implementation should provide a means for changing the timeout
 //# duration, including setting it to "infinity". For example, hosts attached to an
 //# FDDI network which is then attached to the rest of the Internet via a slow
@@ -273,13 +273,13 @@ fn pmtud_config_checked_aging_timebases_and_live_rearming() {
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# The implementation should also provide a way to change the timeout period for
 //# aging stale PMTU information.
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# Note: an implementation should provide a means for changing the timeout
 //# duration, including setting it to "infinity". For example, nodes attached to a
 //# link with a large MTU that is then attached to the rest of the Internet via a
@@ -288,7 +288,7 @@ fn pmtud_config_checked_aging_timebases_and_live_rearming() {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# The implementation should also provide a way to change the timeout period for
 //# aging stale PMTU information.
 
@@ -457,7 +457,7 @@ fn pmtud_config_live_update_preserves_probe_repair_and_connection_state_without_
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# Note: an implementation should provide a means for changing the timeout
 //# duration, including setting it to "infinity". For example, hosts attached to an
 //# FDDI network which is then attached to the rest of the Internet via a slow
@@ -466,13 +466,13 @@ fn pmtud_config_live_update_preserves_probe_repair_and_connection_state_without_
 
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# The implementation should also provide a way to change the timeout period for
 //# aging stale PMTU information.
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# Note: an implementation should provide a means for changing the timeout
 //# duration, including setting it to "infinity". For example, nodes attached to a
 //# link with a large MTU that is then attached to the rest of the Internet via a
@@ -481,7 +481,7 @@ fn pmtud_config_live_update_preserves_probe_repair_and_connection_state_without_
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
 //= type=test
-//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. The Host owner applies the same SearchAging to existing TCP connections at once and to future ones through Host::admin_set_search_aging (Host::admin_search_aging reads it) with the Host-instance-bound Administration capability, without shortening the mandatory holds, and the ntcp-pathctl utility's aging command reaches it through the opt-in local control socket of the native runtime and tun_echo (ntcp-host test plateau_and_search_aging_operations_reach_existing_and_future_users, ntcp-path-control tests/control.rs). No native configuration key sets it.
 //# The implementation should also provide a way to change the timeout period for
 //# aging stale PMTU information.
 

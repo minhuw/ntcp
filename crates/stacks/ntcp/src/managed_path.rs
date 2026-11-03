@@ -68,6 +68,26 @@ pub struct ManagedPathInfo {
     pub ordinary_ip_budget: u32,
 }
 
+/// Transport-local limits of one connection, reported beside (never inside)
+/// the shared IP-layer path estimate: none of them is network evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportCeilings {
+    /// The peer's MSS option (or the family default without one).
+    pub peer_mss: u16,
+    /// The user's TCP_MAXSEG-style ceiling.
+    pub user_mss: Option<u16>,
+    /// The connection's configured send MSS limit.
+    pub local_mss: u16,
+    /// Segment scratch allocation, in octets.
+    pub allocation: usize,
+    /// Configured IP payload ceiling of each transmitted packet.
+    pub send_ip_payload_limit: u16,
+    /// Endpoint destination-policy MTU ceiling, when one applies.
+    pub destination_mtu: Option<u32>,
+    /// The resulting send MSS, intersected with the path budget.
+    pub effective_mss: usize,
+}
+
 /// Minted from the actual selected departure, retrieved by exact live attempt.
 /// A size or a DF bit cannot construct an authenticated intent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

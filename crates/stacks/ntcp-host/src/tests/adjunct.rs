@@ -2,7 +2,8 @@
 // demand, the section 7.3 search with convergence and restart, exact reply
 // validation, silence that never decreases anything, probe PTBs as ordinary
 // trusted decreases, publication only under PathService rules, bounded
-// state, and a seeded model of adjunct events.
+// state, a seeded model of adjunct events, and the administrative search
+// transition (hold, targeted probe, no reopening, policy revisions).
 use super::*;
 use std::boxed::Box;
 
@@ -43,6 +44,7 @@ fn side(local: SocketAddr, identity: u128, paths: usize) -> Side {
                 max_payload: 4000,
                 events: 1,
                 evicted_signatures: 1,
+                probe_receipts: 2,
             },
         )
         .unwrap();
@@ -809,4 +811,383 @@ fn seeded_model_of_adjunct_events() {
         }
     }
     assert!(coverage.iter().all(|c| *c > 0), "{coverage:?}");
+}
+
+// ---- Administrative search transition (caller time, real Echo Replies) ----
+
+const UP: u32 = 1450;
+// The learned ceiling a trusted decrease at time 0 installs, held 600 s.
+const LEARNED: u32 = 1300;
+
+fn adjunct_report(a: &Side, capability: &Administration, path: path::PathId) -> ClientReport {
+    let reports: Vec<_> =
+        a.0.admin_clients(capability, &a.1, path)
+            .unwrap()
+            .filter(|c| c.client == AdminClient::Adjunct)
+            .collect();
+    assert_eq!(reports.len(), 1);
+    reports[0]
+}
+
+// A flow with fragmentation demand on a path whose learned ceiling is
+// LEARNED, held until the returned instant.
+fn learned_side(v6: bool, identity: u128) -> (Side, UdpFlowId, path::PathId, u64) {
+    let (local, remote) = addresses(v6);
+    let mut a = side(local, identity, 1);
+    let flow = open(&mut a, local, Some(remote));
+    let snapshot = learn(&mut a.0, local, remote, 0, LEARNED);
+    let hold = snapshot.retry_not_before();
+    assert!(hold > MDL + 10);
+    send(&mut a, MDL, flow, None);
+    (a, flow, snapshot.path(), hold)
+}
+
+// An upward administrative set inside the hold is cached only: no shared,
+// E or confirmed change, no probe, and the adjunct reports the hold as the
+// deferral. After the hold the first probe is the value itself (not the
+// midpoint); only its exact reply raises E and, through confirm_delivery,
+// the accepted estimate, to that value and no further even though the
+// responder answers every size.
+#[test]
+fn upward_set_waits_for_the_hold_then_one_adjunct_probe_targets_the_value() {
+    use ntcp::{AdministrativeDeferral, AdministrativeSearch};
+    for v6 in [false, true] {
+        let (mut a, flow, path, hold) = learned_side(v6, 430 + u128::from(v6));
+        let capability = a.0.administration();
+        let e0 = effective(&mut a, flow);
+        assert_eq!(e0, initial(v6));
+        let before = a.0.paths().path_snapshot(path).unwrap();
+        super::admin::set_estimate(&mut a, &capability, MDL + 1, path, Some(UP)).unwrap();
+        a.0.service_changes(&mut a.1, MDL + 1).unwrap();
+        let after = a.0.paths().path_snapshot(path).unwrap();
+        assert_eq!(after.administrative_estimate(), Some(UP));
+        assert_eq!(
+            (after.learned_mtu(), after.retry_not_before(), after.negative_revision()),
+            (Some(LEARNED), hold, before.negative_revision())
+        );
+        assert_eq!(effective(&mut a, flow), e0);
+        assert_eq!(a.0.adjunct_confirmed(path), 0);
+        // Inside the hold: fragments stay at E and nothing is probed.
+        let sent = send(&mut a, MDL + 2, flow, None);
+        assert!(sent.iter().all(|f| f.len() as u32 <= e0));
+        assert!(!a.0.adjunct_due(hold - 1));
+        assert_eq!(a.0.next_adjunct_deadline(), Some(hold));
+        assert_eq!(drain(&mut a, hold - 1), None);
+        a.0.service_changes(&mut a.1, hold - 1).unwrap();
+        let report = adjunct_report(&a, &capability, path);
+        assert_eq!(report.usable_ip_packet, Some(e0));
+        assert_eq!(
+            report.search,
+            Some(AdministrativeSearch::Pending {
+                target: UP,
+                deferred: Some(AdministrativeDeferral::Hold)
+            })
+        );
+
+        // After the hold: the value, not the midpoint of (E, UP].
+        let p = probe(&drain(&mut a, hold).unwrap());
+        assert_eq!(p.len as u32, UP, "v6={v6}");
+        assert_eq!(
+            adjunct_report(&a, &capability, path).search,
+            Some(AdministrativeSearch::Attempted {
+                target: UP,
+                size: UP,
+                clipped: None
+            })
+        );
+        // Submission proves nothing.
+        assert_eq!(effective(&mut a, flow), e0);
+        assert_eq!(
+            a.0.paths().path_snapshot(path).unwrap().learned_mtu(),
+            Some(LEARNED)
+        );
+        assert_eq!(
+            outcome(input(&mut a, hold + 1, &exact(&p))),
+            ProbeOutcome::Confirmed {
+                size: UP,
+                published: Some(path::DeliveryConfirmation::Raised)
+            }
+        );
+        assert_eq!(a.0.adjunct_confirmed(path), UP);
+        assert_eq!(effective(&mut a, flow), UP);
+        let admin = a.0.admin_path(&capability, path).unwrap();
+        assert_eq!(admin.accepted.unwrap().value, UP);
+        assert_eq!(a.0.paths().path_snapshot(path).unwrap().learned_mtu(), Some(UP));
+
+        // No further: the value caps the search, which converges.
+        let mut now = hold + 2;
+        while let Some(packet) = drain(&mut a, now) {
+            let p = probe(&packet);
+            assert!(p.len as u32 <= UP);
+            now += 1;
+            input(&mut a, now, &exact(&p));
+        }
+        assert_eq!(a.0.adjunct_counters().converged, 1);
+        assert_eq!(a.0.paths().path_snapshot(path).unwrap().learned_mtu(), Some(UP));
+        assert_eq!(effective(&mut a, flow), UP);
+        let sent = send(&mut a, now, flow, None);
+        assert!(sent.iter().all(|f| f.len() as u32 <= UP));
+    }
+}
+
+// A path delivering up to 1400 octets: the targeted probe at UP is lost.
+// Its failure lowers the search's upper bound only; a re-armed value (clear
+// then set again, two administrative revisions) is clipped by that negative
+// evidence, so no probe reaches UP again and growth stops at what replies
+// prove. After convergence a further revision waits for fresh demand and
+// the restart interval, reported as the deferral.
+#[test]
+fn failed_targeted_adjunct_probe_does_not_reopen_the_search() {
+    use ntcp::{AdministrativeClip, AdministrativeDeferral, AdministrativeSearch};
+    const PMTU: u32 = 1400;
+    for v6 in [false, true] {
+        let (mut a, flow, path, hold) = learned_side(v6, 440 + u128::from(v6));
+        let capability = a.0.administration();
+        let e0 = effective(&mut a, flow);
+        super::admin::set_estimate(&mut a, &capability, MDL + 1, path, Some(UP)).unwrap();
+        a.0.service_changes(&mut a.1, MDL + 1).unwrap();
+        let p = probe(&drain(&mut a, hold).unwrap());
+        assert_eq!(p.len as u32, UP);
+        // Silence past the reply deadline.
+        let mut now = hold + TIMEOUT;
+        a.0.service_changes(&mut a.1, now).unwrap();
+        assert_eq!(a.0.adjunct_counters().lost, 1);
+        assert_eq!(effective(&mut a, flow), e0);
+        assert_eq!(a.0.adjunct_confirmed(path), 0);
+        assert_eq!(
+            a.0.paths().path_snapshot(path).unwrap().learned_mtu(),
+            Some(LEARNED)
+        );
+        let revise = |a: &mut Side, now: u64| {
+            for value in [None, Some(UP)] {
+                super::admin::set_estimate(a, &capability, now, path, value).unwrap();
+                a.0.service_changes(&mut a.1, now).unwrap();
+            }
+        };
+        revise(&mut a, now);
+        assert_eq!(
+            adjunct_report(&a, &capability, path).search,
+            Some(AdministrativeSearch::Pending {
+                target: UP,
+                deferred: None
+            })
+        );
+        let mut sizes = Vec::new();
+        while let Some(packet) = drain(&mut a, now) {
+            let p = probe(&packet);
+            if sizes.is_empty() {
+                // The re-armed target, clipped by the failure.
+                assert_eq!(p.len as u32, UP - 1);
+                assert_eq!(
+                    adjunct_report(&a, &capability, path).search,
+                    Some(AdministrativeSearch::Attempted {
+                        target: UP,
+                        size: UP - 1,
+                        clipped: Some(AdministrativeClip::SearchHigh)
+                    })
+                );
+            }
+            sizes.push(p.len as u32);
+            if p.len as u32 <= PMTU {
+                now += 1;
+                input(&mut a, now, &exact(&p));
+            } else {
+                now += TIMEOUT;
+                a.0.service_changes(&mut a.1, now).unwrap();
+            }
+            assert!(sizes.len() < 20, "{sizes:?}");
+        }
+        assert!(sizes.iter().all(|s| *s < UP), "{sizes:?}");
+        let confirmed = a.0.adjunct_confirmed(path);
+        assert!(confirmed > LEARNED && confirmed <= PMTU, "{sizes:?}");
+        assert_eq!(
+            a.0.paths().path_snapshot(path).unwrap().learned_mtu(),
+            Some(confirmed)
+        );
+        assert_eq!(a.0.adjunct_counters().converged, 1);
+
+        // Converged: another revision reopens nothing; it waits for demand
+        // and then for the restart interval.
+        let converged = now;
+        revise(&mut a, now);
+        assert_eq!(drain(&mut a, now), None);
+        assert_eq!(
+            adjunct_report(&a, &capability, path).search,
+            Some(AdministrativeSearch::Pending {
+                target: UP,
+                deferred: Some(AdministrativeDeferral::DataOrWindow)
+            })
+        );
+        send(&mut a, now + 1, flow, None);
+        a.0.service_changes(&mut a.1, now + 2).unwrap();
+        assert_eq!(
+            adjunct_report(&a, &capability, path).search,
+            Some(AdministrativeSearch::Pending {
+                target: UP,
+                deferred: Some(AdministrativeDeferral::Cooldown)
+            })
+        );
+        assert!(!a.0.adjunct_due(converged + 600 * S - 1));
+        assert_eq!(a.0.next_adjunct_deadline(), Some(converged + 600 * S));
+        assert_eq!(
+            a.0.paths().path_snapshot(path).unwrap().learned_mtu(),
+            Some(confirmed)
+        );
+    }
+}
+
+// A reply to a probe submitted before a discovery-policy transition (a
+// disable and re-enable of the path) proves no size: the disable made the
+// probe ineligible in the same administration transaction, so its exact
+// reply settles it as Unmatched (a re-enable does not revive it).
+#[test]
+fn reply_across_a_discovery_policy_revision_proves_no_size() {
+    for v6 in [false, true] {
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 450 + u128::from(v6), 1);
+        let flow = open(&mut a, local, Some(remote));
+        let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
+        let capability = a.0.administration();
+        send(&mut a, MDL, flow, None);
+        let p = probe(&drain(&mut a, MDL).unwrap());
+        let revision = a.0.paths().path_snapshot(path).unwrap().discovery_revision();
+        for disabled in [true, false] {
+            let expected = a.0.admin_path(&capability, path).unwrap().generation;
+            let candidate =
+                a.0.admin_validate(
+                    &capability,
+                    MDL + 1,
+                    path::AdminChange {
+                        target: path::AdminTarget::Path(path),
+                        expected,
+                        policy: path::AdminPolicy {
+                            discovery_disabled: disabled,
+                            estimate: None,
+                        },
+                    },
+                )
+                .unwrap();
+            a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+        }
+        assert!(a.0.paths().path_snapshot(path).unwrap().discovery_revision() > revision);
+        let e0 = effective(&mut a, flow);
+        // The Echo service and the adjunct are clients of the path.
+        let clients: Vec<_> = a
+            .0
+            .admin_clients(&capability, &a.1, path)
+            .unwrap()
+            .map(|c| c.client)
+            .collect();
+        assert!(clients.contains(&crate::AdminClient::Adjunct));
+        assert!(clients.contains(&crate::AdminClient::Echo { queued: 0 }));
+        // The disable voided the outstanding probe's size result without
+        // loss evidence, so its late reply proves nothing.
+        assert_eq!(outcome(input(&mut a, MDL + 2, &exact(&p))), ProbeOutcome::Unmatched);
+        assert_eq!(a.0.adjunct_confirmed(path), 0);
+        assert_eq!(effective(&mut a, flow), e0);
+        assert_eq!(a.0.adjunct_counters().confirmed, 0);
+        // The search probes again under the current policy.
+        assert_eq!(a.0.adjunct_outstanding(), 0);
+        assert!(a.0.adjunct_due(MDL + 2));
+    }
+}
+
+// A validated PTB quoting a probe definitely submitted before a discovery
+// disable is still correlated under the existing rules (RFC 1191 6.6 /
+// RFC 8201 5.6 stop new probing, not the processing of reports about
+// earlier submissions): it is the ordinary trusted shared decrease, while
+// the probe's search result stays void, and no probe leaves while the
+// disable holds.
+#[test]
+fn ptb_for_a_probe_sent_before_a_disable_still_lowers_the_shared_estimate() {
+    for v6 in [false, true] {
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 455 + u128::from(v6), 1);
+        let flow = open(&mut a, local, Some(remote));
+        let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
+        let capability = a.0.administration();
+        send(&mut a, MDL, flow, None);
+        let packet = drain(&mut a, MDL).unwrap();
+        let p = probe(&packet);
+        let expected = a.0.admin_path(&capability, path).unwrap().generation;
+        let candidate = a
+            .0
+            .admin_validate(
+                &capability,
+                MDL + 1,
+                path::AdminChange {
+                    target: path::AdminTarget::Path(path),
+                    expected,
+                    policy: path::AdminPolicy {
+                        discovery_disabled: true,
+                        estimate: None,
+                    },
+                },
+            )
+            .unwrap();
+        a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+        let mtu = if v6 { 1350 } else { 1200 };
+        assert_eq!(
+            outcome(input(&mut a, MDL + 2, &ptb(&packet, mtu))),
+            ProbeOutcome::TooBig {
+                size: p.len as u32,
+                mtu: Some(mtu),
+                published: Some(path::EstimateChange::Decreased),
+            }
+        );
+        let snapshot = a.0.paths().path_snapshot(path).unwrap();
+        assert_eq!(snapshot.learned_mtu(), Some(mtu));
+        assert!(snapshot.discovery_disabled());
+        assert_eq!(a.0.adjunct_counters().too_big, 1);
+        assert_eq!(a.0.adjunct_outstanding(), 0);
+        assert_eq!(a.0.adjunct_confirmed(path), 0);
+        // Disabled: nothing is due, even after the hold.
+        let hold = snapshot.retry_not_before();
+        assert!(!a.0.adjunct_due(hold));
+        assert_eq!(drain(&mut a, hold), None);
+    }
+}
+
+// RFC 1191 6.6 / RFC 8201 5.6: on a path whose owner disabled discovery the
+// adjunct sends nothing (no probe is due, the drain sends none) while
+// fragmentation demand is still recorded; its administrative state reports
+// the disable; enabling again makes the search due.
+#[test]
+fn discovery_disable_stops_the_adjunct() {
+    for v6 in [false, true] {
+        let (local, remote) = addresses(v6);
+        let mut a = side(local, 470 + u128::from(v6), 1);
+        let flow = open(&mut a, local, Some(remote));
+        let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
+        let capability = a.0.administration();
+        let set = |a: &mut Side, disabled: bool| {
+            let expected = a.0.admin_path(&capability, path).unwrap().generation;
+            let candidate = a
+                .0
+                .admin_validate(
+                    &capability,
+                    MDL,
+                    path::AdminChange {
+                        target: path::AdminTarget::Path(path),
+                        expected,
+                        policy: path::AdminPolicy {
+                            discovery_disabled: disabled,
+                            estimate: None,
+                        },
+                    },
+                )
+                .unwrap();
+            a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+        };
+        set(&mut a, true);
+        send(&mut a, MDL, flow, None);
+        assert!(!a.0.adjunct_due(MDL));
+        assert_eq!(drain(&mut a, MDL), None);
+        assert_eq!(drain(&mut a, MDL + 10_000_000), None);
+        assert_eq!(a.0.adjunct_outstanding(), 0);
+        assert_eq!(a.0.adjunct_confirmed(path), 0);
+        set(&mut a, false);
+        assert!(a.0.adjunct_due(MDL + 10_000_000));
+        assert!(drain(&mut a, MDL + 10_000_000).is_some());
+    }
 }

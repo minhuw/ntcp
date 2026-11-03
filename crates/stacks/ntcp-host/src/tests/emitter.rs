@@ -13,6 +13,7 @@ const UDP: UdpLimits = UdpLimits {
     max_payload: 4000,
     events: 1,
     evicted_signatures: 1,
+    probe_receipts: 2,
 };
 
 fn datagrams(ipv4_initial: u32) -> DatagramLimits {
@@ -132,11 +133,11 @@ fn send(
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion).
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-8
 //= type=test
-//= reason=Host::udp_send_datagram's Fragment mode (crates/stacks/ntcp-host/src/udp.rs) fragments, in the host IP layer, an application datagram larger than the connectionless effective Path MTU E = min(shared ordinary budget, max(connectionless initial eff_pmtu, adjunct-confirmed lower bound)) to E even when it is smaller than the first-hop MTU, within the receiver reassembly guarantee (IPv4 576, IPv6 1500) or a capability the application states; a datagram the guarantee forbids fragmenting still goes whole within the shared budget. Every IPv4 fragment carries DF and a leased Identification, and IPv6 uses the same emitter, so the behavior is the same in both families. Host tests cut a 3000-octet datagram at E = 1280 below a 1500 first hop into 1276-octet IPv4 and 1280-octet IPv6 fragments with DF on each IPv4 fragment and one complete-datagram checksum; the integration/rfc_host fragment case captures tun_echo replies cut to E below the 1500 first hop, and fragment-ptb shows a real router PTB for an oversized DF first fragment lowering the path so the next datagram is refragmented at 1280. Section 9's exception is Probe mode (4821-158).
+//= reason=Host::udp_send_datagram's Fragment mode (crates/stacks/ntcp-host/src/udp.rs) fragments, in the host IP layer, an application datagram larger than the connectionless effective Path MTU E = min(shared ordinary budget, max(connectionless initial eff_pmtu, adjunct-confirmed lower bound)), which the probe outcomes a flow's application reports (4821-160) raise or bound for that flow only, to E even when it is smaller than the first-hop MTU, within the receiver reassembly guarantee (IPv4 576, IPv6 1500) or a capability the application states; a datagram the guarantee forbids fragmenting still goes whole within the shared budget. Every IPv4 fragment carries DF (except on an owner-disabled IPv4 route, the user's recorded decision B under RFC 1191 section 6.6, where every packet leaves DF clear) and a leased Identification, and IPv6 uses the same emitter, so the behavior is the same in both families. Host tests cut a 3000-octet datagram at E = 1280 below a 1500 first hop into 1276-octet IPv4 and 1280-octet IPv6 fragments with DF on each IPv4 fragment and one complete-datagram checksum; the integration/rfc_host fragment case captures tun_echo replies cut to E below the 1500 first hop, and fragment-ptb shows a real router PTB for an oversized DF first fragment lowering the path so the next datagram is refragmented at 1280. Section 9's exception is Probe mode (4821-158).
 //# It is RECOMMENDED that IPv4 implementations use a strategy that mimics IPv6 functionality. When an application sends datagrams that are larger than the effective Path MTU, they SHOULD be fragmented to the Path MTU in the host IP layer even if they are smaller than the MTU of the first link, directly attached to the host. The DF bit SHOULD be set on the fragments, so they will not be fragmented again in the network. This technique will minimize the likelihood that applications will rely on IPv4 fragmentation in a way that cannot be implemented in IPv6. At least one major operating system already uses this strategy. Section 9 describes some exceptions to this rule when the application is sending oversized packets for probing or diagnostic purposes.
 fn fragment_mode_cuts_to_the_effective_size_with_df_and_one_checksum() {
     for v6 in [false, true] {
@@ -305,19 +306,19 @@ fn refuse_mode_and_udp_send_keep_the_unfragmented_contract() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (the application reports the outcome through Host::udp_report_probe, 4821-160). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
 //# All implementations MUST include mechanisms for applications to selectively transmit packets larger than the current effective Path MTU, but smaller than the first-hop link MTU. This is necessary to implement PLPMTUD using a connectionless protocol within an application and to implement diagnostic tools that do not rely on the operating system's implementation of Path MTU Discovery. See Section 9 for further discussion.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-9
 //= type=test
-//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (the application reports the outcome through Host::udp_report_probe, 4821-160). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
 //# All implementations MUST include a mechanism where applications using connectionless protocols can send their own probes. This is necessary to implement PLPMTUD in an application protocol as described in Section 10.4 or to implement diagnostic tools for debugging problems with PMTUD. There MUST be a mechanism that permits an application to send datagrams that are larger than eff_pmtu, the operating systems estimate of the Path MTU, without being fragmented. If these are IPv4 packets, they MUST have the DF bit set.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-9
 //= type=test
-//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (the application reports the outcome through Host::udp_report_probe, 4821-160). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
 //# At this time, most operating systems support two modes for sending datagrams: one that silently fragments packets that are too large, and another that rejects packets that are too large. Neither of these modes is suitable for implementing PLPMTUD in an application or diagnosing problems with Path MTU Discovery. A third mode is REQUIRED where the datagram is sent even if it is larger than the current estimate of the Path MTU.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-10.4
 //= type=test
-//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (outcome reporting is 4821-160, owned by T12). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
+//= reason=Host::udp_send_datagram's Probe mode (UdpSendMode::Probe, crates/stacks/ntcp-host/src/udp.rs), selected per send or as a flow default beside Fragment (fragments a datagram that is too large) and Refuse (rejects it; udp_send's contract), sends one application datagram larger than the current estimate (the shared learned budget, eff_pmtu) and up to the first-hop link MTU unfragmented: IPv4 with DF, IPv6 without a Fragment header. It bypasses only the learned-size admission and keeps first-hop, path-generation and exact-byte validation. Its ProbeRecord states definite or uncertain submission, flow generation, path incarnation, version and negative revision, size, the estimate it exceeded and the submission time; it proves submission, not delivery, and writes no shared state (the application reports the outcome through Host::udp_report_probe, 4821-160). Host tests send a probe above a learned 1280 estimate within the 1500 first hop and assert one unfragmented packet (DF on IPv4), the record, an uncertain record for an unknown backend outcome, refusal beyond the first hop and an unchanged shared limit; the integration/rfc_host probe-mode case sends 1400- and 1500-octet probes above a router-taught 1280 estimate in both families and captures each as one unfragmented packet (DF on IPv4) drawing a real router PTB.
 //# All application probing techniques require the ability to send messages that are larger than the current eff_pmtu described in Section 9.
 fn probe_mode_sends_one_unfragmented_datagram_above_the_estimate() {
     for v6 in [false, true] {
@@ -786,5 +787,97 @@ fn asserted_quiet_periods_count_from_when_emission_ceased() {
             a.0.lease_identification(available, local.ip(), remote.ip(), 17)
                 .is_ok()
         );
+    }
+}
+
+// RFC 8201 section 5.6 / RFC 1191 section 6.6: an owner discovery disable
+// on an IPv6 path is applied to an existing flow by the transaction (its
+// change notification carries the capped limit at once): Refuse admits only
+// datagrams that fit 1280 octets whole, Fragment cuts every physical packet
+// to at most 1280, Probe is refused with DiscoveryDisabled before anything
+// is submitted. IPv4 Probe is refused too and the IPv4 limit drops to 576
+// octets (RFC 1122 section 3.3.3, off-link next hop); clearing the policy
+// restores the earlier limits without any learned estimate.
+#[test]
+fn discovery_disable_caps_ipv6_flows_at_1280_and_refuses_probes() {
+    use path::{AdminChange, AdminPolicy, AdminTarget};
+    let probe = UdpSend {
+        mode: UdpSendMode::Probe,
+        peer_capability: None,
+    };
+    let refuse = UdpSend {
+        mode: UdpSendMode::Refuse,
+        peer_capability: None,
+    };
+    for v6 in [false, true] {
+        let (local, remote) = addresses(v6);
+        let remote = SocketAddr::new(remote.ip(), 7);
+        let mut a = side(local, 9900 + u128::from(v6), datagrams(576));
+        let flow = a.0.udp_open(&a.1, local, Some(remote), options()).unwrap();
+        let before = a.0.udp_path_limits(&a.1, flow, None).unwrap();
+        let path = before.path;
+        let overhead = if v6 { 48 } else { 28 };
+        assert_eq!(before.max_payload, 1500 - overhead);
+        let capability = a.0.administration();
+        let set = |a: &mut Side, disabled: bool| {
+            let expected = a.0.admin_path(&capability, path).unwrap().generation;
+            let candidate = a
+                .0
+                .admin_validate(
+                    &capability,
+                    MDL,
+                    AdminChange {
+                        target: AdminTarget::Path(path),
+                        expected,
+                        policy: AdminPolicy {
+                            discovery_disabled: disabled,
+                            estimate: None,
+                        },
+                    },
+                )
+                .unwrap();
+            a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+        };
+        set(&mut a, true);
+        let change = a.0.udp_path_change(flow).unwrap().unwrap();
+        // IPv4: the RFC 1122 section 3.3.3 limit of a forwarder next hop.
+        let cap = if v6 { 1280 } else { 576 };
+        assert_eq!(change.max_payload, cap - overhead);
+        assert_eq!(
+            a.0.udp_datagram_limits(&a.1, flow, None, Some(probe)).unwrap().max_payload,
+            0
+        );
+        let (result, sent) = send(&mut a, 1, flow, Some(probe), &[1; 100], |_| {
+            panic!("no probe is submitted")
+        });
+        assert_eq!(result.err(), Some(DatagramError::DiscoveryDisabled));
+        assert!(sent.is_empty());
+        if v6 {
+            let (result, _) = send(&mut a, 2, flow, Some(refuse), &[2; 1400], |_| {
+                BackendOutcome::Submitted
+            });
+            assert_eq!(
+                result.err(),
+                Some(DatagramError::TooBig {
+                    max_payload: 1280 - overhead
+                })
+            );
+            let (result, sent) = send(&mut a, 3, flow, Some(refuse), &[3; 1280 - 48], |_| {
+                BackendOutcome::Submitted
+            });
+            assert!(result.is_ok());
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].len(), 1280);
+            let (result, sent) = send(&mut a, 4, flow, Some(fragment(None)), &[4; 1400], |_| {
+                BackendOutcome::Submitted
+            });
+            assert!(result.is_ok());
+            assert!(sent.len() > 1);
+            assert!(sent.iter().all(|p| p.len() <= 1280));
+        }
+        set(&mut a, false);
+        let after = a.0.udp_path_change(flow).unwrap().unwrap();
+        assert_eq!(after.max_payload, before.max_payload);
+        assert_eq!(a.0.paths().path_snapshot(path).unwrap().learned_mtu(), None);
     }
 }

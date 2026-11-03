@@ -11,6 +11,7 @@ const UDP: UdpLimits = UdpLimits {
     max_payload: 4000,
     events: 1,
     evicted_signatures: 1,
+    probe_receipts: 2,
 };
 const OUTPUT: IcmpOutputLimits = IcmpOutputLimits {
     messages: 3,
@@ -892,4 +893,345 @@ fn fragmented_echo_requests_get_fragmented_replies_within_the_peer_capacity() {
             assert_eq!(shape, [(header + 8 + medium.len(), true, None)]);
         }
     }
+}
+
+// RFC 8201 section 5.6: Echo Replies leave through the same capped emitter.
+// After the owner disables discovery on the IPv6 default route, a queued
+// 1448-octet reply is cut into fragments of at most 1280 octets (within the
+// 1500-octet peer guarantee) and reassembles to the exact reply message.
+#[test]
+fn echo_replies_on_a_discovery_disabled_ipv6_route_are_at_most_1280() {
+    // Identifiers are available one maximum datagram lifetime after start.
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(true);
+    let mut a = fragmenting_side(local, 9990, false);
+    let capability = a.0.administration();
+    let prefix = path::IpPrefix::new("::".parse().unwrap(), 0).unwrap();
+    let route = a.0.admin_select_route(&capability, prefix).unwrap();
+    let candidate = a
+        .0
+        .admin_validate(
+            &capability,
+            MDL,
+            path::AdminChange {
+                target: path::AdminTarget::Route(route),
+                expected: 0,
+                policy: path::AdminPolicy {
+                    discovery_disabled: true,
+                    estimate: None,
+                },
+            },
+        )
+        .unwrap();
+    a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+    let to_us = ip(remote.ip(), local.ip());
+    let data: Vec<u8> = (0..1400).map(|i| (i * 7) as u8).collect();
+    let request = echo(to_us, 0x4321, 9, &data);
+    assert_eq!(request.len(), 1448);
+    input_frame(&mut a, MDL + 1, &request).unwrap();
+    let frames = drain_packets(&mut a, MDL + 2).unwrap().unwrap();
+    assert!(frames.len() > 1);
+    assert!(frames.iter().all(|f| f.len() <= 1280));
+    let (outer, message, _) = reconstruct(&frames);
+    assert_eq!(outer, ip(local.ip(), remote.ip()));
+    let decoded = ntcp_icmp::decode_echo(outer, &message).unwrap();
+    assert_eq!(decoded.kind, ntcp_icmp::EchoKind::Reply);
+    assert_eq!(decoded.data, &data[..]);
+}
+
+// Parent decision D17 / SEMANTICS 7: a queued Echo Reply (final bytes: the
+// request is gone) never blocks an administrative change. Without stated
+// peer capacity the reply is beyond what may be fragmented (576 IPv4, 1500
+// IPv6) and leaves whole within the path budget (a control reply shows
+// it). A downward route set below it (and on IPv6 a discovery disable,
+// capping the budget at 1280) applies at once while it is queued and
+// updates the path's TCP connection and UDP flow in the same call; the
+// emitter then discards the reply and counts it unsent, exactly as after a
+// trusted PTB decrease, and the connection keeps working.
+#[test]
+fn queued_oversized_echo_reply_never_blocks_a_restriction_and_is_counted_unsent() {
+    const MDL: u64 = 120_000_000;
+    for v6 in [false, true] {
+        for disable in [false, true] {
+            if disable && !v6 {
+                // An IPv4 disable changes no packet budget in this stage.
+                continue;
+            }
+            let (local, remote) = addresses(v6);
+            let identity = 9994 + 4 * u128::from(v6) + 2 * u128::from(disable);
+            let mut a = fragmenting_side(local, identity, false);
+            let cfg = config(2);
+            let mut b = managed(remote, identity + 1, cfg.clone());
+            if v6 {
+                // A reply larger than the IPv6 guarantee needs a larger link.
+                a.0.set_link_mtu(a.2.link(), 4000).unwrap();
+            }
+            let listener = b.1.listen(remote, 2).unwrap();
+            let tcp = a
+                .1
+                .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+                .unwrap();
+            let mut now = 0;
+            pump(&mut a, &mut b, &mut now);
+            b.1.accept(listener).unwrap();
+            let flow = a
+                .0
+                .udp_open(&a.1, SocketAddr::new(local.ip(), 5000), Some(SocketAddr::new(remote.ip(), 7)), UdpOptions { dscp: 0, hop_limit: 64 })
+                .unwrap();
+            a.0.udp_path_limits(&a.1, flow, None).unwrap();
+            let path = a.0.binding(tcp).unwrap().snapshot.path();
+            let route = a.0.binding(tcp).unwrap().snapshot.key().route();
+            let to_us = ip(remote.ip(), local.ip());
+            let data: Vec<u8> = (0..if v6 { 2000 } else { 1000 }).map(|i| (i * 13) as u8).collect();
+            let header = if v6 { 40 } else { 20 };
+            let reply_len = header + 8 + data.len();
+            // Control: the reply leaves whole under the current budget.
+            // Whole within the 1500-octet receiving link, else fragmented.
+            let request = echo(to_us, 7, 1, &data);
+            let pieces = if request.len() <= 1500 { vec![request] } else { fragments(&request, 41, 1200) };
+            for piece in pieces {
+                input_frame(&mut a, MDL + 1, &piece).unwrap();
+            }
+            let frames = drain_packets(&mut a, MDL + 2).unwrap().unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].len(), reply_len);
+            // The same reply queued again; the owner restricts the route.
+            // Whole within the 1500-octet receiving link, else fragmented.
+            let request = echo(to_us, 7, 2, &data);
+            let pieces = if request.len() <= 1500 { vec![request] } else { fragments(&request, 42, 1200) };
+            for piece in pieces {
+                input_frame(&mut a, MDL + 3, &piece).unwrap();
+            }
+            let capability = a.0.administration();
+            assert!(
+                a.0.admin_clients(&capability, &a.1, path)
+                    .unwrap()
+                    .any(|c| c.client == crate::AdminClient::Echo { queued: 1 })
+            );
+            let (policy, budget) = if disable {
+                (path::AdminPolicy { discovery_disabled: true, estimate: None }, 1280)
+            } else {
+                let value = if v6 { 1500 } else { 900 };
+                (path::AdminPolicy { discovery_disabled: false, estimate: Some(value) }, value)
+            };
+            assert!(reply_len > budget as usize);
+            let candidate = a
+                .0
+                .admin_validate(
+                    &capability,
+                    MDL + 4,
+                    path::AdminChange { target: path::AdminTarget::Route(route), expected: 0, policy },
+                )
+                .unwrap();
+            assert_eq!(a.0.admin_apply(&capability, &mut a.1, candidate), Ok(1));
+            let snapshot = a.0.paths().path_snapshot(path).unwrap();
+            assert_eq!(snapshot.ip_packet_budget().unwrap(), budget);
+            assert_eq!(a.0.binding(tcp).unwrap().snapshot, snapshot);
+            assert!(!a.0.paths().is_dirty(a.0.binding(tcp).unwrap().client).unwrap());
+            assert!(a.1.managed_path(tcp).unwrap().ordinary_ip_budget <= budget);
+            let overhead = if v6 { 48 } else { 28 };
+            assert_eq!(a.0.udp_path_change(flow).unwrap().unwrap().max_payload as u32, budget - overhead);
+            // Sized at emission: discarded and counted unsent.
+            let unsent = a.0.icmp_output_counters().unsent;
+            assert_eq!(drain_packets(&mut a, MDL + 5), Err(Error::Unsupported));
+            assert_eq!(a.0.icmp_output_counters().unsent, unsent + 1);
+            assert_eq!(a.0.icmp_output_pending(), 0);
+            now = MDL + 10;
+            a.1.write(tcp, &[6; 4000]).unwrap();
+            pump(&mut a, &mut b, &mut now);
+            let progress = a.1.send_progress(tcp).unwrap();
+            assert_eq!(progress.acknowledged, progress.queued_end);
+        }
+    }
+}
+
+// RFC 1191 section 6.6 (the user's recorded decision B): after the owner
+// disables discovery on the IPv4 default route (a forwarder next hop), the
+// 1448-octet Echo Reply to a peer with stated reassembly capacity is cut to
+// the RFC 1122 section 3.3.3 limit of 576 octets, every fragment DF-clear
+// with MF, offsets and the one Identification of the reply intact and a
+// valid header checksum; the fragments reassemble to the exact reply.
+#[test]
+fn echo_replies_on_a_discovery_disabled_ipv4_route_are_df_clear_fragments_within_576() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let mut a = fragmenting_side(local, 9992, true);
+    let capability = a.0.administration();
+    let prefix = path::IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap();
+    let route = a.0.admin_select_route(&capability, prefix).unwrap();
+    let candidate = a
+        .0
+        .admin_validate(
+            &capability,
+            MDL,
+            path::AdminChange {
+                target: path::AdminTarget::Route(route),
+                expected: 0,
+                policy: path::AdminPolicy {
+                    discovery_disabled: true,
+                    estimate: None,
+                },
+            },
+        )
+        .unwrap();
+    a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+    let to_us = ip(remote.ip(), local.ip());
+    let data: Vec<u8> = (0..1420).map(|i| (i * 7) as u8).collect();
+    let request = echo(to_us, 0x4321, 9, &data);
+    input_frame(&mut a, MDL + 1, &request).unwrap();
+    let frames = drain_packets(&mut a, MDL + 2).unwrap().unwrap();
+    assert!(frames.len() >= 3);
+    let identification = u16::from_be_bytes([frames[0][4], frames[0][5]]);
+    let mut offset = 0;
+    for (index, frame) in frames.iter().enumerate() {
+        assert!(frame.len() <= 576);
+        assert_eq!(frame[6] & 0x40, 0, "DF clear on every fragment");
+        assert_eq!(ntcp_ip_common::checksum(&frame[..20]), 0);
+        assert_eq!(u16::from_be_bytes([frame[4], frame[5]]), identification);
+        let flags = u16::from_be_bytes([frame[6], frame[7]]);
+        assert_eq!(flags & 0x2000 != 0, index + 1 != frames.len(), "MF");
+        assert_eq!(usize::from(flags & 0x1fff) * 8, offset);
+        offset += frame.len() - 20;
+    }
+    let (outer, message, _) = reconstruct(&frames);
+    assert_eq!(outer, ip(local.ip(), remote.ip()));
+    let decoded = ntcp_icmp::decode_echo(outer, &message).unwrap();
+    assert_eq!(decoded.kind, ntcp_icmp::EchoKind::Reply);
+    assert_eq!(decoded.data, &data[..]);
+}
+
+// On a discovery-disabled IPv4 route every Echo Reply leaves DF clear and
+// needs a leased Identification, whole or fragmented. Inside the
+// allocator's start quiet period the reply is held at the head of the
+// queue (WouldBlock, nothing submitted, nothing counted unsent) and is sent
+// once an identifier can be issued: held output, never a reused value.
+#[test]
+fn df_clear_echo_replies_are_held_while_no_identifier_can_be_issued() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    for size in [100usize, 1420] {
+        let mut a = fragmenting_side(local, 9993 + size as u128, true);
+        let capability = a.0.administration();
+        let prefix = path::IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap();
+        let route = a.0.admin_select_route(&capability, prefix).unwrap();
+        let candidate = a
+            .0
+            .admin_validate(
+                &capability,
+                1,
+                path::AdminChange {
+                    target: path::AdminTarget::Route(route),
+                    expected: 0,
+                    policy: path::AdminPolicy {
+                        discovery_disabled: true,
+                        estimate: None,
+                    },
+                },
+            )
+            .unwrap();
+        a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+        let data: Vec<u8> = (0..size).map(|i| (i * 3) as u8).collect();
+        let request = echo(ip(remote.ip(), local.ip()), 0x5150, 3, &data);
+        input_frame(&mut a, 2, &request).unwrap();
+        let mut packet = vec![0; 8192];
+        for now in [3, MDL - 1] {
+            let mut submitted = 0;
+            let outcome = a
+                .0
+                .icmp_output(now, &mut packet, |_, _| {
+                    submitted += 1;
+                    BackendOutcome::Submitted
+                })
+                .unwrap();
+            assert_eq!(outcome, Some(BackendOutcome::WouldBlock), "held");
+            assert_eq!(submitted, 0);
+            assert_eq!(a.0.icmp_output_counters().unsent, 0);
+        }
+        let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+        assert_eq!(frames.len() > 1, size > 576);
+        let identification = u16::from_be_bytes([frames[0][4], frames[0][5]]);
+        assert_ne!(identification, 0);
+        for frame in &frames {
+            assert!(frame.len() <= 576);
+            assert_eq!(frame[6] & 0x40, 0, "DF clear");
+            assert_eq!(u16::from_be_bytes([frame[4], frame[5]]), identification);
+            assert_eq!(ntcp_ip_common::checksum(&frame[..20]), 0);
+        }
+        let (_, message, _) = reconstruct(&frames);
+        let decoded = ntcp_icmp::decode_echo(ip(local.ip(), remote.ip()), &message).unwrap();
+        assert_eq!(decoded.data, &data[..]);
+        assert_eq!(drain_packets(&mut a, MDL + 2), Ok(None));
+    }
+}
+
+// Identifier backpressure holds only the message that needs an identifier.
+// With one destination's path discovery-disabled (DF clear) and the
+// allocator's start quiet period active, its Echo Reply waits while the
+// reply to a destination on the enabled path, queued behind it, leaves at
+// once with DF; the held reply goes out DF-clear with a leased
+// Identification once one can be issued.
+#[test]
+fn an_identifier_blocked_reply_does_not_hold_other_destinations_output() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let neighbor: IpAddr = "198.51.100.7".parse().unwrap();
+    let mut a = fragmenting_side(local, 9995, true);
+    // Create the path to `remote` (an enabled-path reply needs no identifier).
+    let data = [0x5a; 64];
+    input_frame(&mut a, 1, &echo(ip(remote.ip(), local.ip()), 0x6001, 1, &data)).unwrap();
+    let frames = drain_packets(&mut a, 1).unwrap().unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_ne!(frames[0][6] & 0x40, 0, "DF on the enabled path");
+    let capability = a.0.administration();
+    let target = a
+        .0
+        .admin_paths(&capability)
+        .unwrap()
+        .find(|p| p.snapshot.key().destination().address() == remote.ip())
+        .unwrap();
+    let candidate = a
+        .0
+        .admin_validate(
+            &capability,
+            2,
+            path::AdminChange {
+                target: path::AdminTarget::Path(target.snapshot.path()),
+                expected: target.generation,
+                policy: path::AdminPolicy {
+                    discovery_disabled: true,
+                    estimate: None,
+                },
+            },
+        )
+        .unwrap();
+    a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+    // The disabled destination's request first, the neighbor's behind it.
+    input_frame(&mut a, 3, &echo(ip(remote.ip(), local.ip()), 0x6001, 2, &data)).unwrap();
+    input_frame(&mut a, 3, &echo(ip(neighbor, local.ip()), 0x6002, 1, &data)).unwrap();
+    assert_eq!(a.0.icmp_output_pending(), 2);
+    let frames = drain_packets(&mut a, 4).unwrap().unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(&frames[0][16..20], &[198, 51, 100, 7], "the neighbor's reply");
+    assert_ne!(frames[0][6] & 0x40, 0, "DF kept on the enabled path");
+    assert_eq!(a.0.icmp_output_pending(), 1);
+    let mut packet = vec![0; 8192];
+    let mut submitted = 0;
+    let outcome = a
+        .0
+        .icmp_output(5, &mut packet, |_, _| {
+            submitted += 1;
+            BackendOutcome::Submitted
+        })
+        .unwrap();
+    assert_eq!(outcome, Some(BackendOutcome::WouldBlock), "only the held reply is left");
+    assert_eq!(submitted, 0);
+    assert_eq!(a.0.icmp_output_counters().unsent, 0);
+    let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+    assert_eq!(frames.len(), 1);
+    let IpAddr::V4(held) = remote.ip() else { unreachable!() };
+    assert_eq!(frames[0][16..20], held.octets(), "the held reply");
+    assert_eq!(frames[0][6] & 0x40, 0, "DF clear on the disabled path");
+    assert_ne!(u16::from_be_bytes([frames[0][4], frames[0][5]]), 0);
+    assert_eq!(ntcp_ip_common::checksum(&frames[0][..20]), 0);
+    assert_eq!(drain_packets(&mut a, MDL + 2), Ok(None));
 }

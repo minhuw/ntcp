@@ -31,6 +31,8 @@ def decode(frame):
         start = 34
         pseudo = frame[26:34] + b"\0\x06" + struct.pack("!H", end - start)
         family = 4
+        ip = dict(df=bool(struct.unpack_from("!H", frame, 20)[0] & 0x4000),
+                  ip_id=struct.unpack_from("!H", frame, 18)[0])
     elif eth == 0x86dd:
         assert len(frame) >= 54 and frame[14] >> 4 == 6, "IPv6 framing"
         end = 54 + struct.unpack_from("!H", frame, 18)[0]
@@ -40,6 +42,7 @@ def decode(frame):
         start = 54
         pseudo = frame[22:54] + struct.pack("!I", end - start) + b"\0\0\0\x06"
         family = 6
+        ip = dict(df=None, ip_id=None)
     else:
         return None
     assert end - start >= 20, "short TCP"
@@ -68,7 +71,8 @@ def decode(frame):
     event = dict(family=family, ethernet_length=len(frame), sport=sport, dport=dport, seq=seq, ack=ack, window_scale=window_scale, mss=mss,
                  flags=frame[start + 13], window=struct.unpack_from("!H", frame, start + 14)[0],
                  payload=end - start - offset, tcp_header_length=offset, cookie=cookies, length=end,
-                 sha256=hashlib.sha256(frame[:end]).hexdigest(), checksum_valid=True)
+                 sha256=hashlib.sha256(frame[:end]).hexdigest(), checksum_valid=True,
+                 ip_length=end - 14, **ip)
     return event, options, start, end, pseudo
 
 

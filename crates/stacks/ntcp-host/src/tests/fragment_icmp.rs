@@ -39,6 +39,7 @@ fn side(local: SocketAddr, identity: u128, signatures: usize) -> Side {
             max_payload: 8000,
             events: 2,
             evicted_signatures: signatures,
+            probe_receipts: 2,
         };
         let (p, l) = managed_udp_limits(p, l, udp).unwrap();
         (p, l, 1)

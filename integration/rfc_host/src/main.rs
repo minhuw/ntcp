@@ -225,6 +225,19 @@ fn run() -> io::Result<()> {
     }
     let disabled = args[8] == "1";
     config.socket.fast_open_client_enabled = !disabled;
+    // The T12 administration cases serve the owner's opt-in path control
+    // socket from this runtime (control.socket); absent, none is served.
+    if let Some(socket) = std::env::var_os("T12_CONTROL_SOCKET") {
+        config.control = Some(ntcp_path_control::ControlConfig {
+            socket: socket.into(),
+            allow_uids: Vec::new(),
+        });
+        // Those cases also state the deployment knowledge io.source_quiet
+        // = never: the harness created this address in a fresh namespace,
+        // so nothing emitted from it before (DF-clear output of a disabled
+        // IPv4 route needs Identifications at once).
+        config.io.source_quiet = api::SourceQuiet::Never;
+    }
     api::configure_with_packet_io(config, move || {
         let name = CString::new("t5n").unwrap();
         let index = unsafe { if_nametoindex(name.as_ptr()) };

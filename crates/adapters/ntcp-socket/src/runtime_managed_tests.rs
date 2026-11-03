@@ -5,6 +5,8 @@ use ntcp_host::path;
 mod ingress;
 #[path = "runtime_managed_io_tests.rs"]
 mod scheduled;
+#[path = "runtime_control_tests.rs"]
+mod control;
 
 fn native(v6: bool, last: u8, slots: usize) -> (Owner, Arc<Mutex<State>>) {
     native_output(v6, last, slots, if v6 { 1280 } else { 1100 }, false, false)

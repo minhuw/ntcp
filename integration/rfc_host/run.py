@@ -8,13 +8,16 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.dont_write_bytecode = True
 
 from bridge import Bridge
+import admin
 import icmp
 from linux_peer import fnv, pattern
 
@@ -26,6 +29,8 @@ TUN_ECHO = ROOT / "workbench/network-target/debug/examples/tun_echo"
 STAGED = ROOT / "workbench/network-target/debug/ptb_stage"
 # Harness-only datagram driver for the driven Host UDP cases (same build).
 DRIVER = ROOT / "workbench/network-target/debug/datagram_drive"
+# The real path administration utility (separate process per request).
+PATHCTL = ROOT / "workbench/network-target/debug/ntcp-pathctl"
 
 
 def emit(tag, data):
@@ -207,10 +212,141 @@ def icmp_child(case, proof):
                                          commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
 
 
+def admin_child(case, proof):
+    run_case = dict(refuse=admin.refuse_child, reenable=admin.reenable_child).get(case["scenario"], admin.child)
+    evidence = run_case(case, proof, TUN_ECHO, PATHCTL, Peer, command, emit)
+    emit("T12_ADMIN_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                                kernel_version=os.uname().version, evidence=evidence,
+                                build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                           commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
+def native_admin_child(case, proof):
+    """ntcp-pathctl against the native runtime (this harness's AfPacket
+    embedding, serving control.socket on its owner thread) while it carries
+    real TCP exchanges with a Linux listener through its default route (an
+    Ethernet next hop, i.e. a Forwarder). A disabled IPv6 route caps native
+    output at 1280; a disabled IPv4 route clears DF, leases an Identification
+    for every packet and limits packets to 576 octets without an
+    administrative value (RFC 1122 3.3.3 EMTU_S); re-enabling restores DF and
+    the full size."""
+    family = case["family"]
+    kernel, native = ("198.18.0.1", "198.18.0.2") if family == 4 else ("fd54:3500::1", "fd54:3500::2")
+    settings = setup(family, kernel, native)
+    bridge = Bridge()
+    peers = []
+    directory = tempfile.mkdtemp(prefix="t12-native-control-")
+    socket_path = Path(directory) / "control.sock"
+    evidence = dict(case=case)
+    try:
+        os.environ["T12_CONTROL_SOCKET"] = str(socket_path)
+        try:
+            # The control socket also makes the binary state io.source_quiet
+            # = never (harness-created address in a fresh namespace).
+            n = Peer([BINARY, "client", native, kernel, "hmac", 65536, 3_600_000_000, 1, 0])
+        finally:
+            os.environ.pop("T12_CONTROL_SOCKET")
+        peers.append(n)
+        k = Peer([sys.executable, HERE / "linux_peer.py", "server", kernel, native, 0])
+        peers.append(k)
+        ctl = admin.Pathctl(PATHCTL, socket_path)
+
+        def exchange(name, during=None):
+            start = bridge.configure("none", "native-to-kernel")
+            k.send("accept")
+            n.send("connect blocking")
+            concurrent = during() if during else None
+            c, s = n.read(), k.read()
+            validate_stream(s, c)
+            events, count = bridge.snapshot(start)
+            assert count == 0
+            out = [e for e in events if e["direction"] == "native-to-kernel"]
+            assert out and any(e["payload"] for e in out), name
+            return out, concurrent
+
+        def summary(out):
+            return dict(packets=len(out), max_ip_length=max(e["ip_length"] for e in out),
+                        df=sorted({e["df"] for e in out}, key=str), payload_packets=sum(e["payload"] > 0 for e in out))
+
+        # The runtime (and its control server) starts with the first socket.
+        baseline, _ = exchange("baseline")
+        assert max(e["ip_length"] for e in baseline) == 1500, summary(baseline)
+        assert family == 6 or all(e["df"] for e in baseline), summary(baseline)
+        mode, directory_mode = os.stat(socket_path).st_mode, os.stat(directory).st_mode
+        assert stat.S_ISSOCK(mode) and stat.S_IMODE(mode) == 0o600 and stat.S_IMODE(directory_mode) == 0o700
+        routes = ctl.routes()
+        # The runtime's one default route resolves through its Ethernet
+        # next hop (a Forwarder): the destination is not on a connected
+        # network as far as the Host knows.
+        assert len(routes) == 1 and routes[0]["next_hop"].startswith("forwarder:"), routes
+        route = routes[0]
+        before = ctl.routes()
+
+        # During traffic: a query and a refused stale compare-and-set.
+        def during():
+            paths = ctl.paths()
+            stale = ctl.run("set", "route", route["token"], int(route["generation"]) + 7, "disable", expect=1)
+            return paths, stale.stderr.strip()
+        _, (paths, stale) = exchange("refused", during)
+        assert stale == "status=stale", stale
+        assert ctl.routes() == before, "a refused request changed nothing"
+        target = next(p for p in paths if p["destination"] == kernel)
+        assert target["route"] == route["token"], (target, route)
+
+        disabled = ctl.run("disable", "route", route["token"])
+        state = next(r for r in ctl.routes() if r["token"] == route["token"])
+        assert state["disabled"] == "1" and int(state["generation"]) > int(route["generation"]), state
+        off, _ = exchange("disabled")
+        if family == 6:
+            assert max(e["ip_length"] for e in off) <= 1280, summary(off)
+            ids = None
+        else:
+            assert not any(e["df"] for e in off), ("DF clear on the disabled route", summary(off))
+            ids = [e["ip_id"] for e in off]
+            assert all(ids) and len(set(ids)) == len(ids), ("leased Identification", ids[:16])
+            assert max(e["ip_length"] for e in off) <= 576, summary(off)
+        ctl.run("enable", "route", route["token"])
+        on, _ = exchange("re-enabled")
+        assert max(e["ip_length"] for e in on) == 1500, summary(on)
+        assert family == 6 or all(e["df"] for e in on), summary(on)
+        evidence.update(settings=settings, routes=routes, path=target, stale=stale, disabled_route=state,
+                        utility=disabled.stdout.strip(), baseline=summary(baseline), disabled=summary(off),
+                        leased_ids=len(ids) if ids else None, reenabled=summary(on),
+                        control_socket_mode=oct(stat.S_IMODE(mode)), utility_requests=len(ctl.log),
+                        allow_list="default (the owner's effective uid)", source_quiet="never",
+                        source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission")
+    finally:
+        primary = sys.exc_info()[0] is not None
+        errors = []
+        for peer in peers:
+            try:
+                peer.close()
+            except Exception as e:
+                errors.append(str(e))
+        bridge.close()
+        try:
+            socket_path.unlink()
+        except FileNotFoundError:
+            pass
+        os.rmdir(directory)
+        if errors:
+            emit("T12_ADMIN_CLEANUP", dict(case=case, errors=errors))
+            if not primary:
+                raise RuntimeError(errors)
+    emit("T12_ADMIN_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                                kernel_version=os.uname().version, evidence=evidence,
+                                build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                           commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
 def child(case):
     proof = namespace_guard()  # Must precede every link/sysctl/neighbor/route mutation.
     if case.get("kind") == "icmp":
         return icmp_child(case, proof)
+    if case.get("kind") == "admin":
+        return admin_child(case, proof)
+    if case.get("kind") == "native-admin":
+        return native_admin_child(case, proof)
     family, role, policy, scenario = (case[k] for k in ("family", "role", "policy", "scenario"))
     kernel, native = ("198.18.0.1", "198.18.0.2") if family == 4 else ("fd54:3500::1", "fd54:3500::2")
     settings = setup(family, kernel, native)
@@ -399,13 +535,20 @@ def main():
                   "--target-dir", str(BINARY.parents[1])]
     p = subprocess.run(echo_build, cwd=ROOT, env=env, timeout=600)
     assert p.returncode == 0, dict(command=echo_build, exit=p.returncode)
+    pathctl_build = ["cargo", "build", "--locked", "-p", "ntcp-path-control", "--bin", "ntcp-pathctl",
+                     "--target-dir", str(BINARY.parents[1])]
+    p = subprocess.run(pathctl_build, cwd=ROOT, env=env, timeout=600)
+    assert p.returncode == 0, dict(command=pathctl_build, exit=p.returncode)
     source = fingerprint()
     commit = command(["git", "rev-parse", "HEAD"]).strip()
     cases = matrix()
     icmp_cases = icmp.cases()
+    admin_cases = admin.cases()
     emit("T5_NETWORK_BUILD", dict(schema_version=1, command=build, commit=commit,
                                   source_sha256=source, binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
                                   icmp_command=echo_build, icmp_cases=icmp_cases,
+                                  admin_command=pathctl_build, admin_cases=admin_cases,
+                                  pathctl_sha256=hashlib.sha256(PATHCTL.read_bytes()).hexdigest(),
                                   tun_echo_sha256=hashlib.sha256(TUN_ECHO.read_bytes()).hexdigest(),
                                   ptb_stage_sha256=hashlib.sha256(STAGED.read_bytes()).hexdigest(),
                                   datagram_drive_sha256=hashlib.sha256(DRIVER.read_bytes()).hexdigest(),
@@ -420,7 +563,8 @@ def main():
     refusal_count = 0
     namespace_ids = []
     icmp_completed = 0
-    for case in icmp_cases + cases:
+    admin_completed = 0
+    for case in icmp_cases + admin_cases + cases:
         assert time.monotonic() - started < 1740, "30 minute total gate budget"
         fds = [os.open("/proc/self/ns/" + kind, os.O_RDONLY) for kind in ("net", "user")]
         try:
@@ -450,13 +594,18 @@ def main():
             if err:
                 print(err, end="", file=sys.stderr, flush=True)
             assert code == 0, dict(case=case, command=cmd, exit=code)
-            tag = "T9_ICMP_CASE " if case in icmp_cases else "T5_NETWORK_CASE "
+            tag = ("T9_ICMP_CASE " if case in icmp_cases else "T12_ADMIN_CASE " if case in admin_cases
+                   else "T5_NETWORK_CASE ")
             summaries = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(tag)]
             assert len(summaries) == 1 and summaries[0]["case"] == case, "missing case summary"
             summary = summaries[0]
             if case in icmp_cases:
                 namespace_ids.append(summary["namespace"])
                 icmp_completed += 1
+                continue
+            if case in admin_cases:
+                namespace_ids.append(summary["namespace"])
+                admin_completed += 1
                 continue
             stream_count += summary["streams"]
             refusal_count += summary["completions"] - summary["streams"]
@@ -466,9 +615,10 @@ def main():
             for fd in fds:
                 os.close(fd)
     assert completed == len(cases) and stream_count > 0 and refusal_count == 12
-    assert icmp_completed == len(icmp_cases) == 20
+    assert icmp_completed == len(icmp_cases) == 23
+    assert admin_completed == len(admin_cases) == 7
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
-                                    icmp_cases=icmp_completed,
+                                    icmp_cases=icmp_completed, admin_cases=admin_completed,
                                     namespaces=namespace_ids, kernel=os.uname().release,
                                     stream_sha256={name: hashlib.sha256(pattern(n, salt)).hexdigest()
                                                    for name, n, salt in (("request", 8192, 7), ("response", 6144, 11),

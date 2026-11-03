@@ -48,6 +48,8 @@ pub use ident::{
     Continuity, DEFAULT_LIFETIME_SECONDS, Entropy, EntropyError, IdentifierAllocator,
     IdentifierBackpressure, IdentifierLimits,
 };
+mod admin;
+pub use admin::{AdminCandidate, AdminClient, Administration, AffectedPath, ClientReport};
 mod udp;
 use path::{
     ContextId, Dscp, ForwarderId, InterfaceKey, LinkId, PathRequest, PathService, PathSnapshot,
@@ -55,8 +57,9 @@ use path::{
 };
 use udp::Udp;
 pub use udp::{
-    UdpEgress, UdpEvent, UdpFlowId, UdpLimits, UdpOptions, UdpPathLimits, UdpSendError, UdpSent,
-    managed_udp_limits,
+    ProbeReceipt, ProbeReportError, RetrySuppression, SharedOffer, UdpEgress, UdpEvent, UdpFlowId,
+    UdpLimits, UdpOptions, UdpPathLimits, UdpProbeBounds, UdpProbeOutcome, UdpProbeReport,
+    UdpSendError, UdpSent, UdpSharedWriter, managed_udp_limits,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +72,8 @@ pub enum Error {
     InvalidContext,
     Unsupported,
     Obsolete,
+    /// The administration capability was not issued by this Host.
+    Unauthorized,
 }
 impl From<path::Error> for Error {
     fn from(error: path::Error) -> Self {
@@ -476,6 +481,11 @@ struct Lease {
 /// All tables are allocated fallibly once; packet/factory operations allocate
 /// only through the Endpoint's independently bounded transport allocator.
 pub struct Host {
+    // Process-unique identity binding issued administration capabilities.
+    instance: u64,
+    // Owner search aging (RFC 4821 section 7.3, RFC 1191/8201 aging
+    // timer) for every TCP connection with PLPMTUD; None until set.
+    search_aging: Option<ntcp::SearchAging>,
     paths: PathService,
     ports: Vec<Option<Port>>,
     bindings: Vec<Option<Binding>>,
@@ -536,8 +546,11 @@ impl Host {
         if limits.datagrams.adjunct.paths != 0 && limits.icmp_output.messages == 0 {
             return Err(Error::Capacity);
         }
+        let paths = PathService::new(context, path_limits)?;
         Ok(Self {
-            paths: PathService::new(context, path_limits)?,
+            instance: admin::next_instance()?,
+            search_aging: None,
+            paths,
             ports: table(path_limits.links, None)?,
             bindings: table(limits.bindings, None)?,
             leases: table(limits.output_leases, None)?,
@@ -809,16 +822,19 @@ impl Host {
         mtu: u32,
     ) -> Result<path::EstimateChange, Error> {
         let not_before = now
-            .checked_add(
-                self.timebase
-                    .units_per_second
-                    .checked_mul(600)
-                    .ok_or(Error::Capacity)?,
-            )
+            .checked_add(self.decrease_hold()?)
             .ok_or(Error::Capacity)?;
         Ok(self
             .paths
             .trusted_decrease_with_hold(path, mtu, not_before)?)
+    }
+
+    // The RFC 1191/8201 600-second hold after a decrease, in caller units.
+    pub(crate) fn decrease_hold(&self) -> Result<u64, Error> {
+        self.timebase
+            .units_per_second
+            .checked_mul(600)
+            .ok_or(Error::Capacity)
     }
 
     /// Apply one newest snapshot then acknowledge exactly that observation.
@@ -963,6 +979,11 @@ impl Host {
             let Some(owner) = self.bindings[index].and_then(|b| b.owner) else {
                 continue;
             };
+            // Connections created after an owner aging change adopt it here,
+            // before their first output selection.
+            if let Err(error) = self.apply_search_aging(endpoint, now, owner) {
+                report.fail(error);
+            }
             if let Err(error) = self.publish_results(endpoint, now, owner, &mut report) {
                 report.fail(error);
             }
@@ -1069,6 +1090,18 @@ impl Host {
         if binding.client != selected.client
             || binding.snapshot.path() != selected.snapshot.path()
             || probe.receipt().ip_packet_len != intent.ip_packet_len()
+        {
+            return Ok(None);
+        }
+        // A size result selected under another discovery policy, or on a
+        // path whose owner has since disabled discovery, publishes nothing.
+        if self
+            .paths
+            .path_snapshot(selected.snapshot.path())
+            .is_ok_and(|live| {
+                live.discovery_disabled()
+                    || live.discovery_revision() != selected.snapshot.discovery_revision()
+            })
         {
             return Ok(None);
         }
@@ -1738,9 +1771,10 @@ impl Host {
                     .is_ok_and(|s| s.status() == PathStatus::Valid)
         });
         // RFC 1191 section 5's current PMTU estimate is the shared one that
-        // `host_estimate` reads from the same snapshot, at arrival or replay.
+        // `host_estimate` reads from the same snapshot, at arrival or replay:
+        // the network estimate, never the discovery-policy sending limit.
         let path_estimate =
-            current.and_then(|path| self.paths.path_snapshot(path).ok()?.ip_packet_budget().ok());
+            current.and_then(|path| self.paths.path_snapshot(path).ok()?.pmtu_estimate().ok());
         let report = CorrelatedPmtu {
             segment,
             quoted_packet_len,
@@ -1852,7 +1886,7 @@ impl Host {
             (None, true) => snapshot
                 .ipv4_plateaus()?
                 .legacy_fallback(
-                    snapshot.ip_packet_budget().ok()?,
+                    snapshot.pmtu_estimate().ok()?,
                     quoted_len,
                     u32::from(header_len),
                     dropped,
@@ -1965,6 +1999,21 @@ impl Host {
         }
     }
 
+    /// Whether the IP layer must leave DF clear on this attempt's packet
+    /// whatever its connection requests: its path is IPv4 and the owner
+    /// disabled discovery on its route or path (RFC 1191 section 6.6). The
+    /// embedding applies it with `lease_df_clear` immediately before each
+    /// physical submission (a fresh Identification for every attempt);
+    /// `submit` refuses a DF-set IPv4 packet on such a path. When it no
+    /// longer holds for a packet held across a re-enable (and its
+    /// connection does not ask for DF clear), the embedding restores the
+    /// atomic header with `restore_atomic_header` before the retry.
+    pub fn clears_dont_fragment(&self, context: EgressContext) -> bool {
+        self.paths
+            .snapshot(context.binding.client)
+            .is_ok_and(|s| s.clears_dont_fragment())
+    }
+
     /// The frame starts at IP and contains exactly its resident bytes (no
     /// Ethernet padding). shared_payload_len is added exactly once. Software
     /// GSO calls this separately for each actual physical segment/attempt.
@@ -2004,17 +2053,7 @@ impl Host {
         } else {
             (frame[0] << 4) | (frame[1] >> 4)
         };
-        let expected_header = if let (IpAddr::V4(source), IpAddr::V4(destination)) =
-            (packet.ip.source, packet.ip.destination)
-        {
-            20 + packet
-                .ipv4_options
-                .encode(source, destination, 0, &mut [0; 40])
-                .map_err(|e| Error::Endpoint(EndpointError::Ipv4Options(e)))?
-                .1
-        } else {
-            40
-        };
+        let expected_header = transmit_header_len(&packet)?;
         let actual_destination = if packet.ip.source.is_ipv4() {
             IpAddr::V4(core::net::Ipv4Addr::new(
                 frame[16], frame[17], frame[18], frame[19],
@@ -2037,6 +2076,10 @@ impl Host {
             || Dscp::from_traffic_class(class).value() != packet.dscp
             || (class & 3) != packet.ecn
             || total as u32 > live.binding.snapshot.first_hop_mtu()
+            // RFC 1191 section 6.6: no DF on a discovery-disabled route.
+            || (packet.ip.source.is_ipv4()
+                && live.binding.snapshot.clears_dont_fragment()
+                && frame[6] & 0x40 != 0)
         {
             return Err(Error::Obsolete);
         }
@@ -2059,7 +2102,13 @@ impl Host {
                 .transmit_discovery_intent(context.attempt)
                 .ok_or(Error::Obsolete)?;
             let selected = intent.binding();
+            // Only discovery may exceed the ordinary budget: never on a path
+            // whose owner disabled it, nor for a probe selected under
+            // another discovery policy.
             if (packet.ip.source.is_ipv4() && frame[6] & 0x40 == 0)
+                || live.binding.snapshot.discovery_disabled()
+                || selected.snapshot.discovery_revision()
+                    != live.binding.snapshot.discovery_revision()
                 || selected.client != live.binding.client
                 || selected.snapshot.path() != live.binding.snapshot.path()
                 || selected.snapshot.negative_revision()
@@ -2212,6 +2261,24 @@ fn unfragmentable(frame: &[u8]) -> bool {
         Some(6) => frame.get(6).is_some_and(|n| *n != 44),
         _ => false,
     }
+}
+
+// Complete IP header length of an Endpoint transmission: the IPv4 header
+// with its encoded options, or the base IPv6 header.
+pub(crate) fn transmit_header_len(packet: &ntcp::Transmit) -> Result<usize, Error> {
+    Ok(
+        if let (IpAddr::V4(source), IpAddr::V4(destination)) =
+            (packet.ip.source, packet.ip.destination)
+        {
+            20 + packet
+                .ipv4_options
+                .encode(source, destination, 0, &mut [0; 40])
+                .map_err(|e| Error::Endpoint(EndpointError::Ipv4Options(e)))?
+                .1
+        } else {
+            40
+        },
+    )
 }
 
 // Transport selector of an exactly validated outgoing TCP segment. The
