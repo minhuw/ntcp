@@ -52,8 +52,9 @@ impl ErrorLimiter {
         }
     }
 
-    // Take one token if available. Time that runs backwards adds nothing.
-    pub fn admit(&mut self, now: Instant) -> bool {
+    // Refill to `now` and report whether a token is available. Time that
+    // runs backwards adds nothing.
+    fn available(&mut self, now: Instant) -> bool {
         let token = u128::from(self.units_per_second);
         let capacity = u128::from(self.limits.burst) * token;
         if let Some(last) = self.last {
@@ -61,10 +62,15 @@ impl ErrorLimiter {
             self.credit = capacity.min(self.credit + elapsed * u128::from(self.limits.per_second));
         }
         self.last = Some(self.last.map_or(now, |last| last.max(now)));
-        if self.credit < token || token == 0 {
+        self.credit >= token && token != 0
+    }
+
+    // Take one token if available.
+    pub fn admit(&mut self, now: Instant) -> bool {
+        if !self.available(now) {
             return false;
         }
-        self.credit -= token;
+        self.credit -= u128::from(self.units_per_second);
         true
     }
 }
@@ -114,7 +120,9 @@ pub(crate) struct OriginatedError {
 
 /// Build `error` about `invoking` (the packet as it arrived) into `message`
 /// unless the family's rules suppress it or the limiter refuses it. The
-/// limiter is charged only for a message that was built and would be sent.
+/// limiter is charged only for a message that was built and would be sent,
+/// and `message` is written only for a message returned: it may be the
+/// storage of a held queued message that the new one displaces.
 pub(crate) fn originate(
     limiter: &mut ErrorLimiter,
     now: Instant,
@@ -141,10 +149,12 @@ pub(crate) fn originate(
             ErrorMessage::Ipv6ParameterProblem { code, pointer }
         }
     };
-    let len = ntcp_icmp::encode_error(reply, kind, invoking, message).ok()?;
-    if !limiter.admit(now) {
+    // encode_error writes only once it succeeds.
+    if !limiter.available(now) {
         return None;
     }
+    let len = ntcp_icmp::encode_error(reply, kind, invoking, message).ok()?;
+    limiter.admit(now);
     Some(OriginatedError {
         ip: reply,
         link: arrival.link,

@@ -32,7 +32,9 @@ use crate::{BackendOutcome, Error, Host, IcmpDispatch, IcmpOutcome, IngressConte
 /// path client a drain uses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IcmpOutputLimits {
-    /// Messages queued for the drain; later ones are dropped and counted.
+    /// Messages queued for the drain; later ones are dropped and counted,
+    /// except that a message held for an identifier gives way to them
+    /// (`Host::icmp_output`).
     pub messages: usize,
     /// Largest ICMP message (header and data) one queue slot holds. At
     /// least an ICMPv6 error with RFC 4443 section 2.4(c)'s maximal quote,
@@ -87,12 +89,14 @@ pub struct IcmpOutputCounters {
     pub echo_replies: u64,
     /// Reassembly errors queued (after suppression and rate limiting).
     pub errors: u64,
-    /// Messages not queued: the queue was full or the message exceeded a
-    /// slot.
+    /// Messages not queued: the queue was full of messages no drain attempt
+    /// had held for an identifier, or the message exceeded a slot.
     pub dropped: u64,
     /// Queued messages discarded at the drain: no route or source any more,
     /// larger than the path allows and beyond the peer reassembly guarantee,
-    /// or no identifier available for its fragments.
+    /// or no identifier available for its fragments; and held messages
+    /// (waiting for an identifier on a DF-clear route) displaced by a new
+    /// message arriving at a full queue.
     pub unsent: u64,
 }
 
@@ -115,6 +119,10 @@ struct Queued {
     ip: IpMetadata,
     link: LinkId,
     len: usize,
+    // Queueing order, which rotation does not change.
+    arrival: u64,
+    // An `icmp_output` attempt found it waiting for an identifier.
+    held: bool,
 }
 
 pub(crate) struct IcmpOutput {
@@ -123,6 +131,7 @@ pub(crate) struct IcmpOutput {
     bytes: Vec<u8>,
     head: usize,
     len: usize,
+    arrivals: u64,
     counters: IcmpOutputCounters,
 }
 
@@ -146,23 +155,83 @@ impl IcmpOutput {
             )?,
             head: 0,
             len: 0,
+            arrivals: 0,
             counters: IcmpOutputCounters::default(),
         })
     }
-    // Storage of the next free slot, or None (counted) when full.
-    fn free(&mut self) -> Option<&mut [u8]> {
-        if self.len == self.limits.messages {
-            self.counters.dropped += 1;
+    // Physical slot of the held message that has waited longest, when the
+    // queue is full: the one a new message replaces.
+    fn displaced(&self) -> Option<usize> {
+        let n = self.limits.messages;
+        if self.len != n {
             return None;
         }
-        let index = (self.head + self.len) % self.limits.messages;
+        (0..n)
+            .map(|i| (self.head + i) % n)
+            .filter_map(|index| Some((index, self.entries[index]?)))
+            .filter(|(_, queued)| queued.held)
+            .min_by_key(|(_, queued)| queued.arrival)
+            .map(|(index, _)| index)
+    }
+    // Storage for a new message: the next free slot or, when the queue is
+    // full, the slot of the message `push` will displace; None (counted)
+    // when the queue is full and no message is held. The caller writes the
+    // slot only for a message it then pushes.
+    fn free(&mut self) -> Option<&mut [u8]> {
+        let index = if self.len < self.limits.messages {
+            (self.head + self.len) % self.limits.messages
+        } else if let Some(index) = self.displaced() {
+            index
+        } else {
+            self.counters.dropped += 1;
+            return None;
+        };
         let stride = self.limits.message_bytes;
         Some(&mut self.bytes[index * stride..][..stride])
     }
-    fn push(&mut self, queued: Queued) {
-        let index = (self.head + self.len) % self.limits.messages;
+    // Queue the message written to the slot from `free`. In a full queue it
+    // replaces the displaced held message (counted unsent) and moves behind
+    // the others, which keep their relative order.
+    fn push(&mut self, ip: IpMetadata, link: LinkId, len: usize) {
+        let n = self.limits.messages;
+        let queued = Queued {
+            ip,
+            link,
+            len,
+            arrival: self.arrivals,
+            held: false,
+        };
+        self.arrivals = self.arrivals.saturating_add(1);
+        if self.len < n {
+            self.entries[(self.head + self.len) % n] = Some(queued);
+            self.len += 1;
+            return;
+        }
+        let Some(mut index) = self.displaced() else {
+            return;
+        };
+        self.counters.unsent += 1;
         self.entries[index] = Some(queued);
-        self.len += 1;
+        let tail = (self.head + n - 1) % n;
+        while index != tail {
+            let next = (index + 1) % n;
+            self.swap(index, next);
+            index = next;
+        }
+    }
+    // Exchange two slots, metadata and bytes.
+    fn swap(&mut self, a: usize, b: usize) {
+        let stride = self.limits.message_bytes;
+        let (low, high) = (a.min(b), a.max(b));
+        let (first, second) = self.bytes.split_at_mut(high * stride);
+        first[low * stride..][..stride].swap_with_slice(&mut second[..stride]);
+        self.entries.swap(a, b);
+    }
+    // The oldest message waits for an identifier.
+    fn hold(&mut self) {
+        if let Some(queued) = self.entries.get_mut(self.head).and_then(Option::as_mut) {
+            queued.held = true;
+        }
     }
     fn front(&self) -> Option<(Queued, &[u8])> {
         if self.len == 0 {
@@ -402,11 +471,7 @@ impl Host {
                     && let Some(sent) = originate(errors, now, error, arrival, frame, slot)
                 {
                     icmp_output.counters.errors += 1;
-                    icmp_output.push(Queued {
-                        ip: sent.ip,
-                        link: sent.link,
-                        len: sent.len,
-                    });
+                    icmp_output.push(sent.ip, sent.link, sent.len);
                 }
                 Ok(Received::Discarded)
             }
@@ -472,11 +537,7 @@ impl Host {
                     )
                 {
                     icmp_output.counters.errors += 1;
-                    icmp_output.push(Queued {
-                        ip: sent.ip,
-                        link: sent.link,
-                        len: sent.len,
-                    });
+                    icmp_output.push(sent.ip, sent.link, sent.len);
                 }
             },
         );
@@ -626,6 +687,8 @@ impl Host {
             source: packet.ip.destination,
             destination: packet.ip.source,
         };
+        // Encoding cannot fail once the slot is written: the request decoded
+        // under the same address pair and `len` is within a slot.
         slot[8..len].copy_from_slice(request.data);
         let len = ntcp_icmp::encode_echo(
             reply,
@@ -636,11 +699,7 @@ impl Host {
             len - 8,
         )?;
         output.counters.echo_replies += 1;
-        output.push(Queued {
-            ip: reply,
-            link: context.link,
-            len,
-        });
+        output.push(reply, context.link, len);
         Ok(EchoDisposition::Queued)
     }
 
@@ -698,7 +757,12 @@ impl Host {
     /// waits: it moves behind the other queued messages and the call goes on
     /// with the next one, so output to other destinations is not held behind
     /// it. WouldBlock when every queued message waits for an identifier and
-    /// no adjunct probe is due.
+    /// no adjunct probe is due. From that attempt on the message is held,
+    /// and a held message never keeps a new one out of the queue: a new Echo
+    /// Reply or error arriving at a full queue that holds one takes the place
+    /// of the held message that has waited longest, which is discarded
+    /// (counted unsent) while the others keep their order. A full queue with
+    /// no held message drops the new message (counted dropped).
     /// `packet` holds the complete datagram plus, when it is fragmented, one
     /// fragment: `message_bytes` + 40 + the link MTU suffices.
     ///
@@ -725,7 +789,10 @@ impl Host {
             };
             match self.icmp_output_head(now, queued, packet, &mut submit)? {
                 Some(outcome) => return Ok(Some(outcome)),
-                None => self.icmp_output.rotate(),
+                None => {
+                    self.icmp_output.hold();
+                    self.icmp_output.rotate();
+                }
             }
         }
         // Every queued message waits for an identifier.

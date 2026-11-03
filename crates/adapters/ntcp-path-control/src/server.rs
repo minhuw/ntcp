@@ -15,17 +15,29 @@
 //! SO_PEERCRED (supplied by the kernel at connect time) and checked against
 //! an explicit uid allow-list that defaults to the owner's effective uid.
 //! There is no implicit root bypass; when the credential is unavailable the
-//! connection is closed (fail closed). An unauthorized peer's first request,
-//! queries included, is answered `Unauthorized` without dispatch and the
-//! connection is closed. Requests then act through the Host-bound
+//! connection is closed (fail closed). A peer not on the allow-list is
+//! answered `Unauthorized` at accept and closed without taking a peer slot,
+//! before it sends anything: none of its requests, queries included, is
+//! read or dispatched, and reconnecting denied peers cannot keep allowed
+//! administrators out. Requests then act through the Host-bound
 //! `Administration` capability the owner issued, never through Host access.
+//!
+//! Listings. Route, path and client queries are paginated. The revision of
+//! a listing covers what identifies each entry and its administrative state
+//! (`protocol::PageHeader::revision`), never values that change with
+//! traffic or time, so a continuation fails `Inconsistent` only after an
+//! administrative or membership change; each page reports the live values
+//! (sizes, pins, holds, revisions, transport values) current when that page
+//! is built.
 //!
 //! Bounds (all I/O is nonblocking; descriptors are native and every call is
 //! a direct system call, so an interposition library serving this from its
 //! owner thread never re-enters itself):
-//! - `SLOTS` peers at once: one interactive administrator plus a few
-//!   concurrent scripted queries; a further connection is answered `Busy`
-//!   and closed so a client never hangs on a full server.
+//! - `SLOTS` allowed peers at once: one interactive administrator plus a
+//!   few concurrent scripted queries; a further connection is answered
+//!   `Busy` and closed so a client never hangs on a full server. Refusals
+//!   (`Busy`, `Unauthorized`) are one nonblocking best-effort send of the
+//!   small reply frame before the close.
 //! - Frames: a request frame is at most `MAX_REQUEST_FRAME` octets (derived
 //!   from the largest request, the plateau table); a larger announced length
 //!   is answered `Oversized` and the connection closes, because the stream
@@ -187,15 +199,8 @@ pub fn validate_private_directory(socket: &Path, owner: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Peer {
-    Allowed,
-    Denied,
-}
-
 struct Slot {
     fd: Fd,
-    peer: Peer,
     input: [u8; MAX_REQUEST_FRAME],
     filled: usize,
     output: Vec<u8>,
@@ -437,6 +442,10 @@ impl Server {
                 // Fail closed: no credential, no service.
                 continue;
             }
+            if !self.allow.contains(&cred.uid) {
+                refuse(&fd, Status::Unauthorized);
+                continue;
+            }
             // One outstanding request per connection means a reply never
             // needs more than one frame of kernel buffering; capping the
             // send buffer bounds the kernel memory a peer that never reads
@@ -457,27 +466,12 @@ impl Server {
             {
                 continue;
             }
-            let peer = if self.allow.contains(&cred.uid) {
-                Peer::Allowed
-            } else {
-                Peer::Denied
-            };
             let Some(free) = self.slots.iter().position(Option::is_none) else {
-                let mut reply = Vec::with_capacity(MAX_RESPONSE_FRAME);
-                protocol::encode_response(
-                    &mut reply,
-                    &Response {
-                        status: Status::Busy,
-                        opcode: 0,
-                        payload: Payload::None,
-                    },
-                );
-                let _ = send(&fd, &reply);
+                refuse(&fd, Status::Busy);
                 continue;
             };
             self.slots[free] = Some(Slot {
                 fd,
-                peer,
                 input: [0; MAX_REQUEST_FRAME],
                 filled: 0,
                 output: Vec::with_capacity(MAX_RESPONSE_FRAME),
@@ -561,12 +555,7 @@ impl Server {
         let mut body = [0u8; MAX_REQUEST_BODY];
         let len = slot.filled - LENGTH_PREFIX;
         body[..len].copy_from_slice(&slot.input[LENGTH_PREFIX..slot.filled]);
-        let peer = slot.peer;
         self.slots[index].as_mut().unwrap().filled = 0;
-        if peer == Peer::Denied {
-            self.reply(index, now, Status::Unauthorized, 0, Payload::None, true);
-            return true;
-        }
         match protocol::decode_request(&body[..len]) {
             Err(error) => {
                 let (status, op) = error.status();
@@ -738,7 +727,10 @@ impl Server {
             .collect())
     }
 
-    // Digest of a complete listing: the revision a continuation repeats.
+    // Digest of a complete listing's identities and administrative state
+    // (`protocol::PageHeader::revision`): the revision a continuation
+    // repeats. Live values are left out, so traffic between two page
+    // requests never makes a continuation inconsistent.
     fn revision<T>(&self, entries: &[T], encode: fn(&mut Vec<u8>, &T)) -> u64 {
         let mut bytes = Vec::with_capacity(entries.len().saturating_mul(protocol::PATH_ENTRY));
         for e in entries {
@@ -750,12 +742,12 @@ impl Server {
     fn page<T: Clone>(
         &self,
         entries: &[T],
-        encode: fn(&mut Vec<u8>, &T),
+        revision_of: fn(&mut Vec<u8>, &T),
         per_page: usize,
         cursor: u32,
         revision: u64,
     ) -> Result<(PageHeader, Vec<T>), Status> {
-        let digest = self.revision(entries, encode);
+        let digest = self.revision(entries, revision_of);
         let start = cursor as usize;
         if start > entries.len() {
             return Err(Status::Invalid);
@@ -808,7 +800,7 @@ impl Server {
                     self.route_entries(host)?.into_iter().map(|e| e.1).collect();
                 let (h, page) = self.page(
                     &entries,
-                    protocol::encode_route_entry,
+                    protocol::route_revision,
                     protocol::ROUTES_PER_PAGE,
                     cursor,
                     revision,
@@ -823,7 +815,7 @@ impl Server {
                     .collect();
                 let (h, page) = self.page(
                     &entries,
-                    protocol::encode_path_entry,
+                    protocol::path_revision,
                     protocol::PATHS_PER_PAGE,
                     cursor,
                     revision,
@@ -840,7 +832,7 @@ impl Server {
                 let entries = self.client_entries(host, endpoint, id)?;
                 let (h, page) = self.page(
                     &entries,
-                    protocol::encode_client_entry,
+                    protocol::client_revision,
                     protocol::CLIENTS_PER_PAGE,
                     cursor,
                     revision,
@@ -948,6 +940,21 @@ impl Server {
     }
 }
 
+// Answer a connection refused at accept with `status` (one nonblocking,
+// best-effort send of the small reply frame); the caller then closes it.
+fn refuse(fd: &Fd, status: Status) {
+    let mut reply = Vec::with_capacity(MAX_RESPONSE_FRAME);
+    protocol::encode_response(
+        &mut reply,
+        &Response {
+            status,
+            opcode: 0,
+            payload: Payload::None,
+        },
+    );
+    let _ = send(fd, &reply);
+}
+
 fn send(fd: &Fd, bytes: &[u8]) -> io::Result<usize> {
     // MSG_NOSIGNAL: a vanished client must not raise SIGPIPE in the owner.
     sys(unsafe {
@@ -962,4 +969,70 @@ fn send(fd: &Fd, bytes: &[u8]) -> io::Result<usize> {
         )
     })
     .map(|n| n as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::net::UnixStream;
+
+    // D24: SLOTS + 1 peers outside the allow-list that connect and send
+    // nothing are each answered Unauthorized at accept and closed; none of
+    // them occupies a slot.
+    #[test]
+    fn denied_peers_are_refused_at_accept_without_a_slot() {
+        let cfg = ntcp::EndpointConfig::default();
+        let (paths, limits) = ntcp_host::managed_limits(&cfg, 1, 1, 1, 1, 0).unwrap();
+        let mut host = Host::new(
+            path::ContextId::new(5),
+            paths,
+            limits,
+            cfg.connection.timebase,
+        )
+        .unwrap();
+        let mut endpoint = Endpoint::new(cfg.clone(), [3; 32], 0, |_| true).unwrap();
+        host.attach(&mut endpoint).unwrap();
+        let dir = std::env::temp_dir().join(format!("ntcp-control-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let socket = dir.join("control");
+        let mut server = Server::bind(
+            &ControlConfig {
+                socket: socket.clone(),
+                allow_uids: vec![euid().wrapping_add(1)],
+            },
+            host.administration(),
+            endpoint.caller_timebase(),
+        )
+        .unwrap();
+        let mut peers: Vec<UnixStream> = (0..=SLOTS)
+            .map(|_| {
+                let peer = UnixStream::connect(&socket).unwrap();
+                peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                peer
+            })
+            .collect();
+        // The per-pass accept bound: SLOTS per pass, the rest at the next.
+        server.service(&mut host, &mut endpoint, 0);
+        assert!(server.slots.iter().all(Option::is_none));
+        server.service(&mut host, &mut endpoint, 0);
+        assert!(server.slots.iter().all(Option::is_none));
+        for peer in &mut peers {
+            let mut reply = Vec::new();
+            peer.read_to_end(&mut reply).unwrap();
+            let len = u32::from_be_bytes(reply[..LENGTH_PREFIX].try_into().unwrap()) as usize;
+            assert_eq!(
+                reply.len(),
+                LENGTH_PREFIX + len,
+                "one frame, then end of stream"
+            );
+            let response = protocol::decode_response(&reply[LENGTH_PREFIX..]).unwrap();
+            assert_eq!(response.status, Status::Unauthorized);
+        }
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

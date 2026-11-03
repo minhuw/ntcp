@@ -68,9 +68,18 @@ fn addresses(v6: bool) -> (SocketAddr, SocketAddr) {
 // A Host on one 1500-octet link with a default route through a forwarder
 // and one active TCP connection on the resulting path.
 fn side(v6: bool) -> Side {
+    side_with(v6, |paths, limits| (paths, limits))
+}
+
+// `side` with the Host limits adjusted by `limits`.
+fn side_with(
+    v6: bool,
+    adjust: impl FnOnce(path::Limits, ntcp_host::Limits) -> (path::Limits, ntcp_host::Limits),
+) -> Side {
     let (local, remote) = addresses(v6);
     let cfg = config();
     let (paths, limits) = ntcp_host::managed_limits(&cfg, 1, 1, 1, 4, 1).unwrap();
+    let (paths, limits) = adjust(paths, limits);
     let mut host = Host::new(ContextId::new(77), paths, limits, cfg.connection.timebase).unwrap();
     let context = host
         .register_link(
@@ -773,4 +782,163 @@ fn socket_pathname_safety() {
     std::fs::write(&socket, b"other").unwrap();
     drop(replaced);
     assert_eq!(std::fs::read(&socket).unwrap(), b"other");
+}
+
+// Parent decision D23: a listing's revision covers each entry's identity
+// and administrative state, never values that change with traffic or time.
+// With more than one page of paths (one UDP flow pinned to many
+// destinations leaves their paths cached), a trusted decrease and a new
+// pin between two page requests leave the continuation consistent and the
+// second page reports the new live values; a path policy change (a new
+// policy and generation) between pages makes it Inconsistent.
+#[test]
+fn listing_revisions_ignore_live_values_but_not_administrative_changes() {
+    let wanted = protocol::PATHS_PER_PAGE + 2;
+    let udp = ntcp_host::UdpLimits {
+        flows: 1,
+        receive_datagrams: 1,
+        max_payload: 1500,
+        events: 1,
+        evicted_signatures: 1,
+        probe_receipts: 1,
+    };
+    let mut side = side_with(false, |paths, limits| {
+        let (paths, limits) = ntcp_host::managed_udp_limits(paths, limits, udp).unwrap();
+        (
+            path::Limits {
+                paths: paths.paths + wanted,
+                ..paths
+            },
+            limits,
+        )
+    });
+    let (local, _) = addresses(false);
+    let flow = side
+        .host
+        .udp_open(
+            &side.endpoint,
+            SocketAddr::new(local.ip(), 5000),
+            None,
+            ntcp_host::UdpOptions {
+                dscp: 0,
+                hop_limit: 64,
+            },
+        )
+        .unwrap();
+    let remote = |i: usize| std::net::IpAddr::from([198, 51, 100, i as u8 + 1]);
+    for i in 0..wanted {
+        side.host
+            .udp_path_limits(&side.endpoint, flow, Some(remote(i)))
+            .unwrap();
+    }
+    let cap = side.host.administration();
+    let total = side.host.admin_paths(&cap).unwrap().count();
+    assert!(total > protocol::PATHS_PER_PAGE, "more than one page");
+    let (mut server, socket) = serve(&mut side, Vec::new(), "pages");
+    let mut s = connect(&socket);
+    let query = |cursor: u32, revision: u64| {
+        protocol::encode_request(&Request::QueryPaths { cursor, revision })
+    };
+    let first = |s: &mut UnixStream, server: &mut Server, side: &mut Side| match raw(
+        s,
+        server,
+        side,
+        &query(0, 0),
+        0,
+    ) {
+        Some((Status::Ok, Payload::Paths(header, entries))) => {
+            assert_eq!(header.total as usize, total);
+            assert_eq!(entries.len(), protocol::PATHS_PER_PAGE);
+            header.revision
+        }
+        other => panic!("{other:?}"),
+    };
+    // A path on the second page and its live values before the change.
+    let target = side
+        .host
+        .admin_paths(&cap)
+        .unwrap()
+        .nth(protocol::PATHS_PER_PAGE)
+        .unwrap();
+    let target_path = target.snapshot.path();
+    let revision = first(&mut s, &mut server, &mut side);
+    // Live changes between the pages: the shared estimate of the target
+    // path drops (version, accepted and learned estimates, budget, hold
+    // and negative revision change) and the flow pins another destination.
+    side.host.trusted_decrease(0, target_path, 1200).unwrap();
+    side.host
+        .udp_path_limits(&side.endpoint, flow, Some(remote(0)))
+        .unwrap();
+    let cursor = protocol::PATHS_PER_PAGE as u32;
+    match raw(&mut s, &mut server, &mut side, &query(cursor, revision), 0) {
+        Some((Status::Ok, Payload::Paths(header, entries))) => {
+            assert_eq!(header.revision, revision);
+            assert_eq!(header.cursor, cursor);
+            assert_eq!(entries.len(), total - protocol::PATHS_PER_PAGE);
+            // The page reports the live values current when it was built.
+            assert_eq!(entries[0].learned, Some(1200));
+            assert_eq!(entries[0].budget, Some(1200));
+        }
+        other => panic!("{other:?}"),
+    }
+    // An administrative change between the pages: a path policy (a new
+    // policy and generation) makes the continuation inconsistent.
+    let revision = first(&mut s, &mut server, &mut side);
+    let target = side.host.admin_path(&cap, target_path).unwrap();
+    let candidate = side
+        .host
+        .admin_validate(
+            &cap,
+            0,
+            path::AdminChange {
+                target: path::AdminTarget::Path(target_path),
+                expected: target.generation,
+                policy: path::AdminPolicy {
+                    discovery_disabled: true,
+                    estimate: None,
+                },
+            },
+        )
+        .unwrap();
+    side.host
+        .admin_apply(&cap, &mut side.endpoint, candidate)
+        .unwrap();
+    assert_eq!(
+        raw(&mut s, &mut server, &mut side, &query(cursor, revision), 0).map(|r| r.0),
+        Some(Status::Inconsistent)
+    );
+}
+
+// Parent decision D24: the client reports the reply a server delivered
+// before closing, even when the server closed before the request was
+// written (the write then fails with a broken pipe). A denied peer gets
+// Unauthorized, a peer of a full server Busy, from Client::call.
+#[test]
+fn refusals_at_accept_reach_client_call_after_the_server_closed() {
+    use ntcp_path_control::client::Client;
+    let mut side = side(false);
+    let me = unsafe { libc::geteuid() };
+    let (mut server, socket) = serve(&mut side, vec![me.wrapping_add(1)], "refused");
+    let mut client = Client::connect(&socket).unwrap();
+    server.service(&mut side.host, &mut side.endpoint, 0);
+    let request = Request::QueryRoutes {
+        cursor: 0,
+        revision: 0,
+    };
+    assert_eq!(
+        client.call(&request).map(|r| r.status).ok(),
+        Some(Status::Unauthorized)
+    );
+    drop(server);
+
+    let (mut server, socket) = serve(&mut side, Vec::new(), "full");
+    let held: Vec<UnixStream> = (0..SLOTS).map(|_| connect(&socket)).collect();
+    server.service(&mut side.host, &mut side.endpoint, 0);
+    let mut client = Client::connect(&socket).unwrap();
+    server.service(&mut side.host, &mut side.endpoint, 0);
+    assert_eq!(
+        client.call(&request).map(|r| r.status).ok(),
+        Some(Status::Busy)
+    );
+    drop(held);
 }

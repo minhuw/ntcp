@@ -1235,3 +1235,229 @@ fn an_identifier_blocked_reply_does_not_hold_other_destinations_output() {
     assert_eq!(ntcp_ip_common::checksum(&frames[0][..20]), 0);
     assert_eq!(drain_packets(&mut a, MDL + 2), Ok(None));
 }
+
+// Parent decision D22: a message held for an identifier never keeps a new
+// one out of the queue. `fragmenting_side` with the allocator's start quiet
+// period, discovery disabled on the exact path to `remote` (DF clear): the
+// queued replies to it are held by an icmp_output attempt. Returns the
+// side, the neighbor on an enabled path and the disabled path.
+fn held_replies_side(identity: u128) -> (Side, IpAddr, path::PathId) {
+    let (local, remote) = addresses(false);
+    let neighbor: IpAddr = "198.51.100.7".parse().unwrap();
+    let mut a = fragmenting_side(local, identity, true);
+    let data = [0x5a; 64];
+    input_frame(
+        &mut a,
+        1,
+        &echo(ip(remote.ip(), local.ip()), 0x6001, 0, &data),
+    )
+    .unwrap();
+    assert_eq!(drain_packets(&mut a, 1).unwrap().unwrap().len(), 1);
+    let capability = a.0.administration();
+    let target =
+        a.0.admin_paths(&capability)
+            .unwrap()
+            .find(|p| p.snapshot.key().destination().address() == remote.ip())
+            .unwrap();
+    let candidate =
+        a.0.admin_validate(
+            &capability,
+            2,
+            path::AdminChange {
+                target: path::AdminTarget::Path(target.snapshot.path()),
+                expected: target.generation,
+                policy: path::AdminPolicy {
+                    discovery_disabled: true,
+                    estimate: None,
+                },
+            },
+        )
+        .unwrap();
+    a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+    (a, neighbor, target.snapshot.path())
+}
+
+// Fill the 3-slot queue with replies to `remote` (sequences 1..=3) and let
+// one icmp_output attempt hold all of them.
+fn hold_three_replies(a: &mut Side, now: u64) {
+    let (local, remote) = addresses(false);
+    for sequence in 1..=3 {
+        input_frame(
+            a,
+            now,
+            &echo(ip(remote.ip(), local.ip()), 0x6001, sequence, &[0x5a; 64]),
+        )
+        .unwrap();
+    }
+    assert_eq!(a.0.icmp_output_pending(), 3);
+    let mut packet = vec![0; 8192];
+    assert_eq!(
+        a.0.icmp_output(now, &mut packet, |_, _| panic!("nothing submitted")),
+        Ok(Some(BackendOutcome::WouldBlock)),
+        "every reply waits for an identifier"
+    );
+}
+
+fn echo_queued_on(a: &mut Side, path: path::PathId) -> usize {
+    let capability = a.0.administration();
+    a.0.admin_clients(&capability, &a.1, path)
+        .unwrap()
+        .find_map(|c| match c.client {
+            crate::AdminClient::Echo { queued } => Some(queued),
+            _ => None,
+        })
+        .unwrap()
+}
+
+// The remaining held replies leave DF clear with fresh Identifications once
+// the quiet period ends, in their queueing order.
+fn assert_held_replies_leave(a: &mut Side, now: u64, sequences: &[u16]) {
+    let (local, remote) = addresses(false);
+    let mut identifications = Vec::new();
+    for &sequence in sequences {
+        let frames = drain_packets(a, now).unwrap().unwrap();
+        assert_eq!(frames.len(), 1);
+        let IpAddr::V4(held) = remote.ip() else {
+            unreachable!()
+        };
+        assert_eq!(frames[0][16..20], held.octets(), "a held reply");
+        assert_eq!(frames[0][6] & 0x40, 0, "DF clear on the disabled path");
+        assert_eq!(ntcp_ip_common::checksum(&frames[0][..20]), 0);
+        let identification = u16::from_be_bytes([frames[0][4], frames[0][5]]);
+        assert_ne!(identification, 0);
+        assert!(!identifications.contains(&identification), "never reused");
+        identifications.push(identification);
+        let (outer, message) = icmp_message(&frames[0]);
+        assert_eq!(outer, ip(local.ip(), remote.ip()));
+        let reply = ntcp_icmp::decode_echo(outer, message).unwrap();
+        assert_eq!(reply.sequence, sequence);
+    }
+    assert_eq!(drain_packets(a, now), Ok(None));
+}
+
+// D22 (a): replies held during the quiet period fill the queue; an enabled
+// neighbor's Echo Request is still answered. Its reply takes the place of
+// the longest-waiting held reply (counted unsent, not dropped) and the next
+// icmp_output call submits it with DF; the other held replies follow once
+// the quiet period ends, DF clear with fresh Identifications.
+#[test]
+fn a_new_reply_displaces_the_longest_held_reply_from_a_full_queue() {
+    const MDL: u64 = 120_000_000;
+    let (local, _) = addresses(false);
+    let (mut a, neighbor, disabled) = held_replies_side(9996);
+    hold_three_replies(&mut a, 3);
+    assert_eq!(echo_queued_on(&mut a, disabled), 3);
+    let before = a.0.icmp_output_counters();
+    let request = echo(ip(neighbor, local.ip()), 0x6002, 1, &[0x5a; 64]);
+    assert_eq!(
+        a.0.input_icmp(&mut a.1, a.2, 4, &request).unwrap(),
+        IcmpDispatch::Completed(IcmpOutcome::Echo(EchoDisposition::Queued))
+    );
+    let after = a.0.icmp_output_counters();
+    assert_eq!(after.dropped, before.dropped);
+    assert_eq!(after.unsent, before.unsent + 1, "the displaced held reply");
+    assert_eq!(after.echo_replies, before.echo_replies + 1);
+    assert_eq!(a.0.icmp_output_pending(), 3);
+    assert_eq!(echo_queued_on(&mut a, disabled), 2);
+    let frames = drain_packets(&mut a, 5).unwrap().unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        &frames[0][16..20],
+        &[198, 51, 100, 7],
+        "the neighbor's reply"
+    );
+    assert_ne!(frames[0][6] & 0x40, 0, "DF kept on the enabled path");
+    assert_eq!(a.0.icmp_output_pending(), 2);
+    let mut packet = vec![0; 8192];
+    assert_eq!(
+        a.0.icmp_output(MDL - 1, &mut packet, |_, _| panic!("nothing submitted")),
+        Ok(Some(BackendOutcome::WouldBlock))
+    );
+    assert_held_replies_leave(&mut a, MDL + 1, &[2, 3]);
+    assert_eq!(a.0.icmp_output_counters().unsent, after.unsent);
+}
+
+// D22 (b): a Host-originated error to an enabled destination (Time Exceeded
+// for the neighbor's expired fragment zero) likewise displaces a held reply.
+#[test]
+fn a_reassembly_error_displaces_a_held_reply_from_a_full_queue() {
+    const MDL: u64 = 120_000_000;
+    let (local, _) = addresses(false);
+    let (mut a, neighbor, disabled) = held_replies_side(9997);
+    let complete = udp(ip(neighbor, local.ip()), (4000, local.port()), &[9; 2000]);
+    let pieces = fragments(&complete, 33, 1000);
+    input_frame(&mut a, 3, &pieces[0]).unwrap();
+    hold_three_replies(&mut a, 3);
+    let before = a.0.icmp_output_counters();
+    let second = config(2).connection.timebase.units_per_second;
+    assert!(60 * second + 3 < MDL, "expires within the quiet period");
+    a.0.service_changes(&mut a.1, 60 * second + 3).unwrap();
+    let after = a.0.icmp_output_counters();
+    assert_eq!(after.errors, before.errors + 1);
+    assert_eq!(after.dropped, before.dropped);
+    assert_eq!(after.unsent, before.unsent + 1, "the displaced held reply");
+    assert_eq!(a.0.icmp_output_pending(), 3);
+    assert_eq!(echo_queued_on(&mut a, disabled), 2);
+    let frames = drain_packets(&mut a, 60 * second + 4).unwrap().unwrap();
+    assert_eq!(frames.len(), 1);
+    let (outer, message) = icmp_message(&frames[0]);
+    assert_eq!(outer, ip(local.ip(), neighbor));
+    assert_eq!(&message[..2], [11, 1]);
+    assert_ne!(frames[0][6] & 0x40, 0, "DF kept on the enabled path");
+    assert_held_replies_leave(&mut a, MDL + 1, &[2, 3]);
+}
+
+// D22 (c) and (d): only a held message gives way. A queue full of replies
+// that were never attempted (on the disabled path within the quiet period),
+// or that an attempt found blocked by the backend rather than waiting for an
+// identifier, drops the new request and counts it dropped.
+#[test]
+fn a_full_queue_without_held_messages_drops_new_messages() {
+    let (local, remote) = addresses(false);
+    for attempted in [false, true] {
+        let (mut a, neighbor, disabled) = held_replies_side(9998 + u128::from(attempted));
+        let (source, path) = if attempted {
+            (neighbor, None)
+        } else {
+            (remote.ip(), Some(disabled))
+        };
+        for sequence in 1..=3 {
+            input_frame(
+                &mut a,
+                3,
+                &echo(ip(source, local.ip()), 0x6003, sequence, &[1; 64]),
+            )
+            .unwrap();
+        }
+        if attempted {
+            for _ in 0..2 {
+                let mut packet = vec![0; 8192];
+                assert_eq!(
+                    a.0.icmp_output(4, &mut packet, |_, _| BackendOutcome::WouldBlock),
+                    Ok(Some(BackendOutcome::WouldBlock))
+                );
+            }
+        }
+        if let Some(path) = path {
+            assert_eq!(echo_queued_on(&mut a, path), 3);
+        }
+        let before = a.0.icmp_output_counters();
+        let request = echo(
+            ip(if attempted { remote.ip() } else { neighbor }, local.ip()),
+            0x6004,
+            1,
+            &[2; 64],
+        );
+        assert_eq!(
+            a.0.input_icmp(&mut a.1, a.2, 5, &request).unwrap(),
+            IcmpDispatch::Completed(IcmpOutcome::Echo(EchoDisposition::Dropped))
+        );
+        let after = a.0.icmp_output_counters();
+        assert_eq!(after.dropped, before.dropped + 1);
+        assert_eq!(after.unsent, before.unsent);
+        assert_eq!(a.0.icmp_output_pending(), 3);
+        if let Some(path) = path {
+            assert_eq!(echo_queued_on(&mut a, path), 3);
+        }
+    }
+}

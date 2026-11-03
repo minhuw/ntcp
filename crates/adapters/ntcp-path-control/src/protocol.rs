@@ -309,7 +309,11 @@ pub struct ClientEntry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageHeader {
-    /// Digest of the complete listing; a continuation must repeat it.
+    /// Digest of what identifies each entry of the complete listing and its
+    /// administrative state (never values that change with traffic or
+    /// time); a continuation must repeat it, and fails `Inconsistent` after
+    /// an administrative or membership change. Each page reports the live
+    /// values current when it was built.
     pub revision: u64,
     pub total: u32,
     pub cursor: u32,
@@ -961,15 +965,41 @@ fn read_client_entry(r: &mut Reader) -> Option<ClientEntry> {
     })
 }
 
-/// Encode one route entry alone (the listing revision digests these).
-pub(crate) fn encode_route_entry(out: &mut Vec<u8>, e: &RouteEntry) {
+/// What the listing revision of each entry kind digests (`PageHeader`):
+/// a route entry whole (every field is identity or administrative state).
+pub(crate) fn route_revision(out: &mut Vec<u8>, e: &RouteEntry) {
     route_entry(&mut Writer { bytes: out }, e);
 }
-pub(crate) fn encode_path_entry(out: &mut Vec<u8>, e: &PathEntry) {
-    path_entry(&mut Writer { bytes: out }, e);
+/// A path entry's identity (token, route, addresses, DSCP), policy
+/// generation, validity, its own and its route's policy and the effective
+/// overlay derived from them. Not the version, pins, accepted and learned
+/// estimates, budget, hold, revisions or client count, which change with
+/// traffic or time, nor the first hop (the link MTU, reported live) or the
+/// retained restriction, which confirmed delivery relaxes; those are
+/// reported live on every page.
+pub(crate) fn path_revision(out: &mut Vec<u8>, e: &PathEntry) {
+    let w = &mut Writer { bytes: out };
+    w.u64(e.token);
+    w.u64(e.generation);
+    w.u8(u8::from(e.valid));
+    w.u64(e.route);
+    w.address(Some(e.source));
+    w.address(Some(e.destination));
+    w.address(Some(e.forwarding));
+    w.u8(e.dscp);
+    w.policy(e.policy);
+    w.u8(u8::from(e.route_policy.is_some()));
+    w.policy(e.route_policy.unwrap_or_default());
+    w.u8(source(e.discovery_disabled));
+    w.u32(e.estimate.map_or(0, |e| e.0));
+    w.u8(source(e.estimate.map(|e| e.1)));
 }
-pub(crate) fn encode_client_entry(out: &mut Vec<u8>, e: &ClientEntry) {
-    client_entry(&mut Writer { bytes: out }, e);
+/// A client entry's kind and identity token; the Echo service's `id` is
+/// its queued message count, a live value, so only its kind counts.
+pub(crate) fn client_revision(out: &mut Vec<u8>, e: &ClientEntry) {
+    let w = &mut Writer { bytes: out };
+    w.u8(e.kind as u8);
+    w.u64(if e.kind == ClientKind::Echo { 0 } else { e.id });
 }
 
 /// Encode a response as a complete frame into `out` (cleared first).
@@ -1117,7 +1147,7 @@ mod tests {
             clients: 3,
         };
         let mut one = Vec::new();
-        encode_path_entry(&mut one, &entry);
+        path_entry(&mut Writer { bytes: &mut one }, &entry);
         assert_eq!(one.len(), PATH_ENTRY);
         let route = RouteEntry {
             token: 1,
@@ -1134,7 +1164,7 @@ mod tests {
             policy: Policy::default(),
         };
         one.clear();
-        encode_route_entry(&mut one, &route);
+        route_entry(&mut Writer { bytes: &mut one }, &route);
         assert_eq!(one.len(), ROUTE_ENTRY);
         let client = ClientEntry {
             kind: ClientKind::Tcp,
@@ -1148,7 +1178,7 @@ mod tests {
             }),
         };
         one.clear();
-        encode_client_entry(&mut one, &client);
+        client_entry(&mut Writer { bytes: &mut one }, &client);
         assert_eq!(one.len(), CLIENT_ENTRY);
         let mut out = Vec::new();
         let header = |count: usize| PageHeader {

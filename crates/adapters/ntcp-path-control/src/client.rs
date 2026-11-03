@@ -39,10 +39,27 @@ impl Client {
         Ok(Self { stream })
     }
 
-    /// Send one request and read its reply.
+    /// Send one request and read its reply. A server that refuses the
+    /// connection at accept (`Unauthorized`, `Busy`) replies and closes
+    /// before reading anything, so the write may fail with a broken pipe or
+    /// reset; the reply already delivered to this socket is then read and
+    /// returned, and the write error only when no complete frame arrived.
     pub fn call(&mut self, request: &Request) -> Result<Response, ClientError> {
-        self.stream.write_all(&protocol::encode_request(request))?;
-        self.read_response()
+        match self.stream.write_all(&protocol::encode_request(request)) {
+            Ok(()) => self.read_response(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                match self.read_response() {
+                    Err(ClientError::Io(_)) => Err(ClientError::Io(error)),
+                    other => other,
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Read one reply frame.
