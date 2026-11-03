@@ -1493,9 +1493,12 @@ fn managed_native_scalar_input_records_once_with_one_utc_source_sample() {
     );
 }
 
-// Origin Timestamp time is sampled once, and only for a datagram whose
-// origin recording writes a slot (RFC 1122 section 3.2.1.8); any other value
-// is never written and stays the marked elapsed time.
+// Native TCP originates no IPv4 options, so its egress samples no time.
+// Its provider under the one core origin recording
+// (OutgoingIpv4Options::encode_with) is sampled once, and only for a
+// Timestamp slot the origin writes (RFC 1122 section 3.2.1.8); the value it
+// writes is standard within the test's own kernel clock window or the owner
+// clock's elapsed milliseconds marked nonstandard.
 //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
 //= type=test
 //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
@@ -1505,6 +1508,7 @@ fn native_origin_timestamp_samples_only_for_a_written_slot() {
     use ntcp::{OutgoingIpv4Options, TimestampRequest};
     let source = Ipv4Addr::new(10, 73, 0, 2);
     let other = Ipv4Addr::new(10, 73, 0, 9);
+    let destination = Ipv4Addr::new(10, 73, 0, 1);
     let now = 5_000_000;
     let mut clock = backend::Ipv4Clock::default();
     for (timestamp, writes) in [
@@ -1532,11 +1536,37 @@ fn native_origin_timestamp_samples_only_for_a_written_slot() {
             ..Default::default()
         };
         let sampled = clock.acquisitions;
+        let mut out = [0; 40];
         let before = super::utc_read();
-        let time = clock.origin(&options, source.into(), now);
+        let (_, len) = options
+            .encode_with(
+                source,
+                destination,
+                &mut backend::Recording {
+                    clock: &mut clock,
+                    now,
+                },
+                &mut out,
+            )
+            .unwrap();
         let after = super::utc_read();
         assert_eq!(clock.acquisitions - sampled, usize::from(writes));
-        if !writes || !super::standard_time(time, before, after) {
+        // Record Route (11 octets) precedes the Timestamp option.
+        assert_eq!(&out[..7], &[7, 11, 8, 10, 73, 0, 2]);
+        let Some(request) = timestamp else {
+            assert_eq!(len, 12);
+            continue;
+        };
+        let ts = &out[11..len];
+        let time = match request {
+            TimestampRequest::Times(_) => &ts[4..8],
+            _ => &ts[8..12],
+        };
+        let time = u32::from_be_bytes(time.try_into().unwrap());
+        if !writes {
+            assert_eq!(ts[2], 5, "no slot written");
+            assert_eq!(time, 0);
+        } else if !super::standard_time(time, before, after) {
             assert_eq!(time, 0x8000_0000 | 5_000);
         }
     }

@@ -112,23 +112,6 @@ fn read_all(peer: &mut Peer, id: ConnectionId, len: usize) -> Vec<u8> {
     bytes
 }
 
-//= https://www.rfc-editor.org/rfc/rfc791#section-3.1
-//= type=test
-//# A recorded route is composed of a series of internet addresses. Each
-//# internet address is 32 bits or 4 octets. If the pointer is greater than
-//# the length, the recorded route data area is full. The originating host
-//# must compose this option with a large enough route data area to hold all
-//# the address expected. The size of the option does not change due to
-//# adding addresses. The intitial contents of the route data area must be
-//# zero.
-
-//= https://www.rfc-editor.org/rfc/rfc791#section-3.1
-//= type=test
-//# The originating host must compose this option with a large enough
-//# timestamp data area to hold all the timestamp information expected. The
-//# size of the option does not change due to adding timestamps. The
-//# intitial contents of the timestamp data area must be zero or internet
-//# address/zero pairs.
 #[test]
 fn planned_opens_check_the_plan_before_any_path_or_connection_allocation() {
     use Ipv4RegistrationError::*;

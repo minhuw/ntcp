@@ -568,20 +568,51 @@ impl OutgoingIpv4Options {
         timestamp: u32,
         out: &mut [u8],
     ) -> Result<(Ipv4Addr, usize), Ipv4OptionsError> {
+        self.encode_recorded(source, final_destination, out, |area| {
+            area.record(source, timestamp)
+        })
+    }
+
+    /// [`Self::encode`] recording the origin with time from `provider`,
+    /// sampled at most once and only for a Timestamp slot the origin writes:
+    /// one whose addresses are not prespecified, or whose first prespecified
+    /// address is `source`. Without a sample that slot and its pointer stay
+    /// initialized. A request checked by [`Ipv4RegistrationPlan`] from
+    /// `source` toward `final_destination` yields
+    /// [`Ipv4RegistrationPlan::option_octets`].
+    pub fn encode_with<P: Ipv4TimestampProvider + ?Sized>(
+        &self,
+        source: Ipv4Addr,
+        final_destination: Ipv4Addr,
+        provider: &mut P,
+        out: &mut [u8],
+    ) -> Result<(Ipv4Addr, usize), Ipv4OptionsError> {
+        self.encode_recorded(source, final_destination, out, |area| {
+            area.record_with(source, provider)
+        })
+    }
+
+    // The one origin recording: the initialized area, then `record` on its
+    // Record Route and Timestamp options, never on the unconsumed outgoing
+    // route. `out` is checked first, so nothing is sampled for an area that
+    // cannot be written.
+    fn encode_recorded(
+        &self,
+        source: Ipv4Addr,
+        final_destination: Ipv4Addr,
+        out: &mut [u8],
+        record: impl FnOnce(Ipv4Options) -> Result<Ipv4Options, Ipv4OptionsError>,
+    ) -> Result<(Ipv4Addr, usize), Ipv4OptionsError> {
         if !unicast(source) || !unicast(final_destination) {
             return Err(Ipv4OptionsError::InvalidAddress);
         }
         let mut bytes = [0u8; 40];
         let (destination, route_len, len) = self.initialize(final_destination, &mut bytes)?;
-        // Record originating RR/TS without interpreting the unconsumed outgoing route.
-        let recorded =
-            Ipv4Options::parse(&bytes[route_len..len], false)?.record(source, timestamp)?;
-        bytes[route_len..len].copy_from_slice(recorded.as_bytes());
         let padded = (len + 3) & !3;
-        if out.len() < padded {
-            return Err(Ipv4OptionsError::Capacity);
-        }
-        out[..padded].copy_from_slice(&bytes[..padded]);
+        let out = out.get_mut(..padded).ok_or(Ipv4OptionsError::Capacity)?;
+        let recorded = record(Ipv4Options::parse(&bytes[route_len..len], false)?)?;
+        bytes[route_len..len].copy_from_slice(recorded.as_bytes());
+        out.copy_from_slice(&bytes[..padded]);
         Ok((destination, padded))
     }
 
@@ -812,8 +843,9 @@ fn check_expectations(
 /// originating host composes the option with a data area large enough for all
 /// expected addresses and timestamps) and the zero-padded option area fits
 /// the 40-octet IPv4 maximum. Nothing is truncated, shrunk or dropped. The
-/// encoded area always has [`Self::option_octets`] octets, initialized (zero,
-/// or address/zero pairs for prespecified addresses) before origin recording;
+/// checked request's encoded area ([`OutgoingIpv4Options::encode_with`])
+/// always has [`Self::option_octets`] octets, initialized (zero, or
+/// address/zero pairs for prespecified addresses) before origin recording;
 /// registration never changes its size. TCP options are carried in the TCP
 /// header and do not consume this budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -903,29 +935,6 @@ impl Ipv4RegistrationPlan {
             return Err(Ipv4RegistrationError::PlanMismatch);
         }
         Ok(())
-    }
-
-    /// Encode the initialized option area into `out` and record the origin,
-    /// sampling `provider` only for a Timestamp slot the origin may write;
-    /// without a sample that slot and its pointer stay initialized. Returns
-    /// the header destination and [`Self::option_octets`].
-    pub fn encode_with<P: Ipv4TimestampProvider + ?Sized>(
-        &self,
-        provider: &mut P,
-        out: &mut [u8],
-    ) -> Result<(Ipv4Addr, usize), Ipv4OptionsError> {
-        let out = out
-            .get_mut(..self.option_octets())
-            .ok_or(Ipv4OptionsError::Capacity)?;
-        let mut bytes = [0u8; 40];
-        let (destination, route_len, len) = self
-            .options
-            .initialize(self.final_destination, &mut bytes)?;
-        let recorded = Ipv4Options::parse(&bytes[route_len..len], false)?
-            .record_with(self.source, provider)?;
-        bytes[route_len..len].copy_from_slice(recorded.as_bytes());
-        out.copy_from_slice(&bytes[..out.len()]);
-        Ok((destination, out.len()))
     }
 }
 
@@ -1889,7 +1898,10 @@ mod tests {
                     assert_eq!(plan.options(), &options);
                     let mut out = [0xa5; 40];
                     let mut clock = provider(Some(7));
-                    let (destination, len) = plan.encode_with(&mut clock, &mut out).unwrap();
+                    let (destination, len) = plan
+                        .options()
+                        .encode_with(ip(1), ip(2), &mut clock, &mut out)
+                        .unwrap();
                     assert_eq!(len, padded);
                     assert!(out[padded..].iter().all(|&b| b == 0xa5));
                     assert!(out[unpadded..padded].iter().all(|&b| b == 0));
@@ -2014,23 +2026,6 @@ mod tests {
         );
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
-    //= type=test
-    //# A recorded route is composed of a series of internet addresses. Each
-    //# internet address is 32 bits or 4 octets. If the pointer is greater than
-    //# the length, the recorded route data area is full. The originating host
-    //# must compose this option with a large enough route data area to hold all
-    //# the address expected. The size of the option does not change due to
-    //# adding addresses. The intitial contents of the route data area must be
-    //# zero.
-
-    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
-    //= type=test
-    //# The originating host must compose this option with a large enough
-    //# timestamp data area to hold all the timestamp information expected. The
-    //# size of the option does not change due to adding timestamps. The
-    //# intitial contents of the timestamp data area must be zero or internet
-    //# address/zero pairs.
     #[test]
     fn plan_refuses_insufficient_records_per_option() {
         use Ipv4RegistrationError::InsufficientRecords;
@@ -2325,7 +2320,10 @@ mod tests {
             for sample in [Some(9), None] {
                 let mut clock = provider(sample);
                 let mut out = [0xa5; 40];
-                let (destination, octets) = plan.encode_with(&mut clock, &mut out).unwrap();
+                let (destination, octets) = plan
+                    .options()
+                    .encode_with(ip(1), ip(2), &mut clock, &mut out)
+                    .unwrap();
                 assert_eq!((destination, octets), (ip(3), plan.option_octets()));
                 assert_eq!(clock.calls, usize::from(writes));
                 assert_eq!(&out[..7], &initialized[..7]);
@@ -2341,10 +2339,14 @@ mod tests {
                 }
                 assert_eq!(&out[18..octets], &expected[18..octets]);
                 assert!(out[octets..].iter().all(|&b| b == 0xa5));
+                let mut short = provider(sample);
                 assert_eq!(
-                    plan.encode_with(&mut provider(sample), &mut out[..octets - 1]),
+                    plan.options()
+                        .encode_with(ip(1), ip(2), &mut short, &mut out[..octets - 1]),
                     Err(Ipv4OptionsError::Capacity)
                 );
+                // An area that cannot be written samples nothing.
+                assert_eq!(short.calls, 0);
 
                 // Downstream registrations fill the area, never resize it.
                 let mut received = Ipv4Options::parse(&out[7..len], false).unwrap();
@@ -2376,7 +2378,8 @@ mod tests {
             let plan = plan(options, &exact(&options, &[ip(1); 4])).unwrap();
             let mut encoded = [0; 40];
             let (_, len) = plan
-                .encode_with(&mut provider(Some(7)), &mut encoded)
+                .options()
+                .encode_with(ip(1), ip(2), &mut provider(Some(7)), &mut encoded)
                 .unwrap();
             let mut out = [0xa5; 40];
             // Only the copied source route reaches later fragments.
@@ -2392,7 +2395,8 @@ mod tests {
         let plan = plan(options, &exact(&options, &[ip(1); 4])).unwrap();
         let mut encoded = [0; 40];
         let (_, len) = plan
-            .encode_with(&mut provider(Some(7)), &mut encoded)
+            .options()
+            .encode_with(ip(1), ip(2), &mut provider(Some(7)), &mut encoded)
             .unwrap();
         assert_eq!(len, 32);
         assert_eq!(copied_fragment_options(&encoded[..len], &mut []), Ok(0));

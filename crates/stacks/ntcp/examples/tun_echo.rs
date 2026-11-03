@@ -949,14 +949,14 @@ mod linux {
                 ecn,
                 ipv4_options: ntcp::OutgoingIpv4Options::default(),
             },
-            0,
+            &mut Sample(0),
         )
     }
 
     fn build_ipv4_options(
         packet: &mut [u8],
         transmit: ntcp::Transmit,
-        timestamp: u32,
+        timestamps: &mut dyn ntcp::Ipv4TimestampProvider,
     ) -> io::Result<usize> {
         let (IpAddr::V4(source), IpAddr::V4(destination)) =
             (transmit.ip.source, transmit.ip.destination)
@@ -967,7 +967,7 @@ mod linux {
             return Err(invalid("invalid outgoing IPv4 address"));
         }
         let capacity = packet.len().min(MTU);
-        ntcp_ip::encode(&mut packet[..capacity], transmit, timestamp)
+        ntcp_ip::encode_with(&mut packet[..capacity], transmit, timestamps)
             .map_err(|_| invalid("invalid outgoing IPv4 packet or MTU exceeded"))
     }
 
@@ -1134,10 +1134,10 @@ mod linux {
     fn build_frame(
         packet: &mut [u8],
         transmit: ntcp::Transmit,
-        timestamp: u32,
+        timestamps: &mut dyn ntcp::Ipv4TimestampProvider,
     ) -> io::Result<usize> {
         match transmit.ip.source {
-            IpAddr::V4(_) => build_ipv4_options(packet, transmit, timestamp),
+            IpAddr::V4(_) => build_ipv4_options(packet, transmit, timestamps),
             IpAddr::V6(_) => build_ipv6(packet, transmit),
         }
     }
@@ -1407,30 +1407,6 @@ mod linux {
         start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
     }
 
-    // The time an originated Timestamp option records at this origin,
-    // sampled only when origin recording writes a slot: one whose addresses
-    // are not prespecified, or whose first prespecified address is the
-    // source (RFC 1122 section 3.2.1.8). Without one the value is never
-    // written; it is the loop's elapsed time at `time` marked nonstandard.
-    fn origin_timestamp(
-        transmit: &ntcp::Transmit,
-        time: u64,
-        timestamps: &mut dyn ntcp::Ipv4TimestampProvider,
-    ) -> u32 {
-        let writes = match transmit.ipv4_options.timestamp {
-            None => false,
-            Some(ntcp::TimestampRequest::Prespecified { addresses, len }) => {
-                len != 0 && transmit.ip.source == IpAddr::V4(addresses[0])
-            }
-            Some(_) => true,
-        };
-        writes
-            .then(|| timestamps.ipv4_timestamp())
-            .flatten()
-            .unwrap_or(ntcp::Ipv4Timestamp::nonstandard((time / 1000) as u32))
-            .wire_value()
-    }
-
     // TCP frames on a discovery-disabled IPv4 route or path that wait for an
     // Identification (the allocator's start quiet period, or the RFC 6864
     // ceiling of their tuple). Only such a frame waits: it keeps its owner's
@@ -1607,9 +1583,10 @@ mod linux {
                 };
                 let attempt =
                     attempt.ok_or_else(|| io::Error::other("missing transmit attempt"))?;
-                // A frame held for retry keeps these bytes and its time.
-                let timestamp = origin_timestamp(&packet, time, timestamps);
-                let len = match build_frame(output, packet, timestamp) {
+                // Origin recording samples `timestamps` only for a Timestamp
+                // slot it writes; a frame held for retry keeps these bytes
+                // and its time.
+                let len = match build_frame(output, packet, timestamps) {
                     Ok(len) => len,
                     Err(error) => {
                         // Encoding failed before any backend call. Keep core's
@@ -3150,7 +3127,7 @@ mod linux {
                         transmit.dscp = dscp;
                         transmit.ecn = ecn;
                         transmit.hop_limit = hop_limit;
-                        let len = build_frame(&mut bytes, transmit, 0).unwrap();
+                        let len = build_frame(&mut bytes, transmit, &mut Sample(0)).unwrap();
                         assert_eq!(len, 60);
                         assert_eq!(bytes[0], 0x60 | (dscp >> 2));
                         assert_eq!(bytes[1], ((dscp << 2) | ecn) << 4);
@@ -3166,7 +3143,7 @@ mod linux {
                     }
                 }
             }
-            let len = build_frame(&mut bytes, v6_transmit(20), 0).unwrap();
+            let len = build_frame(&mut bytes, v6_transmit(20), &mut Sample(0)).unwrap();
             for truncated in 0..len {
                 assert!(parse_ipv6(&bytes[..truncated], local).is_none());
             }
@@ -3229,7 +3206,7 @@ mod linux {
                     } else {
                         transmit.ip.destination = address.into();
                     }
-                    assert!(build_frame(&mut bad, transmit, 0).is_err());
+                    assert!(build_frame(&mut bad, transmit, &mut Sample(0)).is_err());
                 }
             }
             let local_ip = IpAddr::V6(local);
@@ -3257,29 +3234,29 @@ mod linux {
                 destination: local.into()
             }));
             for payload in [1, 20, MTU - IPV6_HEADER] {
-                let len = build_frame(&mut bytes, v6_transmit(payload), 0).unwrap();
+                let len = build_frame(&mut bytes, v6_transmit(payload), &mut Sample(0)).unwrap();
                 assert_eq!(len, IPV6_HEADER + payload);
                 assert_eq!(parse_ipv6(&bytes[..len], local).unwrap().2.len(), payload);
             }
             let before = bytes;
             for payload in [0, MTU - IPV6_HEADER + 1, usize::MAX] {
-                assert!(build_frame(&mut bytes, v6_transmit(payload), 0).is_err());
+                assert!(build_frame(&mut bytes, v6_transmit(payload), &mut Sample(0)).is_err());
                 assert_eq!(bytes, before);
             }
-            assert!(build_frame(&mut bytes[..59], v6_transmit(20), 0).is_err());
+            assert!(build_frame(&mut bytes[..59], v6_transmit(20), &mut Sample(0)).is_err());
             for (dscp, ecn, hop) in [(64, 0, 64), (0, 4, 64), (0, 0, 0)] {
                 let mut transmit = v6_transmit(20);
                 transmit.dscp = dscp;
                 transmit.ecn = ecn;
                 transmit.hop_limit = hop;
-                assert!(build_frame(&mut bytes, transmit, 0).is_err());
+                assert!(build_frame(&mut bytes, transmit, &mut Sample(0)).is_err());
             }
             let mut transmit = v6_transmit(20);
             transmit.ip.destination = "192.0.2.2".parse().unwrap();
-            assert!(build_frame(&mut bytes, transmit, 0).is_err());
+            assert!(build_frame(&mut bytes, transmit, &mut Sample(0)).is_err());
             transmit = v6_transmit(20);
             transmit.ipv4_options.record_route_slots = Some(1);
-            assert!(build_frame(&mut bytes, transmit, 0).is_err());
+            assert!(build_frame(&mut bytes, transmit, &mut Sample(0)).is_err());
             let (v4, len, _) = packet();
             assert!(parse_ipv6(&v4[..len], local).is_none());
             assert!(parse_ipv4(&bytes[..60], Ipv4Addr::new(192, 0, 2, 2)).is_none());
@@ -3628,23 +3605,6 @@ mod linux {
 
         // The real active open's originated options state the expected
         // registrations; the plan, not the stack, sizes nothing.
-        //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
-        //= type=test
-        //# A recorded route is composed of a series of internet addresses. Each
-        //# internet address is 32 bits or 4 octets. If the pointer is greater than
-        //# the length, the recorded route data area is full. The originating host
-        //# must compose this option with a large enough route data area to hold all
-        //# the address expected. The size of the option does not change due to
-        //# adding addresses. The intitial contents of the route data area must be
-        //# zero.
-
-        //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
-        //= type=test
-        //# The originating host must compose this option with a large enough
-        //# timestamp data area to hold all the timestamp information expected. The
-        //# size of the option does not change due to adding timestamps. The
-        //# intitial contents of the timestamp data area must be zero or internet
-        //# address/zero pairs.
         #[test]
         fn originated_option_configuration_states_expected_registrations() {
             use ntcp::{
@@ -3708,6 +3668,242 @@ mod linux {
             }
         }
 
+        // The example's real origin output for planned connections: each SYN
+        // leaves transmit_frames with the planned, initialized option area in
+        // which only the origin registered, 4-octet addresses, pointers at the
+        // next slot and the plan's fixed size. The provider is sampled once
+        // for a Timestamp slot the origin writes (flags 0 and 1, or flag 3
+        // whose first address is the source), never otherwise. Downstream
+        // registrations then fill the area without resizing it.
+        //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+        //= type=test
+        //# A recorded route is composed of a series of internet addresses. Each
+        //# internet address is 32 bits or 4 octets. If the pointer is greater than
+        //# the length, the recorded route data area is full. The originating host
+        //# must compose this option with a large enough route data area to hold all
+        //# the address expected. The size of the option does not change due to
+        //# adding addresses. The intitial contents of the route data area must be
+        //# zero.
+
+        //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+        //= type=test
+        //# The originating host must compose this option with a large enough
+        //# timestamp data area to hold all the timestamp information expected. The
+        //# size of the option does not change due to adding timestamps. The
+        //# intitial contents of the timestamp data area must be zero or internet
+        //# address/zero pairs.
+        #[test]
+        fn planned_origin_frames_carry_fixed_initialized_option_areas() {
+            use ntcp::{
+                ExpectedRegistrations, ExpectedTimestamps, Ipv4Options, OutgoingIpv4Options,
+            };
+            use ntcp::{Ipv4RegistrationPlan, SourceRoute, TimestampRequest};
+            use ntcp_io::{PacketIo, PacketLayer};
+            struct Mock {
+                submitted: Vec<Vec<u8>>,
+            }
+            impl PacketIo for Mock {
+                fn layer(&self) -> PacketLayer {
+                    PacketLayer::Ip
+                }
+                fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+                    Ok(None)
+                }
+                fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+                    self.submitted.push(packet.to_vec());
+                    Ok(TxOutcome::Submitted)
+                }
+            }
+            // Counts samples; its time is marked nonstandard.
+            struct Counted(usize);
+            impl ntcp::Ipv4TimestampProvider for Counted {
+                fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
+                    self.0 += 1;
+                    Some(ntcp::Ipv4Timestamp::nonstandard(0x0123_4567))
+                }
+            }
+            const TIME: [u8; 4] = [0x81, 0x23, 0x45, 0x67];
+            let (_, _, local) = packet();
+            let peer = Ipv4Addr::new(10, 0, 0, 1);
+            let hop = Ipv4Addr::new(10, 0, 0, 9);
+            let other = Ipv4Addr::new(10, 0, 0, 7);
+            let config = EndpointConfig {
+                ipv4_options_enabled: true,
+                ..Default::default()
+            };
+            let direct = [local, peer, peer];
+            let routed = [local, hop, peer];
+            for (hops, path) in [(&[][..], &direct[..2]), (&[hop][..], &routed[..])] {
+                let n = path.len() as u8;
+                // The direct path also holds Record Route; the routed one
+                // has room for it only without a Timestamp option.
+                let record_route = hops.is_empty().then_some(n);
+                let mut cases = vec![
+                    (None, Some(n)),
+                    (Some(TimestampRequest::Times(n)), record_route),
+                    (Some(TimestampRequest::AddressTimes(n)), record_route),
+                ];
+                for first in [local, other] {
+                    let mut addresses = [peer; 4];
+                    addresses[..path.len()].copy_from_slice(path);
+                    addresses[0] = first;
+                    cases.push((
+                        Some(TimestampRequest::Prespecified { addresses, len: n }),
+                        record_route,
+                    ));
+                }
+                for (timestamp, record_route_slots) in cases {
+                    let outgoing = OutgoingIpv4Options {
+                        source_route: Some(SourceRoute::new(hops, false).unwrap()),
+                        record_route_slots,
+                        timestamp,
+                    };
+                    let prespecified;
+                    let expected = ExpectedRegistrations {
+                        record_route: record_route_slots,
+                        timestamp: match timestamp {
+                            None => None,
+                            Some(TimestampRequest::Prespecified { addresses, len }) => {
+                                prespecified = addresses;
+                                Some(ExpectedTimestamps::Prespecified(
+                                    &prespecified[..usize::from(len)],
+                                ))
+                            }
+                            Some(_) => Some(ExpectedTimestamps::Count(n)),
+                        },
+                    };
+                    let plan =
+                        Ipv4RegistrationPlan::new(local.into(), peer.into(), outgoing, &expected)
+                            .unwrap();
+                    let mut endpoint =
+                        Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
+                    let mut network =
+                        TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
+                    endpoint
+                        .connect_with_path_provider(
+                            0,
+                            SocketAddr::new(local.into(), 1234),
+                            SocketAddr::new(peer.into(), 8080),
+                            ntcp::ManagedOpenOptions {
+                                transport: ntcp::ActiveOpenOptions::from(&config.connection),
+                                dscp: config.dscp,
+                                ipv4_options: outgoing,
+                                registration: Some(plan),
+                                receive_authority: None,
+                            },
+                            &mut network.host,
+                        )
+                        .unwrap();
+                    let mut backend = Mock {
+                        submitted: Vec::new(),
+                    };
+                    let mut clock = Counted(0);
+                    transmit_frames(
+                        &mut network,
+                        &mut endpoint,
+                        1,
+                        &mut [0; MTU],
+                        &mut None,
+                        IP_HEADER,
+                        &mut clock,
+                        &mut backend,
+                    )
+                    .unwrap();
+                    let writes = match timestamp {
+                        None => false,
+                        Some(TimestampRequest::Prespecified { addresses, .. }) => {
+                            addresses[0] == local
+                        }
+                        Some(_) => true,
+                    };
+                    assert_eq!(clock.0, usize::from(writes), "{outgoing:?}");
+
+                    // The expected area, octet for octet.
+                    let mut area = Vec::new();
+                    if let Some(first) = hops.first() {
+                        area.extend_from_slice(&[131, 7, 4]);
+                        area.extend_from_slice(&peer.octets());
+                        assert_eq!(*first, hop);
+                    }
+                    let route_len = area.len();
+                    if let Some(slots) = record_route_slots {
+                        area.extend_from_slice(&[7, 3 + 4 * slots, 8]);
+                        area.extend_from_slice(&local.octets());
+                        area.resize(area.len() + 4 * usize::from(slots - 1), 0);
+                    }
+                    if let Some(request) = timestamp {
+                        let (flag, stride) = match request {
+                            TimestampRequest::Times(_) => (0, 4),
+                            TimestampRequest::AddressTimes(_) => (1, 8),
+                            TimestampRequest::Prespecified { .. } => (3, 8),
+                        };
+                        let pointer = if writes { 5 + stride } else { 5 };
+                        area.extend_from_slice(&[68, 4 + stride * n, pointer, flag]);
+                        for slot in 0..usize::from(n) {
+                            match request {
+                                TimestampRequest::AddressTimes(_) if slot == 0 => {
+                                    area.extend_from_slice(&local.octets())
+                                }
+                                TimestampRequest::AddressTimes(_) => {
+                                    area.extend_from_slice(&[0; 4])
+                                }
+                                TimestampRequest::Prespecified { addresses, .. } => {
+                                    area.extend_from_slice(&addresses[slot].octets())
+                                }
+                                TimestampRequest::Times(_) => {}
+                            }
+                            area.extend_from_slice(if slot == 0 && writes {
+                                &TIME
+                            } else {
+                                &[0; 4]
+                            });
+                        }
+                    }
+                    let unpadded = area.len();
+                    area.resize(unpadded.div_ceil(4) * 4, 0);
+                    assert_eq!(area.len(), plan.option_octets());
+
+                    let syn = &backend.submitted[0];
+                    let header = usize::from(syn[0] & 15) * 4;
+                    assert_eq!(header, IP_HEADER + plan.option_octets());
+                    assert_eq!(checksum(&syn[..header]), 0);
+                    let first_hop = hops.first().copied().unwrap_or(peer);
+                    assert_eq!(&syn[16..20], &first_hop.octets());
+                    assert_eq!(&syn[IP_HEADER..header], &area[..], "{outgoing:?}");
+
+                    // Downstream registrations fill the area, never resize it.
+                    let mut received =
+                        Ipv4Options::parse(&area[route_len..unpadded], false).unwrap();
+                    let size = unpadded - route_len;
+                    for visit in 0..10 {
+                        received = received
+                            .record(Ipv4Addr::new(10, 0, 1, visit), 0x8000_0001)
+                            .unwrap();
+                        assert_eq!(received.as_bytes().len(), size);
+                    }
+                    let bytes = received.as_bytes();
+                    if let Some(slots) = record_route_slots {
+                        let len = usize::from(3 + 4 * slots);
+                        // Full: the pointer exceeds the length, every slot one address.
+                        assert_eq!(&bytes[..3], &[7, len as u8, len as u8 + 1]);
+                        assert_eq!(&bytes[3..7], &local.octets());
+                        for (slot, address) in bytes[7..len].chunks_exact(4).enumerate() {
+                            assert_eq!(address, &[10, 0, 1, slot as u8]);
+                        }
+                    }
+                    if let Some(TimestampRequest::Times(_) | TimestampRequest::AddressTimes(_)) =
+                        timestamp
+                    {
+                        // Full after n - 1 more registrations; later visits
+                        // only count in the overflow field.
+                        let ts = &bytes[record_route_slots.map_or(0, |r| 3 + 4 * usize::from(r))..];
+                        assert_eq!(usize::from(ts[2]), ts.len() + 1);
+                        assert_eq!(ts[3] >> 4, 10 - (n - 1));
+                    }
+                }
+            }
+        }
+
         #[test]
         fn enabled_option_profile_header_mtu_and_timestamp_roundtrip() {
             use ntcp::{OutgoingIpv4Options, SourceRoute, TimestampRequest};
@@ -3738,7 +3934,7 @@ mod linux {
                     timestamp: Some(TimestampRequest::Times(4)),
                 },
             };
-            let len = build_ipv4_options(&mut bytes, transmit, 0x8000_0001).unwrap();
+            let len = build_ipv4_options(&mut bytes, transmit, &mut Sample(1)).unwrap();
             assert_eq!(len, MTU);
             assert_eq!(bytes[0], 0x4f);
             assert_eq!(checksum(&bytes[..60]), 0);
@@ -3761,10 +3957,10 @@ mod linux {
             assert_eq!(&recorded[26..30], &0x8000_0002u32.to_be_bytes());
             let before = bytes;
             transmit.len = 1441;
-            assert!(build_ipv4_options(&mut bytes, transmit, 0).is_err());
+            assert!(build_ipv4_options(&mut bytes, transmit, &mut Sample(0)).is_err());
             assert_eq!(bytes, before);
             transmit.len = 1440;
-            assert!(build_ipv4_options(&mut bytes[..MTU - 1], transmit, 0).is_err());
+            assert!(build_ipv4_options(&mut bytes[..MTU - 1], transmit, &mut Sample(0)).is_err());
             assert_eq!(bytes, before);
         }
 
@@ -3878,7 +4074,7 @@ mod linux {
                         .unwrap();
                     let tx = poll.packet.unwrap();
                     let attempt = attempt.unwrap();
-                    let mut len = build_ipv4_options(&mut bytes, tx, source_time).unwrap();
+                    let mut len = build_ipv4_options(&mut bytes, tx, &mut Sample(123)).unwrap();
                     let context = from_host.host.egress_context(from, attempt).unwrap();
                     let ticket = from_host.host.submission_ticket(from, context).unwrap();
                     let submitted = from_host

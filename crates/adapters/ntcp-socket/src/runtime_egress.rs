@@ -495,10 +495,12 @@ impl Owner {
             None => (None, None), // Explicit low-level Endpoint fixtures.
         };
         let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
-        // Origin Timestamp time, sampled only for a slot this datagram's
-        // origin recording writes; native TCP refuses outgoing IPv4 options,
-        // so none is. A packet held for retry keeps these bytes.
-        let timestamp = self.ipv4_clock.origin(&tx.ipv4_options, tx.ip.source, now);
+        // Native TCP refuses outgoing IPv4 options (its configuration rejects
+        // ipv4_options_enabled), so no option is ever originated here and
+        // this value is never written; it is marked nonstandard (RFC 791
+        // section 3.1) and samples no clock. A packet held for retry keeps
+        // these bytes.
+        let timestamp = ntcp::Ipv4Timestamp::nonstandard((now / 1000) as u32).wire_value();
         let ip_len = crate::ip::encode(&mut bytes[offset..], tx, timestamp, tx.len - shared_len)
             .map_err(|_| EIO)?;
         // A packet identified at submission keeps its header open until then;

@@ -31,35 +31,11 @@ impl Ipv4Clock {
         // A standard value is below 86 400 000, a nonstandard one marked.
         ntcp::Ipv4Timestamp::from_wire(self.utc.sample(now / 1000).value).ok()
     }
-    /// The time an originated Timestamp option records at the origin with
-    /// `options` from `source`, sampled only when origin recording writes a
-    /// slot: an option whose addresses are not prespecified, or whose first
-    /// prespecified address is `source` (RFC 1122 section 3.2.1.8). Without
-    /// one the value is never written; it is the marked elapsed time.
-    pub(super) fn origin(
-        &mut self,
-        options: &ntcp::OutgoingIpv4Options,
-        source: IpAddr,
-        now: u64,
-    ) -> u32 {
-        let writes = match options.timestamp {
-            None => false,
-            Some(ntcp::TimestampRequest::Prespecified { addresses, len }) => {
-                len != 0 && source == IpAddr::V4(addresses[0])
-            }
-            Some(_) => true,
-        };
-        writes
-            .then(|| self.sample(now))
-            .flatten()
-            .unwrap_or(ntcp::Ipv4Timestamp::nonstandard((now / 1000) as u32))
-            .wire_value()
-    }
 }
 // Destination recording with time sampled at `now` on the owner clock.
-struct Recording<'a> {
-    clock: &'a mut Ipv4Clock,
-    now: u64,
+pub(super) struct Recording<'a> {
+    pub(super) clock: &'a mut Ipv4Clock,
+    pub(super) now: u64,
 }
 impl ntcp::Ipv4TimestampProvider for Recording<'_> {
     fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {

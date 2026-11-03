@@ -1,6 +1,8 @@
 #![no_std]
 use core::net::{IpAddr, Ipv4Addr};
-use ntcp::{EncodedIpv4Options, IpMetadata, Ipv4Options, OutgoingIpv4Options};
+use ntcp::{
+    EncodedIpv4Options, IpMetadata, Ipv4Options, Ipv4TimestampProvider, OutgoingIpv4Options,
+};
 
 pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, UDP_HEADER, checksum};
 pub const IPV4_HEADER: usize = 20;
@@ -411,9 +413,25 @@ impl Fragmenter {
 //# Normally, the host continues to set DF in all datagrams, so that if the route
 //# changes and the new PMTU is lower, it will be discovered.
 
+/// Low-level caller contract: `timestamp` is a caller-asserted
+/// `ntcp::Ipv4Timestamp` wire value, recorded by an originated Timestamp
+/// option whose slot the origin writes.
 pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit, timestamp: u32) -> Result<usize, Error> {
     let len = transmit.len;
     let area = Area::Originate(timestamp);
+    encode_present(packet, transmit.into(), PROTOCOL_TCP, len, area, len)
+}
+
+/// `encode` recording the origin with time from `provider`
+/// (`OutgoingIpv4Options::encode_with`): sampled at most once, and only for
+/// an originated Timestamp slot the origin writes.
+pub fn encode_with(
+    packet: &mut [u8],
+    transmit: ntcp::Transmit,
+    provider: &mut dyn Ipv4TimestampProvider,
+) -> Result<usize, Error> {
+    let len = transmit.len;
+    let area = Area::Record(provider);
     encode_present(packet, transmit.into(), PROTOCOL_TCP, len, area, len)
 }
 
@@ -445,10 +463,11 @@ pub fn encode_datagram_with_options(
 }
 
 // Where the option area of an encoded datagram comes from.
-#[derive(Clone, Copy)]
 enum Area<'a> {
     // Originated from `Header::ipv4_options`, recording with this timestamp.
     Originate(u32),
+    // Originated from `Header::ipv4_options`, recording with this provider.
+    Record(&'a mut dyn Ipv4TimestampProvider),
     // Sent as is.
     Encoded(&'a EncodedIpv4Options),
 }
@@ -464,6 +483,9 @@ fn option_area(
     match area {
         Area::Originate(timestamp) => outgoing
             .encode(source, destination, timestamp, out)
+            .map_err(|_| Error::Options),
+        Area::Record(provider) => outgoing
+            .encode_with(source, destination, provider, out)
             .map_err(|_| Error::Options),
         Area::Encoded(encoded) => {
             if outgoing != OutgoingIpv4Options::default()

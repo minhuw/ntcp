@@ -2,6 +2,7 @@ import copy
 from collections import Counter, defaultdict
 import io
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,6 +28,19 @@ CONTRACT = {
 # Closed together with the checked registration plan and the characterized UTC
 # provider; their reasons must not keep the earlier caller-responsibility gaps.
 T15_CLOSURES = ("791-record-capacity", "791-timestamp-capacity", "1122-timestamp-value")
+
+# The capacity closures need assertions on encoded option bytes (4-octet
+# address slots, the full pointer, zero or address/zero initialization, the
+# fixed size) through the origin encoder production uses: the core encoder
+# test and the example's real origin path. Planner results are not that
+# evidence, so their test copies are exactly these tests, each exercising
+# that encoder, rather than a count any planner-only test could satisfy.
+ENCODED_AREA_TESTS = {
+    ("crates/stacks/ntcp/src/ipv4_options.rs", "plan_initializes_fixed_size_area_before_origin_recording",
+     ".encode_with("),
+    ("crates/stacks/ntcp/examples/tun_echo.rs", "planned_origin_frames_carry_fixed_initialized_option_areas",
+     "transmit_frames("),
+}
 
 
 def ledger(n):
@@ -135,7 +149,7 @@ class Ipv4Inventory(unittest.TestCase):
         partial = {audit.clause_key(row): row for row in rows if row["status"] == "TODO"}
         closed = {audit.clause_key(row): row["id"] for row in rows if row["id"] in T15_CLOSURES}
         self.assertEqual(set(closed.values()), set(T15_CLOSURES))
-        seen, kinds = Counter(), defaultdict(Counter)
+        seen, kinds, tests = Counter(), defaultdict(Counter), defaultdict(set)
         for path in (ROOT / "crates").rglob("*.rs"):
             for annotation in audit.source_annotations(path.read_text()):
                 key = audit.clause_key(annotation)
@@ -146,12 +160,25 @@ class Ipv4Inventory(unittest.TestCase):
                     # A closed obligation's copies carry no retained gap.
                     self.assertEqual(annotation["reason"], "", str(path))
                     kinds[closed[key]][annotation["kind"]] += 1
+                    if annotation["kind"] == "TEST":
+                        attached = annotation["attached"]
+                        test = re.search(r"#\[test\]\s*fn (\w+)\(", attached)
+                        self.assertTrue(test and "assert" in attached, (closed[key], str(path)))
+                        tests[closed[key]].add((str(path.relative_to(ROOT)), test[1], attached))
         self.assertEqual(set(seen), set(partial))
         self.assertTrue(all(count >= 2 for count in seen.values()))
-        # Every closed copy is complete: implementation and several tests.
+        # Every closed copy is complete: implementation and asserting tests.
         for id in T15_CLOSURES:
             self.assertGreaterEqual(kinds[id]["CITATION"], 1, id)
-            self.assertGreaterEqual(kinds[id]["TEST"], 3, id)
+        for id in ("791-record-capacity", "791-timestamp-capacity"):
+            found = {(path, name) for path, name, _ in tests[id]}
+            self.assertEqual(found, {(path, name) for path, name, _ in ENCODED_AREA_TESTS}, id)
+            for path, name, call in ENCODED_AREA_TESTS:
+                attached = next(a for p, n, a in tests[id] if (p, n) == (path, name))
+                self.assertIn(call, attached, (id, name))
+        # The value rule: the core write contract, the provider crate's
+        # recorded and actual facts, and embedding recording.
+        self.assertGreaterEqual(len(tests["1122-timestamp-value"]), 3)
 
 
 class HistoricalPublication(unittest.TestCase):
