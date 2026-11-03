@@ -208,6 +208,48 @@ def main():
             listener.listen(1)
             listener.settimeout(25)
             emit(event="listening", port=int(fields[1]))
+        elif fields[0] == "origin":
+            # The destination of ntcp's originated options: a raw TCP receiver
+            # (opened first) sees each segment as delivered after the kernel's
+            # IP option processing, and a listener accepts ntcp's active open.
+            raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+            listener = socket.socket(family, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((local, int(fields[1])))
+            listener.listen(1)
+            listener.settimeout(25)
+            emit(event="listening", port=int(fields[1]))
+        elif fields[0] == "serve":
+            # Application byte progress over the accepted connection: tun_echo
+            # echoes every byte and closes after this side's FIN.
+            size, salt = int(fields[1]), int(fields[2])
+            data = pattern(size, salt)
+            s, address = listener.accept()
+            with s:
+                s.settimeout(25)
+                s.sendall(data)
+                s.shutdown(socket.SHUT_WR)
+                received = bytearray()
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    received.extend(chunk)
+            listener.close()
+            # Segments still in flight (the last ACK) reach the raw receiver
+            # within the settle time; ntcp's are those from its address.
+            packets, deadline = [], time.monotonic() + 0.5
+            while (left := deadline - time.monotonic()) > 0 and len(packets) < 256:
+                raw.settimeout(left)
+                try:
+                    packet, _ = raw.recvfrom(65535)
+                except socket.timeout:
+                    break
+                if socket.inet_ntoa(packet[12:16]) == remote:
+                    packets.append(packet.hex())
+            raw.close()
+            emit(event="serve", tx=size, rx=len(received), match=received == data, hash=fnv(received),
+                 remote=list(address), delivered=packets)
         elif fields[0] == "collect":
             size = int(fields[1])
             s, _ = listener.accept()

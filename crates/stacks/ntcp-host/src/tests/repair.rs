@@ -156,7 +156,7 @@ fn host_ptb_repairs_exact_quoted_range_of_the_quoted_connection_only() {
         let held = drain(&mut b, now + 2);
         let mtu = if v6 { 1350 } else { 1100 };
         let (report, published) = tcp_report(
-            a.0.input_icmp(&mut a.1, a.2, now + 3, &ptb(&quoted, mtu))
+            a.0.input_icmp(&mut a.1, a.2, now + 3, &ptb(&quoted, mtu), None)
                 .unwrap(),
         );
         assert!(matches!(
@@ -186,7 +186,7 @@ fn host_ptb_repairs_exact_quoted_range_of_the_quoted_connection_only() {
         // A late, smaller report quoting the partially acknowledged original.
         let lower = if v6 { 1280 } else { 1006 };
         let (late, _) = tcp_report(
-            a.0.input_icmp(&mut a.1, a.2, now + 9, &ptb(&quoted, lower))
+            a.0.input_icmp(&mut a.1, a.2, now + 9, &ptb(&quoted, lower), None)
                 .unwrap(),
         );
         // Below the 1500-octet delivery the peer has now proven: the size waits
@@ -259,7 +259,7 @@ fn deferred_report_survives_ledger_eviction_and_path_replacement() {
             let mtu = if v6 { 1350 } else { 1100 };
             let report = ptb(&quoted, mtu);
             let IcmpDispatch::Deferred(deferred) =
-                a.0.input_icmp(&mut a.1, a.2, now + 1, &report).unwrap()
+                a.0.input_icmp(&mut a.1, a.2, now + 1, &report, None).unwrap()
             else {
                 panic!("reserved owner must defer");
             };
@@ -272,7 +272,7 @@ fn deferred_report_survives_ledger_eviction_and_path_replacement() {
             // The quoted record was evicted: the raw frame no longer names A.
             assert_eq!(a.0.correlate(now + 2, &quote_key(&quoted)).owner, None);
             assert!(matches!(
-                a.0.input_icmp(&mut a.1, a.2, now + 2, &report).unwrap(),
+                a.0.input_icmp(&mut a.1, a.2, now + 2, &report, None).unwrap(),
                 IcmpDispatch::Completed(IcmpOutcome::Discarded(_))
             ));
             let old = a.0.binding(id).unwrap().snapshot.path();
@@ -345,7 +345,7 @@ fn deferred_report_about_data_acknowledged_meanwhile_is_rejected_on_replay() {
         let (attempt, frame, external, second) = reserve(&mut a, id, now, Held::Scalar).unwrap();
         let mtu = if v6 { 1350 } else { 1100 };
         let IcmpDispatch::Deferred(deferred) =
-            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, mtu))
+            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, mtu), None)
                 .unwrap()
         else {
             panic!("reserved owner must defer");
@@ -416,7 +416,7 @@ fn host_reserved_ptb_repair_raced_by_decrease_is_one_physical_packet_in_restart(
             let mtu = if v6 { 1420 } else { 1300 };
             assert!(matches!(
                 tcp_report(
-                    a.0.input_icmp(&mut a.1, a.2, now + 3, &ptb(&quoted, mtu))
+                    a.0.input_icmp(&mut a.1, a.2, now + 3, &ptb(&quoted, mtu), None)
                         .unwrap()
                 )
                 .0,
@@ -940,7 +940,7 @@ fn randomized_host_tcp_drop_repair_never_acts_beyond_the_model() {
                         cov.stale_reports += 1;
                         let before = infos(&a, &flows);
                         assert!(matches!(
-                            a.0.input_icmp(&mut a.1, a.2, now, &report).unwrap(),
+                            a.0.input_icmp(&mut a.1, a.2, now, &report, None).unwrap(),
                             IcmpDispatch::Completed(IcmpOutcome::Discarded(_))
                         ));
                         for (x, y) in before.iter().zip(infos(&a, &flows)) {
@@ -956,7 +956,7 @@ fn randomized_host_tcp_drop_repair_never_acts_beyond_the_model() {
                         None
                     };
                     let before = a.1.transport_info(owner).ok();
-                    let mut dispatch = a.0.input_icmp(&mut a.1, a.2, now, &report).unwrap();
+                    let mut dispatch = a.0.input_icmp(&mut a.1, a.2, now, &report, None).unwrap();
                     unchanged(before, a.1.transport_info(owner).ok());
                     if let Some(((attempt, frame, external, wire), infos_before)) = held {
                         // Nothing a reserved owner's report could act on is

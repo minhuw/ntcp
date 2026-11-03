@@ -161,8 +161,12 @@
       "id": "791-record-capacity",
       "section": "3.1",
       "quote": "A recorded route is composed of a series of internet addresses. Each internet address is 32 bits or 4 octets. If the pointer is greater than the length, the recorded route data area is full. The originating host must compose this option with a large enough route data area to hold all the address expected. The size of the option does not change due to adding addresses. The intitial contents of the route data area must be zero.",
-      "status": "TODO",
-      "reason": "Helpers implement address slots, full pointers, zero initialization and fixed option size, but expected route capacity is a caller responsibility: T15 owns the checked expected Record Route/Timestamp registration plan with its 40-octet combined budget and unrepresentable-request errors that this compound obligation needs.",
+      "status": "covered",
+      "reason": "Ipv4RegistrationPlan checks the owner's expected Record Route registrations (every recording visit, the origin and the destination included; the stack never infers hop counts) against the requested 4-octet address slots and the zero-padded 40-octet combined IPv4 option area with checked arithmetic, and refuses an insufficient, unrepresentable, wrong-family or unplanned request with a typed error at planning and again before a managed open commits any path or connection; nothing is truncated or dropped. The planned area is zero-initialized before origin recording, its pointer exceeds the length when full, registration never resizes it, and it stays fixed for the connection bound to its authorized route (StaleRoute otherwise). Core, Host, example and integration/rfc_host router-topology tests assert address width, pointers, zero initialization and fixed size on the wire. The raw encoders and OutgoingIpv4Options remain documented low-level caller contracts.",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub struct Ipv4RegistrationPlan {",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn plan_initializes_fixed_size_area_before_origin_recording()"
+      ],
       "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
     },
     {
@@ -206,7 +210,7 @@
       "section": "3.1",
       "quote": "The Timestamp is a right-justified, 32-bit timestamp in milliseconds since midnight UT. If the time is not available in milliseconds or cannot be provided with respect to midnight UT then any time may be inserted as a timestamp provided the high order bit of the timestamp field is set to one to indicate the use of a non-standard value.",
       "status": "covered",
-      "reason": "Local timestamp writes validate UTC milliseconds within a day or a marked nonstandard wire value; the supplied example uses explicitly marked elapsed milliseconds at receive and transmit. UTC callers must supply the documented clock contract; arbitrary physical-clock accuracy is not established here.",
+      "reason": "Local timestamp writes validate UTC milliseconds within a day or a marked nonstandard wire value; the managed embeddings record UTC milliseconds since midnight from the characterized Linux UTC provider (native at receive, originating no IPv4 options; the example at receive and transmit) only when its kernel conditions hold, and explicitly marked elapsed milliseconds otherwise. Low-level u32 callers must supply the documented clock contract; arbitrary physical-clock accuracy is not established here.",
       "evidence": [
         "crates/stacks/ntcp/src/ipv4_options.rs::pub fn record(",
         "crates/stacks/ntcp/examples/tun_echo.rs::fn option_frames_record_once_before_real_tcp_handoff()"
@@ -217,8 +221,12 @@
       "id": "791-timestamp-capacity",
       "section": "3.1",
       "quote": "The originating host must compose this option with a large enough timestamp data area to hold all the timestamp information expected. The size of the option does not change due to adding timestamps. The intitial contents of the timestamp data area must be zero or internet address/zero pairs.",
-      "status": "TODO",
-      "reason": "Helpers initialize zero or address/zero slots and preserve option size, but expected timestamp capacity is a caller responsibility: T15 owns the checked expected Record Route/Timestamp registration plan with its 40-octet combined budget and unrepresentable-request errors that this compound obligation needs.",
+      "status": "covered",
+      "reason": "Ipv4RegistrationPlan checks the owner's expected Timestamp registrations (a count of every recording visit, the origin and the destination included, or the ordered prespecified addresses, repeated visits included; the stack never infers hop counts) against the requested slots of each form (4 octets for flag 0, 8 for flags 1 and 3) and the zero-padded 40-octet combined IPv4 option area with checked arithmetic, and refuses an insufficient, unrepresentable, mismatched-address, wrong-family or unplanned request with a typed error at planning and again before a managed open commits any path or connection; nothing is truncated or dropped. The planned area is initialized to zero or address/zero pairs before origin recording, registration never resizes it, and it stays fixed for the connection bound to its authorized route (StaleRoute otherwise). Core, Host, example and integration/rfc_host router-topology tests assert initialization, pointers and fixed size on the wire. The raw encoders and OutgoingIpv4Options remain documented low-level caller contracts.",
+      "evidence": [
+        "crates/stacks/ntcp/src/ipv4_options.rs::pub struct Ipv4RegistrationPlan {",
+        "crates/stacks/ntcp/src/ipv4_options.rs::fn plan_initializes_fixed_size_area_before_origin_recording()"
+      ],
       "target": "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
     },
     {

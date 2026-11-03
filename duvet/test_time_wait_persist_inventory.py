@@ -107,7 +107,7 @@ class TimeWaitPersistInventories(unittest.TestCase):
         self.assertTrue(any("rfc6191_sequence_reuse_uses_peer_fin_serial_frontier" in e
                             for e in rows["fin-definition"]["evidence"]))
         for key, reason in {
-            "paws-monotonic": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks. Dedicated complete source/test evidence remains missing.",
+            "paws-monotonic": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks, and T15's IPv4 UTC provider does not establish PAWS monotonicity. T20 owns the characterized monotonic TCP timestamp provider and host lifecycle this needs; dedicated complete source/test evidence remains missing.",
             "processing-boundary": "TIME-WAIT reuse is gated in Endpoint input and reuse_syn, but no complete source/test annotation pair establishes the entire unchanged-processing obligation for SYNs in every other TCP state.",
             "boot-quiet-time": "No host-boot quiet-time enforcement or executable embedding evidence establishes the stated 2*MSL prohibition. Endpoint construction accepts an initial clock and can immediately open connections; reboot safety cannot be exempted merely because this is an embeddable stack.",
         }.items():

@@ -175,7 +175,7 @@ fn unreachable(packet: &[u8]) -> Vec<u8> {
 
 fn dispatch(a: &mut Side, now: u64, report: &[u8]) -> IcmpDispatch {
     let context = a.2;
-    a.0.input_icmp(&mut a.1, context, MDL + now, report)
+    a.0.input_icmp(&mut a.1, context, MDL + now, report, None)
         .unwrap()
 }
 
@@ -258,7 +258,7 @@ fn first_and_later_fragment_ptbs_advise_their_owner_with_the_fragment_length() {
             let sum = ntcp_icmp::checksum(&short[20..]);
             short[22..24].copy_from_slice(&sum.to_be_bytes());
             assert!(!matches!(
-                a.0.input_icmp(&mut a.1, a.2, MDL + 3, &short),
+                a.0.input_icmp(&mut a.1, a.2, MDL + 3, &short, None),
                 Ok(IcmpDispatch::Completed(IcmpOutcome::Advice { .. }))
             ));
         }
@@ -432,7 +432,7 @@ fn fragment_quotes_never_reach_tcp() {
         let report = ptb(&fragment, mtu);
         let context = a.2;
         assert_eq!(
-            a.0.input_icmp(&mut a.1, context, now + 2, &report).unwrap(),
+            a.0.input_icmp(&mut a.1, context, now + 2, &report, None).unwrap(),
             UNCORRELATED
         );
         assert_eq!(a.1.path_mtu_info(id).unwrap().unwrap().current_mtu, before);

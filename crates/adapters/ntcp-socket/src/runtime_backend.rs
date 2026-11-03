@@ -10,14 +10,60 @@ use std::{
     os::fd::{AsFd, AsRawFd},
 };
 
-// Destination Timestamp time: the owner clock's elapsed milliseconds with the
-// high-order bit set. The native runtime has no characterized UTC clock, and
-// RFC 791 section 3.1 permits any time so marked as nonstandard. Read only
-// when recording writes a Timestamp slot.
-struct ElapsedClock<'a>(&'a Owner);
-impl ntcp::Ipv4TimestampProvider for ElapsedClock<'_> {
+// IPv4 Timestamp time (RFC 791 section 3.1, RFC 1122 section 3.2.2.8) from
+// the characterized Linux UTC source: UTC milliseconds since midnight when
+// its sample is standard, otherwise the owner clock's elapsed milliseconds
+// with the high-order bit set. Each sample is one kernel acquisition, taken
+// only when a Timestamp slot will be written; the source keeps only its
+// suspend-continuity state across samples.
+#[derive(Debug, Default)]
+pub(super) struct Ipv4Clock {
+    utc: ntcp_clock::UtcClock,
+    #[cfg(test)]
+    pub(super) acquisitions: usize,
+}
+impl Ipv4Clock {
+    fn sample(&mut self, now: u64) -> Option<ntcp::Ipv4Timestamp> {
+        #[cfg(test)]
+        {
+            self.acquisitions += 1;
+        }
+        // A standard value is below 86 400 000, a nonstandard one marked.
+        ntcp::Ipv4Timestamp::from_wire(self.utc.sample(now / 1000).value).ok()
+    }
+    /// The time an originated Timestamp option records at the origin with
+    /// `options` from `source`, sampled only when origin recording writes a
+    /// slot: an option whose addresses are not prespecified, or whose first
+    /// prespecified address is `source` (RFC 1122 section 3.2.1.8). Without
+    /// one the value is never written; it is the marked elapsed time.
+    pub(super) fn origin(
+        &mut self,
+        options: &ntcp::OutgoingIpv4Options,
+        source: IpAddr,
+        now: u64,
+    ) -> u32 {
+        let writes = match options.timestamp {
+            None => false,
+            Some(ntcp::TimestampRequest::Prespecified { addresses, len }) => {
+                len != 0 && source == IpAddr::V4(addresses[0])
+            }
+            Some(_) => true,
+        };
+        writes
+            .then(|| self.sample(now))
+            .flatten()
+            .unwrap_or(ntcp::Ipv4Timestamp::nonstandard((now / 1000) as u32))
+            .wire_value()
+    }
+}
+// Destination recording with time sampled at `now` on the owner clock.
+struct Recording<'a> {
+    clock: &'a mut Ipv4Clock,
+    now: u64,
+}
+impl ntcp::Ipv4TimestampProvider for Recording<'_> {
     fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
-        Some(ntcp::Ipv4Timestamp::nonstandard((self.0.now() / 1000) as u32))
+        self.clock.sample(self.now)
     }
 }
 
@@ -313,7 +359,7 @@ impl Owner {
                 ReceiveCapabilities {
                     max_ip_packet,
                     // Record Route and Timestamp are interpreted, with time
-                    // from the owner's marked elapsed clock (`ElapsedClock`).
+                    // from the characterized UTC source (`Ipv4Clock`).
                     // Source routes stay refused: native TCP keeps IPv4
                     // options disabled, so no return route can be used.
                     ipv4: if self.local.is_ipv4() {
@@ -690,13 +736,19 @@ impl Owner {
     }
     /// Destination processing of one complete datagram, before it is
     /// classified, dispatched or retained (`Host::process`), with time from
-    /// the owner clock; None for a datagram the Host refuses.
+    /// the characterized UTC source (`Ipv4Clock`) sampled at most once;
+    /// None for a datagram the Host refuses.
     pub(super) fn process_datagram<'a>(
-        &self,
+        &mut self,
         datagram: ntcp_host::Datagram<'a>,
     ) -> Option<ntcp_host::Processed<'a>> {
+        let now = self.now();
         let host = self.host.as_ref()?;
-        host.process(datagram, Some(&mut ElapsedClock(self))).ok()
+        let mut recording = Recording {
+            clock: &mut self.ipv4_clock,
+            now,
+        };
+        host.process(datagram, Some(&mut recording)).ok()
     }
     /// Dispatch one processed datagram exactly like an unfragmented packet;
     /// its processed options are handed on as they are.

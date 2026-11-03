@@ -21,6 +21,15 @@
 //     administrative estimates, plateaus and search aging. Unset, none.
 //   NTCP_CONTROL_ALLOW_UIDS=UID[,UID...]  peer uids allowed on the control
 //     socket (SO_PEERCRED); unset, only this process's effective uid.
+//   NTCP_ORIGINATE_RR=SLOTS,EXPECTED  the active open to PEER_SOCKET_ADDR
+//     originates Record Route with SLOTS address slots, for EXPECTED
+//     registrations on its path (every recording visit, this host and the
+//     destination included). Needs NTCP_IPV4_OPTIONS=1.
+//   NTCP_ORIGINATE_TS=times|addresses,SLOTS,EXPECTED  likewise a Timestamp
+//     option, flag 0 (times) or 1 (addresses and times). The capacities must
+//     hold the expectation and fit the 40-octet option area together; the
+//     option area and its expected route are fixed for the connection, which
+//     ends if its route changes.
 // The caller must configure the TUN interface (MTU 1500) and routes
 // beforehand. This adapter exchanges IP packets, not Ethernet frames; it does
 // not configure the host or implement ARP, routing, or ICMP services beyond
@@ -261,14 +270,105 @@ mod linux {
         bytes: Vec<u8>,
     }
 
-    // The loop's elapsed-time sample for destination processing, always
-    // marked nonstandard: the example has no characterized UTC clock, and
-    // RFC 791 section 3.1 permits any time with the high-order bit set.
+    // IPv4 Timestamp time for destination and origin recording from the
+    // characterized Linux UTC source (ntcp-clock): UTC milliseconds since
+    // midnight when its sample is standard, otherwise the loop's elapsed
+    // milliseconds with the RFC 791 high-order bit set. Recording samples it
+    // only for a slot it writes, one kernel acquisition each; the source
+    // keeps only its suspend-continuity state across samples.
+    struct Utc {
+        clock: ntcp_clock::UtcClock,
+        start: Instant,
+        #[cfg(test)]
+        acquisitions: usize,
+    }
+    impl Utc {
+        fn new(start: Instant) -> Self {
+            Self {
+                clock: ntcp_clock::UtcClock::new(),
+                start,
+                #[cfg(test)]
+                acquisitions: 0,
+            }
+        }
+    }
+    impl ntcp::Ipv4TimestampProvider for Utc {
+        fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
+            #[cfg(test)]
+            {
+                self.acquisitions += 1;
+            }
+            let elapsed = self.start.elapsed().as_millis() as u64;
+            // A standard value is below 86 400 000, a nonstandard one marked.
+            ntcp::Ipv4Timestamp::from_wire(self.clock.sample(elapsed).value).ok()
+        }
+    }
+
+    // A test's fixed time, marked nonstandard.
+    #[cfg(test)]
     struct Sample(u32);
+    #[cfg(test)]
     impl ntcp::Ipv4TimestampProvider for Sample {
         fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
             Some(ntcp::Ipv4Timestamp::nonstandard(self.0))
         }
+    }
+
+    // A test's own read-only adjtimex read of the kernel clock the UTC
+    // source samples: its time in nanoseconds since the epoch when the read
+    // satisfies that source's per-sample conditions (1) and (2) (no kernel
+    // error predicate, neither TIME_ERROR nor TIME_OOP, maximum error within
+    // 0..=16 s).
+    #[cfg(test)]
+    fn utc_read() -> Option<i128> {
+        // SAFETY: timex is plain data; all-zero sets modes 0, a read-only call.
+        let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+        // SAFETY: `tx` is a valid, writable timex for the call.
+        let state = unsafe { libc::adjtimex(&mut tx) };
+        let status = tx.status;
+        let error = status & (libc::STA_UNSYNC | libc::STA_CLOCKERR) != 0
+            || status & (libc::STA_PPSFREQ | libc::STA_PPSTIME) != 0
+                && status & libc::STA_PPSSIGNAL == 0
+            || status & (libc::STA_PPSTIME | libc::STA_PPSJITTER)
+                == libc::STA_PPSTIME | libc::STA_PPSJITTER
+            || status & libc::STA_PPSFREQ != 0
+                && status & (libc::STA_PPSWANDER | libc::STA_PPSERROR) != 0;
+        if state == -1
+            || error
+            || matches!(state, libc::TIME_ERROR | libc::TIME_OOP)
+            || !(0..=16_000_000).contains(&tx.maxerror)
+        {
+            return None;
+        }
+        let unit = if status & libc::STA_NANO != 0 {
+            1
+        } else {
+            1000
+        };
+        Some(i128::from(tx.time.tv_sec) * 1_000_000_000 + i128::from(tx.time.tv_usec) * unit)
+    }
+
+    // An IPv4 Timestamp value recorded between the `before` and `after`
+    // reads: true for a standard value, which both reads must accept and
+    // which must lie within their window in milliseconds since midnight UT
+    // (across midnight too); false for a value marked nonstandard by the
+    // high-order bit.
+    #[cfg(test)]
+    fn standard_time(value: u32, before: Option<i128>, after: Option<i128>) -> bool {
+        const DAY: i128 = 86_400_000;
+        if value & 0x8000_0000 != 0 {
+            return false;
+        }
+        let (Some(before), Some(after)) = (before, after) else {
+            panic!("unmarked time {value} without a healthy kernel clock bracket");
+        };
+        let (first, last) = (before.div_euclid(1_000_000), after.div_euclid(1_000_000));
+        let offset = (i128::from(value) - first).rem_euclid(DAY);
+        assert!(
+            i128::from(value) < DAY && offset <= last - first,
+            "unmarked time {value} outside the UTC window {first}..={last}"
+        );
+        true
     }
 
     // One actual caller-owned L3 forwarding port. All ingress storage is
@@ -722,6 +822,69 @@ mod linux {
         parse_ipv4_options(packet, local, false, 0).map(|(ip, tcp, _)| (ip, tcp))
     }
 
+    // The active open's originated Record Route and Timestamp request with
+    // the registrations the operator expects on its path
+    // (NTCP_ORIGINATE_RR, NTCP_ORIGINATE_TS); the stack never infers hop
+    // counts. Both travel on an explicit empty source route, the direct
+    // route RR/TS opens require. None when neither is set.
+    fn origination(
+        record_route: Option<&str>,
+        timestamp: Option<&str>,
+    ) -> io::Result<
+        Option<(
+            ntcp::OutgoingIpv4Options,
+            ntcp::ExpectedRegistrations<'static>,
+        )>,
+    > {
+        if record_route.is_none() && timestamp.is_none() {
+            return Ok(None);
+        }
+        let counts = |slots: &str, expected: &str| -> Option<(u8, u8)> {
+            let number = |value: &str| {
+                value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| value.parse::<u8>().ok())
+                    .flatten()
+            };
+            Some((number(slots)?, number(expected)?))
+        };
+        let mut options = ntcp::OutgoingIpv4Options {
+            source_route: Some(
+                ntcp::SourceRoute::new(&[], false).map_err(|_| invalid("empty source route"))?,
+            ),
+            ..Default::default()
+        };
+        let mut expected = ntcp::ExpectedRegistrations::default();
+        if let Some(value) = record_route {
+            let (slots, count) = value
+                .split_once(',')
+                .and_then(|(slots, expected)| counts(slots, expected))
+                .ok_or_else(|| invalid("NTCP_ORIGINATE_RR must be SLOTS,EXPECTED"))?;
+            options.record_route_slots = Some(slots);
+            expected.record_route = Some(count);
+        }
+        if let Some(value) = timestamp {
+            let mut fields = value.split(',');
+            let request = match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (Some(form), Some(slots), Some(count), None) => {
+                    counts(slots, count).and_then(|(slots, count)| match form {
+                        "times" => Some((ntcp::TimestampRequest::Times(slots), count)),
+                        "addresses" => Some((ntcp::TimestampRequest::AddressTimes(slots), count)),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            };
+            let (request, count) = request.ok_or_else(|| {
+                invalid("NTCP_ORIGINATE_TS must be times|addresses,SLOTS,EXPECTED")
+            })?;
+            options.timestamp = Some(request);
+            expected.timestamp = Some(ntcp::ExpectedTimestamps::Count(count));
+        }
+        Ok(Some((options, expected)))
+    }
+
     fn options_enabled(value: Option<&str>) -> io::Result<bool> {
         match value {
             None => Ok(false),
@@ -891,7 +1054,7 @@ mod linux {
         packet: &[u8],
         local: IpAddr,
         options_enabled: bool,
-        timestamp: u32,
+        timestamps: &mut dyn ntcp::Ipv4TimestampProvider,
     ) -> io::Result<()> {
         if local != network.local || options_enabled != network.options_enabled {
             return Ok(());
@@ -913,7 +1076,7 @@ mod linux {
         // Reassembly precedes classification; the completed datagram's
         // buffer is restored whatever the outcome.
         let mut completed = std::mem::take(&mut network.completed);
-        let result = input_datagram(network, endpoint, time, packet, &mut completed, timestamp);
+        let result = input_datagram(network, endpoint, time, packet, &mut completed, timestamps);
         network.completed = completed;
         result
     }
@@ -924,7 +1087,7 @@ mod linux {
         time: u64,
         packet: &[u8],
         completed: &mut [u8],
-        timestamp: u32,
+        timestamps: &mut dyn ntcp::Ipv4TimestampProvider,
     ) -> io::Result<()> {
         // A TUN carries IP packets only: no link-layer multicast arrival.
         let Ok(Received::Datagram(datagram)) =
@@ -936,7 +1099,7 @@ mod linux {
         };
         // Destination processing happens once, here; retention and replay
         // keep its result.
-        let Ok(datagram) = network.host.process(datagram, Some(&mut Sample(timestamp))) else {
+        let Ok(datagram) = network.host.process(datagram, Some(timestamps)) else {
             return Ok(());
         };
         let Ok(decoded) = network.host.decode_datagram(datagram) else {
@@ -1244,9 +1407,28 @@ mod linux {
         start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
     }
 
-    fn ipv4_timestamp(start: Instant) -> u32 {
-        // Monotonic elapsed time is not UTC. Mark it on both input and output.
-        ntcp::Ipv4Timestamp::nonstandard(start.elapsed().as_millis() as u32).wire_value()
+    // The time an originated Timestamp option records at this origin,
+    // sampled only when origin recording writes a slot: one whose addresses
+    // are not prespecified, or whose first prespecified address is the
+    // source (RFC 1122 section 3.2.1.8). Without one the value is never
+    // written; it is the loop's elapsed time at `time` marked nonstandard.
+    fn origin_timestamp(
+        transmit: &ntcp::Transmit,
+        time: u64,
+        timestamps: &mut dyn ntcp::Ipv4TimestampProvider,
+    ) -> u32 {
+        let writes = match transmit.ipv4_options.timestamp {
+            None => false,
+            Some(ntcp::TimestampRequest::Prespecified { addresses, len }) => {
+                len != 0 && transmit.ip.source == IpAddr::V4(addresses[0])
+            }
+            Some(_) => true,
+        };
+        writes
+            .then(|| timestamps.ipv4_timestamp())
+            .flatten()
+            .unwrap_or(ntcp::Ipv4Timestamp::nonstandard((time / 1000) as u32))
+            .wire_value()
     }
 
     // TCP frames on a discovery-disabled IPv4 route or path that wait for an
@@ -1378,7 +1560,7 @@ mod linux {
         output: &mut [u8],
         pending: &mut Option<PendingFrame>,
         header_len: usize,
-        timestamp: u32,
+        timestamps: &mut dyn ntcp::Ipv4TimestampProvider,
         backend: &mut impl PacketIo,
     ) -> io::Result<bool> {
         // The change service publishes connection results and serves every
@@ -1425,6 +1607,8 @@ mod linux {
                 };
                 let attempt =
                     attempt.ok_or_else(|| io::Error::other("missing transmit attempt"))?;
+                // A frame held for retry keeps these bytes and its time.
+                let timestamp = origin_timestamp(&packet, time, timestamps);
                 let len = match build_frame(output, packet, timestamp) {
                     Ok(len) => len,
                     Err(error) => {
@@ -1555,6 +1739,23 @@ mod linux {
                         return Err(io::Error::other("stale rejected transmit attempt"));
                     }
                     *pending = None;
+                    network.host.collect(endpoint).map_err(host_error)?;
+                }
+                // The route its owner stated the expected registrations for
+                // changed or is gone (RFC 791 section 3.1). This example has
+                // no topology knowledge to state them for another route
+                // (`Host::revalidate_registration`), so the flow ends: the
+                // certainly unsent attempt fails its connection without a
+                // reset, and other owners' output goes on.
+                Err(ntcp_host::Error::StaleRoute) => {
+                    let held = pending.take().unwrap();
+                    if let Some(ticket) = held.ticket {
+                        network.host.cancel_submission(ticket);
+                    }
+                    if !endpoint.abandon_transmit(held.attempt).map_err(engine)? {
+                        return Err(io::Error::other("stale abandoned transmit attempt"));
+                    }
+                    eprintln!("TUN flow terminated: its IPv4 registration plan's route changed");
                     network.host.collect(endpoint).map_err(host_error)?;
                 }
                 result => {
@@ -2048,6 +2249,35 @@ mod linux {
             .get(4)
             .map(|value| checked_peer(value, local))
             .transpose()?;
+        let var = |name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(_) => Err(invalid("invalid IPv4 origination setting")),
+        };
+        let (record_route, timestamp) = (var("NTCP_ORIGINATE_RR")?, var("NTCP_ORIGINATE_TS")?);
+        let (ipv4_options, registration) = match origination(
+            record_route.as_deref(),
+            timestamp.as_deref(),
+        )? {
+            None => (ntcp::OutgoingIpv4Options::default(), None),
+            Some((options, expected)) => {
+                let Some(peer) = peer.filter(|_| ipv4_options_enabled) else {
+                    return Err(invalid(
+                        "IPv4 option origination needs NTCP_IPV4_OPTIONS=1 and a peer",
+                    ));
+                };
+                // Refused before any connection or path is allocated.
+                let plan = ntcp::Ipv4RegistrationPlan::new(local, peer.ip(), options, &expected)
+                    .map_err(|error| {
+                        invalid(&format!("IPv4 registration plan refused: {error:?}"))
+                    })?;
+                eprintln!(
+                    "IPv4 origination toward {peer}: {options:?} for {expected:?}, {} option octets",
+                    plan.option_octets()
+                );
+                (options, Some(plan))
+            }
+        };
         let header_len = if local.is_ipv4() {
             IP_HEADER
         } else {
@@ -2067,6 +2297,7 @@ mod linux {
         let secret = acquire_secret()?;
         let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
+        let mut utc = Utc::new(start);
         let address_policy: Box<dyn Fn(AddressValidation) -> bool> = match local {
             IpAddr::V4(ip) => Box::new(tun_address_policy(ip, interface_subnet(&tun, ip)?)),
             IpAddr::V6(ip) => {
@@ -2078,7 +2309,8 @@ mod linux {
         let open_options = ntcp::ManagedOpenOptions {
             transport: ntcp::ActiveOpenOptions::from(&config.connection),
             dscp: config.dscp,
-            ipv4_options: ntcp::OutgoingIpv4Options::default(),
+            ipv4_options,
+            registration,
             receive_authority: None,
         };
         let mut endpoint =
@@ -2158,7 +2390,7 @@ mod linux {
                             &input[..len],
                             local,
                             ipv4_options_enabled,
-                            ipv4_timestamp(start),
+                            &mut utc,
                         )?;
                     }
                     Ok(None) => break,
@@ -2225,7 +2457,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 header_len,
-                ipv4_timestamp(start),
+                &mut utc,
                 &mut tun,
             )?;
             immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
@@ -2448,6 +2680,7 @@ mod linux {
                 transport: ntcp::ActiveOpenOptions::from(&config.connection),
                 dscp: config.dscp,
                 ipv4_options: Default::default(),
+                registration: None,
                 receive_authority: None,
             };
             let disabled: SocketAddr = "10.0.0.1:8080".parse().unwrap();
@@ -2507,7 +2740,7 @@ mod linux {
                     &mut output,
                     &mut pending,
                     IP_HEADER,
-                    0,
+                    &mut Sample(0),
                     &mut backend,
                 )
                 .unwrap();
@@ -2527,7 +2760,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 IP_HEADER,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -2593,6 +2826,7 @@ mod linux {
                             source_route: Some(ntcp::SourceRoute::new(&[hop], false).unwrap()),
                             ..Default::default()
                         },
+                        registration: None,
                         receive_authority: None,
                     },
                     &mut network.host,
@@ -2631,7 +2865,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 IP_HEADER,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -2710,6 +2944,7 @@ mod linux {
                         transport: ntcp::ActiveOpenOptions::from(&config.connection),
                         dscp: config.dscp,
                         ipv4_options: Default::default(),
+                        registration: None,
                         receive_authority: None,
                     },
                     &mut network.host,
@@ -2752,7 +2987,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 IP_HEADER,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -2769,7 +3004,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 IP_HEADER,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -2824,6 +3059,7 @@ mod linux {
                         transport: ntcp::ActiveOpenOptions::from(&config.connection),
                         dscp: config.dscp,
                         ipv4_options: Default::default(),
+                        registration: None,
                         receive_authority: None,
                     },
                     &mut network.host,
@@ -2839,7 +3075,7 @@ mod linux {
                     &mut output,
                     &mut pending,
                     IP_HEADER,
-                    0,
+                    &mut Sample(0),
                     &mut backend,
                 )
                 .unwrap();
@@ -2861,7 +3097,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 IP_HEADER,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -2876,7 +3112,7 @@ mod linux {
                 &mut output,
                 &mut pending,
                 IP_HEADER,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -3078,7 +3314,7 @@ mod linux {
                         assert_eq!(class & 3, 2, "negotiated data must be ECT(0)");
                         bytes[1] = (bytes[1] & 0xcf) | 0x30;
                     }
-                    input_frame(to_host, to, time, &bytes, local, false, 0).unwrap();
+                    input_frame(to_host, to, time, &bytes, local, false, &mut Sample(0)).unwrap();
                 }
                 observed
             }
@@ -3108,6 +3344,7 @@ mod linux {
                         transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
                         dscp: cfg.dscp,
                         ipv4_options: Default::default(),
+                        registration: None,
                         receive_authority: None,
                     },
                     &mut client_host.host,
@@ -3302,6 +3539,7 @@ mod linux {
                         transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
                         dscp: cfg.dscp,
                         ipv4_options: Default::default(),
+                        registration: None,
                         receive_authority: None,
                     },
                     &mut client_host.host,
@@ -3315,11 +3553,11 @@ mod linux {
                 for _ in 0..16 {
                     let to_server = super::pmtu_tests::emit(client_host, client, time, b.into());
                     for frame in &to_server {
-                        input_frame(server_host, server, time, frame, b.into(), false, 0).unwrap();
+                        input_frame(server_host, server, time, frame, b.into(), false, &mut Sample(0)).unwrap();
                     }
                     let to_client = super::pmtu_tests::emit(server_host, server, time, a.into());
                     for frame in &to_client {
-                        input_frame(client_host, client, time, frame, a.into(), false, 0).unwrap();
+                        input_frame(client_host, client, time, frame, a.into(), false, &mut Sample(0)).unwrap();
                     }
                     if to_server.is_empty() && to_client.is_empty() {
                         return;
@@ -3369,7 +3607,7 @@ mod linux {
                 packet[12..16].copy_from_slice(&source.octets());
                 reseal(&mut packet);
                 let result =
-                    input_frame(&mut server_host, &mut server, 1, &packet[..len], b.into(), false, 0);
+                    input_frame(&mut server_host, &mut server, 1, &packet[..len], b.into(), false, &mut Sample(0));
                 println!("framed TUN SYN from {source}: {result:?}");
                 assert!(result.is_ok());
                 assert_eq!(server_host.host.binding_count(), bindings);
@@ -3385,6 +3623,88 @@ mod linux {
                 exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
                 let count = client.read(id, &mut received).unwrap();
                 assert_eq!(&received[..count], payload);
+            }
+        }
+
+        // The real active open's originated options state the expected
+        // registrations; the plan, not the stack, sizes nothing.
+        //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+        //= type=test
+        //# A recorded route is composed of a series of internet addresses. Each
+        //# internet address is 32 bits or 4 octets. If the pointer is greater than
+        //# the length, the recorded route data area is full. The originating host
+        //# must compose this option with a large enough route data area to hold all
+        //# the address expected. The size of the option does not change due to
+        //# adding addresses. The intitial contents of the route data area must be
+        //# zero.
+
+        //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+        //= type=test
+        //# The originating host must compose this option with a large enough
+        //# timestamp data area to hold all the timestamp information expected. The
+        //# size of the option does not change due to adding timestamps. The
+        //# intitial contents of the timestamp data area must be zero or internet
+        //# address/zero pairs.
+        #[test]
+        fn originated_option_configuration_states_expected_registrations() {
+            use ntcp::{
+                ExpectedTimestamps, Ipv4RegistrationError, Ipv4RegistrationPlan, RegisteredOption,
+                TimestampRequest,
+            };
+            let local = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            let peer = IpAddr::V4(Ipv4Addr::new(198, 18, 2, 2));
+            assert!(origination(None, None).unwrap().is_none());
+            let (options, expected) = origination(Some("3,3"), Some("times,3,3"))
+                .unwrap()
+                .unwrap();
+            assert!(options.source_route.unwrap().hops().is_empty());
+            assert_eq!(options.record_route_slots, Some(3));
+            assert_eq!(options.timestamp, Some(TimestampRequest::Times(3)));
+            assert_eq!(expected.record_route, Some(3));
+            assert_eq!(expected.timestamp, Some(ExpectedTimestamps::Count(3)));
+            // Three records each: 15 + 16 octets, padded to 32.
+            let plan = Ipv4RegistrationPlan::new(local, peer, options, &expected).unwrap();
+            assert_eq!(plan.option_octets(), 32);
+            let (options, expected) = origination(None, Some("addresses,4,3")).unwrap().unwrap();
+            assert_eq!(options.record_route_slots, None);
+            assert_eq!(options.timestamp, Some(TimestampRequest::AddressTimes(4)));
+            assert_eq!(
+                Ipv4RegistrationPlan::new(local, peer, options, &expected)
+                    .unwrap()
+                    .option_octets(),
+                36
+            );
+            // Addressed Timestamp beside three Record Route records needs 43.
+            let (options, expected) = origination(Some("3,3"), Some("addresses,3,3"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                Ipv4RegistrationPlan::new(local, peer, options, &expected).err(),
+                Some(Ipv4RegistrationError::CombinedCapacity {
+                    required_octets: 44,
+                    maximum: 40
+                })
+            );
+            let (options, expected) = origination(Some("2,3"), None).unwrap().unwrap();
+            assert_eq!(
+                Ipv4RegistrationPlan::new(local, peer, options, &expected).err(),
+                Some(Ipv4RegistrationError::InsufficientRecords {
+                    option: RegisteredOption::RecordRoute,
+                    expected: 3,
+                    available: 2
+                })
+            );
+            for bad in ["3", "3,", ",3", "3,3,3", "+3,3", "256,3", " 3,3", "3,3 "] {
+                assert!(origination(Some(bad), None).is_err(), "{bad:?}");
+            }
+            for bad in [
+                "times,3",
+                "flags,3,3",
+                "times,3,3,3",
+                "addresses,-1,3",
+                "Times,3,3",
+            ] {
+                assert!(origination(None, Some(bad)).is_err(), "{bad:?}");
             }
         }
 
@@ -3461,6 +3781,10 @@ mod linux {
         //# cannot be provided with respect to midnight UT then any time may be
         //# inserted as a timestamp provided the high order bit of the timestamp
         //# field is set to one to indicate the use of a non-standard value.
+        //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+        //= type=test
+        //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
+        //# the ICMP Timestamp message.
         #[test]
         fn option_frames_record_once_before_real_tcp_handoff() {
             use ntcp::{Ipv4Timestamp, OutgoingIpv4Options, TimestampRequest};
@@ -3468,12 +3792,20 @@ mod linux {
             let destination = Ipv4Addr::new(192, 0, 2, 2);
             let source_time = Ipv4Timestamp::nonstandard(123).wire_value();
             let destination_time = Ipv4Timestamp::nonstandard(456).wire_value();
+            // The example's provider: one acquisition per sample, a
+            // standard value only within this test's own healthy kernel
+            // clock bracket, otherwise the elapsed time marked nonstandard.
             let clock = Instant::now();
-            let before = clock.elapsed().as_millis() as u32;
-            let sample = ipv4_timestamp(clock);
-            let after = clock.elapsed().as_millis() as u32;
-            assert_ne!(sample & 0x8000_0000, 0);
-            assert!((before..=after).contains(&(sample & 0x7fff_ffff)));
+            let mut utc = Utc::new(clock);
+            let (utc_before, before) = (utc_read(), clock.elapsed().as_millis() as u32);
+            let sample = ntcp::Ipv4TimestampProvider::ipv4_timestamp(&mut utc)
+                .unwrap()
+                .wire_value();
+            let (after, utc_after) = (clock.elapsed().as_millis() as u32, utc_read());
+            assert_eq!(utc.acquisitions, 1);
+            if !standard_time(sample, utc_before, utc_after) {
+                assert!((before..=after).contains(&(sample & 0x7fff_ffff)));
+            }
             for request in [
                 None,
                 Some(TimestampRequest::Times(2)),
@@ -3504,6 +3836,21 @@ mod linux {
                     timestamp: request,
                     ..Default::default()
                 };
+                // The direct path registers the origin and the destination.
+                let visits = [source, destination];
+                let expected = ntcp::ExpectedRegistrations {
+                    record_route: Some(2),
+                    timestamp: request.map(|request| match request {
+                        TimestampRequest::Prespecified { .. } => {
+                            ntcp::ExpectedTimestamps::Prespecified(&visits)
+                        }
+                        _ => ntcp::ExpectedTimestamps::Count(2),
+                    }),
+                };
+                let registration = enabled.then(|| {
+                    ntcp::Ipv4RegistrationPlan::new(local.ip(), remote.ip(), outgoing, &expected)
+                        .unwrap()
+                });
                 let id = client
                     .connect_with_path_provider(
                         0,
@@ -3513,6 +3860,7 @@ mod linux {
                             transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
                             dscp: cfg.dscp,
                             ipv4_options: outgoing,
+                            registration,
                             receive_authority: None,
                         },
                         &mut client_host.host,
@@ -3572,7 +3920,7 @@ mod linux {
                         &bytes[..len],
                         local.into(),
                         enabled,
-                        destination_time,
+                        &mut Sample(destination_time),
                     )
                     .unwrap();
                     expected

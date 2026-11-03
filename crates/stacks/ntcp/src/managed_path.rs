@@ -1,7 +1,8 @@
 //! Explicit serialized factory and network-budget contracts. The provider is
 //! borrowed for one transaction; it is never stored inside an Endpoint.
 use crate::{
-    ActiveOpenOptions, ConnectionId, EndpointError, Instant, ListenerId, OutgoingIpv4Options, Tuple,
+    ActiveOpenOptions, ConnectionId, EndpointError, Instant, Ipv4RegistrationError,
+    Ipv4RegistrationPlan, ListenerId, OutgoingIpv4Options, RegisteredOption, Tuple,
 };
 use ntcp_path::{ClientId, ContextId, Dscp, PathSnapshot};
 
@@ -19,6 +20,10 @@ pub struct PathFactoryRequest {
     pub listener: Option<ListenerId>,
     pub dscp: Dscp,
     pub ipv4_options: OutgoingIpv4Options,
+    /// The owner's checked plan for `ipv4_options` of an active open. The
+    /// provider binds it to the route authority it selects in `prepare`;
+    /// option-bearing output then leaves only under that authority.
+    pub registration: Option<Ipv4RegistrationPlan>,
 }
 
 /// A provisional client already charged to the provider's bounded storage.
@@ -53,6 +58,11 @@ pub struct ManagedOpenOptions {
     pub transport: ActiveOpenOptions,
     pub dscp: u8,
     pub ipv4_options: OutgoingIpv4Options,
+    /// Required when `ipv4_options` requests Record Route or Timestamp: the
+    /// checked plan for exactly that request between this open's addresses
+    /// (RFC 791 section 3.1), stated for the route authority the open
+    /// selects. Its option area keeps the plan's size for the connection.
+    pub registration: Option<Ipv4RegistrationPlan>,
     pub receive_authority: Option<ListenerId>,
 }
 
@@ -115,6 +125,24 @@ pub(crate) struct FactoryTransaction {
     pub inserted: Option<ConnectionId>,
 }
 
+// The open's registration plan, checked before any path or connection
+// resource is committed: originating Record Route or Timestamp needs the
+// owner's plan, and a supplied plan must describe exactly this request.
+pub(crate) fn check_registration(
+    request: &PathFactoryRequest,
+) -> Result<(), Ipv4RegistrationError> {
+    let options = &request.ipv4_options;
+    let missing = |option| Err(Ipv4RegistrationError::MissingExpectation { option });
+    match &request.registration {
+        Some(plan) => {
+            plan.check_request(request.tuple.local.ip(), request.tuple.remote.ip(), options)
+        }
+        None if options.record_route_slots.is_some() => missing(RegisteredOption::RecordRoute),
+        None if options.timestamp.is_some() => missing(RegisteredOption::Timestamp),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn valid_prepared(
     context: ContextId,
     request: PathFactoryRequest,
@@ -127,7 +155,8 @@ pub(crate) fn valid_prepared(
         .and_then(|r| r.hops().first().copied())
         .map(core::net::IpAddr::V4)
         .unwrap_or(request.tuple.remote.ip());
-    prepared.client.context() == context
+    check_registration(&request).is_ok()
+        && prepared.client.context() == context
         && key.context() == context
         && key.source_address().address() == request.tuple.local.ip()
         && key.destination().address() == request.tuple.remote.ip()

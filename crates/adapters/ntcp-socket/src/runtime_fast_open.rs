@@ -111,6 +111,7 @@ impl Owner {
             transport: open,
             dscp: options.wire_tos(self.local) >> 2,
             ipv4_options: ntcp::OutgoingIpv4Options::default(),
+            registration: None,
             receive_authority: options.receive_authority,
         };
         let cookie = options.server_cookie_for(remote);

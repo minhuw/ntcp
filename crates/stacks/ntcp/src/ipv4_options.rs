@@ -1,4 +1,4 @@
-use core::net::Ipv4Addr;
+use core::net::{IpAddr, Ipv4Addr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ipv4OptionsError {
@@ -16,7 +16,8 @@ pub struct Ipv4Timestamp(u32);
 impl Ipv4Timestamp {
     /// The caller supplies UTC milliseconds since midnight, from a clock updated
     /// at least 15 times/second and accurate within a few minutes (RFC 1122).
-    /// This checks the day range, not the physical clock's accuracy or cadence.
+    /// This checks the day range, not the physical clock's accuracy or cadence:
+    /// a low-level caller contract, for callers that characterize their clock.
     pub fn utc_milliseconds(value: u32) -> Result<Self, Ipv4OptionsError> {
         if value < 86_400_000 {
             Ok(Self(value))
@@ -91,6 +92,11 @@ pub enum TimestampRequest {
     Prespecified { addresses: [Ipv4Addr; 4], len: u8 },
 }
 
+/// Requested source route, Record Route and Timestamp options, in the order
+/// they are encoded. This is the low-level request: its RR and TS slot counts
+/// are capacities the caller asserts are large enough for the registrations it
+/// expects (RFC 791 section 3.1); [`Ipv4RegistrationPlan`] checks that
+/// assertion against stated expected registrations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OutgoingIpv4Options {
     pub source_route: Option<SourceRoute>,
@@ -328,12 +334,12 @@ impl Ipv4Options {
     //# field is set to one to indicate the use of a non-standard value.
 
     //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
-    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this.
     //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
     //# the ICMP Timestamp message.
-    // The u32 is a caller-asserted IPv4Timestamp wire value. Validate only a
-    // local slot write; remote records and irrelevant values on no-write paths
-    // remain opaque.
+    /// Low-level caller contract: `timestamp` is a caller-asserted
+    /// [`Ipv4Timestamp`] wire value, so an unmarked value claims the RFC 1122
+    /// section 3.2.2.8 UTC contract. Only a local slot write validates it;
+    /// remote records and irrelevant values on no-write paths remain opaque.
     pub fn record(self, local: Ipv4Addr, timestamp: u32) -> Result<Self, Ipv4OptionsError> {
         self.record_sampled(local, || Ipv4Timestamp::from_wire(timestamp).map(Some))
     }
@@ -550,6 +556,11 @@ impl OutgoingIpv4Options {
     //# The originating host MUST record a timestamp in a Timestamp option
     //# whose Internet address fields are not pre-specified or whose first
     //# pre-specified address is the host's interface address.
+    /// Low-level caller contract: encodes the requested slot counts without
+    /// checking them against any expected registrations, and records the
+    /// origin with `timestamp`, a caller-asserted [`Ipv4Timestamp`] wire value
+    /// validated only when a Timestamp slot is written. Returns the header
+    /// destination and the zero-padded option length.
     pub fn encode(
         &self,
         source: Ipv4Addr,
@@ -557,13 +568,38 @@ impl OutgoingIpv4Options {
         timestamp: u32,
         out: &mut [u8],
     ) -> Result<(Ipv4Addr, usize), Ipv4OptionsError> {
-        use Ipv4OptionsError::*;
         if !unicast(source) || !unicast(final_destination) {
-            return Err(InvalidAddress);
+            return Err(Ipv4OptionsError::InvalidAddress);
         }
         let mut bytes = [0u8; 40];
+        let (destination, route_len, len) = self.initialize(final_destination, &mut bytes)?;
+        // Record originating RR/TS without interpreting the unconsumed outgoing route.
+        let recorded =
+            Ipv4Options::parse(&bytes[route_len..len], false)?.record(source, timestamp)?;
+        bytes[route_len..len].copy_from_slice(recorded.as_bytes());
+        let padded = (len + 3) & !3;
+        if out.len() < padded {
+            return Err(Ipv4OptionsError::Capacity);
+        }
+        out[..padded].copy_from_slice(&bytes[..padded]);
+        Ok((destination, padded))
+    }
+
+    // The initialized option area before origin recording: the source route,
+    // Record Route with zeroed slots and Timestamp with zeroed or
+    // prespecified-address/zero slots, each pointer at its first slot
+    // (RFC 791 section 3.1). Returns the header destination, the route length
+    // and the unpadded length; the rest of `bytes` is zero.
+    fn initialize(
+        &self,
+        final_destination: Ipv4Addr,
+        bytes: &mut [u8; 40],
+    ) -> Result<(Ipv4Addr, usize, usize), Ipv4OptionsError> {
+        use Ipv4OptionsError::*;
+        *bytes = [0; 40];
         let (destination, mut len) =
-            encode_route(self.source_route.as_ref(), final_destination, &mut bytes);
+            encode_route(self.source_route.as_ref(), final_destination, bytes);
+        let route_len = len;
         if let Some(slots) = self.record_route_slots {
             let size = 3 + usize::from(slots) * 4;
             if slots > 9 || len + size > 40 {
@@ -598,21 +634,298 @@ impl OutgoingIpv4Options {
             }
             len += size;
         }
-        // Record originating RR/TS without interpreting the unconsumed outgoing route.
-        let route_len = if matches!(bytes[0], 131 | 137) {
-            usize::from(bytes[1])
+        Ok((destination, route_len, len))
+    }
+}
+
+/// The originated option an expectation or a capacity refers to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegisteredOption {
+    RecordRoute,
+    Timestamp,
+}
+
+/// Timestamp registrations the owner expects, in the form the requested
+/// Timestamp flag needs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedTimestamps<'a> {
+    /// Registrations for flags 0 and 1, counting every visit that records.
+    Count(u8),
+    /// For flag 3, the ordered addresses expected to register, repeated
+    /// visits included. A module registers only at the next prespecified
+    /// address, so these must begin the requested address list.
+    Prespecified(&'a [Ipv4Addr]),
+}
+
+/// The owner's statement of the registrations a datagram is expected to
+/// collect on its path, counting every visit that records, the originating
+/// host and the destination included. It comes from the owner's topology
+/// knowledge: the stack never infers downstream hop counts. `None` states
+/// nothing about that option.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExpectedRegistrations<'a> {
+    pub record_route: Option<u8>,
+    pub timestamp: Option<ExpectedTimestamps<'a>>,
+}
+
+/// Why requested options cannot hold the expected registrations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ipv4RegistrationError {
+    /// `option` holds `available` registrations, `expected` are expected; an
+    /// option that is not requested holds none.
+    InsufficientRecords {
+        option: RegisteredOption,
+        expected: usize,
+        available: usize,
+    },
+    /// The zero-padded option area needs `required_octets`, beyond the
+    /// `maximum` IPv4 option area of 40 octets.
+    CombinedCapacity {
+        required_octets: usize,
+        maximum: usize,
+    },
+    /// The prespecified Timestamp address at `index` is not unicast, or is not
+    /// the expected address at that position.
+    InvalidPrespecifiedAddress { index: usize },
+    /// An endpoint address is not IPv4.
+    WrongFamily,
+    /// `option` is requested without an expectation in the form it needs,
+    /// or by a managed open without a plan.
+    MissingExpectation { option: RegisteredOption },
+    /// The plan was made for other endpoint addresses or another request
+    /// (any source-route hop, its strictness, a slot count or a prespecified
+    /// address) than the open it is supplied with.
+    PlanMismatch,
+    /// The request is otherwise unencodable: a non-unicast endpoint address
+    /// (`InvalidAddress`) or a Timestamp option without slots (`Malformed`).
+    Options(Ipv4OptionsError),
+}
+
+const MAX_OPTION_OCTETS: usize = 40;
+
+// Unpadded octets of each requested option: a nonempty source route
+// 3 + 4n (an absent or empty one is the direct route and encodes nothing),
+// Record Route 3 + 4r, Timestamp 4 + 4t (flag 0) or 4 + 8t (flags 1 and 3).
+fn requested_octets(options: &OutgoingIpv4Options) -> Option<usize> {
+    let route = match options.source_route.map_or(0, |route| route.hops().len()) {
+        0 => 0,
+        hops => hops.checked_mul(4)?.checked_add(3)?,
+    };
+    let record_route = match options.record_route_slots {
+        Some(slots) => usize::from(slots).checked_mul(4)?.checked_add(3)?,
+        None => 0,
+    };
+    let timestamp = match options.timestamp {
+        Some(TimestampRequest::Times(slots)) => usize::from(slots).checked_mul(4)?,
+        Some(
+            TimestampRequest::AddressTimes(slots)
+            | TimestampRequest::Prespecified { len: slots, .. },
+        ) => usize::from(slots).checked_mul(8)?,
+        None => return route.checked_add(record_route),
+    }
+    .checked_add(4)?;
+    route.checked_add(record_route)?.checked_add(timestamp)
+}
+
+// Each requested capacity must hold every expected registration; capacity may
+// exceed the expectation, never fall short.
+fn check_expectations(
+    options: &OutgoingIpv4Options,
+    expected: &ExpectedRegistrations<'_>,
+) -> Result<(), Ipv4RegistrationError> {
+    use Ipv4RegistrationError::*;
+    use RegisteredOption::*;
+    let insufficient = |option, expected: usize, available: usize| {
+        if expected > available {
+            Err(InsufficientRecords {
+                option,
+                expected,
+                available,
+            })
         } else {
-            0
-        };
-        let recorded =
-            Ipv4Options::parse(&bytes[route_len..len], false)?.record(source, timestamp)?;
-        bytes[route_len..len].copy_from_slice(recorded.as_bytes());
-        let padded = (len + 3) & !3;
-        if out.len() < padded {
-            return Err(Capacity);
+            Ok(())
         }
-        out[..padded].copy_from_slice(&bytes[..padded]);
-        Ok((destination, padded))
+    };
+    match (options.record_route_slots, expected.record_route) {
+        (Some(_), None) => {
+            return Err(MissingExpectation {
+                option: RecordRoute,
+            });
+        }
+        (slots, Some(count)) => insufficient(
+            RecordRoute,
+            usize::from(count),
+            usize::from(slots.unwrap_or(0)),
+        )?,
+        (None, None) => {}
+    }
+    match (options.timestamp, expected.timestamp) {
+        (None, None) => Ok(()),
+        (
+            Some(TimestampRequest::Times(slots) | TimestampRequest::AddressTimes(slots)),
+            Some(ExpectedTimestamps::Count(count)),
+        ) => insufficient(Timestamp, usize::from(count), usize::from(slots)),
+        (
+            Some(TimestampRequest::Prespecified { addresses, len }),
+            Some(ExpectedTimestamps::Prespecified(visits)),
+        ) => {
+            insufficient(Timestamp, visits.len(), usize::from(len))?;
+            match visits
+                .iter()
+                .zip(addresses)
+                .position(|(visit, address)| *visit != address)
+            {
+                Some(index) => Err(InvalidPrespecifiedAddress { index }),
+                None => Ok(()),
+            }
+        }
+        (None, Some(ExpectedTimestamps::Count(count))) => {
+            insufficient(Timestamp, usize::from(count), 0)
+        }
+        (None, Some(ExpectedTimestamps::Prespecified(visits))) => {
+            insufficient(Timestamp, visits.len(), 0)
+        }
+        (Some(_), _) => Err(MissingExpectation { option: Timestamp }),
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+//# A recorded route is composed of a series of internet addresses. Each
+//# internet address is 32 bits or 4 octets. If the pointer is greater than
+//# the length, the recorded route data area is full. The originating host
+//# must compose this option with a large enough route data area to hold all
+//# the address expected. The size of the option does not change due to
+//# adding addresses. The intitial contents of the route data area must be
+//# zero.
+
+//= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+//# The originating host must compose this option with a large enough
+//# timestamp data area to hold all the timestamp information expected. The
+//# size of the option does not change due to adding timestamps. The
+//# intitial contents of the timestamp data area must be zero or internet
+//# address/zero pairs.
+/// A checked capacity plan for originating `OutgoingIpv4Options` between two
+/// IPv4 endpoints, not yet bound to a connection or route.
+///
+/// Planning succeeds only when each requested Record Route and Timestamp
+/// option holds every expected registration (RFC 791 section 3.1: the
+/// originating host composes the option with a data area large enough for all
+/// expected addresses and timestamps) and the zero-padded option area fits
+/// the 40-octet IPv4 maximum. Nothing is truncated, shrunk or dropped. The
+/// encoded area always has [`Self::option_octets`] octets, initialized (zero,
+/// or address/zero pairs for prespecified addresses) before origin recording;
+/// registration never changes its size. TCP options are carried in the TCP
+/// header and do not consume this budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv4RegistrationPlan {
+    options: OutgoingIpv4Options,
+    source: Ipv4Addr,
+    final_destination: Ipv4Addr,
+    octets: u8,
+}
+
+impl Ipv4RegistrationPlan {
+    /// Plan `options` from `local` to `remote` for the `expected`
+    /// registrations. Request errors (family, addresses, slots, the combined
+    /// budget) are reported before expectation errors.
+    pub fn new(
+        local: IpAddr,
+        remote: IpAddr,
+        options: OutgoingIpv4Options,
+        expected: &ExpectedRegistrations<'_>,
+    ) -> Result<Self, Ipv4RegistrationError> {
+        use Ipv4RegistrationError::*;
+        let (IpAddr::V4(source), IpAddr::V4(final_destination)) = (local, remote) else {
+            return Err(WrongFamily);
+        };
+        if !unicast(source) || !unicast(final_destination) {
+            return Err(Options(Ipv4OptionsError::InvalidAddress));
+        }
+        if let Some(request) = options.timestamp {
+            let (TimestampRequest::Times(slots)
+            | TimestampRequest::AddressTimes(slots)
+            | TimestampRequest::Prespecified { len: slots, .. }) = request;
+            if slots == 0 {
+                return Err(Options(Ipv4OptionsError::Malformed));
+            }
+            if let TimestampRequest::Prespecified { addresses, len } = request
+                && let Some(index) = addresses
+                    .iter()
+                    .take(usize::from(len))
+                    .position(|&address| !unicast(address))
+            {
+                return Err(InvalidPrespecifiedAddress { index });
+            }
+        }
+        let required_octets = requested_octets(&options)
+            .and_then(|octets| octets.checked_add(3))
+            .map_or(usize::MAX, |octets| octets & !3);
+        if required_octets > MAX_OPTION_OCTETS {
+            return Err(CombinedCapacity {
+                required_octets,
+                maximum: MAX_OPTION_OCTETS,
+            });
+        }
+        check_expectations(&options, expected)?;
+        Ok(Self {
+            options,
+            source,
+            final_destination,
+            octets: required_octets as u8,
+        })
+    }
+
+    /// The checked request.
+    pub const fn options(&self) -> &OutgoingIpv4Options {
+        &self.options
+    }
+
+    /// The fixed, zero-padded size of the option area, which IHL counts.
+    pub const fn option_octets(&self) -> usize {
+        self.octets as usize
+    }
+
+    // A plan states expectations for exactly one request between two
+    // endpoints; any other request needs its own plan.
+    pub(crate) fn check_request(
+        &self,
+        local: IpAddr,
+        remote: IpAddr,
+        options: &OutgoingIpv4Options,
+    ) -> Result<(), Ipv4RegistrationError> {
+        let (IpAddr::V4(source), IpAddr::V4(final_destination)) = (local, remote) else {
+            return Err(Ipv4RegistrationError::WrongFamily);
+        };
+        if source != self.source
+            || final_destination != self.final_destination
+            || *options != self.options
+        {
+            return Err(Ipv4RegistrationError::PlanMismatch);
+        }
+        Ok(())
+    }
+
+    /// Encode the initialized option area into `out` and record the origin,
+    /// sampling `provider` only for a Timestamp slot the origin may write;
+    /// without a sample that slot and its pointer stay initialized. Returns
+    /// the header destination and [`Self::option_octets`].
+    pub fn encode_with<P: Ipv4TimestampProvider + ?Sized>(
+        &self,
+        provider: &mut P,
+        out: &mut [u8],
+    ) -> Result<(Ipv4Addr, usize), Ipv4OptionsError> {
+        let out = out
+            .get_mut(..self.option_octets())
+            .ok_or(Ipv4OptionsError::Capacity)?;
+        let mut bytes = [0u8; 40];
+        let (destination, route_len, len) = self
+            .options
+            .initialize(self.final_destination, &mut bytes)?;
+        let recorded = Ipv4Options::parse(&bytes[route_len..len], false)?
+            .record_with(self.source, provider)?;
+        bytes[route_len..len].copy_from_slice(recorded.as_bytes());
+        out.copy_from_slice(&bytes[..out.len()]);
+        Ok((destination, out.len()))
     }
 }
 
@@ -670,7 +983,6 @@ mod tests {
 
     //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
     //= type=test
-    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this.
     //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
     //# the ICMP Timestamp message.
     #[test]
@@ -1476,5 +1788,613 @@ mod tests {
             EncodedIpv4Options::new(None, Ipv4Addr::BROADCAST, &[]),
             Err(Ipv4OptionsError::InvalidAddress)
         );
+    }
+
+    fn v4(n: u8) -> IpAddr {
+        IpAddr::V4(ip(n))
+    }
+
+    fn plan(
+        options: OutgoingIpv4Options,
+        expected: &ExpectedRegistrations<'_>,
+    ) -> Result<Ipv4RegistrationPlan, Ipv4RegistrationError> {
+        Ipv4RegistrationPlan::new(v4(1), v4(2), options, expected)
+    }
+
+    fn timestamp_capacity(request: TimestampRequest) -> (u8, usize) {
+        match request {
+            TimestampRequest::Times(n) => (n, 4),
+            TimestampRequest::AddressTimes(n) | TimestampRequest::Prespecified { len: n, .. } => {
+                (n, 8)
+            }
+        }
+    }
+
+    // Expectations equal to every requested capacity.
+    fn exact<'a>(
+        options: &OutgoingIpv4Options,
+        prespecified: &'a [Ipv4Addr; 4],
+    ) -> ExpectedRegistrations<'a> {
+        ExpectedRegistrations {
+            record_route: options.record_route_slots,
+            timestamp: options.timestamp.map(|request| match request {
+                TimestampRequest::Prespecified { len, .. } => {
+                    ExpectedTimestamps::Prespecified(&prespecified[..usize::from(len).min(4)])
+                }
+                request => ExpectedTimestamps::Count(timestamp_capacity(request).0),
+            }),
+        }
+    }
+
+    #[test]
+    fn plan_budget_fits_exactly_forty_padded_octets_with_every_combination() {
+        let hops: [Ipv4Addr; 9] = core::array::from_fn(|i| ip(10 + i as u8));
+        let addresses = [ip(1), ip(3), ip(4), ip(1)];
+        let mut routes = [None; 21];
+        for count in 0..=9 {
+            for strict in [false, true] {
+                routes[1 + count * 2 + usize::from(strict)] =
+                    Some(SourceRoute::new(&hops[..count], strict).unwrap());
+            }
+        }
+        let mut timestamps = [None; 21];
+        for n in 1..=10 {
+            timestamps[usize::from(n)] = Some(TimestampRequest::Times(n));
+        }
+        for n in 1..=5 {
+            timestamps[10 + usize::from(n)] = Some(TimestampRequest::AddressTimes(n));
+            timestamps[15 + usize::from(n)] =
+                Some(TimestampRequest::Prespecified { addresses, len: n });
+        }
+        let mut smallest_over = usize::MAX;
+        let mut largest_fit = 0;
+        for source_route in routes {
+            for record_route_slots in core::iter::once(None).chain((0..=10).map(Some)) {
+                for timestamp in timestamps {
+                    let options = OutgoingIpv4Options {
+                        source_route,
+                        record_route_slots,
+                        timestamp,
+                    };
+                    let route = match source_route.map_or(0, |r| r.hops().len()) {
+                        0 => 0,
+                        n => 3 + 4 * n,
+                    };
+                    let rr = record_route_slots.map_or(0, |r| 3 + 4 * usize::from(r));
+                    let ts = timestamp.map_or(0, |t| {
+                        let (n, stride) = timestamp_capacity(t);
+                        4 + stride * usize::from(n)
+                    });
+                    let unpadded = route + rr + ts;
+                    let padded = unpadded.div_ceil(4) * 4;
+                    let result = plan(options, &exact(&options, &addresses));
+                    let mut raw = [0xa5; 40];
+                    let raw_result = options.encode(ip(1), ip(2), 0x8000_0007, &mut raw);
+                    if padded > 40 {
+                        smallest_over = smallest_over.min(unpadded);
+                        assert_eq!(
+                            result,
+                            Err(Ipv4RegistrationError::CombinedCapacity {
+                                required_octets: padded,
+                                maximum: 40,
+                            }),
+                            "{options:?}"
+                        );
+                        assert!(raw_result.is_err(), "{options:?}");
+                        continue;
+                    }
+                    largest_fit = largest_fit.max(unpadded);
+                    let plan = result.unwrap();
+                    assert_eq!(plan.option_octets(), padded);
+                    assert_eq!(plan.options(), &options);
+                    let mut out = [0xa5; 40];
+                    let mut clock = provider(Some(7));
+                    let (destination, len) = plan.encode_with(&mut clock, &mut out).unwrap();
+                    assert_eq!(len, padded);
+                    assert!(out[padded..].iter().all(|&b| b == 0xa5));
+                    assert!(out[unpadded..padded].iter().all(|&b| b == 0));
+                    // The low-level encoder agrees octet for octet.
+                    assert_eq!(raw_result, Ok((destination, len)));
+                    assert_eq!(raw[..len], out[..len]);
+                    let first_hop = source_route.and_then(|r| r.hops().first().copied());
+                    assert_eq!(destination, first_hop.unwrap_or(ip(2)));
+                }
+            }
+        }
+        // Option sizes are 3 or 0 modulo 4, so 41 unpadded octets are not
+        // attainable: the smallest overflow is a nonempty route with Record
+        // Route (6 + 4k = 42), one record beyond 38.
+        assert_eq!((largest_fit, smallest_over), (40, 42));
+    }
+
+    #[test]
+    fn plan_boundaries_one_record_over_and_padding() {
+        let ok = |options: OutgoingIpv4Options| {
+            plan(options, &exact(&options, &[ip(1); 4])).map(|plan| plan.option_octets())
+        };
+        let over = |required_octets| {
+            Err(Ipv4RegistrationError::CombinedCapacity {
+                required_octets,
+                maximum: 40,
+            })
+        };
+        let route = |n: usize, strict| Some(SourceRoute::new(&[ip(3); 9][..n], strict).unwrap());
+        let rr = |slots| OutgoingIpv4Options {
+            record_route_slots: Some(slots),
+            ..Default::default()
+        };
+        // 39 octets pad to 40; one more record needs 43, padded 44.
+        assert_eq!(ok(rr(9)), Ok(40));
+        assert_eq!(ok(rr(10)), over(44));
+        // Flag 0 fills exactly 40 unpadded octets; one more record is 44.
+        let times = |n| OutgoingIpv4Options {
+            timestamp: Some(TimestampRequest::Times(n)),
+            ..Default::default()
+        };
+        assert_eq!(ok(times(9)), Ok(40));
+        assert_eq!(ok(times(10)), over(44));
+        // Flags 1 and 3: four address/time pairs are 36 octets, five 44.
+        for request in [
+            TimestampRequest::AddressTimes(4),
+            TimestampRequest::Prespecified {
+                addresses: [ip(1); 4],
+                len: 4,
+            },
+        ] {
+            let mut options = OutgoingIpv4Options {
+                timestamp: Some(request),
+                ..Default::default()
+            };
+            assert_eq!(ok(options), Ok(36));
+            options.timestamp = Some(match request {
+                TimestampRequest::AddressTimes(_) => TimestampRequest::AddressTimes(5),
+                _ => TimestampRequest::Prespecified {
+                    addresses: [ip(1); 4],
+                    len: 5,
+                },
+            });
+            assert_eq!(ok(options), over(44));
+        }
+        for strict in [false, true] {
+            // Route 7 + RR 11 + TS 20 = 38, padded 40; one more of either record is 42.
+            let mut options = OutgoingIpv4Options {
+                source_route: route(1, strict),
+                record_route_slots: Some(2),
+                timestamp: Some(TimestampRequest::Times(4)),
+            };
+            assert_eq!(ok(options), Ok(40));
+            options.record_route_slots = Some(3);
+            assert_eq!(ok(options), over(44));
+            options.record_route_slots = Some(2);
+            options.timestamp = Some(TimestampRequest::Times(5));
+            assert_eq!(ok(options), over(44));
+            // Route 11 + RR 27 = 38 pads to 40; one more hop or record is 42.
+            let mut options = OutgoingIpv4Options {
+                source_route: route(2, strict),
+                record_route_slots: Some(6),
+                timestamp: None,
+            };
+            assert_eq!(ok(options), Ok(40));
+            options.source_route = route(3, strict);
+            assert_eq!(ok(options), over(44));
+            options.source_route = route(2, strict);
+            options.record_route_slots = Some(7);
+            assert_eq!(ok(options), over(44));
+            // Nine hops fill 39 octets and leave no room for any record.
+            options.source_route = route(9, strict);
+            options.record_route_slots = None;
+            assert_eq!(ok(options), Ok(40));
+            options.record_route_slots = Some(0);
+            assert_eq!(ok(options), over(44));
+        }
+        // An absent and an explicitly empty source route both take 0 octets.
+        for source_route in [None, route(0, true), route(0, false)] {
+            let options = OutgoingIpv4Options {
+                source_route,
+                record_route_slots: Some(3),
+                timestamp: Some(TimestampRequest::Times(3)),
+            };
+            // RR 15 + TS 16 = 31, padded 32: three records each.
+            assert_eq!(ok(options), Ok(32));
+            // Addressed TS with three RR records needs 15 + 28 = 43, padded 44.
+            let options = OutgoingIpv4Options {
+                timestamp: Some(TimestampRequest::AddressTimes(3)),
+                ..options
+            };
+            assert_eq!(ok(options), over(44));
+        }
+        // Without RR or TS a plan is just the route; nothing at all is empty.
+        assert_eq!(ok(OutgoingIpv4Options::default()), Ok(0));
+        assert_eq!(
+            ok(OutgoingIpv4Options {
+                source_route: route(2, false),
+                ..Default::default()
+            }),
+            Ok(12)
+        );
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# A recorded route is composed of a series of internet addresses. Each
+    //# internet address is 32 bits or 4 octets. If the pointer is greater than
+    //# the length, the recorded route data area is full. The originating host
+    //# must compose this option with a large enough route data area to hold all
+    //# the address expected. The size of the option does not change due to
+    //# adding addresses. The intitial contents of the route data area must be
+    //# zero.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The originating host must compose this option with a large enough
+    //# timestamp data area to hold all the timestamp information expected. The
+    //# size of the option does not change due to adding timestamps. The
+    //# intitial contents of the timestamp data area must be zero or internet
+    //# address/zero pairs.
+    #[test]
+    fn plan_refuses_insufficient_records_per_option() {
+        use Ipv4RegistrationError::InsufficientRecords;
+        use RegisteredOption::*;
+        let insufficient = |option, expected, available| {
+            Err(InsufficientRecords {
+                option,
+                expected,
+                available,
+            })
+        };
+        let route = Some(SourceRoute::new(&[ip(3)], true).unwrap());
+        let options = OutgoingIpv4Options {
+            source_route: route,
+            record_route_slots: Some(2),
+            timestamp: Some(TimestampRequest::Times(2)),
+        };
+        let expect = |rr, ts| ExpectedRegistrations {
+            record_route: Some(rr),
+            timestamp: Some(ExpectedTimestamps::Count(ts)),
+        };
+        // Capacity may exceed the expectation, never fall short.
+        for (rr, ts) in [(0, 0), (1, 2), (2, 1), (2, 2)] {
+            assert_eq!(plan(options, &expect(rr, ts)).unwrap().option_octets(), 32);
+        }
+        assert_eq!(
+            plan(options, &expect(3, 2)),
+            insufficient(RecordRoute, 3, 2)
+        );
+        assert_eq!(plan(options, &expect(2, 3)), insufficient(Timestamp, 3, 2));
+        let addressed = OutgoingIpv4Options {
+            timestamp: Some(TimestampRequest::AddressTimes(2)),
+            ..options
+        };
+        assert_eq!(plan(addressed, &expect(2, 2)).unwrap().option_octets(), 40);
+        assert_eq!(
+            plan(addressed, &expect(2, 3)),
+            insufficient(Timestamp, 3, 2)
+        );
+        // A zero-slot Record Route holds no registration.
+        let empty_rr = OutgoingIpv4Options {
+            record_route_slots: Some(0),
+            timestamp: None,
+            ..options
+        };
+        let rr_only = |rr| ExpectedRegistrations {
+            record_route: Some(rr),
+            timestamp: None,
+        };
+        assert_eq!(plan(empty_rr, &rr_only(0)).unwrap().option_octets(), 12);
+        assert_eq!(plan(empty_rr, &rr_only(1)), insufficient(RecordRoute, 1, 0));
+        // Expected registrations for an option that is not requested.
+        let none = OutgoingIpv4Options {
+            source_route: route,
+            ..Default::default()
+        };
+        assert_eq!(plan(none, &rr_only(1)), insufficient(RecordRoute, 1, 0));
+        fn ts_only(timestamp: ExpectedTimestamps<'_>) -> ExpectedRegistrations<'_> {
+            ExpectedRegistrations {
+                record_route: None,
+                timestamp: Some(timestamp),
+            }
+        }
+        assert_eq!(
+            plan(none, &ts_only(ExpectedTimestamps::Count(1))),
+            insufficient(Timestamp, 1, 0)
+        );
+        assert_eq!(
+            plan(none, &ts_only(ExpectedTimestamps::Prespecified(&[ip(1)]))),
+            insufficient(Timestamp, 1, 0)
+        );
+        // Stating zero registrations of an absent option is consistent.
+        assert!(plan(none, &expect(0, 0)).is_ok());
+        assert!(plan(none, &ts_only(ExpectedTimestamps::Prespecified(&[]))).is_ok());
+        // Ten expected registrations exceed what any 40-octet option holds.
+        let full = OutgoingIpv4Options {
+            source_route: None,
+            record_route_slots: Some(9),
+            timestamp: None,
+        };
+        assert_eq!(plan(full, &rr_only(10)), insufficient(RecordRoute, 10, 9));
+    }
+
+    #[test]
+    fn plan_prespecified_addresses_missing_expectations_and_family() {
+        use Ipv4RegistrationError::*;
+        let addresses = [ip(1), ip(3), ip(1), ip(4)];
+        let options = OutgoingIpv4Options {
+            source_route: Some(SourceRoute::new(&[], false).unwrap()),
+            record_route_slots: None,
+            timestamp: Some(TimestampRequest::Prespecified { addresses, len: 3 }),
+        };
+        fn visits(visits: &[Ipv4Addr]) -> ExpectedRegistrations<'_> {
+            ExpectedRegistrations {
+                record_route: None,
+                timestamp: Some(ExpectedTimestamps::Prespecified(visits)),
+            }
+        }
+        // The expected ordered visits, repeated ones included, begin the list.
+        for n in 0..=3 {
+            assert_eq!(
+                plan(options, &visits(&addresses[..n]))
+                    .unwrap()
+                    .option_octets(),
+                28
+            );
+        }
+        assert_eq!(
+            plan(options, &visits(&addresses)),
+            Err(InsufficientRecords {
+                option: RegisteredOption::Timestamp,
+                expected: 4,
+                available: 3,
+            })
+        );
+        // A module registers only at the next prespecified address.
+        assert_eq!(
+            plan(options, &visits(&[ip(1), ip(1)])),
+            Err(InvalidPrespecifiedAddress { index: 1 })
+        );
+        assert_eq!(
+            plan(options, &visits(&[ip(3)])),
+            Err(InvalidPrespecifiedAddress { index: 0 })
+        );
+        // Requested addresses must be unicast; entries beyond `len` are unused.
+        for bad in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+        ] {
+            let mut addresses = addresses;
+            addresses[2] = bad;
+            let request = |len| OutgoingIpv4Options {
+                timestamp: Some(TimestampRequest::Prespecified { addresses, len }),
+                ..options
+            };
+            assert_eq!(
+                plan(request(3), &visits(&addresses[..2])),
+                Err(InvalidPrespecifiedAddress { index: 2 })
+            );
+            assert!(plan(request(2), &visits(&addresses[..2])).is_ok());
+        }
+        // Requested options without an expectation in the form they need.
+        let rr = OutgoingIpv4Options {
+            record_route_slots: Some(1),
+            timestamp: None,
+            ..options
+        };
+        let missing = |option| Err(MissingExpectation { option });
+        assert_eq!(
+            plan(rr, &ExpectedRegistrations::default()),
+            missing(RegisteredOption::RecordRoute)
+        );
+        assert_eq!(
+            plan(options, &ExpectedRegistrations::default()),
+            missing(RegisteredOption::Timestamp)
+        );
+        let count = ExpectedRegistrations {
+            record_route: None,
+            timestamp: Some(ExpectedTimestamps::Count(1)),
+        };
+        assert_eq!(plan(options, &count), missing(RegisteredOption::Timestamp));
+        for request in [
+            TimestampRequest::Times(2),
+            TimestampRequest::AddressTimes(2),
+        ] {
+            let options = OutgoingIpv4Options {
+                timestamp: Some(request),
+                ..options
+            };
+            assert!(plan(options, &count).is_ok());
+            assert_eq!(
+                plan(options, &visits(&[ip(1)])),
+                missing(RegisteredOption::Timestamp)
+            );
+        }
+        // IPv4 options exist only between IPv4 endpoints.
+        let v6 = IpAddr::V6(core::net::Ipv6Addr::LOCALHOST);
+        let mapped = IpAddr::V6(ip(2).to_ipv6_mapped());
+        let expected = visits(&addresses[..1]);
+        for (local, remote) in [(v6, v4(2)), (v4(1), v6), (v6, v6), (v4(1), mapped)] {
+            assert_eq!(
+                Ipv4RegistrationPlan::new(local, remote, options, &expected),
+                Err(WrongFamily)
+            );
+            assert_eq!(
+                Ipv4RegistrationPlan::new(local, remote, OutgoingIpv4Options::default(), &expected),
+                Err(WrongFamily)
+            );
+        }
+        for (local, remote) in [
+            (Ipv4Addr::BROADCAST, ip(2)),
+            (ip(1), Ipv4Addr::UNSPECIFIED),
+            (ip(1), Ipv4Addr::new(224, 0, 0, 1)),
+        ] {
+            assert_eq!(
+                Ipv4RegistrationPlan::new(local.into(), remote.into(), options, &expected),
+                Err(Options(Ipv4OptionsError::InvalidAddress))
+            );
+        }
+        // A Timestamp option needs at least one slot.
+        for request in [
+            TimestampRequest::Times(0),
+            TimestampRequest::AddressTimes(0),
+            TimestampRequest::Prespecified { addresses, len: 0 },
+        ] {
+            let options = OutgoingIpv4Options {
+                timestamp: Some(request),
+                ..options
+            };
+            assert_eq!(
+                plan(options, &visits(&[])),
+                Err(Options(Ipv4OptionsError::Malformed))
+            );
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# A recorded route is composed of a series of internet addresses. Each
+    //# internet address is 32 bits or 4 octets. If the pointer is greater than
+    //# the length, the recorded route data area is full. The originating host
+    //# must compose this option with a large enough route data area to hold all
+    //# the address expected. The size of the option does not change due to
+    //# adding addresses. The intitial contents of the route data area must be
+    //# zero.
+
+    //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
+    //= type=test
+    //# The originating host must compose this option with a large enough
+    //# timestamp data area to hold all the timestamp information expected. The
+    //# size of the option does not change due to adding timestamps. The
+    //# intitial contents of the timestamp data area must be zero or internet
+    //# address/zero pairs.
+    #[test]
+    fn plan_initializes_fixed_size_area_before_origin_recording() {
+        let route = SourceRoute::new(&[ip(3)], false).unwrap();
+        for (request, flag, stride) in [
+            (TimestampRequest::Times(3), 0, 4),
+            (TimestampRequest::AddressTimes(2), 1, 8),
+            (
+                TimestampRequest::Prespecified {
+                    addresses: [ip(1), ip(5), ip(2), ip(6)],
+                    len: 2,
+                },
+                3,
+                8,
+            ),
+            (
+                TimestampRequest::Prespecified {
+                    addresses: [ip(5), ip(1), ip(2), ip(6)],
+                    len: 2,
+                },
+                3,
+                8,
+            ),
+        ] {
+            let options = OutgoingIpv4Options {
+                source_route: Some(route),
+                record_route_slots: Some(2),
+                timestamp: Some(request),
+            };
+            let prespecified = match request {
+                TimestampRequest::Prespecified { addresses, .. } => addresses,
+                _ => [ip(1); 4],
+            };
+            let plan = plan(options, &exact(&options, &prespecified)).unwrap();
+            // Before origin recording: route, zeroed RR, zeroed or
+            // address/zero TS slots, pointers at their first slot.
+            let mut initialized = [0xa5; 40];
+            let (_, route_len, len) = options.initialize(ip(2), &mut initialized).unwrap();
+            assert_eq!(route_len, 7);
+            assert_eq!(&initialized[..7], &[131, 7, 4, 192, 0, 2, 2]);
+            assert_eq!(&initialized[7..18], &[7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0]);
+            let ts_len = len - 18;
+            assert_eq!(&initialized[18..22], &[68, ts_len as u8, 5, flag]);
+            for (i, slot) in initialized[22..len].chunks_exact(stride).enumerate() {
+                let address = if flag == 3 {
+                    &prespecified[i].octets()[..]
+                } else {
+                    &[0; 4]
+                };
+                assert_eq!(&slot[..stride - 4], &address[..stride - 4]);
+                assert_eq!(&slot[stride - 4..], &[0; 4]);
+            }
+            assert!(initialized[len..].iter().all(|&b| b == 0));
+            assert_eq!(plan.option_octets(), (len + 3) & !3);
+
+            // Origin recording writes into that area without resizing it,
+            // sampling only for a slot the origin may write.
+            let writes = flag != 3 || prespecified[0] == ip(1);
+            for sample in [Some(9), None] {
+                let mut clock = provider(sample);
+                let mut out = [0xa5; 40];
+                let (destination, octets) = plan.encode_with(&mut clock, &mut out).unwrap();
+                assert_eq!((destination, octets), (ip(3), plan.option_octets()));
+                assert_eq!(clock.calls, usize::from(writes));
+                assert_eq!(&out[..7], &initialized[..7]);
+                assert_eq!(&out[7..18], &[7, 11, 8, 192, 0, 2, 1, 0, 0, 0, 0]);
+                let mut expected = initialized;
+                if writes && sample.is_some() {
+                    expected[20] += stride as u8;
+                    if flag == 1 {
+                        expected[22..26].copy_from_slice(&ip(1).octets());
+                    }
+                    expected[18 + stride..22 + stride]
+                        .copy_from_slice(&0x8000_0009u32.to_be_bytes());
+                }
+                assert_eq!(&out[18..octets], &expected[18..octets]);
+                assert!(out[octets..].iter().all(|&b| b == 0xa5));
+                assert_eq!(
+                    plan.encode_with(&mut provider(sample), &mut out[..octets - 1]),
+                    Err(Ipv4OptionsError::Capacity)
+                );
+
+                // Downstream registrations fill the area, never resize it.
+                let mut received = Ipv4Options::parse(&out[7..len], false).unwrap();
+                for _ in 0..4 {
+                    received = received.record(ip(2), 0x8000_0001).unwrap();
+                    assert_eq!(received.as_bytes().len(), len - 7);
+                    assert_eq!(&received.as_bytes()[..2], &[7, 11]);
+                    assert_eq!(&received.as_bytes()[11..13], &[68, ts_len as u8]);
+                }
+                let bytes = received.as_bytes();
+                // Record Route is full: its pointer is one past its length.
+                assert_eq!(bytes[2], 12);
+                if flag != 3 {
+                    assert_eq!(bytes[13], ts_len as u8 + 1);
+                    assert!(bytes[14] >> 4 > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plan_output_keeps_fragment_copy_rules() {
+        for strict in [false, true] {
+            let options = OutgoingIpv4Options {
+                source_route: Some(SourceRoute::new(&[ip(3), ip(4)], strict).unwrap()),
+                record_route_slots: Some(2),
+                timestamp: Some(TimestampRequest::Times(2)),
+            };
+            let plan = plan(options, &exact(&options, &[ip(1); 4])).unwrap();
+            let mut encoded = [0; 40];
+            let (_, len) = plan
+                .encode_with(&mut provider(Some(7)), &mut encoded)
+                .unwrap();
+            let mut out = [0xa5; 40];
+            // Only the copied source route reaches later fragments.
+            assert_eq!(copied_fragment_options(&encoded[..len], &mut out), Ok(12));
+            assert_eq!(&out[..11], &encoded[..11]);
+            assert_eq!(out[11], 0);
+        }
+        let options = OutgoingIpv4Options {
+            source_route: None,
+            record_route_slots: Some(3),
+            timestamp: Some(TimestampRequest::Times(3)),
+        };
+        let plan = plan(options, &exact(&options, &[ip(1); 4])).unwrap();
+        let mut encoded = [0; 40];
+        let (_, len) = plan
+            .encode_with(&mut provider(Some(7)), &mut encoded)
+            .unwrap();
+        assert_eq!(len, 32);
+        assert_eq!(copied_fragment_options(&encoded[..len], &mut []), Ok(0));
     }
 }

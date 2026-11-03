@@ -94,7 +94,7 @@ fn forged(frame: &[u8], mtu: u32, mutate: impl FnOnce(&mut Vec<u8>, usize)) -> V
     ptb(&copy, mtu)
 }
 fn dispatch(side: &mut Side, now: u64, report: &[u8]) -> IcmpDispatch {
-    side.0.input_icmp(&mut side.1, side.2, now, report).unwrap()
+    side.0.input_icmp(&mut side.1, side.2, now, report, None).unwrap()
 }
 fn smaller(v6: bool) -> u32 {
     if v6 { 1280 } else { 1100 }
@@ -717,7 +717,7 @@ fn asymmetric_arrival_admits_unscoped_errors_only() {
         // The router's error about our submission returns over link 2.
         let report = ptb(&original, smaller(v6));
         let (report, published) =
-            tcp_report(a.0.input_icmp(&mut a.1, second, now + 13, &report).unwrap());
+            tcp_report(a.0.input_icmp(&mut a.1, second, now + 13, &report, None).unwrap());
         assert!(matches!(
             report,
             TcpReport::PacketTooBig(PmtuFeedback::Decreased { .. })
@@ -731,11 +731,11 @@ fn asymmetric_arrival_admits_unscoped_errors_only() {
             scoped[8..24].copy_from_slice(&"fe80::1".parse::<Ipv6Addr>().unwrap().octets());
             let report = ptb(&scoped, 1280);
             assert_eq!(
-                a.0.input_icmp(&mut a.1, second, now + 14, &report),
+                a.0.input_icmp(&mut a.1, second, now + 14, &report, None),
                 Err(Error::Path(path::Error::NoRoute))
             );
             assert_eq!(
-                a.0.input_icmp(&mut a.1, a.2, now + 14, &report).unwrap(),
+                a.0.input_icmp(&mut a.1, a.2, now + 14, &report, None).unwrap(),
                 UNCORRELATED
             );
         }

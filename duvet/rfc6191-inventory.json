@@ -17,7 +17,7 @@
       "section": "1",
       "quote": "For the purpose of PAWS, the timestamps sent on a connection are required to be monotonically increasing.",
       "status": "TODO",
-      "reason": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks. Dedicated complete source/test evidence remains missing.",
+      "reason": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks, and T15's IPv4 UTC provider does not establish PAWS monotonicity. T20 owns the characterized monotonic TCP timestamp provider and host lifecycle this needs; dedicated complete source/test evidence remains missing.",
       "target": "https://www.rfc-editor.org/rfc/rfc6191#section-1"
     },
     {

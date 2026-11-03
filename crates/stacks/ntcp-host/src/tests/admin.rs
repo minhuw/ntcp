@@ -474,7 +474,7 @@ fn lowered_by_ptb(v6: bool, identity: u128) -> (Side, Side, ConnectionId, u64) {
     assert!(quoted.len() as u32 > low(v6));
     let report = super::dispatch::ptb(&quoted, low(v6));
     let (_, published) =
-        super::dispatch::tcp_report(a.0.input_icmp(&mut a.1, a.2, now + 1, &report).unwrap());
+        super::dispatch::tcp_report(a.0.input_icmp(&mut a.1, a.2, now + 1, &report, None).unwrap());
     assert_eq!(published, Some(path::EstimateChange::Decreased));
     now += 2;
     assert_eq!(a.0.service_changes(&mut a.1, now).unwrap().failed, 0);
@@ -1056,6 +1056,19 @@ fn unrepresentable_restriction_fails_after_inspecting_several_clients_with_nothi
     // An empty (direct) source route admits a Record Route request.
     recorded.ipv4_options.source_route = Some(ntcp::SourceRoute::new(&[], false).unwrap());
     recorded.ipv4_options.record_route_slots = Some(7);
+    // The direct path registers the origin and the destination.
+    recorded.registration = Some(
+        ntcp::Ipv4RegistrationPlan::new(
+            local.ip(),
+            remote.ip(),
+            recorded.ipv4_options,
+            &ExpectedRegistrations {
+                record_route: Some(2),
+                timestamp: None,
+            },
+        )
+        .unwrap(),
+    );
     let routed = a
         .1
         .connect_with_path_provider(now, SocketAddr::new(local.ip(), local.port() + 1), remote, recorded, &mut a.0)

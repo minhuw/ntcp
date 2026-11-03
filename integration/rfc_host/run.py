@@ -634,7 +634,7 @@ def main():
     assert completed == len(cases) and stream_count > 0 and refusal_count == 12
     assert icmp_completed == len(icmp_cases) == 23
     assert admin_completed == len(admin_cases) == 7
-    assert option_completed == len(option_cases) == 3
+    assert option_completed == len(option_cases) == 5
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
                                     icmp_cases=icmp_completed, admin_cases=admin_completed,
                                     option_cases=option_completed,

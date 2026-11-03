@@ -271,10 +271,14 @@ def public(event):
 
 
 class Capture:
-    """Both directions of the actual TUN device in the router namespace."""
+    """Both directions of the actual TUN device in the router namespace.
 
-    def __init__(self, name):
-        self.socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+    LINK SOCK_DGRAM captures another router interface without its link
+    header; its PACKET_OUTGOING frames (labelled to-ntcp) are then that
+    interface's router output."""
+
+    def __init__(self, name, link=socket.SOCK_RAW):
+        self.socket = socket.socket(socket.AF_PACKET, link, socket.htons(3))
         self.socket.bind((name, 0))
         self.events, self.error, self.bytes = [], None, 0
         self.lock = threading.Lock()
@@ -321,20 +325,30 @@ class Capture:
 class Ntcp:
     """The unmodified tun_echo example: TCP and UDP echo through one Host."""
 
-    def __init__(self, binary, local, udp_mode, settings=None):
-        env = {k: v for k, v in os.environ.items() if not k.startswith("NTCP_") and k != "LD_PRELOAD"}
-        # The UDP echo's send mode is selected explicitly per case; other
-        # operational settings (deployment knowledge) are per case too.
-        env["NTCP_UDP_ECHO_MODE"] = udp_mode
-        env.update(settings or {})
+    def __init__(self, binary, local, udp_mode, settings=None, peer=None):
         self.udp_mode, self.settings = udp_mode, dict(settings or {})
-        self.p = subprocess.Popen([str(binary), TUN, local, str(PORT)], env=env, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.p = subprocess.Popen(self.command(binary, local, peer), env=self.environment(udp_mode, settings),
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  text=True, bufsize=1)
         self.lines = []
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self.read, daemon=True)
         self.thread.start()
         self.wait(r"echo listening on", 0, 10)
+
+    @staticmethod
+    def environment(udp_mode, settings):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("NTCP_") and k != "LD_PRELOAD"}
+        # The UDP echo's send mode is selected explicitly per case; other
+        # operational settings (deployment knowledge) are per case too.
+        env["NTCP_UDP_ECHO_MODE"] = udp_mode
+        env.update(settings or {})
+        return env
+
+    @staticmethod
+    def command(binary, local, peer=None):
+        # PEER: tun_echo's PEER_SOCKET_ADDR, the target of its active open.
+        return [str(binary), TUN, local, str(PORT)] + ([peer] if peer else [])
 
     def read(self):
         for line in self.p.stderr:

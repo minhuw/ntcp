@@ -495,13 +495,12 @@ impl Owner {
             None => (None, None), // Explicit low-level Endpoint fixtures.
         };
         let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
-        let ip_len = crate::ip::encode(
-            &mut bytes[offset..],
-            tx,
-            (now / 1000) as u32,
-            tx.len - shared_len,
-        )
-        .map_err(|_| EIO)?;
+        // Origin Timestamp time, sampled only for a slot this datagram's
+        // origin recording writes; native TCP refuses outgoing IPv4 options,
+        // so none is. A packet held for retry keeps these bytes.
+        let timestamp = self.ipv4_clock.origin(&tx.ipv4_options, tx.ip.source, now);
+        let ip_len = crate::ip::encode(&mut bytes[offset..], tx, timestamp, tx.len - shared_len)
+            .map_err(|_| EIO)?;
         // A packet identified at submission keeps its header open until then;
         // its timestamp copy is taken from the submitted header.
         if shared_len == 0 && !self.df_cleared(owner, attempt, context) {

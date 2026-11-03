@@ -132,6 +132,7 @@ fn side_with(
                 transport: ActiveOpenOptions::from(&cfg.connection),
                 dscp: 0,
                 ipv4_options: OutgoingIpv4Options::default(),
+                registration: None,
                 receive_authority: None,
             },
             &mut host,

@@ -88,13 +88,13 @@ fn udp_echo_round_trip_both_families() {
         for (time, size) in [(1, 0), (2, 1), (3, 512), (4, largest)] {
             let payload: Vec<u8> = (0..size).map(|n| (n * 7 + size) as u8).collect();
             let request = udp_frame(&mut bhost, &b, time, client, &payload);
-            input_frame(&mut ahost, &mut a, time, &request, local.ip(), false, 0).unwrap();
+            input_frame(&mut ahost, &mut a, time, &request, local.ip(), false, &mut Sample(0)).unwrap();
             assert!(echo.drive(&mut ahost, &a, time, &mut backend).unwrap());
             assert_eq!(backend.frames.len(), 1);
             let reply = backend.frames.pop().unwrap();
             assert_eq!(reply.len(), ip_header(v6) + 8 + size);
             // The peer Host verifies the reply's checksum before queueing it.
-            input_frame(&mut bhost, &mut b, time, &reply, remote.ip(), false, 0).unwrap();
+            input_frame(&mut bhost, &mut b, time, &reply, remote.ip(), false, &mut Sample(0)).unwrap();
             let mut bytes = [0; MTU];
             assert_eq!(
                 bhost.host.udp_receive(client, &mut bytes).unwrap(),
@@ -132,7 +132,7 @@ fn udp_quoted_router_ptb_reaches_echo_and_shrinks_tcp_on_the_same_path() {
         );
         let mut backend = Backend::default();
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x42; 1400]);
-        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, &mut Sample(0)).unwrap();
         echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
         let reply = backend.frames.pop().unwrap();
         let mtu = if v6 { 1280 } else { 1006 };
@@ -143,7 +143,7 @@ fn udp_quoted_router_ptb_reaches_echo_and_shrinks_tcp_on_the_same_path() {
         let report = ptb(&reply, mtu as u32);
         assert_ne!(ntcp_icmp::decode_icmp_quote(&report).unwrap().outer.source, p.remote.ip(),
             "an intermediate router, not the peer");
-        input_frame(&mut p.ahost, &mut p.a, p.time, &report, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &report, p.local.ip(), false, &mut Sample(0)).unwrap();
         assert_eq!(p.ahost.host.paths().path_snapshot(path).unwrap().learned_mtu(),
             Some(mtu as u32), "UDP correlation published the shared decrease");
         assert_eq!(p.ahost.host.udp_event(echo.flow).unwrap(), Some(UdpEvent::PacketTooBig {
@@ -151,7 +151,7 @@ fn udp_quoted_router_ptb_reaches_echo_and_shrinks_tcp_on_the_same_path() {
         }));
         assert_eq!(p.ahost.host.udp_event(echo.flow).unwrap(), None, "consumed once");
         // A repeated report is still advice; the service consumes it itself.
-        input_frame(&mut p.ahost, &mut p.a, p.time, &report, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &report, p.local.ip(), false, &mut Sample(0)).unwrap();
         assert!(echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap());
         assert_eq!(p.ahost.host.udp_event(echo.flow).unwrap(), None);
         // Later replies are held to the shared estimate: typed refusal, never split.
@@ -162,17 +162,17 @@ fn udp_quoted_router_ptb_reaches_echo_and_shrinks_tcp_on_the_same_path() {
             Err(UdpSendError::TooBig { max_payload })
         );
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x43; 1400]);
-        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, &mut Sample(0)).unwrap();
         echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
         assert!(backend.frames.is_empty(), "oversized reply dropped, not fragmented");
         assert!(echo.held.is_none());
         let payload = vec![0x44; max_payload];
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &payload);
-        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, &mut Sample(0)).unwrap();
         echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
         let reply = backend.frames.pop().unwrap();
         assert_eq!(reply.len(), mtu);
-        input_frame(&mut p.bhost, &mut p.b, p.time, &reply, p.remote.ip(), false, 0).unwrap();
+        input_frame(&mut p.bhost, &mut p.b, p.time, &reply, p.remote.ip(), false, &mut Sample(0)).unwrap();
         let mut bytes = [0; MTU];
         assert_eq!(p.bhost.host.udp_receive(client, &mut bytes).unwrap(), Some((service, max_payload)));
         // The TCP connection on the same path adopts it at its next egress.
@@ -205,13 +205,13 @@ fn udp_echo_sizes_replies_by_path_limits_and_reconsiders_held_reply_on_change() 
         let mut backend = Backend::default();
         // A fitting echo pins the echo's path to the peer.
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x41; 1400]);
-        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, &mut Sample(0)).unwrap();
         echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
         assert_eq!(backend.frames.pop().unwrap().len(), header + 8 + 1400);
         // The next reply is held: the TUN would block.
         backend.blocked = true;
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x42; 1400]);
-        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, &mut Sample(0)).unwrap();
         echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
         let attempts = backend.attempts;
         assert_eq!(echo.held, Some((p.remote, 1400)));
@@ -221,7 +221,7 @@ fn udp_echo_sizes_replies_by_path_limits_and_reconsiders_held_reply_on_change() 
         let sent = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
         assert!(sent[0].len() > mtu);
         let path = p.ahost.host.binding(p.aid).unwrap().snapshot.path();
-        input_frame(&mut p.ahost, &mut p.a, p.time, &ptb(&sent[0], mtu as u32), p.local.ip(), false, 0)
+        input_frame(&mut p.ahost, &mut p.a, p.time, &ptb(&sent[0], mtu as u32), p.local.ip(), false, &mut Sample(0))
             .unwrap();
         assert_eq!(p.ahost.host.paths().path_snapshot(path).unwrap().learned_mtu(), Some(mtu as u32));
         assert_eq!(p.ahost.host.udp_event(echo.flow).unwrap(), None, "no advice for the echo");
@@ -242,7 +242,7 @@ fn udp_echo_sizes_replies_by_path_limits_and_reconsiders_held_reply_on_change() 
         echo.notes.clear();
         echo.packet.fill(0xa5);
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &[0x43; 1400]);
-        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, &mut Sample(0)).unwrap();
         assert!(echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap());
         assert_eq!(backend.attempts, attempts, "no backend call");
         assert!(echo.packet.iter().all(|&b| b == 0xa5), "nothing encoded");
@@ -253,12 +253,12 @@ fn udp_echo_sizes_replies_by_path_limits_and_reconsiders_held_reply_on_change() 
         echo.notes.clear();
         let payload: Vec<u8> = (0..max_payload).map(|n| (n * 13 + 5) as u8).collect();
         let request = udp_frame(&mut p.bhost, &p.b, p.time, client, &payload);
-        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, 0).unwrap();
+        input_frame(&mut p.ahost, &mut p.a, p.time, &request, p.local.ip(), false, &mut Sample(0)).unwrap();
         echo.drive(&mut p.ahost, &p.a, p.time, &mut backend).unwrap();
         let reply = backend.frames.pop().unwrap();
         assert!(backend.frames.is_empty() && echo.notes.is_empty());
         assert_eq!(reply.len(), mtu);
-        input_frame(&mut p.bhost, &mut p.b, p.time, &reply, p.remote.ip(), false, 0).unwrap();
+        input_frame(&mut p.bhost, &mut p.b, p.time, &reply, p.remote.ip(), false, &mut Sample(0)).unwrap();
         let mut bytes = [0; MTU];
         assert_eq!(p.bhost.host.udp_receive(client, &mut bytes).unwrap(), Some((service, max_payload)));
         assert_eq!(&bytes[..max_payload], payload);
@@ -283,13 +283,13 @@ fn identical_udp_quotes_across_flow_generation_reuse_are_ambiguous() {
         let distinct = udp_frame(&mut ahost, &a, 3, second, &[0x22; 1400]);
         let mtu = if v6 { 1280 } else { 1006 };
         // Positive control: a distinct datagram identifies this generation.
-        input_frame(&mut ahost, &mut a, 4, &ptb(&distinct, mtu), local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, 4, &ptb(&distinct, mtu), local.ip(), false, &mut Sample(0)).unwrap();
         assert!(matches!(ahost.host.udp_event(second).unwrap(),
             Some(UdpEvent::PacketTooBig { dropped_len: 1448 | 1428, .. })));
         // The identical quote matches both generations: no owner advice.
-        input_frame(&mut ahost, &mut a, 5, &ptb(&old, mtu), local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, 5, &ptb(&old, mtu), local.ip(), false, &mut Sample(0)).unwrap();
         assert_eq!(ahost.host.udp_event(second).unwrap(), None);
-        let outcome = ahost.host.input_icmp(&mut a, ahost.ingress, 6, &ptb(&old, mtu)).unwrap();
+        let outcome = ahost.host.input_icmp(&mut a, ahost.ingress, 6, &ptb(&old, mtu), None).unwrap();
         assert!(matches!(outcome,
             IcmpDispatch::Completed(IcmpOutcome::Advice { owner: None, .. })
                 | IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Ambiguous))),
@@ -322,14 +322,14 @@ fn forged_udp_quotes_are_rejected() {
             if !v6 {
                 seal_ip(&mut quote);
             }
-            input_frame(&mut ahost, &mut a, 2, &ptb(&quote, mtu), local.ip(), false, 0).unwrap();
+            input_frame(&mut ahost, &mut a, 2, &ptb(&quote, mtu), local.ip(), false, &mut Sample(0)).unwrap();
             assert_eq!(ahost.host.udp_event(flow).unwrap(), None, "{name}");
         }
         let mut packet = [0; MTU];
         let unchanged = ahost.host.udp_send(&a, 3, flow, None, &[0; 1400], &mut packet,
             |_, _| BackendOutcome::Submitted);
         assert!(matches!(unchanged, Ok(UdpSent::Submitted(_))), "budget unchanged");
-        input_frame(&mut ahost, &mut a, 4, &ptb(&sent, mtu), local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, 4, &ptb(&sent, mtu), local.ip(), false, &mut Sample(0)).unwrap();
         assert!(ahost.host.udp_event(flow).unwrap().is_some());
         assert!(matches!(
             ahost.host.udp_send(&a, 5, flow, None, &[0; 1400], &mut packet,
@@ -353,10 +353,10 @@ fn udp_receive_queue_backpressure_and_checksum_validation() {
             .unwrap();
         let mut corrupt = udp_frame(&mut bhost, &b, 1, client, b"corrupted");
         *corrupt.last_mut().unwrap() ^= 1;
-        input_frame(&mut ahost, &mut a, 1, &corrupt, local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, 1, &corrupt, local.ip(), false, &mut Sample(0)).unwrap();
         for n in 0..BUDGET + 4 {
             let request = udp_frame(&mut bhost, &b, 2, client, &vec![n as u8; 64 + n]);
-            input_frame(&mut ahost, &mut a, 2, &request, local.ip(), false, 0).unwrap();
+            input_frame(&mut ahost, &mut a, 2, &request, local.ip(), false, &mut Sample(0)).unwrap();
         }
         // A blocked TUN holds exactly one reply and reads no further.
         let mut backend = Backend { blocked: true, ..Default::default() };
@@ -373,13 +373,13 @@ fn udp_receive_queue_backpressure_and_checksum_validation() {
         assert_eq!(backend.frames.len(), BUDGET, "queue bound; corrupt and excess dropped");
         let mut bytes = [0; MTU];
         for (n, reply) in backend.frames.drain(..).enumerate() {
-            input_frame(&mut bhost, &mut b, 4, &reply, remote.ip(), false, 0).unwrap();
+            input_frame(&mut bhost, &mut b, 4, &reply, remote.ip(), false, &mut Sample(0)).unwrap();
             let (from, len) = bhost.host.udp_receive(client, &mut bytes).unwrap().unwrap();
             assert_eq!((from, &bytes[..len]), (service, &vec![n as u8; 64 + n][..]));
         }
         // Drained storage admits new requests again.
         let request = udp_frame(&mut bhost, &b, 5, client, b"after drain");
-        input_frame(&mut ahost, &mut a, 5, &request, local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, 5, &request, local.ip(), false, &mut Sample(0)).unwrap();
         drain(&mut echo, &mut ahost, &a, &mut backend);
         assert_eq!(backend.frames.len(), 1);
         println!("v6={v6}: {} queued of {} offered; corrupt checksum dropped", BUDGET, BUDGET + 4);
@@ -424,26 +424,26 @@ fn udp_feedback_stays_attributable_after_history_overflow() {
             .collect();
         let time = 10 + sent.len() as u64;
         let other = &sent[sent.len() - 2];
-        input_frame(&mut ahost, &mut a, time, &unreachable(other), local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, time, &unreachable(other), local.ip(), false, &mut Sample(0)).unwrap();
         assert!(matches!(ahost.host.udp_event(flow).unwrap(),
             Some(UdpEvent::NetworkError { remote: r, .. }) if r == remote));
         // An evicted datagram is remembered only as ambiguous history.
-        input_frame(&mut ahost, &mut a, time, &unreachable(&sent[0]), local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, time, &unreachable(&sent[0]), local.ip(), false, &mut Sample(0)).unwrap();
         assert_eq!(ahost.host.udp_event(flow).unwrap(), None);
         // Resending it byte-identically keeps the old quote ambiguous ...
         let mut payload = [0x33; 1400];
         payload[..2].copy_from_slice(&0u16.to_be_bytes());
         let copy = udp_frame(&mut ahost, &a, time + 1, flow, &payload);
         assert_eq!(copy, sent[0]);
-        input_frame(&mut ahost, &mut a, time + 2, &unreachable(&copy), local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, time + 2, &unreachable(&copy), local.ip(), false, &mut Sample(0)).unwrap();
         assert_eq!(ahost.host.udp_event(flow).unwrap(), None);
         // ... while the other live datagrams remain attributable.
         input_frame(&mut ahost, &mut a, time + 2, &unreachable(&sent[sent.len() - 3]),
-            local.ip(), false, 0).unwrap();
+            local.ip(), false, &mut Sample(0)).unwrap();
         assert!(ahost.host.udp_event(flow).unwrap().is_some());
         let mtu = if v6 { 1280 } else { 1006 };
         let live = &sent[sent.len() - 1];
-        input_frame(&mut ahost, &mut a, time + 3, &ptb(live, mtu), local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, time + 3, &ptb(live, mtu), local.ip(), false, &mut Sample(0)).unwrap();
         assert_eq!(ahost.host.udp_event(flow).unwrap(), Some(UdpEvent::PacketTooBig {
             remote, mtu: Some(mtu), dropped_len: live.len() as u32,
         }));
@@ -479,7 +479,7 @@ fn quote_matching_only_a_widened_udp_summary_publishes_nothing() {
         forged[h + 6..h + 8].copy_from_slice(&0x1234u16.to_be_bytes());
         let mtu = if v6 { 1280 } else { 1006 };
         let dispatch = |ahost: &mut TunHost, a: &mut Endpoint, time| {
-            ahost.host.input_icmp(a, ahost.ingress, time, &ptb(&forged, mtu)).unwrap()
+            ahost.host.input_icmp(a, ahost.ingress, time, &ptb(&forged, mtu), None).unwrap()
         };
         let before = dispatch(&mut ahost, &mut a, 3);
         assert_eq!(before,

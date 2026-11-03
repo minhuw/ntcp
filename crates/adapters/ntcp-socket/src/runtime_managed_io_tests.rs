@@ -1430,12 +1430,10 @@ fn data_frame(owner: &mut Owner, wire: &Wire, server: u64, data: &[u8]) -> Vec<u
         .find(|f| f.windows(data.len()).any(|w| w == data))
         .unwrap()
 }
-// Destination processing of `admitted_ipv4_options` at 10.73.0.2 at `now`:
-// recorded once with the owner clock's elapsed milliseconds, high bit set
-// (RFC 791 section 3.1), leaving the second slots free.
-fn recorded_once(now: u64) -> ntcp::Ipv4Options {
+// Destination processing of `admitted_ipv4_options` at 10.73.0.2 recording
+// `time` once, leaving the second slots free.
+fn recorded_once(time: u32) -> ntcp::Ipv4Options {
     let local = Ipv4Addr::new(10, 73, 0, 2);
-    let time = 0x8000_0000 | (now / 1000) as u32;
     let raw = admitted_ipv4_options();
     let recorded = ntcp::Ipv4Options::parse(&raw, false)
         .unwrap()
@@ -1450,24 +1448,98 @@ fn recorded_once(now: u64) -> ntcp::Ipv4Options {
     assert_eq!(&out[28..], &[0; 8]);
     recorded
 }
+// The time `options` recorded for a datagram processed at `arrival` between
+// the `before` and `after` kernel clock reads: a standard value within their
+// UTC window, or the owner clock's elapsed milliseconds at arrival marked
+// nonstandard (RFC 791 section 3.1).
+fn arrival_time(
+    options: Option<ntcp::Ipv4Options>,
+    arrival: u64,
+    before: Option<i128>,
+    after: Option<i128>,
+) -> u32 {
+    let options = options.unwrap();
+    let time = u32::from_be_bytes(options.as_bytes()[24..28].try_into().unwrap());
+    if !super::standard_time(time, before, after) {
+        assert_eq!(time, 0x8000_0000 | (arrival / 1000) as u32);
+    }
+    time
+}
 
+//= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+//= type=test
+//# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
+//# the ICMP Timestamp message.
 #[test]
-fn managed_native_scalar_input_records_once_with_the_marked_owner_clock() {
+fn managed_native_scalar_input_records_once_with_one_utc_source_sample() {
     let (mut a, mut b, client, server, _, wb) = pair_output(false, false, false);
     let cid = connection(&a, client);
     let frame = data_frame(&mut b, &wb, server, b"scalar options");
     let frame = with_ipv4_options(&frame, &admitted_ipv4_options());
     tick(&mut a);
+    // Handshake output, its header sizing included, sampled no time.
+    assert_eq!(a.ipv4_clock.acquisitions, 0);
     let arrival = a.now();
+    let before = super::utc_read();
     input_frames(&mut a, &[frame]);
-    assert_eq!(
-        a.endpoint.received_ipv4_options(cid).unwrap(),
-        Some(recorded_once(arrival))
-    );
+    let after = super::utc_read();
+    assert_eq!(a.ipv4_clock.acquisitions, 1);
+    let received = a.endpoint.received_ipv4_options(cid).unwrap();
+    let time = arrival_time(received, arrival, before, after);
+    assert_eq!(received, Some(recorded_once(time)));
     assert_eq!(
         a.execute(client, Op::Read(BYTES)).unwrap().bytes,
         b"scalar options"
     );
+}
+
+// Origin Timestamp time is sampled once, and only for a datagram whose
+// origin recording writes a slot (RFC 1122 section 3.2.1.8); any other value
+// is never written and stays the marked elapsed time.
+//= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
+//= type=test
+//# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
+//# the ICMP Timestamp message.
+#[test]
+fn native_origin_timestamp_samples_only_for_a_written_slot() {
+    use ntcp::{OutgoingIpv4Options, TimestampRequest};
+    let source = Ipv4Addr::new(10, 73, 0, 2);
+    let other = Ipv4Addr::new(10, 73, 0, 9);
+    let now = 5_000_000;
+    let mut clock = backend::Ipv4Clock::default();
+    for (timestamp, writes) in [
+        (None, false),
+        (Some(TimestampRequest::Times(1)), true),
+        (Some(TimestampRequest::AddressTimes(2)), true),
+        (
+            Some(TimestampRequest::Prespecified {
+                addresses: [source, other, source, other],
+                len: 2,
+            }),
+            true,
+        ),
+        (
+            Some(TimestampRequest::Prespecified {
+                addresses: [other, source, other, source],
+                len: 2,
+            }),
+            false,
+        ),
+    ] {
+        let options = OutgoingIpv4Options {
+            record_route_slots: Some(2),
+            timestamp,
+            ..Default::default()
+        };
+        let sampled = clock.acquisitions;
+        let before = super::utc_read();
+        let time = clock.origin(&options, source.into(), now);
+        let after = super::utc_read();
+        assert_eq!(clock.acquisitions - sampled, usize::from(writes));
+        if !writes || !super::standard_time(time, before, after) {
+            assert_eq!(time, 0x8000_0000 | 5_000);
+        }
+    }
 }
 
 // Native managed input keeps source routes refused (its TCP has IPv4
@@ -1517,8 +1589,11 @@ fn managed_native_retained_segment_keeps_its_processing_through_replay() {
         let frame = with_ipv4_options(&frame, &admitted_ipv4_options());
         let arrival = a.now();
         wa.lock().unwrap().incoming.push_back(Ok(frame));
+        let utc_before = super::utc_read();
         a.receive_batch(&mut [0; 65549]).unwrap();
+        let utc_after = super::utc_read();
         assert!(a.egress.as_ref().unwrap().retained_rx(cid));
+        assert_eq!(a.ipv4_clock.acquisitions, 1);
         // Later passes, at later times, defer it again unchanged.
         for _ in 0..3 {
             tick(&mut a);
@@ -1568,11 +1643,12 @@ fn managed_native_retained_segment_keeps_its_processing_through_replay() {
             assert_eq!(a.endpoint.state(id).unwrap(), ntcp::State::SynSent);
             assert_eq!(a.endpoint.received_ipv4_options(id).unwrap(), None);
         } else {
-            // Recorded at arrival, not at any later pass.
-            assert_eq!(
-                a.endpoint.received_ipv4_options(cid).unwrap(),
-                Some(recorded_once(arrival))
-            );
+            // Recorded at arrival, not at any later pass: the replay
+            // sampled no time and kept the value recorded then.
+            let received = a.endpoint.received_ipv4_options(cid).unwrap();
+            let time = arrival_time(received, arrival, utc_before, utc_after);
+            assert_eq!(received, Some(recorded_once(time)));
+            assert_eq!(a.ipv4_clock.acquisitions, 1);
             assert_eq!(
                 a.execute(client, Op::Read(BYTES)).unwrap().bytes,
                 b"retained options"

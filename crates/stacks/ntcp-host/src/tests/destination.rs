@@ -346,33 +346,7 @@ fn echo_requests_are_processed_once_in_every_arrival_order() {
         let (local, remote) = addresses(false);
         let mut a = side(local, 1405, &cfg);
         profile(&mut a, interpretation, false);
-        let to_us = IpMetadata {
-            source: remote.ip(),
-            destination: local.ip(),
-        };
-        let data = [9; 900];
-        let mut message = vec![0; 8 + data.len()];
-        message[8..].copy_from_slice(&data);
-        let n = ntcp_icmp::encode_echo(
-            to_us,
-            ntcp_icmp::EchoKind::Request,
-            3,
-            4,
-            &mut message,
-            data.len(),
-        )
-        .unwrap();
-        let mut request = vec![0; 20 + n];
-        request[20..].copy_from_slice(&message[..n]);
-        let header = ntcp_ip::Header {
-            ip: to_us,
-            hop_limit: 64,
-            dscp: 0,
-            ecn: 0,
-            ipv4_options: Default::default(),
-        };
-        ntcp_ip::encode_datagram(&mut request, header, 1, n, 0).unwrap();
-        let frame = with_options(&request, &OPTIONS);
+        let frame = echo_request(local, remote);
         let received = Ipv4Options::parse(&OPTIONS, false).unwrap();
         let expected = if interpretation {
             received.record(v4(local.ip()), SAMPLE).unwrap()
@@ -418,6 +392,87 @@ fn echo_requests_are_processed_once_in_every_arrival_order() {
                 assert_eq!(header, 20, "case {case}");
             }
             assert_eq!(clock.calls, usize::from(interpretation));
+        }
+    }
+}
+
+// An Echo Request from `remote` to `local` carrying `OPTIONS`.
+fn echo_request(local: SocketAddr, remote: SocketAddr) -> Vec<u8> {
+    let to_us = IpMetadata {
+        source: remote.ip(),
+        destination: local.ip(),
+    };
+    let data = [9; 900];
+    let mut message = vec![0; 8 + data.len()];
+    message[8..].copy_from_slice(&data);
+    let n = ntcp_icmp::encode_echo(
+        to_us,
+        ntcp_icmp::EchoKind::Request,
+        3,
+        4,
+        &mut message,
+        data.len(),
+    )
+    .unwrap();
+    let mut request = vec![0; 20 + n];
+    request[20..].copy_from_slice(&message[..n]);
+    let header = ntcp_ip::Header {
+        ip: to_us,
+        hop_limit: 64,
+        dscp: 0,
+        ecn: 0,
+        ipv4_options: Default::default(),
+    };
+    ntcp_ip::encode_datagram(&mut request, header, 1, n, 0).unwrap();
+    with_options(&request, &OPTIONS)
+}
+
+struct Unavailable;
+impl Ipv4TimestampProvider for Unavailable {
+    fn ipv4_timestamp(&mut self) -> Option<Ipv4Timestamp> {
+        None
+    }
+}
+
+// The framed ICMP entry (`Host::input_icmp`) processes its packet with the
+// timestamp source it is given, as `Host::process` does: sampled once for
+// the slot this host writes, never without interpretation; without a source
+// Record Route is still recorded and the Timestamp slot kept.
+#[test]
+fn framed_icmp_input_records_with_its_timestamp_source() {
+    for (interpretation, sampled) in [(true, true), (true, false), (false, true)] {
+        let cfg = config(2);
+        let (local, remote) = addresses(false);
+        let mut a = side(local, 1415, &cfg);
+        profile(&mut a, interpretation, false);
+        let received = Ipv4Options::parse(&OPTIONS, false).unwrap();
+        let expected = match (interpretation, sampled) {
+            (true, true) => received.record(v4(local.ip()), SAMPLE).unwrap(),
+            (true, false) => received
+                .record_with(v4(local.ip()), &mut Unavailable)
+                .unwrap(),
+            (false, _) => received,
+        };
+        let mut clock = Clock::default();
+        let timestamps: Option<&mut dyn Ipv4TimestampProvider> = sampled.then_some(&mut clock);
+        let dispatch =
+            a.0.input_icmp(&mut a.1, a.2, 5, &echo_request(local, remote), timestamps)
+                .unwrap();
+        assert!(matches!(dispatch, IcmpDispatch::Completed(_)));
+        assert_eq!(clock.calls, usize::from(interpretation && sampled));
+        let mut first = None;
+        a.0.icmp_output(5, &mut vec![0; 8192], |_, bytes| {
+            first.get_or_insert_with(|| bytes.to_vec());
+            BackendOutcome::Submitted
+        })
+        .unwrap()
+        .unwrap();
+        let first = first.unwrap();
+        let header = usize::from(first[0] & 15) * 4;
+        if interpretation {
+            assert_eq!(&first[20..43], &expected.as_bytes()[..23]);
+        } else {
+            assert_eq!(header, 20);
         }
     }
 }

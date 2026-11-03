@@ -67,6 +67,21 @@ struct Network {
     held: Option<Held>,
     header_len: usize,
     start: Instant,
+    clock: ntcp_clock::UtcClock,
+}
+
+// IPv4 Timestamp time for destination processing from the characterized
+// Linux UTC source, sampled only for a slot this host may write: none while
+// this link's option interpretation stays disabled.
+struct Utc<'a> {
+    clock: &'a mut ntcp_clock::UtcClock,
+    now: u64,
+}
+impl ntcp::Ipv4TimestampProvider for Utc<'_> {
+    fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
+        // A standard value is below 86 400 000, a nonstandard one marked.
+        ntcp::Ipv4Timestamp::from_wire(self.clock.sample(self.now / 1000).value).ok()
+    }
 }
 
 struct Held {
@@ -154,6 +169,7 @@ impl Network {
             held: None,
             header_len: if local.is_ipv4() { 20 } else { 40 },
             start,
+            clock: ntcp_clock::UtcClock::new(),
         })
     }
 
@@ -176,8 +192,13 @@ impl Network {
             return Ok(());
         };
         if decoded.protocol == if decoded.ip.source.is_ipv4() { 1 } else { 58 } {
+            let mut utc = Utc {
+                clock: &mut self.clock,
+                now,
+            };
             if let Ok(IcmpDispatch::Deferred(deferred)) =
-                self.host.input_icmp(endpoint, self.ingress, now, frame)
+                self.host
+                    .input_icmp(endpoint, self.ingress, now, frame, Some(&mut utc))
             {
                 self.deferred.push_back(deferred);
             }
@@ -519,6 +540,7 @@ fn run() -> io::Result<()> {
                     transport: ntcp::ActiveOpenOptions::from(&config.connection),
                     dscp: 0,
                     ipv4_options: ntcp::OutgoingIpv4Options::default(),
+                    registration: None,
                     receive_authority: None,
                 };
                 let now = network.now();

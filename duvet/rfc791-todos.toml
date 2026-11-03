@@ -1,9 +1,0 @@
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
-quote = "A recorded route is composed of a series of internet addresses. Each internet address is 32 bits or 4 octets. If the pointer is greater than the length, the recorded route data area is full. The originating host must compose this option with a large enough route data area to hold all the address expected. The size of the option does not change due to adding addresses. The intitial contents of the route data area must be zero."
-reason = "Helpers implement address slots, full pointers, zero initialization and fixed option size, but expected route capacity is a caller responsibility: T15 owns the checked expected Record Route/Timestamp registration plan with its 40-octet combined budget and unrepresentable-request errors that this compound obligation needs."
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc791#section-3.1"
-quote = "The originating host must compose this option with a large enough timestamp data area to hold all the timestamp information expected. The size of the option does not change due to adding timestamps. The intitial contents of the timestamp data area must be zero or internet address/zero pairs."
-reason = "Helpers initialize zero or address/zero slots and preserve option size, but expected timestamp capacity is a caller responsibility: T15 owns the checked expected Record Route/Timestamp registration plan with its 40-octet combined budget and unrepresentable-request errors that this compound obligation needs."

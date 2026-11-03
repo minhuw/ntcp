@@ -300,7 +300,7 @@ fn echo_requests_are_answered_exactly_whole_or_reassembled() {
         );
         // input_icmp answers an unfragmented request through the same service.
         assert_eq!(
-            a.0.input_icmp(&mut a.1, a.2, 1, &request).unwrap(),
+            a.0.input_icmp(&mut a.1, a.2, 1, &request, None).unwrap(),
             IcmpDispatch::Completed(IcmpOutcome::Echo(EchoDisposition::Queued))
         );
         // A fragmented request is reassembled and answered.
@@ -1351,7 +1351,7 @@ fn a_new_reply_displaces_the_longest_held_reply_from_a_full_queue() {
     let before = a.0.icmp_output_counters();
     let request = echo(ip(neighbor, local.ip()), 0x6002, 1, &[0x5a; 64]);
     assert_eq!(
-        a.0.input_icmp(&mut a.1, a.2, 4, &request).unwrap(),
+        a.0.input_icmp(&mut a.1, a.2, 4, &request, None).unwrap(),
         IcmpDispatch::Completed(IcmpOutcome::Echo(EchoDisposition::Queued))
     );
     let after = a.0.icmp_output_counters();
@@ -1450,7 +1450,7 @@ fn a_full_queue_without_held_messages_drops_new_messages() {
             &[2; 64],
         );
         assert_eq!(
-            a.0.input_icmp(&mut a.1, a.2, 5, &request).unwrap(),
+            a.0.input_icmp(&mut a.1, a.2, 5, &request, None).unwrap(),
             IcmpDispatch::Completed(IcmpOutcome::Echo(EchoDisposition::Dropped))
         );
         let after = a.0.icmp_output_counters();

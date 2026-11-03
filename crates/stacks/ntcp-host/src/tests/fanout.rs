@@ -268,7 +268,7 @@ fn quoted_flow_decrease_reaches_every_subscriber_and_isolated_paths_stay_unchang
         let (quoted, _) = send(&mut a, now, BackendOutcome::Submitted).unwrap();
         let mtu = if v6 { 1280 } else { 1100 };
         assert!(decreased(
-            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, mtu))
+            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, mtu), None)
                 .unwrap()
         ));
         assert!(dirty(&a, flow_b));
@@ -398,7 +398,7 @@ fn source_and_link_isolated_paths_survive_every_shared_publication() {
         now += 10;
         let (quoted, _) = send(&mut a, now, BackendOutcome::Submitted).unwrap();
         assert!(decreased(
-            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, first))
+            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, first), None)
                 .unwrap()
         ));
         assert_eq!(service(&mut a, now + 2).failed, 0);
@@ -415,7 +415,7 @@ fn source_and_link_isolated_paths_survive_every_shared_publication() {
         now += 10;
         let (quoted, _) = send(&mut a, now, BackendOutcome::Submitted).unwrap();
         let (report, published) = tcp_report(
-            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, second))
+            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&quoted, second), None)
                 .unwrap(),
         );
         assert_eq!(
@@ -532,7 +532,7 @@ fn retired_route_generation_is_never_changed_or_resurrected() {
         // A PTB correlated to the pre-change submission: drop advice only.
         let mtu = if v6 { 1350 } else { 1100 };
         let (report, published) = tcp_report(
-            a.0.input_icmp(&mut a.1, a.2, now + 2, &ptb(&stale, mtu))
+            a.0.input_icmp(&mut a.1, a.2, now + 2, &ptb(&stale, mtu), None)
                 .unwrap(),
         );
         assert_eq!(
@@ -555,7 +555,7 @@ fn retired_route_generation_is_never_changed_or_resurrected() {
             panic!("datagram not submitted");
         };
         assert!(matches!(
-            a.0.input_icmp(&mut a.1, a.2, now + 5, &ptb(&packet[..len], mtu)),
+            a.0.input_icmp(&mut a.1, a.2, now + 5, &ptb(&packet[..len], mtu), None),
             Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
                 published: Some(path::EstimateChange::Decreased),
                 ..
@@ -650,7 +650,7 @@ fn udp_quoted_decrease_notifies_every_tcp_connection_on_the_path() {
         };
         let mtu = if v6 { 1280 } else { 1000 };
         let dispatch =
-            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&packet[..n], mtu));
+            a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&packet[..n], mtu), None);
         assert!(matches!(
             dispatch,
             Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
@@ -763,13 +763,13 @@ fn fragment_quotes_of_unfragmented_datagrams_do_not_correlate() {
             ntcp_ip::encode_datagram(&mut report, h, 1, message.len(), 0).unwrap()
         };
         assert_eq!(
-            a.0.input_icmp(&mut a.1, a.2, 1, &report[..n]).unwrap(),
+            a.0.input_icmp(&mut a.1, a.2, 1, &report[..n], None).unwrap(),
             IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Uncorrelated))
         );
         assert_eq!(a.0.paths().path_snapshot(path).unwrap().learned_mtu(), None);
         assert_eq!(a.0.udp_event(udp).unwrap(), None);
         assert!(matches!(
-            a.0.input_icmp(&mut a.1, a.2, 2, &ptb(sent, mtu)),
+            a.0.input_icmp(&mut a.1, a.2, 2, &ptb(sent, mtu), None),
             Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
                 published: Some(path::EstimateChange::Decreased),
                 ..
@@ -1079,7 +1079,7 @@ fn applied_deferred_report_publishes_exactly_once_and_stale_results_never() {
             let (outstanding, _) = send(&mut a, now, BackendOutcome::Submitted).unwrap();
             let mtu = if v6 { 1300 } else { 1100 };
             let dispatch =
-                a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&outstanding, mtu));
+                a.0.input_icmp(&mut a.1, a.2, now + 1, &ptb(&outstanding, mtu), None);
             assert!(matches!(
                 dispatch,
                 Ok(IcmpDispatch::Completed(IcmpOutcome::Tcp {
@@ -1261,7 +1261,7 @@ fn delivered_probe_after_hold_raises_shared_ceiling_and_stale_proof_never() {
                     // A's search falls back to it, and the shared estimate
                     // stays while its hold restarts from this report.
                     let dispatch =
-                        a.0.input_icmp(&mut a.1, a.2, hold + 1, &ptb(&probe, mtu))
+                        a.0.input_icmp(&mut a.1, a.2, hold + 1, &ptb(&probe, mtu), None)
                             .unwrap();
                     assert!(
                         matches!(
@@ -1462,7 +1462,7 @@ fn unchanged_tcp_report_still_lowers_shared_record_and_restarts_hold() {
 
             now += 1;
             let (report, published) = tcp_report(
-                a.0.input_icmp(&mut a.1, a.2, now, &ptb(&original, mtu))
+                a.0.input_icmp(&mut a.1, a.2, now, &ptb(&original, mtu), None)
                     .unwrap(),
             );
             assert_eq!(report, TcpReport::PacketTooBig(PmtuFeedback::Unchanged));
@@ -1486,7 +1486,7 @@ fn unchanged_tcp_report_still_lowers_shared_record_and_restarts_hold() {
             if duplicate {
                 now += 10;
                 let (report, published) = tcp_report(
-                    a.0.input_icmp(&mut a.1, a.2, now, &ptb(&original, mtu))
+                    a.0.input_icmp(&mut a.1, a.2, now, &ptb(&original, mtu), None)
                         .unwrap(),
                 );
                 assert_eq!(report, TcpReport::PacketTooBig(PmtuFeedback::Unchanged));
@@ -1581,7 +1581,7 @@ fn below_proven_delivery_report_shared_outcome_ignores_loss_inference() {
                 // (1) Immediately: deferred, nothing reaches shared state.
                 now += 1;
                 let (report, change) = tcp_report(
-                    a.0.input_icmp(&mut a.1, a.2, now, &ptb(&quoted, next_hop))
+                    a.0.input_icmp(&mut a.1, a.2, now, &ptb(&quoted, next_hop), None)
                         .unwrap(),
                 );
                 assert_eq!(report, TcpReport::PacketTooBig(PmtuFeedback::Deferred));
@@ -1737,7 +1737,7 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                             panic!("datagram not submitted");
                         };
                         assert!(matches!(
-                            a.0.input_icmp(&mut a.1, a.2, now, &ptb(&packet[..n], SHARED)),
+                            a.0.input_icmp(&mut a.1, a.2, now, &ptb(&packet[..n], SHARED), None),
                             Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
                                 published: Some(path::EstimateChange::Decreased),
                                 ..
@@ -1770,7 +1770,7 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                     });
                     now += 1;
                     let (report, published) =
-                        tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &ptb(&copy, 0)).unwrap());
+                        tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &ptb(&copy, 0), None).unwrap());
                     let TcpReport::PacketTooBig(class) = report else {
                         panic!("{report:?}");
                     };
@@ -1994,7 +1994,7 @@ fn disabled_route_ptb_matches_enabled(
         }
         now += 10;
         let report = ptb(&quoted, if v6 { learned } else { 0 });
-        let (report, published) = tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &report).unwrap());
+        let (report, published) = tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &report, None).unwrap());
         assert_eq!(
             report,
             TcpReport::PacketTooBig(PmtuFeedback::Decreased { mtu: learned }),
@@ -2502,7 +2502,7 @@ fn randomized_shared_fanout_converges_and_isolates_paths() {
                         let frame = &frames[0];
                         match a
                             .0
-                            .input_icmp(&mut a.1, a.2, now + 1, &ptb(frame, rng.pick(sizes)))
+                            .input_icmp(&mut a.1, a.2, now + 1, &ptb(frame, rng.pick(sizes)), None)
                         {
                             Ok(IcmpDispatch::Completed(IcmpOutcome::Tcp { report, .. })) => {
                                 match report {

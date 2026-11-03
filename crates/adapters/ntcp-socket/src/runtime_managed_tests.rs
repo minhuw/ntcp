@@ -130,6 +130,58 @@ fn listener(owner: &mut Owner) -> u64 {
     socket
 }
 
+// The test's own read-only adjtimex read of the kernel clock the UTC source
+// samples: its time in nanoseconds since the epoch when the read satisfies
+// that source's per-sample conditions (1) and (2) (no kernel error predicate,
+// neither TIME_ERROR nor TIME_OOP, maximum error within 0..=16 s).
+fn utc_read() -> Option<i128> {
+    // SAFETY: timex is plain data; all-zero sets modes 0, a read-only call.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    // SAFETY: `tx` is a valid, writable timex for the call.
+    let state = unsafe { libc::adjtimex(&mut tx) };
+    let status = tx.status;
+    let error = status & (libc::STA_UNSYNC | libc::STA_CLOCKERR) != 0
+        || status & (libc::STA_PPSFREQ | libc::STA_PPSTIME) != 0
+            && status & libc::STA_PPSSIGNAL == 0
+        || status & (libc::STA_PPSTIME | libc::STA_PPSJITTER)
+            == libc::STA_PPSTIME | libc::STA_PPSJITTER
+        || status & libc::STA_PPSFREQ != 0
+            && status & (libc::STA_PPSWANDER | libc::STA_PPSERROR) != 0;
+    if state == -1
+        || error
+        || matches!(state, libc::TIME_ERROR | libc::TIME_OOP)
+        || !(0..=16_000_000).contains(&tx.maxerror)
+    {
+        return None;
+    }
+    let unit = if status & libc::STA_NANO != 0 {
+        1
+    } else {
+        1000
+    };
+    Some(i128::from(tx.time.tv_sec) * 1_000_000_000 + i128::from(tx.time.tv_usec) * unit)
+}
+// An IPv4 Timestamp value recorded between the `before` and `after` reads:
+// true for a standard value, which both reads must accept and which must lie
+// within their window in milliseconds since midnight UT (across midnight
+// too); false for a value marked nonstandard by the high-order bit.
+fn standard_time(value: u32, before: Option<i128>, after: Option<i128>) -> bool {
+    const DAY: i128 = 86_400_000;
+    if value & 0x8000_0000 != 0 {
+        return false;
+    }
+    let (Some(before), Some(after)) = (before, after) else {
+        panic!("unmarked time {value} without a healthy kernel clock bracket");
+    };
+    let (first, last) = (before.div_euclid(1_000_000), after.div_euclid(1_000_000));
+    let offset = (i128::from(value) - first).rem_euclid(DAY);
+    assert!(
+        i128::from(value) < DAY && offset <= last - first,
+        "unmarked time {value} outside the UTC window {first}..={last}"
+    );
+    true
+}
+
 #[test]
 fn managed_native_startup_refuses_missing_or_failed_physical_facts() {
     let mut config = SocketConfig::new("external", Ipv4Addr::new(10, 73, 0, 2));

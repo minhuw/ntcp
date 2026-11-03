@@ -13,6 +13,7 @@ ntcp-io-af-packet = { path = "../../crates/io/ntcp-io-af-packet" }
 ntcp-path-control = { path = "../../crates/adapters/ntcp-path-control" }
 # The harness-only staged sender (src/bin/ptb_stage.rs) drives one Host.
 ntcp-host = { path = "../../crates/stacks/ntcp-host" }
+ntcp-clock = { path = "../../crates/adapters/ntcp-clock" }
 ntcp-io = { path = "../../crates/io/ntcp-io" }
 ntcp-io-tun = { path = "../../crates/io/ntcp-io-tun" }
 ntcp-ip = { path = "../../crates/stacks/ntcp-ip" }

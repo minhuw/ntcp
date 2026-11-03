@@ -25,6 +25,7 @@ subtle = { version = "2.6", default-features = false, optional = true }
 [dev-dependencies]
 ntcp-host = { version = "0.0.1", path = "../ntcp-host" }
 ntcp-path-control = { version = "0.0.1", path = "../../adapters/ntcp-path-control" }
+ntcp-clock = { version = "0.0.1", path = "../../adapters/ntcp-clock" }
 libc = "0.2"
 ntcp-ip = { version = "0.0.1", path = "../ntcp-ip" }
 ntcp-io = { version = "0.0.1", path = "../../io/ntcp-io" }

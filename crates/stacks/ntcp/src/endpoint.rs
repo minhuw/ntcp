@@ -188,10 +188,16 @@ pub enum EndpointError {
     AddressInUse,
     InvalidAddress,
     Ipv4Options(Ipv4OptionsError),
+    Registration(crate::Ipv4RegistrationError),
 }
 impl From<Ipv4OptionsError> for EndpointError {
     fn from(error: Ipv4OptionsError) -> Self {
         Self::Ipv4Options(error)
+    }
+}
+impl From<crate::Ipv4RegistrationError> for EndpointError {
+    fn from(error: crate::Ipv4RegistrationError) -> Self {
+        Self::Registration(error)
     }
 }
 impl From<Error> for EndpointError {
@@ -1468,9 +1474,11 @@ impl Endpoint {
             slot.ipv4_options = transaction.request.ipv4_options;
             // Passive factories carry learned peer return routes. Only an
             // active application's selection (including empty/direct) wins
-            // over later validated received route definitions.
+            // over later validated received route definitions; a planned
+            // open's whole option area stays fixed for the connection.
             slot.explicit_route = transaction.request.role == crate::FactoryRole::Active
-                && slot.ipv4_options.source_route.is_some();
+                && (slot.ipv4_options.source_route.is_some()
+                    || transaction.request.registration.is_some());
             Self::sync_ip_header_len(slot);
         }
         if let Some(parent) = listener {
@@ -1728,19 +1736,19 @@ impl Endpoint {
     /// install fresh keys; this endpoint does not provide persistent time trust.
     /// Does not select protected mode, enable TFO, or mutate children/output.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-3
-    //= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw-key restart continuity still requires T20/T15 trusted original lease/time mapping; the whole lifecycle remains TODO until that integration.
+    //= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw-key restart continuity still requires T20 trusted original lease/time mapping; the whole lifecycle remains TODO until that integration.
     //# 5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
-    //= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO: T6 now supplies release actual-path measurements with source/executable provenance, scoped admission/issuance counts, raw rounds and observer controls in integration/rfc_host/check_mac_cost.py; HMAC overlap remains substantial and the complete relative-cost assessment awaits independent review/T23 disposition. External raw-key restart/time continuity still requires T20/T15.
+    //= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO: T6 now supplies release actual-path measurements with source/executable provenance, scoped admission/issuance counts, raw rounds and observer controls in integration/rfc_host/check_mac_cost.py; HMAC overlap remains substantial and the complete relative-cost assessment awaits independent review/T23 disposition. External raw-key restart/time continuity still requires T20.
     //# The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use "SHOULD" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
-    //= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20/T15 integration of trusted original lease/time mapping across external raw-key restart.
+    //= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20 integration of trusted original lease/time mapping across external raw-key restart.
     //# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
-    //= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. T6 now measures actual release SYN/SYN-ACK admission/issuance and remaining processing in integration/rfc_host/check_mac_cost.py, retaining raw rounds, multiplicities, source/executable provenance and observer controls; HMAC overlap remains substantial and full relative-cost assessment awaits independent review/T23 disposition. The cross-reference also still imports trusted external raw-key restart/time continuity (T20/T15), so the whole clause remains TODO.
+    //= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. T6 now measures actual release SYN/SYN-ACK admission/issuance and remaining processing in integration/rfc_host/check_mac_cost.py, retaining raw rounds, multiplicities, source/executable provenance and observer controls; HMAC overlap remains substantial and full relative-cost assessment awaits independent review/T23 disposition. The cross-reference also still imports trusted external raw-key restart/time continuity (T20), so the whole clause remains TODO.
     //# 2. The server responds with a SYN-ACK based on the procedures in the "Server Cookie Handling" section (Section 4.1.2).
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-    //= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. The whole reuse lifecycle remains TODO for T20/T15 trusted original lease/time mapping across external raw-key restart.
+    //= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. The whole reuse lifecycle remains TODO for T20 trusted original lease/time mapping across external raw-key restart.
     //# Once the client obtains the cookie from the target server, it can perform subsequent TFO connections until the cookie is expired by the server.
     pub fn install_fast_open_key(
         &mut self,

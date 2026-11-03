@@ -5,8 +5,9 @@ use alloc::vec::Vec;
 use core::net::IpAddr;
 use ntcp::{
     ConnectionId, CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError,
-    Instant, IpMetadata, Ipv4Options, ManagedError, NetworkError, PathFactoryRequest, PathProvider,
-    PmtuFeedback, PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt,
+    ExpectedRegistrations, Instant, IpMetadata, Ipv4Options, Ipv4RegistrationPlan, ManagedError,
+    NetworkError, OutgoingIpv4Options, PathFactoryRequest, PathProvider, PmtuFeedback,
+    PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt,
 };
 use ntcp_icmp::{FeedbackKind, QuotedTransport};
 pub use ntcp_path as path;
@@ -74,6 +75,12 @@ pub enum Error {
     Obsolete,
     /// The administration capability was not issued by this Host.
     Unauthorized,
+    /// A planned connection's option-bearing output would leave under
+    /// another route authority than the one its registration plan was
+    /// stated for, or under none because no route resolves. Nothing is
+    /// submitted; the owner revalidates (`registration_candidate`,
+    /// `revalidate_registration`) or opens a new connection.
+    StaleRoute,
 }
 impl From<path::Error> for Error {
     fn from(error: path::Error) -> Self {
@@ -495,6 +502,17 @@ struct Port {
 struct Binding {
     owner: Option<ConnectionId>,
     prepared: PreparedPath,
+    registration: Option<Registration>,
+}
+// A planned open's checked plan, whose options hold the connection's
+// complete immutable source route, and the route authority the owner's
+// expected registrations were stated for: route identity with its
+// generation, source, forwarding destination and DSCP. PMTU revisions are
+// not part of a PathKey.
+#[derive(Clone, Copy)]
+struct Registration {
+    plan: Ipv4RegistrationPlan,
+    authorized: path::PathKey,
 }
 #[derive(Clone, Copy)]
 struct Lease {
@@ -1445,19 +1463,22 @@ impl Host {
     /// Unchanged disposition (never for Deferred). A reserved owner is returned as Deferred, carrying
     /// the normalized report, before anything is applied. Unmatched quotes are discarded; there is no fallback to the
     /// connection-local sent ring. `frame` is one unfragmented packet, given
-    /// destination processing without a clock (`process`); an Echo Request
-    /// is answered by the Echo service (`input_icmp_datagram`).
+    /// destination processing (`process`) with time from `timestamps`, which
+    /// is sampled at most once and only for a Timestamp slot this host may
+    /// write; an Echo Request is answered by the Echo service
+    /// (`input_icmp_datagram`).
     pub fn input_icmp(
         &mut self,
         endpoint: &mut Endpoint,
         context: IngressContext,
         now: Instant,
         frame: &[u8],
+        timestamps: Option<&mut dyn ntcp::Ipv4TimestampProvider>,
     ) -> Result<IcmpDispatch, Error> {
         let datagram = Envelope::physical(context, frame.len())
             .datagram(frame)
             .ok_or(Error::Obsolete)?;
-        let processed = self.process(datagram, None)?;
+        let processed = self.process(datagram, timestamps)?;
         self.input_icmp_datagram(endpoint, now, processed)
     }
 
@@ -1926,7 +1947,7 @@ impl Host {
             .transmit_attempt_packet(attempt)
             .ok_or(Error::Obsolete)?;
         let binding = if let Some(owner) = packet.connection {
-            self.refresh(endpoint, owner)?
+            self.authorized_refresh(endpoint, owner, &packet)?
         } else if let Some(index) = self
             .leases
             .iter()
@@ -2005,6 +2026,113 @@ impl Host {
             attempt,
         })
     }
+    // Refresh a connection's live path and budget authority, never its
+    // registration authorization, then admit a planned connection's
+    // option-bearing output only under the route authority its owner's
+    // expected registrations were stated for (RFC 791 section 3.1): another
+    // route generation, source, forwarding selection or class, or no route
+    // at all, is StaleRoute until the owner revalidates.
+    fn authorized_refresh(
+        &mut self,
+        endpoint: &mut Endpoint,
+        owner: ConnectionId,
+        packet: &Transmit,
+    ) -> Result<PreparedPath, Error> {
+        let registration = self
+            .registration(owner)
+            .filter(|_| packet.ipv4_options != OutgoingIpv4Options::default());
+        match (self.refresh(endpoint, owner), registration) {
+            (Ok(live), Some(r)) if live.snapshot.key() != r.authorized => Err(Error::StaleRoute),
+            (Err(Error::Path(path::Error::NoRoute)), Some(_)) => Err(Error::StaleRoute),
+            (result, _) => result,
+        }
+    }
+    fn registration(&self, owner: ConnectionId) -> Option<Registration> {
+        self.bindings
+            .iter()
+            .flatten()
+            .find(|b| b.owner == Some(owner))
+            .and_then(|b| b.registration)
+    }
+    fn planned(&self, owner: ConnectionId) -> Result<(usize, Binding, Registration), Error> {
+        self.bindings
+            .iter()
+            .enumerate()
+            .find_map(|(index, b)| {
+                let b = (*b)?;
+                Some((index, b, b.registration?)).filter(|_| b.owner == Some(owner))
+            })
+            .ok_or(Error::InvalidContext)
+    }
+
+    /// The route authority a planned connection's option-bearing output
+    /// would leave under now, for its owner to state the registrations
+    /// expected on it: None while no route resolves (a removed route) until
+    /// resolution succeeds again. A pure read.
+    pub fn registration_candidate(
+        &self,
+        endpoint: &Endpoint,
+        owner: ConnectionId,
+    ) -> Result<Option<path::PathKey>, Error> {
+        self.check_endpoint(endpoint)?;
+        let (_, binding, _) = self.planned(owner)?;
+        let key = binding.prepared.snapshot.key();
+        let request = self.request(
+            key.source_address().address(),
+            key.destination().address(),
+            key.dscp(),
+        )?;
+        let via = ScopedAddress::new(endpoint.managed_path(owner)?.forwarding_destination, None)?;
+        match self.paths.resolve_via(request, via) {
+            Ok(resolved) => {
+                self.forwarding_resolved(resolved.key())?;
+                Ok(Some(resolved.key()))
+            }
+            Err(path::Error::NoRoute) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Authorize `candidate` for a planned connection whose owner states the
+    /// registrations `expected` on it. The expectations must fit the
+    /// connection's fixed option capacities (`InsufficientRecords`
+    /// otherwise: a new connection is required), and `candidate` must still
+    /// be the live authority after refresh (`StaleRoute` otherwise). Any
+    /// failure leaves the authorization unchanged. The tuple, source route
+    /// and option sizes never change; held output recovers through the
+    /// ordinary nonsubmission and reselection accounting.
+    pub fn revalidate_registration(
+        &mut self,
+        endpoint: &mut Endpoint,
+        owner: ConnectionId,
+        candidate: path::PathKey,
+        expected: &ExpectedRegistrations<'_>,
+    ) -> Result<(), Error> {
+        self.check_endpoint(endpoint)?;
+        let (_, _, registration) = self.planned(owner)?;
+        let tuple = endpoint.managed_path(owner)?.tuple;
+        let plan = Ipv4RegistrationPlan::new(
+            tuple.local.ip(),
+            tuple.remote.ip(),
+            *registration.plan.options(),
+            expected,
+        )
+        .map_err(EndpointError::from)?;
+        let live = match self.refresh(endpoint, owner) {
+            Err(Error::Path(path::Error::NoRoute)) => return Err(Error::StaleRoute),
+            result => result?,
+        };
+        if live.snapshot.key() != candidate {
+            return Err(Error::StaleRoute);
+        }
+        let (index, _, _) = self.planned(owner)?;
+        self.bindings[index].as_mut().unwrap().registration = Some(Registration {
+            plan,
+            authorized: candidate,
+        });
+        Ok(())
+    }
+
     fn forwarding_resolved(&self, key: path::PathKey) -> Result<(), Error> {
         if key.destination().address().is_ipv6() && self.paths.link(key.link())?.mtu < 1280 {
             return Err(Error::Unsupported);
@@ -2391,6 +2519,7 @@ impl PathProvider for Host {
             .and_then(|r| r.hops().first().copied())
             .map(IpAddr::V4)
             .unwrap_or(request.tuple.remote.ip());
+        let plan = request.registration;
         let request = self.request(
             request.tuple.local.ip(),
             request.tuple.remote.ip(),
@@ -2401,9 +2530,15 @@ impl PathProvider for Host {
         self.forwarding_resolved(resolved.key())?;
         let (client, snapshot) = self.paths.acquire_via(request, via)?;
         let prepared = PreparedPath { client, snapshot };
+        // A planned open is authorized for exactly the authority selected
+        // in this serialized preparation.
         self.bindings[index] = Some(Binding {
             owner: None,
             prepared,
+            registration: plan.map(|plan| Registration {
+                plan,
+                authorized: snapshot.key(),
+            }),
         });
         Ok(prepared)
     }

@@ -1061,7 +1061,7 @@ fn randomized_host_dispatch_never_acts_beyond_the_reference_model() {
                     signatures += usize::from(side.0.ledger.evicted_hits(now, &key).0 != 0);
                     quotes += 1;
                     let context = side.2;
-                    match side.0.input_icmp(&mut side.1, context, now, &report) {
+                    match side.0.input_icmp(&mut side.1, context, now, &report, None) {
                         Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
                             owner,
                             published,

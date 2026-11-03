@@ -204,8 +204,10 @@ fn with_ipv4_options(packet: &[u8], options: &[u8]) -> Vec<u8> {
 }
 
 // The native managed profile interprets Record Route and Timestamp: the
-// Echo Reply carries them recorded once with this host's address and the
-// owner's high-bit-marked elapsed time. It refuses source routes at the
+// Echo Reply carries them recorded once with this host's address and one
+// sample of the characterized UTC source: a standard value within the
+// test's own kernel clock bracket, or the owner's elapsed time marked
+// nonstandard by the high-order bit. It refuses source routes at the
 // Host (the Echo service is not gated by TCP's option setting), so a
 // routed request draws no reply.
 #[test]
@@ -222,7 +224,10 @@ fn native_echo_replies_carry_recorded_options_and_routed_requests_are_refused() 
     // RR and TS (flag 0), one free slot each and two for TS, EOL-padded.
     let options = [7, 7, 4, 0, 0, 0, 0, 68, 12, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let frame = ethernet(UNICAST, false, &with_ipv4_options(&request, &options));
+    let before = super::utc_read();
     deliver(&mut a, &wire, &[frame]);
+    let after = super::utc_read();
+    assert_eq!(a.ipv4_clock.acquisitions, 1);
     a.service_egress().unwrap();
     let frames: Vec<_> = wire.lock().unwrap().sent.drain(..).collect();
     assert_eq!(frames.len(), 1);
@@ -232,7 +237,9 @@ fn native_echo_replies_carry_recorded_options_and_routed_requests_are_refused() 
     assert_eq!(&ip[23..27], &local.octets());
     assert_eq!(&ip[27..31], &[68, 12, 9, 0]);
     let time = u32::from_be_bytes(ip[31..35].try_into().unwrap());
-    assert_ne!(time & 0x8000_0000, 0, "nonstandard time is marked");
+    if !super::standard_time(time, before, after) {
+        assert_eq!(time, 0x8000_0000 | (a.now() / 1000) as u32);
+    }
     assert_eq!(&ip[35..40], &[0; 5]);
     let reply = ntcp_icmp::decode_echo(
         ntcp::IpMetadata {
@@ -255,7 +262,8 @@ fn native_echo_replies_carry_recorded_options_and_routed_requests_are_refused() 
     a.service_egress().unwrap();
     assert!(sent_icmp(&wire).is_empty());
     // Refused on arrival, before the Echo service's return-route
-    // authorization could count it.
+    // authorization could count it or recording could sample time; the
+    // reply's output sampled nothing either.
     let host = a.host.as_ref().unwrap();
     let counters = host.icmp_output_counters();
     assert_eq!(
@@ -263,6 +271,7 @@ fn native_echo_replies_carry_recorded_options_and_routed_requests_are_refused() 
         (1, 0)
     );
     assert_eq!(host.icmp_output_pending(), 0);
+    assert_eq!(a.ipv4_clock.acquisitions, 1);
 }
 
 #[test]

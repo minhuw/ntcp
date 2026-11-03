@@ -363,6 +363,7 @@ fn host_error(error: ntcp_host::Error) -> i32 {
         H::Path(P::SourceNotOwned) => EADDRNOTAVAIL,
         H::InvalidContext
         | H::Obsolete
+        | H::StaleRoute
         | H::Path(
             P::ForeignContext
             | P::StaleHandle
@@ -614,6 +615,8 @@ struct Owner {
     completed: Vec<u8>,
     icmp_packet: Vec<u8>,
     icmp_wire: Vec<u8>,
+    // IPv4 Timestamp time for destination and origin recording.
+    ipv4_clock: backend::Ipv4Clock,
     defaults: EndpointConfig,
     socket_policy: crate::SocketPolicy,
     // The operator's assertion about earlier emission from `local`
@@ -933,6 +936,7 @@ impl Owner {
             completed: Vec::new(),
             icmp_packet: Vec::new(),
             icmp_wire: Vec::new(),
+            ipv4_clock: Default::default(),
             defaults,
             socket_policy: crate::SocketPolicy::default(),
             source_quiet: crate::SourceQuiet::Unknown,

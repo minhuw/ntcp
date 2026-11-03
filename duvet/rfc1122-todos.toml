@@ -1,4 +1,0 @@
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
-quote = "A timestamp value MUST follow the rules given in Section 3.2.2.8 for the ICMP Timestamp message."
-reason = "Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this."

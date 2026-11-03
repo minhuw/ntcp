@@ -332,6 +332,7 @@ impl Endpoint {
         if self.factory_transaction.is_some() {
             return Err(EndpointError::Connection(Error::InvalidState).into());
         }
+        crate::managed_path::check_registration(&request).map_err(EndpointError::from)?;
         self.validate_ipv4_options(
             IpMetadata {
                 source: request.tuple.local.ip(),
@@ -382,6 +383,7 @@ impl Endpoint {
             listener: None,
             dscp,
             ipv4_options: options.ipv4_options,
+            registration: options.registration,
         };
         self.path_factory(provider, request, |endpoint| {
             endpoint.connect_with_receive_authority(
@@ -422,6 +424,7 @@ impl Endpoint {
             listener: None,
             dscp,
             ipv4_options: options.ipv4_options,
+            registration: options.registration,
         };
         self.path_factory(provider, request, |endpoint| {
             endpoint.connect_fast_open_authorized(
@@ -490,6 +493,7 @@ impl Endpoint {
                     source_route: route,
                     ..OutgoingIpv4Options::default()
                 },
+                registration: None,
             };
             self.path_factory(provider, request, |endpoint| {
                 endpoint.input_with_metadata(now, ip, traffic_class, options, bytes, metadata)

@@ -32,6 +32,7 @@ fn fixture_connect(
             transport: ntcp::ActiveOpenOptions::from(&inner.defaults.connection),
             dscp: inner.defaults.dscp,
             ipv4_options: Default::default(),
+            registration: None,
             receive_authority: None,
         },
         inner.host.as_mut().unwrap(),

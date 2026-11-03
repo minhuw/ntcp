@@ -233,7 +233,7 @@ fn exact(p: &Probe) -> Vec<u8> {
 
 fn input(a: &mut Side, now: u64, frame: &[u8]) -> IcmpDispatch {
     let context = a.2;
-    a.0.input_icmp(&mut a.1, context, now, frame).unwrap()
+    a.0.input_icmp(&mut a.1, context, now, frame, None).unwrap()
 }
 
 fn outcome(dispatch: IcmpDispatch) -> ProbeOutcome {

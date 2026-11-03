@@ -12,6 +12,7 @@ mod ingress;
 mod ipv4_policy;
 mod probe_receipts;
 mod reassembly;
+mod registration;
 mod repair;
 mod source_routes;
 mod submission;
@@ -222,6 +223,7 @@ fn options(cfg: &EndpointConfig, dscp: u8) -> ManagedOpenOptions {
         transport: ActiveOpenOptions::from(&cfg.connection),
         dscp,
         ipv4_options: OutgoingIpv4Options::default(),
+        registration: None,
         receive_authority: None,
     }
 }

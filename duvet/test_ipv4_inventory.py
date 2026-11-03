@@ -1,5 +1,5 @@
 import copy
-from collections import Counter
+from collections import Counter, defaultdict
 import io
 import json
 from pathlib import Path
@@ -15,13 +15,18 @@ from test_annotation_inventory import report_fixture, report_scopes
 # Exact selected clauses are a review contract: synchronously narrowing a ledger,
 # additions and source/test quotes cannot silently shrink the audited capability.
 CONTRACT = {
-    791: (19, 17, 2, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
+    791: (19, 19, 0, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
           "823132a1638cd0fc39160740de5ecd34c696a65f03fbb863122ffffaaf961e8d"),
-    1122: (16, 15, 1, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
+    1122: (16, 16, 0, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
            "140d6afa98dde87d39941c1863076d8fa41864673c357689e1d81f343880960d"),
     6864: (4, 4, 0, "e00ff443857166e5b26deecfdc77a0a1c5ff17fc87a6a8c50b020ce7f4d516d9",
            "586eabdc924e7104e828cf54cbeddfcdd85f11c2e2ac5e1cc48e5379eba9e772"),
 }
+
+
+# Closed together with the checked registration plan and the characterized UTC
+# provider; their reasons must not keep the earlier caller-responsibility gaps.
+T15_CLOSURES = ("791-record-capacity", "791-timestamp-capacity", "1122-timestamp-value")
 
 
 def ledger(n):
@@ -87,7 +92,7 @@ class Ipv4Inventory(unittest.TestCase):
         self.assertEqual(next(r for r in ledger(1122)["paragraphs"]
                               if r["id"] == "1122-ttl-receive")["status"], "covered")
         for id, status in (("1122-options-pass", "covered"), ("1122-timestamp-destination", "covered"),
-                           ("1122-timestamp-value", "TODO")):
+                           ("1122-timestamp-value", "covered")):
             self.assertEqual(next(r for r in ledger(1122)["paragraphs"] if r["id"] == id)["status"], status)
         parent = next(r for r in ledger(791)["paragraphs"] if r["id"] == "791-total-context")
         child = next(r for r in ledger(791)["paragraphs"] if r["id"] == "791-total")
@@ -100,24 +105,53 @@ class Ipv4Inventory(unittest.TestCase):
         value = next(r for r in ledger(1122)["paragraphs"] if r["id"] == "1122-timestamp-value")
         self.assertIn("15 updates/second", value["reason"])
         self.assertIn("accuracy within a few minutes", value["reason"])
-        self.assertIn("T15", value["reason"])
-        for id in ("791-record-capacity", "791-timestamp-capacity"):
+        for fact in ("ntcp-clock", "16 s phase limit", "at most 64 ms", "high-bit-marked",
+                     "bounded characterization", "originates no IPv4 options"):
+            self.assertIn(fact, value["reason"])
+        self.assertEqual(value["evidence"], [
+            "crates/adapters/ntcp-clock/src/lib.rs::pub fn sample(",
+            "crates/adapters/ntcp-clock/src/tests.rs::fn actual_cadence_characterization()"])
+        # Native refuses outgoing IPv4 options, so it records but never originates.
+        self.assertIn("native at receive, originating no IPv4 options", timebase["reason"])
+        for id, initialized in (("791-record-capacity", "zero-initialized"),
+                                ("791-timestamp-capacity", "zero or address/zero pairs")):
             row = next(r for r in ledger(791)["paragraphs"] if r["id"] == id)
-            self.assertEqual(row["status"], "TODO")
-            self.assertIn("T15", row["reason"])
+            self.assertEqual(row["status"], "covered")
+            for fact in ("expected", "40-octet", "typed error", initialized, "never resizes",
+                         "fixed for the connection", "low-level caller contracts"):
+                self.assertIn(fact, row["reason"])
+            # Address width, full pointer, initialization and fixed size are
+            # asserted on the encoded area, not inferred from planner success.
+            self.assertEqual(row["evidence"], [
+                "crates/stacks/ntcp/src/ipv4_options.rs::pub struct Ipv4RegistrationPlan {",
+                "crates/stacks/ntcp/src/ipv4_options.rs::fn plan_initializes_fixed_size_area_before_origin_recording()"])
+        for id in T15_CLOSURES:
+            row = next(r for n in (791, 1122) for r in ledger(n)["paragraphs"] if r["id"] == id)
+            for gap in ("T15", "TODO", "caller responsibility"):
+                self.assertNotIn(gap, row["reason"])
 
     def test_all_partial_ipv4_source_and_test_copies_keep_canonical_reasons(self):
-        partial = {audit.clause_key(row): row for row in ledger(1122)["paragraphs"]
-                   if row["status"] == "TODO"}
-        seen = Counter()
+        rows = [row for n in (791, 1122) for row in ledger(n)["paragraphs"]]
+        partial = {audit.clause_key(row): row for row in rows if row["status"] == "TODO"}
+        closed = {audit.clause_key(row): row["id"] for row in rows if row["id"] in T15_CLOSURES}
+        self.assertEqual(set(closed.values()), set(T15_CLOSURES))
+        seen, kinds = Counter(), defaultdict(Counter)
         for path in (ROOT / "crates").rglob("*.rs"):
             for annotation in audit.source_annotations(path.read_text()):
                 key = audit.clause_key(annotation)
                 if key in partial:
                     self.assertEqual(annotation["reason"], partial[key]["reason"], str(path))
                     seen[key] += 1
+                if key in closed:
+                    # A closed obligation's copies carry no retained gap.
+                    self.assertEqual(annotation["reason"], "", str(path))
+                    kinds[closed[key]][annotation["kind"]] += 1
         self.assertEqual(set(seen), set(partial))
         self.assertTrue(all(count >= 2 for count in seen.values()))
+        # Every closed copy is complete: implementation and several tests.
+        for id in T15_CLOSURES:
+            self.assertGreaterEqual(kinds[id]["CITATION"], 1, id)
+            self.assertGreaterEqual(kinds[id]["TEST"], 3, id)
 
 
 class HistoricalPublication(unittest.TestCase):

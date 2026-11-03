@@ -95,6 +95,7 @@ dependencies = [
  "hmac",
  "libc",
  "ntcp-buffer",
+ "ntcp-clock",
  "ntcp-host",
  "ntcp-icmp",
  "ntcp-io",
@@ -112,6 +113,13 @@ dependencies = [
 [[package]]
 name = "ntcp-buffer"
 version = "0.0.1"
+
+[[package]]
+name = "ntcp-clock"
+version = "0.0.1"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "ntcp-egress"
@@ -243,6 +251,7 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "ntcp",
+ "ntcp-clock",
  "ntcp-host",
  "ntcp-io",
  "ntcp-io-af-packet",
@@ -260,6 +269,7 @@ dependencies = [
  "cc",
  "libc",
  "ntcp",
+ "ntcp-clock",
  "ntcp-egress",
  "ntcp-ethernet",
  "ntcp-host",

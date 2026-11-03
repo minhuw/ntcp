@@ -178,7 +178,7 @@
       "section": "3.2.1.8",
       "quote": "The destination host MUST (if possible) add the current timestamp to a Timestamp option before passing the option to the transport layer or to ICMP for processing.",
       "status": "covered",
-      "reason": "Where Timestamp processing is implemented (the interpreting profile; the disabled profile declines that OPTIONAL processing and still delivers every option), Host::process records this host's timestamp once per complete datagram after reassembly, before TCP and every ICMP consumer, sampling the embedding's Ipv4TimestampProvider only for a slot this host may write and keeping the slot when no time is available. Native managed input and the example supply high-bit-marked nonstandard elapsed time, so lacking UTC never skips a write; retained, deferred and replayed input is never recorded again. Host, native and example tests and the integration/rfc_host ip-options cases (a peer's Timestamp returned updated by each embedding) cover it; the stateless compatibility parsers (ntcp_ip::parse, the host-less native parser, the full-frame ICMP decoders) make no destination-processing claim.",
+      "reason": "Where Timestamp processing is implemented (the interpreting profile; the disabled profile declines that OPTIONAL processing and still delivers every option), Host::process records this host's timestamp once per complete datagram after reassembly, before TCP and every ICMP consumer, sampling the embedding's Ipv4TimestampProvider only for a slot this host may write and keeping the slot when no time is available. Native managed input and the example supply the characterized Linux UTC provider's time, standard or high-bit-marked nonstandard elapsed time, so lacking UTC never skips a write; retained, deferred and replayed input is never recorded again. Host, native and example tests and the integration/rfc_host ip-options cases (a peer's Timestamp returned updated by each embedding) cover it; the stateless compatibility parsers (ntcp_ip::parse, the host-less native parser, the full-frame ICMP decoders) make no destination-processing claim.",
       "evidence": [
         "crates/stacks/ntcp-host/src/ingress.rs::pub fn process<'a>(",
         "crates/stacks/ntcp-host/src/tests/destination.rs::fn echo_requests_are_processed_once_in_every_arrival_order()"
@@ -189,11 +189,11 @@
       "id": "1122-timestamp-value",
       "section": "3.2.1.8",
       "quote": "A timestamp value MUST follow the rules given in Section 3.2.2.8 for the ICMP Timestamp message.",
-      "status": "TODO",
-      "reason": "Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this.",
+      "status": "covered",
+      "reason": "Local writes enforce UTC day range or a nonstandard high bit. The characterized Linux UTC provider (ntcp-clock) emits UTC milliseconds since midnight only when its one read-only adjtimex acquisition shows no kernel error status and neither TIME_ERROR nor TIME_OOP, a maximum error within the kernel's 16 s phase limit (accuracy within a few minutes under RFC1122 section 3.2.2.8, conditional on the time daemon's bound and the kernel drift model being truthful), a consistent BOOTTIME bracket of at most 64 ms (at most the six low-order bits undefined) and no unconfirmed suspend; otherwise it emits high-bit-marked elapsed time. Recorded kernel facts test every state, error predicate, limit, failure, decoding, step, bracket and suspend case; actual samples are checked against their own facts, and a bounded characterization shows sub-1/15-second progression of the returned time, at least 15 updates/second, on the tested system, never inferred from clock_getres or numeric range. Native records arriving datagrams with the provider and originates no IPv4 options; the example records and originates with it, sampling only for a slot it writes; their tests and the integration/rfc_host cases accept an unmarked value only within the evidence's own healthy adjtimex window. Low-level u32 interfaces remain documented caller contracts.",
       "evidence": [
-        "crates/stacks/ntcp/src/ipv4_options.rs::pub fn record(",
-        "crates/stacks/ntcp/src/ipv4_options.rs::fn timestamp_value_contract_only_applies_to_local_writes()"
+        "crates/adapters/ntcp-clock/src/lib.rs::pub fn sample(",
+        "crates/adapters/ntcp-clock/src/tests.rs::fn actual_cadence_characterization()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
     },

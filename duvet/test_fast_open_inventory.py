@@ -310,7 +310,11 @@ class FastOpenInventory(unittest.TestCase):
             self.assertEqual(rows[id]["status"], "TODO")
         self.assertIn("LinuxSipHash24", rows["mac-expiration"]["reason"])
         self.assertIn("absolute issue/accept deadlines", rows["mac-expiration"]["reason"])
-        self.assertIn("T20/T15", rows["mac-expiration"]["reason"])
+        self.assertIn("T20 must integrate", rows["mac-expiration"]["reason"])
+        self.assertNotIn("T15", rows["mac-expiration"]["reason"])
+        self.assertEqual(rows["expire-any-time"]["status"], "covered")
+        self.assertTrue(rows["expire-any-time"]["reason"].endswith(
+            "external raw-key restart/time continuity remains owned by T20."))
         for id in ("replay-app", "app-reuse", "farm-key", "nat-timestamp-cookie", "aes-example",
                    "cross-connection-cc-disable", "synack-payload-delay", "api-active-option-alternative"):
             self.assertEqual(rows[id]["status"], "exception")
@@ -360,7 +364,8 @@ class FastOpenInventory(unittest.TestCase):
         for id in ("perform-normal-and-expiry", "server-mac-properties", "mac-expiration",
                    "is-cookie-valid", "request-server-properties", "reuse-until-expired"):
             row = rows[id]
-            self.assertIn("T20/T15", row["reason"])
+            self.assertIn("T20", row["reason"])
+            self.assertNotIn("T15", row["reason"])
             self.assertIn("raw", row["reason"].lower())
             self.assertEqual(row["evidence"][1],
                              "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_timebases()")
@@ -399,7 +404,8 @@ class FastOpenInventory(unittest.TestCase):
         for key in ("7413-server-mac-properties", "7413-request-server-properties"):
             row = rows[key]
             self.assertEqual(row["status"], "TODO")
-            self.assertIn("T20/T15", row["reason"])
+            self.assertIn("T20", row["reason"])
+            self.assertNotIn("T15", row["reason"])
             self.assertIn("check_mac_cost.py", row["reason"])
             self.assertNotIn("unmeasured", row["reason"])
         harness = (ROOT / "crates/stacks/ntcp/src/mac_cost_tests.rs").read_text()

@@ -95,6 +95,7 @@ fn tun_echo_serves_pathctl_processes_and_control_is_opt_in() {
                     transport: ntcp::ActiveOpenOptions::from(&config.connection),
                     dscp: config.dscp,
                     ipv4_options: Default::default(),
+                    registration: None,
                     receive_authority: None,
                 },
                 &mut network.host,

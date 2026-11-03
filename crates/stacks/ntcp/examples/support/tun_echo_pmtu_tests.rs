@@ -198,7 +198,7 @@ pub(super) fn emit(
         } else {
             IPV6_HEADER
         },
-        0x8000_0000 | (time / 1000) as u32,
+        &mut Sample(0x8000_0000 | (time / 1000) as u32),
         &mut backend,
     )
     .unwrap();
@@ -244,6 +244,7 @@ impl Pair {
                     transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
                     dscp: cfg.dscp,
                     ipv4_options: Default::default(),
+                    registration: None,
                     receive_authority: None,
                 },
                 &mut ahost.host,
@@ -279,7 +280,7 @@ impl Pair {
                 flags
             );
             assert_eq!(syn.options.timestamps.is_some(), timestamps);
-            input_frame(to_host, to, time, &frames[0], destination, options, 0).unwrap();
+            input_frame(to_host, to, time, &frames[0], destination, options, &mut Sample(0)).unwrap();
         }
         let final_ack = emit(&mut ahost, &mut a, 3000, local.ip());
         assert_eq!(final_ack.len(), 1);
@@ -291,7 +292,7 @@ impl Pair {
         assert!(ack.payload.is_empty());
         assert_eq!(ack.options.timestamps.is_some(), timestamps);
         for frame in final_ack {
-            input_frame(&mut bhost, &mut b, 3000, &frame, remote.ip(), options, 0).unwrap();
+            input_frame(&mut bhost, &mut b, 3000, &frame, remote.ip(), options, &mut Sample(0)).unwrap();
         }
         let bid = b.accept(listener).unwrap();
         for (e, id) in [(&a, aid), (&b, bid)] {
@@ -349,7 +350,7 @@ impl Pair {
                         &frame,
                         self.remote.ip(),
                         false,
-                        0,
+                        &mut Sample(0),
                     )
                     .unwrap();
                 }
@@ -369,7 +370,7 @@ impl Pair {
                     &frame,
                     self.local.ip(),
                     false,
-                    0,
+                    &mut Sample(0),
                 )
                 .unwrap();
             }
@@ -406,18 +407,18 @@ fn runtime_zero_mtu_icmp_uses_live_host_plateaus_and_transport_overrides() {
     let feedback = ntcp_icmp::decode_icmp(&report).unwrap();
     assert_eq!(feedback.kind, ntcp_icmp::FeedbackKind::PacketTooBig);
     assert_eq!(feedback.candidate_mtu, None); // zero-next-hop legacy feedback
-    input_frame(&mut p.ahost, &mut p.a, p.time, &report, p.local.ip(), false, 0).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time, &report, p.local.ip(), false, &mut Sample(0)).unwrap();
     assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1460);
     p.ahost.host.set_ipv4_plateaus(path::Ipv4Plateaus::new(&[1500, 1200, 68]).unwrap()).unwrap();
     p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
-    input_frame(&mut p.ahost, &mut p.a, p.time + 1, &report, p.local.ip(), false, 0).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 1, &report, p.local.ip(), false, &mut Sample(0)).unwrap();
     assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1200);
     p.a.set_pmtud_policy(p.time + 2, p.aid, ntcp::PmtudPolicy {
         ipv4_plateaus: ntcp::Ipv4Plateaus::HISTORICAL, ..Default::default()
     }).unwrap();
     p.ahost.host.set_ipv4_plateaus(path::Ipv4Plateaus::new(&[1500, 900, 68]).unwrap()).unwrap();
     p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
-    input_frame(&mut p.ahost, &mut p.a, p.time + 3, &report, p.local.ip(), false, 0).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 3, &report, p.local.ip(), false, &mut Sample(0)).unwrap();
     assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1006);
     // The shared publication never undercuts the decrease the owner applied
     // under its own plateau policy: the override keeps its local meaning.
@@ -430,7 +431,7 @@ fn runtime_zero_mtu_icmp_uses_live_host_plateaus_and_transport_overrides() {
         learned(&p), p.a.managed_path(p.aid).unwrap().ordinary_ip_budget);
     // Following the live Host table again, TCP and the Host agree.
     p.a.set_pmtud_policy(p.time + 4, p.aid, ntcp::PmtudPolicy::default()).unwrap();
-    input_frame(&mut p.ahost, &mut p.a, p.time + 5, &report, p.local.ip(), false, 0).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 5, &report, p.local.ip(), false, &mut Sample(0)).unwrap();
     assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 900);
     assert_eq!(learned(&p), Some(900), "correlated decrease from the Host plateau table");
     eprintln!("ZERO_MTU override=INHERIT host_table=900 tcp=900 published={:?}", learned(&p));
@@ -448,7 +449,7 @@ fn runtime_zero_mtu_override_below_host_table_publishes_the_host_value() {
         ipv4_plateaus: ntcp::Ipv4Plateaus::HISTORICAL, ..Default::default()
     }).unwrap();
     p.ahost.host.refresh(&mut p.a, p.aid).unwrap();
-    input_frame(&mut p.ahost, &mut p.a, p.time + 2, &report, p.local.ip(), false, 0).unwrap();
+    input_frame(&mut p.ahost, &mut p.a, p.time + 2, &report, p.local.ip(), false, &mut Sample(0)).unwrap();
     assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, 1006);
     // One connection's override never lowers other clients below the
     // Host's own table; the connection keeps its lower local value.
@@ -471,7 +472,7 @@ fn runtime_source_quench_discards_without_touching_reserved_owner_or_clock() {
     let mut output = [0; MTU];
     let mut pending = None;
     transmit_frames(&mut p.ahost, &mut p.a, p.time, &mut output,
-        &mut pending, IP_HEADER, 0, &mut backend).unwrap();
+        &mut pending, IP_HEADER, &mut Sample(0), &mut backend).unwrap();
     let held = pending.as_ref().unwrap();
     let attempt = held.attempt;
     let mut report = ptb(&output[..held.len], 0);
@@ -491,7 +492,7 @@ fn runtime_source_quench_discards_without_touching_reserved_owner_or_clock() {
         p.a.next_deadline(), p.a.send_progress(p.aid).unwrap());
     // A discarded message must not advance the caller's clock either.
     input_frame(&mut p.ahost, &mut p.a, p.time + 1_000_000, &report,
-        p.local.ip(), false, 0).unwrap();
+        p.local.ip(), false, &mut Sample(0)).unwrap();
     assert_eq!((p.a.transport_info(p.aid).unwrap(), p.a.path_mtu_info(p.aid).unwrap(),
         p.a.next_deadline(), p.a.send_progress(p.aid).unwrap()), before);
     assert!(p.a.is_output_reserved(p.aid));
@@ -499,10 +500,10 @@ fn runtime_source_quench_discards_without_touching_reserved_owner_or_clock() {
     assert!(p.ahost.received.is_empty());
     backend.blocked = false;
     transmit_frames(&mut p.ahost, &mut p.a, p.time, &mut output,
-        &mut pending, IP_HEADER, 0, &mut backend).unwrap();
+        &mut pending, IP_HEADER, &mut Sample(0), &mut backend).unwrap();
     assert!(pending.is_none());
     for frame in &backend.frames {
-        input_frame(&mut p.bhost, &mut p.b, p.time, frame, p.remote.ip(), false, 0).unwrap();
+        input_frame(&mut p.bhost, &mut p.b, p.time, frame, p.remote.ip(), false, &mut Sample(0)).unwrap();
     }
     p.progress(MTU, &payload);
 }
@@ -516,7 +517,7 @@ fn runtime_exhausted_timestamp_discards_then_valid_stream_progresses() {
     let cfg = runtime_config(&Backend::default(), local.ip(), false, true, false).unwrap();
     let aid = a.connect_with_path_provider(0, local, remote, ntcp::ManagedOpenOptions {
         transport: ntcp::ActiveOpenOptions::from(&cfg.connection), dscp: 0,
-        ipv4_options: Default::default(), receive_authority: None,
+        ipv4_options: Default::default(), registration: None, receive_authority: None,
     }, &mut ahost.host).unwrap();
     let syn = emit(&mut ahost, &mut a, 1, local.ip()).pop().unwrap();
     let mut exhausted = syn.clone();
@@ -529,26 +530,26 @@ fn runtime_exhausted_timestamp_discards_then_valid_stream_progresses() {
     let IpAddr::V4(local_ip) = remote.ip() else { unreachable!() };
     assert!(packet.options.record(local_ip, 123).is_err());
     let before = b.next_deadline();
-    input_frame(&mut bhost, &mut b, 1_000_000, &exhausted, remote.ip(), true, 123).unwrap();
+    input_frame(&mut bhost, &mut b, 1_000_000, &exhausted, remote.ip(), true, &mut Sample(123)).unwrap();
     assert_eq!(b.next_deadline(), before);
     assert_eq!(bhost.host.binding_count(), 0);
     // Use the original time to also prove the failed option did not advance it.
-    input_frame(&mut bhost, &mut b, 2, &syn, remote.ip(), true, 124).unwrap();
+    input_frame(&mut bhost, &mut b, 2, &syn, remote.ip(), true, &mut Sample(124)).unwrap();
     let reply = emit(&mut bhost, &mut b, 3, remote.ip()).pop().unwrap();
-    input_frame(&mut ahost, &mut a, 4, &reply, local.ip(), false, 0).unwrap();
+    input_frame(&mut ahost, &mut a, 4, &reply, local.ip(), false, &mut Sample(0)).unwrap();
     for frame in emit(&mut ahost, &mut a, 5, local.ip()) {
-        input_frame(&mut bhost, &mut b, 6, &frame, remote.ip(), true, 125).unwrap();
+        input_frame(&mut bhost, &mut b, 6, &frame, remote.ip(), true, &mut Sample(125)).unwrap();
     }
     let bid = b.accept(listener).unwrap();
     let payload = b"valid traffic after exhausted Timestamp";
     a.write(aid, payload).unwrap();
     for frame in emit(&mut ahost, &mut a, 7, local.ip()) {
-        input_frame(&mut bhost, &mut b, 8, &frame, remote.ip(), true, 126).unwrap();
+        input_frame(&mut bhost, &mut b, 8, &frame, remote.ip(), true, &mut Sample(126)).unwrap();
     }
     let ack_time = b.next_deadline().unwrap();
     b.on_timeout(ack_time, BUDGET).unwrap();
     for frame in emit(&mut bhost, &mut b, ack_time, remote.ip()) {
-        input_frame(&mut ahost, &mut a, ack_time + 1, &frame, local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, ack_time + 1, &frame, local.ip(), false, &mut Sample(0)).unwrap();
     }
     let mut bytes = [0; 128];
     assert_eq!(b.read(bid, &mut bytes).unwrap(), payload.len());
@@ -565,15 +566,15 @@ fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
         let cfg = runtime_config(&Backend::default(), local.ip(), false, true, false).unwrap();
         let id = a.connect_with_path_provider(0, local, remote, ntcp::ManagedOpenOptions {
             transport: ntcp::ActiveOpenOptions::from(&cfg.connection), dscp: 0,
-            ipv4_options: Default::default(), receive_authority: None,
+            ipv4_options: Default::default(), registration: None, receive_authority: None,
         }, &mut ahost.host).unwrap();
         let syn = emit(&mut ahost, &mut a, 1, local.ip()).pop().unwrap();
-        input_frame(&mut bhost, &mut b, 2, &syn, remote.ip(), false, 0).unwrap();
+        input_frame(&mut bhost, &mut b, 2, &syn, remote.ip(), false, &mut Sample(0)).unwrap();
         let mut backend = Backend { blocked: true, ..Default::default() };
         let mut output = [0; MTU];
         let mut pending = None;
         transmit_frames(&mut bhost, &mut b, 3, &mut output, &mut pending,
-            IP_HEADER, 0, &mut backend).unwrap();
+            IP_HEADER, &mut Sample(0), &mut backend).unwrap();
         let held = pending.as_ref().unwrap();
         assert!(b.transmit_attempt_packet(held.attempt).unwrap().connection.is_none());
         let old = held.context.unwrap();
@@ -587,7 +588,7 @@ fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
         backend.blocked = false;
         let calls = backend.attempts;
         transmit_frames(&mut bhost, &mut b, 4, &mut output, &mut pending,
-            IP_HEADER, 0, &mut backend).unwrap();
+            IP_HEADER, &mut Sample(0), &mut backend).unwrap();
         assert_eq!(backend.attempts, calls);
         assert!(pending.as_ref().unwrap().blocked);
         assert!(bhost.host.paths().is_dirty(old.binding.client).unwrap());
@@ -597,12 +598,12 @@ fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
             bhost.host.add_route(route).unwrap();
         }
         transmit_frames(&mut bhost, &mut b, 5, &mut output, &mut pending,
-            IP_HEADER, 0, &mut backend).unwrap();
+            IP_HEADER, &mut Sample(0), &mut backend).unwrap();
         assert!(pending.is_none());
         assert_eq!(backend.frames, vec![staged]);
         assert_eq!(bhost.host.lease_count(), 0);
         assert_eq!(bhost.host.paths().usage().clients, 0);
-        input_frame(&mut ahost, &mut a, 6, &backend.frames[0], local.ip(), false, 0).unwrap();
+        input_frame(&mut ahost, &mut a, 6, &backend.frames[0], local.ip(), false, &mut Sample(0)).unwrap();
         assert_eq!(a.state(id).unwrap(), State::Closed);
     }
 }
@@ -699,7 +700,7 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
             &report,
             p.local.ip(),
             false,
-            0,
+            &mut Sample(0),
         )
         .unwrap();
         assert_eq!(
@@ -726,7 +727,7 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
             &stale,
             p.local.ip(),
             false,
-            0,
+            &mut Sample(0),
         )
         .unwrap();
         assert_eq!(p.a.path_mtu_info(p.aid).unwrap(), before);
@@ -801,7 +802,7 @@ fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
                 &frame,
                 p.remote.ip(),
                 false,
-                0,
+                &mut Sample(0),
             )
             .unwrap();
         }
@@ -907,7 +908,7 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
                 &report,
                 configured,
                 false,
-                0,
+                &mut Sample(0),
             )
             .unwrap();
             assert_eq!(p.a.path_mtu_info(p.aid).unwrap(), before, "{v6}: {name}");
@@ -925,7 +926,7 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
                 &report,
                 configured,
                 false,
-                0,
+                &mut Sample(0),
             )
             .unwrap();
             assert_eq!(empty.buffer_bytes(), reserved_storage, "{name}");
@@ -946,7 +947,7 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
             &ptb(&original, path),
             p.local.ip(),
             false,
-            0,
+            &mut Sample(0),
         )
         .unwrap();
         assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, path);
@@ -984,7 +985,7 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
             &mut output,
             &mut pending,
             h,
-            0,
+            &mut Sample(0),
             &mut backend,
         )
         .unwrap();
@@ -1002,7 +1003,7 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
                 &report,
                 p.local.ip(),
                 false,
-                0,
+                &mut Sample(0),
             )
             .unwrap();
         }
@@ -1022,7 +1023,7 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
                 &mut output,
                 &mut pending,
                 h,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -1039,7 +1040,7 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
             &mut output,
             &mut pending,
             h,
-            0,
+            &mut Sample(0),
             &mut backend,
         )
         .unwrap();
@@ -1064,12 +1065,98 @@ fn runtime_ptb_does_not_overwrite_a_committed_blocked_frame() {
                 frame,
                 p.remote.ip(),
                 false,
-                0,
+                &mut Sample(0),
             )
             .unwrap();
         }
         p.progress(path, &payload);
     }
+}
+
+// A planned flow whose route goes away after its owner stated the expected
+// registrations ends explicitly: the held option-bearing frame is never
+// submitted or sampled again, and its connection fails without a reset
+// instead of pausing output.
+#[test]
+fn stale_registration_route_terminates_the_flow() {
+    let local: IpAddr = "192.0.2.1".parse().unwrap();
+    let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+    let cfg = runtime_config(&Backend::default(), local, true, true, true).unwrap();
+    let mut endpoint = Endpoint::new(
+        cfg.clone(),
+        [9; 32],
+        0,
+        tun_address_policy(
+            "192.0.2.1".parse().unwrap(),
+            ("192.0.2.1".parse().unwrap(), 24),
+        ),
+    )
+    .unwrap();
+    let mut network = TunHost::attach(&mut endpoint, &cfg, local).unwrap();
+    let (options, expected) = origination(Some("3,3"), Some("times,3,3"))
+        .unwrap()
+        .unwrap();
+    let plan = ntcp::Ipv4RegistrationPlan::new(local, remote.ip(), options, &expected).unwrap();
+    let id = endpoint
+        .connect_with_path_provider(
+            0,
+            SocketAddr::new(local, 1234),
+            remote,
+            ntcp::ManagedOpenOptions {
+                transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                dscp: cfg.dscp,
+                ipv4_options: options,
+                registration: Some(plan),
+                receive_authority: None,
+            },
+            &mut network.host,
+        )
+        .unwrap();
+    let mut backend = Backend {
+        blocked: true,
+        ..Default::default()
+    };
+    let mut bytes = [0; MTU];
+    let mut pending = None;
+    let mut utc = Utc::new(std::time::Instant::now());
+    transmit_frames(
+        &mut network,
+        &mut endpoint,
+        0,
+        &mut bytes,
+        &mut pending,
+        IP_HEADER,
+        &mut utc,
+        &mut backend,
+    )
+    .unwrap();
+    let route = pending
+        .as_ref()
+        .unwrap()
+        .context
+        .unwrap()
+        .binding
+        .snapshot
+        .key()
+        .route();
+    network.host.remove_route(route).unwrap();
+    backend.blocked = false;
+    transmit_frames(
+        &mut network,
+        &mut endpoint,
+        1,
+        &mut bytes,
+        &mut pending,
+        IP_HEADER,
+        &mut utc,
+        &mut backend,
+    )
+    .unwrap();
+    assert!(pending.is_none());
+    assert!(backend.frames.is_empty());
+    assert_eq!(endpoint.state(id).unwrap(), State::Closed);
+    assert!(!endpoint.is_output_reserved(id));
+    assert_eq!(utc.acquisitions, 1);
 }
 
 #[test]
@@ -1090,6 +1177,11 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
     )
     .unwrap();
     let mut network = TunHost::attach(&mut endpoint, &cfg, local).unwrap();
+    let options = ntcp::OutgoingIpv4Options {
+        source_route: Some(ntcp::SourceRoute::new(&[hop], false).unwrap()),
+        record_route_slots: Some(3),
+        timestamp: Some(ntcp::TimestampRequest::Times(3)),
+    };
     let id = endpoint
         .connect_with_path_provider(
             0,
@@ -1098,12 +1190,20 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
             ntcp::ManagedOpenOptions {
                 transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
                 dscp: cfg.dscp,
-                ipv4_options: ntcp::OutgoingIpv4Options {
-                    source_route: Some(ntcp::SourceRoute::new(&[hop], false).unwrap()),
-                    record_route_slots: Some(2),
-                    timestamp: Some(ntcp::TimestampRequest::Times(2)),
-                    ..Default::default()
-                },
+                ipv4_options: options,
+                registration: Some(
+                    // The origin, the listed hop and the destination record.
+                    ntcp::Ipv4RegistrationPlan::new(
+                        local,
+                        remote.ip(),
+                        options,
+                        &ntcp::ExpectedRegistrations {
+                            record_route: Some(3),
+                            timestamp: Some(ntcp::ExpectedTimestamps::Count(3)),
+                        },
+                    )
+                    .unwrap(),
+                ),
                 receive_authority: None,
             },
             &mut network.host,
@@ -1115,6 +1215,9 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
     };
     let mut bytes = [0; MTU];
     let mut pending = None;
+    // The example's provider, sampled once for the origin's Timestamp slot.
+    let mut utc = Utc::new(std::time::Instant::now());
+    let before = utc_read();
     transmit_frames(
         &mut network,
         &mut endpoint,
@@ -1122,13 +1225,24 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
         &mut bytes,
         &mut pending,
         IP_HEADER,
-        0x8000_0123,
+        &mut utc,
         &mut backend,
     )
     .unwrap();
+    let after = utc_read();
+    assert_eq!(utc.acquisitions, 1);
     let held = pending.as_ref().unwrap();
     let context = held.context.unwrap();
     let staged = bytes[..held.len].to_vec();
+    // The route (7 octets) and Record Route (15) precede the Timestamp.
+    assert_eq!(&staged[42..46], &[68, 16, 9, 0]);
+    // Standard only within the test's healthy kernel clock bracket,
+    // otherwise marked.
+    standard_time(
+        u32::from_be_bytes(staged[46..50].try_into().unwrap()),
+        before,
+        after,
+    );
     assert_eq!(
         context.binding.snapshot.key().destination().address(),
         remote.ip()
@@ -1157,11 +1271,13 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
         &mut bytes,
         &mut pending,
         IP_HEADER,
-        0x8000_0456,
+        &mut utc,
         &mut backend,
     )
     .unwrap();
     assert!(pending.is_none());
+    // The held frame was submitted as encoded, without another sample.
+    assert_eq!(utc.acquisitions, 1);
     assert_eq!(backend.frames, vec![staged]);
     // This is an originating, not-yet-forwarded source route. The ingress
     // codec correctly rejects it as incomplete at the final destination;
@@ -1201,7 +1317,7 @@ fn runtime_rejection_interruption_and_unknown_outcome_never_accept_selected_byte
                 &mut bytes,
                 &mut pending,
                 header,
-                0,
+                &mut Sample(0),
                 &mut backend,
             );
             if errno == Some(libc::EIO) {
@@ -1229,7 +1345,7 @@ fn runtime_rejection_interruption_and_unknown_outcome_never_accept_selected_byte
                 &mut bytes,
                 &mut pending,
                 header,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -1242,7 +1358,7 @@ fn runtime_rejection_interruption_and_unknown_outcome_never_accept_selected_byte
                     frame,
                     p.remote.ip(),
                     false,
-                    0,
+                    &mut Sample(0),
                 )
                 .unwrap();
             }
@@ -1271,7 +1387,7 @@ fn runtime_stale_source_pauses_held_output_until_canonical_rebind() {
             &mut bytes,
             &mut pending,
             header,
-            0,
+            &mut Sample(0),
             &mut backend,
         )
         .unwrap();
@@ -1291,7 +1407,7 @@ fn runtime_stale_source_pauses_held_output_until_canonical_rebind() {
                 &mut bytes,
                 &mut pending,
                 header,
-                0,
+                &mut Sample(0),
                 &mut backend,
             )
             .unwrap();
@@ -1317,7 +1433,7 @@ fn runtime_stale_source_pauses_held_output_until_canonical_rebind() {
             &mut bytes,
             &mut pending,
             header,
-            0,
+            &mut Sample(0),
             &mut backend,
         )
         .unwrap();
@@ -1334,7 +1450,7 @@ fn runtime_stale_source_pauses_held_output_until_canonical_rebind() {
                 frame,
                 p.remote.ip(),
                 false,
-                0,
+                &mut Sample(0),
             )
             .unwrap();
         }
@@ -1363,7 +1479,7 @@ fn runtime_held_attempt_repacketizes_on_shared_or_physical_decrease() {
             &mut output,
             &mut pending,
             h,
-            0,
+            &mut Sample(0),
             &mut backend,
         )
         .unwrap();
@@ -1394,7 +1510,7 @@ fn runtime_held_attempt_repacketizes_on_shared_or_physical_decrease() {
             &mut output,
             &mut pending,
             h,
-            0,
+            &mut Sample(0),
             &mut backend,
         )
         .unwrap();
@@ -1417,7 +1533,7 @@ fn runtime_held_attempt_repacketizes_on_shared_or_physical_decrease() {
                 frame,
                 p.remote.ip(),
                 false,
-                0,
+                &mut Sample(0),
             )
             .unwrap();
         }
