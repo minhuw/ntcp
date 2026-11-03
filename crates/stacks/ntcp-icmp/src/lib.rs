@@ -1,6 +1,6 @@
 #![no_std]
 use core::net::IpAddr;
-use ntcp::IpMetadata;
+use ntcp::{IpMetadata, Ipv4Options};
 pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, checksum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +121,10 @@ impl Quote {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Feedback<Q = TcpQuote> {
     pub outer: IpMetadata,
+    /// Every option of the outer IPv4 header except NOP and EOL, as the
+    /// receiver processed it (`decode_error`); empty for IPv6. Options of
+    /// the quoted header are historical and never appear here.
+    pub outer_options: Ipv4Options,
     pub kind: FeedbackKind,
     pub code: u8,
     // Untrusted candidate only; caller must correlate tuple/sequence with a
@@ -134,6 +138,7 @@ impl Feedback<Quote> {
     pub fn tcp(self) -> Option<Feedback> {
         Some(Feedback {
             outer: self.outer,
+            outer_options: self.outer_options,
             kind: self.kind,
             code: self.code,
             candidate_mtu: self.candidate_mtu,
@@ -209,14 +214,35 @@ pub fn decode_icmp(bytes: &[u8]) -> Result<Feedback, Error> {
 /// Decode an ICMP error quoting any protocol. Validation is identical to
 /// `decode_icmp` except that the quoted protocol is not required to be TCP
 /// and the quoted packet may be a fragment.
+///
+/// A stateless compatibility wrapper over `decode_error`: the outer header
+/// is parsed from `bytes` with source routes refused, and its options are
+/// reported as received, without any destination processing.
 pub fn decode_icmp_quote(bytes: &[u8]) -> Result<Feedback<Quote>, Error> {
-    let (outer, protocol, icmp) = parse_outer(bytes)?;
+    let (outer, outer_options, protocol, icmp) = parse_outer(bytes)?;
+    if protocol != if outer.source.is_ipv6() { 58 } else { 1 } {
+        return Err(Error::ProtocolUnsupported);
+    }
+    decode_error(outer, outer_options, icmp)
+}
+
+/// Decode an ICMP error message (the complete IP payload of an ICMP or
+/// ICMPv6 datagram) whose outer header the receiver has already validated
+/// and processed: `outer` and `outer_options` are that result, carried into
+/// the feedback unchanged and never reparsed here. The quote is validated as
+/// historical data: its header, options included, is read but never
+/// modified or reported as outer metadata.
+pub fn decode_error(
+    outer: IpMetadata,
+    outer_options: Ipv4Options,
+    icmp: &[u8],
+) -> Result<Feedback<Quote>, Error> {
     if icmp.len() < 8 {
         return Err(Error::Truncated);
     }
     let ipv6 = outer.source.is_ipv6();
-    if protocol != if ipv6 { 58 } else { 1 } {
-        return Err(Error::ProtocolUnsupported);
+    if ipv6 && !outer_options.is_empty() {
+        return Err(Error::Options);
     }
     if if ipv6 {
         icmpv6_checksum(outer, icmp)?
@@ -238,6 +264,7 @@ pub fn decode_icmp_quote(bytes: &[u8]) -> Result<Feedback<Quote>, Error> {
     }
     Ok(Feedback {
         outer,
+        outer_options,
         kind,
         code: icmp[1],
         candidate_mtu,
@@ -381,17 +408,17 @@ fn quote_header(b: &[u8], ipv6: bool) -> Result<QuotedHeader, Error> {
     }
 }
 
-fn parse_outer(bytes: &[u8]) -> Result<(IpMetadata, u8, &[u8]), Error> {
+fn parse_outer(bytes: &[u8]) -> Result<(IpMetadata, Ipv4Options, u8, &[u8]), Error> {
     match bytes.first().ok_or(Error::Truncated)? >> 4 {
         #[cfg(feature = "ipv4")]
         4 => {
             let p = ntcp_ip::parse(bytes, false)?;
-            Ok((p.ip, p.protocol, p.payload))
+            Ok((p.ip, p.ipv4_options, p.protocol, p.payload))
         }
         #[cfg(feature = "ipv6")]
         6 => {
             let p = ntcp_ip6::parse(bytes)?;
-            Ok((p.ip, p.protocol, p.payload))
+            Ok((p.ip, Ipv4Options::default(), p.protocol, p.payload))
         }
         _ => Err(Error::Version),
     }

@@ -217,11 +217,15 @@ impl Host {
         let key = self.paths.path_snapshot(path)?.key();
         let echo = self.icmp_output_on(key).map(|queued| ClientReport {
             client: AdminClient::Echo { queued },
-            usable_ip_packet: self
-                .paths
-                .path_snapshot(path)
-                .ok()
-                .and_then(|snapshot| self.connectionless_size(snapshot).ok()),
+            // As the drain sizes them: a queued source-routed message is
+            // never sized by the adjunct-confirmed bound of the direct path.
+            usable_ip_packet: self.paths.path_snapshot(path).ok().and_then(|snapshot| {
+                if self.icmp_source_routed_on(key) {
+                    self.connectionless_unconfirmed_size(snapshot).ok()
+                } else {
+                    self.connectionless_size(snapshot).ok()
+                }
+            }),
             transport: None,
             search: None,
         });

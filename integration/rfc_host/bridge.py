@@ -17,18 +17,41 @@ def checksum(data):
     return (~total) & 0xffff
 
 
-def decode(frame):
+def decode_icmp(frame, hl, end):
+    """A whole IPv4 ICMP message with its complete header, options included
+    (JSON-safe: hex), for the option cases' forwarding and capture."""
+    ip = frame[14:end]
+    assert struct.unpack_from("!H", ip, 6)[0] & 0x3fff == 0, "unexpected fragments"
+    assert end - 14 - hl >= 8 and checksum(ip[hl:]) == 0, "ICMP checksum"
+    event = dict(family=4, protocol=1, ethernet_length=len(frame), ip_length=end - 14, header_len=hl,
+                 ip_options=ip[20:hl].hex(), ip_hex=ip.hex(), source=socket.inet_ntoa(ip[12:16]),
+                 destination=socket.inet_ntoa(ip[16:20]), icmp_type=ip[hl], icmp_code=ip[hl + 1],
+                 df=bool(struct.unpack_from("!H", ip, 6)[0] & 0x4000), ip_id=struct.unpack_from("!H", ip, 4)[0],
+                 sha256=hashlib.sha256(ip).hexdigest(), checksum_valid=True)
+    if ip[hl] in (0, 8):
+        event.update(identifier=struct.unpack_from("!H", ip, hl + 4)[0],
+                     sequence=struct.unpack_from("!H", ip, hl + 6)[0])
+    return event
+
+
+def decode(frame, icmp=False):
+    """A TCP segment (or, with ICMP, a whole IPv4 ICMP message) of FRAME;
+    None for anything else. IPv4 headers of any valid IHL are checked whole."""
     if len(frame) < 14:
         return None
     eth = struct.unpack_from("!H", frame, 12)[0]
     if eth == 0x800:
-        assert len(frame) >= 34 and frame[14] == 0x45, "unsupported IPv4 framing"
+        assert len(frame) >= 34 and frame[14] >> 4 == 4, "unsupported IPv4 framing"
+        hl = (frame[14] & 15) * 4
         end = 14 + struct.unpack_from("!H", frame, 16)[0]
-        assert end <= len(frame) and checksum(frame[14:34]) == 0, "IPv4 checksum/length"
+        assert 20 <= hl and 14 + hl <= end <= len(frame), "IPv4 header/total length"
+        assert checksum(frame[14:14 + hl]) == 0, "IPv4 header checksum"
+        if icmp and frame[23] == 1:
+            return decode_icmp(frame, hl, end)
         if frame[23] != 6:
             return None
         assert struct.unpack_from("!H", frame, 20)[0] & 0x3fff == 0, "unexpected fragments"
-        start = 34
+        start = 14 + hl
         pseudo = frame[26:34] + b"\0\x06" + struct.pack("!H", end - start)
         family = 4
         ip = dict(df=bool(struct.unpack_from("!H", frame, 20)[0] & 0x4000),
@@ -77,7 +100,11 @@ def decode(frame):
 
 
 class Bridge:
-    def __init__(self):
+    """Forwards TCP between the two ports; with ICMP, whole IPv4 ICMP
+    messages too (the option cases), recorded but never altered."""
+
+    def __init__(self, icmp=False):
+        self.icmp = icmp
         self.selector = selectors.DefaultSelector()
         self.sockets = []
         for name in ("t5bk", "t5bn"):
@@ -117,9 +144,18 @@ class Bridge:
                     if addr[2] == socket.PACKET_OUTGOING:
                         continue
                     direction = "kernel-to-native" if s is self.sockets[0] else "native-to-kernel"
-                    decoded = decode(frame)
+                    decoded = decode(frame, self.icmp)
                     if decoded is None:
-                        continue  # only configured TCP needs forwarding; static neighbors
+                        continue  # only configured TCP (and ICMP) needs forwarding; static neighbors
+                    if isinstance(decoded, dict):
+                        with self.lock:
+                            self.bytes += len(frame)
+                            assert len(self.events) < 20000 and self.bytes < 32 * 1024 * 1024, "capture limit"
+                            decoded.update(direction=direction, time_ns=time.monotonic_ns(), action="forward")
+                            self.events.append(decoded)
+                        target = self.sockets[1] if s is self.sockets[0] else self.sockets[0]
+                        assert target.send(frame) == len(frame), "short forwarding send"
+                        continue
                     event, options, tcp, end, pseudo = decoded
                     with self.lock:
                         self.bytes += len(frame)

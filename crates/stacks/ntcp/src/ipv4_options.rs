@@ -44,6 +44,15 @@ impl Ipv4Timestamp {
     }
 }
 
+/// Embedding-supplied clock for destination Timestamp recording. Recording
+/// samples it only for a slot this host may write; `None` means no time is
+/// available, so that slot and its pointer stay unchanged. An embedding
+/// without a characterized UTC clock returns [`Ipv4Timestamp::nonstandard`]
+/// values (RFC 791 section 3.1).
+pub trait Ipv4TimestampProvider {
+    fn ipv4_timestamp(&mut self) -> Option<Ipv4Timestamp>;
+}
+
 fn unicast(ip: Ipv4Addr) -> bool {
     ip.octets()[0] != 0 && ip.octets()[0] < 224
 }
@@ -127,8 +136,15 @@ impl Ipv4Options {
         result
     }
 
-    pub(crate) fn has_known_options(&self) -> bool {
-        self.unrecognized().len != self.len
+    pub(crate) fn has_source_route(&self) -> bool {
+        let mut offset = 0;
+        while offset < usize::from(self.len) {
+            if matches!(self.bytes[offset], 131 | 137) {
+                return true;
+            }
+            offset += usize::from(self.bytes[offset + 1]);
+        }
+        false
     }
 
     //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
@@ -312,12 +328,32 @@ impl Ipv4Options {
     //# field is set to one to indicate the use of a non-standard value.
 
     //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
-    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the example explicitly marks its elapsed clock nonstandard. Arbitrary callers' standard clocks still need evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8; numeric validation cannot establish those physical-clock properties.
+    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this.
     //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
     //# the ICMP Timestamp message.
-    // The u32 is an IPv4Timestamp wire value. Validate only a local slot write;
-    // remote records and irrelevant values on no-write paths remain opaque.
-    pub fn record(mut self, local: Ipv4Addr, timestamp: u32) -> Result<Self, Ipv4OptionsError> {
+    // The u32 is a caller-asserted IPv4Timestamp wire value. Validate only a
+    // local slot write; remote records and irrelevant values on no-write paths
+    // remain opaque.
+    pub fn record(self, local: Ipv4Addr, timestamp: u32) -> Result<Self, Ipv4OptionsError> {
+        self.record_sampled(local, || Ipv4Timestamp::from_wire(timestamp).map(Some))
+    }
+
+    /// Record `local` with time from `provider`, sampled at most once and only
+    /// for a Timestamp slot this host may write. Without a sample the Timestamp
+    /// option is preserved and Record Route is still processed.
+    pub fn record_with<P: Ipv4TimestampProvider + ?Sized>(
+        self,
+        local: Ipv4Addr,
+        provider: &mut P,
+    ) -> Result<Self, Ipv4OptionsError> {
+        self.record_sampled(local, || Ok(provider.ipv4_timestamp()))
+    }
+
+    fn record_sampled(
+        mut self,
+        local: Ipv4Addr,
+        mut sample: impl FnMut() -> Result<Option<Ipv4Timestamp>, Ipv4OptionsError>,
+    ) -> Result<Self, Ipv4OptionsError> {
         use Ipv4OptionsError::*;
         if !unicast(local) {
             return Err(InvalidAddress);
@@ -342,8 +378,10 @@ impl Ipv4Options {
                             return Err(Malformed);
                         }
                         o[3] += 16;
-                    } else if flag != 3 || address(&o[p..p + 4]) == local {
-                        let timestamp = Ipv4Timestamp::from_wire(timestamp)?.wire_value();
+                    } else if (flag != 3 || address(&o[p..p + 4]) == local)
+                        && let Some(timestamp) = sample()?
+                    {
+                        let timestamp = timestamp.wire_value();
                         let time = if flag == 0 { p } else { p + 4 };
                         if flag == 1 {
                             o[p..p + 4].copy_from_slice(&local.octets());
@@ -401,6 +439,100 @@ pub fn copied_fragment_options(encoded: &[u8], out: &mut [u8]) -> Result<usize, 
     Ok(padded)
 }
 
+// An originating source route toward `final_destination` at the start of
+// `bytes`: its first hop is the header destination and the option holds the
+// remaining hops and the final destination, pointer 4 (RFC 791 section 3.1).
+// Returns the header destination and the option length; an empty route
+// encodes nothing.
+fn encode_route(
+    route: Option<&SourceRoute>,
+    final_destination: Ipv4Addr,
+    bytes: &mut [u8; 40],
+) -> (Ipv4Addr, usize) {
+    let Some(route) = route.filter(|route| !route.hops().is_empty()) else {
+        return (final_destination, 0);
+    };
+    let len = 3 + route.hops().len() * 4;
+    bytes[..3].copy_from_slice(&[if route.strict { 137 } else { 131 }, len as u8, 4]);
+    for (i, hop) in route.hops()[1..]
+        .iter()
+        .chain(core::iter::once(&final_destination))
+        .enumerate()
+    {
+        bytes[3 + i * 4..7 + i * 4].copy_from_slice(&hop.octets());
+    }
+    (route.hops()[0], len)
+}
+
+/// An already-encoded IPv4 option area that is sent as is: encoding, retries
+/// and source fragmentation never record into it. It carries options a host
+/// continues from a received datagram (a reply's options), distinct from
+/// received options (`Ipv4Options`) and from `OutgoingIpv4Options`, which
+/// originates fresh Record Route and Timestamp options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncodedIpv4Options {
+    bytes: [u8; 40],
+    len: u8,
+    destination: Ipv4Addr,
+    final_destination: Ipv4Addr,
+}
+
+impl EncodedIpv4Options {
+    /// At most one source route toward `final_destination`, encoded as an
+    /// originating host does (`OutgoingIpv4Options`), followed by `carried`:
+    /// complete, validated options in the form `Ipv4Options::as_bytes`
+    /// presents them, so without NOP, End or a source route (RFC 1122
+    /// section 3.2.1.8 forbids sending a second one, and its first hop would
+    /// not be the header's).
+    /// Their contents, Record Route and Timestamp slots and pointers
+    /// included, are kept octet for octet. The area is zero padded to a
+    /// 32-bit boundary and must fit the 40-octet maximum (Capacity).
+    pub fn new(
+        route: Option<&SourceRoute>,
+        final_destination: Ipv4Addr,
+        carried: &[u8],
+    ) -> Result<Self, Ipv4OptionsError> {
+        use Ipv4OptionsError::*;
+        if !unicast(final_destination) {
+            return Err(InvalidAddress);
+        }
+        let parsed = Ipv4Options::parse(carried, false).map_err(|error| match error {
+            SourceRouteDisabled | IncompleteRoute => Malformed,
+            error => error,
+        })?;
+        if parsed.as_bytes() != carried {
+            return Err(Malformed);
+        }
+        let mut bytes = [0; 40];
+        let (destination, route_len) = encode_route(route, final_destination, &mut bytes);
+        let len = route_len + carried.len();
+        if len > 40 {
+            return Err(Capacity);
+        }
+        bytes[route_len..len].copy_from_slice(carried);
+        Ok(Self {
+            bytes,
+            len: ((len + 3) & !3) as u8,
+            destination,
+            final_destination,
+        })
+    }
+    /// The zero-padded option area.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+    /// The header destination: the source route's first hop, otherwise the
+    /// final destination.
+    pub const fn destination(&self) -> Ipv4Addr {
+        self.destination
+    }
+    /// The datagram's final destination, which transport checksums and
+    /// Identification uniqueness use.
+    pub const fn final_destination(&self) -> Ipv4Addr {
+        self.final_destination
+    }
+}
+
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
 //# A TCP implementation MAY support the Timestamp (MAY-10) and Record
 //# Route (MAY-11) Options.
@@ -430,22 +562,8 @@ impl OutgoingIpv4Options {
             return Err(InvalidAddress);
         }
         let mut bytes = [0u8; 40];
-        let mut len = 0;
-        let mut destination = final_destination;
-        if let Some(route) = self.source_route
-            && !route.hops().is_empty()
-        {
-            destination = route.hops()[0];
-            len = 3 + route.hops().len() * 4;
-            bytes[..3].copy_from_slice(&[if route.strict { 137 } else { 131 }, len as u8, 4]);
-            for (i, hop) in route.hops()[1..]
-                .iter()
-                .chain(core::iter::once(&final_destination))
-                .enumerate()
-            {
-                bytes[3 + i * 4..7 + i * 4].copy_from_slice(&hop.octets());
-            }
-        }
+        let (destination, mut len) =
+            encode_route(self.source_route.as_ref(), final_destination, &mut bytes);
         if let Some(slots) = self.record_route_slots {
             let size = 3 + usize::from(slots) * 4;
             if slots > 9 || len + size > 40 {
@@ -552,7 +670,7 @@ mod tests {
 
     //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
     //= type=test
-    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the example explicitly marks its elapsed clock nonstandard. Arbitrary callers' standard clocks still need evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8; numeric validation cannot establish those physical-clock properties.
+    //= reason=Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this.
     //# A timestamp value MUST follow the rules given in Section 3.2.2.8 for
     //# the ICMP Timestamp message.
     #[test]
@@ -1055,6 +1173,155 @@ mod tests {
         );
     }
 
+    struct Clock {
+        sample: Option<Ipv4Timestamp>,
+        calls: usize,
+    }
+    impl Ipv4TimestampProvider for Clock {
+        fn ipv4_timestamp(&mut self) -> Option<Ipv4Timestamp> {
+            self.calls += 1;
+            self.sample
+        }
+    }
+    fn provider(sample: Option<u32>) -> Clock {
+        Clock {
+            sample: sample.map(Ipv4Timestamp::nonstandard),
+            calls: 0,
+        }
+    }
+
+    #[test]
+    fn provider_recording_samples_only_writable_timestamp_slots() {
+        let rr = [7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let recorded_rr = [7, 11, 8, 192, 0, 2, 2, 0, 0, 0, 0];
+        // Record Route never depends on a timestamp.
+        for sample in [None, Some(5)] {
+            let mut clock = provider(sample);
+            let parsed = Ipv4Options::parse(&rr, false).unwrap();
+            let recorded = parsed.record_with(ip(2), &mut clock).unwrap();
+            assert_eq!(recorded.as_bytes(), &recorded_rr);
+            assert_eq!(clock.calls, 0);
+        }
+        for flag in [0u8, 1, 3] {
+            let len = if flag == 0 { 8 } else { 12 };
+            let mut ts = [0u8; 12];
+            ts[..4].copy_from_slice(&[68, len, 5, flag]);
+            if flag == 3 {
+                ts[4..8].copy_from_slice(&ip(2).octets());
+            }
+            let ts = &ts[..usize::from(len)];
+            let mut both = [0u8; 23];
+            both[..11].copy_from_slice(&rr);
+            both[11..11 + ts.len()].copy_from_slice(ts);
+            let both = &both[..11 + ts.len()];
+            let parsed = Ipv4Options::parse(both, false).unwrap();
+
+            // A successful write samples once.
+            let mut clock = provider(Some(7));
+            let recorded = parsed.record_with(ip(2), &mut clock).unwrap();
+            assert_eq!(clock.calls, 1);
+            let out = recorded.as_bytes();
+            assert_eq!(&out[..11], &recorded_rr);
+            assert_eq!(out[13], len + 1);
+            if flag != 0 {
+                assert_eq!(&out[15..19], &ip(2).octets());
+            }
+            assert_eq!(&out[out.len() - 4..], &0x8000_0007u32.to_be_bytes());
+            // The value adapter keeps the caller-asserted wire contract.
+            assert_eq!(parsed.record(ip(2), 0x8000_0007).unwrap(), recorded);
+
+            // No sample: slot and pointer preserved, RR still recorded.
+            let mut clock = provider(None);
+            let unsampled = parsed.record_with(ip(2), &mut clock).unwrap();
+            assert_eq!(clock.calls, 1);
+            assert_eq!(&unsampled.as_bytes()[..11], &recorded_rr);
+            assert_eq!(&unsampled.as_bytes()[11..], ts);
+
+            // A non-matching prespecified address is not sampled.
+            if flag == 3 {
+                let mut clock = provider(Some(7));
+                let other = parsed.record_with(ip(3), &mut clock).unwrap();
+                assert_eq!(clock.calls, 0);
+                assert_eq!(&other.as_bytes()[3..7], &ip(3).octets());
+                assert_eq!(&other.as_bytes()[11..], ts);
+            }
+
+            // A full area increments overflow once (14 -> 15) without sampling.
+            let mut full = [0u8; 12];
+            full[..usize::from(len)].copy_from_slice(ts);
+            full[2] = len + 1;
+            full[3] = 0xe0 | flag;
+            let full = &full[..usize::from(len)];
+            let mut clock = provider(Some(7));
+            let advanced = Ipv4Options::parse(full, false)
+                .unwrap()
+                .record_with(ip(2), &mut clock)
+                .unwrap();
+            assert_eq!(clock.calls, 0);
+            assert_eq!(advanced.as_bytes()[3], 0xf0 | flag);
+            assert_eq!(&advanced.as_bytes()[4..], &full[4..]);
+
+            // Exhausted overflow discards the datagram, again without sampling.
+            let mut clock = provider(Some(7));
+            assert_eq!(
+                advanced.record_with(ip(2), &mut clock),
+                Err(Ipv4OptionsError::Malformed)
+            );
+            assert_eq!(clock.calls, 0);
+        }
+        let mut clock = provider(Some(7));
+        assert_eq!(
+            Ipv4Options::parse(&rr, false)
+                .unwrap()
+                .record_with(Ipv4Addr::BROADCAST, &mut clock),
+            Err(Ipv4OptionsError::InvalidAddress)
+        );
+        assert_eq!(clock.calls, 0);
+    }
+
+    #[test]
+    fn every_kind_with_opaque_tlvs_is_retained_to_forty_octets() {
+        // Completed LSRR, RR, TS, an opaque copied and a non-copied TLV: 40 octets.
+        let mut raw = [0u8; 40];
+        raw[..7].copy_from_slice(&[131, 7, 8, 192, 0, 2, 9]);
+        raw[7..14].copy_from_slice(&[7, 7, 4, 0, 0, 0, 0]);
+        raw[14..26].copy_from_slice(&[68, 12, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        raw[26..30].copy_from_slice(&[158, 4, 1, 2]);
+        raw[30..32].copy_from_slice(&[30, 10]);
+        raw[32..].fill(0xee);
+        let parsed = Ipv4Options::parse(&raw, true).unwrap();
+        assert_eq!(parsed.as_bytes(), &raw);
+        assert_eq!(
+            Ipv4Options::parse(&raw, false),
+            Err(Ipv4OptionsError::SourceRouteDisabled)
+        );
+        let mut longer = [1u8; 41];
+        longer[1..].copy_from_slice(&raw);
+        assert_eq!(
+            Ipv4Options::parse(&longer, true),
+            Err(Ipv4OptionsError::Capacity)
+        );
+        let mut clock = provider(Some(1));
+        let recorded = parsed.record_with(ip(2), &mut clock).unwrap();
+        assert_eq!(clock.calls, 1);
+        let out = recorded.as_bytes();
+        assert_eq!(&out[..7], &raw[..7]);
+        assert_eq!(&out[7..14], &[7, 7, 8, 192, 0, 2, 2]);
+        assert_eq!(&out[14..22], &[68, 12, 9, 0, 0x80, 0, 0, 1]);
+        assert_eq!(&out[22..], &raw[22..]);
+        let mut copied = [0; 40];
+        let n = copied_fragment_options(out, &mut copied).unwrap();
+        assert_eq!(&copied[..n], &[131, 7, 8, 192, 0, 2, 9, 158, 4, 1, 2, 0]);
+        // NOP and EOL are removed; every other option survives in order.
+        let spaced = [
+            1, 7, 3, 4, 1, 1, 68, 4, 5, 0, 1, 30, 2, 1, 158, 3, 7, 0, 158, 2,
+        ];
+        assert_eq!(
+            Ipv4Options::parse(&spaced, false).unwrap().as_bytes(),
+            &[7, 3, 4, 68, 4, 5, 0, 30, 2, 158, 3, 7]
+        );
+    }
+
     #[test]
     fn combined_bounds_atomic_output_and_malformed_options() {
         let mut options = OutgoingIpv4Options {
@@ -1118,5 +1385,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn encoded_options_send_carried_options_as_is_behind_one_route() {
+        // Processed RR (one recorded hop) and TS (a remote value no local
+        // clock produced, beyond the UTC day): kept octet for octet.
+        let carried = [
+            7, 11, 8, 192, 0, 2, 7, 0, 0, 0, 0, 68, 12, 13, 1, 192, 0, 2, 8, 0x7f, 0xff, 0xff, 0xff,
+        ];
+        assert!(Ipv4Options::parse(&carried, false).is_ok());
+        for strict in [false, true] {
+            let route = SourceRoute::new(&[ip(3), ip(4)], strict).unwrap();
+            let encoded = EncodedIpv4Options::new(Some(&route), ip(2), &carried).unwrap();
+            assert_eq!(encoded.destination(), ip(3));
+            assert_eq!(encoded.final_destination(), ip(2));
+            let bytes = encoded.as_bytes();
+            assert_eq!(bytes.len(), 36);
+            let kind = if strict { 137 } else { 131 };
+            assert_eq!(&bytes[..11], &[kind, 11, 4, 192, 0, 2, 4, 192, 0, 2, 2]);
+            assert_eq!(&bytes[11..34], &carried);
+            assert_eq!(&bytes[34..], &[0, 0]);
+            // The same route as an originating host encodes it.
+            let outgoing = OutgoingIpv4Options {
+                source_route: Some(route),
+                ..Default::default()
+            };
+            let mut out = [0; 40];
+            let (first_hop, len) = outgoing.encode(ip(1), ip(2), 0, &mut out).unwrap();
+            assert_eq!(first_hop, ip(3));
+            assert_eq!(&out[..11], &bytes[..11]);
+            assert_eq!(len, 12);
+        }
+        // Without a route (or with an empty one) the header names the final
+        // destination; nothing at all is an empty area.
+        let empty = SourceRoute::new(&[], true).unwrap();
+        for route in [None, Some(&empty)] {
+            let encoded = EncodedIpv4Options::new(route, ip(2), &carried).unwrap();
+            assert_eq!(encoded.destination(), ip(2));
+            assert_eq!(&encoded.as_bytes()[..23], &carried);
+            assert_eq!(encoded.as_bytes().len(), 24);
+            assert!(
+                EncodedIpv4Options::new(route, ip(2), &[])
+                    .unwrap()
+                    .as_bytes()
+                    .is_empty()
+            );
+        }
+        // Nine hops fill 39 octets; padding makes 40, one more octet does not fit.
+        let hops: [Ipv4Addr; 9] = core::array::from_fn(|i| ip(10 + i as u8));
+        let nine = SourceRoute::new(&hops, false).unwrap();
+        let encoded = EncodedIpv4Options::new(Some(&nine), ip(2), &[]).unwrap();
+        assert_eq!(encoded.as_bytes().len(), 40);
+        assert_eq!(encoded.as_bytes()[39], 0);
+        assert_eq!(
+            EncodedIpv4Options::new(Some(&nine), ip(2), &[68, 4, 5, 0]),
+            Err(Ipv4OptionsError::Capacity)
+        );
+        // A one-hop completed route with a 31-octet RR, 38 admitted octets,
+        // still fits after reversal.
+        let mut admitted = [0u8; 38];
+        admitted[..7].copy_from_slice(&[131, 7, 8, 192, 0, 2, 9]);
+        admitted[7..10].copy_from_slice(&[7, 31, 32]);
+        let parsed = Ipv4Options::parse(&admitted, true).unwrap();
+        let reversed = parsed.return_route(ip(2)).unwrap();
+        let encoded = EncodedIpv4Options::new(Some(&reversed), ip(2), &admitted[7..]).unwrap();
+        assert_eq!(encoded.as_bytes().len(), 40);
+        assert_eq!(encoded.destination(), ip(9));
+        // Malformed carried areas: NOP, End, a source route, a cut TLV, a
+        // bad pointer; oversized areas and non-unicast destinations.
+        for bad in [
+            &[1, 68, 4, 5, 0][..],
+            &[68, 4, 5, 0, 0],
+            &[131, 7, 8, 192, 0, 2, 9],
+            &[137, 7, 4, 192, 0, 2, 9],
+            &[7, 7, 4, 0],
+            &[7, 7, 5, 0, 0, 0, 0],
+        ] {
+            assert_eq!(
+                EncodedIpv4Options::new(None, ip(2), bad),
+                Err(Ipv4OptionsError::Malformed),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            EncodedIpv4Options::new(None, ip(2), &[30; 41]),
+            Err(Ipv4OptionsError::Capacity)
+        );
+        assert_eq!(
+            EncodedIpv4Options::new(None, Ipv4Addr::BROADCAST, &[]),
+            Err(Ipv4OptionsError::InvalidAddress)
+        );
     }
 }

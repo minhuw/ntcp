@@ -10,6 +10,17 @@ use std::{
     os::fd::{AsFd, AsRawFd},
 };
 
+// Destination Timestamp time: the owner clock's elapsed milliseconds with the
+// high-order bit set. The native runtime has no characterized UTC clock, and
+// RFC 791 section 3.1 permits any time so marked as nonstandard. Read only
+// when recording writes a Timestamp slot.
+struct ElapsedClock<'a>(&'a Owner);
+impl ntcp::Ipv4TimestampProvider for ElapsedClock<'_> {
+    fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
+        Some(ntcp::Ipv4Timestamp::nonstandard((self.0.now() / 1000) as u32))
+    }
+}
+
 pub(super) struct EthernetBackend {
     pub(super) io: Box<dyn PacketIo>,
     pub(super) local: [u8; 6],
@@ -301,8 +312,13 @@ impl Owner {
                 mtu,
                 ReceiveCapabilities {
                     max_ip_packet,
+                    // Record Route and Timestamp are interpreted, with time
+                    // from the owner's marked elapsed clock (`ElapsedClock`).
+                    // Source routes stay refused: native TCP keeps IPv4
+                    // options disabled, so no return route can be used.
                     ipv4: if self.local.is_ipv4() {
-                        Ipv4Receive::Options {
+                        Ipv4Receive::Enabled {
+                            interpretation: true,
                             source_routes: false,
                         }
                     } else {
@@ -607,7 +623,7 @@ impl Owner {
     /// exact owner generation.
     pub(super) fn input_icmp(
         &mut self,
-        datagram: ntcp_host::Datagram,
+        datagram: ntcp_host::Processed,
     ) -> Option<ntcp_host::DeferredIcmp> {
         let now = self.now();
         match self
@@ -639,7 +655,9 @@ impl Owner {
     ) {
         if self.host.is_some() {
             let mut completed = std::mem::take(&mut self.completed);
-            if let Some(datagram) = self.receive_datagram(bytes, link_multicast, &mut completed) {
+            if let Some(datagram) = self.receive_datagram(bytes, link_multicast, &mut completed)
+                && let Some(datagram) = self.process_datagram(datagram)
+            {
                 self.input_datagram(datagram, stamps, segment_size);
             }
             self.completed = completed;
@@ -670,10 +688,21 @@ impl Owner {
             _ => None,
         }
     }
-    /// Dispatch one complete datagram exactly like an unfragmented packet.
+    /// Destination processing of one complete datagram, before it is
+    /// classified, dispatched or retained (`Host::process`), with time from
+    /// the owner clock; None for a datagram the Host refuses.
+    pub(super) fn process_datagram<'a>(
+        &self,
+        datagram: ntcp_host::Datagram<'a>,
+    ) -> Option<ntcp_host::Processed<'a>> {
+        let host = self.host.as_ref()?;
+        host.process(datagram, Some(&mut ElapsedClock(self))).ok()
+    }
+    /// Dispatch one processed datagram exactly like an unfragmented packet;
+    /// its processed options are handed on as they are.
     pub(super) fn input_datagram(
         &mut self,
-        datagram: ntcp_host::Datagram,
+        datagram: ntcp_host::Processed,
         stamps: ntcp::RxPacketTimestamps,
         segment_size: Option<core::num::NonZeroU16>,
     ) {
@@ -706,9 +735,7 @@ impl Owner {
             ip: packet.ip,
             traffic_class: packet.traffic_class,
             protocol: packet.protocol,
-            // Keep the native adapter's existing known-option policy;
-            // complete destination processing remains a separate feature.
-            ipv4_options: packet.options.unrecognized(),
+            ipv4_options: packet.options,
             payload: packet.payload,
         };
         self.input_packet(packet, datagram.bytes(), stamps, segment_size);

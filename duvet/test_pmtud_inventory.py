@@ -569,7 +569,9 @@ class PmtudInventory(unittest.TestCase):
             self.assertIn(fragment, rows["8201-050"]["reason"])
         # No reason in these ledgers or their TOML dispositions still claims
         # that fragmentation, a Host datagram service or an allocator is absent,
-        # and every mention of Host Echo Replies states D15's limitation.
+        # and every mention of Host Echo Replies states how a source-routed
+        # request's reply is routed and sized (T14 answers it; D15's
+        # limitation is gone).
         stale = (r"raw-datagram stack|UDP/raw datagram fragmentation service|no IP fragmentation service"
                  r"|does not offer host IP fragmentation|does not require a host datagram fragmentation"
                  r"|not fragmentation-based PLPMTUD|source fragmentation, including DF on originated fragments, is not")
@@ -579,8 +581,11 @@ class PmtudInventory(unittest.TestCase):
             reasons += [t["reason"] for kind in ("TODO", "exception") for t in todos.get(kind, [])]
         for reason in reasons:
             self.assertNotRegex(reason, stale)
+            self.assertNotIn("until T14", reason)
             if "Echo Replies" in reason:
-                self.assertIn("carrying a source route until T14", reason)
+                self.assertIn("a reply to a source-routed Echo Request takes the reversed, "
+                              "policy-authorized return route, registers no adjunct demand "
+                              "and is never sized by an adjunct-confirmed bound", reason)
 
     def test_t12_closures_keep_full_keys_and_every_annotation_copy(self):
         # Whole-obligation closures: the original full target + quote, the

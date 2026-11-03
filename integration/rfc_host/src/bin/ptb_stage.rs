@@ -107,7 +107,10 @@ impl Network {
                 ntcp_host::ReceiveCapabilities {
                     max_ip_packet: MAX_IP_PACKET,
                     ipv4: if local.is_ipv4() {
-                        ntcp_host::Ipv4Receive::Unrecognized
+                        ntcp_host::Ipv4Receive::Enabled {
+                            interpretation: false,
+                            source_routes: false,
+                        }
                     } else {
                         ntcp_host::Ipv4Receive::Disabled
                     },

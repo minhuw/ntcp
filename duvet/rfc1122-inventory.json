@@ -81,11 +81,11 @@
       "id": "1122-options-pass",
       "section": "3.2.1.8",
       "quote": "All IP options (except NOP or END-OF-LIST) received in datagrams MUST be passed to the transport layer (or to ICMP processing when the datagram is an ICMP message). The IP and transport layer MUST each interpret those IP options that they understand and silently ignore the others.",
-      "status": "TODO",
-      "reason": "Opaque TLVs now survive bounded parsing and real TCP handoff in core, codec, example and native input. Native and disabled example profiles still discard known RR/Timestamp metadata, and the ICMP feedback decoder does not expose option metadata to its consumer; complete all-option TCP/ICMP handoff needs those capability/interface contracts.",
+      "status": "covered",
+      "reason": "Host::process, the single destination-processing step after reassembly, keeps every validated option except NOP/EOL in the processed envelope that TCP and every ICMP consumer (Echo, errors, Source Quench classification, the Echo adjunct) receive, in every enabled receive profile whatever its RR/TS interpretation or source-route admission; native managed input, its host-less parser and the example hand on the same options. The Host interprets Record Route, Timestamp and source routes, TCP interprets only a source route (its return route), the Echo service continues RR/TS and reverses an authorized route, and every other option is delivered and silently ignored, never reflected. Host, codec, native and example tests and the integration/rfc_host ip-options cases cover whole and reassembled datagrams with known and opaque options.",
       "evidence": [
-        "crates/stacks/ntcp-ip/src/lib.rs::pub fn parse(",
-        "crates/stacks/ntcp-ip/tests/option_handoff.rs::fn checksummed_frames_carry_opaque_options_through_tcp_handshake_and_data()"
+        "crates/stacks/ntcp-host/src/ingress.rs::pub fn process<'a>(",
+        "crates/stacks/ntcp-host/src/tests/destination.rs::fn tcp_receives_every_option_recorded_once_for_whole_and_reassembled_datagrams()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
     },
@@ -177,11 +177,11 @@
       "id": "1122-timestamp-destination",
       "section": "3.2.1.8",
       "quote": "The destination host MUST (if possible) add the current timestamp to a Timestamp option before passing the option to the transport layer or to ICMP for processing.",
-      "status": "TODO",
-      "reason": "The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.",
+      "status": "covered",
+      "reason": "Where Timestamp processing is implemented (the interpreting profile; the disabled profile declines that OPTIONAL processing and still delivers every option), Host::process records this host's timestamp once per complete datagram after reassembly, before TCP and every ICMP consumer, sampling the embedding's Ipv4TimestampProvider only for a slot this host may write and keeping the slot when no time is available. Native managed input and the example supply high-bit-marked nonstandard elapsed time, so lacking UTC never skips a write; retained, deferred and replayed input is never recorded again. Host, native and example tests and the integration/rfc_host ip-options cases (a peer's Timestamp returned updated by each embedding) cover it; the stateless compatibility parsers (ntcp_ip::parse, the host-less native parser, the full-frame ICMP decoders) make no destination-processing claim.",
       "evidence": [
-        "crates/stacks/ntcp/examples/tun_echo.rs::fn input_frame(",
-        "crates/stacks/ntcp/examples/tun_echo.rs::fn option_frames_record_once_before_real_tcp_handoff()"
+        "crates/stacks/ntcp-host/src/ingress.rs::pub fn process<'a>(",
+        "crates/stacks/ntcp-host/src/tests/destination.rs::fn echo_requests_are_processed_once_in_every_arrival_order()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
     },
@@ -190,7 +190,7 @@
       "section": "3.2.1.8",
       "quote": "A timestamp value MUST follow the rules given in Section 3.2.2.8 for the ICMP Timestamp message.",
       "status": "TODO",
-      "reason": "Local writes enforce UTC day range or a nonstandard high bit, and the example explicitly marks its elapsed clock nonstandard. Arbitrary callers' standard clocks still need evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8; numeric validation cannot establish those physical-clock properties.",
+      "reason": "Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this.",
       "evidence": [
         "crates/stacks/ntcp/src/ipv4_options.rs::pub fn record(",
         "crates/stacks/ntcp/src/ipv4_options.rs::fn timestamp_value_contract_only_applies_to_local_writes()"

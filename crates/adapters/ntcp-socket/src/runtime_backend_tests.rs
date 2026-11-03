@@ -800,8 +800,11 @@ fn pmtud_owner(
     (owner, state)
 }
 
+// The host-less native parser hands every option except NOP/EOL to TCP
+// without destination processing (managed input records them:
+// runtime_managed_io_tests).
 #[test]
-fn native_ingress_preserves_opaque_options_with_known_processing_disabled() {
+fn native_hostless_ingress_hands_every_option_to_tcp_unprocessed() {
     fn add_options(mut packet: Vec<u8>, options: &[u8]) -> Vec<u8> {
         assert!(options.len().is_multiple_of(4));
         packet.splice(20..20, options.iter().copied());
@@ -827,16 +830,26 @@ fn native_ingress_preserves_opaque_options_with_known_processing_disabled() {
             EINPROGRESS
         );
         let raw = if known {
-            // RR/TS used to be discarded; retaining unknown bytes must not turn
-            // these formerly harmless packets into disabled-profile drops.
-            vec![30, 2, 158, 3, 0, 7, 3, 4, 68, 8, 5, 0, 0, 0, 0, 0]
+            // RR and TS (flag 1) with two free slots each, among copied and
+            // non-copied opaque options. RR/TS used to be filtered out before
+            // TCP; every option is now delivered.
+            let mut raw = vec![30, 2, 158, 3, 0, 7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+            raw.extend_from_slice(&[68, 20, 5, 1]);
+            raw.extend_from_slice(&[0; 16]);
+            raw
         } else {
             vec![30, 2, 158, 3, 0, 1, 0, 255]
         };
-        let expected = ntcp::Ipv4Options::parse(&raw, false)
-            .unwrap()
-            .unrecognized();
+        let received = ntcp::Ipv4Options::parse(&raw, false).unwrap();
+        assert_eq!(received.as_bytes().len(), if known { 36 } else { 5 });
+        assert!(b.host.is_none());
         let syn = poll_packet(&mut a).unwrap();
+        assert_eq!(
+            crate::ip::parse(&add_options(syn.clone(), &raw))
+                .unwrap()
+                .ipv4_options,
+            received
+        );
         let routed = add_options(syn.clone(), &[131, 7, 8, 10, 73, 0, 9, 0]);
         assert_eq!(
             crate::ip::parse(&routed).unwrap_err(),
@@ -857,7 +870,7 @@ fn native_ingress_preserves_opaque_options_with_known_processing_disabled() {
         let cid = connection(&b, server);
         assert_eq!(
             b.endpoint.received_ipv4_options(cid).unwrap(),
-            Some(expected)
+            Some(received)
         );
         a.execute(client, Op::Write(b"native opaque handoff".to_vec()))
             .unwrap();
@@ -865,7 +878,7 @@ fn native_ingress_preserves_opaque_options_with_known_processing_disabled() {
         ingress(&mut b, &b_io, &add_options(data, &raw));
         assert_eq!(
             b.endpoint.received_ipv4_options(cid).unwrap(),
-            Some(expected)
+            Some(received)
         );
         assert_eq!(
             b.execute(server, Op::Read(BYTES)).unwrap().bytes,
@@ -875,7 +888,7 @@ fn native_ingress_preserves_opaque_options_with_known_processing_disabled() {
         // This proves acceptance, not a new ICMP host option service.
         let error = add_options(ptb(&syn, 1400), &raw);
         let parsed = ntcp_ip::parse(&error, false).unwrap();
-        assert_eq!(parsed.ipv4_options.unrecognized(), expected);
+        assert_eq!(parsed.ipv4_options, received);
         assert_eq!(
             ntcp_icmp::decode_icmp(&error).unwrap().kind,
             ntcp_icmp::FeedbackKind::PacketTooBig

@@ -73,9 +73,11 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Packet<'_>, ntcp_ip_common::Error> {
                 ip: p.ip,
                 traffic_class: p.traffic_class,
                 protocol: p.protocol,
-                // Native RR/TS processing remains disabled; opaque TLVs still
-                // reach TCP. Source routes are rejected by the codec above.
-                ipv4_options: p.ipv4_options.unrecognized(),
+                // Every option except NOP and EOL reaches TCP as received.
+                // This stateless parser serves host-less fixtures and does
+                // no destination processing; source routes are rejected by
+                // the codec above.
+                ipv4_options: p.ipv4_options,
                 payload: p.payload,
             })
         }

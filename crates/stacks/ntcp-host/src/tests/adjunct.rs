@@ -33,8 +33,12 @@ fn limits(paths: usize) -> DatagramLimits {
 }
 
 fn side(local: SocketAddr, identity: u128, paths: usize) -> Side {
+    side_with(local, identity, limits(paths))
+}
+
+fn side_with(local: SocketAddr, identity: u128, datagrams: DatagramLimits) -> Side {
     let mut side = managed_limited(local, identity, config(2), false, None, None, |p, mut l| {
-        l.datagrams = limits(paths);
+        l.datagrams = datagrams;
         let (p, l) = managed_udp_limits(
             p,
             l,
@@ -275,7 +279,7 @@ fn initial(v6: bool) -> u32 {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-10.3
 //= type=test
-//= reason=IP fragmentation is a packetization layer under unmodified applications here (Host UDP Fragment mode, Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies)), and it relies on Path MTU sharing plus an adjunct: fragments are cut to E, bounded by the shared PathService ordinary budget, which correlated PTBs about fragments and probes lower for every client; the Host-owned ICMP Echo adjunct (crates/stacks/ntcp-host/src/adjunct.rs) probes each path with fragmentation demand using unfragmented Echo Requests (DF on IPv4) carrying an unpredictable identifier, sequence and data nonce, sized by an RFC 4821 section 7.3 search between E (exclusive) and min(first-hop MTU, largest fragmented datagram). Only an exact, timely Echo Reply to a definitely submitted probe raises the path's confirmed lower bound and, under a learned ceiling below it, is offered to PathService::confirm_delivery (NotLarger on an unlearned path); silence and other errors lower only the search's upper bound, and a correlated PTB for a probe is an ordinary trusted decrease. Echo is used despite the preference for forward-only methods because every host implements the responder, the Host verifies its own nonce, and an exact reply proves forward delivery of the unfragmented request; a reply reassembled from fragments proves the same, so the return path limits the result only where the responder cannot deliver its reply at all (the search then stops lower, which is safe). Host tests cover the converging search, silence, forged, stale, mismatched and reassembled replies, a PTB for a probe and publication only under PathService rules; the integration/rfc_host fragment case raises IPv4 E only after a real Echo Reply and draws a real router PTB for a probe above 1280, and adjunct-silence shows that unanswered probes lower nothing.
+//= reason=IP fragmentation is a packetization layer under unmodified applications here (Host UDP Fragment mode, Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound)), and it relies on Path MTU sharing plus an adjunct: fragments are cut to E, bounded by the shared PathService ordinary budget, which correlated PTBs about fragments and probes lower for every client; the Host-owned ICMP Echo adjunct (crates/stacks/ntcp-host/src/adjunct.rs) probes each path with fragmentation demand using unfragmented Echo Requests (DF on IPv4) carrying an unpredictable identifier, sequence and data nonce, sized by an RFC 4821 section 7.3 search between E (exclusive) and min(first-hop MTU, largest fragmented datagram). Only an exact, timely Echo Reply to a definitely submitted probe raises the path's confirmed lower bound and, under a learned ceiling below it, is offered to PathService::confirm_delivery (NotLarger on an unlearned path); silence and other errors lower only the search's upper bound, and a correlated PTB for a probe is an ordinary trusted decrease. Echo is used despite the preference for forward-only methods because every host implements the responder, the Host verifies its own nonce, and an exact reply proves forward delivery of the unfragmented request; a reply reassembled from fragments proves the same, so the return path limits the result only where the responder cannot deliver its reply at all (the search then stops lower, which is safe). Host tests cover the converging search, silence, forged, stale, mismatched and reassembled replies, a PTB for a probe and publication only under PathService rules; the integration/rfc_host fragment case raises IPv4 E only after a real Echo Reply and draws a real router PTB for a probe above 1280, and adjunct-silence shows that unanswered probes lower nothing.
 //# To support IP fragmentation as a Packetization Layer under an unmodified application, an implementation SHOULD rely on the Path MTU sharing described in Section 5.2 plus an adjunct protocol to probe the Path MTU. There are a number of protocols that might be used for the purpose, such as ICMP ECHO and ECHO REPLY, or "traceroute" style UDP datagrams that trigger ICMP messages. Use of ICMP ECHO and ECHO REPLY will probe both forward and return paths, so the sender will only be able to take advantage of the minimum of the two. Other methods that probe only the forward path are preferred if available.
 fn retained_demand_drives_a_converging_search_that_raises_e_only_on_replies() {
     for v6 in [false, true] {
@@ -568,6 +572,42 @@ fn a_ptb_for_a_probe_is_an_ordinary_trusted_decrease() {
             q.len
         );
     }
+}
+
+// Adjunct consumers read the processed datagram: an Echo Reply and a PTB
+// whose outer IPv4 headers carry Record Route and Timestamp still match
+// their probes (the PTB's quote starts after the outer options).
+#[test]
+fn adjunct_replies_and_errors_with_outer_options_match_their_probes() {
+    const OUTER: [u8; 20] = [
+        7, 7, 4, 0, 0, 0, 0, // RR
+        68, 12, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, // TS
+        0,
+    ];
+    let with = super::destination::with_options;
+    let (local, remote) = addresses(false);
+    let mut a = side(local, 407, 1);
+    let flow = open(&mut a, local, Some(remote));
+    send(&mut a, MDL, flow, None);
+    let now = MDL + 1;
+    let p = probe(&drain(&mut a, now).unwrap());
+    match outcome(input(&mut a, now, &with(&exact(&p), &OUTER))) {
+        ProbeOutcome::Confirmed { size, .. } => assert_eq!(size as usize, p.len),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(effective(&mut a, flow), p.len as u32);
+    let later = now + S / 10;
+    let packet = drain(&mut a, later).unwrap();
+    let q = probe(&packet);
+    assert!(q.len > 1200);
+    assert_eq!(
+        outcome(input(&mut a, later + 1, &with(&ptb(&packet, 1200), &OUTER))),
+        ProbeOutcome::TooBig {
+            size: q.len as u32,
+            mtu: Some(1200),
+            published: Some(path::EstimateChange::Decreased),
+        }
+    );
 }
 
 #[test]
@@ -1190,4 +1230,144 @@ fn discovery_disable_stops_the_adjunct() {
         assert!(a.0.adjunct_due(MDL + 10_000_000));
         assert!(drain(&mut a, MDL + 10_000_000).is_some());
     }
+}
+
+// Every physical packet of one ICMP output drain call.
+fn drain_all(a: &mut Side, now: u64) -> Vec<Vec<u8>> {
+    let mut packet = vec![0; 8192];
+    let mut frames = Vec::new();
+    let outcome =
+        a.0.icmp_output(now, &mut packet, |_, b| {
+            frames.push(b.to_vec());
+            BackendOutcome::Submitted
+        })
+        .unwrap();
+    assert_eq!(outcome, Some(BackendOutcome::Submitted));
+    frames
+}
+
+// An Echo Request of `data` from `remote` over a completed loose source
+// route that recorded `hops` (none: unrouted).
+fn echo_request(local: SocketAddr, remote: SocketAddr, hops: &[[u8; 4]], data: &[u8]) -> Vec<u8> {
+    let ip = IpMetadata {
+        source: remote.ip(),
+        destination: local.ip(),
+    };
+    let mut message = vec![0; 8 + data.len()];
+    message[8..].copy_from_slice(data);
+    let n = ntcp_icmp::encode_echo(ip, ntcp_icmp::EchoKind::Request, 9, 9, &mut message, data.len())
+        .unwrap();
+    let mut packet = ip_packet(ip, 1, &message[..n]);
+    if !hops.is_empty() {
+        let len = 3 + 4 * hops.len();
+        let mut option = vec![131, len as u8, len as u8 + 1];
+        option.extend(hops.iter().flatten());
+        option.resize(len.div_ceil(4) * 4, 0);
+        let header = 20 + option.len();
+        packet.splice(20..20, option);
+        packet[0] = 0x40 | (header / 4) as u8;
+        let total = packet.len() as u16;
+        packet[2..4].copy_from_slice(&total.to_be_bytes());
+        packet[10..12].fill(0);
+        let sum = ntcp_ip::checksum(&packet[..header]);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+    }
+    packet
+}
+
+// The adjunct probes the direct path. A source-routed Echo Reply takes
+// another route: its fragmentation is no demand for the adjunct, and the
+// adjunct's confirmed size, which a direct reply of the same size uses to
+// go whole, never sizes it, even when its first hop is the destination
+// itself and so resolves to the probed path (it is cut to the
+// connectionless initial 1024 octets).
+#[test]
+fn source_routed_echo_replies_neither_feed_nor_use_the_adjunct() {
+    let (local, remote) = addresses(false);
+    let IpAddr::V4(peer) = remote.ip() else {
+        unreachable!()
+    };
+    let hop = [203, 0, 113, 9];
+    let mut a = side_with(
+        local,
+        411,
+        DatagramLimits {
+            peer_reassembly_ipv4: Some(4096),
+            ..limits(1)
+        },
+    );
+    a.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Enabled {
+        interpretation: true,
+        source_routes: true,
+    };
+    let input_echo = |a: &mut Side, now: u64, hops: &[[u8; 4]], data: &[u8]| {
+        let frame = echo_request(local, remote, hops, data);
+        let disposition =
+            a.0.input_ip(&mut a.1, a.2, now, &frame, RxPacketMetadata::default(), 0, None);
+        assert_eq!(disposition, Ok(ntcp::InputDisposition::Processed));
+    };
+    let mut now = MDL + 1;
+    for hops in [&[hop][..], &[hop, peer.octets()]] {
+        input_echo(&mut a, now, hops, &[1; 1400]);
+        let frames = drain_all(&mut a, now);
+        assert!(frames.len() > 1, "source-fragmented");
+        assert_eq!(&frames[0][16..20], &hops[hops.len() - 1]);
+        assert!(!a.0.adjunct_due(now));
+        assert_eq!(a.0.adjunct_paths(), 0, "no demand");
+    }
+    // A direct reply's fragmentation is demand; the search confirms sizes
+    // above 1024 on the path.
+    input_echo(&mut a, now, &[], &[2; 1400]);
+    assert!(drain_all(&mut a, now).len() > 1);
+    assert!(a.0.adjunct_due(now));
+    while let Some(packet) = drain(&mut a, now) {
+        let p = probe(&packet);
+        now += S / 10;
+        assert!(matches!(
+            outcome(input(&mut a, now, &exact(&p))),
+            ProbeOutcome::Confirmed { .. }
+        ));
+    }
+    assert_eq!(a.0.adjunct_counters().converged, 1);
+    // 1100 octets (1112 with a route): whole when direct, fragments of the
+    // connectionless initial size when source-routed, first via the
+    // destination (the probed path) or another hop.
+    input_echo(&mut a, now, &[], &[3; 1072]);
+    let frames = drain_all(&mut a, now);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].len(), 1100);
+    let capability = a.0.administration();
+    let path =
+        a.0.admin_paths(&capability)
+            .unwrap()
+            .map(|p| p.snapshot.path())
+            .find(|&p| a.0.adjunct_confirmed(p) > 1024)
+            .unwrap();
+    let echo = |a: &Side| {
+        a.0.admin_clients(&capability, &a.1, path)
+            .unwrap()
+            .find_map(|c| matches!(c.client, AdminClient::Echo { .. }).then_some(c))
+            .unwrap()
+    };
+    for hops in [&[hop, peer.octets()][..], &[hop]] {
+        input_echo(&mut a, now, hops, &[4; 1072]);
+        // The administrative report of the probed path gives the size the
+        // drain uses for a source-routed reply whose first hop is the
+        // destination; a reply first sent to another hop is not on it.
+        let report = echo(&a);
+        if hops.len() == 2 {
+            assert_eq!(report.client, AdminClient::Echo { queued: 1 });
+            assert_eq!(report.usable_ip_packet, Some(1024));
+        } else {
+            assert_eq!(report.client, AdminClient::Echo { queued: 0 });
+        }
+        let frames = drain_all(&mut a, now);
+        assert!(frames.len() > 1);
+        assert!(frames.iter().all(|f| f.len() <= 1024));
+        assert_eq!(&frames[0][16..20], &hops[hops.len() - 1]);
+    }
+    // Nothing source-routed queued: the confirmed size again.
+    assert_eq!(echo(&a).usable_ip_packet, Some(a.0.adjunct_confirmed(path)));
+    assert_eq!(a.0.adjunct_counters().converged, 1);
+    assert_eq!(a.0.adjunct_paths(), 1);
 }

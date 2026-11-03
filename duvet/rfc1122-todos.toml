@@ -1,14 +1,4 @@
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
-quote = "All IP options (except NOP or END-OF-LIST) received in datagrams MUST be passed to the transport layer (or to ICMP processing when the datagram is an ICMP message). The IP and transport layer MUST each interpret those IP options that they understand and silently ignore the others."
-reason = "Opaque TLVs now survive bounded parsing and real TCP handoff in core, codec, example and native input. Native and disabled example profiles still discard known RR/Timestamp metadata, and the ICMP feedback decoder does not expose option metadata to its consumer; complete all-option TCP/ICMP handoff needs those capability/interface contracts."
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
-quote = "The destination host MUST (if possible) add the current timestamp to a Timestamp option before passing the option to the transport layer or to ICMP for processing."
-reason = "The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract."
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
 quote = "A timestamp value MUST follow the rules given in Section 3.2.2.8 for the ICMP Timestamp message."
-reason = "Local writes enforce UTC day range or a nonstandard high bit, and the example explicitly marks its elapsed clock nonstandard. Arbitrary callers' standard clocks still need evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8; numeric validation cannot establish those physical-clock properties."
+reason = "Local writes enforce UTC day range or a nonstandard high bit, and the managed embeddings (native and the example) record high-bit-marked nonstandard elapsed time without claiming UTC. A standard clock needs evidence of at least 15 updates/second and accuracy within a few minutes under RFC1122 section 3.2.2.8, which numeric validation cannot establish; T15 owns the characterized Linux UTC provider and the native originating-option clock that close this."

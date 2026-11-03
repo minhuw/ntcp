@@ -2474,12 +2474,25 @@ fn ipv4_opaque_metadata_default_admission_and_failed_input_safety() {
     let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
-    let options = Ipv4Options::parse(&[30, 2, 158, 3, 0], false).unwrap();
+    // With IPv4 options disabled, Record Route, Timestamp and unknown options
+    // are still retained metadata; only source routes are refused.
+    let options = Ipv4Options::parse(
+        &[
+            30, 2, 7, 7, 8, 192, 0, 2, 9, 68, 8, 9, 0, 0x80, 0, 0, 1, 158, 3, 0,
+        ],
+        false,
+    )
+    .unwrap();
     let (syn, bytes) = option_packet(&mut a, 0);
     let buffers = b.buffer_bytes();
     for metadata in [
         completed_route(&[7]),
-        Ipv4Options::parse(&[7, 3, 4], false).unwrap(),
+        Ipv4Options::parse(&[137, 7, 8, 192, 0, 2, 7], true).unwrap(),
+        Ipv4Options::parse(
+            &[7, 3, 4, 68, 4, 5, 0, 131, 7, 8, 192, 0, 2, 7, 30, 2],
+            true,
+        )
+        .unwrap(),
     ] {
         assert_eq!(
             b.input_with_ipv4_options(0, syn.ip, 0, metadata, &bytes)
@@ -3982,6 +3995,59 @@ fn route_policy_receives_logical_pair_for_hops_and_prespecified_timestamps() {
     );
     assert_eq!(endpoint.buffer_bytes(), 0);
     assert!(packets(&mut endpoint, 0).is_empty());
+}
+
+// A non-TCP reply (the Host Echo service's) authorizes a received return
+// route exactly as TCP admission does: base checks, then the Route policy
+// for every hop, from the local address toward the remote one. A
+// structurally valid route with one denied hop is refused; strict and loose
+// routes of allowed hops are authorized. TCP admission is unchanged.
+#[test]
+fn return_routes_are_authorized_with_tcp_route_policy() {
+    use core::net::{IpAddr, Ipv4Addr};
+    use std::{cell::RefCell, rc::Rc};
+    let (local, remote) = addresses();
+    let denied = Ipv4Addr::new(192, 0, 2, 66);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let observed = calls.clone();
+    let endpoint = Endpoint::new(config(), [1; 32], 0, move |request| {
+        observed.borrow_mut().push(request);
+        test_policy(request)
+            && !matches!(request, AddressValidation::Route { hop, .. } if hop == IpAddr::V4(denied))
+    })
+    .unwrap();
+    let hops = [Ipv4Addr::new(192, 0, 2, 8), Ipv4Addr::new(192, 0, 2, 9)];
+    for strict in [false, true] {
+        let route = SourceRoute::new(&hops, strict).unwrap();
+        calls.borrow_mut().clear();
+        assert!(endpoint.admits_return_route(local.ip(), remote.ip(), &route));
+        let expected: Vec<_> = hops
+            .iter()
+            .map(|&hop| AddressValidation::Route {
+                source: local.ip(),
+                destination: remote.ip(),
+                hop: hop.into(),
+            })
+            .collect();
+        assert_eq!(*calls.borrow(), expected);
+        let route = SourceRoute::new(&[hops[0], denied, hops[1]], strict).unwrap();
+        assert!(!endpoint.admits_return_route(local.ip(), remote.ip(), &route));
+        // Outside the policy's network: refused whatever the hop.
+        let outside = SourceRoute::new(&[Ipv4Addr::new(198, 51, 100, 1)], strict).unwrap();
+        assert!(!endpoint.admits_return_route(local.ip(), remote.ip(), &outside));
+    }
+    // Base checks precede the policy.
+    calls.borrow_mut().clear();
+    let route = SourceRoute::new(&hops, false).unwrap();
+    for invalid in ["0.0.0.0", "255.255.255.255", "224.0.0.1"] {
+        let invalid: IpAddr = invalid.parse().unwrap();
+        assert!(!endpoint.admits_return_route(invalid, remote.ip(), &route));
+        assert!(!endpoint.admits_return_route(local.ip(), invalid, &route));
+    }
+    assert!(calls.borrow().is_empty());
+    // No hop: nothing to authorize.
+    let direct = SourceRoute::new(&[], false).unwrap();
+    assert!(endpoint.admits_return_route(local.ip(), remote.ip(), &direct));
 }
 
 #[test]

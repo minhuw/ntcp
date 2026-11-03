@@ -1,6 +1,6 @@
 #![no_std]
 use core::net::{IpAddr, Ipv4Addr};
-use ntcp::{IpMetadata, Ipv4Options, OutgoingIpv4Options};
+use ntcp::{EncodedIpv4Options, IpMetadata, Ipv4Options, OutgoingIpv4Options};
 
 pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, UDP_HEADER, checksum};
 pub const IPV4_HEADER: usize = 20;
@@ -60,7 +60,6 @@ const IP_HEADER: usize = IPV4_HEADER;
 // Atomic endpoint codec: options are exposed in Packet; no ID is exposed. Only
 // the structural fragment API below reports Identification, for reassembly.
 //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
-//= reason=Opaque TLVs now survive bounded parsing and real TCP handoff in core, codec, example and native input. Native and disabled example profiles still discard known RR/Timestamp metadata, and the ICMP feedback decoder does not expose option metadata to its consumer; complete all-option TCP/ICMP handoff needs those capability/interface contracts.
 //# All IP options (except NOP or END-OF-LIST) received in datagrams MUST be
 //# passed to the transport layer (or to ICMP processing when the datagram is
 //# an ICMP message). The IP and transport layer MUST each interpret those IP
@@ -260,6 +259,41 @@ impl Fragmenter {
         data_len: usize,
         timestamp: u32,
     ) -> Result<Self, Error> {
+        Self::build(
+            header,
+            Area::Originate(timestamp),
+            protocol,
+            identification,
+            data_len,
+        )
+    }
+
+    /// `new` for a datagram that carries an already-encoded option area as
+    /// is (`encode_datagram_with_options`): the first fragment carries all
+    /// of it, later fragments its copied options, and nothing is recorded.
+    pub fn with_options(
+        header: Header,
+        options: &EncodedIpv4Options,
+        protocol: u8,
+        identification: u16,
+        data_len: usize,
+    ) -> Result<Self, Error> {
+        Self::build(
+            header,
+            Area::Encoded(options),
+            protocol,
+            identification,
+            data_len,
+        )
+    }
+
+    fn build(
+        header: Header,
+        area: Area<'_>,
+        protocol: u8,
+        identification: u16,
+        data_len: usize,
+    ) -> Result<Self, Error> {
         let Header {
             ip,
             hop_limit,
@@ -274,9 +308,8 @@ impl Fragmenter {
             return Err(Error::Invalid);
         }
         let mut options = [0; 40];
-        let (destination, option_len) = ipv4_options
-            .encode(source, destination, timestamp, &mut options)
-            .map_err(|_| Error::Options)?;
+        let (destination, option_len) =
+            option_area(ipv4_options, source, destination, area, &mut options)?;
         // The reassembled datagram's Total Length is at most 65535 octets.
         if data_len > usize::from(u16::MAX) - IP_HEADER - option_len {
             return Err(Error::Length);
@@ -380,7 +413,8 @@ impl Fragmenter {
 
 pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit, timestamp: u32) -> Result<usize, Error> {
     let len = transmit.len;
-    encode_present(packet, transmit.into(), PROTOCOL_TCP, len, timestamp, len)
+    let area = Area::Originate(timestamp);
+    encode_present(packet, transmit.into(), PROTOCOL_TCP, len, area, len)
 }
 
 /// Encode IP around `len` transport bytes of `protocol` resident at
@@ -392,7 +426,56 @@ pub fn encode_datagram(
     len: usize,
     timestamp: u32,
 ) -> Result<usize, Error> {
-    encode_present(packet, header, protocol, len, timestamp, len)
+    let area = Area::Originate(timestamp);
+    encode_present(packet, header, protocol, len, area, len)
+}
+
+/// `encode_datagram` with an already-encoded option area sent as is: nothing
+/// is recorded into it, so encoding a retry again produces the same header.
+/// `header.ip.destination` must be the area's final destination (the header
+/// names its first hop) and `header.ipv4_options` must originate nothing.
+pub fn encode_datagram_with_options(
+    packet: &mut [u8],
+    header: Header,
+    options: &EncodedIpv4Options,
+    protocol: u8,
+    len: usize,
+) -> Result<usize, Error> {
+    encode_present(packet, header, protocol, len, Area::Encoded(options), len)
+}
+
+// Where the option area of an encoded datagram comes from.
+#[derive(Clone, Copy)]
+enum Area<'a> {
+    // Originated from `Header::ipv4_options`, recording with this timestamp.
+    Originate(u32),
+    // Sent as is.
+    Encoded(&'a EncodedIpv4Options),
+}
+
+// The option area in `out` and the header destination.
+fn option_area(
+    outgoing: OutgoingIpv4Options,
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    area: Area<'_>,
+    out: &mut [u8; 40],
+) -> Result<(Ipv4Addr, usize), Error> {
+    match area {
+        Area::Originate(timestamp) => outgoing
+            .encode(source, destination, timestamp, out)
+            .map_err(|_| Error::Options),
+        Area::Encoded(encoded) => {
+            if outgoing != OutgoingIpv4Options::default()
+                || encoded.final_destination() != destination
+            {
+                return Err(Error::Options);
+            }
+            let bytes = encoded.as_bytes();
+            out[..bytes.len()].copy_from_slice(bytes);
+            Ok((encoded.destination(), bytes.len()))
+        }
+    }
 }
 
 /// Encode a checksummed UDP datagram whose `payload_len` data bytes are
@@ -437,7 +520,7 @@ pub fn encode_shared_header(
         transmit.into(),
         PROTOCOL_TCP,
         len,
-        timestamp,
+        Area::Originate(timestamp),
         tcp_header_len,
     )
 }
@@ -476,14 +559,14 @@ pub fn encode_shared_header(
 //# Originating sources MAY set the IPv4 ID field of atomic datagrams to any
 //# value.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
-//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 fn encode_present(
     packet: &mut [u8],
     header: Header,
     protocol: u8,
     transport_len: usize,
-    timestamp: u32,
+    area: Area<'_>,
     present: usize,
 ) -> Result<usize, Error> {
     let Header {
@@ -497,9 +580,8 @@ fn encode_present(
         return Err(Error::Version);
     };
     let mut options = [0; 40];
-    let (destination, option_len) = ipv4_options
-        .encode(source, destination, timestamp, &mut options)
-        .map_err(|_| Error::Options)?;
+    let (destination, option_len) =
+        option_area(ipv4_options, source, destination, area, &mut options)?;
     let header_len = IP_HEADER + option_len;
     let total_len = transport_len.checked_add(header_len).ok_or(Error::Length)?;
     let stored_len = header_len.checked_add(present).ok_or(Error::Length)?;
@@ -559,6 +641,20 @@ pub fn quote_fragment_header(
     b: &[u8],
 ) -> Result<(IpMetadata, usize, usize, u8, Fragmentation), Error> {
     quote(b, true)
+}
+
+/// The final destination of an encoded IPv4 packet or fragment, checked as
+/// `quote_fragment_header` checks a quote: the last address of a source
+/// route still in progress, otherwise the header destination. A
+/// source-routed datagram's header names its next hop, but the final
+/// destination reassembles it by (source, destination, protocol,
+/// Identification) as it arrives there, so Identifications are leased for
+/// that address.
+pub fn final_destination(b: &[u8]) -> Result<Ipv4Addr, Error> {
+    match quote(b, true)?.0.destination {
+        IpAddr::V4(destination) => Ok(destination),
+        IpAddr::V6(_) => Err(Error::Version),
+    }
 }
 
 fn quote(

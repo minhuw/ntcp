@@ -28,9 +28,9 @@ struct TxSlot {
 }
 struct RxSlot {
     // A retained TCP segment is a complete datagram, never a fragment:
-    // its bytes and Host envelope (None in Host-less fixtures).
+    // its bytes and processed Host envelope (None in Host-less fixtures).
     bytes: Vec<u8>,
-    envelope: Option<ntcp_host::Envelope>,
+    envelope: Option<ntcp_host::ProcessedEnvelope>,
     owner: Option<ConnectionId>,
     // A Host-dispatched ICMP report deferred for this exact owner generation.
     icmp: Option<ntcp_host::DeferredIcmp>,
@@ -956,35 +956,50 @@ impl Owner {
         self.egress = Some(egress);
         result
     }
+    // The connection a TCP segment addressed to this owner belongs to.
+    fn tcp_owner(
+        &self,
+        ip: ntcp::IpMetadata,
+        protocol: u8,
+        payload: &[u8],
+    ) -> Option<ConnectionId> {
+        if protocol != 6 || ip.destination != self.local {
+            return None;
+        }
+        let tcp = ntcp::wire::parse(ip, payload).ok()?;
+        self.endpoint.connection_id(ntcp::Tuple {
+            local: SocketAddr::new(ip.destination, tcp.header.destination_port),
+            remote: SocketAddr::new(ip.source, tcp.header.source_port),
+        })
+    }
+    // The owner of a processed datagram, from its processed metadata rather
+    // than a fresh parse. TCP only: the Host dispatcher decides ICMP
+    // ownership after correlation.
+    fn processed_owner(&self, datagram: ntcp_host::Processed) -> Option<ConnectionId> {
+        let packet = self.host.as_ref()?.decode_datagram(datagram).ok()?;
+        self.tcp_owner(packet.ip, packet.protocol, packet.payload)
+    }
+    // Explicit host-less Endpoint fixtures: the frame itself, with the
+    // legacy ICMP mapping.
     fn ingress_owner(&self, bytes: &[u8]) -> Option<ConnectionId> {
         let packet = crate::ip::parse(bytes).ok()?;
         if packet.ip.destination != self.local {
             return None;
         }
-        let tuple = if packet.protocol == 6 {
-            let tcp = ntcp::wire::parse(packet.ip, packet.payload).ok()?;
-            ntcp::Tuple {
-                local: SocketAddr::new(packet.ip.destination, tcp.header.destination_port),
-                remote: SocketAddr::new(packet.ip.source, tcp.header.source_port),
-            }
-        } else if self.host.is_some() {
-            // The Host dispatcher decides ICMP ownership after correlation.
+        if packet.protocol == 6 {
+            return self.tcp_owner(packet.ip, packet.protocol, packet.payload);
+        }
+        let feedback = ntcp_icmp::decode_icmp(bytes).ok()?;
+        // Even nonterminal errors must wait for the exact reserved owner;
+        // Source Quench needs no connection state and is discarded directly.
+        if feedback.kind == ntcp_icmp::FeedbackKind::SourceQuench {
             return None;
-        } else {
-            // Explicit host-less Endpoint fixtures keep the legacy mapping.
-            let feedback = ntcp_icmp::decode_icmp(bytes).ok()?;
-            // Even nonterminal errors must wait for the exact reserved owner;
-            // Source Quench needs no connection state and is discarded directly.
-            if feedback.kind == ntcp_icmp::FeedbackKind::SourceQuench {
-                return None;
-            }
-            let q = feedback.quoted;
-            ntcp::Tuple {
-                local: SocketAddr::new(q.ip.source, q.source_port),
-                remote: SocketAddr::new(q.ip.destination, q.destination_port),
-            }
-        };
-        self.endpoint.connection_id(tuple)
+        }
+        let q = feedback.quoted;
+        self.endpoint.connection_id(ntcp::Tuple {
+            local: SocketAddr::new(q.ip.source, q.source_port),
+            remote: SocketAddr::new(q.ip.destination, q.destination_port),
+        })
     }
     pub(super) fn receive_scheduled(&mut self, input: &mut [u8]) -> std::io::Result<()> {
         let mut egress = self.egress.take().unwrap();
@@ -1010,14 +1025,17 @@ impl Owner {
                         egress.received.push_back(index);
                         continue;
                     }
-                } else if self.ingress_owner(&slot.bytes) == Some(owner) {
-                    // A retained generation never migrates to a tuple's new owner.
-                    match slot.envelope.and_then(|e| e.datagram(&slot.bytes)) {
-                        Some(datagram) => {
-                            self.input_datagram(datagram, slot.stamps, slot.segment_size)
-                        }
-                        None => self.input_ip_metadata(&slot.bytes, slot.stamps, slot.segment_size),
+                } else if let Some(envelope) = slot.envelope {
+                    // A retained generation never migrates to a tuple's new
+                    // owner. The processed metadata is dispatched as
+                    // retained: nothing is processed or recorded again.
+                    if let Some(datagram) = envelope.datagram(&slot.bytes)
+                        && self.processed_owner(datagram) == Some(owner)
+                    {
+                        self.input_datagram(datagram, slot.stamps, slot.segment_size);
                     }
+                } else if self.ingress_owner(&slot.bytes) == Some(owner) {
+                    self.input_ip_metadata(&slot.bytes, slot.stamps, slot.segment_size);
                 }
                 slot.owner = None;
                 slot.envelope = None;
@@ -1068,11 +1086,17 @@ impl Owner {
                     else {
                         return Ok(());
                     };
-                    let retained = if let Some(owner) = self.ingress_owner(datagram.bytes())
+                    // Destination processing precedes classification and
+                    // retention; a retained datagram keeps its result.
+                    let Some(datagram) = self.process_datagram(datagram) else {
+                        return Ok(());
+                    };
+                    let packet = datagram.packet();
+                    let retained = if let Some(owner) = self.processed_owner(datagram)
                         && self.endpoint.is_output_reserved(owner)
                     {
                         Some((owner, None))
-                    } else if icmp(datagram.bytes()) {
+                    } else if packet.protocol == if packet.ip.source.is_ipv4() { 1 } else { 58 } {
                         // The single Host dispatcher classifies, correlates and
                         // applies the report (or answers an Echo Request); one
                         // about a reserved owner comes back unapplied, bound
@@ -1191,10 +1215,6 @@ impl Owner {
         }
         Ok(())
     }
-}
-
-fn icmp(bytes: &[u8]) -> bool {
-    crate::ip::parse(bytes).is_ok_and(|p| p.protocol == if p.ip.source.is_ipv4() { 1 } else { 58 })
 }
 
 // The attached backend, borrowed apart from the Host and the Endpoint so its

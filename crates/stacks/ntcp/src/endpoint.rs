@@ -648,6 +648,17 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Whether `route`, the return route reversed from a received datagram,
+    /// may carry a reply from `local` to `remote`: every hop passes the base
+    /// address checks and the `AddressValidation::Route` policy, as for the
+    /// return route of a received TCP segment.
+    pub fn admits_return_route(&self, local: IpAddr, remote: IpAddr, route: &SourceRoute) -> bool {
+        route
+            .hops()
+            .iter()
+            .all(|&hop| self.valid_route(local, remote, hop.into()))
+    }
+
     fn valid_route(&self, source: IpAddr, destination: IpAddr, hop: IpAddr) -> bool {
         valid_address(source)
             && valid_address(destination)
@@ -3029,7 +3040,9 @@ impl Endpoint {
             .timestamps
             .validate(self.config.connection.timebase)?;
         if !options.is_empty()
-            && ((!self.config.ipv4_options_enabled && options.has_known_options())
+            // Disabled IPv4 options refuse source routes only; RR, Timestamp
+            // and unknown options are retained as metadata (RFC 1122 3.2.1.8).
+            && ((!self.config.ipv4_options_enabled && options.has_source_route())
                 || !ip.source.is_ipv4()
                 || !ip.destination.is_ipv4())
         {
@@ -3069,11 +3082,7 @@ impl Endpoint {
             IpAddr::V4(source) => options.return_route(source),
             _ => None,
         };
-        if route.is_some_and(|r| {
-            r.hops()
-                .iter()
-                .any(|&a| !self.valid_route(ip.destination, ip.source, a.into()))
-        }) {
+        if route.is_some_and(|r| !self.admits_return_route(ip.destination, ip.source, &r)) {
             return Ok(None);
         }
         let segment = match wire::parse(ip, bytes) {

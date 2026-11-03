@@ -1394,6 +1394,193 @@ fn input_frames(to: &mut Owner, frames: &[Vec<u8>]) {
     to.events();
 }
 
+// Every option native IPv4 input admits: Record Route and Timestamp (flag 1)
+// with two free slots each, an opaque copied and a non-copied option.
+fn admitted_ipv4_options() -> Vec<u8> {
+    let mut raw = vec![30, 2, 158, 3, 0, 7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    raw.extend_from_slice(&[68, 20, 5, 1]);
+    raw.extend_from_slice(&[0; 16]);
+    raw
+}
+// The frame's IPv4 datagram with `options` inserted, as an Ethernet frame to
+// this host.
+fn with_ipv4_options(frame: &[u8], options: &[u8]) -> Vec<u8> {
+    let payload = ntcp_ethernet::parse_ethernet(frame).unwrap().payload;
+    let total = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
+    let mut ip = payload[..total].to_vec();
+    ip.splice(20..20, options.iter().copied());
+    ip[0] = 0x45 + (options.len() / 4) as u8;
+    let len = ip.len() as u16;
+    ip[2..4].copy_from_slice(&len.to_be_bytes());
+    ip[10..12].fill(0);
+    let checksum = ntcp_ip_common::checksum(&ip[..20 + options.len()]);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    let mut out = vec![0; (14 + ip.len()).max(60)];
+    ntcp_ethernet::encode_ethernet(&mut out, [2; 6], [4; 6], ntcp_ethernet::ETHERTYPE_IPV4, &ip)
+        .unwrap();
+    out
+}
+// The frame `owner` sent carrying `data`.
+fn data_frame(owner: &mut Owner, wire: &Wire, server: u64, data: &[u8]) -> Vec<u8> {
+    owner.execute(server, Op::Write(data.to_vec())).unwrap();
+    tick(owner);
+    owner.service_egress().unwrap();
+    let sent: Vec<_> = wire.lock().unwrap().sent.drain(..).collect();
+    sent.into_iter()
+        .find(|f| f.windows(data.len()).any(|w| w == data))
+        .unwrap()
+}
+// Destination processing of `admitted_ipv4_options` at 10.73.0.2 at `now`:
+// recorded once with the owner clock's elapsed milliseconds, high bit set
+// (RFC 791 section 3.1), leaving the second slots free.
+fn recorded_once(now: u64) -> ntcp::Ipv4Options {
+    let local = Ipv4Addr::new(10, 73, 0, 2);
+    let time = 0x8000_0000 | (now / 1000) as u32;
+    let raw = admitted_ipv4_options();
+    let recorded = ntcp::Ipv4Options::parse(&raw, false)
+        .unwrap()
+        .record(local, time)
+        .unwrap();
+    let out = recorded.as_bytes();
+    assert_eq!(&out[..5], &raw[..5]);
+    assert_eq!(&out[5..16], &[7, 11, 8, 10, 73, 0, 2, 0, 0, 0, 0]);
+    assert_eq!(&out[16..20], &[68, 20, 13, 1]);
+    assert_eq!(&out[20..24], &local.octets());
+    assert_eq!(&out[24..28], &time.to_be_bytes());
+    assert_eq!(&out[28..], &[0; 8]);
+    recorded
+}
+
+#[test]
+fn managed_native_scalar_input_records_once_with_the_marked_owner_clock() {
+    let (mut a, mut b, client, server, _, wb) = pair_output(false, false, false);
+    let cid = connection(&a, client);
+    let frame = data_frame(&mut b, &wb, server, b"scalar options");
+    let frame = with_ipv4_options(&frame, &admitted_ipv4_options());
+    tick(&mut a);
+    let arrival = a.now();
+    input_frames(&mut a, &[frame]);
+    assert_eq!(
+        a.endpoint.received_ipv4_options(cid).unwrap(),
+        Some(recorded_once(arrival))
+    );
+    assert_eq!(
+        a.execute(client, Op::Read(BYTES)).unwrap().bytes,
+        b"scalar options"
+    );
+}
+
+// Native managed input keeps source routes refused (its TCP has IPv4
+// options disabled, so no return route could be used): a routed copy of a
+// segment is dropped by scalar and scheduled input alike, nothing recorded
+// or delivered; the segment itself is then accepted.
+#[test]
+fn managed_native_input_refuses_source_routed_segments() {
+    for scheduled in [false, true] {
+        let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);
+        let cid = connection(&a, client);
+        let frame = data_frame(&mut b, &wb, server, b"routed");
+        // A completed loose source route ahead of Record Route.
+        let mut options = vec![131, 7, 8, 10, 73, 0, 9, 7, 11, 4];
+        options.resize(20, 0);
+        let routed = with_ipv4_options(&frame, &options);
+        let before = a.endpoint.received_ipv4_options(cid).unwrap();
+        tick(&mut a);
+        if scheduled {
+            wa.lock().unwrap().incoming.push_back(Ok(routed));
+            a.receive_batch(&mut [0; 65549]).unwrap();
+        } else {
+            input_frames(&mut a, &[routed]);
+        }
+        assert_eq!(a.endpoint.received_ipv4_options(cid).unwrap(), before);
+        assert_eq!(a.execute(client, Op::Read(BYTES)).unwrap_err(), EAGAIN);
+        input_frames(&mut a, &[frame]);
+        assert_eq!(a.execute(client, Op::Read(BYTES)).unwrap().bytes, b"routed");
+    }
+}
+
+// A segment for a reserved owner is retained after destination processing;
+// passes that defer it again and its final dispatch record nothing more, and
+// a stale owner generation never receives it.
+#[test]
+fn managed_native_retained_segment_keeps_its_processing_through_replay() {
+    for stale in [false, true] {
+        let (mut a, mut b, client, server, wa, wb) = pair_output(false, true, false);
+        let cid = connection(&a, client);
+        let tuple = a.endpoint.tuple(cid).unwrap();
+        a.execute(client, Op::Write(vec![5; 7000])).unwrap();
+        wa.lock().unwrap().block_after = Some((tuple.local.port(), 1));
+        a.service_egress().unwrap();
+        assert!(a.endpoint.is_output_reserved(cid));
+        let before = a.endpoint.received_ipv4_options(cid).unwrap();
+        let frame = data_frame(&mut b, &wb, server, b"retained options");
+        let frame = with_ipv4_options(&frame, &admitted_ipv4_options());
+        let arrival = a.now();
+        wa.lock().unwrap().incoming.push_back(Ok(frame));
+        a.receive_batch(&mut [0; 65549]).unwrap();
+        assert!(a.egress.as_ref().unwrap().retained_rx(cid));
+        // Later passes, at later times, defer it again unchanged.
+        for _ in 0..3 {
+            tick(&mut a);
+            a.receive_batch(&mut [0; 65549]).unwrap();
+            assert!(a.egress.as_ref().unwrap().retained_rx(cid));
+            assert_eq!(a.endpoint.received_ipv4_options(cid).unwrap(), before);
+        }
+        wa.lock().unwrap().block_after = None;
+        tick(&mut a);
+        a.service_egress().unwrap();
+        assert!(!a.endpoint.is_output_reserved(cid));
+        let replacement = stale.then(|| {
+            // The tuple's next generation must not inherit the retained input.
+            // A hard error about its unacknowledged data ends it without a
+            // reset, so the tuple is free at once.
+            let sent = wa.lock().unwrap().sent[0].clone();
+            let ip = crate::ip::parse(ntcp_ethernet::parse_ethernet(&sent).unwrap().payload);
+            let ip = ip.unwrap();
+            let sequence = ntcp::wire::parse(ip.ip, ip.payload)
+                .unwrap()
+                .header
+                .sequence;
+            let error = ntcp::NetworkError::HardUnreachable;
+            assert!(
+                a.endpoint
+                    .network_error(a.now(), tuple, sequence, error)
+                    .unwrap()
+            );
+            a.endpoint.release(cid).unwrap();
+            a.sockets.remove(&client);
+            let replacement = new(&mut a, SOCK_NONBLOCK);
+            a.execute(replacement, Op::Bind(tuple.local)).unwrap();
+            assert_eq!(
+                a.execute(replacement, Op::Connect(tuple.remote))
+                    .unwrap_err(),
+                EINPROGRESS
+            );
+            let id = connection(&a, replacement);
+            assert_ne!(id, cid);
+            assert_eq!(a.endpoint.connection_id(tuple), Some(id));
+            id
+        });
+        tick(&mut a);
+        a.receive_batch(&mut [0; 65549]).unwrap();
+        assert!(!a.egress.as_ref().unwrap().retained_rx(cid));
+        if let Some(id) = replacement {
+            assert_eq!(a.endpoint.state(id).unwrap(), ntcp::State::SynSent);
+            assert_eq!(a.endpoint.received_ipv4_options(id).unwrap(), None);
+        } else {
+            // Recorded at arrival, not at any later pass.
+            assert_eq!(
+                a.endpoint.received_ipv4_options(cid).unwrap(),
+                Some(recorded_once(arrival))
+            );
+            assert_eq!(
+                a.execute(client, Op::Read(BYTES)).unwrap().bytes,
+                b"retained options"
+            );
+        }
+    }
+}
+
 #[test]
 fn managed_native_timestamp_fallback_and_msgsize_rejection_reuse_the_attempt_ticket() {
     let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);

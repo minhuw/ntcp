@@ -662,12 +662,13 @@ fn completed_datagrams_own_their_bytes_for_retention() {
         }
         assert!(envelope.datagram(&bytes[1..]).is_none());
         let datagram = envelope.datagram(&bytes).unwrap();
+        let processed = a.0.process(datagram, None).unwrap();
         assert_eq!(
-            a.0.decode_datagram(datagram).unwrap().protocol,
+            a.0.decode_datagram(processed).unwrap().protocol,
             ntcp_ip::PROTOCOL_UDP
         );
         assert_eq!(
-            a.0.input_datagram(&mut a.1, 3, datagram, RxPacketMetadata::default(), 0, None),
+            a.0.input_datagram(&mut a.1, 3, processed, RxPacketMetadata::default(), 0),
             Ok(ntcp::InputDisposition::Processed)
         );
         let mut payload = vec![0; 4000];
@@ -1460,4 +1461,670 @@ fn a_full_queue_without_held_messages_drops_new_messages() {
             assert_eq!(echo_queued_on(&mut a, path), 3);
         }
     }
+}
+
+// Option-aware emission (RFC 791 section 3.2 copy rules): queued ICMP
+// messages carrying already-encoded IPv4 options, as the Echo service's
+// continued reply options will be.
+
+fn v4(address: IpAddr) -> core::net::Ipv4Addr {
+    match address {
+        IpAddr::V4(address) => address,
+        IpAddr::V6(_) => unreachable!(),
+    }
+}
+
+// An Echo Reply message for `ip`.
+fn reply_message(ip: IpMetadata, sequence: u16, data: &[u8]) -> Vec<u8> {
+    let mut message = vec![0; 8 + data.len()];
+    message[8..].copy_from_slice(data);
+    let n = ntcp_icmp::encode_echo(
+        ip,
+        ntcp_icmp::EchoKind::Reply,
+        0x7007,
+        sequence,
+        &mut message,
+        data.len(),
+    )
+    .unwrap();
+    message.truncate(n);
+    message
+}
+
+// Options toward `destination`: a loose route via `hop` when given, then a
+// full Record Route holding 10.0.0.`mark` and a copied opaque TLV.
+fn reply_options(hop: Option<IpAddr>, destination: IpAddr, mark: u8) -> ntcp::EncodedIpv4Options {
+    let route = hop.map(|hop| ntcp::SourceRoute::new(&[v4(hop)], false).unwrap());
+    let carried = [7, 7, 8, 10, 0, 0, mark, 158, 4, mark, 1];
+    ntcp::EncodedIpv4Options::new(route.as_ref(), v4(destination), &carried).unwrap()
+}
+
+// (Identification, DF, MF, offset) of one IPv4 packet.
+type Fields = (u16, bool, bool, usize);
+
+// One originated IPv4 packet, whose source route may still be in progress
+// (which the endpoint parser refuses): its checked header, fields and data.
+fn sent_v4(frame: &[u8]) -> (&[u8], Fields, &[u8]) {
+    assert_eq!(frame[0] >> 4, 4);
+    let header = usize::from(frame[0] & 15) * 4;
+    assert_eq!(
+        usize::from(u16::from_be_bytes([frame[2], frame[3]])),
+        frame.len()
+    );
+    assert_eq!(
+        ntcp_ip_common::checksum(&frame[..header]),
+        0,
+        "header checksum"
+    );
+    let flags = u16::from_be_bytes([frame[6], frame[7]]);
+    let fields = (
+        u16::from_be_bytes([frame[4], frame[5]]),
+        flags & 0x4000 != 0,
+        flags & 0x2000 != 0,
+        usize::from(flags & 0x1fff) * 8,
+    );
+    (&frame[..header], fields, &frame[header..])
+}
+
+// Queue a 64-octet reply marked `mark` with its options; returns them.
+fn queue_reply(
+    a: &mut Side,
+    ip: IpMetadata,
+    hop: Option<IpAddr>,
+    mark: u8,
+) -> ntcp::EncodedIpv4Options {
+    let options = reply_options(hop, ip.destination, mark);
+    let message = reply_message(ip, u16::from(mark), &[mark; 64]);
+    assert!(a.0.queue_icmp(ip, a.2.link(), &message, Some(options)));
+    options
+}
+
+// A queued message with options leaves whole with its complete option area
+// and the real header length, or as source fragments sized by each
+// fragment's real header: the first carries every option, later ones only
+// the copied route and opaque TLV, all with one Identification, correct
+// offsets, MF and header checksums. A source route's first hop is the
+// header destination; the route ends at the final destination.
+#[test]
+fn option_bearing_icmp_output_carries_its_options_whole_and_fragmented() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let hop: IpAddr = "203.0.113.9".parse().unwrap();
+    let mut a = fragmenting_side(local, 10_001, true);
+    let from_us = ip(local.ip(), remote.ip());
+    for (route, size) in [
+        (None, 100),
+        (Some(hop), 100),
+        (None, 1420),
+        (Some(hop), 1420),
+    ] {
+        let data: Vec<u8> = (0..size).map(|i| (i * 5 + size) as u8).collect();
+        let message = reply_message(from_us, 1, &data);
+        let options = reply_options(route, remote.ip(), 7);
+        assert!(a.0.queue_icmp(from_us, a.2.link(), &message, Some(options)));
+        let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+        assert_eq!(frames.len() > 1, size > 1000);
+        let mut copied = [0; 40];
+        let n = ntcp::copied_fragment_options(options.as_bytes(), &mut copied).unwrap();
+        assert_eq!(n, if route.is_some() { 12 } else { 4 });
+        let first_header = 20 + options.as_bytes().len();
+        if frames.len() > 1 {
+            // Filled to the 1024-octet connectionless size under its header.
+            assert_eq!(frames[0].len(), first_header + ((1024 - first_header) & !7));
+        }
+        let mut reassembled = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            assert!(frame.len() <= 1024);
+            let (header, (id, df, more, offset), data) = sent_v4(frame);
+            assert!(df, "DF on every packet of an enabled route");
+            assert_eq!(header[9], 1);
+            assert_eq!(&header[12..16], &v4(local.ip()).octets());
+            assert_eq!(&header[16..20], &v4(route.unwrap_or(remote.ip())).octets());
+            assert_eq!(ntcp_ip::final_destination(frame), Ok(v4(remote.ip())));
+            let expected = if i == 0 {
+                options.as_bytes()
+            } else {
+                &copied[..n]
+            };
+            assert_eq!(&header[20..], expected);
+            assert_eq!(more, i + 1 < frames.len());
+            assert_eq!(offset, reassembled.len());
+            let (first_id, ..) = sent_v4(&frames[0]).1;
+            assert_eq!(id, if frames.len() > 1 { first_id } else { 0 });
+            reassembled.extend_from_slice(data);
+        }
+        assert_eq!(reassembled, message);
+        let reply = ntcp_icmp::decode_echo(from_us, &reassembled).unwrap();
+        assert_eq!(reply.data, &data[..]);
+    }
+    assert_eq!(a.0.icmp_output_counters().unsent, 0);
+    assert_eq!(a.0.icmp_output_pending(), 0);
+}
+
+// RFC 6864 section 4.3 uniqueness holds at the datagram's final
+// destination, which reassembles it: on a discovery-disabled IPv4 route
+// (DF clear, RFC 1191 section 6.6, within RFC 1122 section 3.3.3's 576)
+// a source-routed message whole and fragmented, the public whole-packet
+// rewrite embeddings use (`lease_df_clear`) and an option-free message to
+// the same destination all lease from one (source, final destination,
+// ICMP) tuple, never from one keyed on the route's first hop.
+#[test]
+fn df_clear_source_routed_output_leases_for_the_final_destination() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let hop: IpAddr = "203.0.113.9".parse().unwrap();
+    let mut a = fragmenting_side(local, 10_002, true);
+    let capability = a.0.administration();
+    let prefix = path::IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap();
+    let route = a.0.admin_select_route(&capability, prefix).unwrap();
+    let candidate =
+        a.0.admin_validate(
+            &capability,
+            MDL,
+            path::AdminChange {
+                target: path::AdminTarget::Route(route),
+                expected: 0,
+                policy: path::AdminPolicy {
+                    discovery_disabled: true,
+                    estimate: None,
+                },
+            },
+        )
+        .unwrap();
+    a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+    let from_us = ip(local.ip(), remote.ip());
+    let options = reply_options(Some(hop), remote.ip(), 9);
+    let mut identifications = Vec::new();
+    for size in [100usize, 1420] {
+        let message = reply_message(from_us, size as u16, &vec![0x3c; size]);
+        assert!(a.0.queue_icmp(from_us, a.2.link(), &message, Some(options)));
+        let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+        assert_eq!(frames.len() > 1, size > 576);
+        let (first_id, ..) = sent_v4(&frames[0]).1;
+        let mut reassembled = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            assert!(frame.len() <= 576);
+            let (header, (id, df, more, offset), data) = sent_v4(frame);
+            assert!(!df, "DF clear on the disabled route");
+            assert_eq!(id, first_id);
+            assert_eq!(&header[16..20], &v4(hop).octets());
+            assert_eq!(more, i + 1 < frames.len());
+            assert_eq!(offset, reassembled.len());
+            if i == 0 {
+                assert_eq!(&header[20..], options.as_bytes());
+            }
+            reassembled.extend_from_slice(data);
+        }
+        assert_eq!(reassembled, message);
+        identifications.push(first_id);
+    }
+    let mut packet = vec![0; 20 + options.as_bytes().len() + 8];
+    let header = ntcp_ip::Header {
+        ip: from_us,
+        hop_limit: 64,
+        dscp: 0,
+        ecn: 0,
+        ipv4_options: Default::default(),
+    };
+    let len = ntcp_ip::encode_datagram_with_options(&mut packet, header, &options, 1, 8).unwrap();
+    identifications.push(a.0.lease_df_clear(MDL + 1, &mut packet[..len]).unwrap());
+    let (header, (id, df, ..), _) = sent_v4(&packet[..len]);
+    assert_eq!((id, df), (identifications[2], false));
+    assert_eq!(&header[16..20], &v4(hop).octets());
+    let message = reply_message(from_us, 1, &[1; 32]);
+    assert!(a.0.queue_icmp(from_us, a.2.link(), &message, None));
+    let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+    let (header, (id, df, ..), _) = sent_v4(&frames[0]);
+    assert_eq!((header.len(), df), (20, false));
+    identifications.push(id);
+    // Consecutive values of one tuple's counter.
+    for pair in identifications.windows(2) {
+        assert_eq!(pair[1], pair[0].wrapping_add(1), "{identifications:?}");
+    }
+}
+
+// Options are stored beside each queue slot and follow their message. A
+// source-routed message to `remote` is routed (and counted) by its first
+// hop, so it leaves at once over that enabled path while replies to the
+// disabled direct path are held. Distinct option-bearing replies are held,
+// rotated, swapped behind a newcomer and displaced oldest first, by an
+// option-bearing message and by an option-free reassembly error; each
+// survivor leaves with its own options and payload, and the queue counts
+// and unsent/dropped counters are exact.
+#[test]
+fn queued_options_follow_their_messages_through_hold_rotation_and_displacement() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let hop: IpAddr = "203.0.113.9".parse().unwrap();
+    let (mut a, neighbor, disabled) = held_replies_side(10_003);
+    let to_remote = ip(local.ip(), remote.ip());
+    let start = a.0.icmp_output_counters();
+    let check = |frame: &[u8], ip: IpMetadata, options: &ntcp::EncodedIpv4Options, mark: u8| {
+        let (header, (_, df, more, offset), message) = sent_v4(frame);
+        assert_eq!((more, offset), (false, 0));
+        assert_eq!(&header[16..20], &options.destination().octets());
+        assert_eq!(&header[20..], options.as_bytes());
+        assert!(
+            options
+                .as_bytes()
+                .windows(4)
+                .any(|w| w == [mark, 158, 4, mark])
+        );
+        let reply = ntcp_icmp::decode_echo(ip, message).unwrap();
+        assert_eq!(reply.sequence, u16::from(mark));
+        assert_eq!(reply.data, &[mark; 64]);
+        df
+    };
+
+    // First-hop resolution for output and accounting alike.
+    let routed = queue_reply(&mut a, to_remote, Some(hop), 10);
+    assert_eq!(echo_queued_on(&mut a, disabled), 0);
+    let frames = drain_packets(&mut a, 3).unwrap().unwrap();
+    assert_eq!(frames.len(), 1);
+    assert!(
+        check(&frames[0], to_remote, &routed, 10),
+        "DF via the enabled hop"
+    );
+
+    // Fragment zero whose expiry later queues a Time Exceeded.
+    let complete = udp(ip(neighbor, local.ip()), (4000, local.port()), &[9; 2000]);
+    input_frame(&mut a, 3, &fragments(&complete, 33, 1000)[0]).unwrap();
+
+    let mut sent = std::collections::BTreeMap::new();
+    for mark in 1..=3 {
+        sent.insert(mark, queue_reply(&mut a, to_remote, None, mark));
+    }
+    assert_eq!(echo_queued_on(&mut a, disabled), 3);
+    let mut packet = vec![0; 8192];
+    assert_eq!(
+        a.0.icmp_output(4, &mut packet, |_, _| panic!("nothing submitted")),
+        Ok(Some(BackendOutcome::WouldBlock))
+    );
+
+    // An option-bearing newcomer displaces the longest held reply (1).
+    let to_neighbor = ip(local.ip(), neighbor);
+    let newcomer = queue_reply(&mut a, to_neighbor, Some(hop), 4);
+    let counters = a.0.icmp_output_counters();
+    assert_eq!(
+        (counters.unsent, counters.dropped),
+        (start.unsent + 1, start.dropped)
+    );
+    assert_eq!(a.0.icmp_output_pending(), 3);
+    assert_eq!(echo_queued_on(&mut a, disabled), 2);
+    let frames = drain_packets(&mut a, 5).unwrap().unwrap();
+    assert!(check(&frames[0], to_neighbor, &newcomer, 4));
+    assert_eq!(ntcp_ip::final_destination(&frames[0]), Ok(v4(neighbor)));
+
+    // Refill with 5; every reply is held again.
+    sent.insert(5, queue_reply(&mut a, to_remote, None, 5));
+    assert_eq!(
+        a.0.icmp_output(6, &mut packet, |_, _| panic!("nothing submitted")),
+        Ok(Some(BackendOutcome::WouldBlock))
+    );
+    assert_eq!(echo_queued_on(&mut a, disabled), 3);
+
+    // The option-free error displaces the longest held reply (2).
+    let second = config(2).connection.timebase.units_per_second;
+    assert!(60 * second + 3 < MDL);
+    a.0.service_changes(&mut a.1, 60 * second + 3).unwrap();
+    let counters = a.0.icmp_output_counters();
+    assert_eq!(counters.errors, start.errors + 1);
+    assert_eq!(
+        (counters.unsent, counters.dropped),
+        (start.unsent + 2, start.dropped)
+    );
+    assert_eq!(a.0.icmp_output_pending(), 3);
+    assert_eq!(echo_queued_on(&mut a, disabled), 2);
+    let frames = drain_packets(&mut a, 60 * second + 4).unwrap().unwrap();
+    let (header, (_, df, ..), message) = sent_v4(&frames[0]);
+    assert_eq!((header.len(), df), (20, true));
+    assert_eq!(&message[..2], [11, 1]);
+
+    // The survivors leave in order, each with its own options, DF clear.
+    for mark in [3, 5] {
+        let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(!check(&frames[0], to_remote, &sent[&mark], mark));
+    }
+    assert_eq!(drain_packets(&mut a, MDL + 1), Ok(None));
+    let end = a.0.icmp_output_counters();
+    assert_eq!((end.unsent, end.dropped), (start.unsent + 2, start.dropped));
+}
+
+// Echo option continuation (RFC 1122 section 3.2.2.6): the Echo service
+// answers a request with its processed Record Route and Timestamp and, for
+// a source-routed request, the reversed return route.
+
+const HOP_A: [u8; 4] = [203, 0, 113, 8];
+const HOP_B: [u8; 4] = [203, 0, 113, 9];
+// Record Route with one of two slots filled by a router, then this host.
+const RR: [u8; 11] = [7, 11, 8, 198, 51, 100, 1, 0, 0, 0, 0];
+const RR_RECORDED: [u8; 11] = [7, 11, 12, 198, 51, 100, 1, 192, 0, 2, 1];
+// Timestamp (flag 0) with one of three slots filled; this host's marked
+// sample fills the second and the third stays free.
+const TS: [u8; 16] = [68, 16, 9, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0];
+const TS_RECORDED: [u8; 16] = [68, 16, 13, 0, 0, 0, 0, 5, 0x80, 0, 0, 0x55, 0, 0, 0, 0];
+
+#[derive(Default)]
+struct Samples {
+    calls: usize,
+}
+impl ntcp::Ipv4TimestampProvider for Samples {
+    fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
+        self.calls += 1;
+        Some(ntcp::Ipv4Timestamp::nonstandard(0x55))
+    }
+}
+
+fn receive_profile(a: &mut Side, interpretation: bool, source_routes: bool) {
+    a.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Enabled {
+        interpretation,
+        source_routes,
+    };
+}
+
+// `frame` (IPv4, option-free) with `options` after its base header,
+// EOL-padded to a word.
+fn with_ipv4_options(frame: &[u8], options: &[u8]) -> Vec<u8> {
+    let mut area = options.to_vec();
+    area.resize(options.len().div_ceil(4) * 4, 0);
+    let mut packet = frame.to_vec();
+    packet.splice(20..20, area.iter().copied());
+    packet[0] = 0x45 + (area.len() / 4) as u8;
+    let total = packet.len() as u16;
+    packet[2..4].copy_from_slice(&total.to_be_bytes());
+    super::dispatch::seal_ipv4(&mut packet);
+    packet
+}
+
+// Receive, process (sampling `clock`) and dispatch one physical ICMP
+// packet; the Echo service's disposition of a completed request.
+fn echo_input(
+    a: &mut Side,
+    now: u64,
+    frame: &[u8],
+    clock: &mut Samples,
+) -> Option<EchoDisposition> {
+    let mut out = vec![0; 8192];
+    let Received::Datagram(datagram) = a.0.receive(a.2, now, frame, false, &mut out).unwrap()
+    else {
+        return None;
+    };
+    let processed = a.0.process(datagram, Some(clock)).unwrap();
+    match a.0.input_icmp_datagram(&mut a.1, now, processed).unwrap() {
+        IcmpDispatch::Completed(IcmpOutcome::Echo(disposition)) => Some(disposition),
+        other => panic!("{other:?}"),
+    }
+}
+
+// A received completed source route over `recorded` and the reply's
+// expected route option toward `remote` with its first hop: recorded hops
+// reversed (a legacy leading source entry dropped), strictness kept.
+fn routes(
+    strict: bool,
+    recorded: &[[u8; 4]],
+    legacy: Option<IpAddr>,
+) -> (Vec<u8>, Vec<u8>, [u8; 4]) {
+    let kind = if strict { 137 } else { 131 };
+    let mut entries: Vec<[u8; 4]> = legacy.map(|s| v4(s).octets()).into_iter().collect();
+    entries.extend_from_slice(recorded);
+    let len = 3 + 4 * entries.len();
+    let mut received = vec![kind, len as u8, len as u8 + 1];
+    received.extend(entries.iter().flatten());
+    let reversed: Vec<[u8; 4]> = recorded.iter().rev().copied().collect();
+    let first_hop = reversed[0];
+    (received, reversed[1..].iter().flatten().copied().collect(), first_hop)
+}
+
+// Every carried set (RR alone, TS alone, RR and TS) with no route, loose,
+// strict and legacy-encoded loose routes, with interpretation enabled and
+// disabled. The reply comes from the request's destination; it carries the
+// processed RR/TS exactly (lengths, pointers and free slots), after the
+// reversed route when there is one, and never the unknown option. It is
+// recorded once at arrival: a WouldBlock retry sends the same bytes.
+#[test]
+fn echo_replies_continue_processed_options_and_reverse_source_routes() {
+    let (local, remote) = addresses(false);
+    let to_us = ip(remote.ip(), local.ip());
+    let from_us = ip(local.ip(), remote.ip());
+    let mut identity = 10_100;
+    for interpretation in [true, false] {
+        for route in 0..4 {
+            for carried in 0..3 {
+                identity += 1;
+                let mut a = fragmenting_side(local, identity, true);
+                receive_profile(&mut a, interpretation, true);
+                let (received_route, reply_hops, first_hop) = match route {
+                    0 => (Vec::new(), Vec::new(), v4(remote.ip()).octets()),
+                    1 => routes(false, &[HOP_A, HOP_B], None),
+                    2 => routes(true, &[HOP_A, HOP_B], None),
+                    _ => routes(false, &[HOP_A], Some(remote.ip())),
+                };
+                let (rr, ts) = (carried != 1, carried != 0);
+                let mut options = received_route.clone();
+                let mut expected = Vec::new();
+                if route != 0 {
+                    expected.push(received_route[0]);
+                    expected.extend_from_slice(&[3 + 4 * (reply_hops.len() as u8 / 4 + 1), 4]);
+                    expected.extend_from_slice(&reply_hops);
+                    expected.extend_from_slice(&v4(remote.ip()).octets());
+                }
+                if rr {
+                    options.extend_from_slice(&RR);
+                }
+                if ts {
+                    options.extend_from_slice(&TS);
+                }
+                // Unknown: delivered, never reflected.
+                options.extend_from_slice(&[30, 2]);
+                assert!(options.len() <= 40);
+                if interpretation {
+                    if rr {
+                        expected.extend_from_slice(&RR_RECORDED);
+                    }
+                    if ts {
+                        expected.extend_from_slice(&TS_RECORDED);
+                    }
+                }
+                expected.resize(expected.len().div_ceil(4) * 4, 0);
+                let data: Vec<u8> = (0..64).map(|i| (i * 3 + carried) as u8).collect();
+                let frame = with_ipv4_options(&echo(to_us, 0x5e5e, 7, &data), &options);
+                let mut clock = Samples::default();
+                assert_eq!(
+                    echo_input(&mut a, 1, &frame, &mut clock),
+                    Some(EchoDisposition::Queued)
+                );
+                assert_eq!(clock.calls, usize::from(interpretation && ts));
+                let case = (interpretation, route, carried);
+                let mut packet = vec![0; 8192];
+                let mut blocked = Vec::new();
+                assert_eq!(
+                    a.0.icmp_output(1, &mut packet, |_, bytes| {
+                        blocked.push(bytes.to_vec());
+                        BackendOutcome::WouldBlock
+                    }),
+                    Ok(Some(BackendOutcome::WouldBlock))
+                );
+                assert_eq!(a.0.icmp_output_pending(), 1);
+                let frames = drain_packets(&mut a, 2).unwrap().unwrap();
+                assert_eq!(frames, blocked, "{case:?}: retried unchanged");
+                assert_eq!(frames.len(), 1);
+                let (header, (_, df, more, offset), message) = sent_v4(&frames[0]);
+                assert!(df && !more && offset == 0);
+                assert_eq!(&header[12..16], &v4(local.ip()).octets());
+                assert_eq!(&header[16..20], &first_hop, "{case:?}");
+                assert_eq!(&header[20..], &expected[..], "{case:?}");
+                assert_eq!(ntcp_ip::final_destination(&frames[0]), Ok(v4(remote.ip())));
+                let reply = ntcp_icmp::decode_echo(from_us, message).unwrap();
+                assert_eq!(reply.kind, ntcp_icmp::EchoKind::Reply);
+                assert_eq!((reply.identifier, reply.sequence), (0x5e5e, 7));
+                assert_eq!(reply.data, &data[..]);
+                assert_eq!(clock.calls, usize::from(interpretation && ts));
+                let counters = a.0.icmp_output_counters();
+                assert_eq!((counters.echo_replies, counters.unsent), (1, 0));
+            }
+        }
+    }
+}
+
+// The largest admitted option areas stay representable after reversal: a
+// nine-hop route fills all 40 octets, its legacy form drops the source
+// entry, and a route with RR, TS and an unknown option fills the area too.
+#[test]
+fn maximal_echo_option_areas_are_answered_within_forty_octets() {
+    let (local, remote) = addresses(false);
+    let to_us = ip(remote.ip(), local.ip());
+    let hops: Vec<[u8; 4]> = (1..=9).map(|n| [203, 0, 113, n]).collect();
+    let mut cases = Vec::new();
+    for strict in [false, true] {
+        let (received, _, _) = routes(strict, &hops, None);
+        cases.push((received, 9, hops[8]));
+        let (received, _, _) = routes(strict, &hops[..8], Some(remote.ip()));
+        cases.push((received, 8, hops[7]));
+    }
+    let (mut received, _, _) = routes(false, &[HOP_A, HOP_B], None);
+    received.extend_from_slice(&RR);
+    received.extend_from_slice(&TS);
+    received.extend_from_slice(&[30, 2]);
+    cases.push((received, 2, HOP_B));
+    for (n, (options, reversed, first_hop)) in cases.into_iter().enumerate() {
+        assert_eq!(options.len().div_ceil(4) * 4, 40);
+        let mut a = fragmenting_side(local, 10_200 + n as u128, true);
+        receive_profile(&mut a, true, true);
+        let frame = with_ipv4_options(&echo(to_us, 1, n as u16, &[n as u8; 32]), &options);
+        let mut clock = Samples::default();
+        assert_eq!(
+            echo_input(&mut a, 1, &frame, &mut clock),
+            Some(EchoDisposition::Queued)
+        );
+        let frames = drain_packets(&mut a, 2).unwrap().unwrap();
+        let (header, ..) = sent_v4(&frames[0]);
+        assert!(header.len() <= 60);
+        assert_eq!(&header[16..20], &first_hop);
+        assert_eq!(&header[20..23], &[options[0], 3 + 4 * reversed, 4]);
+        assert_eq!(ntcp_ip::final_destination(&frames[0]), Ok(v4(remote.ip())));
+    }
+}
+
+// A large source-routed reply is source-fragmented: the first fragment
+// carries the reversed route, RR and TS, later ones only the copied route,
+// with one Identification, correct offsets, MF and checksums.
+#[test]
+fn fragmented_echo_replies_copy_only_the_route_into_later_fragments() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let to_us = ip(remote.ip(), local.ip());
+    let mut a = fragmenting_side(local, 10_300, true);
+    receive_profile(&mut a, true, true);
+    let (route, _, _) = routes(false, &[HOP_A, HOP_B], None);
+    let options = [&route[..], &RR, &TS, &[30, 2]].concat();
+    let data: Vec<u8> = (0..1400).map(|i| (i * 7) as u8).collect();
+    let frame = with_ipv4_options(&echo(to_us, 2, 3, &data), &options);
+    assert!(frame.len() <= 1500);
+    let mut clock = Samples::default();
+    assert_eq!(
+        echo_input(&mut a, MDL + 1, &frame, &mut clock),
+        Some(EchoDisposition::Queued)
+    );
+    let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+    assert!(frames.len() > 1);
+    let first_route = [131, 11, 4, 203, 0, 113, 8, 192, 0, 2, 2, 0];
+    let mut reassembled = Vec::new();
+    let (first_id, ..) = sent_v4(&frames[0]).1;
+    for (i, frame) in frames.iter().enumerate() {
+        assert!(frame.len() <= 1024);
+        let (header, (id, df, more, offset), data) = sent_v4(frame);
+        assert!(df);
+        assert_eq!((id, more, offset), (first_id, i + 1 < frames.len(), reassembled.len()));
+        assert_eq!(&header[16..20], &HOP_B);
+        if i == 0 {
+            assert_eq!(&header[20..31], &first_route[..11]);
+            assert_eq!(&header[31..42], &RR_RECORDED);
+            assert_eq!(&header[42..58], &TS_RECORDED);
+            assert_eq!(&header[58..], &[0, 0]);
+        } else {
+            assert_eq!(&header[20..], &first_route);
+        }
+        reassembled.extend_from_slice(data);
+    }
+    let reply = ntcp_icmp::decode_echo(ip(local.ip(), remote.ip()), &reassembled).unwrap();
+    assert_eq!(reply.data, &data[..]);
+    assert_eq!(clock.calls, 1);
+}
+
+// The return route is used only when the endpoint's Route policy
+// authorizes each hop, as for TCP: a structurally valid route through a
+// denied hop is not answered and is counted, through either dispatcher;
+// a strict and a loose route of allowed hops are answered.
+#[test]
+fn echo_requests_with_unauthorized_return_routes_are_counted_not_answered() {
+    let (local, remote) = addresses(false);
+    let to_us = ip(remote.ip(), local.ip());
+    let denied = IpAddr::from(HOP_B);
+    let mut a = managed_limited(local, 10_400, config(2), false, None, Some(denied), |p, l| {
+        let (p, mut l) = managed_icmp_output_limits(p, l, OUTPUT).unwrap();
+        l.reassembly = reassembly();
+        (p, l, 1)
+    });
+    receive_profile(&mut a, true, true);
+    let request = echo(to_us, 4, 4, &[4; 16]);
+    for strict in [false, true] {
+        let (route, _, _) = routes(strict, &[HOP_A, HOP_B], None);
+        let frame = with_ipv4_options(&request, &[&route[..], &RR].concat());
+        let mut clock = Samples::default();
+        assert_eq!(
+            echo_input(&mut a, 1, &frame, &mut clock),
+            Some(EchoDisposition::UnauthorizedRoute)
+        );
+        assert_eq!(input_frame(&mut a, 1, &frame), Ok(ntcp::InputDisposition::Dropped));
+    }
+    let counters = a.0.icmp_output_counters();
+    assert_eq!(
+        (counters.unauthorized_routes, counters.echo_replies, counters.dropped),
+        (4, 0, 0)
+    );
+    assert_eq!(a.0.icmp_output_pending(), 0);
+    for strict in [false, true] {
+        let (route, _, _) = routes(strict, &[[203, 0, 113, 7], HOP_A], None);
+        let frame = with_ipv4_options(&request, &route);
+        let mut clock = Samples::default();
+        assert_eq!(
+            echo_input(&mut a, 2, &frame, &mut clock),
+            Some(EchoDisposition::Queued)
+        );
+        let frames = drain_packets(&mut a, 2).unwrap().unwrap();
+        let (header, ..) = sent_v4(&frames[0]);
+        assert_eq!(&header[16..20], &HOP_A);
+        assert_eq!(header[20], route[0]);
+    }
+    assert_eq!(a.0.icmp_output_counters().unauthorized_routes, 4);
+}
+
+// A reply held for an identifier on a DF-clear route keeps the options
+// recorded at arrival: it leaves later with the same bytes, sampled once.
+#[test]
+fn held_echo_replies_keep_their_recorded_options() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let (mut a, _, _) = held_replies_side(10_500);
+    let options = [&RR[..], &TS].concat();
+    let frame = with_ipv4_options(&echo(ip(remote.ip(), local.ip()), 5, 5, &[5; 64]), &options);
+    let mut clock = Samples::default();
+    assert_eq!(
+        echo_input(&mut a, 3, &frame, &mut clock),
+        Some(EchoDisposition::Queued)
+    );
+    let mut packet = vec![0; 8192];
+    for now in [4, 5] {
+        assert_eq!(
+            a.0.icmp_output(now, &mut packet, |_, _| panic!("held")),
+            Ok(Some(BackendOutcome::WouldBlock))
+        );
+    }
+    let frames = drain_packets(&mut a, MDL + 1).unwrap().unwrap();
+    assert_eq!(frames.len(), 1);
+    let (header, (id, df, ..), _) = sent_v4(&frames[0]);
+    assert!(!df && id != 0);
+    assert_eq!(&header[20..], &[&RR_RECORDED[..], &TS_RECORDED, &[0]].concat()[..]);
+    assert_eq!(clock.calls, 1);
 }

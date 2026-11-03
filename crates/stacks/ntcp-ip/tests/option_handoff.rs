@@ -14,7 +14,6 @@ fn with_options(frame: &mut Vec<u8>, options: &[u8]) {
 
 //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
 //= type=test
-//= reason=Opaque TLVs now survive bounded parsing and real TCP handoff in core, codec, example and native input. Native and disabled example profiles still discard known RR/Timestamp metadata, and the ICMP feedback decoder does not expose option metadata to its consumer; complete all-option TCP/ICMP handoff needs those capability/interface contracts.
 //# All IP options (except NOP or END-OF-LIST) received in datagrams MUST be
 //# passed to the transport layer (or to ICMP processing when the datagram is
 //# an ICMP message). The IP and transport layer MUST each interpret those IP
@@ -40,8 +39,9 @@ fn checksummed_frames_carry_opaque_options_through_tcp_handshake_and_data() {
             let listener = server.listen(remote, 1).unwrap();
             let id = client.connect(0, local, remote).unwrap();
             let mut raw = unknown.to_vec();
-            if enabled && raw.len() < 32 {
-                raw.splice(0..0, [7, 7, 4, 0, 0, 0, 0, 1]);
+            // Record Route and Timestamp are retained metadata in both profiles.
+            if raw.len() < 32 {
+                raw.splice(0..0, [7, 7, 4, 0, 0, 0, 0, 1, 68, 8, 5, 0, 0, 0, 0, 0]);
             }
             let expected = Ipv4Options::parse(&raw, false).unwrap();
             let transfer = |from: &mut Endpoint, to: &mut Endpoint, opaque: bool| {

@@ -69,8 +69,8 @@ pub use endpoint::{
     ListenerId, PendingPmtuApplied, PhysicalReceipt, PollTransmit, Transmit,
 };
 pub use ipv4_options::{
-    Ipv4Options, Ipv4OptionsError, Ipv4Timestamp, OutgoingIpv4Options, SourceRoute,
-    TimestampRequest, copied_fragment_options,
+    EncodedIpv4Options, Ipv4Options, Ipv4OptionsError, Ipv4Timestamp, Ipv4TimestampProvider, OutgoingIpv4Options,
+    SourceRoute, TimestampRequest, copied_fragment_options,
 };
 pub use recovery::{CongestionAlgorithm, InitialWindow, RecoveryAlgorithm};
 pub use wire::{IpMetadata, WireError};

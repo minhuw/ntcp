@@ -322,7 +322,10 @@ impl Network {
                 ntcp_host::ReceiveCapabilities {
                     max_ip_packet: MAX_IP_PACKET,
                     ipv4: if ipv4 {
-                        ntcp_host::Ipv4Receive::Unrecognized
+                        ntcp_host::Ipv4Receive::Enabled {
+                            interpretation: false,
+                            source_routes: false,
+                        }
                     } else {
                         ntcp_host::Ipv4Receive::Disabled
                     },
@@ -411,6 +414,9 @@ impl Network {
         else {
             return;
         };
+        let Ok(datagram) = self.host.process(datagram, None) else {
+            return;
+        };
         let Ok(decoded) = self.host.decode_datagram(datagram) else {
             return;
         };
@@ -425,7 +431,6 @@ impl Network {
                 datagram,
                 ntcp::RxPacketMetadata::default(),
                 0,
-                None,
             );
         }
     }

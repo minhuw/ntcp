@@ -26,8 +26,8 @@ pub use icmp_error::IcmpErrorLimits;
 mod ingress;
 use ingress::IcmpOutput;
 pub use ingress::{
-    Datagram, EchoDisposition, Envelope, IcmpOutputCounters, IcmpOutputLimits, Received,
-    managed_icmp_output_limits,
+    Datagram, EchoDisposition, Envelope, IcmpOutputCounters, IcmpOutputLimits, Processed,
+    ProcessedEnvelope, Received, managed_icmp_output_limits,
 };
 mod reassembly;
 use reassembly::Reassembly;
@@ -111,17 +111,43 @@ pub struct ReceiveCapabilities {
     pub ipv6: Ipv6Receive,
     pub gro: bool,
 }
+/// IPv4 receive profile. Every enabled profile validates the options of each
+/// datagram and hands every option except NOP and EOL, known or unknown, to
+/// TCP and to ICMP processing (RFC 1122 section 3.2.1.8); the two settings
+/// change only what the Host interprets or admits, never what it retains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ipv4Receive {
     Disabled,
-    /// Validate framing and retain unrecognized options while leaving known
-    /// option interpretation disabled by the embedding's receive policy.
-    Unrecognized,
-    /// Current codec decoding and metadata retention; this does not promise
-    /// complete IPv4 option processing (the remaining host work is T14).
-    Options {
+    Enabled {
+        /// Record Route and Timestamp interpretation, which RFC 1122 section
+        /// 3.2.1.8 makes optional: destination processing (`Host::process`)
+        /// records this host in them once per complete datagram. Without it
+        /// they are delivered exactly as received.
+        interpretation: bool,
+        /// Admission of datagrams carrying a Loose or Strict Source Route,
+        /// checked on every fragment before reassembly. Use of the return
+        /// route is authorized separately by its consumer.
         source_routes: bool,
     },
+}
+impl Ipv4Receive {
+    // Source-route admission, or None when IPv4 is disabled.
+    pub(crate) fn source_routes(self) -> Option<bool> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { source_routes, .. } => Some(source_routes),
+        }
+    }
+    // Record Route and Timestamp interpretation.
+    pub(crate) fn interpretation(self) -> bool {
+        matches!(
+            self,
+            Self::Enabled {
+                interpretation: true,
+                ..
+            }
+        )
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ipv6Receive {
@@ -1283,21 +1309,13 @@ impl Host {
         }
         let packet = match frame.first().ok_or(ntcp_ip::Error::Truncated)? >> 4 {
             4 => {
-                let source_routes = match capabilities.ipv4 {
-                    Ipv4Receive::Disabled => return Err(Error::Unsupported),
-                    Ipv4Receive::Unrecognized => false,
-                    Ipv4Receive::Options { source_routes } => source_routes,
-                };
-                let packet = ntcp_ip::parse(frame, source_routes)?;
+                let source_routes = capabilities.ipv4.source_routes();
+                let packet = ntcp_ip::parse(frame, source_routes.ok_or(Error::Unsupported)?)?;
                 IngressPacket {
                     ip: packet.ip,
                     traffic_class: packet.traffic_class,
                     protocol: packet.protocol,
-                    options: if capabilities.ipv4 == Ipv4Receive::Unrecognized {
-                        packet.ipv4_options.unrecognized()
-                    } else {
-                        packet.ipv4_options
-                    },
+                    options: packet.ipv4_options,
                     payload: packet.payload,
                 }
             }
@@ -1317,14 +1335,18 @@ impl Host {
     }
 
     /// One physical packet arriving by link-layer unicast: `receive`
-    /// (framing, local authority, reassembly) and then, for a complete
-    /// datagram, `input_datagram`; a fragment held for reassembly is
-    /// Processed, one it discarded Dropped.
+    /// (framing, local authority, reassembly), destination processing
+    /// (`process`) and then, for a complete datagram, `input_datagram`; a
+    /// fragment held for reassembly is Processed, one it discarded Dropped,
+    /// as is a datagram whose Timestamp option cannot be advanced.
     ///
-    /// Complete outer metadata is validated before dispatch. Quoted options
-    /// remain historical data inside the ICMP decoder and are never recorded
-    /// as present-day destination options. Timestamp recording, when requested,
-    /// is the caller's explicit low-level clock contract, not a UTC guarantee.
+    /// Quoted options remain historical data inside the ICMP decoder and are
+    /// never recorded as present-day destination options. `timestamp` is the
+    /// caller-asserted wire value written to an eligible Timestamp slot when
+    /// interpretation is enabled (`Ipv4Options::record`): the caller's
+    /// explicit low-level clock contract, not a UTC guarantee. Without one,
+    /// Record Route is still recorded and the Timestamp option kept as it
+    /// arrived.
     #[allow(clippy::too_many_arguments)]
     pub fn input_ip(
         &mut self,
@@ -1342,7 +1364,13 @@ impl Host {
         let mut completed = core::mem::take(&mut self.completed);
         let result = match self.receive(context, now, frame, false, &mut completed) {
             Ok(Received::Datagram(datagram)) => {
-                self.input_datagram(endpoint, now, datagram, metadata, outgoing_dscp, timestamp)
+                match self.process_clock(datagram, ingress::Clock::Asserted(timestamp)) {
+                    Ok(Some(processed)) => {
+                        self.input_datagram(endpoint, now, processed, metadata, outgoing_dscp)
+                    }
+                    Ok(None) => Ok(ntcp::InputDisposition::Dropped),
+                    Err(error) => Err(error),
+                }
             }
             Ok(Received::Held) => Ok(ntcp::InputDisposition::Processed),
             Ok(Received::Discarded) => Ok(ntcp::InputDisposition::Dropped),
@@ -1352,8 +1380,8 @@ impl Host {
         result
     }
 
-    // UDP and TCP input of one validated complete datagram.
-    #[allow(clippy::too_many_arguments)]
+    // UDP and TCP input of one processed complete datagram: its options are
+    // the result of destination processing, never recorded again here.
     fn input_transport(
         &mut self,
         endpoint: &mut Endpoint,
@@ -1362,7 +1390,6 @@ impl Host {
         packet: &IngressPacket,
         metadata: RxPacketMetadata,
         outgoing_dscp: u8,
-        timestamp: Option<u32>,
     ) -> Result<ntcp::InputDisposition, Error> {
         self.owned_on_link(context, packet.ip.destination)?;
         if metadata.tcp_segment_size.is_some() && !self.port(context.link)?.receive.gro {
@@ -1379,21 +1406,11 @@ impl Host {
             if self.bindings.iter().all(Option::is_some) {
                 self.collect(endpoint)?;
             }
-            let mut options = packet.options;
-            if let (Some(timestamp), IpAddr::V4(local)) = (timestamp, packet.ip.destination) {
-                // Failure to record a received option invalidates this packet,
-                // not the embedding. In particular a full Timestamp option
-                // with overflow 15 cannot be advanced any further.
-                let Ok(recorded) = options.record(local, timestamp) else {
-                    return Ok(ntcp::InputDisposition::Dropped);
-                };
-                options = recorded;
-            }
             Ok(endpoint.input_with_path_provider(
                 now,
                 packet.ip,
                 packet.traffic_class,
-                options,
+                packet.options,
                 packet.payload,
                 metadata,
                 outgoing_dscp,
@@ -1427,8 +1444,9 @@ impl Host {
     /// estimate is published only for its current-path Decreased or
     /// Unchanged disposition (never for Deferred). A reserved owner is returned as Deferred, carrying
     /// the normalized report, before anything is applied. Unmatched quotes are discarded; there is no fallback to the
-    /// connection-local sent ring. `frame` is one unfragmented packet; an
-    /// Echo Request is answered by the Echo service (`input_icmp_datagram`).
+    /// connection-local sent ring. `frame` is one unfragmented packet, given
+    /// destination processing without a clock (`process`); an Echo Request
+    /// is answered by the Echo service (`input_icmp_datagram`).
     pub fn input_icmp(
         &mut self,
         endpoint: &mut Endpoint,
@@ -1439,7 +1457,8 @@ impl Host {
         let datagram = Envelope::physical(context, frame.len())
             .datagram(frame)
             .ok_or(Error::Obsolete)?;
-        self.input_icmp_datagram(endpoint, now, datagram)
+        let processed = self.process(datagram, None)?;
+        self.input_icmp_datagram(endpoint, now, processed)
     }
 
     /// Apply a deferred report to its owner generation, or defer it again
@@ -1475,14 +1494,13 @@ impl Host {
         &mut self,
         endpoint: &mut Endpoint,
         now: Instant,
-        datagram: Datagram<'_>,
+        context: IngressContext,
         packet: &IngressPacket,
     ) -> Result<IcmpDispatch, Error> {
         use IcmpDispatch::Completed;
         use IcmpOutcome::Discarded;
-        let context = datagram.context();
         self.owned_in_context(context, packet.ip.destination)?;
-        let feedback = ntcp_icmp::decode_icmp_quote(datagram.bytes())?;
+        let feedback = icmp_feedback(packet)?;
         // RFC 6633: after wire validation, before correlation, clock
         // advancement or any access to a possibly reserved owner.
         if feedback.kind == FeedbackKind::SourceQuench {
@@ -1583,7 +1601,7 @@ impl Host {
         let Some(dropped) = dropped else {
             // The Host's own Echo probes are not in the ledger: their
             // identifier, sequence and exact length match the adjunct.
-            if let Some(outcome) = self.adjunct_error(now, datagram.bytes(), &feedback)? {
+            if let Some(outcome) = self.adjunct_error(now, packet.payload, &feedback)? {
                 return Ok(Completed(IcmpOutcome::Probe(outcome)));
             }
             return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
@@ -2313,6 +2331,20 @@ fn quoted(key: &QuoteKey) -> (u32, u16) {
 
 fn is_icmp(packet: &IngressPacket) -> bool {
     packet.protocol == if packet.ip.source.is_ipv4() { 1 } else { 58 }
+}
+
+// The ICMP error carried by a processed datagram, decoded from its message
+// with the processed outer metadata: the outer header is never parsed again
+// (so a source route the Host admitted is not refused here) and its options
+// are the ones destination processing produced.
+pub(crate) fn icmp_feedback(
+    packet: &IngressPacket,
+) -> Result<ntcp_icmp::Feedback<ntcp_icmp::Quote>, Error> {
+    Ok(ntcp_icmp::decode_error(
+        packet.ip,
+        packet.options,
+        packet.payload,
+    )?)
 }
 
 // Host-level validation of a PTB's next-hop MTU for owners without TCP

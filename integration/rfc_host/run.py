@@ -19,6 +19,7 @@ sys.dont_write_bytecode = True
 from bridge import Bridge
 import admin
 import icmp
+import options
 from linux_peer import fnv, pattern
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -212,6 +213,14 @@ def icmp_child(case, proof):
                                          commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
 
 
+def options_child(case, proof):
+    evidence = options.child(case, proof, dict(native=BINARY, tun_echo=TUN_ECHO), Peer, command, setup)
+    emit("T14_OPTIONS_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                                  kernel_version=os.uname().version, evidence=evidence,
+                                  build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                             commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
 def admin_child(case, proof):
     run_case = dict(refuse=admin.refuse_child, reenable=admin.reenable_child).get(case["scenario"], admin.child)
     evidence = run_case(case, proof, TUN_ECHO, PATHCTL, Peer, command, emit)
@@ -347,6 +356,8 @@ def child(case):
         return admin_child(case, proof)
     if case.get("kind") == "native-admin":
         return native_admin_child(case, proof)
+    if case.get("kind") == "ip-options":
+        return options_child(case, proof)
     family, role, policy, scenario = (case[k] for k in ("family", "role", "policy", "scenario"))
     kernel, native = ("198.18.0.1", "198.18.0.2") if family == 4 else ("fd54:3500::1", "fd54:3500::2")
     settings = setup(family, kernel, native)
@@ -544,10 +555,11 @@ def main():
     cases = matrix()
     icmp_cases = icmp.cases()
     admin_cases = admin.cases()
+    option_cases = options.cases()
     emit("T5_NETWORK_BUILD", dict(schema_version=1, command=build, commit=commit,
                                   source_sha256=source, binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
                                   icmp_command=echo_build, icmp_cases=icmp_cases,
-                                  admin_command=pathctl_build, admin_cases=admin_cases,
+                                  admin_command=pathctl_build, admin_cases=admin_cases, option_cases=option_cases,
                                   pathctl_sha256=hashlib.sha256(PATHCTL.read_bytes()).hexdigest(),
                                   tun_echo_sha256=hashlib.sha256(TUN_ECHO.read_bytes()).hexdigest(),
                                   ptb_stage_sha256=hashlib.sha256(STAGED.read_bytes()).hexdigest(),
@@ -564,7 +576,8 @@ def main():
     namespace_ids = []
     icmp_completed = 0
     admin_completed = 0
-    for case in icmp_cases + admin_cases + cases:
+    option_completed = 0
+    for case in icmp_cases + admin_cases + option_cases + cases:
         assert time.monotonic() - started < 1740, "30 minute total gate budget"
         fds = [os.open("/proc/self/ns/" + kind, os.O_RDONLY) for kind in ("net", "user")]
         try:
@@ -595,7 +608,7 @@ def main():
                 print(err, end="", file=sys.stderr, flush=True)
             assert code == 0, dict(case=case, command=cmd, exit=code)
             tag = ("T9_ICMP_CASE " if case in icmp_cases else "T12_ADMIN_CASE " if case in admin_cases
-                   else "T5_NETWORK_CASE ")
+                   else "T14_OPTIONS_CASE " if case in option_cases else "T5_NETWORK_CASE ")
             summaries = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(tag)]
             assert len(summaries) == 1 and summaries[0]["case"] == case, "missing case summary"
             summary = summaries[0]
@@ -607,6 +620,10 @@ def main():
                 namespace_ids.append(summary["namespace"])
                 admin_completed += 1
                 continue
+            if case in option_cases:
+                namespace_ids.append(summary["namespace"])
+                option_completed += 1
+                continue
             stream_count += summary["streams"]
             refusal_count += summary["completions"] - summary["streams"]
             namespace_ids.append(summary["namespace"])
@@ -617,8 +634,10 @@ def main():
     assert completed == len(cases) and stream_count > 0 and refusal_count == 12
     assert icmp_completed == len(icmp_cases) == 23
     assert admin_completed == len(admin_cases) == 7
+    assert option_completed == len(option_cases) == 3
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
                                     icmp_cases=icmp_completed, admin_cases=admin_completed,
+                                    option_cases=option_completed,
                                     namespaces=namespace_ids, kernel=os.uname().release,
                                     stream_sha256={name: hashlib.sha256(pattern(n, salt)).hexdigest()
                                                    for name, n, salt in (("request", 8192, 7), ("response", 6144, 11),

@@ -191,6 +191,166 @@ fn reserved_owner_retains_the_completed_datagram_never_a_fragment() {
     }
 }
 
+// `packet` (IPv4) with `options` inserted after its base header.
+fn with_ipv4_options(packet: &[u8], options: &[u8]) -> Vec<u8> {
+    let mut packet = packet.to_vec();
+    packet.splice(IP_HEADER..IP_HEADER, options.iter().copied());
+    packet[0] = 0x45 + (options.len() / 4) as u8;
+    let len = packet.len() as u16;
+    packet[2..4].copy_from_slice(&len.to_be_bytes());
+    seal_ip(&mut packet);
+    packet
+}
+
+// The drain's retention keeps the result of destination processing: a
+// segment for a reserved owner is processed (recorded with the loop's sample,
+// marked nonstandard) before it is retained; passes that defer it again and
+// its dispatch record nothing more, and a stale owner generation never
+// receives it. With interpretation disabled every option arrives unrecorded
+// and a source route is refused.
+#[test]
+fn retained_segment_keeps_its_destination_processing() {
+    // RR and TS (flag 1) with two free slots each, an opaque copied and a
+    // non-copied option.
+    let mut raw = vec![30, 2, 158, 3, 0, 7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0, 68, 20, 5, 1];
+    raw.extend_from_slice(&[0; 16]);
+    let received = ntcp::Ipv4Options::parse(&raw, false).unwrap();
+    for (options, stale) in [(true, false), (true, true), (false, false)] {
+        let mut p = Pair::with_options(false, true, options);
+        let IpAddr::V4(local) = p.local.ip() else { unreachable!() };
+        let expected = if options {
+            // An unmarked loop sample is still written marked.
+            let recorded = received.record(local, 0x8000_04d2).unwrap();
+            let out = recorded.as_bytes();
+            assert_eq!(&out[5..16], &[7, 11, 8, 192, 0, 2, 1, 0, 0, 0, 0]);
+            assert_eq!(&out[16..28], &[68, 20, 13, 1, 192, 0, 2, 1, 0x80, 0, 4, 0xd2]);
+            assert_eq!(&out[28..], &[0; 8]);
+            recorded
+        } else {
+            received
+        };
+        p.a.write(p.aid, &[0x21; 2000]).unwrap();
+        let mut backend = Backend { blocked: true, ..Default::default() };
+        let mut output = [0; MTU];
+        let mut pending = None;
+        transmit_frames(&mut p.ahost, &mut p.a, p.time, &mut output, &mut pending, IP_HEADER,
+            0, &mut backend).unwrap();
+        assert!(p.a.is_output_reserved(p.aid));
+        let before = p.a.received_ipv4_options(p.aid).unwrap();
+        p.b.write(p.bid, b"retained options").unwrap();
+        let frames = emit(&mut p.bhost, &mut p.b, p.time, p.remote.ip());
+        assert_eq!(frames.len(), 1);
+        if !options {
+            // A completed source route is refused by the disabled profile.
+            let routed = with_ipv4_options(&frames[0], &[131, 7, 8, 192, 0, 2, 9, 0]);
+            input_frame(&mut p.ahost, &mut p.a, p.time, &routed, p.local.ip(), options, 1234)
+                .unwrap();
+            assert!(p.ahost.received.is_empty());
+        }
+        let frame = with_ipv4_options(&frames[0], &raw);
+        input_frame(&mut p.ahost, &mut p.a, p.time, &frame, p.local.ip(), options, 1234)
+            .unwrap();
+        assert_eq!(p.ahost.received.len(), 1);
+        // Later passes defer it again unchanged.
+        for pass in 1..=3 {
+            p.ahost.replay(&mut p.a, p.time + pass).unwrap();
+            assert_eq!(p.ahost.received.len(), 1);
+            assert_eq!(p.a.received_ipv4_options(p.aid).unwrap(), before);
+        }
+        if stale {
+            // Release the reservation without sending, end the generation
+            // and reuse its tuple before the drain replays.
+            let held = pending.take().unwrap();
+            p.ahost.host.cancel_submission(held.ticket.unwrap());
+            assert!(p.a.abandon_transmit(held.attempt).unwrap());
+            p.a.abort(p.aid).unwrap();
+            assert_eq!(p.a.state(p.aid).unwrap(), State::Closed);
+            p.a.release(p.aid).unwrap();
+            let cfg = runtime_config(&Backend::default(), p.local.ip(), true, true, options)
+                .unwrap();
+            let id = p.a.connect_with_path_provider(p.time + 5, p.local, p.remote,
+                ntcp::ManagedOpenOptions {
+                    transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                    dscp: cfg.dscp,
+                    ipv4_options: Default::default(),
+                    receive_authority: None,
+                }, &mut p.ahost.host).unwrap();
+            assert_ne!(id, p.aid);
+            p.ahost.replay(&mut p.a, p.time + 6).unwrap();
+            assert!(p.ahost.received.is_empty());
+            // Never dispatched to the new generation, which would answer the
+            // old stream's segment with a reset.
+            let sent = emit(&mut p.ahost, &mut p.a, p.time + 7, p.local.ip());
+            assert_eq!(sent.len(), 1);
+            let flags = segment(&sent[0]).header.flags;
+            assert_eq!(flags & (ntcp::wire::SYN | ntcp::wire::ACK | ntcp::wire::RST),
+                ntcp::wire::SYN);
+            assert_eq!(p.a.received_ipv4_options(id).unwrap(), None);
+            continue;
+        }
+        backend.blocked = false;
+        transmit_frames(&mut p.ahost, &mut p.a, p.time + 4, &mut output, &mut pending, IP_HEADER,
+            0, &mut backend).unwrap();
+        assert!(p.ahost.received.is_empty());
+        // Recorded once, with the sample at arrival.
+        assert_eq!(p.a.received_ipv4_options(p.aid).unwrap(), Some(expected));
+        let mut bytes = [0; 64];
+        assert_eq!(p.a.read(p.aid, &mut bytes).unwrap(), 16);
+        assert_eq!(&bytes[..16], b"retained options");
+    }
+}
+
+// The Host Echo service through the TUN drain. With options enabled
+// (NTCP_IPV4_OPTIONS=1) a reply carries the request's Record Route and
+// Timestamp recorded once with this host and the loop's sample marked
+// nonstandard, never the unknown option; a source-routed request is
+// answered along its reversed route when the TUN policy authorizes every
+// hop, and a structurally valid route through the subnet broadcast address
+// is refused and counted. With options disabled the reply carries none.
+#[test]
+fn echo_replies_carry_processed_options_through_the_tun_drain() {
+    let (local, remote) = addresses(false);
+    let to_us = IpMetadata { source: remote.ip(), destination: local.ip() };
+    // RR with two free slots, TS (flag 1) with one, an unknown option.
+    let area = [7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0, 68, 12, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 30, 2, 0,
+        0, 0];
+    let recorded = [7, 11, 8, 192, 0, 2, 1, 0, 0, 0, 0, 68, 12, 13, 1, 192, 0, 2, 1, 0x80, 0, 4,
+        0xd2, 0];
+    for options in [true, false] {
+        let (mut a, mut ahost) = endpoint_with_options(local.ip(), true, options);
+        let mut backend = Backend::default();
+        let mut buffer = [0; MTU];
+        let data = [0x42; 48];
+        let request = with_ipv4_options(&echo_request(to_us, 0x77, 1, &data), &area);
+        input_frame(&mut ahost, &mut a, 1, &request, local.ip(), options, 1234).unwrap();
+        assert!(ahost.icmp_output(1, &mut buffer, &mut backend).unwrap());
+        let reply = backend.frames.pop().unwrap();
+        let header = usize::from(reply[0] & 15) * 4;
+        assert_eq!(&reply[20..header], if options { &recorded[..] } else { &[] });
+        assert_eq!(&reply[16..20], &[192, 0, 2, 2]);
+        let decoded = ntcp_icmp::decode_echo(
+            IpMetadata { source: local.ip(), destination: remote.ip() }, &reply[header..]).unwrap();
+        assert_eq!((decoded.kind, decoded.identifier, decoded.data),
+            (ntcp_icmp::EchoKind::Reply, 0x77, &data[..]));
+        if !options {
+            continue;
+        }
+        let routed = [131, 11, 12, 192, 0, 2, 9, 192, 0, 2, 8, 0];
+        let request = with_ipv4_options(&echo_request(to_us, 0x77, 2, &data), &routed);
+        input_frame(&mut ahost, &mut a, 2, &request, local.ip(), options, 1234).unwrap();
+        assert!(ahost.icmp_output(2, &mut buffer, &mut backend).unwrap());
+        let reply = backend.frames.pop().unwrap();
+        assert_eq!(&reply[16..20], &[192, 0, 2, 8]);
+        assert_eq!(&reply[20..32], &[131, 11, 4, 192, 0, 2, 9, 192, 0, 2, 2, 0]);
+        let denied = [131, 7, 8, 192, 0, 2, 255, 0];
+        let request = with_ipv4_options(&echo_request(to_us, 0x77, 3, &data), &denied);
+        input_frame(&mut ahost, &mut a, 3, &request, local.ip(), options, 1234).unwrap();
+        assert_eq!(ahost.host.icmp_output_pending(), 0);
+        assert_eq!(ahost.host.icmp_output_counters().unauthorized_routes, 1);
+        assert!(backend.frames.is_empty());
+    }
+}
+
 #[test]
 fn datagram_settings_are_validated_and_reported() {
     let v4: IpAddr = "192.0.2.1".parse().unwrap();

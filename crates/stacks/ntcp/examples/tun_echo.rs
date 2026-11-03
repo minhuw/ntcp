@@ -35,9 +35,9 @@ mod linux {
     #[cfg(test)]
     use ntcp::{IpMetadata, Ipv4Options};
     use ntcp_host::{
-        BackendOutcome, Continuity, Datagram, DatagramError, DeferredIcmp, EgressContext,
-        Envelope, Host, IcmpDispatch, IngressContext, Received, Submission, SubmissionTicket,
-        UdpEvent, UdpFlowId, UdpSend, UdpSendError, UdpSendMode, UdpSent, path,
+        BackendOutcome, Continuity, DatagramError, DeferredIcmp, EgressContext, Host,
+        IcmpDispatch, IngressContext, Processed, ProcessedEnvelope, Received, Submission,
+        SubmissionTicket, UdpEvent, UdpFlowId, UdpSend, UdpSendError, UdpSendMode, UdpSent, path,
     };
     use ntcp_io::{PacketIo, TxOutcome};
     use ntcp_io_tun::Tun;
@@ -252,13 +252,23 @@ mod linux {
         }
     }
 
-    // A retained TCP segment is the complete datagram (never a fragment):
-    // its envelope and bytes. A deferred ICMP report needs only its token.
+    // A retained TCP segment is the complete datagram (never a fragment)
+    // after destination processing: its processed envelope and bytes. A
+    // deferred ICMP report needs only its token.
     struct RetainedIngress {
         owner: Retained,
-        envelope: Option<Envelope>,
+        envelope: Option<ProcessedEnvelope>,
         bytes: Vec<u8>,
-        timestamp: u32,
+    }
+
+    // The loop's elapsed-time sample for destination processing, always
+    // marked nonstandard: the example has no characterized UTC clock, and
+    // RFC 791 section 3.1 permits any time with the high-order bit set.
+    struct Sample(u32);
+    impl ntcp::Ipv4TimestampProvider for Sample {
+        fn ipv4_timestamp(&mut self) -> Option<ntcp::Ipv4Timestamp> {
+            Some(ntcp::Ipv4Timestamp::nonstandard(self.0))
+        }
     }
 
     // One actual caller-owned L3 forwarding port. All ingress storage is
@@ -390,12 +400,9 @@ mod linux {
                     ntcp_host::ReceiveCapabilities {
                         max_ip_packet: MAX_IP_PACKET,
                         ipv4: if local.is_ipv4() {
-                            if config.ipv4_options_enabled {
-                                ntcp_host::Ipv4Receive::Options {
-                                    source_routes: true,
-                                }
-                            } else {
-                                ntcp_host::Ipv4Receive::Unrecognized
+                            ntcp_host::Ipv4Receive::Enabled {
+                                interpretation: config.ipv4_options_enabled,
+                                source_routes: config.ipv4_options_enabled,
                             }
                         } else {
                             ntcp_host::Ipv4Receive::Disabled
@@ -474,7 +481,7 @@ mod linux {
         }
 
         // TCP segments only; ICMP ownership is the Host dispatcher's decision.
-        fn owner(&self, endpoint: &Endpoint, datagram: Datagram) -> Option<ConnectionId> {
+        fn owner(&self, endpoint: &Endpoint, datagram: Processed) -> Option<ConnectionId> {
             let packet = self.host.decode_datagram(datagram).ok()?;
             if packet.protocol != 6 {
                 return None;
@@ -488,12 +495,7 @@ mod linux {
 
         // Retention follows completion: a TCP owner keeps the complete
         // datagram, never a fragment.
-        fn retain(
-            &mut self,
-            owner: Retained,
-            datagram: Option<Datagram>,
-            timestamp: u32,
-        ) -> io::Result<()> {
+        fn retain(&mut self, owner: Retained, datagram: Option<Processed>) -> io::Result<()> {
             let mut bytes = self
                 .free
                 .pop()
@@ -507,7 +509,6 @@ mod linux {
                 owner,
                 envelope: datagram.map(|d| d.envelope()),
                 bytes,
-                timestamp,
             });
             Ok(())
         }
@@ -537,7 +538,6 @@ mod linux {
                                 datagram,
                                 ntcp::RxPacketMetadata::default(),
                                 self.dscp,
-                                self.options_enabled.then_some(retained.timestamp),
                             ))?;
                         }
                     }
@@ -755,10 +755,12 @@ mod linux {
         {
             return None;
         }
+        // Like Host destination processing, disabled interpretation keeps
+        // every option as received.
         let options = if enabled {
             parsed.ipv4_options.record(local, timestamp).ok()?
         } else {
-            parsed.ipv4_options.unrecognized()
+            parsed.ipv4_options
         };
         Some((parsed.ip, parsed.payload, options))
     }
@@ -875,7 +877,6 @@ mod linux {
     //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
     //# that implements PAWS MUST also implement Path MTU Discovery.
     //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
-    //= reason=The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.
     //# The destination host MUST (if possible) add the current timestamp to
     //# a Timestamp option before passing the option to the transport layer
     //# or to ICMP for processing.
@@ -933,6 +934,11 @@ mod linux {
         else {
             return Ok(());
         };
+        // Destination processing happens once, here; retention and replay
+        // keep its result.
+        let Ok(datagram) = network.host.process(datagram, Some(&mut Sample(timestamp))) else {
+            return Ok(());
+        };
         let Ok(decoded) = network.host.decode_datagram(datagram) else {
             return Ok(());
         };
@@ -943,14 +949,14 @@ mod linux {
             if let Some(IcmpDispatch::Deferred(deferred)) =
                 silent(network.host.input_icmp_datagram(endpoint, time, datagram))?
             {
-                network.retain(Retained::Icmp(deferred), None, timestamp)?;
+                network.retain(Retained::Icmp(deferred), None)?;
             }
             return Ok(());
         }
         if let Some(owner) = network.owner(endpoint, datagram)
             && endpoint.is_output_reserved(owner)
         {
-            return network.retain(Retained::Tcp(owner), Some(datagram), timestamp);
+            return network.retain(Retained::Tcp(owner), Some(datagram));
         }
         silent(network.host.input_datagram(
             endpoint,
@@ -958,7 +964,6 @@ mod linux {
             datagram,
             ntcp::RxPacketMetadata::default(),
             network.dscp,
-            network.options_enabled.then_some(timestamp),
         ))?;
         Ok(())
     }
@@ -2537,6 +2542,124 @@ mod linux {
             assert_eq!(checksum(&syn[0][..20]), 0);
         }
 
+        // RFC 6864 uniqueness holds at the final destination: a source-routed
+        // SYN on a discovery-disabled path leaves DF clear through this
+        // embedding's `lease_df_clear` with an Identification of the
+        // (source, final destination, TCP) tuple, so an option-free packet
+        // to that destination leases the next value, not its first hop's.
+        #[test]
+        fn source_routed_df_clear_frames_lease_for_the_final_destination() {
+            use ntcp_io::{PacketIo, PacketLayer};
+            const MDL_US: u64 = 120_000_000;
+            struct Mock {
+                submitted: Vec<Vec<u8>>,
+            }
+            impl PacketIo for Mock {
+                fn layer(&self) -> PacketLayer {
+                    PacketLayer::Ip
+                }
+                fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+                    Ok(None)
+                }
+                fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+                    self.submitted.push(packet.to_vec());
+                    Ok(TxOutcome::Submitted)
+                }
+            }
+            let (_, _, local) = packet();
+            let mut output = [0; MTU];
+            let mut pending = None;
+            let mut backend = Mock {
+                submitted: Vec::new(),
+            };
+            let config = EndpointConfig {
+                ipv4_options_enabled: true,
+                ..Default::default()
+            };
+            let mut endpoint =
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
+            let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
+            let destination: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+            let hop = Ipv4Addr::new(10, 0, 0, 9);
+            endpoint
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(local.into(), 1234),
+                    destination,
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&config.connection),
+                        dscp: config.dscp,
+                        ipv4_options: ntcp::OutgoingIpv4Options {
+                            source_route: Some(ntcp::SourceRoute::new(&[hop], false).unwrap()),
+                            ..Default::default()
+                        },
+                        receive_authority: None,
+                    },
+                    &mut network.host,
+                )
+                .unwrap();
+            let capability = network.host.administration();
+            let target = network
+                .host
+                .admin_paths(&capability)
+                .unwrap()
+                .find(|p| p.snapshot.key().destination().address() == destination.ip())
+                .unwrap();
+            let candidate = network
+                .host
+                .admin_validate(
+                    &capability,
+                    0,
+                    path::AdminChange {
+                        target: path::AdminTarget::Path(target.snapshot.path()),
+                        expected: target.generation,
+                        policy: path::AdminPolicy {
+                            discovery_disabled: true,
+                            estimate: None,
+                        },
+                    },
+                )
+                .unwrap();
+            network
+                .host
+                .admin_apply(&capability, &mut endpoint, candidate)
+                .unwrap();
+            transmit_frames(
+                &mut network,
+                &mut endpoint,
+                MDL_US,
+                &mut output,
+                &mut pending,
+                IP_HEADER,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            let syn = &backend.submitted[0];
+            let header = usize::from(syn[0] & 15) * 4;
+            assert!(header > 20, "the source route is in the header");
+            assert_eq!(&syn[16..20], &hop.octets(), "sent to the route's first hop");
+            assert_eq!(syn[6] & 0x40, 0, "DF clear on the disabled path");
+            assert_eq!(checksum(&syn[..header]), 0);
+            let first = u16::from_be_bytes([syn[4], syn[5]]);
+            assert_ne!(first, 0);
+            // An option-free TCP header to the final destination.
+            let mut direct = [0; 40];
+            direct[..12].copy_from_slice(&[0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0]);
+            direct[12..16].copy_from_slice(&local.octets());
+            if let IpAddr::V4(final_destination) = destination.ip() {
+                direct[16..20].copy_from_slice(&final_destination.octets());
+            }
+            let sum = checksum(&direct[..20]);
+            direct[10..12].copy_from_slice(&sum.to_be_bytes());
+            network.host.lease_df_clear(MDL_US, &mut direct).unwrap();
+            assert_eq!(direct[6] & 0x40, 0);
+            assert_eq!(
+                u16::from_be_bytes([direct[4], direct[5]]),
+                first.wrapping_add(1)
+            );
+        }
+
         // The final bytes follow the decision current at each submission:
         // a SYN rewritten DF clear with a leased Identification on a
         // discovery-disabled path, whose submission the backend refuses
@@ -3327,7 +3450,6 @@ mod linux {
 
         //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8
         //= type=test
-        //= reason=The enabled example records exactly once before real TCP input, including prespecified addresses. The reusable codec has no local clock/recording context, and the ICMP feedback path does not record or hand off destination timestamps; complete host handoff requires an explicit local-clock and ICMP option-metadata contract.
         //# The destination host MUST (if possible) add the current timestamp to
         //# a Timestamp option before passing the option to the transport layer
         //# or to ICMP for processing.
@@ -3423,7 +3545,7 @@ mod linux {
                         let raw: &[u8] = if enabled {
                             &[30, 2, 158, 2]
                         } else {
-                            // Disabled known processing preserves historical acceptance.
+                            // Disabled interpretation still retains RR and TS.
                             &[30, 2, 158, 2, 7, 3, 4, 1, 68, 4, 5, 0]
                         };
                         bytes.copy_within(20..len, 20 + raw.len());
@@ -3437,10 +3559,11 @@ mod linux {
                     }
                     let parsed = ntcp_ip::parse(&bytes[..len], false).unwrap();
                     assert!(ntcp::wire::parse(parsed.ip, parsed.payload).is_ok());
+                    // Disabled interpretation delivers every option unrecorded.
                     let expected = if enabled {
                         parsed.ipv4_options.record(local, destination_time).unwrap()
                     } else {
-                        parsed.ipv4_options.unrecognized()
+                        parsed.ipv4_options
                     };
                     input_frame(
                         to_host,

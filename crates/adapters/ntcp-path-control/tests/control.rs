@@ -87,7 +87,10 @@ fn side_with(
             1500,
             ReceiveCapabilities {
                 max_ip_packet: 65575,
-                ipv4: Ipv4Receive::Unrecognized,
+                ipv4: Ipv4Receive::Enabled {
+                    interpretation: false,
+                    source_routes: false,
+                },
                 ipv6: Ipv6Receive::BaseHeader,
                 gro: false,
             },

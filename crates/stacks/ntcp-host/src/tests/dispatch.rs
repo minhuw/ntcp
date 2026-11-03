@@ -613,7 +613,8 @@ fn two_links(v6: bool, identity: u128, cfg: &EndpointConfig) -> (Side, IngressCo
     .unwrap();
     let capabilities = ReceiveCapabilities {
         max_ip_packet: 65575,
-        ipv4: Ipv4Receive::Options {
+        ipv4: Ipv4Receive::Enabled {
+            interpretation: true,
             source_routes: false,
         },
         ipv6: Ipv6Receive::BaseHeader,

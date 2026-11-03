@@ -1,6 +1,9 @@
 use core::net::{IpAddr, Ipv4Addr};
-use ntcp::{IpMetadata, OutgoingIpv4Options, SourceRoute, TimestampRequest};
-use ntcp_ip::{Fragmenter, Header, IPV4_HEADER, parse, parse_fragment, quote_fragment_header};
+use ntcp::{EncodedIpv4Options, IpMetadata, OutgoingIpv4Options, SourceRoute, TimestampRequest};
+use ntcp_ip::{
+    Fragmenter, Header, IPV4_HEADER, encode_datagram_with_options, final_destination, parse,
+    parse_fragment, quote_fragment_header,
+};
 use ntcp_ip_common::{Error, PROTOCOL_UDP, checksum, encode_udp, parse_udp};
 
 fn addr(n: u8) -> Ipv4Addr {
@@ -292,4 +295,169 @@ fn fragmenter_refuses_invalid_fragments_and_datagrams() {
         );
     }
     assert_eq!(IPV4_HEADER, 20);
+}
+
+// Reply options carried as is: a loose or strict route toward addr(2) via
+// addr(7), processed RR and TS, an opaque copied and a non-copied TLV.
+fn carried(strict: bool) -> EncodedIpv4Options {
+    let route = SourceRoute::new(&[addr(7)], strict).unwrap();
+    let carried = [
+        7, 11, 8, 192, 0, 2, 5, 0, 0, 0, 0, // RR, one free slot
+        68, 12, 13, 0x10, 0x80, 0, 0, 9, 0x80, 0, 0, 10, // full TS, overflow 1
+        158, 4, 1, 2, // copied opaque
+        30, 2, // non-copied opaque
+    ];
+    EncodedIpv4Options::new(Some(&route), addr(2), &carried).unwrap()
+}
+
+// A whole datagram sends the encoded area as is, with the real header
+// length and the route's first hop in the header; encoding again (a retry)
+// gives identical bytes because nothing is recorded.
+#[test]
+fn encoded_options_whole_datagram_keeps_the_area_and_header_length() {
+    for strict in [false, true] {
+        let options = carried(strict);
+        let area = options.as_bytes();
+        assert_eq!(area.len(), 36);
+        let data = udp(100);
+        let mut packets = Vec::new();
+        for _ in 0..2 {
+            let mut packet = vec![0xee; 56 + data.len()];
+            packet[IPV4_HEADER..IPV4_HEADER + data.len()].copy_from_slice(&data);
+            let header = header(Default::default());
+            let len = encode_datagram_with_options(
+                &mut packet,
+                header,
+                &options,
+                PROTOCOL_UDP,
+                data.len(),
+            )
+            .unwrap();
+            assert_eq!(len, 56 + data.len());
+            packets.push(packet);
+        }
+        assert_eq!(packets[0], packets[1]);
+        let packet = &packets[0];
+        assert_eq!(packet[0], 0x4e, "IHL 14");
+        assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), 164);
+        assert_eq!(checksum(&packet[..56]), 0);
+        assert_eq!(packet[6], 0x40, "an atomic datagram keeps DF");
+        assert_eq!(&packet[16..20], &addr(7).octets());
+        assert_eq!(&packet[20..56], area);
+        assert_eq!(&packet[56..], &data[..]);
+        assert_eq!(final_destination(packet), Ok(addr(2)));
+        let (ip, header_len, total, protocol, _) = quote_fragment_header(packet).unwrap();
+        assert_eq!(ip.destination, IpAddr::V4(addr(2)));
+        assert_eq!((header_len, total, protocol), (56, 164, PROTOCOL_UDP));
+    }
+    // The header must name the area's final destination and originate
+    // nothing else; the output must hold the whole packet.
+    let options = carried(false);
+    let data = udp(100);
+    let mut packet = vec![0; 56 + data.len()];
+    let mut other = header(Default::default());
+    other.ip.destination = addr(7).into();
+    assert_eq!(
+        encode_datagram_with_options(&mut packet, other, &options, PROTOCOL_UDP, data.len()),
+        Err(Error::Options)
+    );
+    let originating = header(OutgoingIpv4Options {
+        record_route_slots: Some(1),
+        ..Default::default()
+    });
+    assert_eq!(
+        encode_datagram_with_options(&mut packet, originating, &options, PROTOCOL_UDP, data.len()),
+        Err(Error::Options)
+    );
+    let mut short = vec![0; 55 + data.len()];
+    assert_eq!(
+        encode_datagram_with_options(
+            &mut short,
+            header(Default::default()),
+            &options,
+            PROTOCOL_UDP,
+            data.len()
+        ),
+        Err(Error::Length)
+    );
+    // Without options the area is empty and the header is 20 octets.
+    let plain = EncodedIpv4Options::new(None, addr(2), &[]).unwrap();
+    let mut packet = vec![0; 20 + data.len()];
+    packet[IPV4_HEADER..].copy_from_slice(&data);
+    let len = encode_datagram_with_options(
+        &mut packet,
+        header(Default::default()),
+        &plain,
+        PROTOCOL_UDP,
+        data.len(),
+    )
+    .unwrap();
+    assert_eq!((len, packet[0]), (20 + data.len(), 0x45));
+    assert_eq!(final_destination(&packet), Ok(addr(2)));
+}
+
+// Source fragments of a datagram with an encoded area: the first carries
+// all of it, every later one only the copied route and opaque TLV (RFC 791
+// section 3.2); sizes follow each fragment's real header length, and
+// offsets, MF, Identification and checksums are correct.
+#[test]
+fn encoded_options_fragments_copy_only_copied_options() {
+    for strict in [false, true] {
+        let options = carried(strict);
+        let data = udp(1000);
+        let f = Fragmenter::with_options(
+            header(Default::default()),
+            &options,
+            PROTOCOL_UDP,
+            0x1234,
+            data.len(),
+        )
+        .unwrap();
+        assert_eq!(f.header_len(0), 56);
+        // Route (7) and copied TLV (4) padded to 12.
+        assert_eq!(f.header_len(8), 32);
+        let packets = fragment(&f, &data, 300);
+        // 300 - 56 = 244 rounds down to 240 data octets first, then 268 to
+        // 264; 1008 - 240 - 2 * 264 = 240 remain.
+        let lens: Vec<_> = packets.iter().map(Vec::len).collect();
+        assert_eq!(lens, [296, 296, 296, 272]);
+        let kind = if strict { 137 } else { 131 };
+        let mut reassembled = vec![0; data.len()];
+        let mut offset = 0;
+        for (i, packet) in packets.iter().enumerate() {
+            let header_len = usize::from(packet[0] & 15) * 4;
+            assert_eq!(checksum(&packet[..header_len]), 0);
+            assert_eq!(&packet[16..20], &addr(7).octets());
+            assert_eq!(final_destination(packet), Ok(addr(2)));
+            let (_, _, _, _, fr) = quote_fragment_header(packet).unwrap();
+            assert_eq!(fr.identification, 0x1234);
+            assert!(fr.dont_fragment);
+            assert_eq!(fr.more_fragments, i + 1 < packets.len());
+            assert_eq!(usize::from(fr.offset), offset);
+            if i == 0 {
+                assert_eq!(&packet[20..56], options.as_bytes());
+            } else {
+                assert_eq!(
+                    &packet[20..header_len],
+                    &[kind, 7, 4, 192, 0, 2, 2, 158, 4, 1, 2, 0]
+                );
+            }
+            let payload = &packet[header_len..];
+            reassembled[offset..offset + payload.len()].copy_from_slice(payload);
+            offset += payload.len();
+        }
+        assert_eq!(offset, data.len());
+        assert_eq!(reassembled, data);
+    }
+    // RR, TS and opaque non-copied options alone leave later fragments bare.
+    let options = EncodedIpv4Options::new(None, addr(2), &[7, 7, 4, 0, 0, 0, 0, 30, 2]).unwrap();
+    let f = Fragmenter::with_options(header(Default::default()), &options, PROTOCOL_UDP, 1, 1000)
+        .unwrap();
+    assert_eq!((f.header_len(0), f.header_len(8)), (32, 20));
+    let mut other = header(Default::default());
+    other.ip.destination = addr(3).into();
+    assert_eq!(
+        Fragmenter::with_options(other, &options, PROTOCOL_UDP, 1, 1000).err(),
+        Some(Error::Options)
+    );
 }

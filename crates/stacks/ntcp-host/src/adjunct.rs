@@ -409,14 +409,31 @@ impl Host {
     /// octets): min(shared ordinary budget, max(connectionless initial,
     /// Host-confirmed lower bound)).
     pub(crate) fn connectionless_size(&self, snapshot: PathSnapshot) -> Result<u32, Error> {
-        let ipv4 = snapshot.key().destination().address().is_ipv4();
-        let initial = if ipv4 {
+        let floor = self
+            .connectionless_initial(snapshot)
+            .max(self.adjunct.confirmed(snapshot.path()));
+        Ok(snapshot.ip_packet_budget()?.min(floor))
+    }
+
+    /// The connectionless effective size for a datagram that leaves over
+    /// `snapshot`'s path but does not follow the direct route the adjunct
+    /// probes (a source-routed one): min(shared ordinary budget,
+    /// connectionless initial), never raised by a Host-confirmed bound.
+    pub(crate) fn connectionless_unconfirmed_size(
+        &self,
+        snapshot: PathSnapshot,
+    ) -> Result<u32, Error> {
+        Ok(snapshot
+            .ip_packet_budget()?
+            .min(self.connectionless_initial(snapshot)))
+    }
+
+    fn connectionless_initial(&self, snapshot: PathSnapshot) -> u32 {
+        if snapshot.key().destination().address().is_ipv4() {
             self.datagram_limits.connectionless.ipv4
         } else {
             self.datagram_limits.connectionless.ipv6
-        };
-        let floor = initial.max(self.adjunct.confirmed(snapshot.path()));
-        Ok(snapshot.ip_packet_budget()?.min(floor))
+        }
     }
 
     /// Record that a datagram of `ip_len` complete IP octets was
@@ -765,6 +782,7 @@ impl Host {
             fragment_size: None,
             snapshot,
             client: None,
+            options: None,
         };
         let result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut *submit);
         let outcome = match result {
@@ -831,7 +849,7 @@ impl Host {
     /// incarnation. A reply reassembled from fragments proves the same
     /// forward delivery; its return path is not measured.
     //= https://www.rfc-editor.org/rfc/rfc4821#section-10.3
-    //= reason=IP fragmentation is a packetization layer under unmodified applications here (Host UDP Fragment mode, Echo Replies (the Echo service does not answer an IPv4 Echo Request carrying a source route until T14 delivers received option metadata to Host-originated replies)), and it relies on Path MTU sharing plus an adjunct: fragments are cut to E, bounded by the shared PathService ordinary budget, which correlated PTBs about fragments and probes lower for every client; the Host-owned ICMP Echo adjunct (crates/stacks/ntcp-host/src/adjunct.rs) probes each path with fragmentation demand using unfragmented Echo Requests (DF on IPv4) carrying an unpredictable identifier, sequence and data nonce, sized by an RFC 4821 section 7.3 search between E (exclusive) and min(first-hop MTU, largest fragmented datagram). Only an exact, timely Echo Reply to a definitely submitted probe raises the path's confirmed lower bound and, under a learned ceiling below it, is offered to PathService::confirm_delivery (NotLarger on an unlearned path); silence and other errors lower only the search's upper bound, and a correlated PTB for a probe is an ordinary trusted decrease. Echo is used despite the preference for forward-only methods because every host implements the responder, the Host verifies its own nonce, and an exact reply proves forward delivery of the unfragmented request; a reply reassembled from fragments proves the same, so the return path limits the result only where the responder cannot deliver its reply at all (the search then stops lower, which is safe). Host tests cover the converging search, silence, forged, stale, mismatched and reassembled replies, a PTB for a probe and publication only under PathService rules; the integration/rfc_host fragment case raises IPv4 E only after a real Echo Reply and draws a real router PTB for a probe above 1280, and adjunct-silence shows that unanswered probes lower nothing.
+    //= reason=IP fragmentation is a packetization layer under unmodified applications here (Host UDP Fragment mode, Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound)), and it relies on Path MTU sharing plus an adjunct: fragments are cut to E, bounded by the shared PathService ordinary budget, which correlated PTBs about fragments and probes lower for every client; the Host-owned ICMP Echo adjunct (crates/stacks/ntcp-host/src/adjunct.rs) probes each path with fragmentation demand using unfragmented Echo Requests (DF on IPv4) carrying an unpredictable identifier, sequence and data nonce, sized by an RFC 4821 section 7.3 search between E (exclusive) and min(first-hop MTU, largest fragmented datagram). Only an exact, timely Echo Reply to a definitely submitted probe raises the path's confirmed lower bound and, under a learned ceiling below it, is offered to PathService::confirm_delivery (NotLarger on an unlearned path); silence and other errors lower only the search's upper bound, and a correlated PTB for a probe is an ordinary trusted decrease. Echo is used despite the preference for forward-only methods because every host implements the responder, the Host verifies its own nonce, and an exact reply proves forward delivery of the unfragmented request; a reply reassembled from fragments proves the same, so the return path limits the result only where the responder cannot deliver its reply at all (the search then stops lower, which is safe). Host tests cover the converging search, silence, forged, stale, mismatched and reassembled replies, a PTB for a probe and publication only under PathService rules; the integration/rfc_host fragment case raises IPv4 E only after a real Echo Reply and draws a real router PTB for a probe above 1280, and adjunct-silence shows that unanswered probes lower nothing.
     //# To support IP fragmentation as a Packetization Layer under an unmodified application, an implementation SHOULD rely on the Path MTU sharing described in Section 5.2 plus an adjunct protocol to probe the Path MTU. There are a number of protocols that might be used for the purpose, such as ICMP ECHO and ECHO REPLY, or "traceroute" style UDP datagrams that trigger ICMP messages. Use of ICMP ECHO and ECHO REPLY will probe both forward and return paths, so the sender will only be able to take advantage of the minimum of the two. Other methods that probe only the forward path are preferred if available.
     pub(crate) fn adjunct_reply(
         &mut self,
@@ -926,11 +944,12 @@ impl Host {
     /// An ICMP error whose quote is an unfragmented Echo Request: matched
     /// against outstanding probes by addresses, the quoted packet length
     /// (or RFC 1191 section 5's inflated reading from a legacy IPv4 router),
-    /// identifier and sequence. None when it quotes no probe.
+    /// identifier and sequence. None when it quotes no probe. `message` is
+    /// the error's ICMP message, the payload of its processed datagram.
     pub(crate) fn adjunct_error(
         &mut self,
         now: Instant,
-        bytes: &[u8],
+        message: &[u8],
         feedback: &ntcp_icmp::Feedback<ntcp_icmp::Quote>,
     ) -> Result<Option<ProbeOutcome>, Error> {
         let quote = feedback.quoted;
@@ -941,16 +960,11 @@ impl Host {
         {
             return Ok(None);
         }
-        // The quoted Echo header follows the outer header, the 8-octet ICMP
-        // error header and the quoted IP header (every IPv4 error quotes at
-        // least 8 data octets, RFC 1122 section 3.2.2).
-        let outer = if ipv4 {
-            usize::from(bytes[0] & 0x0f) * 4
-        } else {
-            ntcp_ip6::IPV6_HEADER
-        };
-        let Some(echo) = bytes
-            .get(outer + 8 + usize::from(quote.ip_header_len)..)
+        // The quoted Echo header follows the 8-octet ICMP error header and
+        // the quoted IP header (every IPv4 error quotes at least 8 data
+        // octets, RFC 1122 section 3.2.2).
+        let Some(echo) = message
+            .get(8 + usize::from(quote.ip_header_len)..)
             .and_then(|b| b.get(..8))
         else {
             return Ok(None);

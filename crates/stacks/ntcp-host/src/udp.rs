@@ -1209,6 +1209,7 @@ impl Host {
             fragment_size,
             snapshot,
             client: Some(prepared.client),
+            options: None,
         };
         let mut report = self.transmit(
             now,

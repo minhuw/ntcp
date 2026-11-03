@@ -10,7 +10,8 @@ fn hop(last: u8) -> Ipv4Addr {
 }
 pub(super) fn routed(local: SocketAddr, identity: u128, cfg: EndpointConfig) -> Peer {
     let mut peer = managed(local, identity, cfg);
-    peer.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Options {
+    peer.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Enabled {
+        interpretation: true,
         source_routes: true,
     };
     peer
@@ -522,7 +523,8 @@ fn rejected_received_return_route_is_dropped_before_path_preparation() {
     let mut a = routed(local, 161, cfg.clone());
     // The embedding's route policy rejects one otherwise well-formed hop.
     let mut b = managed_route_policy(remote, 162, cfg.clone(), false, None, Some(hop(66).into()));
-    b.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Options {
+    b.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Enabled {
+        interpretation: true,
         source_routes: true,
     };
     let listener = b.1.listen(remote, cfg.max_connections).unwrap();

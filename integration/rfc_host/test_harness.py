@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from bridge import checksum
 import admin
+import bridge
 import icmp
+import options
 import run
 
 
@@ -225,3 +227,106 @@ class IcmpScenario(unittest.TestCase):
         # A truncated or misaligned SACK option yields no blocks.
         self.assertIsNone(self.tcp(struct.pack("!BBI", 5, 10, 1) + b"\0\0")["sack"])
         self.assertIsNone(self.tcp(struct.pack("!BBII", 5, 9, 1, 2) + b"\0\0\0")["sack"])
+
+
+class OptionScenario(unittest.TestCase):
+    def test_option_cases_without_inherited_proof_cannot_reach_setup(self):
+        for case in options.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(icmp, "setup") as setup, \
+                    patch.object(run, "setup") as native_setup:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+                setup.assert_not_called()
+                native_setup.assert_not_called()
+
+    def test_cases_cover_each_embedding_and_the_disabled_interpretation_profile(self):
+        self.assertEqual({(c["kind"], c["family"], c["embedding"], c["scenario"]) for c in options.cases()},
+                         {("ip-options", 4, "tun_echo", "interpreted"), ("ip-options", 4, "tun_echo", "uninterpreted"),
+                          ("ip-options", 4, "native", "interpreted")})
+        self.assertFalse(any(c in icmp.cases() or c in admin.cases() or c in run.matrix() for c in options.cases()))
+        # Every request's option area fits the 40-octet IPv4 limit.
+        for name, packet, _ in options.requests("198.18.1.1", "198.18.1.2", "198.18.2.2", "198.18.1.1", 1, True):
+            self.assertLessEqual((packet[0] & 15) * 4, 60, name)
+            self.assertEqual(checksum(packet[:(packet[0] & 15) * 4]), 0, name)
+
+    def reply(self, request, local, stamps):
+        """REQUEST's RR/TS area recorded at LOCAL with the given timestamps."""
+        area = b""
+        for kind, option in options.tlvs(request):
+            if kind not in (7, 68):
+                continue
+            expected, at = options.recorded(option, local)
+            if at is not None:
+                expected = expected[:at] + struct.pack("!I", stamps.pop(0)) + expected[at + 4:]
+            area += expected
+        return options.pad(area)
+
+    def test_continuation_accepts_one_marked_recording_and_rejects_anything_else(self):
+        local = "198.18.1.2"
+        request = options.pad(options.RR + options.TS_ADDRESSED + bytes([30, 2]))
+        good = self.reply(request, local, [0x80000123])
+        self.assertEqual(good[:15], bytes([7, 15, 12, 198, 18, 9, 9, 198, 18, 1, 2]) + bytes(4))
+        self.assertEqual(good[15:27], bytes([68, 20, 13, 1, 198, 18, 1, 2, 0x80, 0, 1, 0x23]))
+        self.assertEqual(options.check_continuation(request, good, local), [0x80000123])
+        bad = {
+            "unmarked timestamp": self.reply(request, local, [0x123]),
+            "no recording": options.pad(options.RR + options.TS_ADDRESSED),
+            "recorded twice": self.reply(self.reply(request, local, [0x80000001]), local, [0x80000002]),
+            "truncated": options.pad(options.RR[:11] + options.TS_ADDRESSED),
+            "unknown reflected": options.pad(good[:35] + bytes([30, 2])),
+            "other address": self.reply(request, "198.18.1.3", [0x80000123]),
+        }
+        for name, reply in bad.items():
+            with self.assertRaises(AssertionError, msg=name):
+                options.check_continuation(request, reply, local)
+        # A full timestamp area only increments the overflow.
+        full = bytes([68, 12, 13, 0x21]) + bytes(8)
+        self.assertEqual(options.recorded(full, local), (bytes([68, 12, 13, 0x31]) + bytes(8), None))
+
+    def ipv4(self, protocol, area, body):
+        header = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45 + len(area) // 4, 0, 20 + len(area) + len(body), 7, 0,
+                                       64, protocol, 0, bytes([198, 18, 0, 1]), bytes([198, 18, 0, 2])) + area)
+        struct.pack_into("!H", header, 10, checksum(bytes(header)))
+        return bytes(header) + body
+
+    def test_bridge_validates_variable_headers_and_forwards_icmp_only_when_asked(self):
+        area = options.pad(options.RR)
+        echo = options.echo_request("198.18.0.1", "198.18.0.2", options.RR, 5, 6, b"data")
+        frame = bytes(12) + b"\x08\x00" + echo
+        self.assertIsNone(bridge.decode(frame))
+        event = bridge.decode(frame, icmp=True)
+        self.assertEqual((event["header_len"], event["ip_options"], event["icmp_type"], event["identifier"],
+                          event["sequence"], event["ip_hex"]), (20 + len(area), area.hex(), 8, 5, 6, echo.hex()))
+        corrupt = bytearray(frame)
+        corrupt[14 + 25] ^= 1  # inside the option area
+        with self.assertRaisesRegex(AssertionError, "header checksum"):
+            bridge.decode(bytes(corrupt), icmp=True)
+        # A TCP segment after an option-bearing header is found at its IHL.
+        tcp = bytearray(struct.pack("!HHIIBBHHH", 18080, 18081, 1, 2, 5 << 4, 0x10, 100, 0, 0))
+        struct.pack_into("!H", tcp, 16, checksum(bytes([198, 18, 0, 1, 198, 18, 0, 2, 0, 6, 0, 20]) + bytes(tcp)))
+        decoded, *_ = bridge.decode(bytes(12) + b"\x08\x00" + self.ipv4(6, area, bytes(tcp)))
+        self.assertEqual((decoded["sport"], decoded["dport"], decoded["payload"]), (18080, 18081, 0))
+
+    def test_capture_exposes_option_bytes_and_keeps_them_through_reassembly(self):
+        area = options.pad(bytes([131, 7, 8, 198, 18, 1, 1]) + options.RR)
+        body = struct.pack("!HHHH", 18080, 18090, 8 + 1000, 0) + bytes(range(250)) * 4
+        datagram = self.ipv4(17, area, body)
+        self.assertEqual(icmp.parse(datagram)["ip_options"], area.hex())
+        hl = 20 + len(area)
+        pieces = []
+        for offset in range(0, len(body), 504):
+            chunk, more = body[offset:offset + 504], offset + 504 < len(body)
+            # RFC 791: later fragments carry only the copied source route.
+            header = bytearray(datagram[:hl] if offset == 0 else datagram[:20] + area[:8])
+            header[0] = 0x40 + len(header) // 4
+            struct.pack_into("!HHH", header, 2, len(header) + len(chunk), 7, (0x2000 if more else 0) | offset // 8)
+            header[10:12] = b"\0\0"
+            struct.pack_into("!H", header, 10, checksum(bytes(header)))
+            event = icmp.parse(bytes(header) + chunk)
+            event.update(direction="from-ntcp", time_ns=offset, raw=bytes(header) + chunk)
+            pieces.append(event)
+        self.assertEqual(pieces[1]["ip_options"], area[:8].hex())
+        (whole, _), = icmp.reassemble(pieces[::-1])
+        self.assertEqual((whole["ip_options"], whole["payload"]), (area.hex(), 1000))
+        self.assertTrue(whole["checksum_valid"] and whole["ip_checksum_valid"])
+        self.assertEqual(icmp.public(whole)["ip_options"], area.hex())

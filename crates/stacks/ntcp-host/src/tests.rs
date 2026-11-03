@@ -3,6 +3,7 @@ mod adjunct;
 mod admin;
 mod admission;
 mod correlation;
+mod destination;
 mod dispatch;
 mod emitter;
 mod fanout;
@@ -159,7 +160,8 @@ fn managed_limited(
             1500,
             ReceiveCapabilities {
                 max_ip_packet: 65575,
-                ipv4: Ipv4Receive::Options {
+                ipv4: Ipv4Receive::Enabled {
+                    interpretation: true,
                     source_routes: false,
                 },
                 ipv6: Ipv6Receive::BaseHeader,

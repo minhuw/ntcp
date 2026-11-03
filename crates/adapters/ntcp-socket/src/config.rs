@@ -251,7 +251,7 @@ impl SocketConfig {
         c.validate(self.io.address.is_ipv4())
             .map_err(|_| invalid())?;
         // The owner clock, IPv4 packet size and descriptor registry are adapter constraints.
-        if self.tcp.ipv4_options_enabled // Native input strips/rejects IPv4 options.
+        if self.tcp.ipv4_options_enabled // Native TCP neither sends IPv4 options nor admits source routes.
             || c.timebase.units_per_second != 1_000_000
             || c.send_ip_payload_limit > 65515
             || c.receive_ip_payload_limit > 65515

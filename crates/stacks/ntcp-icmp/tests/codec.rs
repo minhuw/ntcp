@@ -414,3 +414,49 @@ fn ipv4_error_classification_separates_soft_hard_pmtu_and_source_quench() {
         );
     }
 }
+
+// The payload decoder takes the receiver's processed outer metadata as is:
+// a source route the receiver admitted is not refused again, the options
+// it recorded are the ones reported, and quoted options stay historical.
+#[test]
+fn payload_decoder_reports_processed_outer_options_without_reparsing() {
+    for v6 in families() {
+        let tcp = tcp_packet(v6, OutgoingIpv4Options::default());
+        let header = if v6 { 40 } else { 20 };
+        let frame = error_packet(v6, &tcp[..header + 8]);
+        let outer = parse(&frame, false).unwrap();
+        let wrapped = decode_icmp_quote(&frame).unwrap();
+        let direct = decode_error(outer.ip, outer.ipv4_options, outer.payload).unwrap();
+        assert_eq!(direct, wrapped);
+        assert!(direct.outer_options.is_empty());
+        if v6 {
+            // IPv6 has no IPv4 options to carry.
+            let options = ntcp::Ipv4Options::parse(&[7, 3, 4, 0], false).unwrap();
+            assert_eq!(
+                decode_error(outer.ip, options, outer.payload).unwrap_err(),
+                Error::Options
+            );
+            continue;
+        }
+        // A completed loose source route, then Record Route as processed by
+        // the receiver (its own address recorded).
+        let raw = [131, 7, 8, 192, 0, 2, 9, 7, 7, 8, 192, 0, 2, 1, 0, 0];
+        let mut routed = vec![0; frame.len() + raw.len()];
+        routed[..20].copy_from_slice(&frame[..20]);
+        routed[0] = 0x40 | ((20 + raw.len()) / 4) as u8;
+        let total = routed.len() as u16;
+        routed[2..4].copy_from_slice(&total.to_be_bytes());
+        routed[20..20 + raw.len()].copy_from_slice(&raw);
+        routed[20 + raw.len()..].copy_from_slice(&frame[20..]);
+        seal(&mut routed);
+        // The stateless full-frame wrapper still refuses source routes.
+        assert_eq!(decode_icmp_quote(&routed).unwrap_err(), Error::Options);
+        let processed = parse(&routed, true).unwrap();
+        let feedback =
+            decode_error(processed.ip, processed.ipv4_options, processed.payload).unwrap();
+        assert_eq!(feedback.outer_options, processed.ipv4_options);
+        assert_eq!(feedback.outer_options.as_bytes(), &raw[..14]);
+        assert_eq!(feedback.quoted, wrapped.quoted);
+        assert_eq!(feedback.tcp().unwrap().outer_options, processed.ipv4_options);
+    }
+}

@@ -137,8 +137,10 @@ def parse(packet):
         source, destination = packet[12:16], packet[16:20]
         fragment = u16(packet, 6)
         # ip_id: the whole-packet Identification field, whatever DF says.
+        # ip_options: the option area in JSON-safe form (a reassembled
+        # datagram keeps its first fragment's).
         info = dict(family=4, df=bool(fragment & 0x4000), fragmented=bool(fragment & 0x3fff),
-                    ip_checksum_valid=checksum(packet[:hl]) == 0, ip_id=u16(packet, 4))
+                    ip_checksum_valid=checksum(packet[:hl]) == 0, ip_id=u16(packet, 4), ip_options=packet[20:hl].hex())
         if info["fragmented"]:
             info.update(ident=u16(packet, 4), offset=(fragment & 0x1fff) * 8, more=bool(fragment & 0x2000))
         pseudo = source + destination + bytes([0, protocol]) + struct.pack("!H", total - hl)

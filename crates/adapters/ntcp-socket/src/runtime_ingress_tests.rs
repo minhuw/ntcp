@@ -189,6 +189,82 @@ fn native_fragmented_echo_requests_are_reassembled_and_answered_exactly() {
     }
 }
 
+// `packet` (IPv4, option-free) with `options` (whole words) after its base
+// header.
+fn with_ipv4_options(packet: &[u8], options: &[u8]) -> Vec<u8> {
+    let mut ip = packet.to_vec();
+    ip.splice(20..20, options.iter().copied());
+    ip[0] = 0x45 + (options.len() / 4) as u8;
+    let len = ip.len() as u16;
+    ip[2..4].copy_from_slice(&len.to_be_bytes());
+    ip[10..12].fill(0);
+    let checksum = ntcp_ip_common::checksum(&ip[..20 + options.len()]);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    ip
+}
+
+// The native managed profile interprets Record Route and Timestamp: the
+// Echo Reply carries them recorded once with this host's address and the
+// owner's high-bit-marked elapsed time. It refuses source routes at the
+// Host (the Echo service is not gated by TCP's option setting), so a
+// routed request draws no reply.
+#[test]
+fn native_echo_replies_carry_recorded_options_and_routed_requests_are_refused() {
+    let (mut a, wire) = native(false, 2, 2);
+    let IpAddr::V4(local) = a.local else {
+        unreachable!()
+    };
+    let to_us = ntcp::IpMetadata {
+        source: peer(false),
+        destination: a.local,
+    };
+    let request = echo_request(to_us, &[3; 32]);
+    // RR and TS (flag 0), one free slot each and two for TS, EOL-padded.
+    let options = [7, 7, 4, 0, 0, 0, 0, 68, 12, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let frame = ethernet(UNICAST, false, &with_ipv4_options(&request, &options));
+    deliver(&mut a, &wire, &[frame]);
+    a.service_egress().unwrap();
+    let frames: Vec<_> = wire.lock().unwrap().sent.drain(..).collect();
+    assert_eq!(frames.len(), 1);
+    let ip = ntcp_ethernet::parse_ethernet(&frames[0]).unwrap().payload;
+    assert_eq!(ip[0], 0x45 + 5);
+    assert_eq!(&ip[20..23], &[7, 7, 8]);
+    assert_eq!(&ip[23..27], &local.octets());
+    assert_eq!(&ip[27..31], &[68, 12, 9, 0]);
+    let time = u32::from_be_bytes(ip[31..35].try_into().unwrap());
+    assert_ne!(time & 0x8000_0000, 0, "nonstandard time is marked");
+    assert_eq!(&ip[35..40], &[0; 5]);
+    let reply = ntcp_icmp::decode_echo(
+        ntcp::IpMetadata {
+            source: a.local,
+            destination: peer(false),
+        },
+        &ip[40..],
+    )
+    .unwrap();
+    assert_eq!(
+        (reply.kind, reply.data),
+        (ntcp_icmp::EchoKind::Reply, &[3; 32][..])
+    );
+    // A completed loose source route ahead of the same options.
+    let mut routed = vec![131, 7, 8, 192, 0, 2, 9];
+    routed.extend_from_slice(&options[..19]);
+    routed.resize(28, 0);
+    let frame = ethernet(UNICAST, false, &with_ipv4_options(&request, &routed));
+    deliver(&mut a, &wire, &[frame]);
+    a.service_egress().unwrap();
+    assert!(sent_icmp(&wire).is_empty());
+    // Refused on arrival, before the Echo service's return-route
+    // authorization could count it.
+    let host = a.host.as_ref().unwrap();
+    let counters = host.icmp_output_counters();
+    assert_eq!(
+        (counters.echo_replies, counters.unauthorized_routes),
+        (1, 0)
+    );
+    assert_eq!(host.icmp_output_pending(), 0);
+}
+
 #[test]
 fn native_reassembly_errors_respect_link_layer_group_destinations() {
     for v6 in [false, true] {
