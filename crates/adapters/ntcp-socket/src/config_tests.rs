@@ -425,7 +425,14 @@ fn layering_order_defaults_and_adapter_constraints() {
     assert_eq!(base.tcp.connection.receive_capacity, 65536);
     assert_eq!(base.tcp.connection.mss, 1460);
     assert_eq!(base.tcp.connection.send_ip_payload_limit, 1480);
-    assert_eq!(base.tcp.connection.receive_ip_payload_limit, 65515);
+    // Native connections are Host-managed: their receive MSS offer comes
+    // from the Host's receive capability, so no static receive limit is
+    // configured and the raw-Endpoint legacy limit keeps its default.
+    assert_eq!(
+        base.tcp.connection.receive_ip_payload_limit,
+        ntcp::ConnectionConfig::default().receive_ip_payload_limit
+    );
+    assert!(base.validate().is_ok());
     assert_eq!(base.tcp.connection.pacing, None);
     for tuning in [
         "tcp.pacing_gain_percent=150",
@@ -460,7 +467,6 @@ fn layering_order_defaults_and_adapter_constraints() {
     let invalid: &[fn(&mut SocketConfig)] = &[
         |c| c.tcp.connection.timebase.units_per_second = 1_000_000_000,
         |c| c.tcp.connection.send_ip_payload_limit = 65516,
-        |c| c.tcp.connection.receive_ip_payload_limit = 65516,
         |c| c.tcp.ipv4_options_enabled = true,
         |c| c.tcp.max_connections = 513,
         |c| c.tcp.max_listeners = 513,

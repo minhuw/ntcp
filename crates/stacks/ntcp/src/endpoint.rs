@@ -1224,18 +1224,19 @@ impl Endpoint {
         options.validate()?;
         // Managed mode requires a live provisional path before allocation,
         // TFO authorization or controller/initial PMTU construction.
-        let managed_path = match self.managed_context {
+        let (managed_path, receive_capability) = match self.managed_context {
             Some(context) => {
                 let transaction = self.factory_transaction.ok_or(Error::InvalidState)?;
                 if transaction.request.tuple != tuple
                     || transaction.inserted.is_some()
                     || !crate::managed_path::valid_prepared(context, transaction.request, transaction.prepared)
+                    || !crate::managed_path::valid_receive(context, transaction.request, transaction.receive)
                 {
                     return Err(Error::InvalidState);
                 }
-                Some(transaction.prepared)
+                (Some(transaction.prepared), Some(transaction.receive))
             }
-            None => None,
+            None => (None, None),
         };
         let initial_ip_header_len = if let Some(transaction) = self.factory_transaction {
             if let (IpAddr::V4(source), IpAddr::V4(destination)) = (tuple.local.ip(), tuple.remote.ip()) {
@@ -1343,6 +1344,7 @@ impl Endpoint {
                 rx_timestamps,
                 timestamps,
                 managed_path,
+                receive_capability,
                 initial_ip_header_len,
             ),
             None => Connection::active_with_receive_path(
@@ -1352,6 +1354,7 @@ impl Endpoint {
                 self.now,
                 &mut receive,
                 managed_path,
+                receive_capability,
                 initial_ip_header_len,
             ),
         };

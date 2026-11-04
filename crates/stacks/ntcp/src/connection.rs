@@ -323,17 +323,21 @@ impl ConnectionConfig {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
-    //= reason=The receive offer is captured from configured receive/user/advertised ceilings without routing-locality input. Public Endpoint tests use authoritative single-address policies and equivalent /24 local/routed topologies, compare actual codec SYN/SYNACK offers above536 under four identical configurations, and retain receive capability after validated lower send-PMTU feedback in both directions. The continuation and host receive-sizing advice remain separately TODO at1191-024/025.
+    //= reason=The receive offer is captured without routing-locality input: a managed connection's from its Host's per-family receive capability, a raw Endpoint's from configured receive ceilings, both intersected with user/advertised caps. Public Endpoint tests use authoritative single-address policies and equivalent /24 local/routed topologies, compare actual codec SYN/SYNACK offers above536 under four identical configurations, and retain receive capability after validated lower send-PMTU feedback in both directions. The continuation's host receive sizing and the connected-network note are covered separately at1191-024/025.
     //# Moreover, doing this prevents PMTU Discovery from discovering PMTUs larger than 576, so hosts SHOULD no longer lower the value they send
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
-    //= reason=Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. T13 supplies the host capacity: Host::reassembly_capacity states, per family and per Host context, EMTU_R (RFC 1122 section 3.3.2: the largest complete IP datagram, header included, that the configured, storage-backed reassembly engine accepts) and MMS_R (EMTU_R - 20 for IPv4, EMTU_R - 40 for IPv6). This paragraph calls the largest reassemblable datagram MMS_R, so its host MMS_R-40 is EMTU_R - 40, that is RFC 1122's MMS_R less TCP's 20-octet header for IPv4; the TCP payload unit (MSS) differs from both EMTU_R and MMS_R. Configured receive sizing is not yet derived from that capacity or from the permitted maximum connected-link MTU across multiple interfaces: a host receive/reassembly and topology contract remains necessary. Remaining: T16 owns the receive-MSS derivation from Host::reassembly_capacity and the connected links, and T19 the topology evidence. The optional link-derived choice is not itself a required feature.
+    //= reason=Managed connections send the MSS this paragraph describes. T13 supplies the host capacity: Host::reassembly_capacity states, per family and per Host context, EMTU_R (RFC 1122 section 3.3.2: the largest complete IP datagram, header included, that the configured, storage-backed reassembly engine accepts) and MMS_R (EMTU_R - 20 for IPv4, EMTU_R - 40 for IPv6). This paragraph calls the largest reassemblable datagram MMS_R, so its host MMS_R-40 is EMTU_R - 40, that is RFC 1122's MMS_R less TCP's 20-octet header for IPv4; the TCP payload unit (MSS) differs from both EMTU_R and MMS_R. T16 derives the managed receive MSS inside every Host factory transaction (active, Fast Open, passive child and TIME-WAIT replacement): Host::receive_ip_capability takes the least of EMTU_R (no term while reassembly is disabled), the largest live link enabled for the family at the smaller of its current MTU and physical receive capacity (the permitted maximum connected-link choice: a multi-homed Host counts its largest link, not the selected route's) and the family wire limit, less the IP and TCP base headers, so 65495 is offered exactly when an actual 65535-octet IPv4 link and matching reassembly support it; only user and advertised caps reduce it, a discovered send PMTU never does, and the offer is frozen once committed in its SYN or SYN-ACK. Host factory tests (ntcp-host src/tests/receive_capability.rs) cover both families, unequal links with per-link family enablement, link addition, removal and MTU change, new listener children after a topology change, separate contexts and source replacement, reassembly below and above the links and disabled, physical capacity below a link MTU, the 65535-octet IPv4 link and rejection without a capability. The supplied managed embeddings keep no static receive sizing: native SYN and SYN-ACK offers follow the Host's link (ntcp-socket packet_tests.rs) and tun_echo's equal Host::receive_ip_capability (tun_echo_pmtu_tests.rs). On the wire, the integration/rfc_host mss case's production-factory driver (src/bin/two_link.rs) owns two TUNs of unequal MTU with genuine reassembly and routes over the smaller: in both families the captured SYN-ACK and SYN offers over the smaller link equal the larger link's derivation, also for connections opened after real downstream PTBs lowered the send PMTU. Raw Endpoints keep their documented caller-supplied receive limits as an explicit legacy contract, on which this closure does not rest. The optional link-derived choice is not itself a required feature.
     //# in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.
-    fn receive_mss_offer(&self) -> u16 {
-        self.mss
+    fn receive_mss_offer(&self, capability: Option<u16>) -> u16 {
+        // A managed connection's offer starts from its Host's receive
+        // capability (already an MSS); `mss` (the local send and allocation
+        // ceiling) and `receive_ip_payload_limit` keep limiting only the raw
+        // Endpoint's legacy offer. User and advertised caps apply to both.
+        capability
+            .unwrap_or_else(|| self.mss.min(self.receive_ip_payload_limit - 20))
             .min(self.user_mss.unwrap_or(u16::MAX))
             .min(self.advertised_mss.unwrap_or(u16::MAX))
-            .min(self.receive_ip_payload_limit - 20)
     }
 
     fn ack_timeout_floor(&self) -> u64 {
@@ -545,6 +549,10 @@ pub struct TransportInfo {
     pub sndbuf_limited_us: u64,
     pub send_used: usize,
     pub send_capacity: usize,
+    // Ceiling on unacknowledged plus queued payload: send_capacity rounded
+    // down to whole segments for a managed connection. send_used may exceed
+    // it after it shrinks; those bytes stay queued.
+    pub send_space: usize,
     pub receive_used: usize,
     pub receive_capacity: usize,
 }
@@ -608,6 +616,19 @@ impl ConnectionEvents {
 
 fn due(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
+}
+
+// RFC 1191 section 6.4: the greatest multiple of the segment size in use
+// not above the sender's buffer space, so no partial segment is left over.
+// A legal buffer below one segment keeps its whole capacity: the literal
+// multiple, zero, would deadlock it, and the peer and congestion windows
+// still bound what is outstanding.
+fn rounded_send_space(capacity: usize, quantum: usize) -> usize {
+    if capacity < quantum {
+        capacity
+    } else {
+        capacity / quantum * quantum
+    }
 }
 
 // One initial/restart burst, not a duplicate original-transmission ledger.
@@ -751,6 +772,10 @@ pub(crate) struct Connection {
     mss: usize,
     peer_mss: u16,
     receive_mss_offer: u16,
+    // Managed only: the MSS of the Host's receive capability derived when
+    // this connection was constructed, kept so that a user MSS set before
+    // the SYN commits composes with it.
+    receive_capability: Option<u16>,
     send_mss_limit: u16,
     ip_header_len: u16,
     //= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
@@ -898,9 +923,10 @@ impl Connection {
         now: Instant,
         receive: &mut Option<ReceiveBuffer>,
     ) -> Result<Self, Error> {
-        Self::active_with_receive_path(tuple, config, iss, now, receive, None, None)
+        Self::active_with_receive_path(tuple, config, iss, now, receive, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn active_with_receive_path(
         tuple: Tuple,
         mut config: ConnectionConfig,
@@ -908,12 +934,21 @@ impl Connection {
         now: Instant,
         receive: &mut Option<ReceiveBuffer>,
         managed_path: Option<crate::PreparedPath>,
+        receive_capability: Option<crate::ReceiveIpCapability>,
         initial_ip_header_len: Option<u16>,
     ) -> Result<Self, Error> {
         config.validate(tuple.local.is_ipv4())?;
         if tuple.local.is_ipv4() != tuple.remote.is_ipv4() {
             return Err(Error::InvalidArgument);
         }
+        // A managed connection receives under its Host's derived capability
+        // for this family; a raw one under its configured legacy limits.
+        if managed_path.is_some() != receive_capability.is_some()
+            || receive_capability.is_some_and(|c| c.ipv6() == tuple.local.is_ipv4())
+        {
+            return Err(Error::InvalidState);
+        }
+        let receive_capability = receive_capability.map(crate::ReceiveIpCapability::mss);
         // Non-jumbo family limits include the TCP header, not the IP header.
         let family_limit = if tuple.local.is_ipv4() { 65515 } else { 65535 };
         config.receive_ip_payload_limit = config.receive_ip_payload_limit.min(family_limit);
@@ -1014,8 +1049,9 @@ impl Connection {
             managed_results: crate::endpoint::ManagedResults::default(),
             tuple,
             peer_mss: config.mss,
-            receive_mss_offer: config.receive_mss_offer(),
-            received_mss: crate::receive_metadata::ReceiveMss::new(config.receive_mss_offer()),
+            receive_mss_offer: config.receive_mss_offer(receive_capability),
+            received_mss: crate::receive_metadata::ReceiveMss::new(config.receive_mss_offer(receive_capability)),
+            receive_capability,
             send_mss_limit: config.mss,
             ip_header_len,
             pmtud,
@@ -1243,7 +1279,7 @@ impl Connection {
         timestamps: RxPacketTimestamps,
     ) -> Result<Self, Error> {
         Self::passive_with_receive_path(tuple, config, iss, now, syn, early_authorized,
-            receive, rx_timestamps, timestamps, None, None)
+            receive, rx_timestamps, timestamps, None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1258,6 +1294,7 @@ impl Connection {
         rx_timestamps: RxTimestamps,
         timestamps: RxPacketTimestamps,
         managed_path: Option<crate::PreparedPath>,
+        receive_capability: Option<crate::ReceiveIpCapability>,
         initial_ip_header_len: Option<u16>,
     ) -> Result<Self, Error> {
         if syn.header.flags & (SYN | ACK | RST) != SYN {
@@ -1272,7 +1309,7 @@ impl Connection {
         if early_authorized {
             config.initial_window = InitialWindow::Rfc5681;
         }
-        let mut connection = Self::active_with_receive_path(tuple, config, iss, now, receive, managed_path, initial_ip_header_len)?;
+        let mut connection = Self::active_with_receive_path(tuple, config, iss, now, receive, managed_path, receive_capability, initial_ip_header_len)?;
         connection.rx_timestamps = rx_timestamps;
         connection.input_timestamps = timestamps;
         connection.passive_open = true;
@@ -1413,7 +1450,7 @@ impl Connection {
         }
         self.send.set_limit(send);
         self.config.send_capacity = send;
-        if self.send.remaining() != 0 {
+        if self.send_space_remaining() != 0 {
             self.send_backpressured = false;
         }
         self.config.receive_capacity = receive;
@@ -1442,7 +1479,7 @@ impl Connection {
         self.events.writable = !self.shutdown
             && !self.read_closed
             && matches!(self.state, State::Established | State::CloseWait)
-            && self.send.remaining() != 0;
+            && self.send_space_remaining() != 0;
         if self.synchronized() && self.advertised_window(false) > old_window {
             self.immediate_ack();
         }
@@ -1539,7 +1576,7 @@ impl Connection {
         .saturating_sub(40)
         .min(self.path_payload_limit().saturating_sub(60))
         .min(self.scratch.len());
-        let count = initial.len().min(limit).min(self.send.remaining());
+        let count = initial.len().min(limit).min(self.send_space_remaining());
         if count == 0 {
             return Ok(0);
         }
@@ -1748,6 +1785,7 @@ impl Connection {
             sndbuf_limited_us: self.config.timebase.us_from_ticks(ticks[2]),
             send_used: self.send.len(),
             send_capacity: self.config.send_capacity,
+            send_space: self.send_space(),
             receive_used: self.receive_used,
             receive_capacity: self.config.receive_capacity,
         }
@@ -1776,7 +1814,7 @@ impl Connection {
             // Linux chronographs prioritize sndbuf over rwnd. Here NOSPACE means
             // an actual short/blocked core write, and ends at core writable credit.
             let sndbuf = self.send_backpressured
-                && self.send.remaining() == 0
+                && self.send_space_remaining() == 0
                 && unsent == 0
                 && matches!(self.state, State::Established | State::CloseWait)
                 && flight < self.congestion.cwnd();
@@ -2623,7 +2661,7 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
-    //= reason=Dynamic send path MSS never mutates config.mss receive offer; family-floor wire test asserts unchanged receive capability.
+    //= reason=Dynamic send path MSS never mutates the receive offer (Host-derived when managed, configured when raw); family-floor wire test asserts unchanged receive capability.
     //# PMTU Discovery does not affect the value sent in the TCP MSS option, because that
     //# value is used by the other end of the connection, which may be using an unrelated
     //# PMTU value.
@@ -3616,7 +3654,7 @@ impl Connection {
         // An application can limit future sends after establishment, but cannot
         // retroactively change the receive capability advertised in its SYN.
         if !self.syn_committed {
-            self.receive_mss_offer = self.config.receive_mss_offer();
+            self.receive_mss_offer = self.config.receive_mss_offer(self.receive_capability);
         }
         if self.pmtud.is_some() {
             self.refresh_path_mss();
@@ -3654,6 +3692,7 @@ impl Connection {
         }
         // Legacy explicit MSS override retains its original SYN behavior.
         self.config.mss = self.config.mss.min(mss);
+        self.receive_capability = self.receive_capability.map(|c| c.min(mss));
         self.receive_mss_offer = self.receive_mss_offer.min(mss);
         self.send_mss_limit = self.send_mss_limit.min(mss);
         self.set_path_mss(effective as usize);
@@ -3692,7 +3731,14 @@ impl Connection {
             return;
         }
         let decreased = effective < self.mss;
+        let blocked = self.send_space_remaining() == 0;
         self.mss = effective;
+        // A new segment size moves C; reopened room is writable as after an ACK.
+        if blocked && self.send_space_remaining() != 0 {
+            self.send_backpressured = false;
+            self.events.writable |=
+                !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
+        }
         if self.pmtud.is_some() || self.managed_path.is_some() {
             self.congestion.set_path_mss(effective as u32);
         } else {
@@ -4177,7 +4223,7 @@ impl Connection {
         }
         self.syn_pending = false;
         self.events.connected = true;
-        self.events.writable = !self.shutdown && self.send.remaining() != 0;
+        self.events.writable = !self.shutdown && self.send_space_remaining() != 0;
         self.events.readable =
             !self.read_closed && (self.receive.readable() != 0 || self.receive.eof());
         self.events.pushed |= self.receive.take_push();
@@ -4617,7 +4663,62 @@ impl Connection {
         let cursor_room = u64::MAX - self.acknowledged - self.send.len() as u64;
         self.send
             .admission_room(self.notsent_bytes(), lowat)
+            .min(self.send_space_remaining())
             .min(usize::try_from(cursor_room).unwrap_or(usize::MAX))
+    }
+
+    // The ordinary effective data-segment size Q under the current PMTU:
+    // `mss` already carries the fixed IP and TCP headers, negotiated
+    // timestamps and the user, local and path ceilings. Fast Open installs
+    // a cached or default peer MSS before the SYN-ACK updates `mss`.
+    fn send_quantum(&self) -> usize {
+        let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
+        let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
+        self.mss
+            .min(usize::from(self.peer_mss).saturating_sub(options).max(1))
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+    //= reason=Managed connections bound unacknowledged plus queued payload by a send-space ceiling C: the logical send-buffer capacity B rounded down to the greatest multiple of Q, the segment size in use under the current PMTU. User disposition (decision A, 2026-11-04, recorded): Q, the ordinary effective data payload segments actually carry (the PMTU less the fixed IP and TCP headers and negotiated timestamps, within the peer, user and local send ceilings), is this paragraph's segment size (PMTU - 40), because the literal PMTU - 40 would reintroduce the partial segment the rule avoids; the two agree only for option-free IPv4 without a lower transport ceiling (IPv4 PMTU 1500 with timestamps: Q = 1448 and B = 20000 give C = 18824, the literal formula 18980). User disposition (decision A, 2026-11-04, recorded): for a legal buffer below one segment C = B, because the literal greatest multiple, zero, would deadlock it; the peer and congestion windows still bound what is outstanding, so no credit is invented. C is derived on demand, so every PMTU decrease and increase, MSS negotiation, user-cap, header and buffer change applies before the next admission or output. Write admission and readiness use C, and every fresh-output branch (ordinary, Limited Transmit, PRR, RFC 6675 recovery, TLP, Fast Open and early-response data, reserved, shared and GSO totals, PLPMTUD probes) sends at most C less the unacknowledged payload, repairing instead when none is left; retransmission, exact-range repair, FIN, persist and keepalive take none of it, data admitted above a smaller C drains through ACKs, snd_wnd, max_snd_wnd and cwnd are unchanged and reported capacity stays B. Core tests (connection_send_space_tests.rs) cover B = 1, Q-1, Q, Q+1, 2Q-1 and multiples through receiver completion and the largest legal capacity arithmetically, peer windows 0, 1, Q-1, Q and Q+1, cwnd below and above C, PMTU and buffer changes below the flight, partial ACK, SACK and sequence wrap; native tests re-round SO_SNDBUF on PTB feedback with truthful getsockopt and writable edges, tun_echo admits whole segments across a PMTU change, and the integration/rfc_host mss send-space case captures distinct outstanding bytes reaching exactly C for a non-multiple B below the peer window and cwnd before any ACK advancement, then complete delivery verified by length and hash. Raw Endpoints keep B as their legacy contract.
+    //# TCP performance can be reduced if the sender's maximum window size is not an exact
+    //# multiple of the segment size in use (this is not the congestion window size, which
+    //# is always a multiple of the segment size). In many system (such as those derived
+    //# from 4.2BSD), the segment size is often set to 1024 octets, and the maximum window
+    //# size (the "send space") is usually a multiple of 1024 octets, so the proper
+    //# relationship holds by default. If PMTU Discovery is used, however, the segment size
+    //# may not be a submultiple of the send space, and it may change during a connection;
+    //# this means that the TCP layer may need to change the transmission window size when
+    //# PMTU Discovery changes the PMTU value. The maximum window size should be set to the
+    //# greatest multiple of the segment size (PMTU - 40) that is less than or equal to the
+    //# sender's buffer space size.
+    // The send-space ceiling C bounding unacknowledged plus queued payload.
+    // A managed connection rounds its logical capacity B to whole segments;
+    // a raw Endpoint keeps B. Derived on demand, so every PMTU, MSS, header
+    // and capacity change applies before the next admission.
+    pub(crate) fn send_space(&self) -> usize {
+        if self.managed_path.is_none() {
+            return self.config.send_capacity;
+        }
+        rounded_send_space(self.config.send_capacity, self.send_quantum())
+    }
+
+    // Bytes admitted above a smaller new C stay queued; room reopens only
+    // once ordinary ACK progress drains below it.
+    fn send_space_remaining(&self) -> usize {
+        self.send_space().saturating_sub(self.send.len())
+    }
+
+    // Fresh payload a managed connection may newly transmit: C less the
+    // unacknowledged payload. Retransmissions, SYN/FIN sequence units and
+    // persist/keepalive probes take none of it. After C falls below the
+    // flight, no new payload leaves until ACK progress reopens it. A raw
+    // Endpoint keeps its legacy output, bounded by its windows alone.
+    fn fresh_send_allowance(&self) -> usize {
+        if self.managed_path.is_none() {
+            return usize::MAX;
+        }
+        self.send_space()
+            .saturating_sub(self.data_flight() as usize)
     }
 
     // Stage both sender ledgers before accepting any bytes. The existing
@@ -4866,7 +4967,7 @@ impl Connection {
         if self.snd_up.is_some_and(|up| up.after(end)) {
             self.snd_up = (retained != 0).then_some(end);
         }
-        if discarded != 0 && self.send.remaining() != 0 {
+        if discarded != 0 && self.send_space_remaining() != 0 {
             self.send_backpressured = false;
             self.events.writable = true;
         }
@@ -5097,7 +5198,7 @@ impl Connection {
     }
 
     pub(crate) fn record_send_backpressure(&mut self) {
-        self.send_backpressured |= self.send.remaining() == 0;
+        self.send_backpressured |= self.send_space_remaining() == 0;
     }
 
     pub(crate) fn finish_send(&mut self, end: u64, more: bool, end_of_record: bool, force: bool) {
@@ -6490,6 +6591,7 @@ impl Connection {
                             .is_none()
                         && !(self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize
                             && self.snd_wnd > self.flight()
+                            && self.fresh_send_allowance() != 0
                             && self.ecn_pause.is_none_or(|deadline| now >= deadline))
                         && r.rescue_rxt.is_none_or(|end| self.snd_una.after(end))
                         && self
@@ -6802,7 +6904,7 @@ impl Connection {
             self.send
                 .acknowledge(bytes as usize)
                 .expect("ACK is bounded by sent sequence space");
-            if self.send.remaining() != 0 {
+            if self.send_space_remaining() != 0 {
                 self.send_backpressured = false;
             }
             self.send_base = self.send_base.wrapping_add(bytes);
@@ -6818,7 +6920,7 @@ impl Connection {
                 self.now,
                 TxTimestampClock::CallerTicks(self.config.timebase),
             );
-            if !self.shutdown && self.send.remaining() != 0 {
+            if !self.shutdown && self.send_space_remaining() != 0 {
                 self.events.writable = true;
             }
         }
@@ -8282,6 +8384,7 @@ impl Connection {
                 let unsent = self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize;
                 let new_allowed = unsent
                     && self.snd_wnd > self.flight()
+                    && self.fresh_send_allowance() != 0
                     && self.ecn_pause.is_none_or(|deadline| now >= deadline);
                 if let Some((left, right)) = lost {
                     sack_segment = Some((left, right, false, false));
@@ -8406,7 +8509,8 @@ impl Connection {
                                 .min(self.config.user_mss.unwrap_or(u16::MAX)),
                         )
                         .saturating_sub(option_len),
-                    );
+                    )
+                    .min(self.fresh_send_allowance());
                 count = self.send.copy(0, &mut self.scratch[..limit]);
             }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
@@ -8450,7 +8554,9 @@ impl Connection {
             //= reason=Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
             //# 3)  The initial transmission MUST be within the window announced by
             //# the most recent <ACK>.
-            let credit = self.snd_wnd.saturating_sub(self.flight()) as usize;
+            // New data needs fresh send space too; otherwise probe the tail.
+            let credit = (self.snd_wnd.saturating_sub(self.flight()) as usize)
+                .min(self.fresh_send_allowance());
             if unsent != 0 && credit >= unsent.min(packet_mss) {
                 count = self
                     .send
@@ -8717,6 +8823,8 @@ impl Connection {
                 && self.snd_wnd.saturating_sub(self.flight()) as usize > unsent
                 && (usable > unsent || unsent == 0 && self.prr.is_none())
                 && matches!(self.state, State::Established | State::CloseWait);
+            // FIN consumes no send space; payload, probes and GSO totals do.
+            let usable = usable.min(self.fresh_send_allowance());
             //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
             //# It has no outstanding probes or losses.
             // Leading/trailing retransmissions are tracked through cumulative
@@ -8903,10 +9011,18 @@ impl Connection {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1
                 //# A TCP implementation MUST include a SWS avoidance algorithm in the
                 //# sender (MUST-38).
+                // A managed C below one segment is the largest payload this
+                // connection can ever send: a segment it alone shortens is
+                // not held, since waiting cannot enlarge it.
+                let largest = if self.managed_path.is_some() {
+                    record.min(self.send_space())
+                } else {
+                    record
+                };
                 let sws = !flushing
                     && !descriptor_limited
                     && !self.sws_override
-                    && count < record
+                    && count < largest
                     && count < (self.max_snd_wnd / 2) as usize;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
                 //# When an application issues a series of SEND calls without setting

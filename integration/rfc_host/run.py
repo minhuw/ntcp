@@ -19,6 +19,7 @@ sys.dont_write_bytecode = True
 from bridge import Bridge
 import admin
 import icmp
+import mss
 import options
 from linux_peer import fnv, pattern
 
@@ -32,6 +33,15 @@ STAGED = ROOT / "workbench/network-target/debug/ptb_stage"
 DRIVER = ROOT / "workbench/network-target/debug/datagram_drive"
 # The real path administration utility (separate process per request).
 PATHCTL = ROOT / "workbench/network-target/debug/ntcp-pathctl"
+# Harness-only two-TUN driver for the receive-MSS and send-space cases.
+TWO_LINK = ROOT / "workbench/network-target/debug/two_link"
+
+
+# The native runtime's physical receive bound on an AF_PACKET port (no fixed
+# adapter limit: the IPv4 datagram maximum) and the reassembly capacity it
+# configures from it, both families: its receive MSS derivation inputs.
+NATIVE_RECEIVE = 65535
+NATIVE_REASSEMBLY = 65535
 
 
 def emit(tag, data):
@@ -104,7 +114,7 @@ def setup(family, kernel, native):
     with open("/proc/sys/net/ipv4/tcp_fastopen", "w") as f:
         f.write("3")
     return dict(route=route, native_kernel_address=False, tcp_fastopen=3,
-                mtu=1500, static_neighbor="02:00:00:00:00:02", offload="disabled on owned veths")
+                mtu=1500, native_mtu=native_link["mtu"], static_neighbor="02:00:00:00:00:02", offload="disabled on owned veths")
 
 
 class Peer:
@@ -219,6 +229,14 @@ def options_child(case, proof):
                                   kernel_version=os.uname().version, evidence=evidence,
                                   build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
                                              commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
+def mss_child(case, proof):
+    evidence = mss.child(case, proof, TWO_LINK, Peer, command)
+    emit("T16_MSS_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                              kernel_version=os.uname().version, evidence=evidence,
+                              build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                         commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
 
 
 def admin_child(case, proof):
@@ -358,6 +376,8 @@ def child(case):
         return native_admin_child(case, proof)
     if case.get("kind") == "ip-options":
         return options_child(case, proof)
+    if case.get("kind") == "mss":
+        return mss_child(case, proof)
     family, role, policy, scenario = (case[k] for k in ("family", "role", "policy", "scenario"))
     kernel, native = ("198.18.0.1", "198.18.0.2") if family == 4 else ("fd54:3500::1", "fd54:3500::2")
     settings = setup(family, kernel, native)
@@ -406,6 +426,11 @@ def child(case):
             events, count = bridge.snapshot(start)
             assert count == (0 if fault == "none" else 1), (fault, count)
             wire = wire_proof(events, direction, expected)
+            # The native runtime's offer is its Host's derivation from the
+            # queried port MTU, the AF_PACKET receive bound and reassembly.
+            native_segment = wire["initial_syn"] if direction == "native-to-kernel" else wire["synack"]
+            offer = icmp.receive_mss(family, [(settings["native_mtu"], NATIVE_RECEIVE)], NATIVE_REASSEMBLY)
+            assert native_segment["mss"] == offer, (offer, native_segment)
             if expected in ("warm", "partial", "rejected", "drop", "strip"):
                 assert wire["initial_syn"]["cookie"] == learned_cookie, "opaque cookie was not returned byte-for-byte"
             if wire["synack"]["cookie"]:
@@ -556,14 +581,17 @@ def main():
     icmp_cases = icmp.cases()
     admin_cases = admin.cases()
     option_cases = options.cases()
+    mss_cases = mss.cases()
     emit("T5_NETWORK_BUILD", dict(schema_version=1, command=build, commit=commit,
                                   source_sha256=source, binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
                                   icmp_command=echo_build, icmp_cases=icmp_cases,
                                   admin_command=pathctl_build, admin_cases=admin_cases, option_cases=option_cases,
+                                  mss_cases=mss_cases,
                                   pathctl_sha256=hashlib.sha256(PATHCTL.read_bytes()).hexdigest(),
                                   tun_echo_sha256=hashlib.sha256(TUN_ECHO.read_bytes()).hexdigest(),
                                   ptb_stage_sha256=hashlib.sha256(STAGED.read_bytes()).hexdigest(),
                                   datagram_drive_sha256=hashlib.sha256(DRIVER.read_bytes()).hexdigest(),
+                                  two_link_sha256=hashlib.sha256(TWO_LINK.read_bytes()).hexdigest(),
                                   kernel=os.uname().release, kernel_version=os.uname().version,
                                   rustc=command(["rustc", "--version"]).strip(), packet_test=False,
                                   applicability=dict(partial_syn="Native server 128-byte receive admission, then public SO_RCVBUF growth after prefix read",
@@ -577,7 +605,8 @@ def main():
     icmp_completed = 0
     admin_completed = 0
     option_completed = 0
-    for case in icmp_cases + admin_cases + option_cases + cases:
+    mss_completed = 0
+    for case in icmp_cases + admin_cases + option_cases + mss_cases + cases:
         assert time.monotonic() - started < 1740, "30 minute total gate budget"
         fds = [os.open("/proc/self/ns/" + kind, os.O_RDONLY) for kind in ("net", "user")]
         try:
@@ -608,7 +637,8 @@ def main():
                 print(err, end="", file=sys.stderr, flush=True)
             assert code == 0, dict(case=case, command=cmd, exit=code)
             tag = ("T9_ICMP_CASE " if case in icmp_cases else "T12_ADMIN_CASE " if case in admin_cases
-                   else "T14_OPTIONS_CASE " if case in option_cases else "T5_NETWORK_CASE ")
+                   else "T14_OPTIONS_CASE " if case in option_cases
+                   else "T16_MSS_CASE " if case in mss_cases else "T5_NETWORK_CASE ")
             summaries = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(tag)]
             assert len(summaries) == 1 and summaries[0]["case"] == case, "missing case summary"
             summary = summaries[0]
@@ -624,6 +654,10 @@ def main():
                 namespace_ids.append(summary["namespace"])
                 option_completed += 1
                 continue
+            if case in mss_cases:
+                namespace_ids.append(summary["namespace"])
+                mss_completed += 1
+                continue
             stream_count += summary["streams"]
             refusal_count += summary["completions"] - summary["streams"]
             namespace_ids.append(summary["namespace"])
@@ -635,9 +669,10 @@ def main():
     assert icmp_completed == len(icmp_cases) == 23
     assert admin_completed == len(admin_cases) == 7
     assert option_completed == len(option_cases) == 5
+    assert mss_completed == len(mss_cases) == 4
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
                                     icmp_cases=icmp_completed, admin_cases=admin_completed,
-                                    option_cases=option_completed,
+                                    option_cases=option_completed, mss_cases=mss_completed,
                                     namespaces=namespace_ids, kernel=os.uname().release,
                                     stream_sha256={name: hashlib.sha256(pattern(n, salt)).hexdigest()
                                                    for name, n, salt in (("request", 8192, 7), ("response", 6144, 11),

@@ -177,8 +177,16 @@ class Ipv4Inventory(unittest.TestCase):
                 attached = next(a for p, n, a in tests[id] if (p, n) == (path, name))
                 self.assertIn(call, attached, (id, name))
         # The value rule: the core write contract, the provider crate's
-        # recorded and actual facts, and embedding recording.
-        self.assertGreaterEqual(len(tests["1122-timestamp-value"]), 3)
+        # recorded and actual facts, and embedding recording, each with at
+        # least one asserting test of its own.
+        origins = {
+            "core": ("crates/stacks/ntcp/src/",),
+            "clock": ("crates/adapters/ntcp-clock/",),
+            "embedding": ("crates/stacks/ntcp/examples/", "crates/adapters/ntcp-socket/"),
+        }
+        for origin, prefixes in origins.items():
+            self.assertTrue(any(path.startswith(prefixes) for path, _, _ in tests["1122-timestamp-value"]),
+                            origin)
 
 
 class HistoricalPublication(unittest.TestCase):

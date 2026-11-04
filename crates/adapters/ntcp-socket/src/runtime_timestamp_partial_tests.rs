@@ -86,9 +86,11 @@ fn fixture_with_window(window: u16) -> Fixture {
         ts::TX_SCHED | ts::TX_SOFTWARE | ts::TX_ACK | ts::SOFTWARE | ts::OPT_ID,
     );
     let info = f.owner.endpoint.transport_info(cid).unwrap();
+    // SO_SNDBUF stays the logical capacity B; admission rounds it down to
+    // whole 988-octet segments (RFC 1191 section 6.4): C = 4 * 988.
     assert_eq!(
-        (info.mss, info.max_send_window, info.send_capacity),
-        (988, u32::from(window), 4608)
+        (info.mss, info.max_send_window, info.send_capacity, info.send_space),
+        (988, u32::from(window), 4608, 3952)
     );
     f
 }
@@ -156,16 +158,16 @@ fn timestamp_partial_actual_admission_and_first_flight() {
         )
         .unwrap()
         .value;
-    assert_eq!(n, 4608);
+    assert_eq!(n, 3952);
     let before = f.owner.endpoint.transport_info(f.cid).unwrap();
-    assert_eq!((before.send_used, before.notsent_bytes), (4608, 4608));
+    assert_eq!((before.send_used, before.notsent_bytes), (3952, 3952));
     let packets = drain(&mut f);
     assert_eq!(
         packets.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
         [(1, 988), (989, 988), (1977, 24)]
     );
     let after = f.owner.endpoint.transport_info(f.cid).unwrap();
-    assert_eq!((after.send_used, after.notsent_bytes), (4608, 2608));
+    assert_eq!((after.send_used, after.notsent_bytes), (3952, 1952));
     assert!(timestamp_records(&f.owner, f.id).is_empty());
 }
 
@@ -221,23 +223,66 @@ fn timestamp_partial_native_accounting_fixture_keeps_all_phases() {
             )
             .unwrap()
             .value,
-        4608
+        3952
     );
     assert_eq!(drain(&mut f), [(1, 988, false), (989, 988, true)]);
     assert!(timestamp_records(&f.owner, f.id).is_empty());
     ack(&mut f, 20000, 1976);
     assert_eq!(
         drain(&mut f),
-        [(1977, 988, false), (2965, 988, false), (3953, 656, true)]
+        [(1977, 988, false), (2965, 988, true)]
     );
     let first = timestamp_records(&f.owner, f.id);
     assert_eq!(first.len(), 2);
-    assert!(first.iter().all(|r| r.1 == 4607 && r.2 > 0 && r.4 > 0));
-    ack(&mut f, 30000, 4608);
+    assert!(first.iter().all(|r| r.1 == 3951 && r.2 > 0 && r.4 > 0));
+    ack(&mut f, 30000, 3952);
     let last = timestamp_records(&f.owner, f.id);
     assert_eq!(last.len(), 3);
-    assert!(last.iter().all(|r| r.1 == 4607 && r.2 > 0 && r.4 > 0));
+    assert!(last.iter().all(|r| r.1 == 3951 && r.2 > 0 && r.4 > 0));
     for stage in 0..3 {
         assert_eq!(last.iter().filter(|r| r.0 == stage).count(), 1);
     }
+}
+
+// Writable readiness follows the rounded admission ceiling C, not the
+// SO_SNDBUF capacity B that getsockopt keeps reporting.
+#[test]
+fn writable_readiness_agrees_with_rounded_admission() {
+    let mut f = fixture();
+    let writable = |f: &mut Fixture| f.owner.execute(f.id, Op::Ready).unwrap().value & EPOLLOUT != 0;
+    let room = |f: &Fixture| f.owner.endpoint.send_admission_room(f.cid, None).unwrap();
+    let bytes = vec![0x55; 10000];
+    let send = |f: &mut Fixture| {
+        f.owner
+            .execute(f.id, Op::Send(vec![(bytes.as_ptr() as usize, bytes.len())], 0))
+            .map(|r| r.value)
+    };
+    assert_eq!(send(&mut f).unwrap(), 3952);
+    drain(&mut f);
+    let info = f.owner.endpoint.transport_info(f.cid).unwrap();
+    assert!(info.send_used < info.send_capacity);
+    assert_eq!(room(&f), 0);
+    assert!(!writable(&mut f));
+    assert_eq!(send(&mut f), Err(EAGAIN));
+    // A partial ACK drains below C and reopens both together.
+    ack(&mut f, 20000, 988);
+    assert_eq!(room(&f), 988);
+    assert!(writable(&mut f));
+    assert_eq!(send(&mut f).unwrap(), 988);
+    assert!(!writable(&mut f));
+    // A live resize keeps reporting B and moves C with it.
+    f.owner
+        .execute(f.id, Op::Set(SOL_SOCKET, SO_SNDBUF, 3000))
+        .unwrap();
+    assert_eq!(
+        f.owner
+            .execute(f.id, Op::Get(SOL_SOCKET, SO_SNDBUF))
+            .unwrap()
+            .value,
+        6000
+    );
+    let info = f.owner.endpoint.transport_info(f.cid).unwrap();
+    assert_eq!((info.send_capacity, info.send_space), (6000, 5928));
+    assert_eq!(room(&f), 5928 - 3952);
+    assert!(writable(&mut f));
 }

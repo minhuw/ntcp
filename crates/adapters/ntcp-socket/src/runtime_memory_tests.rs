@@ -453,6 +453,70 @@ fn packet_ptb_validation_precedes_bounded_queue_admission() {
     assert_eq!(path_mtu(&a, clients[1]), 1500);
 }
 
+// PMTU feedback re-rounds the send space C of an unchanged SO_SNDBUF (B):
+// a smaller C keeps the bytes already admitted above it, a larger one
+// reopens writable readiness with a new edge; getsockopt keeps B.
+#[test]
+fn packet_ptb_rerounds_send_space_readiness_and_edges() {
+    let (mut a, _, clients, _) = ptb_pair(1);
+    let fd = clients[0];
+    let id = cid(&a, fd);
+    a.execute(fd, Op::Set(SOL_SOCKET, SO_SNDBUF, 2304)).unwrap();
+    let sndbuf = |a: &mut Owner| a.execute(fd, Op::Get(SOL_SOCKET, SO_SNDBUF)).unwrap().value;
+    let ready = |a: &mut Owner| a.execute(fd, Op::Ready).unwrap();
+    assert_eq!(sndbuf(&mut a), 4608);
+    assert_eq!(a.endpoint.transport_info(id).unwrap().mss, 1460);
+    assert_eq!(
+        a.execute(fd, Op::Write(vec![7; 10000])).unwrap().value,
+        3 * 1460
+    );
+    // Send everything so that no reserved output defers the feedback.
+    let mut packets = Vec::new();
+    for _ in 0..3 {
+        a.service_egress().unwrap();
+        packets.push(a.execute(0, Op::Capture(65535)).unwrap().bytes);
+        a.test_now = Some(a.now() + 1000);
+    }
+    assert!(!a.endpoint.is_output_reserved(id));
+    let blocked = ready(&mut a);
+    assert_eq!(blocked.value & EPOLLOUT, 0);
+    let info = a.endpoint.transport_info(id).unwrap();
+    assert!(info.send_used < info.send_capacity);
+    let feedback = |a: &mut Owner, mtu: u16| {
+        let mut report = ptb_frame(&packets[0]);
+        report[26..28].copy_from_slice(&mtu.to_be_bytes());
+        ptb_checksums(&mut report);
+        a.execute(0, Op::Inject(report)).unwrap();
+        receive(a);
+        assert_eq!(path_mtu(a, fd), u32::from(mtu));
+        a.endpoint.transport_info(id).unwrap()
+    };
+    // 1200: C = 3 * 1160 is below the 4380 admitted bytes, which stay.
+    let info = feedback(&mut a, 1200);
+    assert_eq!(
+        (info.mss, info.send_space, info.send_used),
+        (1160, 3480, 4380)
+    );
+    assert_eq!(ready(&mut a).value & EPOLLOUT, 0);
+    assert_eq!(a.execute(fd, Op::Write(vec![7; 1])).unwrap_err(), EAGAIN);
+    // 1140: C = 4 * 1100 exceeds them again and reopens 20 bytes.
+    let info = feedback(&mut a, 1140);
+    assert_eq!(
+        (info.mss, info.send_space, info.send_used),
+        (1100, 4400, 4380)
+    );
+    let reopened = ready(&mut a);
+    assert_ne!(reopened.value & EPOLLOUT, 0);
+    assert!(socket_options::edge_changed(
+        EPOLLOUT as u32,
+        Some(blocked.readiness_generations),
+        reopened.readiness_generations,
+    ));
+    assert_eq!(a.execute(fd, Op::Write(vec![7; 10000])).unwrap().value, 20);
+    assert_eq!(ready(&mut a).value & EPOLLOUT, 0);
+    assert_eq!(sndbuf(&mut a), 4608);
+}
+
 #[test]
 fn packet_ptb_retained_owner_does_not_block_other_flow() {
     let (mut a, mut b, clients, servers) = ptb_pair(1);

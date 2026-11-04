@@ -1011,7 +1011,7 @@ impl Owner {
             owner.socket_policy.fast_open_client_policy =
                 FastOpenClientPolicy::ApplicationProtected;
         }
-        owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
+        owner.packets = Some(PacketBackend::new(profile, local, options.queue_capacity)?);
         // The packet-test port is an in-process queue created with this
         // Owner: nothing emitted before it existed can be in flight on it.
         owner.source_quiet = crate::SourceQuiet::Never;
@@ -1862,7 +1862,7 @@ impl Owner {
                     || matches!(state, State::Closed | State::TimeWait)
                     || ((matches!(state, State::Established | State::CloseWait)
                         || state == State::SynReceived && s.connected)
-                        && info.send_used < info.send_capacity
+                        && info.send_used < info.send_space
                         && notsent_writable(
                             info.notsent_bytes,
                             effective_notsent_lowat(

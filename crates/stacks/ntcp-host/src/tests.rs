@@ -12,6 +12,7 @@ mod ingress;
 mod ipv4_policy;
 mod probe_receipts;
 mod reassembly;
+mod receive_capability;
 mod registration;
 mod repair;
 mod source_routes;

@@ -8,11 +8,29 @@ pub(super) struct PacketBackend {
     // Accepted output, each with the packet mark it was submitted under.
     pub(super) output: VecDeque<(Reply, u32)>,
     capacity: usize,
+    mtu: u32,
     pub(super) local_reject: bool,
     mark: u32,
 }
 impl PacketBackend {
-    pub(super) fn new(profile: crate::packet_profile::Profile, capacity: usize) -> Result<Self> {
+    pub(super) fn new(
+        profile: crate::packet_profile::Profile,
+        local: IpAddr,
+        capacity: usize,
+    ) -> Result<Self> {
+        // The port stands for packetdrill's tun device: the runner's default
+        // 1500-octet MTU for IPv4 runs (IPv4-mapped ones included) and the
+        // 1520 octets its IPv6 variant pins, so 1460-octet segments fit in
+        // either family. Explicit packet-test link profiles override it. The
+        // port still accepts every complete IP packet up to BYTES, as a tun
+        // device does not drop inbound packets above its MTU.
+        let mtu = match profile {
+            crate::packet_profile::Profile::Upstream(options) => {
+                options.link_mtu.or(options.pmtud1500.then_some(1500))
+            }
+            _ => None,
+        }
+        .unwrap_or(if local.is_ipv4() { 1500 } else { 1520 });
         let mut input = VecDeque::new();
         let mut output = VecDeque::new();
         input.try_reserve_exact(capacity).map_err(|_| ENOMEM)?;
@@ -22,6 +40,7 @@ impl PacketBackend {
             input,
             output,
             capacity,
+            mtu,
             local_reject: false,
             mark: 0,
         })
@@ -47,19 +66,7 @@ impl PacketIo for PacketBackend {
         ntcp_io::PacketLayer::Ip
     }
     fn local_ip_mtu(&self) -> std::io::Result<Option<u32>> {
-        // The in-memory port accepts every complete IP packet up to BYTES.
-        // Explicit packet-test link profiles additionally emulate that limit.
-        let mtu = match self.profile {
-            crate::packet_profile::Profile::Upstream(options) => {
-                options.link_mtu.unwrap_or(if options.pmtud1500 {
-                    1500
-                } else {
-                    crate::packet_profile::BYTES as u32
-                })
-            }
-            _ => crate::packet_profile::BYTES as u32,
-        };
-        Ok(Some(mtu))
+        Ok(Some(self.mtu))
     }
     fn max_packet_len(&self) -> Option<usize> {
         Some(crate::packet_profile::BYTES)

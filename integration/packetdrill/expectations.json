@@ -7,14 +7,14 @@
       "source_sha256": "5a119eceac60170a8d3cc160c06ee272da119d63286ba1e1a9a87b992490038c",
       "input_generated_sha256": "cf0d84113668ac68912d0d951d2fc66cabd6592af0d8d70d2ab36fdf4242d57f",
       "fixture": "ntcp-expectations/timestamping/partial.pkt",
-      "fixture_sha256": "f28fb0ba798027bad1f95e0cbdbc3656a45bb812cf93a6982abda8cd0c21d0b7",
-      "rationale": "ntcp stores payload in a byte ring: SO_SNDBUF1000 becomes max(2*1000,4608)=4608 payload bytes, whereas Linux charges skb memory and this source expects2964. Exercise the same partial-write/last-byte timestamp contract using the native capacity.",
+      "fixture_sha256": "224e42a5c9995aee629e22979838e0e1faffaa143db0c64a5218e8fc71e091f1",
+      "rationale": "ntcp stores payload in a byte ring: SO_SNDBUF1000 becomes max(2*1000,4608)=4608 payload bytes, whereas Linux charges skb memory and this source expects2964. A Host-managed connection admits only whole segments of that capacity (RFC 1191 section 6.4: the greatest multiple of the segment size in use, here the 988-byte timestamped segment, not above the buffer space), so 4*988=3952 bytes are accepted. Exercise the same partial-write/last-byte timestamp contract using the native capacity.",
       "changes": [
         {
           "field": "nonblocking write return",
           "upstream": 2964,
-          "ntcp": 4608,
-          "derivation": "max(2*1000,4608); request10000 still exceeds capacity."
+          "ntcp": 3952,
+          "derivation": "floor(max(2*1000,4608)/988)*988=4*988; request10000 still exceeds the send space."
         },
         {
           "field": "initial peer SYN window",
@@ -25,18 +25,18 @@
         {
           "field": "second outbound aggregate / final ACK",
           "upstream": "1977:2965(988),ACK2965",
-          "ntcp": "1977:4609(2632),ACK4609",
-          "derivation": "Remaining4608-1976=2632 bytes; full-buffer finalization releases them after the20ms ACK."
+          "ntcp": "1977:3953(1976),ACK3953",
+          "derivation": "Remaining3952-1976=1976 bytes; full-buffer finalization releases them after the20ms ACK."
         },
         {
           "field": "all3 timestamp ee_data IDs",
           "upstream": 2963,
-          "ntcp": 4607,
-          "derivation": "Last actually accepted byte:4608-1. SCHED/SND20ms,ACK30ms and RTT bounds unchanged."
+          "ntcp": 3951,
+          "derivation": "Last actually accepted byte:3952-1. SCHED/SND20ms,ACK30ms and RTT bounds unchanged."
         }
       ],
       "invariants": [
-        "The write remains partial:4608 of10000, not a smaller full write.",
+        "The write remains partial:3952 of10000, not a smaller full write.",
         "Contiguous data is fully acknowledged; ACKs never cover unsent bytes.",
         "All3 timestamp phases, option fields, packet payload and RTT assertions remain enabled.",
         "The final application PUSH remains checked; no runtime/profile/timestamp-counter changes."

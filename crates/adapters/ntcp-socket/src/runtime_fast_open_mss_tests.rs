@@ -56,6 +56,8 @@ fn fast_open_socket_mss_limits_initial_copy_in_explicit_and_deferred_opens() {
             );
             let syn = tfo_capture(&mut a);
             let segment = segment(&syn);
+            // A socket MSS caps the Host-derived offer of the in-memory
+            // link (packetdrill's 1500-octet IPv4 tun MTU).
             assert_eq!(segment.options.mss, Some(cap.map_or(1460, |n| n as u16)));
             assert_eq!(segment.payload, &data[..expected as usize]);
             let connection = cid(&a, client);

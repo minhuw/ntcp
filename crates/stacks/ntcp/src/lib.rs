@@ -29,7 +29,7 @@ mod fast_open_policy_tests;
 #[cfg(test)]
 mod fast_open_tests;
 mod managed_path;
-pub use managed_path::{DiscoveryIntent, FactoryRole, ManagedError, ManagedOpenOptions, ManagedPathInfo, PathFactoryRequest, PathProvider, PreparedPath, TransportCeilings};
+pub use managed_path::{DiscoveryIntent, FactoryRole, ManagedError, ManagedOpenOptions, ManagedPathInfo, PathFactoryRequest, PathProvider, PreparedFactory, PreparedPath, ReceiveIpCapability, TransportCeilings};
 mod output_reservation;
 pub use output_reservation::{GsoLimits, TransmitAttempt, TransmitSegmentation};
 #[cfg(test)]

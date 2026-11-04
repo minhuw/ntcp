@@ -64,22 +64,6 @@ quote = '''
 2 minutes, respectively).
 '''
 
-# 1191-024
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
-reason = "Actual codec SYN/SYNACK comparisons prove equivalent local/routed receive offers above536 and independence from validated lower send PMTU. T13 supplies the host capacity: Host::reassembly_capacity states, per family and per Host context, EMTU_R (RFC 1122 section 3.3.2: the largest complete IP datagram, header included, that the configured, storage-backed reassembly engine accepts) and MMS_R (EMTU_R - 20 for IPv4, EMTU_R - 40 for IPv6). This paragraph calls the largest reassemblable datagram MMS_R, so its host MMS_R-40 is EMTU_R - 40, that is RFC 1122's MMS_R less TCP's 20-octet header for IPv4; the TCP payload unit (MSS) differs from both EMTU_R and MMS_R. Configured receive sizing is not yet derived from that capacity or from the permitted maximum connected-link MTU across multiple interfaces: a host receive/reassembly and topology contract remains necessary. Remaining: T16 owns the receive-MSS derivation from Host::reassembly_capacity and the connected links, and T19 the topology evidence. The optional link-derived choice is not itself a required feature."
-quote = '''
-in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.
-'''
-
-# 1191-025
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
-reason = "receive_mss_offer caps configured MSS by receive_ip_payload_limit, user_mss and advertised_mss, but not by the maximum connected-link MTU. Tests intentionally retain MSS1460 with a smaller send-path MTU. The whole host recommendation remains TODO; no sign-bit bug is alleged."
-quote = '''
-Note: At the moment, we see no reason to send an MSS greater than the maximum MTU of the connected networks, and we recommend that hosts do not use 65495. It is quite possible that some IP implementations have sign-bit bugs that would be tickled by unnecessary use of such a large MSS.
-'''
-
 # 1191-026
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-4"
@@ -185,14 +169,6 @@ target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
 reason = "Implemented operative behavior: a DTB-caused retransmission never reduces cwnd or ssthresh, enters or extends recovery, starts PRR or manufactures delivery credit, and it triggers slow start: a notification adding new repair work admits one accepted physical repair packet until acknowledgements show useful progress (a cumulative advance or newly SACKed bytes), then ordinary congestion admission; probe attribution invalidates a quoted probe's size in every accepted class without a congestion response. Dual-family real-receiver scheduler, SACK/RACK/PRR, NewReno and Host reservation tests verify it. Remaining (T23, AC-27): only the standards decision whether the RFC 5681/RFC 4821 rescaling of the byte congestion window by segment count on an MSS decrease (Congestion::set_mss, kept) conflicts with \"should not change the congestion window\"."
 quote = '''
 Modern TCP implementations incorporate "congestion advoidance" and "slow-start" algorithms to improve performance [4]. Unlike a retransmission caused by a TCP retransmission timeout, a retransmission caused by a Datagram Too Big message should not change the congestion window. It should, however, trigger the slow-start mechanism (i.e., only one segment should be retransmitted until acknowledgements begin to arrive again).
-'''
-
-# 1191-083
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
-reason = "No adjustment rounds the maximum send window to the greatest multiple of PMTU-40 within send-buffer space; the MSS byte budget alone does not establish this recommendation."
-quote = '''
-TCP performance can be reduced if the sender's maximum window size is not an exact multiple of the segment size in use (this is not the congestion window size, which is always a multiple of the segment size). In many system (such as those derived from 4.2BSD), the segment size is often set to 1024 octets, and the maximum window size (the "send space") is usually a multiple of 1024 octets, so the proper relationship holds by default. If PMTU Discovery is used, however, the segment size may not be a submultiple of the send space, and it may change during a connection; this means that the TCP layer may need to change the transmission window size when PMTU Discovery changes the PMTU value. The maximum window size should be set to the greatest multiple of the segment size (PMTU - 40) that is less than or equal to the sender's buffer space size.
 '''
 
 # 1191-085

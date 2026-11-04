@@ -115,7 +115,7 @@ fn ack(a: &mut Connection, now: u64, end: Seq) {
 //# that is less than the IPv6 minimum link MTU, it must discard it.
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
 //= type=test
-//= reason=Dynamic send path MSS never mutates config.mss receive offer; family-floor wire test asserts unchanged receive capability.
+//= reason=Dynamic send path MSS never mutates the receive offer (Host-derived when managed, configured when raw); family-floor wire test asserts unchanged receive capability.
 //# PMTU Discovery does not affect the value sent in the TCP MSS option, because that value
 //# is used by the other end of the connection, which may be using an unrelated PMTU value.
 

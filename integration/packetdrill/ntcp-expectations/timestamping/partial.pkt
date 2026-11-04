@@ -19,16 +19,17 @@
 		    SOF_TIMESTAMPING_TX_ACK | SOF_TIMESTAMPING_SOFTWARE |
 		    SOF_TIMESTAMPING_OPT_ID], 4) = 0
 
-// ntcp payload capacity = max(2*1000,4608)=4608. Peer window=2*988;
-// five segments cover 4*988+656; full-buffer finalization releases the 20ms tail.
+// ntcp payload capacity = max(2*1000,4608)=4608, admitted in whole 988-byte
+// segments: 4*988=3952. Peer window=2*988; four segments cover 3952; the
+// 20ms ACK releases the full-buffer tail.
 // We retain partial-write, last-byte ID, all three phase and RTT assertions.
 // We have a partial write.
-   +0	write(3, ..., 10000) = 4608
+   +0	write(3, ..., 10000) = 3952
    +0	> . 1:989(988) ack 1 <nop,nop,TS val 110 ecr 700>
    +0	> P. 989:1977(988) ack 1 <nop,nop,TS val 110 ecr 700>
  +.01	< . 1:1(0) ack 1977 win 92 <nop,nop,TS val 800 ecr 200>
-   +0	> P. 1977:4609(2632) ack 1 <nop,nop,TS val 114 ecr 800>
- +.01	< . 1:1(0) ack 4609 win 92 <nop,nop,TS val 800 ecr 200>
+   +0	> P. 1977:3953(1976) ack 1 <nop,nop,TS val 114 ecr 800>
+ +.01	< . 1:1(0) ack 3953 win 92 <nop,nop,TS val 800 ecr 200>
 
 // Make sure that internal TCP timestamps are not overwritten and we have sane
 // RTT measurement.
@@ -52,7 +53,7 @@ assert 5000 <= tcpi_rtt <= 20000, 'srtt=%d us' % tcpi_rtt
 				    ee_type=0,
 				    ee_code=0,
 				    ee_info=SCM_TSTAMP_SCHED,
-				    ee_data=4607}}
+				    ee_data=3951}}
 		    ]}, MSG_ERRQUEUE) = 0
 // SCM_TSTAMP_SND for the first chunk should be received almost immediately
 // after the first ack at t=20ms.
@@ -70,7 +71,7 @@ assert 5000 <= tcpi_rtt <= 20000, 'srtt=%d us' % tcpi_rtt
 				    ee_type=0,
 				    ee_code=0,
 				    ee_info=SCM_TSTAMP_SND,
-				    ee_data=4607}}
+				    ee_data=3951}}
 		    ]}, MSG_ERRQUEUE) = 0
 // SCM_TSTAMP_ACK for the first chunk should be received after the last ack at
 // t=30ms.
@@ -88,5 +89,5 @@ assert 5000 <= tcpi_rtt <= 20000, 'srtt=%d us' % tcpi_rtt
 				    ee_type=0,
 				    ee_code=0,
 				    ee_info=SCM_TSTAMP_ACK,
-				    ee_data=4607}}
+				    ee_data=3951}}
 		    ]}, MSG_ERRQUEUE) = 0

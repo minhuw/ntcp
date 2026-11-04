@@ -258,7 +258,6 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     c.sack = profile == Profile::Sack;
     c.ecn = false;
     c.coalesce_read_window_updates = false;
-    c.receive_ip_payload_limit = 65515;
     c.send_ip_payload_limit = 65515;
     if let Profile::Upstream(o) = profile {
         config.max_buffer_bytes = if o.budget224m {
@@ -715,7 +714,6 @@ mod setup_profile_tests {
                     .then(ntcp::PacingConfig::default);
             expected.connection.sack = profile == Profile::Sack;
             expected.connection.coalesce_read_window_updates = false;
-            expected.connection.receive_ip_payload_limit = 65515;
             expected.connection.send_ip_payload_limit = 65515;
             expected.connection.ecn = false;
             assert_eq!(format!("{:?}", config(profile)), format!("{expected:?}"));

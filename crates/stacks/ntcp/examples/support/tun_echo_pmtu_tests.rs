@@ -123,7 +123,13 @@ fn runtime_mtu_and_option_selection() {
             assert_eq!(cfg.ipv4_options_enabled, !v6);
             let payload = if v6 { 1460 } else { 1480 };
             assert_eq!(cfg.connection.send_ip_payload_limit, payload);
-            assert_eq!(cfg.connection.receive_ip_payload_limit, payload);
+            assert_eq!(cfg.connection.mss, payload - 20);
+            // No static receive limit: the managed offer is the Host's
+            // derivation (asserted on the wire by Pair::with_options).
+            assert_eq!(
+                cfg.connection.receive_ip_payload_limit,
+                ConnectionConfig::default().receive_ip_payload_limit
+            );
             assert_eq!(cfg.connection.send_capacity, 65536);
             assert_eq!(cfg.connection.receive_capacity, 65536);
         }
@@ -279,6 +285,15 @@ impl Pair {
                 syn.header.flags & (ntcp::wire::SYN | ntcp::wire::ACK),
                 flags
             );
+            // The SYN and SYN-ACK offer the sender Host's receive capability:
+            // its one 1500-octet link, below the 65535/65575-octet reassembly
+            // and 65575-octet backend receive capacity, less the base headers.
+            let capability = from_host.host.receive_ip_capability(v6).unwrap();
+            assert_eq!(syn.options.mss, Some(capability.mss()));
+            assert_eq!(
+                usize::from(capability.mss()),
+                MTU - if v6 { IPV6_HEADER } else { IP_HEADER } - 20
+            );
             assert_eq!(syn.options.timestamps.is_some(), timestamps);
             input_frame(to_host, to, time, &frames[0], destination, options, &mut Sample(0)).unwrap();
         }
@@ -302,6 +317,24 @@ impl Pair {
                 timestamps
             );
             assert_eq!(e.path_mtu_info(id).unwrap().unwrap().first_hop_mtu, 1500);
+            // The 65536-byte send buffer is reported as configured and
+            // rounded down to whole segments for admission (the IPv4
+            // options profile's segments are smaller still).
+            let info = e.transport_info(id).unwrap();
+            assert_eq!(info.send_capacity, 65536);
+            let q = info.mss as usize;
+            assert_eq!(info.send_space, 65536 / q * q);
+            if !options {
+                assert_eq!(
+                    (info.mss, info.send_space),
+                    match (v6, timestamps) {
+                        (false, false) => (1460, 44 * 1460),
+                        (false, true) => (1448, 45 * 1448),
+                        (true, false) => (1440, 45 * 1440),
+                        (true, true) => (1428, 45 * 1428),
+                    }
+                );
+            }
         }
         Self {
             a,
@@ -731,6 +764,57 @@ fn runtime_ptb_repairs_and_receiver_ack_progress() {
         )
         .unwrap();
         assert_eq!(p.a.path_mtu_info(p.aid).unwrap(), before);
+    }
+}
+
+// The supplied embedding admits whole segments of its 65536-byte buffer and
+// re-rounds on a PMTU change: IPv4's smaller C keeps the bytes already
+// admitted above it, IPv6's larger C reopens room, and the receiver gets the
+// whole stream.
+#[test]
+fn runtime_send_space_rounds_to_segments_across_pmtu_change() {
+    for v6 in [false, true] {
+        let mut p = Pair::new(v6, true);
+        let stream: Vec<u8> = (0..200_000).map(|n| (n % 253) as u8).collect();
+        let first = p.a.write(p.aid, &stream).unwrap();
+        assert_eq!(first, if v6 { 45 * 1428 } else { 45 * 1448 });
+        assert!(matches!(
+            p.a.write(p.aid, &stream[first..]),
+            Err(EndpointError::Connection(Error::WouldBlock))
+        ));
+        let frames = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip());
+        let path = if v6 { 1280 } else { 1006 };
+        assert!(frames[0].len() > path);
+        let report = ptb(&frames[0], path as u32);
+        input_frame(
+            &mut p.ahost,
+            &mut p.a,
+            p.time,
+            &report,
+            p.local.ip(),
+            false,
+            &mut Sample(0),
+        )
+        .unwrap();
+        let info = p.a.transport_info(p.aid).unwrap();
+        let q = path - if v6 { IPV6_HEADER } else { IP_HEADER } - 20 - 12;
+        assert_eq!(info.mss as usize, q);
+        assert_eq!(info.send_capacity, 65536);
+        assert_eq!(info.send_space, 65536 / q * q);
+        assert_eq!(info.send_used, first);
+        let more = match p.a.write(p.aid, &stream[first..]) {
+            Ok(n) => n,
+            Err(EndpointError::Connection(Error::WouldBlock)) => 0,
+            other => panic!("{other:?}"),
+        };
+        // IPv4: 68 * 954 < 45 * 1448; IPv6: 54 * 1208 > 45 * 1428.
+        assert_eq!(more, if v6 { 54 * 1208 - first } else { 0 });
+        let total = first + more;
+        p.progress(path, &stream[..total]);
+        let info = p.a.transport_info(p.aid).unwrap();
+        let q = info.mss as usize;
+        assert_eq!(info.send_space, 65536 / q * q);
+        assert_eq!(p.a.write(p.aid, &stream[total..]).unwrap(), info.send_space);
     }
 }
 

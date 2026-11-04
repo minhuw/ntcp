@@ -805,6 +805,9 @@ fn sndbuf_rcvbuf_end_to_end_shared_abi() {
         );
     }
     assert_eq!(received, data);
+    // The SYN carries no MSS option, so the segment size in use is the
+    // default 536 and admission stops at whole segments: 15 * 536 of the
+    // 8192-byte SO_SNDBUF that getsockopt reports.
     unsafe {
         assert_eq!(
             ntcp_socket::send(
@@ -813,7 +816,7 @@ fn sndbuf_rcvbuf_end_to_end_shared_abi() {
                 data.len(),
                 MSG_DONTWAIT | MSG_NOSIGNAL
             ),
-            8192
+            8040
         );
     }
     pollfd.events = POLLOUT;
@@ -851,6 +854,8 @@ fn shutdown_completes_pending_reads_poll_and_blocked_writes() {
     for (i, how) in [SHUT_RD, SHUT_WR, SHUT_RDWR].into_iter().enumerate() {
         let (listener, fd, _, _) = connect_listener(&adapter, 8080 + i as u16, false, None);
         let data = vec![0u8; 65535];
+        // Fill the send space: the 65536-byte buffer rounds down to whole
+        // default 536-octet segments, 122 * 536.
         unsafe {
             assert_eq!(
                 ntcp_socket::send(
@@ -859,13 +864,14 @@ fn shutdown_completes_pending_reads_poll_and_blocked_writes() {
                     data.len(),
                     MSG_DONTWAIT | MSG_NOSIGNAL
                 ),
-                65535
+                65392
             );
             assert_eq!(
                 ntcp_socket::send(fd, c"x".as_ptr().cast(), 1, MSG_DONTWAIT | MSG_NOSIGNAL),
-                1
+                -1
             );
         }
+        assert_eq!(errno(), EAGAIN);
         let (rt, received) = std::sync::mpsc::sync_channel(1);
         let (st, sent) = std::sync::mpsc::sync_channel(1);
         let (pt, polled) = std::sync::mpsc::sync_channel(1);

@@ -292,8 +292,9 @@ class AccountingExpectations(unittest.TestCase):
 
     def test_derived_scripts_retain_positive_counters_and_last_byte_phase_checks(self):
         partial = (HERE / self.manifest['scripts']['timestamping/partial.pkt']['fixture']).read_text()
-        self.assertIn('write(3, ..., 10000) = 4608', partial)
-        self.assertEqual(partial.count('ee_data=4607'), 3)
+        # SO_SNDBUF 4608 admits whole 988-byte segments: 4*988=3952.
+        self.assertIn('write(3, ..., 10000) = 3952', partial)
+        self.assertEqual(partial.count('ee_data=3951'), 3)
         self.assertEqual(partial.count('scm_nsec=20000000'), 2)
         self.assertEqual(partial.count('scm_nsec=30000000'), 1)
         self.assertIn('assert 5000 <= tcpi_rtt <= 20000', partial)

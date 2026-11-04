@@ -8,6 +8,7 @@ from bridge import checksum
 import admin
 import bridge
 import icmp
+import mss
 import options
 import run
 
@@ -216,6 +217,19 @@ class IcmpScenario(unittest.TestCase):
         struct.pack_into("!H", tcp, 16, checksum(pseudo + bytes(tcp)))
         return icmp.parse(header + bytes(tcp))
 
+    def test_decoder_reports_handshake_negotiation(self):
+        # MSS 8960, SACK-permitted, timestamps, NOP, window scale 7.
+        options = (struct.pack("!BBH", 2, 4, 8960) + b"\4\2" + struct.pack("!BBII", 8, 10, 11, 0)
+                   + b"\1" + struct.pack("!BBB", 3, 3, 7))
+        event = self.tcp(options)
+        self.assertTrue(event["checksum_valid"])
+        self.assertEqual((event["mss"], event["window_scale"], event["sack_permitted"], event["timestamp"],
+                          event["window"]), (8960, 7, True, (11, 0), 1000))
+        self.assertEqual(icmp.negotiation(b""), dict(mss=None, window_scale=None, sack_permitted=False, timestamp=None))
+        # A wrong option length or a truncated option yields nothing.
+        for bad in (struct.pack("!BBHB", 2, 5, 1460, 0) + b"\0\0\0", struct.pack("!BBH", 2, 4, 1460)[:3]):
+            self.assertEqual(icmp.negotiation(bad)["mss"], None, bad)
+
     def test_decoder_reports_sack_blocks_after_other_options(self):
         # NOP, NOP, timestamps, NOP, NOP, SACK with two blocks.
         options = (b"\1\1" + struct.pack("!BBII", 8, 10, 5, 6) + b"\1\1"
@@ -227,6 +241,77 @@ class IcmpScenario(unittest.TestCase):
         # A truncated or misaligned SACK option yields no blocks.
         self.assertIsNone(self.tcp(struct.pack("!BBI", 5, 10, 1) + b"\0\0")["sack"])
         self.assertIsNone(self.tcp(struct.pack("!BBII", 5, 9, 1, 2) + b"\0\0\0")["sack"])
+
+
+class MssScenario(unittest.TestCase):
+    def test_mss_cases_without_inherited_proof_cannot_reach_setup(self):
+        for case in mss.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(mss, "setup") as setup, \
+                    patch.object(icmp, "setup") as icmp_setup:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+                setup.assert_not_called()
+                icmp_setup.assert_not_called()
+
+    def test_cases_cover_both_families_and_both_scenarios(self):
+        self.assertEqual({(c["kind"], c["family"], c["scenario"]) for c in mss.cases()},
+                         {("mss", f, s) for f in (4, 6) for s in ("receive-offer", "send-space")})
+        self.assertEqual(len(mss.cases()), 4)
+        self.assertFalse(any(c in icmp.cases() or c in admin.cases() or c in options.cases() or c in run.matrix()
+                             for c in mss.cases()))
+        # Unequal links, both at least the IPv6 minimum and above the egress.
+        self.assertTrue(1280 < mss.SMALL_MTU < mss.LARGE_MTU)
+        self.assertEqual(run.TWO_LINK.name, "two_link")
+
+    def test_receive_mss_derivation(self):
+        two = [(1400, 65575), (9000, 65575)]
+        self.assertEqual((icmp.receive_mss(4, two, 65535), icmp.receive_mss(6, two, 65575)), (8960, 8940))
+        # Reassembly below the largest link, and no reassembly term.
+        self.assertEqual(icmp.receive_mss(4, two, 1500), 1460)
+        self.assertEqual(icmp.receive_mss(4, two, None), 8960)
+        # A link that cannot receive its own MTU counts at its capacity.
+        self.assertEqual(icmp.receive_mss(4, [(9000, 2000), (1500, 65575)], 65535), 1960)
+        # The family wire limits: 65495 exactly when everything supports it.
+        self.assertEqual(icmp.receive_mss(4, [(65535, 65575)], 65535), 65495)
+        self.assertEqual(icmp.receive_mss(4, [(65535, 65575)], 65534), 65494)
+        self.assertEqual(icmp.receive_mss(6, [(65575, 65575)], None), 65515)
+        self.assertEqual(icmp.receive_mss(6, [(70000, 70000)], None), 65515)
+
+    def test_send_space_rounds_to_whole_segments_and_keeps_a_sub_segment_buffer(self):
+        q = 1348
+        for capacity, expected in ((1, 1), (q - 1, q - 1), (q, q), (q + 1, q), (2 * q - 1, q), (3 * q, 3 * q),
+                                   (2 * q + q // 2, 2 * q), ((1 << 30) - 1, ((1 << 30) - 1) // q * q)):
+            self.assertEqual(mss.send_space(capacity, q), expected, capacity)
+
+    def segment(self, direction, seq, ack, payload, flags=0x10):
+        if direction == "from-ntcp":
+            ports = (18100, 18082)
+        else:
+            ports = (18082, 18100)
+        return dict(protocol=6, direction=direction, sport=ports[0], dport=ports[1], seq=seq, ack=ack,
+                    payload=payload, flags=flags)
+
+    def test_outstanding_counts_distinct_payload_above_the_cumulative_ack(self):
+        base = 0xfffffff0  # sequence wrap inside the flow
+        ntcp = lambda offset, n, flags=0x18: self.segment("from-ntcp", (base + offset) & 0xffffffff, 0, n, flags)
+        peer = lambda ack: self.segment("to-ntcp", 0, (base + ack) & 0xffffffff, 0)
+        events = [peer(0), ntcp(0, 100), ntcp(100, 100), ntcp(0, 100), dict(protocol=1, direction="to-ntcp"),
+                  peer(100), ntcp(200, 100), ntcp(300, 0, 0x11), peer(300)]
+        counts, first = mss.outstanding(events, (18100, 18082), base)
+        # A retransmission adds nothing; a FIN occupies no payload.
+        self.assertEqual(counts, [0, 100, 200, 200, 100, 200, 0])
+        self.assertEqual((first, max(counts[:first])), (4, 200))
+        # Another flow's segments are ignored.
+        other = dict(self.segment("from-ntcp", base, 0, 500), sport=18101)
+        self.assertEqual(mss.outstanding([other], (18100, 18082), base), ([], None))
+
+    def test_handshake_selects_one_connection(self):
+        syn = dict(self.segment("from-ntcp", 7, 0, 0, 0x02), mss=8960)
+        old = dict(self.segment("to-ntcp", 1, 0, 0, 0x12), sport=18083)
+        reply = dict(self.segment("to-ntcp", 9, 8, 0, 0x12), mss=1460)
+        self.assertEqual(mss.handshake([old, syn, reply], sport=18100), (syn, reply))
+        with self.assertRaisesRegex(AssertionError, "no SYN-ACK"):
+            mss.handshake([syn, old], sport=18100)
 
 
 class OptionScenario(unittest.TestCase):

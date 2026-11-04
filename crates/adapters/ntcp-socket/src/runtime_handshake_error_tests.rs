@@ -245,7 +245,7 @@ fn fatal_case(v6: bool, mode: Open, failure: Failure, blocking: bool, consume: b
     if matches!(failure, Failure::ApplicationHeld) {
         // A second real connection fills the bounded backend. The candidate
         // owns an unsubmitted WouldBlock reservation, not local RTO evidence.
-        a.packets = Some(PacketBackend::new(Profile::Pipeline, 1).unwrap());
+        a.packets = Some(PacketBackend::new(Profile::Pipeline, a.local, 1).unwrap());
         let holder = new(&mut a, SOCK_NONBLOCK);
         assert_eq!(
             a.execute(holder, Op::Connect(SocketAddr::new(remote.ip(), 8090)))

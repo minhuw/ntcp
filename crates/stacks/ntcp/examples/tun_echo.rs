@@ -2186,8 +2186,10 @@ mod linux {
                 pmtud: Some(PmtudConfig::new(first_hop_mtu)),
                 send_capacity: 65536,
                 receive_capacity: 65536,
+                // The send and allocation ceiling of the fixed output storage.
+                // The receive MSS offer is the Host's receive capability for
+                // the link, so no static receive limit is set here.
                 mss: (MTU - header_len - 20) as u16,
-                receive_ip_payload_limit: (MTU - header_len) as u16,
                 send_ip_payload_limit: (MTU - header_len) as u16,
                 ..ConnectionConfig::default()
             },
@@ -3303,7 +3305,6 @@ mod linux {
             };
             cfg.connection.nagle = false;
             cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
-            cfg.connection.receive_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
             cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
             let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
             let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();

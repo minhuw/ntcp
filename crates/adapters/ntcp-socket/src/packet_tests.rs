@@ -15,6 +15,10 @@ use std::{
 const LIMIT: usize = crate::packet_profile::LIMIT;
 const BYTES: usize = crate::packet_profile::BYTES;
 const TCP_INFO_SIZE: usize = 280;
+// The managed receive MSS offer the Host derives for the in-memory IPv4 link:
+// packetdrill's 1500-octet tun MTU, below its 65535-octet receive and
+// reassembly capacity, less the IPv4 and TCP base headers.
+const LINK_RECEIVE_MSS: u16 = 1500 - 20 - 20;
 struct Owner {
     inner: SocketOwner,
 }
@@ -2171,10 +2175,13 @@ fn owner_loop_emits_pure_handshake_ack_before_pending_send_data() {
 
 #[test]
 fn profiles_emit_real_synack_scale_through_owner_thread() {
-    for (name, scale) in [
-        ("baseline", 0),
-        ("upstream,no-timestamps", 8),
-        ("upstream", 8),
+    // A 1520-octet link raises the Host-derived offer above config.mss 1460,
+    // which stays the send and allocation ceiling.
+    for (name, scale, mss) in [
+        ("baseline", 0, LINK_RECEIVE_MSS),
+        ("upstream,no-timestamps", 8, LINK_RECEIVE_MSS),
+        ("upstream", 8, LINK_RECEIVE_MSS),
+        ("upstream,link-mtu=1520", 8, 1520 - 20 - 20),
     ] {
         let adapter = Adapter::start(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
         let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as u64;
@@ -2197,9 +2204,10 @@ fn profiles_emit_real_synack_scale_through_owner_thread() {
         assert_eq!(segment.header.flags, ntcp::wire::SYN | ntcp::wire::ACK);
         assert_eq!(segment.header.window, 65535);
         assert_eq!(segment.options.window_scale, Some(scale));
-        assert_eq!(segment.options.mss, Some(1460));
+        assert_eq!(segment.options.mss, Some(mss));
         assert_eq!(segment.options.timestamps, None);
-        assert_eq!(segment.raw_options, &[2, 4, 5, 180, 1, 3, 3, scale]);
+        let [high, low] = mss.to_be_bytes();
+        assert_eq!(segment.raw_options, &[2, 4, high, low, 1, 3, 3, scale]);
     }
 }
 
@@ -2371,13 +2379,14 @@ fn upstream_sack_profile_negotiates_combined_options_and_peer_fallback() {
         let segment = ntcp::wire::parse(ip, tcp).unwrap();
         assert_eq!(segment.options.sack_permitted, sack);
         assert_eq!(segment.options.window_scale, Some(8));
-        assert_eq!(segment.options.mss, Some(1460));
+        assert_eq!(segment.options.mss, Some(LINK_RECEIVE_MSS));
         assert_eq!(segment.header.window, 65535);
         assert_eq!(
             segment.options.timestamps.map(|pair| pair.1),
             timestamps.then_some(100)
         );
         let mut expected = options.to_vec();
+        expected[2..4].copy_from_slice(&LINK_RECEIVE_MSS.to_be_bytes());
         *expected.last_mut().unwrap() = 8;
         if let Some((value, _)) = segment.options.timestamps {
             expected[8..12].copy_from_slice(&value.to_be_bytes());

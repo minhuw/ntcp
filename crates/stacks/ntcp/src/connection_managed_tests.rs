@@ -99,6 +99,7 @@ fn managed_pair_with_peer(
         0,
         &mut None,
         Some(prepared),
+        crate::ReceiveIpCapability::new(ContextId::new(101), tuple.local.is_ipv6(), 1500),
         None,
     )
     .unwrap();
@@ -483,6 +484,7 @@ fn managed_disabled_discovery_keeps_byte_window_and_real_retry_on_budget_growth(
         0,
         &mut None,
         Some(prepared),
+        crate::ReceiveIpCapability::new(ContextId::new(101), tuple.local.is_ipv6(), 1100),
         None,
     )
     .unwrap();
@@ -971,3 +973,6 @@ fn administrative_target_clipped_by_user_or_peer_mss_reports_transport() {
         }
     }
 }
+
+#[path = "connection_send_space_tests.rs"]
+mod send_space;

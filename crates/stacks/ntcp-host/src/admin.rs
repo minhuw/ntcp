@@ -71,7 +71,11 @@ pub enum AdminClient {
     /// The Host's Echo service and ICMP output (configured ICMP output):
     /// replies and errors to the path's destination are sized at drain by
     /// the path's connectionless size and budget. `queued` messages are
-    /// routed over the path now.
+    /// routed over the path now. Its report's `usable_ip_packet` is the
+    /// smallest size the drain uses for any of them: while one carries a
+    /// source route, the size that is never raised by the adjunct-confirmed
+    /// bound, which understates an option-free message's size on a path
+    /// with such a bound; otherwise the connectionless size.
     Echo { queued: usize },
 }
 
@@ -217,8 +221,9 @@ impl Host {
         let key = self.paths.path_snapshot(path)?.key();
         let echo = self.icmp_output_on(key).map(|queued| ClientReport {
             client: AdminClient::Echo { queued },
-            // As the drain sizes them: a queued source-routed message is
-            // never sized by the adjunct-confirmed bound of the direct path.
+            // The smallest size the drain uses for a queued message: a
+            // source-routed one is never sized by the adjunct-confirmed
+            // bound of the direct path, an option-free one may be.
             usable_ip_packet: self.paths.path_snapshot(path).ok().and_then(|snapshot| {
                 if self.icmp_source_routed_on(key) {
                     self.connectionless_unconfirmed_size(snapshot).ok()

@@ -340,14 +340,22 @@ impl Endpoint {
             },
             request.ipv4_options,
         )?;
-        let prepared = provider.prepare(request).map_err(ManagedError::Provider)?;
+        let crate::PreparedFactory {
+            path: prepared,
+            receive,
+        } = provider.prepare(request).map_err(ManagedError::Provider)?;
         if !crate::managed_path::valid_prepared(context, request, prepared) {
             provider.cancel(prepared);
             return Err(EndpointError::InvalidAddress.into());
         }
+        if !crate::managed_path::valid_receive(context, request, receive) {
+            provider.cancel(prepared);
+            return Err(EndpointError::Connection(Error::InvalidArgument).into());
+        }
         self.factory_transaction = Some(crate::managed_path::FactoryTransaction {
             request,
             prepared,
+            receive,
             inserted: None,
         });
         let result = operation(self);

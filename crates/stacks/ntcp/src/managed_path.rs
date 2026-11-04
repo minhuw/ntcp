@@ -34,9 +34,63 @@ pub struct PreparedPath {
     pub snapshot: PathSnapshot,
 }
 
+/// The largest complete IP datagram (header included) that the Host context
+/// can receive for one family: its reassembly capacity, its maximum live
+/// connected link enabled for the family and the family wire limit, the
+/// least of them. A managed connection's receive MSS offer is derived from
+/// it, never from the discovered send PMTU or the local send ceilings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiveIpCapability {
+    context: ContextId,
+    ipv6: bool,
+    ip_packet: u32,
+}
+impl ReceiveIpCapability {
+    /// `None` unless `ip_packet` carries the fixed IP and TCP base headers
+    /// and one payload octet, and fits the family's non-jumbo datagram
+    /// (65535 octets for IPv4; a 65535-octet payload after the 40-octet
+    /// IPv6 header).
+    pub const fn new(context: ContextId, ipv6: bool, ip_packet: u32) -> Option<Self> {
+        let (header, wire) = if ipv6 { (40, 65575) } else { (20, 65535) };
+        if ip_packet < header + 20 + 1 || ip_packet > wire {
+            return None;
+        }
+        Some(Self {
+            context,
+            ipv6,
+            ip_packet,
+        })
+    }
+    pub const fn context(self) -> ContextId {
+        self.context
+    }
+    pub const fn ipv6(self) -> bool {
+        self.ipv6
+    }
+    pub const fn ip_packet(self) -> u32 {
+        self.ip_packet
+    }
+    /// The TCP payload one such datagram carries after the IP and TCP base
+    /// headers; TCP options are not subtracted (RFC 6691 section 2).
+    pub const fn mss(self) -> u16 {
+        (self.ip_packet - if self.ipv6 { 40 } else { 20 } - 20) as u16
+    }
+}
+
+/// A prepared path and the receive capability derived for its family in
+/// the same serialized factory transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedFactory {
+    pub path: PreparedPath,
+    pub receive: ReceiveIpCapability,
+}
+
 pub trait PathProvider {
     type Error;
-    fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedPath, Self::Error>;
+    /// Acquire the provisional path and derive, from current facts, the
+    /// receive capability of the request's family. A provider that cannot
+    /// state one fails without retaining anything.
+    fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Self::Error>;
     /// All capacity must have been reserved by prepare. Commit cannot fail.
     fn commit(&mut self, prepared: PreparedPath, connection: ConnectionId);
     fn cancel(&mut self, prepared: PreparedPath);
@@ -122,6 +176,7 @@ impl DiscoveryIntent {
 pub(crate) struct FactoryTransaction {
     pub request: PathFactoryRequest,
     pub prepared: PreparedPath,
+    pub receive: ReceiveIpCapability,
     pub inserted: Option<ConnectionId>,
 }
 
@@ -141,6 +196,16 @@ pub(crate) fn check_registration(
         None if options.timestamp.is_some() => missing(RegisteredOption::Timestamp),
         None => Ok(()),
     }
+}
+
+// The receive capability was derived for this Host context and the family
+// of the request's tuple.
+pub(crate) fn valid_receive(
+    context: ContextId,
+    request: PathFactoryRequest,
+    receive: ReceiveIpCapability,
+) -> bool {
+    receive.context() == context && receive.ipv6() == request.tuple.local.is_ipv6()
 }
 
 pub(crate) fn valid_prepared(

@@ -8,7 +8,7 @@ struct Counting<'a> {
 }
 impl PathProvider for Counting<'_> {
     type Error = Error;
-    fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedPath, Error> {
+    fn prepare(&mut self, request: PathFactoryRequest) -> Result<ntcp::PreparedFactory, Error> {
         self.prepared += 1;
         self.host.prepare(request)
     }

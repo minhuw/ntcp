@@ -211,14 +211,18 @@ class PmtudInventory(unittest.TestCase):
 
     def test_final_bounded_evidence_keeps_full_keys_and_partial_dispositions(self):
         # Hash the full original target + quote, not a narrowed test assertion.
-        # Locality closes only023; topology, detector robustness and literal
-        # unchanged-cwnd obligations retain their separate identity. T13's host
-        # fragmentation closes the whole 062 recommendation, with the recorded
-        # IP_PMTUDISC_DONT disposition; receive-MSS derivation stays open.
+        # Locality closes 023; T16's Host receive derivation, its embeddings
+        # and the two-link captures close 024, and with the recorded 65495
+        # disposition 025, on managed (not legacy locality) evidence; the
+        # rounded send space closes 083 with its two recorded dispositions.
+        # Detector robustness and literal unchanged-cwnd obligations retain
+        # their separate identity. T13's host fragmentation closes the whole
+        # 062 recommendation, with the recorded IP_PMTUDISC_DONT disposition.
         expected = {
             "1191-023": ("covered", "b707ab63ef804beb967fd98fc590e0fb3d32b388bd1714383cd69ed4b81b7540"),
-            "1191-024": ("TODO", "aa85eaa493b1e0f480f7bdc7bc423f41afc5aac20a1993d6803b519bab927308"),
-            "1191-025": ("TODO", "54660db94e505f213213e1d4b163e451f8089853f3b60ffc06d70dd157593f11"),
+            "1191-024": ("covered", "aa85eaa493b1e0f480f7bdc7bc423f41afc5aac20a1993d6803b519bab927308"),
+            "1191-025": ("covered", "54660db94e505f213213e1d4b163e451f8089853f3b60ffc06d70dd157593f11"),
+            "1191-083": ("covered", "0024f3d005f34caa42b7f3d606589fda32c6680be34c654ae447a1a34af85b40"),
             "4821-062": ("covered", "e4351333b58527eb5fcd9a6fc58a08ba600816aeada37c9cb0fc871163134f55"),
             "4821-090": ("TODO", "a0cad509ac88cfb5c86207ba33c9b552ef2d4edfbc4e442ac29f4020a6ae980e"),
             "8201-076": ("TODO", "1c249737ce83c551636bf21eea5e111f11011d4cd800c80e2f2d05e4f08effc0"),
@@ -230,12 +234,37 @@ class PmtudInventory(unittest.TestCase):
             full_key = row["target"] + "\n" + " ".join(row["quote"].split())
             self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(), full_key_hash, key)
             self.assertEqual(row["status"], status, key)
-            if key != "1191-025":
-                self.assertEqual(len(row["evidence"]), 2, key)
-        self.assertIn("MMS_R-40", rows["1191-024"]["reason"])
-        self.assertIn("topology contract", rows["1191-024"]["reason"])
-        for fragment in ("Host::reassembly_capacity", "EMTU_R", "T16 owns the receive-MSS derivation", "T19"):
+            self.assertEqual(len(row["evidence"]), 2, key)
+        for fragment in ("MMS_R-40", "Host::reassembly_capacity", "EMTU_R", "Host::receive_ip_capability",
+                         "every Host factory transaction", "src/tests/receive_capability.rs",
+                         "keep no static receive sizing", "src/bin/two_link.rs", "two TUNs of unequal MTU",
+                         "captured SYN-ACK and SYN offers", "explicit legacy contract, on which this closure does not rest"):
             self.assertIn(fragment, rows["1191-024"]["reason"])
+        for fragment in ("User disposition (decision A, 2026-11-04, recorded)", "65535-octet IPv4 link",
+                         "no 65494 or other substitute ceiling", "capability-backed use", "No sign-bit bug is alleged"):
+            self.assertIn(fragment, rows["1191-025"]["reason"])
+        for fragment in ("greatest multiple of Q", "is this paragraph's segment size (PMTU - 40)",
+                         "C = 18824, the literal formula 18980", "below one segment C = B", "no credit is invented",
+                         "snd_wnd, max_snd_wnd and cwnd are unchanged", "integration/rfc_host mss send-space case",
+                         "Raw Endpoints keep B"):
+            self.assertIn(fragment, rows["1191-083"]["reason"])
+        self.assertEqual(rows["1191-083"]["reason"].count("User disposition (decision A, 2026-11-04, recorded)"), 2)
+        for key in ("1191-024", "1191-025", "1191-083"):
+            self.assertNotRegex(rows[key]["reason"], r"\bRemaining\b|\bTODO\b|T19", key)
+        # Managed closure rests on the Host derivation and its factory tests,
+        # not on the legacy raw-Endpoint locality evidence.
+        for key, test in (("1191-024", "offer_is_largest_family_link_capped_by_physical_reassembly_and_wire_limits"),
+                          ("1191-025", "ipv4_65535_link_with_matching_reassembly_offers_65495_and_smaller_caps_do_not")):
+            self.assertEqual(rows[key]["evidence"], [
+                "crates/stacks/ntcp-host/src/lib.rs::    pub fn receive_ip_capability(",
+                f"crates/stacks/ntcp-host/src/tests/receive_capability.rs::fn {test}()",
+            ], key)
+        self.assertEqual(rows["1191-083"]["evidence"], [
+            "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn send_space(",
+            "crates/stacks/ntcp/src/connection_send_space_tests.rs::fn managed_boundary_buffers_admit_c_and_deliver_to_completion()",
+        ])
+        self.assertIn("covered separately at1191-024/025", rows["1191-023"]["reason"])
+        self.assertNotIn("TODO", rows["1191-023"]["reason"])
         for fragment in ("ntcp_ip::Fragmenter, which sets DF on every fragment", "TCP never enters source fragmentation",
                          "User disposition of the SHOULD (recorded)", "IP_PMTUDISC_DONT", "its PLPMTUD probes keep DF"):
             self.assertIn(fragment, rows["4821-062"]["reason"])
@@ -260,8 +289,7 @@ class PmtudInventory(unittest.TestCase):
                                      (canonical[key]["id"], str(path), annotation["line"]))
                     counts[key] += 1
         for key, row in canonical.items():
-            if row["id"] != "1191-025":
-                self.assertGreaterEqual(counts[key], 2, row["id"])
+            self.assertGreaterEqual(counts[key], 2, row["id"])
 
     def test_contemporary_policy_keeps_whole_quote_and_host_integration_gaps(self):
         rows = {p["id"]: p for p in self.inventory(1191)["paragraphs"]}
@@ -565,8 +593,11 @@ class PmtudInventory(unittest.TestCase):
                              "Clearing removes the cap and keeps every hold"):
                 self.assertIn(fragment, rows[key]["reason"], key)
         self.assertEqual(rows["8201-050"]["status"], "TODO")
-        for fragment in ("T13 supplies source fragmentation and reassembly", "T17 owns", "T16"):
+        for fragment in ("T13 supplies source fragmentation and reassembly", "T17 owns",
+                         "T16 implements the receive-side indication", "src/tests/receive_capability.rs",
+                         "captured IPv6 offers from a two-link Host"):
             self.assertIn(fragment, rows["8201-050"]["reason"])
+        self.assertNotIn("T16 supplies", rows["8201-050"]["reason"])
         # No reason in these ledgers or their TOML dispositions still claims
         # that fragmentation, a Host datagram service or an allocator is absent,
         # and every mention of Host Echo Replies states how a source-routed

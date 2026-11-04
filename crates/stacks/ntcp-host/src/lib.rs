@@ -7,7 +7,7 @@ use ntcp::{
     ConnectionId, CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError,
     ExpectedRegistrations, Instant, IpMetadata, Ipv4Options, Ipv4RegistrationPlan, ManagedError,
     NetworkError, OutgoingIpv4Options, PathFactoryRequest, PathProvider, PmtuFeedback,
-    PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt,
+    PreparedFactory, PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt,
 };
 use ntcp_icmp::{FeedbackKind, QuotedTransport};
 pub use ntcp_path as path;
@@ -665,6 +665,59 @@ impl Host {
             emtu_r,
             mms_r: emtu_r - if ipv6 { 40 } else { 20 },
         })
+    }
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+    //= reason=Managed connections send the MSS this paragraph describes. T13 supplies the host capacity: Host::reassembly_capacity states, per family and per Host context, EMTU_R (RFC 1122 section 3.3.2: the largest complete IP datagram, header included, that the configured, storage-backed reassembly engine accepts) and MMS_R (EMTU_R - 20 for IPv4, EMTU_R - 40 for IPv6). This paragraph calls the largest reassemblable datagram MMS_R, so its host MMS_R-40 is EMTU_R - 40, that is RFC 1122's MMS_R less TCP's 20-octet header for IPv4; the TCP payload unit (MSS) differs from both EMTU_R and MMS_R. T16 derives the managed receive MSS inside every Host factory transaction (active, Fast Open, passive child and TIME-WAIT replacement): Host::receive_ip_capability takes the least of EMTU_R (no term while reassembly is disabled), the largest live link enabled for the family at the smaller of its current MTU and physical receive capacity (the permitted maximum connected-link choice: a multi-homed Host counts its largest link, not the selected route's) and the family wire limit, less the IP and TCP base headers, so 65495 is offered exactly when an actual 65535-octet IPv4 link and matching reassembly support it; only user and advertised caps reduce it, a discovered send PMTU never does, and the offer is frozen once committed in its SYN or SYN-ACK. Host factory tests (ntcp-host src/tests/receive_capability.rs) cover both families, unequal links with per-link family enablement, link addition, removal and MTU change, new listener children after a topology change, separate contexts and source replacement, reassembly below and above the links and disabled, physical capacity below a link MTU, the 65535-octet IPv4 link and rejection without a capability. The supplied managed embeddings keep no static receive sizing: native SYN and SYN-ACK offers follow the Host's link (ntcp-socket packet_tests.rs) and tun_echo's equal Host::receive_ip_capability (tun_echo_pmtu_tests.rs). On the wire, the integration/rfc_host mss case's production-factory driver (src/bin/two_link.rs) owns two TUNs of unequal MTU with genuine reassembly and routes over the smaller: in both families the captured SYN-ACK and SYN offers over the smaller link equal the larger link's derivation, also for connections opened after real downstream PTBs lowered the send PMTU. Raw Endpoints keep their documented caller-supplied receive limits as an explicit legacy contract, on which this closure does not rest. The optional link-derived choice is not itself a required feature.
+    //# in the MSS option. The MSS option should be 40 octets less than the size of the
+    //# largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many
+    //# cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY
+    //# send an MSS value derived from the MTU of its connected network (the maximum MTU
+    //# over its connected networks, for a multi-homed host); this should not cause problems
+    //# for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+    //= reason=Managed receive offers derive from Host::receive_ip_capability, never above the maximum MTU of the connected links enabled for the family (each counted at the smaller of its current MTU and physical receive capacity), nor above EMTU_R or the family wire limit. User disposition (decision A, 2026-11-04, recorded): 65495 is advertised only when this uncapped derivation supports it, that is with an actual 65535-octet IPv4 link and matching reassembly capacity; this paragraph's warning against unnecessary use of such a large MSS is read as not covering that capability-backed use, so no 65494 or other substitute ceiling applies, and any smaller link, physical receive or reassembly capacity gives a smaller offer. Host factory tests (ntcp-host src/tests/receive_capability.rs) offer 65495 on a 65535-octet IPv4 link with 65535-octet reassembly and 64960, 65494 and 65494 with 65000-octet reassembly, a 65534-octet physical receive capacity and a 65534-octet link; a smaller validated send PMTU leaves the offer unchanged. Raw Endpoint offers keep their configured receive_ip_payload_limit and MSS caps as an explicit legacy contract. No sign-bit bug is alleged.
+    //# Note: At the moment, we see no reason to send an MSS greater than the maximum MTU of
+    //# the connected networks, and we recommend that hosts do not use 65495. It is quite
+    //# possible that some IP implementations have sign-bit bugs that would be tickled by
+    //# unnecessary use of such a large MSS.
+    /// The receive capability of this Host context for one family, from
+    /// current facts: the least of the reassembly capacity (EMTU_R; no term
+    /// while reassembly is disabled), the largest live link that enables the
+    /// family, each counted at its current MTU or at what its backend can
+    /// physically receive when that is smaller, and the family's non-jumbo
+    /// datagram limit. Every managed factory derives its connection's
+    /// receive MSS offer from it; the discovered send PMTU and the selected
+    /// route play no part. `Unsupported` when no link receives the family or
+    /// the result cannot carry the IP and TCP base headers and one octet.
+    pub fn receive_ip_capability(&self, ipv6: bool) -> Result<ntcp::ReceiveIpCapability, Error> {
+        let links = self
+            .ports
+            .iter()
+            .flatten()
+            .filter(|port| {
+                if ipv6 {
+                    port.receive.ipv6 != Ipv6Receive::Disabled
+                } else {
+                    port.receive.ipv4 != Ipv4Receive::Disabled
+                }
+            })
+            .filter_map(|port| {
+                let mtu = self.paths.link(port.link).ok()?.mtu;
+                Some(mtu.min(port.receive.max_ip_packet as u32))
+            })
+            .max()
+            .ok_or(Error::Unsupported)?;
+        let reassembly = self
+            .reassembly_capacity(ipv6)
+            .map_or(u32::MAX, |capacity| capacity.emtu_r);
+        let wire = if ipv6 { 65575 } else { 65535 };
+        ntcp::ReceiveIpCapability::new(
+            self.paths.context(),
+            ipv6,
+            links.min(reassembly).min(wire),
+        )
+        .ok_or(Error::Unsupported)
     }
     pub fn reassembly_counters(&self) -> ReassemblyCounters {
         self.reassembly.counters()
@@ -2504,10 +2557,13 @@ impl PathProvider for Host {
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
     //= reason=Managed factories acquire per-host records from configured network/default routes before TCP construction, initializing unlearned budgets from the physical first hop. Trusted decreases change only per-host learned estimates, preserving forwarding routes and independent first-hop facts. Dual-family two-Endpoint tests exercise both route selections, first SYN/hidden child and later decreases without forwarding-route mutation. Generic ICMP publication remains the separate 1191-057 obligation.
     //# When the first packet is sent to a host for which no per-host route exists, a route is chosen either from the set of per-network routes, or from the set of default routes. The PMTU fields in these route entries should be initialized to be the MTU of the associated first-hop data link, and must never be changed by the PMTU Discovery process. (PMTU Discovery only creates or changes entries for per-host routes). Until a Datagram Too Big message is received, the PMTU associated with the initially-chosen route is presumed to be accurate.
-    fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedPath, Error> {
+    fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Error> {
         if !self.attached {
             return Err(Error::InvalidContext);
         }
+        // Derived before anything is acquired, so that a Host without a
+        // receive capability for the family retains nothing.
+        let receive = self.receive_ip_capability(request.tuple.local.is_ipv6())?;
         let index = self
             .bindings
             .iter()
@@ -2540,7 +2596,10 @@ impl PathProvider for Host {
                 authorized: snapshot.key(),
             }),
         });
-        Ok(prepared)
+        Ok(PreparedFactory {
+            path: prepared,
+            receive,
+        })
     }
     fn commit(&mut self, prepared: PreparedPath, connection: ConnectionId) {
         let binding = self

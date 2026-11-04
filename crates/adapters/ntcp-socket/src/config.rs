@@ -9,6 +9,9 @@ use std::{
 };
 
 const MAX_FILE_BYTES: usize = 64 * 1024;
+// The local send and allocation ceiling (it sizes send scratch). It does not
+// limit the receive MSS offer, which every native connection takes from its
+// Host's receive capability for the link (tcp.advertised_mss caps it).
 pub(crate) const MSS: u16 = 1460;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -129,7 +132,8 @@ impl SocketConfig {
         tcp.connection.send_capacity = crate::runtime::BYTES;
         tcp.connection.mss = MSS;
         tcp.connection.send_ip_payload_limit = if address.is_ipv4() { 1480 } else { 1460 };
-        tcp.connection.receive_ip_payload_limit = 65515;
+        // receive_ip_payload_limit keeps the core default: it bounds only a
+        // raw Endpoint's legacy offer, and native connections are managed.
         Self {
             tcp,
             socket: SocketPolicy::default(),
@@ -254,7 +258,6 @@ impl SocketConfig {
         if self.tcp.ipv4_options_enabled // Native TCP neither sends IPv4 options nor admits source routes.
             || c.timebase.units_per_second != 1_000_000
             || c.send_ip_payload_limit > 65515
-            || c.receive_ip_payload_limit > 65515
             || self.tcp.max_connections > crate::runtime::LIMIT
             || self.tcp.max_listeners > crate::runtime::LIMIT
             || c.keepalive.is_some_and(|k| {

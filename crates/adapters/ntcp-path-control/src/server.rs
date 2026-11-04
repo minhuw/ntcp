@@ -18,9 +18,14 @@
 //! connection is closed (fail closed). A peer not on the allow-list is
 //! answered `Unauthorized` at accept and closed without taking a peer slot,
 //! before it sends anything: none of its requests, queries included, is
-//! read or dispatched, and reconnecting denied peers cannot keep allowed
-//! administrators out. Requests then act through the Host-bound
-//! `Administration` capability the owner issued, never through Host access.
+//! read or dispatched, so reconnecting denied peers never hold a slot an
+//! allowed administrator needs. They can still fill the listen backlog
+//! (`SLOTS` pending connections) between passes, which the kernel's
+//! connection queue shares with allowed peers: a denied local process can
+//! delay an allowed administrator's connection (a blocking connect waits,
+//! a nonblocking one fails with `EAGAIN`), not exclude it from a slot.
+//! Requests then act through the Host-bound `Administration` capability
+//! the owner issued, never through Host access.
 //!
 //! Listings. Route, path and client queries are paginated. The revision of
 //! a listing covers what identifies each entry and its administrative state

@@ -60,6 +60,11 @@ CONNECTIONLESS_INITIAL = {4: 1024, 6: 1280}
 # send, each probe waits up to the 3 s reply timeout.
 ADJUNCT_WAIT = 30
 STAGED = ("tcp-staged", "tcp-burst")
+# tun_echo's physical receive buffers and storage-backed reassembly capacity
+# (its MAX_IP_PACKET, IPV4_DATAGRAM and IPV6_DATAGRAM), the inputs of its
+# Host's receive MSS derivation besides the queried TUN MTU.
+TUN_ECHO_RECEIVE = 65575
+TUN_ECHO_REASSEMBLY = {4: 65535, 6: 65575}
 # The driver's peer: a receive-only socket (kernel reassembly) on this port.
 SINK_PORT = 18092
 # The driven cases' deployment configuration, stated per case and recorded:
@@ -109,6 +114,17 @@ def cases():
 
 def header_len(family):
     return 20 if family == 4 else 40
+
+
+def receive_mss(family, links, emtu_r):
+    """The managed receive MSS a Host derives (T16): the least of its
+    reassembly capacity EMTU_R (None while disabled), the largest link
+    enabled for the family, each at the smaller of its MTU and physical
+    receive capacity (LINKS: (mtu, max_ip_packet) pairs), and the family's
+    non-jumbo datagram limit, less the IP and TCP base headers."""
+    largest = max(min(mtu, capacity) for mtu, capacity in links)
+    wire = 65535 if family == 4 else 65575
+    return min(largest, wire, emtu_r if emtu_r is not None else wire) - header_len(family) - 20
 
 
 def large_udp(family):
@@ -169,7 +185,8 @@ def parse(packet):
         offset = (body[12] >> 4) * 4
         sport, dport, seq, ack = struct.unpack_from("!HHII", body)
         info.update(sport=sport, dport=dport, seq=seq, ack=ack, flags=body[13], payload=len(body) - offset,
-                    checksum_valid=checksum(pseudo + body) == 0, sack=sack_blocks(body[20:offset]))
+                    checksum_valid=checksum(pseudo + body) == 0, sack=sack_blocks(body[20:offset]),
+                    window=u16(body, 14), **negotiation(body[20:offset]))
     elif protocol == 17 and len(body) >= 8:
         sport, dport, length, value = struct.unpack_from("!HHHH", body)
         info.update(sport=sport, dport=dport, udp_length=length, udp_checksum=value, payload=length - 8,
@@ -257,6 +274,38 @@ def sack_blocks(options):
             return [struct.unpack_from("!II", options, j) for j in range(i + 2, i + length - 7, 8)]
         i += length
     return None
+
+
+def negotiation(options):
+    """The handshake options as captured: MSS (kind 2), window scale (kind 3),
+    SACK-permitted (kind 4) and timestamps (kind 8, TSval and TSecr); None
+    (False for SACK-permitted) when absent. Malformed options yield all
+    absent."""
+    found = dict(mss=None, window_scale=None, sack_permitted=False, timestamp=None)
+    sizes = {2: 4, 3: 3, 4: 2, 8: 10}
+    i = 0
+    while i < len(options):
+        kind = options[i]
+        if kind == 0:
+            break
+        if kind == 1:
+            i += 1
+            continue
+        if i + 1 >= len(options) or options[i + 1] < 2 or i + options[i + 1] > len(options):
+            return dict(mss=None, window_scale=None, sack_permitted=False, timestamp=None)
+        length = options[i + 1]
+        if kind in sizes and length != sizes[kind]:
+            return dict(mss=None, window_scale=None, sack_permitted=False, timestamp=None)
+        if kind == 2:
+            found["mss"] = u16(options, i + 2)
+        elif kind == 3:
+            found["window_scale"] = options[i + 2]
+        elif kind == 4:
+            found["sack_permitted"] = True
+        elif kind == 8:
+            found["timestamp"] = struct.unpack_from("!II", options, i + 2)
+        i += length
+    return found
 
 
 def quotes(quote, original):
@@ -1252,6 +1301,13 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None, driver_b
             data = [e for e in sent(events, 6) if e["payload"]]
             originals = [e for e in data if e["length"] == 1500]
             assert originals, [public(e) for e in data[:8]]
+            # tun_echo's captured offer is its Host's derivation: the queried
+            # TUN MTU, its 65575-octet input buffers and its reassembly
+            # capacity (TUN_ECHO_REASSEMBLY); MSS appears only on the SYN-ACK.
+            synack, = [e for e in sent(events, 6) if e["flags"] & 0x12 == 0x12]
+            offer = receive_mss(family, [(settings["mtu"][TUN], TUN_ECHO_RECEIVE)], TUN_ECHO_REASSEMBLY[family])
+            assert synack["mss"] == offer, (offer, public(synack))
+            assert all(e["mss"] is None for e in sent(events, 6) if not e["flags"] & 2)
             correlation = accepted_ptb(events, originals)
             assert correlation and all(c["original"]["protocol"] == 6 for c in correlation), correlation
             # Once ntcp sends its first reduced data segment it never again
@@ -1276,7 +1332,8 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None, driver_b
             fitted = udp(allowed, 9)
             assert fitted["reply"] == allowed and fitted["match"], fitted
             assert not [e for e in sent(capture.since(mark), 17) if e["length"] > 1280]
-            evidence.update(stream=stream, correlation=correlation, dropped_range=dict(seq=dropped["seq"], payload=dropped["payload"]),
+            evidence.update(tun_echo_offer=dict(captured=synack["mss"], derived=offer, window_scale=synack["window_scale"]),
+                            stream=stream, correlation=correlation, dropped_range=dict(seq=dropped["seq"], payload=dropped["payload"]),
                             large_segments=len(originals), reduced_segments=len(data) - first_small,
                             reduced_payload=small_mss, udp_after_tcp_ptb=refused.group(0), smaller_udp=fitted)
         else:

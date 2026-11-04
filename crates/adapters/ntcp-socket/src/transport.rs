@@ -399,6 +399,7 @@ mod tests {
             sndbuf_limited_us: 0x33445566778899aa,
             send_used: 5000,
             send_capacity: 65536,
+            send_space: 65536,
             receive_used: 42,
             receive_capacity: 65536,
         };
