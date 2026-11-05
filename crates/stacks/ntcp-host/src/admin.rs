@@ -473,8 +473,8 @@ impl Host {
                 || snapshot.status() != PathStatus::Valid
                 || !endpoint.managed_path(owner).is_ok_and(|current| {
                     current.binding.client == binding.prepared.client
-                        && path::ScopedAddress::new(current.forwarding_destination, None)
-                            .is_ok_and(|via| snapshot.key().forwarding_destination() == via)
+                        && crate::scoped(current.forwarding_destination, current.zone)
+                            .is_ok_and(|via| self.forwards_via(snapshot.key(), via))
                 })
                 || self.forwarding(snapshot).is_err()
             {

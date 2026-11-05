@@ -1020,7 +1020,9 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
         "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=33",
         "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.next_hop_mac=02:00:00:00:00:02",
         "port.b.interface=ntcp1\nport.b.address=2001:db8::2",
-        // Gateways: on the port's own link, of its family, canonical.
+        // Gateways on a TUN port are refused whatever they name (the
+        // on-link, family, canonical-prefix, own-address and duplicate
+        // checks are exercised on the resolving port below).
         "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.gateway.10.80.0.0/16=10.74.0.1",
         "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.gateway.10.80.0.0/16=10.73.1.1",
         "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.gateway.10.80.0.1/16=10.73.1.1",
@@ -1047,15 +1049,26 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
     assert_eq!(resolving.ports[0].gateways.len(), 1);
     let af6 = "io.backend=af-packet\nio.interface=eth0\nio.address=2001:db8::2\nio.next_hop_mac=02:00:00:00:00:01\n";
     let resolving = SocketConfig::parse(&format!(
-        "{af6}port.b.interface=eth1\nport.b.address=fe80::1\nport.b.gateway.2001:db8:5::/48=fe80::fe\n"
+        "{af6}port.b.interface=eth1\nport.b.address=fe80::1\nport.b.prefix=64\nport.b.gateway.2001:db8:5::/48=fe80::fe\n"
     ))
     .unwrap();
     assert_eq!(resolving.ports[0].gateways.len(), 1);
     // An AF_PACKET `io.*` port without `io.next_hop_mac` resolves its next
     // hops like a named port (D3: the fixed MAC is the legacy forwarder).
-    let io = SocketConfig::parse("io.backend=af-packet\nio.interface=eth0\nio.address=10.73.0.2\n")
-        .unwrap();
+    let io = SocketConfig::parse(
+        "io.backend=af-packet\nio.interface=eth0\nio.address=10.73.0.2\nio.prefix=24\n",
+    )
+    .unwrap();
     assert!(io.io.resolves() && io.io.gateways.is_empty());
+    // A resolving port owns its address on its configured subnet, which
+    // startup needs: without a prefix it is refused here.
+    for config in [
+        "io.backend=af-packet\nio.interface=eth0\nio.address=10.73.0.2\n".to_string(),
+        "io.backend=af-packet\nio.interface=eth0\nio.address=fe80::1\n".to_string(),
+        format!("{af6}port.b.interface=eth1\nport.b.address=fe80::1\n"),
+    ] {
+        assert!(SocketConfig::parse(&config).is_err(), "{config}");
+    }
     let port = "port.b.interface=eth1\nport.b.address=10.73.1.2\nport.b.prefix=24";
     for suffix in [
         // Gateways on a resolving port: on its own link, of its family,

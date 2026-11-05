@@ -6,7 +6,7 @@ use ntcp_socket as api;
 use std::{
     ffi::CString,
     io::{self, BufRead, Write},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     time::{Duration, Instant},
 };
 
@@ -44,17 +44,40 @@ fn address(addr: SocketAddr) -> (sockaddr_storage, u32) {
                 *p = sockaddr_in6 {
                     sin6_family: AF_INET6 as _,
                     sin6_port: a.port().to_be(),
-                    sin6_flowinfo: 0,
+                    sin6_flowinfo: a.flowinfo(),
                     sin6_addr: in6_addr {
                         s6_addr: a.ip().octets(),
                     },
-                    sin6_scope_id: 0,
+                    // A link-local address names its link (RFC 4007 section 11).
+                    sin6_scope_id: a.scope_id(),
                 };
             }
             28
         }
     };
     (storage, len)
+}
+// The inverse of `address`, scope included.
+fn decode(storage: &sockaddr_storage, len: u32) -> io::Result<SocketAddr> {
+    match i32::from(storage.ss_family) {
+        AF_INET if len >= 16 => {
+            let a = unsafe { &*(storage as *const _ as *const sockaddr_in) };
+            Ok(SocketAddr::new(
+                IpAddr::from(a.sin_addr.s_addr.to_ne_bytes()),
+                u16::from_be(a.sin_port),
+            ))
+        }
+        AF_INET6 if len >= 28 => {
+            let a = unsafe { &*(storage as *const _ as *const sockaddr_in6) };
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                a.sin6_addr.s6_addr.into(),
+                u16::from_be(a.sin6_port),
+                a.sin6_flowinfo,
+                a.sin6_scope_id,
+            )))
+        }
+        _ => Err(io::Error::other("unexpected socket address")),
+    }
 }
 fn pattern(n: usize, salt: usize) -> Vec<u8> {
     (0..n).map(|i| ((i * 31 + salt) % 251) as u8).collect()
@@ -191,6 +214,9 @@ fn main() {
 }
 fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("scoped") {
+        return scoped(&args);
+    }
     if args.len() != 9 {
         return Err(io::Error::other(
             "role local peer policy capacity lifetime_us managed disabled",
@@ -502,6 +528,249 @@ fn run() -> io::Result<()> {
                 hash(&last)
             ));
             check(unsafe { api::close(fd) })?;
+        }
+    }
+    Ok(())
+}
+
+// Bind `fd` to `addr`, retrying while its address is tentative: the runtime
+// refuses a tentative address (EADDRNOTAVAIL) until its Duplicate Address
+// Detection completes. Returns the number of attempts.
+fn bind_tentative(fd: i32, addr: SocketAddr, deadline: Instant) -> io::Result<u32> {
+    let (storage, len) = address(addr);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        if unsafe { api::bind(fd, (&storage as *const sockaddr_storage).cast(), len) } == 0 {
+            return Ok(attempts);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(EADDRNOTAVAIL) || Instant::now() >= deadline {
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+fn name(fd: i32, peer: bool) -> io::Result<SocketAddr> {
+    let mut storage: sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<sockaddr_storage>() as u32;
+    let p = (&mut storage as *mut sockaddr_storage).cast();
+    check(unsafe {
+        if peer {
+            api::getpeername(fd, p, &mut len)
+        } else {
+            api::getsockname(fd, p, &mut len)
+        }
+    })?;
+    decode(&storage, len)
+}
+// One connection's scoped names, send MSS and current path MTU.
+fn connection(fd: i32, index: u32) -> io::Result<String> {
+    let mut bytes = [0u8; 280];
+    let mut len = bytes.len() as u32;
+    check(unsafe {
+        api::getsockopt(
+            fd,
+            IPPROTO_TCP,
+            TCP_INFO,
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+        )
+    })?;
+    let mss = u32::from_ne_bytes(bytes[16..20].try_into().unwrap());
+    let mut mtu = 0i32;
+    let mut len = 4;
+    check(unsafe {
+        api::getsockopt(
+            fd,
+            IPPROTO_IPV6,
+            IPV6_MTU,
+            (&mut mtu as *mut i32).cast(),
+            &mut len,
+        )
+    })?;
+    Ok(format!(
+        "\"index\":{index},\"local\":\"{}\",\"peer\":\"{}\",\"tcp_state\":{},\"snd_mss\":{mss},\"path_mtu\":{mtu}",
+        name(fd, false)?,
+        name(fd, true)?,
+        bytes[0]
+    ))
+}
+fn accept_one(listener: i32, deadline: Instant) -> io::Result<i32> {
+    loop {
+        wait(listener, POLLIN, deadline)?;
+        let fd = unsafe {
+            api::accept4(
+                listener,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                SOCK_NONBLOCK,
+            )
+        };
+        if fd >= 0 {
+            return Ok(fd);
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(EAGAIN) {
+            return Err(io::Error::last_os_error());
+        }
+    }
+}
+
+// The T18 two-link case (`scoped CONFIG`): one runtime configured from the
+// production configuration text CONFIG, whose `io.*` port and `port.<name>`
+// ports each resolve their next hops, so one Host and Endpoint own every
+// link. Every port has the same link-local address; each socket names its
+// link by the interface index as sin6_scope_id. On stdin:
+//   listen PORT        on every link bind [LOCAL%link]:PORT, retrying while
+//                      the address is tentative, and listen
+//   serve N M SALT...  accept one connection on every link's listener, then
+//                      on each in link order read N request bytes (pattern
+//                      of that link's SALT), answer M bytes (SALT + 100) and
+//                      close after EOF
+//   pair LPORT PEER RPORT N M SALT...
+//                      on every link connect from [LOCAL%link]:LPORT to
+//                      [PEER%link]:RPORT (one identical address and port
+//                      pair per link), all established before any data; then
+//                      on each in link order send N bytes (SALT), read M
+//                      (SALT + 100), shut down and read EOF
+//   quit
+fn scoped(args: &[String]) -> io::Result<()> {
+    if args.len() != 3 {
+        return Err(io::Error::other("scoped CONFIG"));
+    }
+    let config = api::SocketConfig::parse(&args[2])?;
+    let local = config.io.address;
+    let mut links = Vec::new();
+    for name in std::iter::once(&config.io.interface).chain(config.ports.iter().map(|p| &p.interface)) {
+        let c = CString::new(name.as_str()).map_err(|_| io::Error::other("interface name"))?;
+        let index = unsafe { if_nametoindex(c.as_ptr()) };
+        if index == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        links.push((name.clone(), index));
+    }
+    api::configure(config)?;
+    let at = |ip: IpAddr, port: u16, index: u32| match ip {
+        IpAddr::V6(ip) => SocketAddr::V6(SocketAddrV6::new(ip, port, 0, index)),
+        ip => SocketAddr::new(ip, port),
+    };
+    let family = if local.is_ipv4() { AF_INET } else { AF_INET6 };
+    emit(format!(
+        "{{\"event\":\"ready\",\"backend\":\"AfPacket\",\"packet_test\":false,\"local\":\"{local}\",\"links\":[{}]}}",
+        links
+            .iter()
+            .map(|(name, index)| format!("{{\"name\":{name:?},\"index\":{index}}}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    let mut listeners = Vec::new();
+    for line in io::stdin().lock().lines() {
+        let line = line?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let number = |i: usize| -> io::Result<usize> {
+            fields
+                .get(i)
+                .and_then(|f| f.parse().ok())
+                .ok_or_else(|| io::Error::other(format!("invalid command {line:?}")))
+        };
+        let salts = |from: usize| (from..from + links.len()).map(number).collect::<io::Result<Vec<_>>>();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        match fields.first().copied() {
+            None => continue,
+            Some("quit") => break,
+            Some("listen") => {
+                let port = number(1)? as u16;
+                let started = Instant::now();
+                let mut sockets = Vec::new();
+                for &(_, index) in &links {
+                    let fd = check(unsafe { api::socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0) })?;
+                    let attempts = bind_tentative(fd, at(local, port, index), deadline)?;
+                    check(unsafe { api::listen(fd, 4) })?;
+                    sockets.push(format!(
+                        "{{\"index\":{index},\"local\":\"{}\",\"bind_attempts\":{attempts}}}",
+                        name(fd, false)?
+                    ));
+                    listeners.push(fd);
+                }
+                emit(format!(
+                    "{{\"event\":\"listening\",\"sockets\":[{}],\"waited_ms\":{}}}",
+                    sockets.join(","),
+                    started.elapsed().as_millis()
+                ));
+            }
+            Some("serve") => {
+                let (n, m, salts) = (number(1)?, number(2)?, salts(3)?);
+                if listeners.len() != links.len() {
+                    return Err(io::Error::other("serve needs listen"));
+                }
+                let mut children = Vec::new();
+                for &listener in &listeners {
+                    children.push(accept_one(listener, deadline)?);
+                }
+                // Every link's child exists before any is served.
+                let mut results = Vec::new();
+                for ((&fd, &(_, index)), salt) in children.iter().zip(&links).zip(salts) {
+                    let accepted = connection(fd, index)?;
+                    let request = read_exact(fd, n, deadline)?;
+                    verify(&request, salt)?;
+                    write_all(fd, &pattern(m, salt + 100), deadline)?;
+                    eof(fd, deadline)?;
+                    let done = connection(fd, index)?;
+                    check(unsafe { api::shutdown(fd, SHUT_WR) })?;
+                    check(unsafe { api::close(fd) })?;
+                    results.push(format!(
+                        "{{\"accepted\":{{{accepted}}},\"done\":{{{done}}},\"rx\":{n},\"tx\":{m},\"request_hash\":{:?},\"salt\":{salt}}}",
+                        hash(&request)
+                    ));
+                }
+                emit(format!("{{\"event\":\"served\",\"connections\":[{}]}}", results.join(",")));
+            }
+            Some("pair") => {
+                let lport = number(1)? as u16;
+                let peer: IpAddr = fields
+                    .get(2)
+                    .and_then(|f| f.parse().ok())
+                    .ok_or_else(|| io::Error::other("invalid peer"))?;
+                let (rport, n, m, salts) = (number(3)? as u16, number(4)?, number(5)?, salts(6)?);
+                let mut sockets = Vec::new();
+                for &(_, index) in &links {
+                    let fd = check(unsafe { api::socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0) })?;
+                    bind_tentative(fd, at(local, lport, index), deadline)?;
+                    let (addr, len) = address(at(peer, rport, index));
+                    if unsafe { api::connect(fd, (&addr as *const sockaddr_storage).cast(), len) } < 0
+                        && io::Error::last_os_error().raw_os_error() != Some(EINPROGRESS)
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    sockets.push(fd);
+                }
+                let mut established = Vec::new();
+                for (&fd, &(_, index)) in sockets.iter().zip(&links) {
+                    wait(fd, POLLOUT, deadline)?;
+                    match so_error(fd)? {
+                        0 => established.push(connection(fd, index)?),
+                        error => return Err(io::Error::from_raw_os_error(error)),
+                    }
+                }
+                let mut results = Vec::new();
+                for (((&fd, &(_, index)), salt), established) in
+                    sockets.iter().zip(&links).zip(salts).zip(established)
+                {
+                    write_all(fd, &pattern(n, salt), deadline)?;
+                    let response = read_exact(fd, m, deadline)?;
+                    verify(&response, salt + 100)?;
+                    check(unsafe { api::shutdown(fd, SHUT_WR) })?;
+                    eof(fd, deadline)?;
+                    let done = connection(fd, index)?;
+                    check(unsafe { api::close(fd) })?;
+                    results.push(format!(
+                        "{{\"established\":{{{established}}},\"done\":{{{done}}},\"tx\":{n},\"rx\":{m},\"response_hash\":{:?},\"salt\":{salt}}}",
+                        hash(&response)
+                    ));
+                }
+                emit(format!("{{\"event\":\"paired\",\"connections\":[{}]}}", results.join(",")));
+            }
+            Some(other) => return Err(io::Error::other(format!("unknown command {other}"))),
         }
     }
     Ok(())

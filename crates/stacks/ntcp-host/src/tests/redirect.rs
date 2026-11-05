@@ -532,6 +532,9 @@ fn nd_receive() -> ReceiveCapabilities {
 }
 
 fn nd_side(identity: u128, cfg: &EndpointConfig) -> Side {
+    nd_side_with(identity, cfg, IcmpOutputLimits::default())
+}
+fn nd_side_with(identity: u128, cfg: &EndpointConfig, output: IcmpOutputLimits) -> Side {
     let (paths, mut limits) = managed_limits(cfg, 2, 2, 2, 2, 0).unwrap();
     limits.neighbors = NeighborLimits {
         entries: 4,
@@ -540,6 +543,7 @@ fn nd_side(identity: u128, cfg: &EndpointConfig) -> Side {
         answers: 2,
     };
     let (paths, limits) = managed_udp_limits(paths, limits, UDP).unwrap();
+    let (paths, limits) = managed_icmp_output_limits(paths, limits, output).unwrap();
     let mut host = Host::new(
         ContextId::new(identity),
         paths,
@@ -603,6 +607,14 @@ fn receive(side: &mut Side, now: u64, frame: &[u8]) -> Result<bool, Error> {
     side.0
         .receive(side.2, now, frame, false, &mut out)
         .map(|r| matches!(r, Received::Neighbor))
+}
+// A Redirect's outcome through physical input.
+fn redirected(side: &mut Side, now: u64, frame: &[u8]) -> Result<RedirectOutcome, Error> {
+    let mut out = [0; 2048];
+    match side.0.receive(side.2, now, frame, false, &mut out)? {
+        Received::Redirect(outcome) => Ok(outcome),
+        _ => panic!("not consumed as a Redirect"),
+    }
 }
 // The router learns its mapping by soliciting this host's address.
 fn learn_router(side: &mut Side, router: Ipv6Addr, mac: [u8; 6], now: u64) {
@@ -693,6 +705,96 @@ fn ipv6_connection(identity: u128) -> (Side, ConnectionId, Vec<u8>) {
     (a, id, syn)
 }
 
+// A Redirect's Target Link-Layer Address that resolves a neighbor holding
+// Host ICMP output settles it at once, as an advertisement does: the
+// bounded pending slot is free again and the message leaves to the
+// learned address.
+#[test]
+fn ipv6_redirect_mapping_settles_held_icmp_output() {
+    let cfg = config(2);
+    let output = IcmpOutputLimits {
+        messages: 2,
+        message_bytes: 1280,
+        hop_limit: 64,
+    };
+    let mut a = nd_side_with(730, &cfg, output);
+    let link = a.2.link();
+    learn_router(&mut a, v6("fe80::1"), R1, 0);
+    let second = ScopedAddress::new(IpAddr::V6(v6("fe80::2")), Some(link)).unwrap();
+    a.0.add_route(path::Route {
+        destination: path::IpPrefix::new("2001:db8:2::".parse().unwrap(), 64).unwrap(),
+        source: None,
+        dscp: None,
+        link,
+        next_hop: path::NextHop::Gateway(second),
+        metric: 0,
+    })
+    .unwrap();
+    a.1.connect_with_path_provider(0, local6(), remote6(), options(&cfg, 0), &mut a.0)
+        .unwrap();
+    let (_, syn) = send6(&mut a, 1).unwrap();
+    // An Echo Reply through fe80::2 waits for its resolution.
+    let peer = v6("2001:db8:2::5");
+    let ip = IpMetadata {
+        source: IpAddr::V6(peer),
+        destination: IpAddr::V6(v6("2001:db8::10")),
+    };
+    let mut message = [0; 16];
+    let n =
+        ntcp_icmp::encode_echo(ip, ntcp_icmp::EchoKind::Request, 7, 1, &mut message, 8).unwrap();
+    let frame = arriving(peer, v6("2001:db8::10"), &message[..n]);
+    a.0.input_ip(
+        &mut a.1,
+        a.2,
+        2,
+        &frame,
+        RxPacketMetadata::default(),
+        0,
+        None,
+    )
+    .unwrap();
+    let mut sent = None;
+    let mut drain = |a: &mut Side, now| {
+        let mut packet = vec![0; 2048];
+        let _ = a.0.icmp_output(now, &mut packet, |egress, bytes| {
+            let ip = ntcp_ip6::parse(bytes).unwrap().ip;
+            sent = Some((egress.link_layer, ip.destination));
+            BackendOutcome::Submitted
+        });
+        sent.take()
+    };
+    assert_eq!(drain(&mut a, 2), None);
+    assert_eq!(a.0.icmp_output_pending(), 1);
+    assert_eq!(
+        a.0.neighbor(link, v6("fe80::2")),
+        Some((NeighborState::Incomplete, None, false))
+    );
+    let held = |a: &Side| {
+        (0..a.0.neighbors.pending_slots())
+            .filter(|&slot| a.0.neighbors.pending_at(slot).is_some())
+            .count()
+    };
+    assert_eq!(held(&a), 1);
+    let redirect = redirect6(
+        v6("fe80::1"),
+        v6("fe80::2"),
+        v6("2001:db8:1::7"),
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 3, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
+    assert_eq!(
+        a.0.neighbor(link, v6("fe80::2")),
+        Some((NeighborState::Stale, Some(R2), true))
+    );
+    assert_eq!(held(&a), 0);
+    assert_eq!(drain(&mut a, 4), Some((Some(R2), IpAddr::V6(peer))));
+    assert_eq!(a.0.icmp_output_counters().unsent, 0);
+}
+
 // RFC 4861 section 8.3: a Redirect to a better router with its Target
 // Link-Layer Address moves the destination, installs the router STALE
 // with IsRouter set, and the retransmitted SYN leaves at its mapping.
@@ -713,7 +815,10 @@ fn ipv6_redirect_to_a_router_with_its_link_layer_address() {
         )
         .unwrap();
     let redirect = redirect6(v6("fe80::1"), v6("fe80::2"), destination, Some(R2), Some(&syn));
-    assert_eq!(receive(&mut a, 2, &redirect), Ok(true));
+    assert_eq!(
+        redirected(&mut a, 2, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
     let link = a.2.link();
     assert_eq!(
         a.0.neighbor(link, v6("fe80::2")),
@@ -763,7 +868,10 @@ fn ipv6_redirect_without_a_mapping_and_to_the_destination() {
     let destination = v6("2001:db8:1::7");
     let link = a.2.link();
     let redirect = redirect6(v6("fe80::1"), v6("fe80::2"), destination, None, Some(&syn));
-    assert_eq!(receive(&mut a, 2, &redirect), Ok(true));
+    assert_eq!(
+        redirected(&mut a, 2, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
     assert_eq!(a.0.neighbor(link, v6("fe80::2")), None);
     a.0.service_changes(&mut a.1, 3).unwrap();
     assert_eq!(next_hop(&a, id), scoped(&a, "fe80::2"));
@@ -778,7 +886,7 @@ fn ipv6_redirect_without_a_mapping_and_to_the_destination() {
     let mut now = 2 * SECOND;
     let mut out = [0; 128];
     for _ in 0..3 {
-        while let Some(transmit) = a.0.neighbor_output(now, &mut out).unwrap() {
+        while let Some(transmit) = a.0.neighbor_output(link, now, &mut out).unwrap() {
             a.0.complete_neighbor_output(transmit.ticket, BackendOutcome::Submitted, now)
                 .unwrap();
         }
@@ -794,7 +902,10 @@ fn ipv6_redirect_without_a_mapping_and_to_the_destination() {
     // The destination itself as target.
     let (mut a, id, syn) = ipv6_connection(720);
     let redirect = redirect6(v6("fe80::1"), destination, destination, Some(PEER), Some(&syn));
-    assert_eq!(receive(&mut a, 2, &redirect), Ok(true));
+    assert_eq!(
+        redirected(&mut a, 2, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
     let link = a.2.link();
     assert_eq!(
         a.0.neighbor(link, destination),
@@ -851,7 +962,10 @@ fn ipv6_redirect_rejections_change_nothing() {
         );
         // Through physical input too.
         if context == a.2 {
-            assert_eq!(receive(&mut a, 2, &frame), Ok(true));
+            assert_eq!(
+                redirected(&mut a, 2, &frame),
+                Ok(RedirectOutcome::Rejected(rejection))
+            );
         }
     }
     assert_eq!(a.0.paths().revision(), revision);
@@ -871,4 +985,502 @@ fn ipv6_redirect_rejections_change_nothing() {
         a.0.redirect_ipv6(a.2, 3, v6("fe80::1"), decoded),
         Ok(RedirectOutcome::Rejected(Stale))
     );
+}
+
+// Two connections to one destination submitted with DSCP 0 and DSCP 24,
+// each with one full data segment submitted and lost; returns their
+// identifiers and those segments.
+fn ipv4_dscp_pair(
+    identity: u128,
+    cfg: &EndpointConfig,
+    dscp: u8,
+) -> (Side, Side, [(ConnectionId, Vec<u8>); 2]) {
+    let mut a = gateway_side(identity, cfg, false);
+    let mut b = managed(remote4(), identity + 1, cfg.clone());
+    let listener = b.1.listen(remote4(), 2).unwrap();
+    let plain =
+        a.1.connect_with_path_provider(0, local4(), remote4(), options(cfg, 0), &mut a.0)
+            .unwrap();
+    let marked =
+        a.1.connect_with_path_provider(
+            0,
+            "192.0.2.1:1001".parse().unwrap(),
+            remote4(),
+            options(cfg, dscp),
+            &mut a.0,
+        )
+        .unwrap();
+    let mut now = 0;
+    pump(&mut a, &mut b, &mut now);
+    b.1.accept(listener).unwrap();
+    b.1.accept(listener).unwrap();
+    a.1.write(plain, &[7; 1000]).unwrap();
+    a.1.write(marked, &[8; 1000]).unwrap();
+    let mut frames = [None, None];
+    while let Some(frame) = emit(&mut a.0, &mut a.1, now + 10) {
+        let index = usize::from(frame[1] >> 2 == dscp);
+        frames[index] = Some(frame);
+    }
+    let [Some(p), Some(m)] = frames else {
+        panic!("both segments")
+    };
+    (a, b, [(plain, p), (marked, m)])
+}
+// The next retransmission of each connection, after its RTO at `now`.
+fn retransmissions(a: &mut Side, now: u64, dscp: u8) -> [Vec<u8>; 2] {
+    a.1.on_timeout(now, 32).unwrap();
+    let mut frames = [None, None];
+    while let Some(frame) = emit(&mut a.0, &mut a.1, now) {
+        let index = usize::from(frame[1] >> 2 == dscp);
+        frames[index].get_or_insert(frame);
+    }
+    frames.map(|frame| frame.expect("a retransmission"))
+}
+
+// RFC 1122 section 3.2.2.2 over a sequence of Redirects: the
+// type-of-service forms (codes 2 and 3) move only the DSCP the quoted
+// segment was submitted with; the forms for every type of service (codes 0
+// and 1) move every DSCP whose first hop is the sender, whether that first
+// hop is the configured gateway or the target of an earlier override.
+// Each Redirect must quote a submission that left through its sender: a
+// quote of a segment sent through the replaced first hop is refused.
+#[test]
+fn ipv4_redirect_sequences_follow_each_dscp_first_hop() {
+    for (specific, general) in [(2, 1), (3, 0)] {
+        let cfg = config(2);
+        let (mut a, _b, [(plain, data0), (marked, data24)]) =
+            ipv4_dscp_pair(660 + u128::from(specific) * 2, &cfg, 24);
+        let gateway = ResolvedNextHop::Address(unscoped(v4("192.0.2.254")));
+        let hop = |address| ResolvedNextHop::Address(unscoped(v4(address)));
+        let other = |a: &Side| {
+            let request =
+                a.0.request(local4().ip(), remote4().ip(), None, Dscp::new(46).unwrap())
+                    .unwrap();
+            a.0.paths().resolve(request).unwrap().key().next_hop()
+        };
+        let state = |a: &Side| (next_hop(a, plain), next_hop(a, marked), other(a));
+        assert_eq!(state(&a), (gateway, gateway, gateway));
+
+        // The gateway moves DSCP 24 alone to 192.0.2.253.
+        let mut now = SECOND;
+        assert_eq!(
+            dispatch(&mut a, now, &redirect4(&data24, specific, "192.0.2.253")),
+            RedirectOutcome::Installed
+        );
+        a.0.service_changes(&mut a.1, now).unwrap();
+        assert_eq!(state(&a), (gateway, hop("192.0.2.253"), gateway));
+        // 192.0.2.253 never forwarded the segment sent through the
+        // gateway.
+        let revision = a.0.paths().revision();
+        let stale = from(redirect4(&data24, general, "192.0.2.252"), [192, 0, 2, 253]);
+        assert!(matches!(
+            dispatch(&mut a, now, &stale),
+            RedirectOutcome::Rejected(_)
+        ));
+        // The gateway is no first hop of DSCP 24 any more.
+        assert!(matches!(
+            dispatch(&mut a, now, &redirect4(&data24, general, "192.0.2.252")),
+            RedirectOutcome::Rejected(_)
+        ));
+        assert_eq!(a.0.paths().revision(), revision);
+        assert_eq!(state(&a), (gateway, hop("192.0.2.253"), gateway));
+
+        // 192.0.2.253's Redirect for every type of service, quoting the
+        // retransmission it forwarded, moves only DSCP 24: it is the first
+        // hop of nothing else.
+        now += 10 * SECOND;
+        let [_, again24] = retransmissions(&mut a, now, 24);
+        assert_eq!(again24[1] >> 2, 24);
+        let report = from(
+            redirect4(&again24, general, "192.0.2.252"),
+            [192, 0, 2, 253],
+        );
+        assert_eq!(dispatch(&mut a, now, &report), RedirectOutcome::Installed);
+        a.0.service_changes(&mut a.1, now).unwrap();
+        assert_eq!(state(&a), (gateway, hop("192.0.2.252"), gateway));
+
+        // The gateway's Redirect for every type of service, quoting the
+        // DSCP 0 segment, moves DSCP 0 and every other DSCP still leaving
+        // through it, but not DSCP 24.
+        assert_eq!(
+            dispatch(&mut a, now, &redirect4(&data0, general, "192.0.2.251")),
+            RedirectOutcome::Installed
+        );
+        a.0.service_changes(&mut a.1, now).unwrap();
+        assert_eq!(
+            state(&a),
+            (hop("192.0.2.251"), hop("192.0.2.252"), hop("192.0.2.251"))
+        );
+    }
+}
+
+// Codes 0 and 1 move the destination across DSCP values: a connection
+// with another DSCP to the same destination, leaving through the same
+// gateway, is notified and rebound with the quoted one.
+#[test]
+fn ipv4_general_redirect_rebinds_connections_of_every_dscp() {
+    for code in [0, 1] {
+        let cfg = config(2);
+        let (mut a, _b, [(plain, data0), (marked, _)]) =
+            ipv4_dscp_pair(680 + u128::from(code) * 2, &cfg, 46);
+        assert_eq!(
+            dispatch(&mut a, SECOND, &redirect4(&data0, code, "192.0.2.253")),
+            RedirectOutcome::Installed
+        );
+        let report = a.0.service_changes(&mut a.1, SECOND).unwrap();
+        assert_eq!((report.applied, report.failed), (2, 0));
+        let moved = ResolvedNextHop::Address(unscoped(v4("192.0.2.253")));
+        assert_eq!(next_hop(&a, plain), moved);
+        assert_eq!(next_hop(&a, marked), moved);
+        // The marked connection's retransmission leaves on the new path.
+        let [_, again] = retransmissions(&mut a, 10 * SECOND, 46);
+        assert_eq!(again[1] >> 2, 46);
+        assert_eq!(next_hop(&a, marked), moved);
+    }
+}
+
+// RFC 4861 section 8.3 with T17's Segment Routing routes: a router on the
+// link sees, and redirects, the packet's forwarding destination (the first
+// segment in the base header), so the ICMPv6 Destination of a valid
+// Redirect is that destination, never the final destination the Segment
+// Routing Header carries; the override then moves the route's flows to it.
+#[test]
+fn ipv6_redirect_destination_is_the_segment_route_forwarding_destination() {
+    let cfg = config(2);
+    let (paths, mut limits) = managed_limits(&cfg, 2, 2, 2, 3, 0).unwrap();
+    limits.neighbors = NeighborLimits {
+        entries: 4,
+        pending_packets: 4,
+        addresses: 2,
+        answers: 2,
+    };
+    let (paths, limits) = managed_udp_limits(paths, limits, UDP).unwrap();
+    let mut host = Host::new(ContextId::new(740), paths, limits, cfg.connection.timebase).unwrap();
+    host.set_entropy(Box::new(|out: &mut [u8]| {
+        out.fill(0);
+        out[0] = 0x80;
+        Ok(())
+    }));
+    let port = NdPort {
+        dad_transmits: 0,
+        ..NdPort::new(OWN)
+    };
+    let context = host
+        .register_neighbor_port(InterfaceKey(1), 1500, nd_receive(), port)
+        .unwrap();
+    let link = context.link();
+    host.add_neighbor_address(link, v6("2001:db8::10")).unwrap();
+    let router = ScopedAddress::new(IpAddr::V6(v6("fe80::1")), Some(link)).unwrap();
+    let segments = [v6("2001:db8:5::1"), v6("2001:db8:6::1")];
+    host.add_segment_route(
+        path::Route {
+            destination: path::IpPrefix::new(remote6().ip(), 128).unwrap(),
+            source: None,
+            dscp: None,
+            link,
+            next_hop: path::NextHop::Gateway(router),
+            metric: 0,
+        },
+        &segments,
+    )
+    .unwrap();
+    let mut endpoint = endpoint(&cfg, 740, local6().ip());
+    host.attach(&mut endpoint).unwrap();
+    endpoint
+        .enable_output_reservations_with_capacity(1)
+        .unwrap();
+    let mut a = (host, endpoint, context);
+    learn_router(&mut a, v6("fe80::1"), R1, 0);
+    let id =
+        a.1.connect_with_path_provider(0, local6(), remote6(), options(&cfg, 0), &mut a.0)
+            .unwrap();
+    let (mac, syn) = send_routed(&mut a, 1).unwrap();
+    assert_eq!(mac, R1);
+    // The SYN leaves for the first segment through fe80::1.
+    assert_eq!(syn[24..40], segments[0].octets());
+    assert_eq!(next_hop(&a, id), scoped(&a, "fe80::1"));
+    // The final destination is not what fe80::1 forwarded the SYN to.
+    let revision = a.0.paths().revision();
+    let wrong = redirect6(
+        v6("fe80::1"),
+        v6("fe80::2"),
+        v6("2001:db8:1::7"),
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 2, &wrong),
+        Ok(RedirectOutcome::Rejected(RedirectRejection::Destination))
+    );
+    assert_eq!(a.0.paths().revision(), revision);
+    let redirect = redirect6(
+        v6("fe80::1"),
+        v6("fe80::2"),
+        segments[0],
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 3, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
+    a.0.service_changes(&mut a.1, 4).unwrap();
+    assert_eq!(next_hop(&a, id), scoped(&a, "fe80::2"));
+    let (mac, again) = send_routed(&mut a, 2 * SECOND).unwrap();
+    assert_eq!(mac, R2);
+    assert_eq!(again[24..40], segments[0].octets());
+}
+// As `send6`, the segment after the complete header chain of its path.
+fn send_routed(side: &mut Side, now: u64) -> Option<([u8; 6], Vec<u8>)> {
+    side.1.on_timeout(now, 32).unwrap();
+    let mut tcp = [0; 2048];
+    let (poll, attempt) = side
+        .1
+        .poll_reserved_transmit_with_path_provider(now, &mut tcp, 32, &mut side.0)
+        .unwrap();
+    let packet = poll.packet.expect("a segment");
+    let attempt = attempt.unwrap();
+    let context = side.0.egress_context(&mut side.1, attempt).unwrap();
+    let plan = side.0.header_plan(context.binding.snapshot.key()).unwrap();
+    let mut frame = vec![0; plan.len + packet.len];
+    frame[plan.len..].copy_from_slice(&tcp[..packet.len]);
+    ntcp_ip6::encode_tcp_routed(&mut frame, packet, plan.segments, packet.len).unwrap();
+    let owner = Owner::Tcp(packet.connection.unwrap());
+    let NeighborHop::Resolved(mac) = side.0.resolve_neighbor(context, owner, now).unwrap() else {
+        side.1.reject_unsubmitted(attempt).unwrap();
+        return None;
+    };
+    let ticket = side.0.submission_ticket(&mut side.1, context).unwrap();
+    let submitted = side
+        .0
+        .submit(&mut side.1, now, ticket, context, &frame, 0, |_| {
+            BackendOutcome::Submitted
+        })
+        .unwrap();
+    assert!(submitted == Submission::Submitted);
+    side.0.collect(&side.1).unwrap();
+    Some((mac, frame))
+}
+
+// RFC 4861 section 8.3 over a sequence: the new router may redirect the
+// destination again, quoting a packet it forwarded, while the replaced
+// router, and a quote of a packet sent through it, no longer may. (A
+// retransmission identical in its ledger key to a copy sent through the
+// replaced router is ambiguous evidence and stays refused.)
+#[test]
+fn ipv6_redirects_follow_the_current_first_hop() {
+    use RedirectRejection::*;
+    let (mut a, id, syn) = ipv6_connection(750);
+    let destination = v6("2001:db8:1::7");
+    let redirect = redirect6(
+        v6("fe80::1"),
+        v6("fe80::2"),
+        destination,
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 2, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
+    a.0.service_changes(&mut a.1, 3).unwrap();
+    let (mac, again) = send6(&mut a, 2 * SECOND).unwrap();
+    assert_eq!(mac, R2);
+    // A second connection to the destination, opened through fe80::2.
+    let cfg = config(2);
+    let second =
+        a.1.connect_with_path_provider(
+            2 * SECOND,
+            "[2001:db8::10]:1001".parse().unwrap(),
+            remote6(),
+            options(&cfg, 0),
+            &mut a.0,
+        )
+        .unwrap();
+    let (mac, fresh) = send6(&mut a, 2 * SECOND).unwrap();
+    assert_eq!(mac, R2);
+    assert_eq!(fresh[40..42], 1001u16.to_be_bytes());
+    assert_eq!(next_hop(&a, second), scoped(&a, "fe80::2"));
+    let revision = a.0.paths().revision();
+    for (router, quoted) in [
+        ("fe80::1", &fresh),
+        ("fe80::1", &again),
+        ("fe80::2", &syn),
+        ("fe80::1", &syn),
+    ] {
+        let frame = redirect6(v6(router), v6("fe80::3"), destination, None, Some(quoted));
+        let outcome = redirected(&mut a, 2 * SECOND + 1, &frame).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                RedirectOutcome::Rejected(Stale | NotFirstHop | Uncorrelated)
+            ),
+            "{router}: {outcome:?}"
+        );
+    }
+    assert_eq!(a.0.paths().revision(), revision);
+    let frame = redirect6(
+        v6("fe80::2"),
+        v6("fe80::3"),
+        destination,
+        None,
+        Some(&fresh),
+    );
+    assert_eq!(
+        redirected(&mut a, 2 * SECOND + 2, &frame),
+        Ok(RedirectOutcome::Installed)
+    );
+    let report = a.0.service_changes(&mut a.1, 2 * SECOND + 3).unwrap();
+    assert_eq!((report.applied, report.failed), (2, 0));
+    assert_eq!(next_hop(&a, id), scoped(&a, "fe80::3"));
+    assert_eq!(next_hop(&a, second), scoped(&a, "fe80::3"));
+    // fe80::3 is a router even before its mapping is known.
+    let ResolvedNextHop::Address(third) = scoped(&a, "fe80::3") else {
+        unreachable!()
+    };
+    assert!(a.0.paths().redirect_router(a.2.link(), third));
+}
+
+// A Redirect to this host's own address on the arrival link is refused and
+// its Target Link-Layer Address changes no cache entry. A link-local
+// address is unique only on its link (RFC 4007): the same address this
+// host owns on another port is another node on the arrival link, and a
+// valid router target there (RFC 4861 section 8.1 requires only that it
+// be link-local).
+#[test]
+fn ipv6_redirect_target_ownership_is_per_link() {
+    let destination = v6("2001:db8:1::7");
+    // Own on the arrival link.
+    let (mut a, id, syn) = ipv6_connection(760);
+    let link = a.2.link();
+    assert_eq!(
+        a.0.add_neighbor_address(link, v6("fe80::10")),
+        Ok(AddressState::Assigned)
+    );
+    let frame = redirect6(
+        v6("fe80::1"),
+        v6("fe80::10"),
+        destination,
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 2, &frame),
+        Ok(RedirectOutcome::Rejected(RedirectRejection::Target))
+    );
+    assert_eq!(a.0.neighbor(link, v6("fe80::10")), None);
+    assert_eq!(next_hop(&a, id), scoped(&a, "fe80::1"));
+
+    // Own only on another port.
+    let (mut a, id, syn) = ipv6_connection(770);
+    let other =
+        a.0.register_neighbor_port(
+            InterfaceKey(2),
+            1500,
+            nd_receive(),
+            NdPort {
+                dad_transmits: 0,
+                ..NdPort::new([2, 0, 0, 0, 0, 2])
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        a.0.add_neighbor_address(other.link(), v6("fe80::10")),
+        Ok(AddressState::Assigned)
+    );
+    let frame = redirect6(
+        v6("fe80::1"),
+        v6("fe80::10"),
+        destination,
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 2, &frame),
+        Ok(RedirectOutcome::Installed)
+    );
+    a.0.service_changes(&mut a.1, 3).unwrap();
+    assert_eq!(next_hop(&a, id), scoped(&a, "fe80::10"));
+    assert_eq!(
+        a.0.neighbor(a.2.link(), v6("fe80::10")),
+        Some((NeighborState::Stale, Some(R2), true))
+    );
+}
+
+// RFC 4861 section 7.3.3 and D5: an override also ends when the router
+// that sent it is found unreachable. The SYN that left through fe80::1
+// moved it to DELAY; without any answer its probes run out, and the
+// override fe80::1 sent ends with it, returning the flow to the route.
+#[test]
+fn ipv6_redirect_ends_when_its_sender_is_unreachable() {
+    let (mut a, id, syn) = ipv6_connection(780);
+    let link = a.2.link();
+    let destination = v6("2001:db8:1::7");
+    let redirect = redirect6(
+        v6("fe80::1"),
+        v6("fe80::2"),
+        destination,
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 2, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
+    a.0.service_changes(&mut a.1, 3).unwrap();
+    assert_eq!(next_hop(&a, id), scoped(&a, "fe80::2"));
+    let mut out = [0; 128];
+    let mut now = 3;
+    while a.0.neighbor(link, v6("fe80::1")).is_some() && now < 30 * SECOND {
+        a.0.service_neighbors(now);
+        while let Some(transmit) = a.0.neighbor_output(link, now, &mut out).unwrap() {
+            a.0.complete_neighbor_output(transmit.ticket, BackendOutcome::Submitted, now)
+                .unwrap();
+        }
+        now += SECOND / 4;
+    }
+    assert_eq!(a.0.neighbor(link, v6("fe80::1")), None);
+    // fe80::2 itself is untouched.
+    assert_eq!(
+        a.0.neighbor(link, v6("fe80::2")),
+        Some((NeighborState::Stale, Some(R2), true))
+    );
+    a.0.service_changes(&mut a.1, now).unwrap();
+    assert_eq!(next_hop(&a, id), scoped(&a, "fe80::1"));
+}
+
+// An administrative downward estimate reaches a binding moved by a
+// Redirect within `admin_apply`, as it reaches any other binding: the
+// fan-out recognizes the override's selection as the binding's current
+// path.
+#[test]
+fn admin_estimate_lowers_a_redirected_binding_at_once() {
+    let cfg = config(2);
+    let (mut a, _b, id, data) = ipv4_connection(790, &cfg, 0);
+    assert_eq!(
+        dispatch(&mut a, SECOND, &redirect4(&data, 1, "192.0.2.253")),
+        RedirectOutcome::Installed
+    );
+    a.0.service_changes(&mut a.1, SECOND).unwrap();
+    let moved = a.0.binding(id).unwrap();
+    assert_eq!(
+        moved.snapshot.key().next_hop(),
+        ResolvedNextHop::Address(unscoped(v4("192.0.2.253")))
+    );
+    let before = a.1.transport_ceilings(id).unwrap().effective_mss;
+    // Below the connection's current packets.
+    let estimate = before as u32 + 40 - 100;
+    let capability = a.0.administration();
+    super::admin::set_estimate(
+        &mut a,
+        &capability,
+        2 * SECOND,
+        moved.snapshot.path(),
+        Some(estimate),
+    )
+    .unwrap();
+    let binding = a.0.binding(id).unwrap();
+    assert!(!a.0.paths().is_dirty(binding.client).unwrap());
+    assert_eq!(binding.snapshot.ip_packet_budget(), Ok(estimate));
+    assert!(a.1.transport_ceilings(id).unwrap().effective_mss <= before - 100);
 }

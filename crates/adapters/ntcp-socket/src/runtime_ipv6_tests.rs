@@ -1398,6 +1398,141 @@ fn identical_link_local_binds_and_connections_coexist_on_two_ports() {
     }
 }
 
+// MSG_FASTOPEN and a deferred TCP_FASTOPEN_CONNECT open to scope 2 leave
+// through the second port, beside an identical address on the first.
+#[test]
+fn fast_open_scopes_select_their_port_on_a_two_port_owner() {
+    let (mut a, sa) = two_port_owner("fe80::1", "fe80::1");
+    let mut peers = link_local_peers();
+    a.socket_policy.fast_open_client_policy = ntcp::FastOpenClientPolicy::ApplicationProtected;
+    let listeners = peers.each_mut().map(|(peer, _)| {
+        let l = link_local_listener(peer, v6("fe80::2", 8080, 1), None);
+        peer.execute(l, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 4)).unwrap();
+        l
+    });
+    let data = [9u8; 10];
+    let implicit = new(&mut a);
+    a.execute(
+        implicit,
+        Op::SendTo(
+            vec![(data.as_ptr() as usize, data.len())],
+            MSG_FASTOPEN,
+            Some(v6("fe80::2", 8080, 2)),
+            None,
+        ),
+    )
+    .unwrap();
+    let deferred = new(&mut a);
+    a.execute(deferred, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+        .unwrap();
+    a.execute(deferred, Op::Connect(v6("fe80::2", 8080, 2))).unwrap();
+    assert_eq!(a.execute(deferred, Op::Name(true)).unwrap().addr, Some(v6("fe80::2", 8080, 2)));
+    a.execute(deferred, Op::Send(vec![(data.as_ptr() as usize, data.len())], 0))
+        .unwrap();
+    // Both SYNs leave the second port's frame queue only.
+    a.service_egress().unwrap();
+    assert!(sa[0].lock().unwrap().sent.is_empty());
+    let syns = sa[1].lock().unwrap().sent.len();
+    assert_eq!(syns, 2);
+    exchange_ports(&mut a, &sa, &mut peers);
+    for id in [implicit, deferred] {
+        let port = a.execute(id, Op::Name(false)).unwrap().addr.unwrap().port();
+        assert_eq!(a.execute(id, Op::Name(false)).unwrap().addr, Some(v6("fe80::1", port, 2)));
+        assert_eq!(a.execute(id, Op::Name(true)).unwrap().addr, Some(v6("fe80::2", 8080, 2)));
+        assert_eq!(
+            a.endpoint.retained_scoped_tuple(cid(&a, id)).unwrap().zone(),
+            a.ports[1].link()
+        );
+        let accepted = peers[1].0.execute(listeners[1], Op::Accept(0)).unwrap();
+        assert_eq!(peers[1].0.execute(accepted.value as u64, Op::Read(100)).unwrap().bytes, data);
+    }
+    assert_eq!(peers[0].0.execute(listeners[0], Op::Accept(0)).unwrap_err(), EAGAIN);
+}
+
+// The OS reusing the second port's interface index for a new interface
+// gives that port a new link: a socket bound to the old link is never
+// retargeted, and the first port's connection is untouched.
+#[test]
+fn a_reused_index_on_one_port_never_retargets_its_sockets_or_the_other_port() {
+    let (mut a, sa) = two_port_owner("fe80::1", "fe80::1");
+    let mut peers = link_local_peers();
+    let listeners = peers
+        .each_mut()
+        .map(|(peer, _)| link_local_listener(peer, v6("fe80::2", 8080, 1), None));
+    let first = new(&mut a);
+    a.execute(first, Op::Bind(v6("fe80::1", 9000, 1))).unwrap();
+    assert_eq!(
+        a.execute(first, Op::Connect(v6("fe80::2", 8080, 1))).unwrap_err(),
+        EINPROGRESS
+    );
+    let stale = new(&mut a);
+    a.execute(stale, Op::Bind(v6("fe80::1", 9000, 2))).unwrap();
+    exchange_ports(&mut a, &sa, &mut peers);
+    let child = peers[0].0.execute(listeners[0], Op::Accept(0)).unwrap().value as u64;
+    let zone = a.ports[0].link();
+    let old = a.ports[1].ingress.unwrap();
+    let host = a.host.as_mut().unwrap();
+    let receive = host.receive_capabilities(old).unwrap();
+    host.remove_link(old).unwrap();
+    use ntcp_host::path;
+    let forwarder = path::ForwarderId(1);
+    let ingress = host
+        .register_link(
+            path::InterfaceKey(2),
+            1500,
+            receive,
+            ntcp_host::Forwarding::Forwarder(forwarder),
+        )
+        .unwrap();
+    assert_ne!(ingress.link(), old.link());
+    host.register_source(
+        path::ScopedAddress::new("fe80::1".parse().unwrap(), Some(ingress.link())).unwrap(),
+        ingress.link(),
+    )
+    .unwrap();
+    host.add_route(path::Route {
+        destination: path::IpPrefix::new("fe80::".parse().unwrap(), 64).unwrap(),
+        source: None,
+        dscp: None,
+        link: ingress.link(),
+        next_hop: path::NextHop::Forwarder(forwarder),
+        metric: 0,
+    })
+    .unwrap();
+    a.ports[1].ingress = Some(ingress);
+    // The bound socket keeps its old link: index 2 now names another one,
+    // and the first port's link is not a substitute.
+    assert_eq!(
+        a.execute(stale, Op::Connect(v6("fe80::2", 8080, 2))).unwrap_err(),
+        EINVAL
+    );
+    assert_eq!(
+        a.execute(stale, Op::Connect(v6("fe80::2", 8080, 1))).unwrap_err(),
+        EINVAL
+    );
+    assert_eq!(a.execute(stale, Op::Name(false)).unwrap().addr, Some(v6("fe80::1", 9000, 2)));
+    // The same address and port on the new link is a distinct binding.
+    let fresh = new(&mut a);
+    a.execute(fresh, Op::Bind(v6("fe80::1", 9000, 2))).unwrap();
+    assert_eq!(
+        a.execute(fresh, Op::Connect(v6("fe80::2", 8080, 2))).unwrap_err(),
+        EINPROGRESS
+    );
+    a.execute(first, Op::Write(vec![0x61; 100])).unwrap();
+    exchange_ports(&mut a, &sa, &mut peers);
+    assert_eq!(
+        peers[1].0.execute(listeners[1], Op::Accept(0)).unwrap().addr,
+        Some(v6("fe80::1", 9000, 1))
+    );
+    assert_eq!(
+        a.endpoint.retained_scoped_tuple(cid(&a, fresh)).unwrap().zone(),
+        Some(ingress.link())
+    );
+    assert_eq!(a.endpoint.retained_scoped_tuple(cid(&a, first)).unwrap().zone(), zone);
+    assert_eq!(peers[0].0.execute(child, Op::Read(200)).unwrap().bytes, vec![0x61; 100]);
+    assert_eq!(peers[0].0.execute(listeners[0], Op::Accept(0)).unwrap_err(), EAGAIN);
+}
+
 #[test]
 fn a_wildcard_listener_accepts_on_both_ports_with_each_arrival_scope() {
     for v6only in [0, 1] {
@@ -2304,6 +2439,10 @@ fn unrestorable_held_output_survives_resolution_failure_and_is_delivered() {
 // probes up to its own link, and a checksummed PTB quoting a packet
 // definitely submitted on port b lowers only b's estimate and packet
 // sizes; port c's estimate and both first-hop MTUs stay unchanged.
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+//= type=test
+//= reason=Each IPv6 link keeps its own Path MTU information. PathService keys learned estimates by context, source, destination with its zone, routing DSCP, link, next hop and route generation, and a link-local destination carries an authoritative LinkId zone (context, slot, generation) with which Host::prepare selects and acquires the path on exactly that link before TCP construction. T18 carries this scoped tuple through Endpoint and Host factories, listeners (an exact address and zone beats the wildcard; wildcard children carry the arrival link), TIME-WAIT, digests, Fast Open and MSS caches, Host UDP flows and zone-constrained ICMP correlation; the native runtime resolves sin6_scope_id through its interface-index-to-live-link map over a bounded collection of configured ports, each with its own link, addresses and routes, and IPv6 Ethernet ports resolve next hops by bounded host Neighbor Discovery. Host tests (ntcp-host src/tests/scoped.rs) keep identical link-local pairs on two links as separate connections and UDP flows, and a PTB correlated with one link's submission lowers only that link's estimate; the native two-port test neighbor_discovery_ports_keep_path_mtu_per_link probes each connection up to its own link MTU (1500 and 1400), and a checksummed PTB quoting a packet definitely submitted on one port lowers only that port's estimate and packet sizes while the other port's estimate and both first-hop MTUs stay unchanged; the integration/rfc_host scoped two-link case (one native runtime owning two veth links of MTU 1500 and 1400 to one Linux peer namespace, identical link-local pairs, captured DAD and NS/NA, hashed TCP streams on both links) shows a checksummed, harness-injected PTB quoting a captured packet on link A lowering only A's learned PMTU and packet sizes while link B keeps 1400-octet packets and both first-hop MTUs stay unchanged, and later connections start at their own link's value.
+//# Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.
 #[test]
 fn neighbor_discovery_ports_keep_path_mtu_per_link() {
     let (mut a, sa) = nd_owner_assigned_with([Some(1500), Some(1400)]);

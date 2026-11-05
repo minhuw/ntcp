@@ -348,11 +348,47 @@ class PmtudInventory(unittest.TestCase):
                 self.assertIn(dependency, rows[key]["reason"], key)
         for key in ("1191-056", "1191-057", "1191-058", "1191-074"):
             self.assertEqual(len(rows[key]["evidence"]), 2, key)
+        # Covered 1191-053 and 1191-055 no longer name T9 as an owner.
+        for key in ("1191-053", "1191-055"):
+            self.assertNotRegex(rows[key]["reason"], r"\bT9\b|\bremains\b", key)
+        self.assertIn("PathService::redirect", rows["1191-055"]["reason"])
         rows6 = {p["id"]: p for p in self.inventory(8201)["paragraphs"]}
-        # 8201-052 stays TODO: zone propagation and multi-link ND are T18's.
-        self.assertEqual(rows6["8201-052"]["status"], "TODO")
-        for fragment in ("T7 PathService", "remain T18"):
-            self.assertIn(fragment, rows6["8201-052"]["reason"])
+        # 8201-052 closes with T18's multi-link runtime evidence: the Host
+        # path selection, the Host and native per-link tests and the
+        # namespace two-link case, every annotation copy carrying its reason.
+        per_link = rows6["8201-052"]
+        full_key = per_link["target"] + "\n" + " ".join(per_link["quote"].split())
+        self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(),
+                         "8a2fd2f3794b8320cd38d2fa3a4caf24b757f62325941a0eb63d92b06631ef2e")
+        self.assertEqual(per_link["status"], "covered")
+        self.assertEqual(per_link["evidence"], [
+            "crates/stacks/ntcp-host/src/lib.rs::    fn prepare(",
+            "crates/stacks/ntcp-host/src/tests/scoped.rs::fn ptb_lowers_only_the_link_whose_submission_it_quotes("])
+        for fragment in ("Host::prepare", "sin6_scope_id", "bounded host Neighbor Discovery",
+                         "neighbor_discovery_ports_keep_path_mtu_per_link",
+                         "integration/rfc_host scoped two-link case", "harness-injected PTB",
+                         "both first-hop MTUs stay unchanged"):
+            self.assertIn(fragment, per_link["reason"])
+        self.assertNotRegex(per_link["reason"], r"\bRemaining\b|remain T18")
+        self.assertFalse([t for t in tomllib.loads((ROOT / "duvet/rfc8201-todos.toml").read_text()).get("TODO", [])
+                          if normalize(t["quote"]) == normalize(per_link["quote"])])
+        copies = {}
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in source_annotations(path.read_text()):
+                if (annotation["target"], normalize(annotation["quote"])) == (
+                        per_link["target"], normalize(per_link["quote"])):
+                    self.assertEqual(annotation["reason"], per_link["reason"], str(path))
+                    copies[path.relative_to(ROOT).as_posix()] = annotation["kind"]
+        self.assertEqual(copies, {
+            "crates/stacks/ntcp-host/src/lib.rs": "CITATION",
+            "crates/stacks/ntcp-host/src/tests/scoped.rs": "TEST",
+            "crates/adapters/ntcp-socket/src/runtime_ipv6_tests.rs": "TEST"})
+        # 8201-031 stays TODO for T19's proxy-ND topology only; the on-link
+        # ND route and its PMTUD are T18's implemented behavior.
+        self.assertEqual(rows6["8201-031"]["status"], "TODO")
+        for fragment in ("on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud",
+                         "bounded host Neighbor Discovery", "Remaining T19 (AC-22): the proxy-ND namespace topology"):
+            self.assertIn(fragment, rows6["8201-031"]["reason"])
         # 8201-050 closes with T17's complete header length (pinned below).
         self.assertEqual(rows6["8201-050"]["status"], "covered")
         # T10 closes whole notification, UDP-quoted, MMS_S, deferred-report
@@ -610,7 +646,9 @@ class PmtudInventory(unittest.TestCase):
                  "scalar, shared, reserved and software GSO output", "EMTU_S - H - 8",
                  "1500 octets for IPv6", "repeat the unfragmentable part",
                  "TCP never source-fragments", "Host::reassembly_capacity",
-                 "Host::receive_ip_capability", "integration/rfc_host srh cases")),
+                 "Host::receive_ip_capability", "integration/rfc_host srh cases",
+                 "tun_echo's transit-ptb case repairs a transit router's real Packet Too Big",
+                 "the native runtime's endpoint case makes TCP progress through Linux's own SR endpoint")),
             "8201-060": ("7dca119cc6ea95fe712577b228622de5bb9f0d416be441d22afb128c32f551df", [
                 "crates/stacks/ntcp-ip-common/src/ipv6.rs::    pub fn final_destination(",
                 "crates/stacks/ntcp-icmp/tests/extension_quote.rs::"

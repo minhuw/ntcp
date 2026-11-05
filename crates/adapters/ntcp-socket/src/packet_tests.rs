@@ -1091,6 +1091,9 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
 #[test]
 fn user_timeout_preconnect_updates_reset_and_deadlines() {
     let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
+    // The owner's test clock, not the elapsed one: every call below sees the
+    // same instant, so the Endpoint never runs ahead of `on_timeout`.
+    owner.inner.test_now = Some(0);
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
     assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(0));
     assert_eq!(execute_value(&mut owner, 11, fd, 5, -1), Err(EINVAL));

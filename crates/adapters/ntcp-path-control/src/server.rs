@@ -22,9 +22,12 @@
 //! allowed administrator needs. They can still fill the listen backlog
 //! between passes (`listen(SLOTS)`; a Linux unix stream listener holds
 //! `SLOTS + 1` pending connections), which the kernel's
-//! connection queue shares with allowed peers: a denied local process can
-//! delay an allowed administrator's connection (a blocking connect waits,
-//! a nonblocking one fails with `EAGAIN`), not exclude it from a slot.
+//! connection queue shares with allowed peers: a denied local process that
+//! keeps reconnecting can keep an allowed administrator's connection out
+//! of the backlog for as long as it does so (a blocking connect waits, a
+//! nonblocking one fails with `EAGAIN`). Once queued, an allowed
+//! connection is accepted in queue order within two passes (each takes up
+//! to `SLOTS`) and never loses a peer slot to a denied peer.
 //! Requests then act through the Host-bound `Administration` capability
 //! the owner issued, never through Host access.
 //!

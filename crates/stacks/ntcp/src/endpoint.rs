@@ -25,6 +25,11 @@ use crate::{
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
 };
 
+// A managed drain's provider of the complete IP header length of the path a
+// stateless reply with these addresses (and zone) leaves on now.
+pub(crate) type ReplyHeader<'a> =
+    Option<&'a mut dyn FnMut(IpMetadata, Option<ntcp_path::LinkId>) -> Option<u16>>;
+
 // Per-active-open parameters; endpoint allocation and protocol policy remain authoritative.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActiveOpenOptions {
@@ -432,7 +437,8 @@ pub struct Endpoint {
     deadlines: Deadlines,
     // Stateless replies: addresses, header, IPv4 options, timestamp echo and,
     // when a managed provider stated it at queueing, the complete IP header
-    // length (extensions included) of the IPv6 path the reply leaves on, and
+    // length (extensions included) of the IPv6 path the reply leaves on (a
+    // managed drain states it again for the path selected then), and
     // the arrival link of the input that caused it when one of its addresses
     // is IPv6 link-local (the only link the reply may leave on).
     #[allow(clippy::type_complexity)]
@@ -4549,7 +4555,7 @@ impl Endpoint {
         {
             return Err(Error::InvalidArgument.into());
         }
-        self.poll_reserved_selected(now, out, budget, Some(id), Some(payload))
+        self.poll_reserved_selected(now, out, budget, Some(id), Some(payload), None)
     }
 
     pub fn enable_output_reservations(&mut self) -> Result<(), EndpointError> {
@@ -4679,7 +4685,7 @@ impl Endpoint {
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         self.retained_slot(id)?;
-        self.poll_reserved_selected(now, out, budget, Some(id), None)
+        self.poll_reserved_selected(now, out, budget, Some(id), None, None)
     }
 
     pub fn poll_reserved_stateless_transmit(
@@ -4688,7 +4694,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
-        self.poll_reserved_selected(now, out, budget, None, None)
+        self.poll_reserved_selected(now, out, budget, None, None, None)
     }
 
     pub fn poll_reserved_transmit(
@@ -4696,6 +4702,16 @@ impl Endpoint {
         now: Instant,
         out: &mut [u8],
         budget: usize,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        self.poll_reserved_any(now, out, budget, None)
+    }
+
+    pub(crate) fn poll_reserved_any(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        budget: usize,
+        mut reply: ReplyHeader<'_>,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
@@ -4730,7 +4746,8 @@ impl Endpoint {
                 self.cleanup_one();
                 continue;
             }
-            let result = self.poll_reserved_selected(now, out, 1, owner, None)?;
+            let resize = reply.as_mut().map(|f| &mut **f as _);
+            let result = self.poll_reserved_selected(now, out, 1, owner, None, resize)?;
             if let Some(id) = owner {
                 // Repairs share the ready queue rather than monopolizing its head.
                 if self.is_output_reserved(id) {
@@ -4752,13 +4769,14 @@ impl Endpoint {
     }
 
     // Select exactly one owner; None is the independent stateless lane.
-    fn poll_reserved_selected(
+    pub(crate) fn poll_reserved_selected(
         &mut self,
         now: Instant,
         out: &mut [u8],
         budget: usize,
         selected: Option<ConnectionId>,
         mut shared: Option<&mut Vec<crate::Payload>>,
+        reply: ReplyHeader<'_>,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
@@ -4863,6 +4881,7 @@ impl Endpoint {
             Some(selected),
             gso,
             shared.as_deref_mut(),
+            reply,
         );
         self.reservations[index].payload = payload;
         let (output, mut zone) = output?;
@@ -5273,7 +5292,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<PollTransmit, EndpointError> {
-        self.poll_transmit_inner(now, out, budget, false, None, None, None)
+        self.poll_transmit_inner(now, out, budget, false, None, None, None, None)
             .map(|(output, _)| output)
     }
 
@@ -5288,6 +5307,7 @@ impl Endpoint {
         selected: Option<Option<ConnectionId>>,
         mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
         mut shared: Option<&mut Vec<crate::Payload>>,
+        mut reply: ReplyHeader<'_>,
     ) -> Result<(PollTransmit, Option<ntcp_path::LinkId>), EndpointError> {
         self.clock(now)?;
         for _ in 0..budget {
@@ -5308,8 +5328,17 @@ impl Endpoint {
                 && selected.is_none_or(|owner| owner.is_none())
                 && (self.control_turn || next.is_none() || selected == Some(None))
             {
-                let (ip, header, ipv4_options, mut echo, path_header, zone) =
+                let (ip, header, ipv4_options, mut echo, mut path_header, zone) =
                     *self.control.front().unwrap();
+                // A managed drain sizes an IPv6 reply with the header of the
+                // path its provider selects for it now: routes replaced since
+                // queueing must neither refuse a reply that fits nor shrink
+                // one that no longer does.
+                if ip.destination.is_ipv6()
+                    && let Some(resize) = reply.as_mut()
+                {
+                    path_header = resize(ip, zone);
+                }
                 if let Some(policy) = self.config.connection.pmtud {
                     let ip_len = match (ip.source, ip.destination) {
                         (IpAddr::V4(source), IpAddr::V4(destination)) => {

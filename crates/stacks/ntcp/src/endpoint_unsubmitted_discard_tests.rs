@@ -297,3 +297,118 @@ fn unrestorable_selection_is_released_as_unsent_output() {
     assert_eq!(b.readable_bytes(peer).unwrap(), 2000);
     assert_eq!(a.close_reason(id).unwrap(), None);
 }
+
+// A passive open's SYN-ACK whose next hop never resolved: withdrawn
+// without a departure, the child stays in SYN-RECEIVED, and the same
+// SYN-ACK is sent again no earlier than one RTO after the failure, not as
+// a retransmission; the handshake then completes.
+#[test]
+fn discarded_syn_ack_has_no_departure_and_retries_at_the_rto() {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    b.enable_output_reservations().unwrap();
+    let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+    a.connect(0, LOCAL.parse().unwrap(), REMOTE.parse().unwrap())
+        .unwrap();
+    let mut bytes = [0; 2048];
+    let syn = a.poll_transmit(0, &mut bytes, 16).unwrap().packet.unwrap();
+    b.input(1, syn.ip, &bytes[..syn.len]).unwrap();
+    let (out, token) = b.poll_reserved_transmit(1, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    let (iss, flags, _) = segment(p, &bytes);
+    assert_eq!(flags & (SYN | wire::ACK), SYN | wire::ACK);
+    let child = p.connection.expect("a SYN-RECEIVED child");
+    let rto = b.transport_info(child).unwrap().rto_us;
+    let failed = 3_000_001;
+    assert!(
+        b.discard_unsubmitted(
+            failed,
+            token.unwrap(),
+            Some(crate::NetworkError::SoftUnreachable)
+        )
+        .unwrap()
+    );
+    assert!(!b.is_output_reserved(child));
+    let info = b.transport_info(child).unwrap();
+    assert_eq!(info.state, State::SynReceived);
+    assert_eq!(
+        (info.retransmitted, info.rto_backoff, info.rto_us),
+        (0, 0, rto)
+    );
+    assert!(b.next_deadline().is_some_and(|at| at >= failed + rto));
+    b.on_timeout(failed + rto - 1, 16).unwrap();
+    let (out, token) = b
+        .poll_reserved_transmit(failed + rto - 1, &mut bytes, 16)
+        .unwrap();
+    assert!(out.packet.is_none() && token.is_none());
+    let retry = failed + rto;
+    b.on_timeout(retry, 16).unwrap();
+    let (out, token) = b.poll_reserved_transmit(retry, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    assert_eq!(segment(p, &bytes).0, iss);
+    assert!(b.accept_transmit(retry, token.unwrap()).unwrap());
+    assert_eq!(b.transport_info(child).unwrap().retransmitted, 0);
+    a.input(retry + 1, p.ip, &bytes[..p.len]).unwrap();
+    let ack = a
+        .poll_transmit(retry + 1, &mut bytes, 16)
+        .unwrap()
+        .packet
+        .unwrap();
+    b.input(retry + 2, ack.ip, &bytes[..ack.len]).unwrap();
+    assert_eq!(b.accept(listener).unwrap(), child);
+    assert_eq!(b.state(child).unwrap(), State::Established);
+}
+
+// A retransmission whose next hop never resolved is no retransmission:
+// withdrawing it leaves the retransmission count and backoff as the
+// timeout left them, nothing is aborted, and the same range is sent again
+// no earlier than one RTO after the failure.
+#[test]
+fn discarded_retransmission_counts_no_retransmission() {
+    let (mut a, mut b, id, peer) = established();
+    let mut bytes = [0; 2048];
+    a.write(id, &[5; 600]).unwrap();
+    let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+    let (start, _, len) = segment(out.packet.unwrap(), &bytes);
+    assert_eq!(len, 600);
+    assert!(a.accept_transmit(2, token.unwrap()).unwrap());
+    // The segment is lost; its RTO expires.
+    let expiry = a.next_deadline().unwrap();
+    a.on_timeout(expiry, 16).unwrap();
+    let timed_out = a.transport_info(id).unwrap();
+    let (out, token) = a.poll_reserved_transmit(expiry, &mut bytes, 16).unwrap();
+    assert_eq!(segment(out.packet.unwrap(), &bytes).0, start);
+    let failed = expiry + 3_000_000;
+    assert!(
+        a.discard_unsubmitted(
+            failed,
+            token.unwrap(),
+            Some(crate::NetworkError::SoftUnreachable)
+        )
+        .unwrap()
+    );
+    assert!(!a.is_output_reserved(id));
+    assert!(soft_error(&mut a, id));
+    let info = a.transport_info(id).unwrap();
+    assert_eq!(
+        (info.retransmitted, info.rto_backoff),
+        (timed_out.retransmitted, timed_out.rto_backoff)
+    );
+    assert_eq!(a.close_reason(id).unwrap(), None);
+    let rto = info.rto_us;
+    let mut now = failed;
+    let (p, token) = loop {
+        a.on_timeout(now, 16).unwrap();
+        let (out, token) = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap();
+        if let Some(p) = out.packet {
+            break (p, token.unwrap());
+        }
+        now = a.next_deadline().unwrap().max(now + 1);
+        assert!(now < failed + 10 * rto);
+    };
+    assert!(now >= failed + rto, "{now}");
+    assert_eq!(segment(p, &bytes).0, start);
+    assert!(a.accept_transmit(now, token).unwrap());
+    b.input(now, p.ip, &bytes[..p.len]).unwrap();
+    assert_eq!(b.readable_bytes(peer).unwrap(), 600);
+}

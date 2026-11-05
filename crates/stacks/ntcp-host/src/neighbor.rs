@@ -366,26 +366,6 @@ impl<T: Copy + PartialEq> Neighbors<T> {
         }
     }
 
-    // Replace BaseReachableTime (RFC 4861 section 6.3.2 recomputes
-    // ReachableTime whenever it changes). Nothing changes on failure.
-    pub(crate) fn set_base_reachable(
-        &mut self,
-        link: LinkId,
-        base_ms: u64,
-        entropy: Option<&mut Entropy>,
-    ) -> Result<(), Error> {
-        let base = self.units(base_ms);
-        let interface = self
-            .interfaces
-            .iter_mut()
-            .flatten()
-            .find(|i| i.link == link)
-            .ok_or(Error::InvalidContext)?;
-        interface.reachable = reachable_time(base, entropy)?;
-        interface.base_reachable = base;
-        Ok(())
-    }
-
     pub(crate) fn state(
         &self,
         link: LinkId,
@@ -523,38 +503,37 @@ impl<T: Copy + PartialEq> Neighbors<T> {
         events: &mut impl FnMut(NdEvent),
     ) -> Result<(), Error> {
         self.port(link).ok_or(Error::InvalidContext)?;
-        let own = self.address(link, ns.target);
-        if let Some(slot) = own {
-            let a = self.addresses[slot].unwrap();
-            if !matches!(a.dad, Dad::Done(_)) {
-                // A tentative target: a resolution solicitation is ignored;
-                // another node's DAD probe for it fails DAD, unless it is
-                // one of this port's own probes looped back.
-                if source.is_unspecified() {
-                    if a.looped > 0 {
-                        let mut a = a;
-                        a.looped -= 1;
-                        self.addresses[slot] = Some(a);
-                    } else {
-                        self.dad_failed(slot, events);
-                    }
+        // A solicitation for a target that is not an address of this port
+        // is discarded before any cache update (RFC 4861 section 7.2.3):
+        // it may reach this node through all-nodes or a solicited-node
+        // group it shares with the real target.
+        let Some(slot) = self.address(link, ns.target) else {
+            return Ok(());
+        };
+        let a = self.addresses[slot].unwrap();
+        if !matches!(a.dad, Dad::Done(_)) {
+            // A tentative target: a resolution solicitation is ignored;
+            // another node's DAD probe for it fails DAD, unless it is
+            // one of this port's own probes looped back.
+            if source.is_unspecified() {
+                if a.looped > 0 {
+                    let mut a = a;
+                    a.looped -= 1;
+                    self.addresses[slot] = Some(a);
+                } else {
+                    self.dad_failed(slot, events);
                 }
-                return Ok(());
             }
+            return Ok(());
+        }
+        // A duplicate address is not assigned to the interface either.
+        if !matches!(a.dad, Dad::Done(AddressState::Assigned)) {
+            return Ok(());
         }
         if !source.is_unspecified()
             && let Some(mac) = ns.source_link_layer
         {
             self.learn(link, source, mac, now);
-        }
-        let Some(slot) = own else {
-            return Ok(());
-        };
-        if !matches!(
-            self.addresses[slot].unwrap().dad,
-            Dad::Done(AddressState::Assigned)
-        ) {
-            return Ok(());
         }
         // An unspecified source is answered to all-nodes; a unicast one at
         // its stated or cached link-layer address. Without either there is
@@ -923,14 +902,19 @@ impl<T: Copy + PartialEq> Neighbors<T> {
 
     // Control output.
 
-    // The next control message due at `now`: answers first, then DAD and
-    // neighbor solicitations. Polling changes nothing; `complete` applies
-    // the backend's outcome (see ControlOutcome), so a solicitation never
-    // known to be unsent is spaced by RetransTimer and blocked data never
-    // holds control output back.
-    pub(crate) fn next_control(&self, now: Instant) -> Option<(Control, ControlToken)> {
+    // The next control message for `link` due at `now`: answers first,
+    // then DAD and neighbor solicitations. Polling changes nothing;
+    // `complete` applies the backend's outcome (see ControlOutcome), so a
+    // solicitation never known to be unsent is spaced by RetransTimer,
+    // blocked data never holds control output back, and neither does
+    // another port's blocked transmit path.
+    pub(crate) fn next_control(
+        &self,
+        link: LinkId,
+        now: Instant,
+    ) -> Option<(Control, ControlToken)> {
         for (slot, a) in self.answers.iter().enumerate() {
-            if let Some(a) = a {
+            if let Some(a) = a.filter(|a| a.link == link) {
                 let control = Control::Advertise {
                     link: a.link,
                     target: a.target,
@@ -940,7 +924,9 @@ impl<T: Copy + PartialEq> Neighbors<T> {
             }
         }
         for (slot, a) in self.addresses.iter().enumerate() {
-            let Some(a) = a else { continue };
+            let Some(a) = a.filter(|a| a.link == link) else {
+                continue;
+            };
             let Dad::Probing { sent, deadline } = a.dad else {
                 continue;
             };
@@ -963,7 +949,9 @@ impl<T: Copy + PartialEq> Neighbors<T> {
             }
         }
         for (slot, e) in self.entries.iter().enumerate() {
-            let Some(e) = e else { continue };
+            let Some(e) = e.filter(|e| e.link == link) else {
+                continue;
+            };
             let (limit, destination) = match (e.state, e.mac) {
                 (NeighborState::Incomplete, _) => (MAX_MULTICAST_SOLICIT, Destination::Multicast),
                 (NeighborState::Probe, Some(mac)) => {

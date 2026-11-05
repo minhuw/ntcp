@@ -21,6 +21,7 @@ import admin
 import icmp
 import mss
 import options
+import scoped
 import srh
 from linux_peer import fnv, pattern
 
@@ -248,6 +249,14 @@ def srh_child(case, proof):
                                          commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
 
 
+def scoped_child(case, proof):
+    evidence = scoped.child(case, proof, dict(native=BINARY, tun_echo=TUN_ECHO), Peer, command)
+    emit("T18_SCOPED_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                                 kernel_version=os.uname().version, evidence=evidence,
+                                 build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                            commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
 def admin_child(case, proof):
     run_case = dict(refuse=admin.refuse_child, reenable=admin.reenable_child).get(case["scenario"], admin.child)
     evidence = run_case(case, proof, TUN_ECHO, PATHCTL, Peer, command, emit)
@@ -389,6 +398,8 @@ def child(case):
         return mss_child(case, proof)
     if case.get("kind") == "srh":
         return srh_child(case, proof)
+    if case.get("kind") == "scoped":
+        return scoped_child(case, proof)
     family, role, policy, scenario = (case[k] for k in ("family", "role", "policy", "scenario"))
     kernel, native = ("198.18.0.1", "198.18.0.2") if family == 4 else ("fd54:3500::1", "fd54:3500::2")
     settings = setup(family, kernel, native)
@@ -594,11 +605,12 @@ def main():
     option_cases = options.cases()
     mss_cases = mss.cases()
     srh_cases = srh.cases()
+    scoped_cases = scoped.cases()
     emit("T5_NETWORK_BUILD", dict(schema_version=1, command=build, commit=commit,
                                   source_sha256=source, binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
                                   icmp_command=echo_build, icmp_cases=icmp_cases,
                                   admin_command=pathctl_build, admin_cases=admin_cases, option_cases=option_cases,
-                                  mss_cases=mss_cases, srh_cases=srh_cases,
+                                  mss_cases=mss_cases, srh_cases=srh_cases, scoped_cases=scoped_cases,
                                   pathctl_sha256=hashlib.sha256(PATHCTL.read_bytes()).hexdigest(),
                                   tun_echo_sha256=hashlib.sha256(TUN_ECHO.read_bytes()).hexdigest(),
                                   ptb_stage_sha256=hashlib.sha256(STAGED.read_bytes()).hexdigest(),
@@ -609,7 +621,9 @@ def main():
                                   applicability=dict(partial_syn="Native server 128-byte receive admission, then public SO_RCVBUF growth after prefix read",
                                                      linux_partial="No manufactured Linux partial ACK; Linux listener buffer minimum does not produce the selected small-SYN partial case",
                                                      linux_stale="Actual TCP_FASTOPEN_KEY revocation, not clock-lease expiration",
-                                                     later_host_capabilities="No host path service or Neighbor Discovery proxy in T5"), declared_cases=cases))
+                                                     later_host_capabilities="No host path service or Neighbor Discovery proxy in T5",
+                                                     scoped_ptb="Two directly connected link-local peers have no router to send a Packet Too Big: the two-link case's PTB is harness-injected and labelled so"),
+                                  declared_cases=cases))
     completed = 0
     stream_count = 0
     refusal_count = 0
@@ -619,7 +633,9 @@ def main():
     option_completed = 0
     mss_completed = 0
     srh_completed = 0
-    for case in icmp_cases + admin_cases + option_cases + mss_cases + srh_cases + cases:
+    scoped_completed = 0
+    injected_ptbs = []
+    for case in icmp_cases + admin_cases + option_cases + mss_cases + srh_cases + scoped_cases + cases:
         assert time.monotonic() - started < 1740, "30 minute total gate budget"
         fds = [os.open("/proc/self/ns/" + kind, os.O_RDONLY) for kind in ("net", "user")]
         try:
@@ -652,7 +668,8 @@ def main():
             tag = ("T9_ICMP_CASE " if case in icmp_cases else "T12_ADMIN_CASE " if case in admin_cases
                    else "T14_OPTIONS_CASE " if case in option_cases
                    else "T16_MSS_CASE " if case in mss_cases
-                   else "T17_SRH_CASE " if case in srh_cases else "T5_NETWORK_CASE ")
+                   else "T17_SRH_CASE " if case in srh_cases
+                   else "T18_SCOPED_CASE " if case in scoped_cases else "T5_NETWORK_CASE ")
             summaries = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(tag)]
             assert len(summaries) == 1 and summaries[0]["case"] == case, "missing case summary"
             summary = summaries[0]
@@ -676,6 +693,15 @@ def main():
                 namespace_ids.append(summary["namespace"])
                 srh_completed += 1
                 continue
+            if case in scoped_cases:
+                namespace_ids.append(summary["namespace"])
+                ptb = summary["evidence"].get("ptb")
+                if ptb:
+                    assert ptb["origin"] == "harness-injected", ptb
+                    injected_ptbs.append(dict(case=case, origin=ptb["origin"], link=ptb["link"], mtu=ptb["mtu"],
+                                              link_a_after=ptb["link_a_after"], link_b=ptb["link_b"]))
+                scoped_completed += 1
+                continue
             stream_count += summary["streams"]
             refusal_count += summary["completions"] - summary["streams"]
             namespace_ids.append(summary["namespace"])
@@ -689,10 +715,12 @@ def main():
     assert option_completed == len(option_cases) == 5
     assert mss_completed == len(mss_cases) == 4
     assert srh_completed == len(srh_cases) == 2
+    assert scoped_completed == len(scoped_cases) == 2 and len(injected_ptbs) == 1
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
                                     icmp_cases=icmp_completed, admin_cases=admin_completed,
                                     option_cases=option_completed, mss_cases=mss_completed,
-                                    srh_cases=srh_completed, namespaces=namespace_ids, kernel=os.uname().release,
+                                    srh_cases=srh_completed, scoped_cases=scoped_completed,
+                                    injected_ptbs=injected_ptbs, namespaces=namespace_ids, kernel=os.uname().release,
                                     stream_sha256={name: hashlib.sha256(pattern(n, salt)).hexdigest()
                                                    for name, n, salt in (("request", 8192, 7), ("response", 6144, 11),
                                                                          ("second_request", 3072, 19), ("second_response", 1024, 23))},

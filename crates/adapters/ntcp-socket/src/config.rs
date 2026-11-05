@@ -261,7 +261,6 @@ impl SocketConfig {
                 self.io.address,
                 self.io.prefix,
                 self.io.next_hop_mac,
-                true,
             )
             || !valid_resolution(
                 self.io.backend,
@@ -361,7 +360,6 @@ impl SocketConfig {
                     port.address,
                     port.prefix,
                     port.next_hop_mac,
-                    true,
                 )
                 || port.address.is_ipv4() != self.io.address.is_ipv4()
                 || port.interface == self.io.interface
@@ -707,14 +705,13 @@ fn valid_name(name: &str) -> bool {
 
 // The interface, address, prefix and fixed next hop of one port, as the
 // `io.*` keys have always been validated. An AF_PACKET port without a fixed
-// next hop resolves its next hops where `resolves` permits it.
+// next hop resolves its next hops (`valid_resolution`).
 fn valid_port(
     backend: Backend,
     interface: &str,
     address: IpAddr,
     prefix: Option<u8>,
     next_hop_mac: Option<[u8; 6]>,
-    resolves: bool,
 ) -> bool {
     !interface.is_empty()
         && interface.len() < libc::IFNAMSIZ
@@ -733,7 +730,7 @@ fn valid_port(
         && match (backend, next_hop_mac) {
             (Backend::Tun, None) => true,
             (Backend::AfPacket, Some(mac)) => mac != [0; 6] && mac[0] & 1 == 0,
-            (Backend::AfPacket, None) => resolves,
+            (Backend::AfPacket, None) => true,
             _ => false,
         }
 }
@@ -755,7 +752,10 @@ fn valid_resolution(
     // hole. Static neighbors serve only an IPv4 port that resolves
     // its next hops (an IPv6 one uses Neighbor Discovery).
     let resolves = backend == Backend::AfPacket && next_hop_mac.is_none();
-    if (!gateways.is_empty() && !resolves)
+    // A resolving port owns its address on its configured subnet, which
+    // is its on-link route; the kernel's addresses never stand in for it.
+    if (resolves && prefix.is_none())
+        || (!gateways.is_empty() && !resolves)
         || (!neighbors.is_empty() && !(resolves && own.is_ipv4()))
     {
         return false;

@@ -1100,6 +1100,37 @@ mod tests {
         }
     }
 
+    // A link-local address pair on one link and the same pair on another
+    // (or unscoped) are different peers: neither the cookie, the MSS
+    // observation nor the negative entry of one is visible to the other.
+    #[test]
+    fn client_cache_entries_are_scoped_by_zone() {
+        let local = "fe80::1".parse().unwrap();
+        let remote: IpAddr = "fe80::2".parse().unwrap();
+        let service = SocketAddr::new(remote, 80);
+        let [first, second, recycled] = crate::fast_open_policy_tests::zones();
+        let cookie = FastOpenCookie::new(&[5; 8]).unwrap();
+        let mut cache = FastOpen::new().unwrap();
+        cache.update_mss(1, local, remote, Some(first), 940);
+        cache.learn_in(2, local, remote, Some(second), cookie, None);
+        cache.fail(3, local, service, Some(first));
+        assert_eq!(
+            cache.peer_mss(3, 100, local, remote, Some(first)),
+            Some(940)
+        );
+        assert!(cache.get_in(3, 100, local, remote, Some(first)).is_none());
+        for zone in [Some(second), Some(recycled), None] {
+            assert_eq!(cache.peer_mss(3, 100, local, remote, zone), None);
+            assert!(!cache.suppressed(3, 100, local, service, zone));
+        }
+        let entry = cache.get_in(3, 100, local, remote, Some(second)).unwrap();
+        assert_eq!((entry.cookie, entry.mss), (cookie, None));
+        assert!(cache.suppressed(3, 100, local, service, Some(first)));
+        for zone in [Some(first), Some(recycled), None] {
+            assert!(cache.get_in(3, 100, local, remote, zone).is_none());
+        }
+    }
+
     #[test]
     fn cookie_only_learning_preserves_absent_or_aging_advertised_mss() {
         let local = "2001:db8::1".parse().unwrap();

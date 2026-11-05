@@ -53,7 +53,10 @@ mod admin;
 pub use admin::{AdminCandidate, AdminClient, Administration, AffectedPath, ClientReport};
 mod neighbor;
 use neighbor::Neighbors;
-pub use neighbor::{AddressState, NdPort, NeighborLimits, NeighborState};
+pub use neighbor::{AddressState, NdPort, NeighborLimits};
+// Neighbor cache inspection for the tests of embeddings (`Host::neighbor`).
+#[cfg(any(test, feature = "test-support"))]
+pub use neighbor::NeighborState;
 mod redirect;
 pub use redirect::{RedirectOutcome, RedirectRejection};
 mod discovery;
@@ -448,7 +451,7 @@ pub enum IcmpOutcome {
     /// by the Echo adjunct.
     Probe(ProbeOutcome),
     /// An IPv4 Redirect. (An ICMPv6 Redirect is Neighbor Discovery,
-    /// consumed by `receive` on an ND-capable port.)
+    /// consumed by `receive` on an ND-capable port: `Received::Redirect`.)
     Redirect(RedirectOutcome),
 }
 
@@ -578,6 +581,9 @@ pub struct Host {
     identifiers: Allocator,
     adjunct: Adjunct,
     neighbors: Neighbors<discovery::HeldOutput>,
+    // Addresses ND ingress found duplicate since the last
+    // `service_neighbors` report, which carries them to the owner.
+    unreported_duplicates: usize,
     entropy: Option<Entropy>,
     // Latest caller time seen by a submission or collection; only used to
     // skip burying history that has already expired.
@@ -659,6 +665,7 @@ impl Host {
                 path_limits.links,
                 timebase.units_per_second,
             )?,
+            unreported_duplicates: 0,
             entropy: None,
             now: 0,
             timebase,
@@ -1577,7 +1584,9 @@ impl Host {
                     Err(error) => Err(error),
                 }
             }
-            Ok(Received::Held | Received::Neighbor) => Ok(ntcp::InputDisposition::Processed),
+            Ok(Received::Held | Received::Neighbor | Received::Redirect(_)) => {
+                Ok(ntcp::InputDisposition::Processed)
+            }
             Ok(Received::Discarded) => Ok(ntcp::InputDisposition::Dropped),
             Err(error) => Err(error),
         };
@@ -1601,7 +1610,7 @@ impl Host {
             return Err(Error::Unsupported);
         }
         if packet.protocol == ntcp_ip::PROTOCOL_UDP && metadata.tcp_segment_size.is_none() {
-            return Ok(self.input_udp(endpoint, packet));
+            return Ok(self.input_udp(endpoint, context.link, packet));
         }
         if packet.protocol == 6 {
             // Bindings cover every Endpoint slot plus one provisional factory,
@@ -2336,7 +2345,7 @@ impl Host {
     /// frame and encode the header with `ntcp_ip6::encode_tcp_routed`
     /// (`EgressContext::binding` names the key).
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.1
-    //= reason=Host path budgets subtract the complete IPv6 header H of the selected path, the 40-octet base header plus, on an owner-configured Segment Routing route of n segments, its 8 + 16(n + 1)-octet Segment Routing Header (Host::header_plan, PathSnapshot::ip_header_len), from the largest IP packet that can be sent: TCP takes H before construction and admission for its MSS, T16's segment quantum and send space, PLPMTUD probes, exact-range repair and retransmission in scalar, shared, reserved and software GSO output, and an indivisible header that no longer fits fails admission. Host UDP flows report MMS_S as the path budget less H and limit Refuse and Probe payloads to EMTU_S - H - 8. When source fragmentation is selected (Host::udp_send_datagram's Fragment mode and the Host's Echo Replies, where a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) EMTU_S is the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and the Host creates fragments each limited by the connectionless effective size (never above the PMTU) that repeat the unfragmentable part (base header and Segment Routing Header) before the Fragment header; Refuse and Probe modes and TCP keep EMTU_S at the PMTU (TCP never source-fragments). Host::reassembly_capacity states this Host's own EMTU_R and MMS_R, and every managed TCP factory advertises the MSS Host::receive_ip_capability derives from EMTU_R, the largest IPv6 link and the wire limit independently of the send PMTU (T16, 1191-024). Host segment_routes tests (TCP, UDP Refuse/Probe/Fragment, Echo and ICMP errors with exact chains and checksums over the final destination), the native and tun_echo placement tests and the integration/rfc_host srh cases (TCP progress through a Linux SRv6 endpoint in both embeddings, with a transit router's PTB repaired) verify it.
+    //= reason=Host path budgets subtract the complete IPv6 header H of the selected path, the 40-octet base header plus, on an owner-configured Segment Routing route of n segments, its 8 + 16(n + 1)-octet Segment Routing Header (Host::header_plan, PathSnapshot::ip_header_len), from the largest IP packet that can be sent: TCP takes H before construction and admission for its MSS, T16's segment quantum and send space, PLPMTUD probes, exact-range repair and retransmission in scalar, shared, reserved and software GSO output, and an indivisible header that no longer fits fails admission. Host UDP flows report MMS_S as the path budget less H and limit Refuse and Probe payloads to EMTU_S - H - 8. When source fragmentation is selected (Host::udp_send_datagram's Fragment mode and the Host's Echo Replies, where a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) EMTU_S is the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and the Host creates fragments each limited by the connectionless effective size (never above the PMTU) that repeat the unfragmentable part (base header and Segment Routing Header) before the Fragment header; Refuse and Probe modes and TCP keep EMTU_S at the PMTU (TCP never source-fragments). Host::reassembly_capacity states this Host's own EMTU_R and MMS_R, and every managed TCP factory advertises the MSS Host::receive_ip_capability derives from EMTU_R, the largest IPv6 link and the wire limit independently of the send PMTU (T16, 1191-024). Host segment_routes tests (TCP, UDP Refuse/Probe/Fragment, Echo and ICMP errors with exact chains and checksums over the final destination), the native and tun_echo placement tests and the integration/rfc_host srh cases verify it, per embedding: tun_echo's transit-ptb case repairs a transit router's real Packet Too Big quoting its submitted SRH packets and makes TCP progress through a Linux SRv6 endpoint, and the native runtime's endpoint case makes TCP progress through Linux's own SR endpoint processing to the final destination.
     //# MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see "Fragment Header", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.
     pub fn header_plan(&self, key: path::PathKey) -> Result<HeaderPlan<'_>, Error> {
         let segments = self.paths.route_segments(key.route())?;
@@ -2860,6 +2869,9 @@ impl PathProvider for Host {
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
     //= reason=Managed factories acquire per-host records from configured network/default routes before TCP construction, initializing unlearned budgets from the physical first hop. Trusted decreases change only per-host learned estimates, preserving forwarding routes and independent first-hop facts. Dual-family two-Endpoint tests exercise both route selections, first SYN/hidden child and later decreases without forwarding-route mutation. Generic ICMP publication remains the separate 1191-057 obligation.
     //# When the first packet is sent to a host for which no per-host route exists, a route is chosen either from the set of per-network routes, or from the set of default routes. The PMTU fields in these route entries should be initialized to be the MTU of the associated first-hop data link, and must never be changed by the PMTU Discovery process. (PMTU Discovery only creates or changes entries for per-host routes). Until a Datagram Too Big message is received, the PMTU associated with the initially-chosen route is presumed to be accurate.
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+    //= reason=Each IPv6 link keeps its own Path MTU information. PathService keys learned estimates by context, source, destination with its zone, routing DSCP, link, next hop and route generation, and a link-local destination carries an authoritative LinkId zone (context, slot, generation) with which Host::prepare selects and acquires the path on exactly that link before TCP construction. T18 carries this scoped tuple through Endpoint and Host factories, listeners (an exact address and zone beats the wildcard; wildcard children carry the arrival link), TIME-WAIT, digests, Fast Open and MSS caches, Host UDP flows and zone-constrained ICMP correlation; the native runtime resolves sin6_scope_id through its interface-index-to-live-link map over a bounded collection of configured ports, each with its own link, addresses and routes, and IPv6 Ethernet ports resolve next hops by bounded host Neighbor Discovery. Host tests (ntcp-host src/tests/scoped.rs) keep identical link-local pairs on two links as separate connections and UDP flows, and a PTB correlated with one link's submission lowers only that link's estimate; the native two-port test neighbor_discovery_ports_keep_path_mtu_per_link probes each connection up to its own link MTU (1500 and 1400), and a checksummed PTB quoting a packet definitely submitted on one port lowers only that port's estimate and packet sizes while the other port's estimate and both first-hop MTUs stay unchanged; the integration/rfc_host scoped two-link case (one native runtime owning two veth links of MTU 1500 and 1400 to one Linux peer namespace, identical link-local pairs, captured DAD and NS/NA, hashed TCP streams on both links) shows a checksummed, harness-injected PTB quoting a captured packet on link A lowering only A's learned PMTU and packet sizes while link B keeps 1400-octet packets and both first-hop MTUs stay unchanged, and later connections start at their own link's value.
+    //# Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.
     fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Error> {
         if !self.attached {
             return Err(Error::InvalidContext);

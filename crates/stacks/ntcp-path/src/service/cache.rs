@@ -564,7 +564,7 @@ impl PathService {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
-    //= reason=T7 PathService maintains bounded per-host resolved routing records with independent learned estimates and exact first-hop authority. Every acquired active destination is pinned by its clients; capacity exhaustion preserves active records, and deterministic idle eviction uses fresh generations. Public tests exercise shared pinning, full-cache backpressure, idle reuse and repeated release cycles. ICMP Redirect processing remains a separate T9 producer obligation.
+    //= reason=T7 PathService maintains bounded per-host resolved routing records with independent learned estimates and exact first-hop authority. Every acquired active destination is pinned by its clients; capacity exhaustion preserves active records, and deterministic idle eviction uses fresh generations. Public tests exercise shared pinning, full-cache backpressure, idle reuse and repeated release cycles. Received ICMP Redirects become bounded destination overrides beneath the selected administrative route, not new owner routes (PathService::redirect, 1191-074).
     //# The obvious place to store this association is as a field in the routing table entries. A host will not have a route for every possible destination, but it should be able to cache a per-host route for every active destination. (This requirement is already imposed by the need to process ICMP Redirect messages.)
     pub fn acquire(&mut self, request: PathRequest) -> Result<(ClientId, PathSnapshot), Error> {
         self.acquire_via(request, request.destination)
@@ -712,7 +712,7 @@ impl PathService {
     /// it again. No packetization version equality, ACK, timer or TCP state is
     /// treated as network provenance here. No remote-address route creation.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
-    //= reason=T7 PathService keys learned estimates by canonical context, source, destination/scope, routing DSCP, link, next-hop and route generation, excluding ECN and ports. T8 Host binds actual native/TUN TCP owners to these records; public tests preserve source/destination/DSCP/scoped-link isolation. Generic validated ICMP publication remains T9.
+    //= reason=T7 PathService keys learned estimates by canonical context, source, destination/scope, routing DSCP, link, next-hop and route generation, excluding ECN and ports. T8 Host binds actual native/TUN TCP owners to these records; public tests preserve source/destination/DSCP/scoped-link isolation.
     //# In general, the IP layer should associate each PMTU value that it has learned with a specific path. A path is identified by a source address, a destination address and an IP type-of-service. (Some implementations do not record the source address of paths; this is acceptable for single-homed hosts, which have only one possible source address.)
     pub fn trusted_decrease(
         &mut self,

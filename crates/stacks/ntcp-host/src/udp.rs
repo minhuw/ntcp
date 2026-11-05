@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use ntcp::{AddressValidation, Endpoint, EndpointError, Instant, IpMetadata, NetworkError};
 use ntcp::{InputDisposition, PreparedPath};
-use ntcp_path::{Dscp, LinkId, PathStatus, ResolvedNextHop, ScopedAddress};
+use ntcp_path::{Dscp, LinkId, PathStatus, ResolvedNextHop};
 
 mod receipts;
 use receipts::Receipt;
@@ -208,6 +208,10 @@ impl From<Error> for UdpSendError {
 struct Flow {
     local: SocketAddr,
     remote: Option<SocketAddr>,
+    // The link scoping the flow's IPv6 link-local addresses (D1): Some
+    // exactly when its local address, or a fixed remote, is link-local.
+    // Sources, paths and received datagrams are those of that link only.
+    zone: Option<LinkId>,
     options: UdpOptions,
     // Default send mode and stated peer capability (Refuse until set).
     send: UdpSend,
@@ -370,6 +374,28 @@ fn udp_limits(snapshot: ntcp_path::PathSnapshot, header: usize) -> Result<UdpPat
     })
 }
 
+fn link_local(address: IpAddr) -> bool {
+    matches!(address, IpAddr::V6(v) if v.is_unicast_link_local())
+}
+
+// The zone of the flow's datagrams to `remote`: its own, which is Some
+// exactly when its local address or `remote` is link-local.
+fn flow_zone(flow: Flow, remote: IpAddr) -> Option<LinkId> {
+    flow.zone.filter(|_| link_local(flow.local.ip()) || link_local(remote))
+}
+
+// Send admission of `remote` for the flow, in its zone: a link-local
+// remote is reachable only from a scoped flow, on the flow's link.
+fn admits_remote(endpoint: &Endpoint, flow: Flow, remote: IpAddr) -> bool {
+    endpoint.admits_scoped_datagram(
+        AddressValidation::Open {
+            local: flow.local.ip(),
+            remote,
+        },
+        flow_zone(flow, remote),
+    )
+}
+
 fn supported(address: SocketAddr) -> bool {
     !matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
 }
@@ -388,6 +414,25 @@ impl Host {
         remote: Option<SocketAddr>,
         options: UdpOptions,
     ) -> Result<UdpFlowId, Error> {
+        self.udp_open_scoped(endpoint, local, remote, None, options)
+    }
+
+    /// `udp_open` for a flow whose IPv6 link-local local address (or fixed
+    /// remote) is scoped to the link `zone`, present exactly when one of
+    /// them is link-local (as for a `ScopedTuple`). The flow's source, path
+    /// and ledger evidence are those of that link, it receives only
+    /// datagrams arriving on it, and the identical binding on another link
+    /// is a separate flow. A zone whose link was removed or replaced owns
+    /// no source: such an open, and every later send of a flow whose link
+    /// went away, is refused (`SourceNotOwned`).
+    pub fn udp_open_scoped(
+        &mut self,
+        endpoint: &Endpoint,
+        local: SocketAddr,
+        remote: Option<SocketAddr>,
+        zone: Option<LinkId>,
+        options: UdpOptions,
+    ) -> Result<UdpFlowId, Error> {
         self.check_endpoint(endpoint)?;
         let dscp = Dscp::new(options.dscp)?;
         if options.hop_limit == 0 {
@@ -397,23 +442,27 @@ impl Host {
             Some(remote) => {
                 remote.port() != 0
                     && supported(remote)
-                    && endpoint.admits_datagram(AddressValidation::Open {
-                        local: local.ip(),
-                        remote: remote.ip(),
-                    })
+                    && endpoint.admits_scoped_datagram(
+                        AddressValidation::Open {
+                            local: local.ip(),
+                            remote: remote.ip(),
+                        },
+                        zone,
+                    )
             }
-            None => endpoint.admits_datagram(AddressValidation::Bind { local: local.ip() }),
+            None => endpoint
+                .admits_scoped_datagram(AddressValidation::Bind { local: local.ip() }, zone),
         };
         if !admitted || local.port() == 0 || !supported(local) {
             return Err(EndpointError::InvalidAddress.into());
         }
-        self.source(local.ip(), None)?;
+        self.source(local.ip(), zone)?;
         if self
             .udp
             .slots
             .iter()
             .flat_map(|s| s.flow)
-            .any(|f| f.local == local && f.remote == remote)
+            .any(|f| f.local == local && f.remote == remote && f.zone == zone)
         {
             return Err(EndpointError::AddressInUse.into());
         }
@@ -426,8 +475,8 @@ impl Host {
         let generation = self.udp.generation.checked_add(1).ok_or(Error::Capacity)?;
         let path = match remote {
             Some(remote) => {
-                let request = self.request(local.ip(), remote.ip(), None, dscp)?;
-                let via = ScopedAddress::new(remote.ip(), None)?;
+                let request = self.request(local.ip(), remote.ip(), zone, dscp)?;
+                let via = crate::scoped(remote.ip(), zone)?;
                 let resolved = self.paths.resolve_via(request, via)?;
                 self.forwarding_resolved(resolved.key())?;
                 let (client, snapshot) = self.paths.acquire_via(request, via)?;
@@ -444,6 +493,7 @@ impl Host {
             flow: Some(Flow {
                 local,
                 remote,
+                zone,
                 options,
                 send: UdpSend::default(),
                 path,
@@ -509,10 +559,7 @@ impl Host {
         };
         if remote.port() == 0
             || !supported(remote)
-            || !endpoint.admits_datagram(AddressValidation::Open {
-                local: flow.local.ip(),
-                remote: remote.ip(),
-            })
+            || !admits_remote(endpoint, flow, remote.ip())
         {
             return Err(Error::from(EndpointError::InvalidAddress).into());
         }
@@ -711,9 +758,10 @@ impl Host {
             }
             _ => None,
         };
+        let zone = flow_zone(flow, remote);
         let request =
-            self.request(flow.local.ip(), remote, None, Dscp::new(flow.options.dscp)?)?;
-        let via = ScopedAddress::new(remote, None)?;
+            self.request(flow.local.ip(), remote, zone, Dscp::new(flow.options.dscp)?)?;
+        let via = crate::scoped(remote, zone)?;
         let current = match flow.path {
             Some(prepared) => {
                 let snapshot = self.paths.snapshot(prepared.client)?;
@@ -833,34 +881,44 @@ impl Host {
     // a connected flow's exact binding takes precedence over an unconnected
     // one. No matching flow, a full queue or an oversized payload drops the
     // datagram; this Host originates no ICMP Port Unreachable.
+    // A datagram with an IPv6 link-local address is scoped to its arrival
+    // `link` and reaches only a flow of that zone.
     pub(crate) fn input_udp(
         &mut self,
         endpoint: &Endpoint,
+        link: LinkId,
         packet: &IngressPacket,
     ) -> InputDisposition {
         let (source, destination) = (packet.ip.source, packet.ip.destination);
         let Ok(udp) = ntcp_ip_common::parse_udp(source, destination, packet.payload) else {
             return InputDisposition::Dropped;
         };
-        if !endpoint.admits_datagram(AddressValidation::Incoming {
-            source,
-            destination,
-        }) {
+        let zone = (link_local(source) || link_local(destination)).then_some(link);
+        if !endpoint.admits_scoped_datagram(
+            AddressValidation::Incoming {
+                source,
+                destination,
+            },
+            zone,
+        ) {
             return InputDisposition::Dropped;
         }
         let local = SocketAddr::new(destination, udp.destination_port);
         let remote = SocketAddr::new(source, udp.source_port);
         let slots = &self.udp.slots;
+        // An unconnected flow's zone scopes its link-local local address; a
+        // global one receives no link-local source it could not answer.
         let Some(slot) = slots
             .iter()
             .position(|s| {
-                s.flow
-                    .is_some_and(|f| f.local == local && f.remote == Some(remote))
+                s.flow.is_some_and(|f| {
+                    f.local == local && f.remote == Some(remote) && f.zone == zone
+                })
             })
             .or_else(|| {
                 slots.iter().position(|s| {
                     s.flow
-                        .is_some_and(|f| f.local == local && f.remote.is_none())
+                        .is_some_and(|f| f.local == local && f.remote.is_none() && f.zone == zone)
                 })
             })
         else {
@@ -1048,10 +1106,7 @@ impl Host {
         };
         if remote.port() == 0
             || !supported(remote)
-            || !endpoint.admits_datagram(AddressValidation::Open {
-                local: flow.local.ip(),
-                remote: remote.ip(),
-            })
+            || !admits_remote(endpoint, flow, remote.ip())
         {
             return Err(Error::from(EndpointError::InvalidAddress).into());
         }

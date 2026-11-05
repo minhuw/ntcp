@@ -10,12 +10,11 @@ use ntcp_icmp::{
 use ntcp_path::{InterfaceKey, LinkId, PathService, ScopedAddress};
 
 use crate::neighbor::{
-    AddressState, Control, ControlOutcome, ControlToken, Destination, NdEvent, NdPort,
-    NeighborState, Resolution,
+    AddressState, Control, ControlOutcome, ControlToken, Destination, NdEvent, NdPort, Resolution,
 };
 use crate::{
     Advice, BackendOutcome, EgressContext, Error, Forwarding, Host, IngressContext, Owner,
-    ReceiveCapabilities, ResolvedNextHop,
+    ReceiveCapabilities, Received, ResolvedNextHop,
 };
 use ntcp::TransmitAttempt;
 
@@ -48,7 +47,8 @@ pub struct NeighborTicket {
 pub struct NeighborReport {
     /// Addresses whose DAD completed, now published as sources.
     pub assigned: usize,
-    /// Addresses found duplicate, which stay unusable.
+    /// Addresses found duplicate since the previous pass (by received
+    /// solicitations or advertisements), which stay unusable.
     pub duplicates: usize,
     pub first_error: Option<Error>,
 }
@@ -178,37 +178,31 @@ impl Host {
         self.neighbors.address_state(link, address)
     }
 
-    /// The cache entry for `address` on `link`: its state, link-layer
-    /// address and IsRouter flag.
+    /// Inspection for tests of embeddings that serve ND ports: the cache
+    /// entry for `address` on `link`, its state, link-layer address and
+    /// IsRouter flag. Resolution itself is `resolve_neighbor`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn neighbor(
         &self,
         link: LinkId,
         address: Ipv6Addr,
-    ) -> Option<(NeighborState, Option<[u8; 6]>, bool)> {
+    ) -> Option<(crate::NeighborState, Option<[u8; 6]>, bool)> {
         self.neighbors.state(link, address)
     }
 
     /// Apply every Neighbor Discovery timer due at `now` (reachability,
     /// probing, resolution failure and DAD completion).
     pub fn service_neighbors(&mut self, now: Instant) -> NeighborReport {
-        let mut report = NeighborReport::default();
+        let mut report = NeighborReport {
+            duplicates: core::mem::take(&mut self.unreported_duplicates),
+            ..NeighborReport::default()
+        };
         let Self {
             neighbors, paths, ..
         } = self;
         neighbors.service(now, &mut |event| apply(paths, event, &mut report));
         self.settle_held_icmp(now);
         report
-    }
-
-    /// Replace `link`'s BaseReachableTime, drawing a new ReachableTime
-    /// (RFC 4861 section 6.3.2); nothing changes when entropy fails.
-    pub fn set_neighbor_base_reachable(
-        &mut self,
-        link: LinkId,
-        milliseconds: u32,
-    ) -> Result<(), Error> {
-        self.neighbors
-            .set_base_reachable(link, u64::from(milliseconds), self.entropy.as_mut())
     }
 
     /// The Ethernet next hop of `context`'s output attempt, held for
@@ -330,9 +324,9 @@ impl Host {
 
     // ND ingress on an ND-capable port, before ordinary destination
     // admission (a solicitation goes to a group, or to a tentative address
-    // this context does not yet own). None for anything that is not a
-    // Neighbor Solicitation, Advertisement or Redirect, which then takes
-    // the ordinary path. The Hop Limit is the arriving packet's; a message in a packet
+    // this context does not yet own): `Received::Neighbor`, or a Redirect's
+    // outcome. None for anything that is not a Neighbor Solicitation,
+    // Advertisement or Redirect, which then takes the ordinary path. The Hop Limit is the arriving packet's; a message in a packet
     // carrying a Fragment header, an atomic fragment included, is refused
     // (RFC 6980 section 5). A later fragment cannot be recognized here, and
     // its reassembly (to a unicast address this context owns) is refused
@@ -342,12 +336,12 @@ impl Host {
         context: IngressContext,
         now: Instant,
         frame: &[u8],
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<Received<'static>>, Error> {
         if self.neighbors.port(context.link).is_none() {
-            return Ok(false);
+            return Ok(None);
         }
         let Ok(packet) = ntcp_ip6::parse_fragment(frame) else {
-            return Ok(false);
+            return Ok(None);
         };
         let first = packet.fragment.is_none_or(|f| f.offset == 0);
         if packet.protocol != ICMPV6
@@ -357,7 +351,7 @@ impl Host {
                 Some(&(SOLICITATION | ADVERTISEMENT | REDIRECT))
             )
         {
-            return Ok(false);
+            return Ok(None);
         }
         if packet.fragment.is_some() {
             return Err(ntcp_ip::Error::FragmentationUnsupported.into());
@@ -372,8 +366,10 @@ impl Host {
         if packet.payload.first() == Some(&REDIRECT) {
             let redirect =
                 ntcp_icmp::decode_ipv6_redirect(packet.ip, packet.hop_limit, packet.payload)?;
-            self.redirect_ipv6(context, now, source, redirect)?;
-            return Ok(true);
+            let outcome = self.redirect_ipv6(context, now, source, redirect)?;
+            // Its Target Link-Layer Address may have resolved held output.
+            self.settle_held_icmp(now);
+            return Ok(Some(Received::Redirect(outcome)));
         }
         let message = decode_neighbor(packet.ip, packet.hop_limit, packet.payload)?;
         let mut report = NeighborReport::default();
@@ -392,8 +388,9 @@ impl Host {
                 neighbors.advertisement(context.link, na, now, entropy.as_mut(), &mut events)?;
             }
         }
+        self.unreported_duplicates = self.unreported_duplicates.saturating_add(report.duplicates);
         self.settle_held_icmp(now);
-        report.first_error.map_or(Ok(true), Err)
+        report.first_error.map_or(Ok(Some(Received::Neighbor)), Err)
     }
 
     // A destination ND accepts on `link`: an address configured there
@@ -405,18 +402,20 @@ impl Host {
             })
     }
 
-    /// Write the next due ND control packet (answers, DAD probes, then
+    /// Write `link`'s next due ND control packet (answers, DAD probes, then
     /// resolution and unreachability solicitations) into `out`. It is
-    /// independent of data output: blocked data never holds it back. A
+    /// independent of data output and of other ports: neither blocked data
+    /// nor another port's blocked transmit path holds it back. A
     /// solicitation counts, and its RetransTimer spacing starts, only once
     /// `complete_neighbor_output` reports it possibly or definitely
     /// submitted.
     pub fn neighbor_output(
         &mut self,
+        link: LinkId,
         now: Instant,
         out: &mut [u8],
     ) -> Result<Option<NeighborTransmit>, Error> {
-        let Some((control, token)) = self.neighbors.next_control(now) else {
+        let Some((control, token)) = self.neighbors.next_control(link, now) else {
             return Ok(None);
         };
         let (link, source, destination, mac, message) = match control {

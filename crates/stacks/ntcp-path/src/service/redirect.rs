@@ -89,7 +89,8 @@ impl PathService {
     /// authoritative selection (a stale route generation or link is
     /// refused), `sender` its current first hop, which is a router (a
     /// destination reached directly is never redirected), and `target` a
-    /// unicast address of the key's link other than this host's own. The
+    /// unicast address of the key's link other than this host's own there
+    /// (a link-local address is compared with its zone, RFC 4007). The
     /// caller validates the Redirect's evidence and family rules first. The
     /// paths it moves are invalidated and their clients dirty.
     pub fn redirect(
@@ -106,7 +107,7 @@ impl PathService {
             || target.address.is_ipv4() != destination.address.is_ipv4()
             || target.zone.is_some_and(|zone| zone != key.link)
             || target == sender
-            || self.sources().any(|(_, own)| own.address == target.address)
+            || self.sources().any(|(_, own)| own == target)
         {
             return Err(Error::InvalidArgument);
         }

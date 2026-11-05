@@ -1747,8 +1747,15 @@ mod linux {
                 // A frame waiting for an identifier is tried again first.
                 *pending = Some(frame);
             } else if pending.is_none() {
+                // A stateless reply is sized for the path the Host selects
+                // for it now, not when it was queued.
                 let (polled, attempt) =
-                    match endpoint.poll_reserved_transmit(time, &mut output[header_len..], 1) {
+                    match endpoint.poll_reserved_transmit_with_path_provider(
+                        time,
+                        &mut output[header_len..],
+                        1,
+                        &mut network.host,
+                    ) {
                         Ok(polled) => polled,
                         // Every reservation is held by a frame waiting for an
                         // identifier: nothing else can be selected now.
@@ -1982,12 +1989,15 @@ mod linux {
             config: &EndpointConfig,
             settings: &DatagramSettings,
         ) -> io::Result<Self> {
+            // A link-local service address is scoped to the TUN link: the
+            // flow receives and answers datagrams of that link only.
             let flow = network
                 .host
-                .udp_open(
+                .udp_open_scoped(
                     endpoint,
                     local,
                     None,
+                    zone(local.ip(), network.ingress.link()),
                     ntcp_host::UdpOptions {
                         dscp: config.dscp,
                         hop_limit: config.hop_limit,
@@ -2523,20 +2533,13 @@ mod linux {
         let listener = network
             .listen(&mut endpoint, SocketAddr::new(local, port), MAX_FLOWS)
             .map_err(engine)?;
-        // Host UDP flows bind unscoped sources only: a link-local local
-        // address serves TCP alone.
-        let mut udp = if zone(local, network.ingress.link()).is_some() {
-            eprintln!("UDP echo unavailable on the link-local {local}");
-            None
-        } else {
-            Some(UdpEcho::open(
-                &mut network,
-                &endpoint,
-                SocketAddr::new(local, port),
-                &config,
-                &settings,
-            )?)
-        };
+        let mut udp = UdpEcho::open(
+            &mut network,
+            &endpoint,
+            SocketAddr::new(local, port),
+            &config,
+            &settings,
+        )?;
         let mut flows = Vec::with_capacity(MAX_FLOWS);
         if let Some(peer) = peer {
             let id = network
@@ -2688,9 +2691,7 @@ mod linux {
                 );
                 undeliverable_reported = undeliverable;
             }
-            if let Some(udp) = &mut udp {
-                immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
-            }
+            immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
             immediate |= network.icmp_output(now(start), &mut icmp_output, &mut tun)?;
             network.host.collect(&endpoint).map_err(host_error)?;
             // Bounded control pass; the wait below is at most TICK_US, so
@@ -2732,7 +2733,7 @@ mod linux {
             wait(
                 &tun,
                 timeout_ms,
-                pending.as_ref().is_some_and(|held| !held.blocked) || udp.as_ref().is_some_and(|udp| udp.blocked),
+                pending.as_ref().is_some_and(|held| !held.blocked) || udp.blocked,
                 network.can_receive(),
             )?;
         }

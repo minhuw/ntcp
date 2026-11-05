@@ -505,3 +505,54 @@ fn quote_matching_only_a_widened_udp_summary_publishes_nothing() {
             datagrams -> {after:?}; next 1400-byte send {unchanged:?}");
     }
 }
+
+// A link-local service address is scoped to the TUN link (interface 9):
+// the echo flow is that link's, a peer flow scoped to its own TUN link
+// exchanges datagrams with it, and each reply leaves on the TUN link.
+#[test]
+fn udp_echo_serves_a_link_local_address_on_the_tun_link() {
+    let a: Ipv6Addr = "fe80::1".parse().unwrap();
+    let b: Ipv6Addr = "fe80::2".parse().unwrap();
+    let cfg = config(a.into());
+    let mut ae = Endpoint::new(cfg.clone(), [7; 32], 0, tun_v6_policy(a)).unwrap();
+    let mut be = Endpoint::new(cfg.clone(), [8; 32], 0, tun_v6_policy(b)).unwrap();
+    let settings = refuse_settings();
+    let mut ahost = TunHost::attach_routed(&mut ae, &cfg, a.into(), &settings, &[], 0, 9).unwrap();
+    let mut bhost = TunHost::attach_routed(&mut be, &cfg, b.into(), &settings, &[], 0, 9).unwrap();
+    let service = SocketAddr::new(a.into(), 7);
+    let mut echo = UdpEcho::open(&mut ahost, &ae, service, &cfg, &settings).unwrap();
+    // The link-local service is the TUN link's; unscoped it names none.
+    assert_eq!(
+        ahost.host.udp_open(&ae, SocketAddr::new(a.into(), 8), None, OPTIONS),
+        Err(ntcp_host::Error::Endpoint(EndpointError::InvalidAddress))
+    );
+    let client = bhost
+        .host
+        .udp_open_scoped(
+            &be,
+            SocketAddr::new(b.into(), 5000),
+            Some(service),
+            Some(bhost.ingress.link()),
+            OPTIONS,
+        )
+        .unwrap();
+    let mut backend = Backend::default();
+    for (time, payload) in [(1, &b"scoped request"[..]), (2, &b"second round"[..])] {
+        let request = udp_frame(&mut bhost, &be, time, client, payload);
+        let ip = ntcp_ip6::parse(&request).unwrap().ip;
+        assert_eq!((ip.source, ip.destination), (IpAddr::V6(b), IpAddr::V6(a)));
+        input_frame(&mut ahost, &mut ae, time, &request, a.into(), false, &mut Sample(0)).unwrap();
+        assert!(echo.drive(&mut ahost, &ae, time, &mut backend).unwrap());
+        let reply = backend.frames.pop().unwrap();
+        assert!(backend.frames.is_empty());
+        let ip = ntcp_ip6::parse(&reply).unwrap().ip;
+        assert_eq!((ip.source, ip.destination), (IpAddr::V6(a), IpAddr::V6(b)));
+        input_frame(&mut bhost, &mut be, time, &reply, b.into(), false, &mut Sample(0)).unwrap();
+        let mut bytes = [0; MTU];
+        assert_eq!(
+            bhost.host.udp_receive(client, &mut bytes).unwrap(),
+            Some((service, payload.len()))
+        );
+        assert_eq!(&bytes[..payload.len()], payload);
+    }
+}

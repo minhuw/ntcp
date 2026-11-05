@@ -236,8 +236,7 @@ pub struct EthernetPacketIo {
     pub local_mac: [u8; 6],
     /// The fixed next hop everything leaves through (the legacy forwarder
     /// mode), or None for a port that resolves each next hop (the `io.*`
-    /// port with the `io.gateway`/`io.neighbor` configuration, or a
-    /// `config.ports` entry with its own): by Neighbor Discovery
+    /// port with the `io.gateway`/`io.neighbor` configuration): by Neighbor Discovery
     /// for IPv6 (the embedding's link must deliver all-nodes and the
     /// address's solicited-node group), through its static neighbors for
     /// IPv4.
@@ -248,7 +247,7 @@ static PACKET_IO_FACTORY: Mutex<Option<PacketIoFactory>> = Mutex::new(None);
 
 /// Assign an explicitly owned address/subnet (`config.io.prefix` is required).
 /// The factory runs on the socket owner thread after lazy runtime startup.
-/// The one-port form of `configure_with_packet_ports`.
+/// It provides the `io.*` port only (`config.ports` must be empty).
 pub fn configure_with_packet_io(
     config: SocketConfig,
     factory: impl FnOnce() -> std::io::Result<EthernetPacketIo> + Send + 'static,
@@ -256,11 +255,11 @@ pub fn configure_with_packet_io(
     configure_with_packet_ports(config, move || factory().map(|io| vec![io]))
 }
 
-/// Userspace-owned ports: the factory returns the `io.*` port's backend
-/// first, then one for each `config.ports` entry in order, each with its
-/// explicitly assigned address and subnet (every prefix is required). The
-/// factory runs on the socket owner thread after lazy runtime startup.
-pub fn configure_with_packet_ports(
+// Userspace-owned ports: the factory returns the `io.*` port's backend
+// first, then one for each `config.ports` entry in order, each with its
+// explicitly assigned address and subnet (every prefix is required). The
+// factory runs on the socket owner thread after lazy runtime startup.
+fn configure_with_packet_ports(
     config: SocketConfig,
     factory: impl FnOnce() -> std::io::Result<Vec<EthernetPacketIo>> + Send + 'static,
 ) -> std::io::Result<()> {

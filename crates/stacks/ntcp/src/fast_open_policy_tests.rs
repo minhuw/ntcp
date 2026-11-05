@@ -1165,3 +1165,163 @@ fn scoped_cookies_are_domain_separated_and_unscoped_bytes_unchanged() {
         assert!(linux.valid_in(&[0; 32], local, remote, None, 0, raw));
     }
 }
+
+// The path authority of a managed endpoint owning fe80::1 on one link
+// (fe80::/64 on-link there).
+#[cfg(feature = "tfo-linux-cookie")]
+struct ScopedPaths(ntcp_path::PathService, ntcp_path::SourceId);
+
+#[cfg(feature = "tfo-linux-cookie")]
+impl ScopedPaths {
+    fn new() -> (Self, ntcp_path::LinkId) {
+        use ntcp_path::{ContextId, InterfaceKey, IpPrefix, Limits, NextHop, Route, ScopedAddress};
+        let mut service = ntcp_path::PathService::new(
+            ContextId::new(78),
+            Limits {
+                links: 1,
+                sources: 1,
+                source_owners: 1,
+                routes: 1,
+                paths: 4,
+                clients: 4,
+            },
+        )
+        .unwrap();
+        let link = service.register_link(InterfaceKey(1), 1500).unwrap();
+        let source = service
+            .register_source(ScopedAddress::new("fe80::1".parse().unwrap(), Some(link)).unwrap(), link)
+            .unwrap();
+        service
+            .add_route(Route {
+                destination: IpPrefix::new("fe80::".parse().unwrap(), 64).unwrap(),
+                source: None,
+                dscp: None,
+                link,
+                next_hop: NextHop::OnLink,
+                metric: 0,
+            })
+            .unwrap();
+        (Self(service, source), link)
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+impl PathProvider for ScopedPaths {
+    type Error = ntcp_path::Error;
+    fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Self::Error> {
+        let destination = ntcp_path::ScopedAddress::new(request.tuple.remote.ip(), request.zone)?;
+        let (client, snapshot) = self.0.acquire(ntcp_path::PathRequest {
+            source: self.1,
+            destination,
+            dscp: request.dscp,
+        })?;
+        Ok(PreparedFactory {
+            path: PreparedPath { client, snapshot },
+            receive: ReceiveIpCapability::new(self.0.context(), true, 1500).unwrap(),
+        })
+    }
+    fn commit(&mut self, _: PreparedPath, _: ConnectionId) {}
+    fn cancel(&mut self, prepared: PreparedPath) {
+        self.0.release(prepared.client).unwrap();
+    }
+}
+
+// A segment from fe80::2 arriving on `zone` for the managed endpoint.
+#[cfg(feature = "tfo-linux-cookie")]
+fn scoped_segment(
+    endpoint: &mut Endpoint,
+    paths: &mut ScopedPaths,
+    zone: ntcp_path::LinkId,
+    header: wire::Header,
+    cookie: Option<FastOpenCookie>,
+    payload: &[u8],
+) {
+    let ip = IpMetadata {
+        source: "fe80::2".parse().unwrap(),
+        destination: "fe80::1".parse().unwrap(),
+    };
+    let mut options = [1; 20];
+    let option_len = cookie.map_or(0, |cookie| {
+        let n = cookie.as_bytes().len();
+        options[..2].copy_from_slice(&[34, (n + 2) as u8]);
+        options[2..2 + n].copy_from_slice(cookie.as_bytes());
+        (n + 2).next_multiple_of(4)
+    });
+    let mut bytes = [0; 128];
+    let n = wire::encode(ip, header, &options[..option_len], payload, &mut bytes).unwrap();
+    endpoint
+        .input_with_path_provider(
+            0,
+            zone,
+            ip,
+            0,
+            Ipv4Options::default(),
+            &bytes[..n],
+            crate::RxPacketMetadata::default(),
+            0,
+            paths,
+        )
+        .unwrap();
+}
+
+// The raw Linux cookie encodes only the two addresses, which cannot tell
+// one link's fe80::2 from another's: a Linux-cookie listener answers a
+// scoped peer's cookie request without a cookie and ignores an offered raw
+// cookie, and the connection completes as ordinary TCP. The same request
+// under the HMAC policy, which authenticates the zone, is issued one.
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn linux_cookie_listener_serves_scoped_peers_as_ordinary_tcp() {
+    let local: SocketAddr = "[fe80::1]:8080".parse().unwrap();
+    let linux = LinuxSipHash24Key::new([3; 16]);
+    let raw = FastOpenCookiePolicy::LinuxSipHash24(linux.clone())
+        .issue(&[0; 32], local.ip(), "fe80::2".parse().unwrap(), 0)
+        .unwrap();
+    let syn = |port| wire::Header {
+        source_port: port,
+        destination_port: 8080,
+        sequence: 100,
+        acknowledgment: 0,
+        flags: wire::SYN,
+        window: 8192,
+        urgent_pointer: 0,
+    };
+    for (policy, issued) in [
+        (FastOpenCookiePolicy::LinuxSipHash24(linux.clone()), false),
+        (FastOpenCookiePolicy::HmacSha256, true),
+    ] {
+        let (mut paths, zone) = ScopedPaths::new();
+        let mut endpoint = endpoint();
+        endpoint.enable_managed_paths(zone.context()).unwrap();
+        endpoint.enable_fast_open().unwrap();
+        endpoint.set_fast_open_cookie_policy(policy);
+        let listener = endpoint.listen_scoped(local, Some(zone), 4).unwrap();
+        endpoint.set_listener_fast_open(listener, 4).unwrap();
+        scoped_segment(&mut endpoint, &mut paths, zone, syn(40000), Some(FastOpenCookie::request()), b"");
+        let (_, cookie, ack) = response(&mut endpoint);
+        assert_eq!(cookie.is_some(), issued);
+        assert_eq!(ack, 101);
+        if issued {
+            continue;
+        }
+        // An offered raw cookie authorizes no early data: only the SYN is
+        // acknowledged, and the handshake completes without it.
+        scoped_segment(&mut endpoint, &mut paths, zone, syn(40001), Some(raw), b"early");
+        let mut bytes = [0; 2048];
+        let tx = endpoint.poll_transmit(0, &mut bytes, 64).unwrap().packet.unwrap();
+        let reply = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+        assert_eq!(reply.options.fast_open, None);
+        assert_eq!(reply.header.acknowledgment, 101);
+        assert!(endpoint.accept(listener).is_err());
+        let ack = wire::Header {
+            sequence: 101,
+            acknowledgment: reply.header.sequence.wrapping_add(1),
+            flags: wire::ACK,
+            ..syn(40001)
+        };
+        scoped_segment(&mut endpoint, &mut paths, zone, ack, None, b"");
+        let child = endpoint.accept(listener).unwrap();
+        assert_eq!(endpoint.state(child), Ok(State::Established));
+        assert_eq!(endpoint.retained_scoped_tuple(child).unwrap().zone(), Some(zone));
+    }
+}

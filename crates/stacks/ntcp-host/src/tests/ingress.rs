@@ -596,6 +596,7 @@ fn abandoned_ipv6_datagrams_draw_no_parameter_problems() {
         Received::Discarded => "discarded",
         Received::Datagram(_) => "datagram",
         Received::Neighbor => "neighbor",
+        Received::Redirect(_) => "redirect",
     };
     let problems = |a: &mut Side, now| -> Vec<(u8, u8, u32)> {
         drain(a, now)
@@ -725,7 +726,9 @@ fn completed_datagrams_own_their_bytes_for_retention() {
                     );
                     retained = Some((datagram.envelope(), datagram.bytes().to_vec()));
                 }
-                Received::Discarded | Received::Neighbor => panic!("not a datagram"),
+                Received::Discarded | Received::Neighbor | Received::Redirect(_) => {
+                    panic!("not a datagram")
+                }
             }
         }
         // Retained beyond the engine's next use, then dispatched.

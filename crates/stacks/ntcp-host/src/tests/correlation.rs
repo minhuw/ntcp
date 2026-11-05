@@ -184,6 +184,69 @@ fn datagram(f: &Fixture, generation: u64, path: PathId, length: u16, checksum: u
     )
 }
 
+// Lossy history is zoned (RFC 4007 section 6: a link-local address pair is
+// unique only on its link). A released generation on link B folds into a
+// tombstone that denies only quotes arriving on B; the identical
+// link-local four-tuple and sequence range live on link A stays exact,
+// attributable evidence. Four-tuple keys ignore zones, so the tombstone's
+// own zone check is what separates them.
+#[test]
+fn folded_link_local_history_denies_only_its_own_zone() {
+    let f = fixture();
+    let mut paths = PathService::new(
+        ContextId::new(9),
+        path::Limits {
+            links: 2,
+            sources: 1,
+            source_owners: 1,
+            routes: 1,
+            paths: 1,
+            clients: 1,
+        },
+    )
+    .unwrap();
+    let a = paths.register_link(InterfaceKey(1), 1500).unwrap();
+    let b = paths.register_link(InterfaceKey(2), 1500).unwrap();
+    let segment = |link, id| Evidence {
+        link,
+        path: f.paths[0],
+        owner: Owner::Tcp(id),
+        source: "fe80::1".parse().unwrap(),
+        destination: "fe80::2".parse().unwrap(),
+        dscp: 0,
+        header_len: 40,
+        packet_len: 40 + 20 + 1000,
+        protocol: 6,
+        transport: Selector::Tcp {
+            source_port: 1000,
+            destination_port: 8080,
+            start: 5000,
+            end: 6000,
+        },
+    };
+    let mut ledger = Ledger::new(limits(0)).unwrap();
+    let released = segment(b, f.ids[1]);
+    assert!(commit(&mut ledger, released, 1));
+    let index = ledger.owner_index(released.owner).unwrap();
+    assert!(ledger.release_owner(index, 2));
+    let live = segment(a, f.ids[0]);
+    assert!(commit(&mut ledger, live, 3));
+    let quote = key(&live);
+    let on_a = ledger.correlate_in(4, &quote, Some(a));
+    assert_eq!((on_a.matches, on_a.summarized), (1, false));
+    assert_eq!(on_a.path, Some(f.paths[0]));
+    assert_eq!(
+        on_a.owner.map(|r| r.evidence.owner),
+        Some(Owner::Tcp(f.ids[0]))
+    );
+    let on_b = ledger.correlate_in(4, &quote, Some(b));
+    assert_eq!(
+        (on_b.matches, on_b.summarized, on_b.path, on_b.owner),
+        (0, true, None, None),
+        "link B's own history denies"
+    );
+}
+
 // An exact match agreeing with lossy history keeps path-level action but
 // loses owner attribution; lossy history alone is no evidence at all, even
 // when its widened cover admits a never-sent length and checksum.

@@ -472,6 +472,8 @@ pub enum Received<'a> {
     /// A Neighbor Solicitation or Advertisement on an ND-capable port,
     /// consumed by the Host's Neighbor Discovery.
     Neighbor,
+    /// An ICMPv6 Redirect on an ND-capable port, and what became of it.
+    Redirect(crate::RedirectOutcome),
     /// A fragment discarded by reassembly, counted in
     /// `Host::reassembly_counters`; any error it caused is queued.
     Discarded,
@@ -545,9 +547,9 @@ impl Host {
         }
         if capabilities.ipv6 != crate::Ipv6Receive::Disabled
             && frame.first().is_some_and(|b| b >> 4 == 6)
-            && self.neighbor_receive(context, now, frame)?
+            && let Some(received) = self.neighbor_receive(context, now, frame)?
         {
-            return Ok(Received::Neighbor);
+            return Ok(received);
         }
         let whole = Datagram {
             envelope: Envelope::physical(context, frame.len()),

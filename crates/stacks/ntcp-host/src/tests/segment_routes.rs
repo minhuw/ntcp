@@ -1062,12 +1062,16 @@ fn full_size_config() -> EndpointConfig {
     cfg
 }
 
-// The next attempt's frame as the embeddings build it: the TCP segment
-// after the complete IP header of the path its authority selected
-// (`Host::header_plan`).
+// The next attempt's frame as the embeddings build it: drained with the
+// Host as path provider (a stateless reply sized for the path selected
+// now), the TCP segment after the complete IP header of the path its
+// authority selected (`Host::header_plan`).
 fn routed_frame(side: &mut Side, now: u64) -> Option<(TransmitAttempt, EgressContext, Vec<u8>)> {
     let mut tcp = [0; 2048];
-    let (poll, attempt) = side.1.poll_reserved_transmit(now, &mut tcp, 32).unwrap();
+    let (poll, attempt) = side
+        .1
+        .poll_reserved_transmit_with_path_provider(now, &mut tcp, 32, &mut side.0)
+        .unwrap();
     let packet = poll.packet?;
     let attempt = attempt.unwrap();
     let context = side.0.egress_context(&mut side.1, attempt).unwrap();
@@ -1197,7 +1201,7 @@ fn read_all(b: &mut Side, child: ConnectionId, into: &mut Vec<u8>) {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.1
 //= type=test
-//= reason=Host path budgets subtract the complete IPv6 header H of the selected path, the 40-octet base header plus, on an owner-configured Segment Routing route of n segments, its 8 + 16(n + 1)-octet Segment Routing Header (Host::header_plan, PathSnapshot::ip_header_len), from the largest IP packet that can be sent: TCP takes H before construction and admission for its MSS, T16's segment quantum and send space, PLPMTUD probes, exact-range repair and retransmission in scalar, shared, reserved and software GSO output, and an indivisible header that no longer fits fails admission. Host UDP flows report MMS_S as the path budget less H and limit Refuse and Probe payloads to EMTU_S - H - 8. When source fragmentation is selected (Host::udp_send_datagram's Fragment mode and the Host's Echo Replies, where a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) EMTU_S is the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and the Host creates fragments each limited by the connectionless effective size (never above the PMTU) that repeat the unfragmentable part (base header and Segment Routing Header) before the Fragment header; Refuse and Probe modes and TCP keep EMTU_S at the PMTU (TCP never source-fragments). Host::reassembly_capacity states this Host's own EMTU_R and MMS_R, and every managed TCP factory advertises the MSS Host::receive_ip_capability derives from EMTU_R, the largest IPv6 link and the wire limit independently of the send PMTU (T16, 1191-024). Host segment_routes tests (TCP, UDP Refuse/Probe/Fragment, Echo and ICMP errors with exact chains and checksums over the final destination), the native and tun_echo placement tests and the integration/rfc_host srh cases (TCP progress through a Linux SRv6 endpoint in both embeddings, with a transit router's PTB repaired) verify it.
+//= reason=Host path budgets subtract the complete IPv6 header H of the selected path, the 40-octet base header plus, on an owner-configured Segment Routing route of n segments, its 8 + 16(n + 1)-octet Segment Routing Header (Host::header_plan, PathSnapshot::ip_header_len), from the largest IP packet that can be sent: TCP takes H before construction and admission for its MSS, T16's segment quantum and send space, PLPMTUD probes, exact-range repair and retransmission in scalar, shared, reserved and software GSO output, and an indivisible header that no longer fits fails admission. Host UDP flows report MMS_S as the path budget less H and limit Refuse and Probe payloads to EMTU_S - H - 8. When source fragmentation is selected (Host::udp_send_datagram's Fragment mode and the Host's Echo Replies, where a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) EMTU_S is the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and the Host creates fragments each limited by the connectionless effective size (never above the PMTU) that repeat the unfragmentable part (base header and Segment Routing Header) before the Fragment header; Refuse and Probe modes and TCP keep EMTU_S at the PMTU (TCP never source-fragments). Host::reassembly_capacity states this Host's own EMTU_R and MMS_R, and every managed TCP factory advertises the MSS Host::receive_ip_capability derives from EMTU_R, the largest IPv6 link and the wire limit independently of the send PMTU (T16, 1191-024). Host segment_routes tests (TCP, UDP Refuse/Probe/Fragment, Echo and ICMP errors with exact chains and checksums over the final destination), the native and tun_echo placement tests and the integration/rfc_host srh cases verify it, per embedding: tun_echo's transit-ptb case repairs a transit router's real Packet Too Big quoting its submitted SRH packets and makes TCP progress through a Linux SRv6 endpoint, and the native runtime's endpoint case makes TCP progress through Linux's own SR endpoint processing to the final destination.
 //# MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see "Fragment Header", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.
 #[test]
 fn tcp_over_a_segment_route_sizes_and_repairs_segments_with_h() {
@@ -1727,4 +1731,89 @@ fn stateless_replies_are_sized_with_the_path_header() {
     assert_eq!(a.1.oversized_control_replies(), 1);
     assert!(emit_routed(&mut a, 7).is_none());
     assert_eq!(a.1.oversized_control_replies(), 1);
+}
+
+// An administrative downward estimate reaches a binding on an SR path
+// within `admin_apply`, as it reaches an ordinary binding: the SR
+// connection's forwarding destination is S1 while its path key names D,
+// and the transaction's fan-out compares the actual outgoing selection.
+#[test]
+fn admin_estimate_lowers_a_segment_route_binding_at_once() {
+    let cfg = full_size_config();
+    let (local, remote) = addresses(true);
+    let mut a = tcp_side(local, 1940, cfg.clone(), false);
+    segment_route(&mut a, remote.ip());
+    let mut b = tcp_side(remote, 1941, cfg.clone(), false);
+    let listener = b.1.listen(remote, 4).unwrap();
+    let routed = a
+        .1
+        .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+        .unwrap();
+    let mut now = 0;
+    establish(&mut a, &mut b, &mut now, routed, listener, |_| {});
+    let s1 = SocketAddr::new(IpAddr::V6(segments()[0]), remote.port());
+    let ordinary = a
+        .1
+        .connect_with_path_provider(now, local, s1, options(&cfg, 0), &mut a.0)
+        .unwrap();
+    let capability = a.0.administration();
+    for (id, header) in [(routed, H as u32), (ordinary, 40)] {
+        let before = a.1.transport_ceilings(id).unwrap().effective_mss;
+        let path = a.0.binding(id).unwrap().snapshot.path();
+        assert_eq!(
+            a.0.binding(id).unwrap().snapshot.ip_packet_budget(),
+            Ok(1500)
+        );
+        super::admin::set_estimate(&mut a, &capability, now, path, Some(1400)).unwrap();
+        let binding = a.0.binding(id).unwrap();
+        assert!(!a.0.paths().is_dirty(binding.client).unwrap());
+        assert_eq!(binding.snapshot.ip_packet_budget(), Ok(1400));
+        assert_eq!(binding.snapshot.ip_header_len(), header);
+        assert_eq!(a.1.transport_ceilings(id).unwrap().effective_mss, before - 100);
+    }
+}
+
+// A stateless reply queued before its route is replaced is sized for the
+// route selected when it drains: an ordinary route replaced by an 88-segment
+// SR route (H = 1472) drops the timestamp echo the queued sizing included,
+// which would no longer fit the 1500-octet first hop; an 89-segment SR route
+// (H = 1488, no room for the 20-octet TCP header) replaced by an ordinary
+// route sends the reply with its echo rather than dropping it as oversized.
+#[test]
+fn stateless_replies_are_sized_for_the_route_replaced_before_drain() {
+    const BIG: usize = 1472;
+    let cfg = config(4);
+    let (local, remote) = addresses(true);
+    let mut a = tcp_side(local, 1770, cfg, false);
+    let ordinary = a.0.add_route(route(&a, remote.ip())).unwrap();
+    input(&mut a, 2, &closed_port_syn(remote, local, 1771)).unwrap();
+    a.0.remove_route(ordinary).unwrap();
+    let segments = many_segments(88);
+    let routed = a
+        .0
+        .add_segment_route(route(&a, remote.ip()), &segments)
+        .unwrap();
+    let reply = emit_routed(&mut a, 3).unwrap();
+    assert_eq!(reply.len(), BIG + 20);
+    assert_eq!(&reply[40..48], &[6, 2 * 89, 4, 88, 88, 0, 0, 0]);
+    let tcp = &reply[BIG..];
+    assert_eq!(tcp[12] >> 4, 5, "no options: the echo is omitted");
+    assert_eq!(tcp[13], ntcp::wire::RST | ntcp::wire::ACK);
+    assert_eq!(
+        ntcp_ip_common::pseudo_header_checksum(local.ip(), remote.ip(), 6, tcp),
+        Ok(0)
+    );
+    a.0.remove_route(routed).unwrap();
+    let unfit = a
+        .0
+        .add_segment_route(route(&a, remote.ip()), &many_segments(89))
+        .unwrap();
+    input(&mut a, 4, &closed_port_syn(remote, local, 1772)).unwrap();
+    a.0.replace_route(unfit, route(&a, remote.ip())).unwrap();
+    let reply = emit_routed(&mut a, 5).unwrap();
+    assert_eq!(reply[6], 6);
+    assert_eq!(&reply[24..40], &v6(remote.ip()).octets());
+    assert_eq!(reply.len(), 40 + 32, "the ordinary route keeps the echo");
+    assert_eq!(a.1.oversized_control_replies(), 0);
+    assert!(emit_routed(&mut a, 6).is_none());
 }

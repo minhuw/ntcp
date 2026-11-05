@@ -479,11 +479,21 @@ impl Owner {
                 &mut bytes[offset + header..],
                 BUDGET,
             ),
-            None => self.endpoint.poll_reserved_stateless_transmit(
-                now,
-                &mut bytes[offset + header..],
-                BUDGET,
-            ),
+            // A stateless reply is sized for the path the Host selects for
+            // it now, not when it was queued.
+            None => match &mut self.host {
+                Some(host) => self.endpoint.poll_reserved_stateless_transmit_with_path_provider(
+                    now,
+                    &mut bytes[offset + header..],
+                    BUDGET,
+                    host,
+                ),
+                None => self.endpoint.poll_reserved_stateless_transmit(
+                    now,
+                    &mut bytes[offset + header..],
+                    BUDGET,
+                ),
+            },
         };
         let (output, attempt) = match output {
             Ok(output) => output,
@@ -1275,10 +1285,11 @@ impl Owner {
         Ok(())
     }
     /// Neighbor Discovery's caller-time work on the owner thread: due
-    /// timers (reachability, probes, resolution failure, DAD), then its
-    /// control output (answers, DAD probes, solicitations) through each
-    /// port's one physical call, independently of blocked data output. A
-    /// blocked or refusing backend ends the pass, keeping the message due.
+    /// timers (reachability, probes, resolution failure, DAD), then each
+    /// port's control output (answers, DAD probes, solicitations) through
+    /// its one physical call, independently of blocked data output. A
+    /// blocked or refusing backend ends that port's pass, keeping the
+    /// message due, and leaves the other ports' passes alone.
     pub(super) fn service_discovery(&mut self) {
         let now = self.now();
         let Self {
@@ -1294,34 +1305,36 @@ impl Owner {
             return;
         }
         let _ = host.service_neighbors(now);
-        for _ in 0..BUDGET {
-            let Some(frame) = icmp_wire.get_mut(..) else {
-                return;
+        for port in ports.iter_mut() {
+            let Some(link) = port.link() else {
+                continue;
             };
-            let Some(body) = frame.get_mut(14..) else {
-                return;
-            };
-            let Ok(Some(transmit)) = host.neighbor_output(now, body) else {
-                return;
-            };
-            let len = (14 + transmit.len).max(60);
-            let outcome = match ports.iter_mut().find(|p| p.link() == Some(transmit.link)) {
-                Some(port) => match (&mut port.ethernet, frame.get_mut(..len)) {
+            for _ in 0..BUDGET {
+                let Some(frame) = icmp_wire.get_mut(..) else {
+                    return;
+                };
+                let Some(body) = frame.get_mut(14..) else {
+                    return;
+                };
+                let Ok(Some(transmit)) = host.neighbor_output(link, now, body) else {
+                    break;
+                };
+                let len = (14 + transmit.len).max(60);
+                let outcome = match (&mut port.ethernet, frame.get_mut(..len)) {
                     (Some(backend), Some(frame)) => {
                         frame[14 + transmit.len..].fill(0);
                         backend.frame_header(frame, port.address, Some(transmit.destination));
                         backend_outcome(&backend.transmit_frame(None, (false, false), frame))
                     }
                     _ => ntcp_host::BackendOutcome::NotSubmitted,
-                },
-                None => ntcp_host::BackendOutcome::NotSubmitted,
-            };
-            let _ = host.complete_neighbor_output(transmit.ticket, outcome, now);
-            if matches!(
-                outcome,
-                ntcp_host::BackendOutcome::WouldBlock | ntcp_host::BackendOutcome::Rejected
-            ) {
-                return;
+                };
+                let _ = host.complete_neighbor_output(transmit.ticket, outcome, now);
+                if matches!(
+                    outcome,
+                    ntcp_host::BackendOutcome::WouldBlock | ntcp_host::BackendOutcome::Rejected
+                ) {
+                    break;
+                }
             }
         }
     }

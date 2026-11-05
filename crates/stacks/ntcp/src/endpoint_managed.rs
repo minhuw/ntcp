@@ -300,8 +300,35 @@ impl Endpoint {
     /// where a TCP connection in this network context could. Route requests
     /// are TCP source-route policy and are never admitted here.
     pub fn admits_datagram(&self, check: AddressValidation) -> bool {
-        let unicast = |address| valid_address(address) && !unzoned_link_local(address);
+        self.admits_scoped_datagram(check, None)
+    }
+
+    /// `admits_datagram` for a scoped datagram flow: an IPv6 link-local
+    /// address is admitted only with `zone`, a link of this managed context
+    /// (RFC 4007: the address names an interface of that link only), and a
+    /// zone only when one of the checked addresses is link-local, as for a
+    /// `ScopedTuple`. None keeps the unscoped admission.
+    pub fn admits_scoped_datagram(
+        &self,
+        check: AddressValidation,
+        zone: Option<ntcp_path::LinkId>,
+    ) -> bool {
+        let scoped = |a: IpAddr, b: Option<IpAddr>| {
+            let link_local = unzoned_link_local(a) || b.is_some_and(unzoned_link_local);
+            link_local == zone.is_some()
+                && zone.is_none_or(|zone| Some(zone.context()) == self.managed_context)
+        };
+        let unicast = |address| valid_address(address);
         self.managed_context.is_some()
+            && match check {
+                AddressValidation::Bind { local } => scoped(local, None),
+                AddressValidation::Open { local, remote } => scoped(local, Some(remote)),
+                AddressValidation::Incoming {
+                    source,
+                    destination,
+                } => scoped(source, Some(destination)),
+                AddressValidation::Route { .. } => false,
+            }
             && match check {
                 AddressValidation::Bind { local } => unicast(local),
                 AddressValidation::Open { local, remote } => {
@@ -693,6 +720,39 @@ impl Endpoint {
         }
         self.refresh(id.slot);
         Ok(())
+    }
+
+    /// `poll_reserved_transmit` for a managed Endpoint: a stateless IPv6
+    /// reply selected now is sized with the complete IP header of the path
+    /// `provider` selects for it now (`PathProvider::reply_header_len`), not
+    /// the one sampled when it was queued, so a route replaced in between
+    /// neither refuses a reply that fits its new path nor sizes it for the
+    /// old one. A reply that cannot fit even the new path is still dropped
+    /// and counted (`oversized_control_replies`).
+    pub fn poll_reserved_transmit_with_path_provider<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        budget: usize,
+        provider: &mut P,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        let dscp = self.config.dscp;
+        let mut reply = |ip, zone| provider.reply_header_len(ip, zone, dscp);
+        self.poll_reserved_any(now, out, budget, Some(&mut reply))
+    }
+
+    /// `poll_reserved_stateless_transmit` with drain-time reply sizing
+    /// (`poll_reserved_transmit_with_path_provider`).
+    pub fn poll_reserved_stateless_transmit_with_path_provider<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        budget: usize,
+        provider: &mut P,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        let dscp = self.config.dscp;
+        let mut reply = |ip, zone| provider.reply_header_len(ip, zone, dscp);
+        self.poll_reserved_selected(now, out, budget, None, None, Some(&mut reply))
     }
 
     /// Metadata for exactly the currently selected physical segment, including

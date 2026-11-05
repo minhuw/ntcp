@@ -87,7 +87,7 @@ fn resolution_holds_packets_and_counts_only_submitted_solicitations() {
     // other output is backpressure.
     assert_eq!(cache.output(link, neighbor(), 0, 7), Ok(Resolution::Held));
     assert_eq!(cache.output(link, neighbor(), 0, 8), Err(Error::Capacity));
-    let (control, token) = cache.next_control(0).unwrap();
+    let (control, token) = cache.next_control(link, 0).unwrap();
     assert_eq!(
         control,
         Control::Solicit {
@@ -99,18 +99,18 @@ fn resolution_holds_packets_and_counts_only_submitted_solicitations() {
     );
     // Neither a blocked nor a failed local submission is an attempt.
     cache.complete(token, ControlOutcome::Blocked, 0);
-    let (_, token) = cache.next_control(0).unwrap();
+    let (_, token) = cache.next_control(link, 0).unwrap();
     cache.complete(token, ControlOutcome::Failed, 0);
     let mut now = 0;
     for _ in 0..3 {
-        let (_, token) = cache.next_control(now).unwrap();
+        let (_, token) = cache.next_control(link, now).unwrap();
         cache.complete(token, ControlOutcome::Submitted, now);
         // The next one waits a full RetransTimer.
-        assert_eq!(cache.next_control(now + SECOND - 1), None);
+        assert_eq!(cache.next_control(link, now + SECOND - 1), None);
         now += SECOND;
     }
     // After the third, failure only a full RetransTimer later.
-    assert_eq!(cache.next_control(now), None);
+    assert_eq!(cache.next_control(link, now), None);
     cache.service(now - 1, &mut no_events);
     assert!(cache.state(link, neighbor()).is_some());
     let mut events = Vec::new();
@@ -206,10 +206,99 @@ fn idle_stale_entries_are_reclaimed_and_active_ones_pinned() {
 }
 
 #[test]
+fn one_ports_blocked_control_output_never_holds_back_another() {
+    let mut paths = PathService::new(
+        ContextId::new(1),
+        path::Limits {
+            links: 2,
+            sources: 1,
+            source_owners: 1,
+            routes: 1,
+            paths: 1,
+            clients: 1,
+        },
+    )
+    .unwrap();
+    let a = paths.register_link(InterfaceKey(1), 1500).unwrap();
+    let b = paths.register_link(InterfaceKey(2), 1500).unwrap();
+    let mut entropy = fixed(0x80);
+    let mut c = Neighbors::new(limits(2, 1), 2, SECOND).unwrap();
+    for link in [a, b] {
+        let port = NdPort {
+            dad_transmits: 0,
+            ..NdPort::new(OWN)
+        };
+        c.add_port(link, port, Some(&mut entropy)).unwrap();
+        assert_eq!(c.add_address(link, own()), Ok(AddressState::Assigned));
+    }
+    // A's answer is queued and its transmit path blocks; B resolves.
+    let ns = ntcp_icmp::NeighborSolicitation {
+        target: own(),
+        source_link_layer: Some(MAC_A),
+    };
+    c.solicitation(a, neighbor(), ns, 0, &mut no_events)
+        .unwrap();
+    assert_eq!(c.output(b, neighbor(), 0, 1), Ok(Resolution::Held));
+    let (control, token) = c.next_control(a, 0).unwrap();
+    assert!(matches!(control, Control::Advertise { link, .. } if link == a));
+    c.complete(token, ControlOutcome::Blocked, 0);
+    assert!(c.next_control(a, 0).is_some());
+    let (control, token) = c.next_control(b, 0).unwrap();
+    assert_eq!(
+        control,
+        Control::Solicit {
+            link: b,
+            target: neighbor(),
+            destination: Destination::Multicast,
+            dad: false,
+        }
+    );
+    c.complete(token, ControlOutcome::Submitted, 0);
+    assert_eq!(c.next_control(b, 0), None);
+}
+
+#[test]
+fn solicitations_for_foreign_targets_are_discarded_before_the_cache() {
+    let (mut c, link, _) = cache(2, 1);
+    let [a, b, d]: [Ipv6Addr; 3] = ["fe80::a", "fe80::b", "fe80::d"].map(|s| s.parse().unwrap());
+    let ns = |target, mac| ntcp_icmp::NeighborSolicitation {
+        target,
+        source_link_layer: Some(mac),
+    };
+    c.solicitation(link, a, ns(own(), MAC_A), 0, &mut no_events)
+        .unwrap();
+    c.solicitation(link, b, ns(own(), MAC_B), 1, &mut no_events)
+        .unwrap();
+    // A target this port does not own (RFC 4861 section 7.2.3): no entry
+    // is created, none reclaimed or updated, and nothing is answered.
+    let foreign: Ipv6Addr = "fe80::dead".parse().unwrap();
+    c.solicitation(link, d, ns(foreign, MAC_A), 2, &mut no_events)
+        .unwrap();
+    c.solicitation(link, a, ns(foreign, MAC_B), 3, &mut no_events)
+        .unwrap();
+    assert_eq!(c.state(link, d), None);
+    assert_eq!(
+        c.state(link, a),
+        Some((NeighborState::Stale, Some(MAC_A), false))
+    );
+    assert_eq!(
+        c.state(link, b),
+        Some((NeighborState::Stale, Some(MAC_B), false))
+    );
+    let mut answers = 0;
+    while let Some((control, token)) = c.next_control(link, 3) {
+        assert!(matches!(control, Control::Advertise { target, .. } if target == own()));
+        c.complete(token, ControlOutcome::Submitted, 3);
+        answers += 1;
+    }
+    assert_eq!(answers, 2);
+}
+
+#[test]
 fn reachability_timers_follow_caller_time() {
     let (mut cache, link, mut entropy) = cache(1, 1);
     cache.output(link, neighbor(), 0, 1).unwrap();
-    let (_, token) = cache.next_control(0).unwrap();
+    let (_, token) = cache.next_control(link, 0).unwrap();
     cache.complete(token, ControlOutcome::Submitted, 0);
     assert_eq!(
         cache.advertisement(
@@ -258,7 +347,7 @@ fn reachability_timers_follow_caller_time() {
         cache.output(link, neighbor(), probe, 3),
         Ok(Resolution::Ready(MAC_A))
     );
-    let (control, _) = cache.next_control(probe).unwrap();
+    let (control, _) = cache.next_control(link, probe).unwrap();
     assert!(matches!(
         control,
         Control::Solicit {
@@ -302,7 +391,7 @@ fn probes_exhausted_remove_the_entry() {
     cache.service(5 * SECOND, &mut no_events);
     let mut now = 5 * SECOND;
     for _ in 0..3 {
-        let (_, token) = cache.next_control(now).unwrap();
+        let (_, token) = cache.next_control(link, now).unwrap();
         cache.complete(token, ControlOutcome::Submitted, now);
         now += SECOND;
     }
@@ -322,7 +411,7 @@ fn probes_exhausted_remove_the_entry() {
             cache.advertisement(link, advertisement, now - 1, None, &mut no_events),
             Ok(NaBranch::UpdatedUnchanged)
         );
-        assert_eq!(cache.next_control(now - 1), None);
+        assert_eq!(cache.next_control(link, now - 1), None);
     }
     let mut events = Vec::new();
     cache.service(now, &mut |event| events.push(event));
@@ -359,10 +448,6 @@ fn entropy_failure_is_explicit_and_changes_nothing() {
         cache.advertisement(link, na(true, true, Some(MAC_A)), 0, None, &mut no_events),
         Err(Error::Entropy)
     );
-    assert_eq!(
-        cache.set_base_reachable(link, 10_000, Some(&mut failing)),
-        Err(Error::Entropy)
-    );
     // An unsolicited advertisement needs no new ReachableTime.
     assert_eq!(
         cache.advertisement(link, na(false, true, Some(MAC_A)), 0, None, &mut no_events),
@@ -395,20 +480,6 @@ fn reachable_time_is_uniform_between_half_and_one_and_a_half_base() {
         .unwrap();
         assert_eq!(c.next_deadline(), Some(expected));
     }
-    // A new BaseReachableTime recomputes it.
-    let (mut c, link, _) = cache(1, 1);
-    c.set_base_reachable(link, 10_000, Some(&mut fixed(0)))
-        .unwrap();
-    c.output(link, neighbor(), 0, 1).unwrap();
-    c.advertisement(
-        link,
-        na(true, true, Some(MAC_A)),
-        0,
-        Some(&mut fixed(0x80)),
-        &mut no_events,
-    )
-    .unwrap();
-    assert_eq!(c.next_deadline(), Some(10 * SECOND));
 }
 
 #[test]
@@ -426,7 +497,7 @@ fn solicitations_create_or_update_stale_entries() {
         Some((NeighborState::Stale, Some(MAC_A), false))
     );
     // The answer goes to the stated address, solicited.
-    let (control, token) = cache.next_control(0).unwrap();
+    let (control, token) = cache.next_control(link, 0).unwrap();
     assert_eq!(
         control,
         Control::Advertise {
@@ -436,7 +507,7 @@ fn solicitations_create_or_update_stale_entries() {
         }
     );
     cache.complete(token, ControlOutcome::Submitted, 0);
-    assert_eq!(cache.next_control(0), None);
+    assert_eq!(cache.next_control(link, 0), None);
     // The same address keeps the state; a changed one is STALE again.
     cache.output(link, neighbor(), 0, 0).unwrap();
     assert_eq!(
@@ -458,7 +529,7 @@ fn solicitations_create_or_update_stale_entries() {
         Some((NeighborState::Stale, Some(MAC_B), false))
     );
     // Another node's DAD probe is answered to all-nodes and learns nothing.
-    let (_, token) = cache.next_control(0).unwrap();
+    let (_, token) = cache.next_control(link, 0).unwrap();
     cache.complete(token, ControlOutcome::Submitted, 0);
     let dad = ntcp_icmp::NeighborSolicitation {
         target: own(),
@@ -467,7 +538,7 @@ fn solicitations_create_or_update_stale_entries() {
     cache
         .solicitation(link, Ipv6Addr::UNSPECIFIED, dad, 0, &mut no_events)
         .unwrap();
-    let (control, _) = cache.next_control(0).unwrap();
+    let (control, _) = cache.next_control(link, 0).unwrap();
     assert_eq!(
         control,
         Control::Advertise {
@@ -498,13 +569,13 @@ fn duplicate_address_detection_both_ways() {
     };
     // Nothing is probed before the groups are joined.
     let (mut cache, mut entropy) = make(false);
-    assert_eq!(cache.next_control(10 * SECOND), None);
+    assert_eq!(cache.next_control(link, 10 * SECOND), None);
     cache
         .membership_ready(link, tentative, 0, Some(&mut entropy))
         .unwrap();
     // The random delay (half of MAX_RTR_SOLICITATION_DELAY here).
-    assert_eq!(cache.next_control(SECOND / 2 - 1), None);
-    let (control, token) = cache.next_control(SECOND / 2).unwrap();
+    assert_eq!(cache.next_control(link, SECOND / 2 - 1), None);
+    let (control, token) = cache.next_control(link, SECOND / 2).unwrap();
     assert_eq!(
         control,
         Control::Solicit {
@@ -518,7 +589,7 @@ fn duplicate_address_detection_both_ways() {
     let mut assigned = None;
     cache.service(10 * SECOND, &mut |e| assigned = Some(e));
     assert_eq!(assigned, None);
-    let (_, token) = cache.next_control(SECOND).unwrap();
+    let (_, token) = cache.next_control(link, SECOND).unwrap();
     cache.complete(token, ControlOutcome::Submitted, SECOND);
     // A resolution solicitation for a tentative address is ignored.
     let ns = ntcp_icmp::NeighborSolicitation {
@@ -529,7 +600,10 @@ fn duplicate_address_detection_both_ways() {
         .solicitation(link, neighbor(), ns, SECOND, &mut no_events)
         .unwrap();
     assert_eq!(
-        (cache.next_control(SECOND), cache.state(link, neighbor())),
+        (
+            cache.next_control(link, SECOND),
+            cache.state(link, neighbor())
+        ),
         (None, None)
     );
     cache.service(2 * SECOND - 1, &mut no_events);
@@ -576,14 +650,14 @@ fn duplicate_address_detection_both_ways() {
         cache.address_state(link, tentative),
         Some(AddressState::Duplicate)
     );
-    assert_eq!(cache.next_control(10 * SECOND), None);
+    assert_eq!(cache.next_control(link, 10 * SECOND), None);
 
     // Its own probe looped back is not another node's.
     let (mut cache, mut entropy) = make(true);
     cache
         .membership_ready(link, tentative, 0, Some(&mut entropy))
         .unwrap();
-    let (_, token) = cache.next_control(SECOND).unwrap();
+    let (_, token) = cache.next_control(link, SECOND).unwrap();
     cache.complete(token, ControlOutcome::Submitted, SECOND);
     cache
         .solicitation(link, Ipv6Addr::UNSPECIFIED, dad, SECOND, &mut no_events)
@@ -681,7 +755,7 @@ fn seeded_state_model_covers_every_advertisement_branch() {
         let roll = next();
         let before = cache.state(link, neighbor()).map(|(s, m, _)| (s, m));
         // The pending solicitation, its attempt count included.
-        let due = cache.next_control(now);
+        let due = cache.next_control(link, now);
         match roll % 6 {
             0 => {
                 if cache.output(link, neighbor(), now, 0) == Ok(Resolution::Held) {
@@ -716,14 +790,18 @@ fn seeded_state_model_covers_every_advertisement_branch() {
                         | NaBranch::KeptIgnored
                         | NaBranch::UpdatedUnchanged
                 ) {
-                    assert_eq!(cache.next_control(now), due, "{before:?} {advertisement:?}");
+                    assert_eq!(
+                        cache.next_control(link, now),
+                        due,
+                        "{before:?} {advertisement:?}"
+                    );
                 }
                 if !branches.contains(&branch) {
                     branches.push(branch);
                 }
             }
             3 => {
-                if let Some((_, token)) = cache.next_control(now) {
+                if let Some((_, token)) = cache.next_control(link, now) {
                     let outcome = [
                         ControlOutcome::Submitted,
                         ControlOutcome::Uncertain,
@@ -837,4 +915,102 @@ fn redirect_targets_update_the_cache_and_router_flag() {
         }]
     );
     assert_eq!(cache.state(link, neighbor()).map(|n| n.2), Some(false));
+}
+
+// RFC 4861 section 7.2.5 as an exhaustive table, the IsRouter flag
+// included: from each of the five states, with the flag set or clear,
+// every combination of Solicited, Override, Router and Target Link-Layer
+// Address (absent, the cached one, another). INCOMPLETE takes the flag
+// with the address; otherwise only the update branch sets it (an ignored
+// advertisement and REACHABLE turned STALE change nothing else), and a
+// flag the update clears is reported.
+#[test]
+fn advertisements_update_the_router_flag_only_where_permitted() {
+    use NeighborState::*;
+    // A cache whose entry for `neighbor()` is in `state`, mapped to MAC_A
+    // unless INCOMPLETE, with IsRouter `router`, at the returned time.
+    let prepare = |state: NeighborState, router: bool| {
+        let (mut c, link, mut entropy) = cache(1, 2);
+        let mut events = |_| {};
+        c.output(link, neighbor(), 0, 1).unwrap();
+        if state == Incomplete {
+            if router {
+                c.redirect(link, neighbor(), None, true, 0);
+            }
+            return (c, link, entropy, 0);
+        }
+        let mut setup = na(state == Reachable, false, Some(MAC_A));
+        setup.router = router;
+        c.advertisement(link, setup, 0, Some(&mut entropy), &mut events)
+            .unwrap();
+        while let Some((slot, ..)) = c.next_pending(|_| true) {
+            c.release(slot);
+        }
+        let mut now = 0;
+        if matches!(state, Delay | Probe) {
+            now = SECOND;
+            assert_eq!(
+                c.output(link, neighbor(), now, 2),
+                Ok(Resolution::Ready(MAC_A))
+            );
+            while let Some((slot, ..)) = c.next_pending(|_| true) {
+                c.release(slot);
+            }
+        }
+        if state == Probe {
+            now += 5 * SECOND;
+            c.service(now, &mut events);
+        }
+        assert_eq!(
+            c.state(link, neighbor()),
+            Some((state, (state != Incomplete).then_some(MAC_A), router))
+        );
+        (c, link, entropy, now)
+    };
+    for state in [Incomplete, Reachable, Stale, Delay, Probe] {
+        for router in [false, true] {
+            for bits in 0..8u8 {
+                let (solicited, override_, flag) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+                for tllao in [None, Some(MAC_A), Some(MAC_B)] {
+                    let (mut c, link, mut entropy, now) = prepare(state, router);
+                    let before = c.state(link, neighbor()).unwrap();
+                    let mut advertisement = na(solicited, override_, tllao);
+                    advertisement.router = flag;
+                    let mut events = Vec::new();
+                    c.advertisement(link, advertisement, now, Some(&mut entropy), &mut |e| {
+                        events.push(e)
+                    })
+                    .unwrap();
+                    let after = c.state(link, neighbor()).unwrap();
+                    let (expected_state, expected_mac) =
+                        reference(Some((before.0, before.1)), advertisement).unwrap();
+                    let updates = if state == Incomplete {
+                        tllao.is_some()
+                    } else {
+                        override_ || tllao.is_none() || tllao == before.1
+                    };
+                    let expected_router = if updates { flag } else { router };
+                    let case = (state, router, solicited, override_, flag, tllao);
+                    assert_eq!(
+                        after,
+                        (expected_state, expected_mac, expected_router),
+                        "{case:?}"
+                    );
+                    let lost = router && !expected_router;
+                    assert_eq!(
+                        events,
+                        if lost {
+                            vec![NdEvent::RouterLost {
+                                link,
+                                address: neighbor(),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        "{case:?}"
+                    );
+                }
+            }
+        }
+    }
 }

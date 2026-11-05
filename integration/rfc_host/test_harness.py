@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+import ipaddress
 import os
 import struct
+import sys
 import unittest
 from unittest.mock import patch
 
+# The harness modules beside this file, also when run by path from the root.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bridge import checksum
 import admin
 import bridge
@@ -11,6 +15,7 @@ import icmp
 import mss
 import options
 import run
+import scoped
 import srh
 
 
@@ -658,3 +663,111 @@ class SegmentRouting(unittest.TestCase):
         self.assertTrue(datagram["checksum_valid"])
         self.assertEqual(datagram["final_destination"], self.D)
         self.assertEqual(str(ipaddress.ip_address(datagram["raw"][24:40])), self.S1)
+
+
+class ScopedScenario(unittest.TestCase):
+    NATIVE_MAC, PEER_MAC = "02:00:00:18:0a:02", "02:00:00:18:0a:01"
+
+    def test_scoped_cases_without_inherited_proof_cannot_reach_setup(self):
+        for case in scoped.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(scoped, "setup") as setup:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+                setup.assert_not_called()
+
+    def test_cases_cover_one_native_two_link_runtime_and_tun_echo(self):
+        self.assertEqual({(c["kind"], c["family"], c["embedding"], c["scenario"]) for c in scoped.cases()},
+                         {("scoped", 6, "native", "two-link"), ("scoped", 6, "tun_echo", "link-local-peer")})
+        others = icmp.cases() + admin.cases() + options.cases() + mss.cases() + srh.cases() + run.matrix()
+        self.assertFalse(any(c in others for c in scoped.cases()))
+        # Different first-hop MTUs; the report lies below both, so link B
+        # keeps larger packets than link A after it.
+        a, b = scoped.LINKS
+        self.assertTrue(1280 <= scoped.PTB_MTU < b["mtu"] < a["mtu"])
+        self.assertEqual(len({a["native_mac"], a["peer_mac"], b["native_mac"], b["peer_mac"]}), 4)
+
+    def test_one_configuration_owns_both_resolving_ports_with_the_same_address(self):
+        text = scoped.config()
+        self.assertNotIn("next_hop_mac", text)
+        self.assertNotIn("neighbor", text)
+        keys = dict(line.split("=", 1) for line in text.splitlines())
+        self.assertEqual((keys["io.interface"], keys["port.b.interface"]), tuple(l["native"] for l in scoped.LINKS))
+        self.assertEqual(keys["io.address"], keys["port.b.address"])
+        self.assertTrue(ipaddress.ip_address(keys["io.address"]).is_link_local)
+        self.assertEqual(scoped.solicited_node("fe80::2"), "ff02::1:ff00:2")
+        self.assertEqual(scoped.solicited_node("fe80::1:abcd:1234"), "ff02::1:ffcd:1234")
+
+    def ipv6(self, source, destination, protocol, body, hop_limit=255, prefix=b""):
+        src, dst = ipaddress.ip_address(source).packed, ipaddress.ip_address(destination).packed
+        body = bytearray(body)
+        if protocol == 58:
+            pseudo = src + dst + struct.pack("!I", len(body)) + bytes([0, 0, 0, 58])
+            struct.pack_into("!H", body, 2, checksum(pseudo + bytes(body)))
+        next_header = 0 if prefix else protocol
+        header = struct.pack("!IHBB", 6 << 28, len(prefix) + len(body), next_header, hop_limit) + src + dst
+        return header + prefix + bytes(body)
+
+    def ether(self, packet, source, destination):
+        return bytes.fromhex(destination.replace(":", "")) + bytes.fromhex(source.replace(":", "")) + b"\x86\xdd" + packet
+
+    def test_frame_decodes_neighbor_discovery_targets_flags_and_options(self):
+        mac = bytes.fromhex(self.NATIVE_MAC.replace(":", ""))
+        ns = struct.pack("!BBHI", 135, 0, 0, 0) + ipaddress.ip_address("fe80::1").packed + bytes([1, 1]) + mac
+        event = scoped.frame(self.ether(self.ipv6("fe80::2", "ff02::1:ff00:1", 58, ns), self.NATIVE_MAC,
+                                        "33:33:ff:00:00:01"))
+        self.assertTrue(event["checksum_valid"])
+        self.assertEqual((event["icmp_type"], event["target"], event["hop_limit"], event["eth_dst"]),
+                         (135, "fe80::1", 255, "33:33:ff:00:00:01"))
+        self.assertEqual(event["options"], [dict(type=1, length=8, value=self.NATIVE_MAC)])
+        event.update(direction="out", time_ns=1)
+        self.assertEqual(scoped.lladdr(scoped.checked_nd(event), 1), self.NATIVE_MAC)
+        na = struct.pack("!BBHI", 136, 0, 0, 0x60000000) + ipaddress.ip_address("fe80::1").packed + bytes([2, 1]) + mac
+        event = scoped.frame(self.ether(self.ipv6("fe80::1", "fe80::2", 58, na), self.PEER_MAC, self.NATIVE_MAC))
+        self.assertEqual((event["solicited"], event["override"], event["router"]), (True, True, False))
+        self.assertEqual(event["options"], [dict(type=2, length=8, value=self.NATIVE_MAC)])
+        # Fixed ND checks: Hop Limit 255 and a valid checksum.
+        for packet in (self.ipv6("fe80::1", "fe80::2", 58, na, hop_limit=64),
+                       self.ipv6("fe80::1", "fe80::2", 58, na)[:-1] + b"\0"):
+            event = dict(scoped.frame(self.ether(packet, self.PEER_MAC, self.NATIVE_MAC)), direction="in", time_ns=1)
+            with self.assertRaises(AssertionError):
+                scoped.checked_nd(event)
+        # A DAD probe: unspecified source, no option.
+        dad = struct.pack("!BBHI", 135, 0, 0, 0) + ipaddress.ip_address("fe80::2").packed
+        event = scoped.frame(self.ether(self.ipv6("::", "ff02::1:ff00:2", 58, dad), self.NATIVE_MAC,
+                                        "33:33:ff:00:00:02"))
+        self.assertEqual((event["source"], event["options"], event["target"]), ("::", [], "fe80::2"))
+
+    def test_frame_walks_the_router_alert_to_mldv2_records(self):
+        record = struct.pack("!BBH", 4, 0, 0) + ipaddress.ip_address("ff02::1:ff00:2").packed
+        report = struct.pack("!BBHHH", 143, 0, 0, 0, 1) + record
+        alert = bytes([58, 0, 5, 2, 0, 0, 1, 0])
+        event = scoped.frame(self.ether(self.ipv6("::", "ff02::16", 58, report, hop_limit=1, prefix=alert),
+                                        self.NATIVE_MAC, "33:33:00:00:00:16"))
+        self.assertEqual((event["extensions"], event["icmp_type"], event["records"]),
+                         ([0], 143, [dict(type=4, group="ff02::1:ff00:2")]))
+        self.assertTrue(event["checksum_valid"])
+
+    def test_injected_packet_too_big_is_checksummed_and_quotes_within_the_minimum_mtu(self):
+        tcp = bytearray(struct.pack("!HHIIBBHHH", 40002, 18080, 7, 9, 5 << 4, 0x18, 1000, 0, 0) + bytes(1440))
+        quoted = self.ipv6("fe80::2", "fe80::1", 6, tcp, hop_limit=64)
+        self.assertEqual(len(quoted), 1500)
+        frame = scoped.packet_too_big(quoted, scoped.PTB_MTU, "fe80::1", "fe80::2", self.PEER_MAC, self.NATIVE_MAC)
+        event = scoped.frame(frame)
+        self.assertTrue(event["checksum_valid"])
+        self.assertEqual((event["icmp_type"], event["icmp_code"], event["mtu"], event["ip_length"]),
+                         (2, 0, scoped.PTB_MTU, 1280))
+        self.assertEqual(event["quote"], quoted[:1232])
+        self.assertEqual((event["source"], event["destination"], event["eth_src"], event["eth_dst"]),
+                         ("fe80::1", "fe80::2", self.PEER_MAC, self.NATIVE_MAC))
+
+    def test_flows_select_one_connection_by_direction_and_ports(self):
+        segment = lambda direction, sport, dport, payload, length: dict(
+            protocol=6, direction=direction, sport=sport, dport=dport, payload=payload, ip_length=length)
+        events = [segment("out", 40000, 18080, 1440, 1500), segment("in", 18080, 40000, 0, 60),
+                  segment("out", 40001, 18080, 1340, 1400), segment("in", 40000, 18080, 1440, 1500),
+                  dict(protocol=58, direction="in")]
+        out, back = scoped.tcp_flow(events, 40000, 18080)
+        self.assertEqual((len(out), len(back)), (1, 1))
+        self.assertEqual((scoped.lengths(out), scoped.lengths(back)), ([1500], []))
+        self.assertTrue(scoped.scoped_name("[fe80::2%3]:40000", "fe80::2", 40000, 3))
+        self.assertFalse(scoped.scoped_name("[fe80::2%4]:40000", "fe80::2", 40000, 3))

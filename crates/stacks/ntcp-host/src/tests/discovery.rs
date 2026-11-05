@@ -121,6 +121,7 @@ fn input(host: &mut Host, link: LinkId, now: Instant, frame: &[u8]) -> Result<bo
 // The next ND transmission: link-layer destination and decoded message.
 fn output(
     host: &mut Host,
+    link: LinkId,
     now: Instant,
 ) -> Option<(
     [u8; 6],
@@ -129,7 +130,7 @@ fn output(
     NeighborTicket,
 )> {
     let mut out = [0; 128];
-    let transmit = host.neighbor_output(now, &mut out).unwrap()?;
+    let transmit = host.neighbor_output(link, now, &mut out).unwrap()?;
     let frame = &out[..transmit.len];
     assert_eq!(frame[7], 255);
     let packet = ntcp_ip6::parse(frame).unwrap();
@@ -162,10 +163,10 @@ fn dad_publishes_the_address_only_after_its_final_probe() {
     );
     assert!(!owned(&host, link));
     // Nothing is probed before the groups are joined.
-    assert!(output(&mut host, 10 * SECOND).is_none());
+    assert!(output(&mut host, link, 10 * SECOND).is_none());
     host.neighbor_membership_ready(link, own(), 0).unwrap();
-    assert!(output(&mut host, SECOND / 2 - 1).is_none());
-    let (mac, ip, message, ticket) = output(&mut host, SECOND / 2).unwrap();
+    assert!(output(&mut host, link, SECOND / 2 - 1).is_none());
+    let (mac, ip, message, ticket) = output(&mut host, link, SECOND / 2).unwrap();
     let group: Ipv6Addr = "ff02::1:ff00:1".parse().unwrap();
     assert_eq!(mac, [0x33, 0x33, 0xff, 0, 0, 1]);
     assert_eq!(
@@ -183,10 +184,10 @@ fn dad_publishes_the_address_only_after_its_final_probe() {
     host.complete_neighbor_output(ticket, BackendOutcome::WouldBlock, SECOND / 2)
         .unwrap();
     assert_eq!(host.service_neighbors(10 * SECOND).assigned, 0);
-    let (.., ticket) = output(&mut host, SECOND).unwrap();
+    let (.., ticket) = output(&mut host, link, SECOND).unwrap();
     host.complete_neighbor_output(ticket, BackendOutcome::Submitted, SECOND)
         .unwrap();
-    assert!(output(&mut host, SECOND).is_none());
+    assert!(output(&mut host, link, SECOND).is_none());
     assert_eq!(host.next_neighbor_deadline(), Some(2 * SECOND));
     assert_eq!(host.service_neighbors(2 * SECOND - 1).assigned, 0);
     assert!(!owned(&host, link));
@@ -230,8 +231,18 @@ fn tentative_addresses_are_never_answered_and_fail_on_duplicates() {
         host.neighbor_address_state(link, own()),
         Some(AddressState::Duplicate)
     );
-    assert!(output(&mut host, 10 * SECOND).is_none());
-    assert_eq!(host.service_neighbors(10 * SECOND).assigned, 0);
+    assert!(output(&mut host, link, 10 * SECOND).is_none());
+    // The owner's next pass reports the failure, once.
+    let failed = NeighborReport {
+        assigned: 0,
+        duplicates: 1,
+        first_error: None,
+    };
+    assert_eq!(host.service_neighbors(10 * SECOND), failed);
+    assert_eq!(
+        host.service_neighbors(10 * SECOND),
+        NeighborReport::default()
+    );
     assert!(!owned(&host, link));
 
     // A valid advertisement for a tentative address fails it as well.
@@ -257,6 +268,7 @@ fn tentative_addresses_are_never_answered_and_fail_on_duplicates() {
         host.neighbor_address_state(link, own()),
         Some(AddressState::Duplicate)
     );
+    assert_eq!(host.service_neighbors(0).duplicates, 1);
 }
 
 #[test]
@@ -293,7 +305,10 @@ fn assigned_addresses_answer_solicitations_and_learn_the_sender() {
         Err(Error::Path(path::Error::NoRoute))
     );
     assert_eq!(
-        (host.neighbor(link, peer()), output(&mut host, 0).is_none()),
+        (
+            host.neighbor(link, peer()),
+            output(&mut host, link, 0).is_none()
+        ),
         (None, true)
     );
 
@@ -306,7 +321,7 @@ fn assigned_addresses_answer_solicitations_and_learn_the_sender() {
     );
     // The queued answer is due at once, though a STALE entry has no timer.
     assert_eq!(host.next_neighbor_deadline(), Some(0));
-    let (mac, ip, message, ticket) = output(&mut host, 0).unwrap();
+    let (mac, ip, message, ticket) = output(&mut host, link, 0).unwrap();
     assert_eq!(mac, PEER);
     assert_eq!(
         (ip.source, ip.destination),
@@ -324,7 +339,7 @@ fn assigned_addresses_answer_solicitations_and_learn_the_sender() {
     );
     host.complete_neighbor_output(ticket, BackendOutcome::Submitted, 0)
         .unwrap();
-    assert!(output(&mut host, 0).is_none());
+    assert!(output(&mut host, link, 0).is_none());
     assert_eq!(host.next_neighbor_deadline(), None);
 
     // Another node's DAD probe for an assigned address is answered to
@@ -342,7 +357,7 @@ fn assigned_addresses_answer_solicitations_and_learn_the_sender() {
         false,
     );
     assert_eq!(input(&mut host, link, 0, &frame), Ok(true));
-    let (mac, ip, message, _) = output(&mut host, 0).unwrap();
+    let (mac, ip, message, _) = output(&mut host, link, 0).unwrap();
     assert_eq!(mac, [0x33, 0x33, 0, 0, 0, 1]);
     assert_eq!(ip.destination, IpAddr::V6(ntcp_ethernet::IPV6_ALL_NODES));
     assert!(matches!(
@@ -485,7 +500,7 @@ fn on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud() {
     );
     // The resolution solicitation, multicast to the target's group, from
     // the assigned address with its link-layer address.
-    let (mac, ip, message, ticket) = output(&mut a.0, 1).unwrap();
+    let (mac, ip, message, ticket) = output(&mut a.0, a.2.link(), 1).unwrap();
     let group = ntcp_ethernet::solicited_node(target);
     assert_eq!(Some(mac), ntcp_ethernet::ipv6_multicast_mac(group));
     assert_eq!((ip.source, ip.destination), (local.ip(), IpAddr::V6(group)));
@@ -684,23 +699,23 @@ fn unknown_resolution_solicitations_are_spaced_and_counted() {
     let (mut a, id, _held, _) = resolving();
     let mut now = 1;
     for attempt in 0..3 {
-        let (.., ticket) = output(&mut a.0, now).expect("a solicitation");
+        let (.., ticket) = output(&mut a.0, a.2.link(), now).expect("a solicitation");
         if attempt == 1 {
             // WouldBlock and NotSubmitted leave it due at once.
             a.0.complete_neighbor_output(ticket, BackendOutcome::WouldBlock, now)
                 .unwrap();
-            let (.., ticket) = output(&mut a.0, now).expect("still due");
+            let (.., ticket) = output(&mut a.0, a.2.link(), now).expect("still due");
             a.0.complete_neighbor_output(ticket, BackendOutcome::NotSubmitted, now)
                 .unwrap();
-            let (.., ticket) = output(&mut a.0, now).expect("still due");
+            let (.., ticket) = output(&mut a.0, a.2.link(), now).expect("still due");
             a.0.complete_neighbor_output(ticket, BackendOutcome::Unknown, now)
                 .unwrap();
         } else {
             a.0.complete_neighbor_output(ticket, BackendOutcome::Unknown, now)
                 .unwrap();
         }
-        assert!(output(&mut a.0, now).is_none());
-        assert!(output(&mut a.0, now + SECOND - 1).is_none());
+        assert!(output(&mut a.0, a.2.link(), now).is_none());
+        assert!(output(&mut a.0, a.2.link(), now + SECOND - 1).is_none());
         assert_eq!(a.0.next_neighbor_deadline(), Some(now + SECOND));
         a.0.service_neighbors(now + SECOND - 1);
         assert!(a.0.neighbor_wake().is_none());
@@ -708,7 +723,7 @@ fn unknown_resolution_solicitations_are_spaced_and_counted() {
     }
     // Three possibly sent: no fourth, and failure a full RetransTimer
     // after the third.
-    assert!(output(&mut a.0, now).is_none());
+    assert!(output(&mut a.0, a.2.link(), now).is_none());
     a.0.service_neighbors(now);
     assert_eq!(
         a.0.neighbor(a.2.link(), "2001:db8::2".parse().unwrap()),
@@ -732,10 +747,10 @@ fn unknown_dad_probes_are_spaced_but_not_counted() {
     host.add_neighbor_address(link, own()).unwrap();
     host.neighbor_membership_ready(link, own(), 0).unwrap();
     let start = SECOND / 2;
-    let (.., ticket) = output(&mut host, start).unwrap();
+    let (.., ticket) = output(&mut host, link, start).unwrap();
     host.complete_neighbor_output(ticket, BackendOutcome::Unknown, start)
         .unwrap();
-    assert!(output(&mut host, start + SECOND - 1).is_none());
+    assert!(output(&mut host, link, start + SECOND - 1).is_none());
     assert_eq!(host.service_neighbors(start + SECOND).assigned, 0);
     assert_eq!(
         host.neighbor_address_state(link, own()),
@@ -744,15 +759,15 @@ fn unknown_dad_probes_are_spaced_but_not_counted() {
     // Certainly unsent probes consume nothing and start no spacing.
     let next = start + SECOND;
     for outcome in [BackendOutcome::WouldBlock, BackendOutcome::NotSubmitted] {
-        let (.., ticket) = output(&mut host, next).unwrap();
+        let (.., ticket) = output(&mut host, link, next).unwrap();
         host.complete_neighbor_output(ticket, outcome, next)
             .unwrap();
         assert_eq!(host.service_neighbors(next + 2 * SECOND).assigned, 0);
     }
-    let (.., ticket) = output(&mut host, next).unwrap();
+    let (.., ticket) = output(&mut host, link, next).unwrap();
     host.complete_neighbor_output(ticket, BackendOutcome::Submitted, next)
         .unwrap();
-    assert!(output(&mut host, next + 10 * SECOND).is_none());
+    assert!(output(&mut host, link, next + 10 * SECOND).is_none());
     assert_eq!(host.service_neighbors(next + SECOND - 1).assigned, 0);
     assert_eq!(host.service_neighbors(next + SECOND).assigned, 1);
     assert!(owned(&host, link));
@@ -769,7 +784,7 @@ fn unknown_dad_probe_expects_its_looped_copy() {
     });
     host.add_neighbor_address(link, own()).unwrap();
     host.neighbor_membership_ready(link, own(), 0).unwrap();
-    let (.., ticket) = output(&mut host, SECOND / 2).unwrap();
+    let (.., ticket) = output(&mut host, link, SECOND / 2).unwrap();
     host.complete_neighbor_output(ticket, BackendOutcome::Unknown, SECOND / 2)
         .unwrap();
     let probe = ns_frame(Ipv6Addr::UNSPECIFIED, own(), None);
@@ -804,27 +819,27 @@ fn bounded_answers_end_unless_blocked() {
         assert_eq!(input(&mut host, link, 0, &ns(source)), Ok(true));
     }
     let answered = |ip: ntcp::IpMetadata| ip.destination;
-    let (_, ip, _, ticket) = output(&mut host, 0).unwrap();
+    let (_, ip, _, ticket) = output(&mut host, link, 0).unwrap();
     assert_eq!(answered(ip), IpAddr::V6(solicitors[0]));
     host.complete_neighbor_output(ticket, BackendOutcome::WouldBlock, 0)
         .unwrap();
-    let (_, ip, _, ticket) = output(&mut host, 0).unwrap();
+    let (_, ip, _, ticket) = output(&mut host, link, 0).unwrap();
     assert_eq!(answered(ip), IpAddr::V6(solicitors[0]));
     host.complete_neighbor_output(ticket, BackendOutcome::Unknown, 0)
         .unwrap();
-    let (_, ip, _, ticket) = output(&mut host, 0).unwrap();
+    let (_, ip, _, ticket) = output(&mut host, link, 0).unwrap();
     assert_eq!(answered(ip), IpAddr::V6(solicitors[1]));
     host.complete_neighbor_output(ticket, BackendOutcome::NotSubmitted, 0)
         .unwrap();
     // The third solicitation was never queued.
-    assert!(output(&mut host, 0).is_none());
+    assert!(output(&mut host, link, 0).is_none());
     // Its retransmission is answered now that slots are free.
     assert_eq!(input(&mut host, link, 1, &ns(solicitors[2])), Ok(true));
-    let (mac, ip, _, ticket) = output(&mut host, 1).unwrap();
+    let (mac, ip, _, ticket) = output(&mut host, link, 1).unwrap();
     assert_eq!((mac, answered(ip)), (PEER, IpAddr::V6(solicitors[2])));
     host.complete_neighbor_output(ticket, BackendOutcome::Submitted, 1)
         .unwrap();
-    assert!(output(&mut host, 1).is_none());
+    assert!(output(&mut host, link, 1).is_none());
 }
 
 // RFC 4861 section 7.2.3 through Host::receive: a unicast-source
@@ -847,7 +862,7 @@ fn solicitation_source_address_creates_and_updates_stale() {
         a.0.neighbor(link, target),
         Some((NeighborState::Stale, Some(PEER), false))
     );
-    let (mac, ip, message, ticket) = output(&mut a.0, 1).unwrap();
+    let (mac, ip, message, ticket) = output(&mut a.0, a.2.link(), 1).unwrap();
     assert_eq!((mac, ip.destination), (PEER, remote.ip()));
     assert!(matches!(
         message,
@@ -866,7 +881,7 @@ fn solicitation_source_address_creates_and_updates_stale() {
         Some(NeighborState::Delay)
     );
     // Neither a resolution nor a probe solicitation was needed.
-    assert!(output(&mut a.0, 2).is_none());
+    assert!(output(&mut a.0, a.2.link(), 2).is_none());
 
     let frame = ns_frame(target, own_address, Some(OTHER));
     assert_eq!(input(&mut a.0, link, 3, &frame), Ok(true));
@@ -1003,7 +1018,7 @@ fn echo_replies_use_the_cached_neighbor_mapping() {
     let peer: Ipv6Addr = "2001:db8::2".parse().unwrap();
     let frame = ns_frame(peer, own_address, Some(PEER));
     assert_eq!(input(&mut a.0, link, 1, &frame), Ok(true));
-    let (.., ticket) = output(&mut a.0, 1).unwrap();
+    let (.., ticket) = output(&mut a.0, a.2.link(), 1).unwrap();
     a.0.complete_neighbor_output(ticket, BackendOutcome::Submitted, 1)
         .unwrap();
     echo_in(&mut a, 2, &echo_request(peer, own_address, 1));
@@ -1030,7 +1045,7 @@ fn icmp_output_to_an_unresolved_neighbor_is_held_without_blocking_others() {
     echo_in(&mut a, 1, &echo_request(unresolved, own_address, 1));
     let frame = ns_frame(cached, own_address, Some(OTHER));
     assert_eq!(input(&mut a.0, link, 1, &frame), Ok(true));
-    let (.., ticket) = output(&mut a.0, 1).unwrap();
+    let (.., ticket) = output(&mut a.0, a.2.link(), 1).unwrap();
     a.0.complete_neighbor_output(ticket, BackendOutcome::Submitted, 1)
         .unwrap();
     echo_in(&mut a, 1, &echo_request(cached, own_address, 2));
@@ -1045,7 +1060,7 @@ fn icmp_output_to_an_unresolved_neighbor_is_held_without_blocking_others() {
     );
     // Held, not resubmitted, while it is resolved.
     assert_eq!(icmp_drain(&mut a, 3), None);
-    let (mac, ip, message, ticket) = output(&mut a.0, 3).expect("the solicitation");
+    let (mac, ip, message, ticket) = output(&mut a.0, a.2.link(), 3).expect("the solicitation");
     assert_eq!(mac, [0x33, 0x33, 0xff, 0, 0, 2]);
     assert_eq!(ip.source, IpAddr::V6(own_address));
     assert!(matches!(
@@ -1082,7 +1097,7 @@ fn failed_resolution_discards_held_icmp_output() {
     assert_eq!(icmp_drain(&mut a, 1), None);
     let mut now = 1;
     for _ in 0..3 {
-        let (.., ticket) = output(&mut a.0, now).expect("a solicitation");
+        let (.., ticket) = output(&mut a.0, a.2.link(), now).expect("a solicitation");
         a.0.complete_neighbor_output(ticket, BackendOutcome::Submitted, now)
             .unwrap();
         now += SECOND;
