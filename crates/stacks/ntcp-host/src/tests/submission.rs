@@ -534,7 +534,7 @@ fn tcp_retirement_across_sequence_wrap_and_owner_generation_reuse() {
     let old = a.0.correlate(now + 12, &quote(&lost));
     assert_eq!((old.matches, old.summarized, old.unique), (0, true, None));
     a.0.ledger
-        .retire_tcp(id, sequence(&lost).wrapping_add(1000));
+        .retire_tcp(id, sequence(&lost).wrapping_add(1000), |_| {});
     assert_eq!(records(&a.0).len(), 1, "stale generation retires nothing");
 }
 
@@ -595,7 +595,7 @@ fn delivery_shrinks_evicted_tcp_history_so_live_segments_stay_attributable() {
     // outstanding segment.
     let rounds = (1u64 << 32) / u64::from(SPAN) + 100;
     for k in 0..rounds as u32 {
-        ledger.retire_tcp(id, k.wrapping_sub(3).wrapping_mul(SPAN));
+        ledger.retire_tcp(id, k.wrapping_sub(3).wrapping_mul(SPAN), |_| {});
         let ticket = ledger.reserve_group(index, &[segment(k)]).unwrap();
         assert_eq!(ledger.seal(ticket, 10, false), 1);
         if k % 4096 == 4095 || k + 1 == rounds as u32 {

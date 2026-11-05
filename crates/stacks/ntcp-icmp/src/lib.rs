@@ -2,6 +2,15 @@
 use core::net::IpAddr;
 use ntcp::{IpMetadata, Ipv4Options};
 pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, checksum};
+mod nd;
+pub use nd::{
+    ND_HOP_LIMIT, NeighborAdvertisement, NeighborMessage, NeighborSolicitation, decode_neighbor,
+    encode_advertisement, encode_solicitation,
+};
+mod redirect;
+pub use redirect::{
+    Ipv4Redirect, Ipv6Redirect, RedirectCode, decode_ipv4_redirect, decode_ipv6_redirect,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeedbackKind {

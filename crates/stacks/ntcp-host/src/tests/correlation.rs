@@ -624,7 +624,7 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
                                 s.retired = true;
                             }
                         }
-                        ledger.retire_tcp(id, una);
+                        ledger.retire_tcp(id, una, |_| {});
                     }
                     _ => {
                         if let Some(index) = ledger.owner_index(Owner::Tcp(id)) {

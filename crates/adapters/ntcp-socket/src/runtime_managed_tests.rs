@@ -48,7 +48,7 @@ fn native_output(
         crate::EthernetPacketIo {
             io: Box::new(Fixture(state.clone())),
             local_mac: [2; 6],
-            next_hop_mac: [4; 6],
+            next_hop_mac: Some([4; 6]),
         },
     )
     .unwrap();
@@ -74,7 +74,7 @@ fn native_output(
             .as_ref()
             .unwrap()
             .paths()
-            .link(owner.ingress.unwrap().link())
+            .link(owner.ports[0].ingress.unwrap().link())
             .unwrap()
             .mtu,
         mtu
@@ -201,7 +201,7 @@ fn managed_native_startup_refuses_missing_or_failed_physical_facts() {
             crate::EthernetPacketIo {
                 io: Box::new(Fixture(state.clone())),
                 local_mac: [2; 6],
-                next_hop_mac: [4; 6],
+                next_hop_mac: Some([4; 6]),
             },
         );
         assert_eq!(result.err(), Some(expected));
@@ -440,13 +440,13 @@ fn managed_native_repeated_constructor_and_option_failures_reuse_exact_generatio
     let remote: SocketAddr = "10.73.0.3:8080".parse().unwrap();
     for _ in 0..16 {
         owner.sockets.get_mut(&socket).unwrap().send_capacity = 0;
-        assert!(owner.start_connection(socket, local, remote, None).is_err());
+        assert!(owner.start_connection(socket, local, remote, None, None).is_err());
         assert_eq!(owner.host.as_ref().unwrap().binding_count(), 0);
         assert_eq!(owner.host.as_ref().unwrap().paths().usage().clients, 0);
         owner.sockets.get_mut(&socket).unwrap().send_capacity = 65536;
         owner.sockets.get_mut(&socket).unwrap().user_timeout_ms = -1;
         assert_eq!(
-            owner.start_connection(socket, local, remote, None),
+            owner.start_connection(socket, local, remote, None, None),
             Err(EINVAL)
         );
         assert_eq!(owner.host.as_ref().unwrap().binding_count(), 0);
@@ -454,13 +454,13 @@ fn managed_native_repeated_constructor_and_option_failures_reuse_exact_generatio
         assert!(matches!(owner.sockets[&socket].handle, Handle::Fresh));
         owner.sockets.get_mut(&socket).unwrap().user_timeout_ms = 0;
     }
-    owner.start_connection(socket, local, remote, None).unwrap();
+    owner.start_connection(socket, local, remote, None, None).unwrap();
     let cid = connection(&owner, socket);
     let prepared = owner.host.as_ref().unwrap().binding(cid).unwrap();
     for _ in 0..16 {
         let other = new(&mut owner, SOCK_NONBLOCK);
         assert_eq!(
-            owner.start_connection(other, SocketAddr::new(owner.local, 40001), remote, None),
+            owner.start_connection(other, SocketAddr::new(owner.local, 40001), remote, None, None),
             Err(ENOBUFS)
         );
         owner.execute(other, Op::Close).unwrap();
@@ -476,7 +476,7 @@ fn managed_native_live_class_capacity_failure_preserves_socket_core_client_and_d
     // explicitly constrained Host storage. Keep the actual registered backend,
     // source and forwarding contract; normal startup includes migration space.
     let previous = owner.host.as_ref().unwrap();
-    let ingress = owner.ingress.unwrap();
+    let ingress = owner.ports[0].ingress.unwrap();
     let receive = previous.receive_capabilities(ingress).unwrap();
     let link = previous.paths().link(ingress.link()).unwrap();
     let (mut paths, limits) = ntcp_host::managed_limits(&owner.defaults, 1, 1, 1, 1, 1).unwrap();
@@ -515,7 +515,7 @@ fn managed_native_live_class_capacity_failure_preserves_socket_core_client_and_d
     owner.endpoint = Endpoint::new(owner.defaults.clone(), [42; 32], 0, |_| true).unwrap();
     host.attach(&mut owner.endpoint).unwrap();
     owner.host = Some(host);
-    owner.ingress = Some(ingress);
+    owner.ports[0].ingress = Some(ingress);
     let socket = new(&mut owner, SOCK_NONBLOCK);
     class(&mut owner, socket, 96).unwrap();
     assert_eq!(
@@ -589,7 +589,7 @@ fn managed_native_public_rust_fast_open_helper_and_fd_alias_use_production_attac
         Ok(crate::EthernetPacketIo {
             io: Box::new(Fixture(factory_state)),
             local_mac: [2; 6],
-            next_hop_mac: [4; 6],
+            next_hop_mac: Some([4; 6]),
         })
     })
     .unwrap();
@@ -683,7 +683,7 @@ fn managed_native_time_wait_replacement_capacity_keeps_old_binding_and_cancels_p
         a.test_now = Some(1_001_000);
         b.test_now = Some(1_001_000);
         let next = new(&mut a, SOCK_NONBLOCK);
-        a.start_connection(next, local, remote, None).unwrap();
+        a.start_connection(next, local, remote, None, None).unwrap();
         flush(&mut a, &mut b, &wa);
         assert_eq!(b.host.as_ref().unwrap().binding(old).unwrap(), retained);
         let current = b

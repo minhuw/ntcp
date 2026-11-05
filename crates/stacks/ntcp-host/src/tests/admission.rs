@@ -73,8 +73,10 @@ fn core_input(
         host: &mut peer.0,
         prepared: 0,
     };
+    let link = peer.2.link();
     let result = peer.1.input_with_path_provider(
         now,
+        link,
         ip,
         0,
         Ipv4Options::default(),
@@ -95,8 +97,9 @@ fn rejected_managed_syns_prepare_no_path_and_valid_syn_still_establishes() {
         let (local, remote) = addresses(v6);
         let mut b = managed(remote, 41, cfg.clone());
         let listener = b.1.listen(remote, 4).unwrap();
+        // A link-local source is admitted with its arrival link's scope.
         let sources: &[&str] = if v6 {
-            &["::", "ff02::1", "fe80::2"]
+            &["::", "ff02::1"]
         } else {
             &["0.0.0.0", "224.0.0.1"]
         };
@@ -260,7 +263,7 @@ fn managed_active_open_keeps_endpoint_admission_errors_and_reserves_no_route_for
         assert!(selected(&mut a.1, 1).is_none());
         // An owned, registered source with no matching forwarding route.
         let request =
-            a.0.request(local.ip(), remote.ip(), Dscp::new(24).unwrap())
+            a.0.request(local.ip(), remote.ip(), None, Dscp::new(24).unwrap())
                 .unwrap();
         let route = a.0.paths().resolve(request).unwrap().key().route();
         a.0.remove_route(route).unwrap();

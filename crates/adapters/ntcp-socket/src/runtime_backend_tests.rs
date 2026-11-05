@@ -231,10 +231,10 @@ fn attach(owner: &mut Owner, capacity: usize) -> Arc<Mutex<State>> {
         capacity,
         ..Default::default()
     }));
-    owner.ethernet = Some(EthernetBackend {
+    owner.ports[0].ethernet = Some(EthernetBackend {
         io: Box::new(Fixture(state.clone())),
         local: [2; 6],
-        next_hop: [4; 6],
+        next_hop: Some([4; 6]),
         next_cookie: 1,
         pending: Vec::new(),
         cancelled: Vec::new(),
@@ -403,7 +403,7 @@ fn missing_hardware_evicts_oldest_sources_not_tcp_or_ack_or_queued_events() {
         assert_eq!(take_offered(&state), packet);
         assert!(state.lock().unwrap().sent.is_empty());
         assert_eq!(state.lock().unwrap().cancelled, [1]);
-        assert!(a.ethernet.as_ref().unwrap().pending.is_empty());
+        assert!(a.ports[0].ethernet.as_ref().unwrap().pending.is_empty());
     }
     state.lock().unwrap().block = false;
     advance(&mut a, 1000);
@@ -446,7 +446,7 @@ fn missing_hardware_evicts_oldest_sources_not_tcp_or_ack_or_queued_events() {
         b"second"
     );
     assert_eq!(b.execute(plain_peer, Op::Read(99)).unwrap().bytes, b"plain");
-    assert_eq!(a.ethernet.as_ref().unwrap().pending.len(), 1);
+    assert_eq!(a.ports[0].ethernet.as_ref().unwrap().pending.len(), 1);
 }
 
 #[test]
@@ -474,8 +474,8 @@ fn real_backpressure_retries_unchanged_without_reservation_or_duplicate() {
         assert_eq!(take_offered(&state), bytes);
         assert_eq!(a.egress.as_ref().unwrap().attempt(cid), attempt);
         assert_eq!(a.sockets[&client].timestamps.reserved(), 3);
-        assert!(a.ethernet.as_ref().unwrap().pending.is_empty());
-        assert_eq!(a.ethernet.as_ref().unwrap().next_cookie, 1);
+        assert!(a.ports[0].ethernet.as_ref().unwrap().pending.is_empty());
+        assert_eq!(a.ports[0].ethernet.as_ref().unwrap().next_cookie, 1);
     }
     state.lock().unwrap().block = false;
     advance(&mut a, 1000);
@@ -506,7 +506,7 @@ fn impossible_or_unsupported_metadata_falls_back_but_fatal_io_does_not() {
         );
         a.execute(client, Op::Write(b"data".to_vec())).unwrap();
         if exhausted {
-            a.ethernet.as_mut().unwrap().next_cookie = u64::MAX;
+            a.ports[0].ethernet.as_mut().unwrap().next_cookie = u64::MAX;
         }
         state.lock().unwrap().error = error;
         if error == Some(io::ErrorKind::BrokenPipe) {
@@ -574,11 +574,11 @@ fn full_phase_capacity_across_connections_never_blocks_transport() {
             unreachable!()
         };
         assert_eq!(a.endpoint.transport_info(cid).unwrap().unacked, 0);
-        assert!(a.ethernet.as_ref().unwrap().pending.len() <= timestamps::PHASES);
+        assert!(a.ports[0].ethernet.as_ref().unwrap().pending.len() <= timestamps::PHASES);
     }
     assert_eq!(state.lock().unwrap().cancelled, [1]);
     assert_eq!(
-        a.ethernet.as_ref().unwrap().pending.len(),
+        a.ports[0].ethernet.as_ref().unwrap().pending.len(),
         timestamps::PHASES
     );
     a.execute(plain, Op::Write(b"plain".to_vec())).unwrap();
@@ -789,10 +789,10 @@ fn pmtud_owner(
     let config = backend_config(config, &io).unwrap();
     let mut owner = Owner::with_config(local, (local, 24), [last; 32], None, config).unwrap();
     owner.test_now = Some(1000);
-    owner.ethernet = Some(EthernetBackend {
+    owner.ports[0].ethernet = Some(EthernetBackend {
         io: Box::new(io),
         local: [2; 6],
-        next_hop: [4; 6],
+        next_hop: Some([4; 6]),
         next_cookie: 1,
         pending: Vec::new(),
         cancelled: Vec::new(),
@@ -1089,7 +1089,7 @@ fn egress_with_refresh(
 ) -> (Receiver<()>, SyncSender<io::Result<Option<u32>>>) {
     owner.enable_egress(capacity, None).unwrap();
     let (refresh, request, result) = super::super::output::MtuRefresh::fixture();
-    owner.mtu_refresh = Some(refresh);
+    owner.ports[0].mtu_refresh = Some(refresh);
     (request, result)
 }
 fn connection(owner: &Owner, id: u64) -> ConnectionId {
@@ -1778,7 +1778,7 @@ fn reserved_repeated_interrupted_expires_only_owner_and_releases_commands() {
             );
             assert!(state.lock().unwrap().sent.is_empty());
             assert!(state.lock().unwrap().requests.is_empty());
-            assert_eq!(a.ethernet.as_ref().unwrap().next_cookie, 1);
+            assert_eq!(a.ports[0].ethernet.as_ref().unwrap().next_cookie, 1);
         }
         a.expire_egress(deadline - 1).unwrap();
         assert!(a.endpoint.is_output_reserved(cid));
@@ -2210,7 +2210,7 @@ fn scheduled_mtu_prefix_repair_keeps_deadline_and_other_owner_alive() {
     let (mut a, mut b, clients, servers, state) = scheduled_pair(4);
     let held = connection(&a, clients[0]);
     let (refresh, request, result) = super::super::output::MtuRefresh::fixture();
-    a.mtu_refresh = Some(refresh);
+    a.ports[0].mtu_refresh = Some(refresh);
     state.lock().unwrap().enforce_mtu = true;
     state.lock().unwrap().mtu = Some(1400);
     a.execute(clients[0], Op::Write(vec![7; 8000])).unwrap();
@@ -2886,4 +2886,14 @@ fn retained_native_receive_preserves_original_segment_size_through_reservation()
         a.execute(clients[0], Op::Read(10037)).unwrap().bytes,
         vec![0x51; 10037]
     );
+}
+
+// Device timestamps compare equal only within one opened clock: a later
+// interface given the same index is another device.
+#[test]
+fn device_clock_identities_are_not_interface_indices_and_never_repeat() {
+    let first = device_clock();
+    let second = device_clock();
+    assert_ne!(first, second);
+    assert!(second > first);
 }

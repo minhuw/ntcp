@@ -116,7 +116,7 @@ fn runtime_with(
                 crate::EthernetPacketIo {
                     io: Box::new(Fixture(state)),
                     local_mac: [2; 6],
-                    next_hop_mac: [4; 6],
+                    next_hop_mac: Some([4; 6]),
                 },
             )?;
             owner.start_control(config.control.as_ref())?;

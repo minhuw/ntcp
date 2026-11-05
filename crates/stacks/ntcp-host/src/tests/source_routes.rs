@@ -414,6 +414,7 @@ fn changed_return_route_failed_refresh_and_class_rebind_preserve_authority_and_r
                     b.0.request(
                         addresses(false).1.ip(),
                         hop(suffix).into(),
+                        None,
                         Dscp::new(24).unwrap(),
                     )
                     .unwrap();

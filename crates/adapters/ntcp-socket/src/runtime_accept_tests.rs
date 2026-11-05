@@ -59,10 +59,10 @@ fn held_child(siblings: usize, flags: i32) -> (Owner, u64, ConnectionId, Arc<Mut
         blocked: true,
         ..Default::default()
     }));
-    b.ethernet = Some(EthernetBackend {
+    b.ports[0].ethernet = Some(EthernetBackend {
         io: Box::new(Backend(backend.clone())),
         local: [2; 6],
-        next_hop: [4; 6],
+        next_hop: Some([4; 6]),
         next_cookie: 1,
         pending: Vec::new(),
         cancelled: Vec::new(),

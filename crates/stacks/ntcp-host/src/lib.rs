@@ -51,6 +51,13 @@ pub use ident::{
 };
 mod admin;
 pub use admin::{AdminCandidate, AdminClient, Administration, AffectedPath, ClientReport};
+mod neighbor;
+use neighbor::Neighbors;
+pub use neighbor::{AddressState, NdPort, NeighborLimits, NeighborState};
+mod redirect;
+pub use redirect::{RedirectOutcome, RedirectRejection};
+mod discovery;
+pub use discovery::{NeighborHop, NeighborReport, NeighborTicket, NeighborTransmit, NeighborWake};
 mod udp;
 use path::{
     ContextId, Dscp, ForwarderId, InterfaceKey, LinkId, PathRequest, PathService, PathSnapshot,
@@ -81,6 +88,9 @@ pub enum Error {
     /// submitted; the owner revalidates (`registration_candidate`,
     /// `revalidate_registration`) or opens a new connection.
     StaleRoute,
+    /// The embedding's entropy supply is absent or failed; what needed it
+    /// (an RFC 4861 ReachableTime or RFC 4862 DAD delay) did not change.
+    Entropy,
 }
 impl From<path::Error> for Error {
     fn from(error: path::Error) -> Self {
@@ -203,6 +213,8 @@ pub struct Limits {
     /// Source fragmentation and identifier allocation; nothing is
     /// fragmented by default.
     pub datagrams: DatagramLimits,
+    /// Neighbor Discovery for ND-capable ports; none by default.
+    pub neighbors: NeighborLimits,
 }
 
 /// Fragmented datagrams this Host context can receive, per family: what it
@@ -291,6 +303,7 @@ pub fn managed_limits(
             icmp_errors: IcmpErrorLimits::default(),
             icmp_output: IcmpOutputLimits::default(),
             datagrams: DatagramLimits::default(),
+            neighbors: NeighborLimits::default(),
         },
     ))
 }
@@ -434,6 +447,9 @@ pub enum IcmpOutcome {
     /// An Echo Reply, or an ICMP error quoting an Echo Request, considered
     /// by the Echo adjunct.
     Probe(ProbeOutcome),
+    /// An IPv4 Redirect. (An ICMPv6 Redirect is Neighbor Discovery,
+    /// consumed by `receive` on an ND-capable port.)
+    Redirect(RedirectOutcome),
 }
 
 /// An ICMP error for a TCP owner whose output is reserved. Nothing was
@@ -561,6 +577,7 @@ pub struct Host {
     datagram_limits: DatagramLimits,
     identifiers: Allocator,
     adjunct: Adjunct,
+    neighbors: Neighbors<discovery::HeldOutput>,
     entropy: Option<Entropy>,
     // Latest caller time seen by a submission or collection; only used to
     // skip burying history that has already expired.
@@ -637,6 +654,11 @@ impl Host {
             datagram_limits: limits.datagrams,
             identifiers: Allocator::new(limits.datagrams.identifiers, timebase.units_per_second)?,
             adjunct: Adjunct::new(limits.datagrams.adjunct, timebase.units_per_second)?,
+            neighbors: Neighbors::new(
+                limits.neighbors,
+                path_limits.links,
+                timebase.units_per_second,
+            )?,
             entropy: None,
             now: 0,
             timebase,
@@ -652,6 +674,11 @@ impl Host {
         link: LinkId,
     ) -> Result<path::SourceId, Error> {
         self.port(link)?;
+        // An ND-capable port's IPv6 addresses are published by DAD
+        // (`add_neighbor_address`), never at once.
+        if address.address().is_ipv6() && self.neighbors.port(link).is_some() {
+            return Err(Error::Unsupported);
+        }
         Ok(self.paths.register_source(address, link)?)
     }
     pub fn remove_source_owner(
@@ -871,6 +898,7 @@ impl Host {
     pub fn remove_link(&mut self, context: IngressContext) -> Result<(), Error> {
         self.port(context.link)?;
         self.paths.remove_link(context.link)?;
+        self.neighbors.remove_port(context.link);
         let slot = self
             .ports
             .iter()
@@ -905,28 +933,30 @@ impl Host {
             _ => Err(Error::Unsupported),
         }
     }
+    // `zone` scopes the link-local addresses of a scoped identity
+    // (`ScopedTuple`); unscoped addresses never carry it.
     fn request(
         &self,
         source: IpAddr,
         destination: IpAddr,
+        zone: Option<LinkId>,
         dscp: Dscp,
     ) -> Result<PathRequest, Error> {
-        // Endpoint's current tuple contract rejects scoped socket addresses;
-        // the canonical service still supports scoped identities independently.
         // An unregistered source is missing local authority, not a missing
         // route: NoRoute is reserved for forwarding selection from a source
         // this host owns.
         Ok(PathRequest {
-            source: self.source(source)?,
-            destination: ScopedAddress::new(destination, None)?,
+            source: self.source(source, zone)?,
+            destination: scoped(destination, zone)?,
             dscp,
         })
     }
-    fn source(&self, address: IpAddr) -> Result<path::SourceId, Error> {
+    fn source(&self, address: IpAddr, zone: Option<LinkId>) -> Result<path::SourceId, Error> {
+        let zone = zone.filter(|_| matches!(address, IpAddr::V6(v) if v.is_unicast_link_local()));
         Ok(self
             .paths
             .sources()
-            .find(|(_, a)| a.address() == address && a.zone().is_none())
+            .find(|(_, a)| a.address() == address && a.zone() == zone)
             .map(|(id, _)| id)
             .ok_or(path::Error::SourceNotOwned)?)
     }
@@ -983,7 +1013,7 @@ impl Host {
         if current.binding.client != binding.prepared.client {
             return Err(Error::InvalidContext);
         }
-        let via = ScopedAddress::new(current.forwarding_destination, None)?;
+        let via = scoped(current.forwarding_destination, current.zone)?;
         let mut snapshot = self.paths.snapshot(binding.prepared.client)?;
         // A validated peer return-route update need not invalidate the old
         // routing entry, so compare the actual outgoing selection as well.
@@ -991,6 +1021,7 @@ impl Host {
             let request = self.request(
                 snapshot.key().source_address().address(),
                 snapshot.key().destination().address(),
+                current.zone,
                 snapshot.key().dscp(),
             )?;
             let resolved = self.paths.resolve_via(request, via)?;
@@ -1040,7 +1071,7 @@ impl Host {
         }
         let mut request = binding.snapshot.key().request();
         request.dscp = Dscp::new(dscp)?;
-        let via = ScopedAddress::new(old.forwarding_destination, None)?;
+        let via = scoped(old.forwarding_destination, old.zone)?;
         let resolved = self.paths.resolve_via(request, via)?;
         self.forwarding_resolved(resolved.key())?;
         let (client, snapshot) = self.paths.rebind_via(binding.client, request, via)?;
@@ -1309,7 +1340,7 @@ impl Host {
             match self.ledger.owner(index) {
                 Some(Owner::Tcp(id)) if endpoint.connection_exists(id) => {
                     if let Ok(progress) = endpoint.send_progress(id) {
-                        self.ledger.retire_tcp(id, progress.unacknowledged_sequence);
+                        self.retire_tcp(id, progress.unacknowledged_sequence);
                     }
                 }
                 Some(Owner::Tcp(id)) if !endpoint.is_output_reserved(id) => {
@@ -1319,6 +1350,55 @@ impl Host {
             }
         }
         self.ledger.expire(self.now);
+    }
+
+    // Retire delivered TCP data. Each definitely submitted segment a new
+    // cumulative acknowledgment covers is forward progress through the
+    // neighbor that carried it (RFC 4861 section 7.3.1), when its path is
+    // still the owner's authoritative one: duplicate acknowledgments retire
+    // nothing, and data sent on an old route confirms nothing.
+    fn retire_tcp(&mut self, id: ConnectionId, unacknowledged: u32) {
+        let Self {
+            ledger,
+            neighbors,
+            bindings,
+            entropy,
+            now,
+            ..
+        } = self;
+        let current = bindings
+            .iter()
+            .flatten()
+            .find(|b| b.owner == Some(id))
+            .map(|b| b.prepared.snapshot);
+        ledger.retire_tcp(id, unacknowledged, |record| {
+            let Some(snapshot) = current else {
+                return;
+            };
+            let evidence = record.evidence;
+            if record.possibly_submitted
+                || snapshot.status() != PathStatus::Valid
+                || snapshot.path() != evidence.path
+                || snapshot.key().link() != evidence.link
+            {
+                return;
+            }
+            let ResolvedNextHop::Address(next_hop) = snapshot.key().next_hop() else {
+                return;
+            };
+            let IpAddr::V6(next_hop) = next_hop.address() else {
+                return;
+            };
+            // A confirmation without entropy for its ReachableTime is lost,
+            // like an unsent hint; NUD then probes.
+            let _ = neighbors.confirm(
+                evidence.link,
+                next_hop,
+                record.committed_at,
+                *now,
+                entropy.as_mut(),
+            );
+        });
     }
 
     // Idempotent: one reservation per physical attempt. Owner admission is
@@ -1497,7 +1577,7 @@ impl Host {
                     Err(error) => Err(error),
                 }
             }
-            Ok(Received::Held) => Ok(ntcp::InputDisposition::Processed),
+            Ok(Received::Held | Received::Neighbor) => Ok(ntcp::InputDisposition::Processed),
             Ok(Received::Discarded) => Ok(ntcp::InputDisposition::Dropped),
             Err(error) => Err(error),
         };
@@ -1533,6 +1613,7 @@ impl Host {
             }
             Ok(endpoint.input_with_path_provider(
                 now,
+                context.link,
                 packet.ip,
                 packet.traffic_class,
                 packet.options,
@@ -1636,72 +1717,16 @@ impl Host {
         }
         self.now = self.now.max(now);
         let quote = feedback.quoted;
-        let key = QuoteKey {
-            source: quote.ip.source,
-            destination: quote.ip.destination,
-            header_len: u32::from(quote.ip_header_len),
-            packet_len: quote.ip_packet_len,
-            protocol: quote.protocol,
-            transport: match (quote.fragment, quote.transport) {
-                // A quoted fragment of a datagram this Host source-fragmented
-                // (RFC 4821 section 8). Fragment zero of a UDP datagram is
-                // correlated by its UDP header, which is its leading data;
-                // every other fragment only by its exact physical evidence,
-                // never by ports and never by the IPv4 Identification (RFC
-                // 6864 section 4.1). The Host never originates TCP fragments
-                // or IPv6 atomic fragments (RFC 8021), so their quotes find no
-                // evidence and never reach TCP repair.
-                (
-                    Some(f),
-                    QuotedTransport::Udp {
-                        source_port,
-                        destination_port,
-                        length,
-                        checksum,
-                    },
-                ) if f.offset == 0 && f.more_fragments => QuotedSelector::UdpFirstFragment {
-                    source_port,
-                    destination_port,
-                    length,
-                    checksum,
-                },
-                (Some(f), _) => QuotedSelector::Fragment {
-                    offset: f.offset,
-                    more: f.more_fragments,
-                    prefix: FragmentPrefix::new(f.data()),
-                },
-                (
-                    None,
-                    QuotedTransport::Tcp {
-                        source_port,
-                        destination_port,
-                        sequence,
-                    },
-                ) => QuotedSelector::Tcp {
-                    source_port,
-                    destination_port,
-                    sequence,
-                },
-                (
-                    None,
-                    QuotedTransport::Udp {
-                        source_port,
-                        destination_port,
-                        length,
-                        checksum,
-                    },
-                ) => QuotedSelector::Udp {
-                    source_port,
-                    destination_port,
-                    length,
-                    checksum,
-                },
-                (None, QuotedTransport::Other) => QuotedSelector::Other,
-            },
-        };
+        let key = quote_key(&quote);
         let ptb = feedback.kind == FeedbackKind::PacketTooBig;
         let candidate = feedback.candidate_mtu;
-        let exact = self.ledger.correlate(now, &key);
+        // The decoder requires the outer destination to be the quoted
+        // source: a link-local one is the address of the arrival link, which
+        // constrains the candidates. Unscoped quotes search every link, the
+        // outgoing link coming only from ledger evidence.
+        let scoped = matches!(quote.ip.source, IpAddr::V6(v) if v.is_unicast_link_local());
+        let zone = scoped.then_some(context.link);
+        let exact = self.ledger.correlate_in(now, &key, zone);
         // The dropped packet's complete length under each matching reading.
         let mut dropped = (exact.matches != 0).then_some(key.packet_len);
         let mut correlation = exact;
@@ -1720,7 +1745,7 @@ impl Host {
                 .checked_sub(key.header_len)
                 .filter(|len| *len >= key.header_len + 20)
         {
-            let corrected = self.ledger.correlate(now, &QuoteKey { packet_len, ..key });
+            let corrected = self.ledger.correlate_in(now, &QuoteKey { packet_len, ..key }, zone);
             if corrected.matches != 0 {
                 dropped = Some(dropped.map_or(packet_len, |len| len.min(packet_len)));
             }
@@ -1745,7 +1770,6 @@ impl Host {
         {
             return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
         }
-        let scoped = matches!(quote.ip.source, IpAddr::V6(v) if v.is_unicast_link_local());
         if scoped
             && correlation
                 .owner
@@ -2069,6 +2093,25 @@ impl Host {
         let packet = endpoint
             .transmit_attempt_packet(attempt)
             .ok_or(Error::Obsolete)?;
+        // A connection's packets carry its scoped identity; a stateless reply
+        // to a link-local peer carries the arrival link of the input that
+        // caused it. Either leaves only on that link.
+        let zone = match packet.connection {
+            Some(owner) => endpoint.managed_path(owner)?.zone,
+            None => endpoint
+                .transmit_attempt_zone(attempt)
+                .ok_or(Error::Obsolete)?,
+        };
+        // A reply whose link was removed or replaced can leave on no link:
+        // it is counted once and the embedding discards it as certainly
+        // unsubmitted, rather than holding it for a link that never returns.
+        if packet.connection.is_none()
+            && let Some(link) = zone
+            && self.port(link).is_err()
+        {
+            endpoint.count_undeliverable_reply(attempt);
+            return Err(Error::Obsolete);
+        }
         let binding = if let Some(owner) = packet.connection {
             self.authorized_refresh(endpoint, owner, &packet)?
         } else if let Some(index) = self
@@ -2081,9 +2124,10 @@ impl Host {
             let request = self.request(
                 packet.ip.source,
                 packet.ip.destination,
+                zone,
                 Dscp::new(packet.dscp)?,
             )?;
-            let via = ScopedAddress::new(wire_destination(packet), None)?;
+            let via = scoped(wire_destination(packet), zone)?;
             let prepared = if snapshot.status() != PathStatus::Valid
                 || snapshot.key().request() != request
                 || !self.forwards_via(snapshot.key(), via)
@@ -2117,9 +2161,10 @@ impl Host {
             let request = self.request(
                 packet.ip.source,
                 packet.ip.destination,
+                zone,
                 Dscp::new(packet.dscp)?,
             )?;
-            let via = ScopedAddress::new(destination, None)?;
+            let via = scoped(destination, zone)?;
             let resolved = self.paths.resolve_via(request, via)?;
             self.forwarding_resolved(resolved.key())?;
             let (client, snapshot) = self.paths.acquire_via(request, via)?;
@@ -2131,10 +2176,7 @@ impl Host {
         if packet.dscp != binding.snapshot.key().dscp().value()
             || packet.ip.source != binding.snapshot.key().source_address().address()
             || packet.ip.destination != binding.snapshot.key().destination().address()
-            || !self.forwards_via(
-                binding.snapshot.key(),
-                ScopedAddress::new(wire_destination(packet), None)?,
-            )
+            || !self.forwards_via(binding.snapshot.key(), scoped(wire_destination(packet), zone)?)
         {
             return Err(Error::Obsolete);
         }
@@ -2203,12 +2245,14 @@ impl Host {
         self.check_endpoint(endpoint)?;
         let (_, binding, _) = self.planned(owner)?;
         let key = binding.prepared.snapshot.key();
+        let current = endpoint.managed_path(owner)?;
         let request = self.request(
             key.source_address().address(),
             key.destination().address(),
+            current.zone,
             key.dscp(),
         )?;
-        let via = ScopedAddress::new(endpoint.managed_path(owner)?.forwarding_destination, None)?;
+        let via = scoped(current.forwarding_destination, current.zone)?;
         match self.paths.resolve_via(request, via) {
             Ok(resolved) => {
                 self.forwarding_resolved(resolved.key())?;
@@ -2568,7 +2612,7 @@ impl Host {
             .and_then(|p| p.connection)
             && let Ok(progress) = endpoint.send_progress(id)
         {
-            self.ledger.retire_tcp(id, progress.unacknowledged_sequence);
+            self.retire_tcp(id, progress.unacknowledged_sequence);
         }
         match submit(live) {
             BackendOutcome::Submitted => {
@@ -2691,6 +2735,73 @@ fn live<T>(result: Result<T, EndpointError>) -> Result<Option<T>, Error> {
     }
 }
 
+// The ledger key of a validated quote.
+pub(crate) fn quote_key(quote: &ntcp_icmp::Quote) -> QuoteKey {
+    QuoteKey {
+        source: quote.ip.source,
+        destination: quote.ip.destination,
+        header_len: u32::from(quote.ip_header_len),
+        packet_len: quote.ip_packet_len,
+        protocol: quote.protocol,
+        transport: match (quote.fragment, quote.transport) {
+            // A quoted fragment of a datagram this Host source-fragmented
+            // (RFC 4821 section 8). Fragment zero of a UDP datagram is
+            // correlated by its UDP header, which is its leading data;
+            // every other fragment only by its exact physical evidence,
+            // never by ports and never by the IPv4 Identification (RFC
+            // 6864 section 4.1). The Host never originates TCP fragments
+            // or IPv6 atomic fragments (RFC 8021), so their quotes find no
+            // evidence and never reach TCP repair.
+            (
+                Some(f),
+                QuotedTransport::Udp {
+                    source_port,
+                    destination_port,
+                    length,
+                    checksum,
+                },
+            ) if f.offset == 0 && f.more_fragments => QuotedSelector::UdpFirstFragment {
+                source_port,
+                destination_port,
+                length,
+                checksum,
+            },
+            (Some(f), _) => QuotedSelector::Fragment {
+                offset: f.offset,
+                more: f.more_fragments,
+                prefix: FragmentPrefix::new(f.data()),
+            },
+            (
+                None,
+                QuotedTransport::Tcp {
+                    source_port,
+                    destination_port,
+                    sequence,
+                },
+            ) => QuotedSelector::Tcp {
+                source_port,
+                destination_port,
+                sequence,
+            },
+            (
+                None,
+                QuotedTransport::Udp {
+                    source_port,
+                    destination_port,
+                    length,
+                    checksum,
+                },
+            ) => QuotedSelector::Udp {
+                source_port,
+                destination_port,
+                length,
+                checksum,
+            },
+            (None, QuotedTransport::Other) => QuotedSelector::Other,
+        },
+    }
+}
+
 fn quoted(key: &QuoteKey) -> (u32, u32) {
     (key.packet_len, key.header_len)
 }
@@ -2723,6 +2834,13 @@ fn report_mtu(ipv4: bool, dropped: u32, candidate: Option<u32>) -> Option<Option
     };
     let mtu = if ipv4 { mtu.max(68) } else { mtu };
     (mtu < dropped && (ipv4 || mtu >= 1280)).then_some(Some(mtu))
+}
+
+// `address` as part of an identity scoped by `zone`: only an IPv6
+// link-local address is scoped, by exactly that zone.
+pub(crate) fn scoped(address: IpAddr, zone: Option<LinkId>) -> Result<ScopedAddress, Error> {
+    let link_local = matches!(address, IpAddr::V6(v) if v.is_unicast_link_local());
+    Ok(ScopedAddress::new(address, zone.filter(|_| link_local))?)
 }
 
 fn wire_destination(packet: Transmit) -> IpAddr {
@@ -2761,12 +2879,14 @@ impl PathProvider for Host {
             .map(IpAddr::V4)
             .unwrap_or(request.tuple.remote.ip());
         let plan = request.registration;
+        let zone = request.zone;
         let request = self.request(
             request.tuple.local.ip(),
             request.tuple.remote.ip(),
+            zone,
             request.dscp,
         )?;
-        let via = ScopedAddress::new(destination, None)?;
+        let via = scoped(destination, zone)?;
         let resolved = self.paths.resolve_via(request, via)?;
         self.forwarding_resolved(resolved.key())?;
         let (client, snapshot) = self.paths.acquire_via(request, via)?;
@@ -2807,12 +2927,18 @@ impl PathProvider for Host {
         self.bindings[index] = None;
     }
     // The header plan of the path `egress_context` would select for this
-    // stateless reply now; a reply without one fails there instead.
-    fn reply_header_len(&mut self, ip: IpMetadata, dscp: u8) -> Option<u16> {
+    // stateless reply now (on its zone's link); a reply without one fails
+    // there instead.
+    fn reply_header_len(
+        &mut self,
+        ip: IpMetadata,
+        zone: Option<LinkId>,
+        dscp: u8,
+    ) -> Option<u16> {
         let request = self
-            .request(ip.source, ip.destination, Dscp::new(dscp).ok()?)
+            .request(ip.source, ip.destination, zone, Dscp::new(dscp).ok()?)
             .ok()?;
-        let via = ScopedAddress::new(ip.destination, None).ok()?;
+        let via = scoped(ip.destination, zone).ok()?;
         let resolved = self.paths.resolve_via(request, via).ok()?;
         u16::try_from(self.header_plan(resolved.key()).ok()?.len).ok()
     }

@@ -102,9 +102,11 @@ pub struct IcmpOutputCounters {
     pub unauthorized_routes: u64,
     /// Queued messages discarded at the drain: no route or source any more,
     /// larger than the path allows and beyond the peer reassembly guarantee,
-    /// or no identifier available for its fragments; and held messages
-    /// (waiting for an identifier on a DF-clear route) displaced by a new
-    /// message arriving at a full queue.
+    /// or no identifier available for its fragments, refused by the backend
+    /// (`BackendOutcome::NotSubmitted`), no neighbor storage, or a failed
+    /// neighbor resolution on an ND-capable port; and held messages
+    /// (waiting for an identifier on a DF-clear route, or for neighbor
+    /// resolution) displaced by a new message arriving at a full queue.
     pub unsent: u64,
 }
 
@@ -274,6 +276,27 @@ impl IcmpOutput {
         self.head = (self.head + 1) % self.limits.messages;
         self.len -= 1;
     }
+    // The message queued as `arrival`, if still queued.
+    fn position(&self, arrival: u64) -> Option<usize> {
+        (0..self.len).find(|i| {
+            self.entries[(self.head + i) % self.limits.messages]
+                .is_some_and(|q| q.arrival == arrival)
+        })
+    }
+    // Remove the message queued as `arrival` unsent (counted), keeping the
+    // order of the others.
+    fn discard(&mut self, arrival: u64) {
+        let Some(mut i) = self.position(arrival) else {
+            return;
+        };
+        let n = self.limits.messages;
+        while i > 0 {
+            self.swap((self.head + i) % n, (self.head + i - 1) % n);
+            i -= 1;
+        }
+        self.pop();
+        self.counters.unsent += 1;
+    }
     // Move the oldest message behind the others, keeping the relative order
     // of the rest; storage stays within the fixed slots.
     fn rotate(&mut self) {
@@ -300,6 +323,10 @@ pub struct Envelope {
     // Reconstructed from fragments: bounded by the reassembly capacity
     // rather than the arrival link's physical packet limit.
     reassembled: bool,
+    // The arriving packet carried a Fragment header, an atomic fragment's
+    // included (RFC 6946), whatever the reconstruction's bytes now hold;
+    // Neighbor Discovery refuses such messages (RFC 6980 section 5).
+    fragment_header: bool,
 }
 
 impl Envelope {
@@ -309,6 +336,7 @@ impl Envelope {
             context,
             len,
             reassembled: false,
+            fragment_header: false,
         }
     }
     pub const fn context(self) -> IngressContext {
@@ -401,6 +429,11 @@ impl<'a> Processed<'a> {
     pub const fn reassembled(&self) -> bool {
         self.envelope.envelope.reassembled
     }
+    /// The arriving packet carried a Fragment header: a reassembled
+    /// datagram, or an atomic fragment processed whole.
+    pub const fn contained_fragment_header(&self) -> bool {
+        self.envelope.envelope.fragment_header
+    }
     /// The processed header with the datagram's payload.
     pub fn packet(&self) -> crate::IngressPacket<'a> {
         let e = self.envelope;
@@ -436,6 +469,9 @@ pub enum Received<'a> {
     /// A fragment stored (or an exact duplicate): its datagram is still
     /// incomplete.
     Held,
+    /// A Neighbor Solicitation or Advertisement on an ND-capable port,
+    /// consumed by the Host's Neighbor Discovery.
+    Neighbor,
     /// A fragment discarded by reassembly, counted in
     /// `Host::reassembly_counters`; any error it caused is queued.
     Discarded,
@@ -507,12 +543,14 @@ impl Host {
         if frame.len() > capabilities.max_ip_packet {
             return Err(Error::Unsupported);
         }
+        if capabilities.ipv6 != crate::Ipv6Receive::Disabled
+            && frame.first().is_some_and(|b| b >> 4 == 6)
+            && self.neighbor_receive(context, now, frame)?
+        {
+            return Ok(Received::Neighbor);
+        }
         let whole = Datagram {
-            envelope: Envelope {
-                context,
-                len: frame.len(),
-                reassembled: false,
-            },
+            envelope: Envelope::physical(context, frame.len()),
             bytes: frame,
         };
         let piece = match frame.first().ok_or(ntcp_ip::Error::Truncated)? >> 4 {
@@ -573,6 +611,7 @@ impl Host {
                         context,
                         len,
                         reassembled: false,
+                        fragment_header: true,
                     },
                     bytes: out,
                 }))
@@ -591,6 +630,7 @@ impl Host {
                         },
                         len,
                         reassembled: true,
+                        fragment_header: true,
                     },
                     bytes: out,
                 }))
@@ -708,6 +748,7 @@ impl Host {
                 context: IngressContext { link: arrival.link },
                 len,
                 reassembled,
+                fragment_header: true,
             },
             bytes: out,
         }))
@@ -988,6 +1029,32 @@ impl Host {
         } else {
             (128, 129)
         };
+        // Neighbor Discovery is consumed by `receive` from unfragmented
+        // packets only; one that reaches dispatch arrived with a Fragment
+        // header (RFC 6980 section 5) or bypassed physical input. A
+        // Redirect is acted on only where Neighbor Discovery resolves the
+        // first hops it changes.
+        let link = processed.context().link;
+        if packet.ip.source.is_ipv6()
+            && match packet.payload.first() {
+                Some(135 | 136) => true,
+                Some(137) => {
+                    processed.contained_fragment_header() || self.neighbors.port(link).is_some()
+                }
+                _ => false,
+            }
+        {
+            return Err(if processed.contained_fragment_header() {
+                ntcp_ip::Error::FragmentationUnsupported.into()
+            } else {
+                Error::Unsupported
+            });
+        }
+        if packet.ip.source.is_ipv4() && packet.payload.first() == Some(&5) {
+            return Ok(IcmpDispatch::Completed(IcmpOutcome::Redirect(
+                self.redirect_ipv4(processed.context(), now, &packet)?,
+            )));
+        }
         if packet.payload.first() == Some(&request) {
             return Ok(IcmpDispatch::Completed(IcmpOutcome::Echo(
                 self.echo(endpoint, processed.context(), &packet)?,
@@ -1122,11 +1189,13 @@ impl Host {
         queued: Queued,
     ) -> Result<(ntcp_path::PathRequest, ScopedAddress), Error> {
         let ip = queued.ip;
-        let request = self.request(ip.source, ip.destination, Dscp::new(0)?)?;
+        // A message to a link-local address stays on the link it concerns.
+        let zone = Some(queued.link);
+        let request = self.request(ip.source, ip.destination, zone, Dscp::new(0)?)?;
         let first_hop = queued
             .options
             .map_or(ip.destination, |options| options.destination().into());
-        Ok((request, ScopedAddress::new(first_hop, None)?))
+        Ok((request, crate::scoped(first_hop, zone)?))
     }
 
     // Whether the queued message is routed over the path with `key` now.
@@ -1157,6 +1226,19 @@ impl Host {
                 .is_some_and(|o| source_routed(o.as_bytes()))
                 && self.icmp_routed(queued, key)
         })
+    }
+
+    // A queued message whose neighbor resolution ended (`resolved`), or is
+    // still waiting (None): a failed one is discarded, counted unsent.
+    // False when the message is no longer queued.
+    pub(crate) fn icmp_output_settle(&mut self, arrival: u64, resolved: Option<bool>) -> bool {
+        if self.icmp_output.position(arrival).is_none() {
+            return false;
+        }
+        if resolved == Some(false) {
+            self.icmp_output.discard(arrival);
+        }
+        true
     }
 
     pub fn icmp_output_counters(&self) -> IcmpOutputCounters {
@@ -1190,7 +1272,15 @@ impl Host {
     /// waits: it moves behind the other queued messages and the call goes on
     /// with the next one, so output to other destinations is not held behind
     /// it. WouldBlock when every queued message waits for an identifier and
-    /// no adjunct probe is due. From that attempt on the message is held,
+    /// no adjunct probe is due. A message whose next hop on an ND-capable
+    /// port (`register_neighbor_port`) has no usable mapping waits the same
+    /// way while Neighbor Discovery resolves it (RFC 4861 section 7.2.2's
+    /// per-neighbor queue): it is sent, to the resolved address, by a pass
+    /// after resolution, and discarded (counted unsent) when resolution
+    /// fails; a cached mapping is used at once (`UdpEgress::link_layer`),
+    /// the first use of a STALE one starting DELAY. Exhausted neighbor
+    /// storage discards the message, counted unsent.
+    /// From that attempt on the message is held,
     /// and a held message never keeps a new one out of the queue: a new Echo
     /// Reply or error arriving at a full queue that holds one takes the place
     /// of the held message that has waited longest, which is discarded
@@ -1212,6 +1302,8 @@ impl Host {
         packet: &mut [u8],
         submit: impl FnMut(UdpEgress, &[u8]) -> BackendOutcome,
     ) -> Result<Option<BackendOutcome>, Error> {
+        // Free what held messages no longer need.
+        self.settle_held_icmp(now);
         if self.icmp_output.len == 0 {
             // With nothing queued, the Echo adjunct's next due probe.
             return self.adjunct_probe(now, packet, submit);
@@ -1239,7 +1331,8 @@ impl Host {
     }
 
     // Send the oldest queued message (as `icmp_output` describes); None when
-    // it waits for an identifier on a DF-clear route and stays queued.
+    // it waits for an identifier on a DF-clear route, or for its neighbor's
+    // resolution, and stays queued.
     fn icmp_output_head(
         &mut self,
         now: Instant,
@@ -1263,7 +1356,28 @@ impl Host {
             };
             let fragmented = plan.fragment_size.is_some();
             let clears_df = plan.snapshot.clears_dont_fragment();
-            result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut *submit);
+            let held = crate::discovery::HeldOutput::Icmp(queued.arrival);
+            let link_layer = match self.host_output_neighbor(plan.snapshot.key(), now, held) {
+                Ok(None) => None,
+                Ok(Some(crate::NeighborHop::Resolved(mac))) => Some(mac),
+                // Nothing was submitted: held output, sent once resolved.
+                Ok(Some(crate::NeighborHop::Held)) => return Ok(None),
+                Err(error) => {
+                    self.icmp_output.counters.unsent += 1;
+                    self.icmp_output.pop();
+                    return Err(error);
+                }
+            };
+            let mut resolved = |egress: UdpEgress, bytes: &[u8]| {
+                submit(
+                    UdpEgress {
+                        link_layer,
+                        ..egress
+                    },
+                    bytes,
+                )
+            };
+            result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut resolved);
             if let Err(DatagramError::Backpressure(backpressure)) = result
                 && clears_df
                 && matches!(
@@ -1290,6 +1404,11 @@ impl Host {
                     outcome,
                     BackendOutcome::WouldBlock | BackendOutcome::Rejected
                 ) {
+                    // Refused by the backend (an IPv4 next hop without a
+                    // static neighbor, for one): consumed unsent.
+                    if outcome == BackendOutcome::NotSubmitted {
+                        self.icmp_output.counters.unsent += 1;
+                    }
                     self.icmp_output.pop();
                 }
                 Ok(Some(outcome))

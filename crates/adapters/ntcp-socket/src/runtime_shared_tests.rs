@@ -60,10 +60,10 @@ fn attach_limit(owner: &mut Owner, packet_limit: usize) -> Arc<Mutex<SharedState
         packet_limit,
         ..Default::default()
     }));
-    owner.ethernet = Some(EthernetBackend {
+    owner.ports[0].ethernet = Some(EthernetBackend {
         io: Box::new(AsyncShared(state.clone())),
         local: [2; 6],
-        next_hop: [4; 6],
+        next_hop: Some([4; 6]),
         next_cookie: 1,
         pending: Vec::with_capacity(timestamps::PHASES),
         cancelled: Vec::new(),
@@ -380,7 +380,7 @@ fn external_backend_is_created_used_and_dropped_on_owner_thread() {
                 crate::EthernetPacketIo {
                     io: Box::new(io),
                     local_mac: [2; 6],
-                    next_hop_mac: [4; 6],
+                    next_hop_mac: Some([4; 6]),
                 },
             )
         },

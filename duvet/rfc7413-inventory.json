@@ -524,7 +524,7 @@
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
       "offset": 1450,
       "evidence": [
-        "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn issue(",
+        "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn issue_in(",
         "crates/stacks/ntcp/src/fast_open_policy_tests.rs::fn rfc7413_cookie_policies_authenticate_addresses_and_secret()"
       ]
     },

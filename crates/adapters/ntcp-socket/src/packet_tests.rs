@@ -3167,7 +3167,7 @@ fn dont_packets_follow_the_source_quiet_assertion() {
         let inner = &mut owner.inner;
         let config = inner.defaults.clone();
         inner.host = None;
-        inner.ingress = None;
+        inner.ports[0].ingress = None;
         inner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
         inner.source_quiet = quiet;
         inner.attach_backend_host(1).unwrap();

@@ -1,4 +1,5 @@
 #![no_std]
+use core::net::Ipv6Addr;
 pub use ntcp_ip_common::Error;
 
 pub const ETHERNET_HEADER: usize = 14;
@@ -93,4 +94,27 @@ pub fn encode_ethernet(
     out[ETHERNET_HEADER..ip_end].copy_from_slice(payload);
     out[ip_end..total].fill(0);
     Ok(total)
+}
+
+/// The link-local all-nodes multicast group, ff02::1 (RFC 4291 section
+/// 2.7.1), to which Neighbor Discovery sends advertisements answering a
+/// solicitation from the unspecified address (RFC 4861 section 7.2.4).
+pub const IPV6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// The solicited-node multicast group of `address` (RFC 4291 section
+/// 2.7.1): ff02::1:ff00:0/104 followed by the address's low-order 24 bits.
+/// Address resolution solicits it (RFC 4861 section 7.2.2) and every node
+/// joins it for each of its unicast addresses, tentative ones included
+/// (RFC 4862 section 5.4.2).
+pub fn solicited_node(address: Ipv6Addr) -> Ipv6Addr {
+    let [.., a, b, c] = address.octets();
+    Ipv6Addr::from([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, a, b, c])
+}
+
+/// The Ethernet destination of an IPv6 multicast packet: 33:33 followed by
+/// the group's low-order 32 bits (RFC 2464 section 7); None for a
+/// non-multicast address, which needs a resolved neighbor instead.
+pub fn ipv6_multicast_mac(group: Ipv6Addr) -> Option<[u8; 6]> {
+    let [.., a, b, c, d] = group.octets();
+    group.is_multicast().then_some([0x33, 0x33, a, b, c, d])
 }

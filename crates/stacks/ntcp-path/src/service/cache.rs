@@ -270,7 +270,10 @@ pub(super) struct CachedPath {
     pub(super) pins: usize,
     // Exact-path owner policy: a nonempty policy is an administrative pin
     // that keeps this incarnation out of idle eviction until cleared or
-    // invalidated. It never migrates to another path incarnation.
+    // invalidated. It migrates only across a forwarding transition (a
+    // Redirect override installed or ended beneath the same route): the
+    // invalidated incarnation keeps it until the same flow's next
+    // incarnation is installed and takes it.
     pub(super) admin: PathAdmin,
     // The learned ceiling owner-trusted application evidence raised, while
     // it is still the learned ceiling: provenance only, never Host proof.
@@ -279,7 +282,7 @@ pub(super) struct CachedPath {
 
 impl CachedPath {
     fn idle(&self) -> bool {
-        self.pins == 0 && self.admin.policy.is_empty()
+        self.pins == 0 && (self.admin.policy.is_empty() || self.snapshot.status != PathStatus::Valid)
     }
     // Learned ceiling, else the largest unlearned budget exposed.
     pub(super) fn network_estimate(&self) -> u32 {
@@ -350,10 +353,11 @@ impl PathService {
     /// remains here. Invalidations are sticky until rebind/release; later table
     /// changes can never revive an old path, even if its key resolves again.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
-    //= reason=T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners, and T10 Host::service_changes notifies every TCP binding and Host UDP flow of the replacement on the next service pass (a failed rebind stays dirty with bounded backpressure) while the submission barrier refuses held packets the current path no longer carries (dual-family Host and native reservation-race tests). T9 correlation never lets a stale or invalidated path incarnation change an estimate. Remaining T18: ICMP Redirect is decoded as unsupported because no production backend has an IP gateway route; Redirect-driven route changes and their notification arrive with the first real Gateway forwarding in T18, with topology evidence in T19.
+    //= reason=T7 PathService invalidates bound paths on route/source/link changes, including shadowing routes. T8 Host rebinds actual native/TUN TCP owners, and T10 Host::service_changes notifies every TCP binding and Host UDP flow of the replacement on the next service pass (a failed rebind stays dirty with bounded backpressure) while the submission barrier refuses held packets the current path no longer carries (dual-family Host and native reservation-race tests). T9 correlation never lets a stale or invalidated path incarnation change an estimate. T18 receives IPv4 and ICMPv6 Redirects, validated against the destination's current first hop, the arrival link and an exact committed submission, as bounded overrides beneath the selected administrative route (PathService::redirect); installing or replacing one and each event that ends one (route replacement or removal, link removal, neighbor unreachability, loss of the IPv6 Router flag, eviction) invalidates the affected paths, and Host::service_changes then notifies their TCP and UDP clients (ntcp-path tests/redirect.rs, ntcp-host src/tests/redirect.rs). Remaining T19: Linux-router Redirect topology evidence.
     //# PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.
     pub(super) fn commit_revision(&mut self, revision: u64) {
         self.revision = revision;
+        self.prune_redirects();
         for index in 0..self.paths.slots.len() {
             let Some(mut path) = self.paths.slots[index].value else {
                 continue;
@@ -385,7 +389,11 @@ impl PathService {
                 Err(_) => {
                     // Invalidation releases the administrative pin and its
                     // policy: the target no longer exists for the owner.
-                    path.admin = PathAdmin::default();
+                    // Across a forwarding transition the same flow goes on
+                    // through the same route, and its successor takes it.
+                    if !self.forwarding_transition(old.key) {
+                        path.admin = PathAdmin::default();
+                    }
                     let key = old.key;
                     let reason = if self.source_address(key.source).is_err() {
                         InvalidationReason::SourceRemoved
@@ -500,6 +508,25 @@ impl PathService {
             // route's future paths as a downward set on a live path would.
             self.retain_route_restriction(resolved.key.route, imposed);
         }
+        // The same flow's exact-path policy, carried across a forwarding
+        // transition, restricts this incarnation as it did the last one,
+        // with that incarnation's hold.
+        let admin = match self.carried_admin(resolved.key) {
+            Some((slot, carried, previous)) => {
+                self.paths.slots[slot].value.as_mut().unwrap().admin = PathAdmin::default();
+                let effective = EffectivePolicy::of(route.policy, carried.policy);
+                snapshot.admin_estimate = effective.estimate.map(|e| e.value);
+                if effective.discovery_disabled.is_some() {
+                    snapshot.discovery_disabled = true;
+                    snapshot.discovery_revision = previous.discovery_revision;
+                }
+                snapshot.retry_not_before = snapshot.retry_not_before.max(previous.retry_not_before);
+                snapshot.restriction = lower(snapshot.restriction, carried.policy.estimate)
+                    .filter(|&e| e < unlearned_mtu);
+                carried
+            }
+            None => PathAdmin::default(),
+        };
         self.paths.insert(
             self.context,
             index,
@@ -508,11 +535,23 @@ impl PathService {
                 snapshot,
                 unlearned_mtu,
                 pins: 0,
-                admin: PathAdmin::default(),
+                admin,
                 application_mtu: None,
             },
         );
         id
+    }
+
+    // The exact-path policy an invalidated incarnation of `key`'s flow
+    // kept across a forwarding transition: its slot, policy and snapshot.
+    fn carried_admin(&self, key: PathKey) -> Option<(usize, PathAdmin, PathSnapshot)> {
+        self.paths.slots.iter().enumerate().find_map(|(slot, record)| {
+            let path = record.value?;
+            (path.snapshot.status == PathStatus::Invalidated(InvalidationReason::SelectionChanged)
+                && !path.admin.policy.is_empty()
+                && super::redirect::same_flow(path.snapshot.key, key))
+            .then_some((slot, path.admin, path.snapshot))
+        })
     }
 
     fn pin(&mut self, path: PathId) {

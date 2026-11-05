@@ -122,7 +122,7 @@ fn ipv6_tclass_fresh_syn_reset_and_ipv4_tos_remain_distinct() {
             crate::EthernetPacketIo {
                 io: Box::new(Io(state.clone())),
                 local_mac: [2; 6],
-                next_hop_mac: [4; 6],
+                next_hop_mac: Some([4; 6]),
             },
         )
         .unwrap();

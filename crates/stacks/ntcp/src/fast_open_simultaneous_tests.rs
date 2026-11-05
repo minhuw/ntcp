@@ -206,7 +206,7 @@ impl Peers {
             (&mut self.a, self.aa, self.ba),
             (&mut self.b, self.ba, self.aa),
         ] {
-            let tag = e.digest(b"ntcp initial sequence", Tuple { local, remote });
+            let tag = e.digest(b"ntcp initial sequence", crate::ScopedTuple::unscoped(Tuple { local, remote }));
             let ticks = (now / e.config.connection.timebase.ticks_from_us(4))
                 .saturating_sub(e.last_isn_time / e.config.connection.timebase.ticks_from_us(4))
                 .max(1);

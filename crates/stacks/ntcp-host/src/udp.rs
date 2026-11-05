@@ -162,6 +162,10 @@ pub struct UdpPathLimits {
 pub struct UdpEgress {
     pub link: LinkId,
     pub next_hop: ResolvedNextHop,
+    /// The Ethernet destination this Host resolved for the packet: Host
+    /// ICMP output on an ND-capable port (`register_neighbor_port`). None
+    /// where the embedding resolves the next hop itself.
+    pub link_layer: Option<[u8; 6]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -403,7 +407,7 @@ impl Host {
         if !admitted || local.port() == 0 || !supported(local) {
             return Err(EndpointError::InvalidAddress.into());
         }
-        self.source(local.ip())?;
+        self.source(local.ip(), None)?;
         if self
             .udp
             .slots
@@ -422,7 +426,7 @@ impl Host {
         let generation = self.udp.generation.checked_add(1).ok_or(Error::Capacity)?;
         let path = match remote {
             Some(remote) => {
-                let request = self.request(local.ip(), remote.ip(), dscp)?;
+                let request = self.request(local.ip(), remote.ip(), None, dscp)?;
                 let via = ScopedAddress::new(remote.ip(), None)?;
                 let resolved = self.paths.resolve_via(request, via)?;
                 self.forwarding_resolved(resolved.key())?;
@@ -601,6 +605,7 @@ impl Host {
         let egress = UdpEgress {
             link: snapshot.key().link(),
             next_hop: snapshot.key().next_hop(),
+            link_layer: None,
         };
         match submit(egress, packet) {
             BackendOutcome::Submitted => {
@@ -706,7 +711,8 @@ impl Host {
             }
             _ => None,
         };
-        let request = self.request(flow.local.ip(), remote, Dscp::new(flow.options.dscp)?)?;
+        let request =
+            self.request(flow.local.ip(), remote, None, Dscp::new(flow.options.dscp)?)?;
         let via = ScopedAddress::new(remote, None)?;
         let current = match flow.path {
             Some(prepared) => {

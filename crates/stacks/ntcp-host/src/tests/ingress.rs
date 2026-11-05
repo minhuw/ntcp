@@ -595,6 +595,7 @@ fn abandoned_ipv6_datagrams_draw_no_parameter_problems() {
         Received::Held => "held",
         Received::Discarded => "discarded",
         Received::Datagram(_) => "datagram",
+        Received::Neighbor => "neighbor",
     };
     let problems = |a: &mut Side, now| -> Vec<(u8, u8, u32)> {
         drain(a, now)
@@ -724,7 +725,7 @@ fn completed_datagrams_own_their_bytes_for_retention() {
                     );
                     retained = Some((datagram.envelope(), datagram.bytes().to_vec()));
                 }
-                Received::Discarded => panic!("discarded"),
+                Received::Discarded | Received::Neighbor => panic!("not a datagram"),
             }
         }
         // Retained beyond the engine's next use, then dispatched.
@@ -2199,4 +2200,48 @@ fn held_echo_replies_keep_their_recorded_options() {
     assert!(!df && id != 0);
     assert_eq!(&header[20..], &[&RR_RECORDED[..], &TS_RECORDED, &[0]].concat()[..]);
     assert_eq!(clock.calls, 1);
+}
+
+// RFC 6980 section 5: Neighbor Discovery in a packet that carried a Fragment
+// header is refused, by the provenance the datagram keeps from its physical
+// arrival (a reassembled one here, whose bytes hold no Fragment header).
+#[test]
+fn reassembled_neighbor_discovery_is_refused_by_its_fragment_provenance() {
+    let cfg = config(2);
+    let (local, remote) = addresses(true);
+    let mut a = side(local, 74, &cfg, OUTPUT);
+    let to_us = ip(remote.ip(), local.ip());
+    let mut message = [0; 32];
+    let IpAddr::V6(target) = remote.ip() else {
+        panic!()
+    };
+    let advertisement = ntcp_icmp::NeighborAdvertisement {
+        router: false,
+        solicited: true,
+        override_: true,
+        target,
+        target_link_layer: Some([2, 0, 0, 0, 0, 9]),
+    };
+    ntcp_icmp::encode_advertisement(to_us, advertisement, &mut message).unwrap();
+    let mut out = vec![0; 4200];
+    assert!(matches!(
+        a.0.receive(
+            a.2,
+            1,
+            &raw_fragment6(to_us, 58, 5, 0, true, &message[..16]),
+            false,
+            &mut out
+        ),
+        Ok(Received::Held)
+    ));
+    let last = raw_fragment6(to_us, 58, 5, 16, false, &message[16..]);
+    let Ok(Received::Datagram(datagram)) = a.0.receive(a.2, 1, &last, false, &mut out) else {
+        panic!("not reassembled")
+    };
+    let processed = a.0.process(datagram, None).unwrap();
+    assert!(processed.reassembled() && processed.contained_fragment_header());
+    assert_eq!(
+        a.0.input_icmp_datagram(&mut a.1, 1, processed).map(|_| ()),
+        Err(Error::Codec(ntcp_ip::Error::FragmentationUnsupported))
+    );
 }

@@ -1105,3 +1105,63 @@ fn passive_abandon_listener_cleanup_does_not_rearm_closed_or_reused_listener() {
 
 #[path = "fast_open_early_data_policy_tests.rs"]
 mod early_data_policy;
+
+// Two live zones and a recycled one (same slot, next generation).
+pub(crate) fn zones() -> [ntcp_path::LinkId; 3] {
+    use ntcp_path::{ContextId, InterfaceKey, Limits, PathService};
+    let mut service = PathService::new(
+        ContextId::new(77),
+        Limits {
+            links: 2,
+            sources: 1,
+            source_owners: 1,
+            routes: 1,
+            paths: 1,
+            clients: 1,
+        },
+    )
+    .unwrap();
+    let first = service.register_link(InterfaceKey(1), 1500).unwrap();
+    let second = service.register_link(InterfaceKey(2), 1500).unwrap();
+    service.remove_link(first).unwrap();
+    let recycled = service.register_link(InterfaceKey(1), 1500).unwrap();
+    [first, second, recycled]
+}
+
+// HMAC credentials authenticate the complete link identity of a scoped
+// peer while unscoped cookie bytes are unchanged; the raw Linux encoding
+// cannot separate zones, so it neither issues nor accepts a scoped cookie.
+#[test]
+fn scoped_cookies_are_domain_separated_and_unscoped_bytes_unchanged() {
+    let local = "fe80::1".parse().unwrap();
+    let remote = "fe80::2".parse().unwrap();
+    let zones = zones();
+    let hmac = FastOpenCookiePolicy::HmacSha256;
+    assert_eq!(
+        hmac.issue_in(&[1; 32], local, remote, None, 7),
+        Some(crate::fast_open::issue(&[1; 32], local, remote, 7))
+    );
+    let cookies = zones.map(|zone| hmac.issue_in(&[1; 32], local, remote, Some(zone), 7).unwrap());
+    let unscoped = crate::fast_open::issue(&[1; 32], local, remote, 7);
+    for (i, cookie) in cookies.iter().enumerate() {
+        assert_ne!(*cookie, unscoped);
+        for (j, zone) in zones.iter().enumerate() {
+            assert_eq!(
+                hmac.valid_in(&[1; 32], local, remote, Some(*zone), 7, *cookie),
+                i == j,
+                "cookie {i} under zone {j}"
+            );
+        }
+        assert!(!hmac.valid_in(&[1; 32], local, remote, None, 7, *cookie));
+    }
+    assert!(!hmac.valid_in(&[1; 32], local, remote, Some(zones[0]), 7, unscoped));
+    #[cfg(feature = "tfo-linux-cookie")]
+    {
+        let linux = FastOpenCookiePolicy::LinuxSipHash24(crate::LinuxSipHash24Key::new([3; 16]));
+        let raw = linux.issue_in(&[0; 32], local, remote, None, 0).unwrap();
+        assert_eq!(linux.issue(&[0; 32], local, remote, 0), Some(raw));
+        assert_eq!(linux.issue_in(&[0; 32], local, remote, Some(zones[0]), 0), None);
+        assert!(!linux.valid_in(&[0; 32], local, remote, Some(zones[0]), 0, raw));
+        assert!(linux.valid_in(&[0; 32], local, remote, None, 0, raw));
+    }
+}

@@ -251,13 +251,14 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
             .parse()
             .unwrap(),
         };
-        let identity = endpoint.digest(b"ntcp initial sequence", tuple);
-        let hash = endpoint.hash(tuple);
+        let scoped = crate::ScopedTuple::unscoped(tuple);
+        let identity = endpoint.digest(b"ntcp initial sequence", scoped);
+        let hash = endpoint.hash(scoped);
         let mut domain = *b"ntcp timestamp offset\0\0\0\0";
         let len = domain.len();
         domain[len - 4..].copy_from_slice(&123u32.to_be_bytes());
-        let timestamp = endpoint.digest(&domain, tuple);
-        let isn = endpoint.isn(tuple);
+        let timestamp = endpoint.digest(&domain, scoped);
+        let isn = endpoint.isn(scoped);
         let before = endpoint.buffer_bytes();
         endpoint.try_set_fast_open_hmac_key([9; 32]).unwrap();
         endpoint
@@ -285,10 +286,10 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
         assert_eq!(endpoint.fast_open_key_registry_usage(), usage);
         assert!(endpoint.fast_open.is_none());
         assert_eq!(endpoint.secret, [42; 32]);
-        assert_eq!(endpoint.digest(b"ntcp initial sequence", tuple), identity);
-        assert_eq!(endpoint.hash(tuple), hash);
-        assert_eq!(endpoint.digest(&domain, tuple), timestamp);
-        assert_eq!(endpoint.isn(tuple), isn.wrapping_add(1));
+        assert_eq!(endpoint.digest(b"ntcp initial sequence", scoped), identity);
+        assert_eq!(endpoint.hash(scoped), hash);
+        assert_eq!(endpoint.digest(&domain, scoped), timestamp);
+        assert_eq!(endpoint.isn(scoped), isn.wrapping_add(1));
         #[cfg(feature = "tfo-linux-cookie")]
         {
             let policy =
@@ -320,4 +321,39 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
             }
         );
     }
+}
+
+// The tuple digests (lookup, ISN and timestamp-offset domains) keep their
+// unscoped bytes and separate zones, including a recycled link slot.
+#[test]
+fn scoped_tuple_digests_separate_zones_and_keep_unscoped_bytes() {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let endpoint = Endpoint::new(EndpointConfig::default(), [5; 32], 0, |_| true).unwrap();
+    let tuple = Tuple {
+        local: "[fe80::1]:1000".parse().unwrap(),
+        remote: "[fe80::2]:8080".parse().unwrap(),
+    };
+    let mut legacy = Hmac::<Sha256>::new_from_slice(&[5; 32]).unwrap();
+    legacy.update(b"ntcp initial sequence");
+    for address in [tuple.local, tuple.remote] {
+        legacy.update(&[6]);
+        if let SocketAddr::V6(v6) = address {
+            legacy.update(&v6.ip().octets());
+        }
+        legacy.update(&address.port().to_be_bytes());
+    }
+    let legacy: [u8; 32] = legacy.finalize().into_bytes().into();
+    let unscoped = crate::ScopedTuple::unscoped(tuple);
+    assert_eq!(endpoint.digest(b"ntcp initial sequence", unscoped), legacy);
+    let digests = crate::fast_open_policy_tests::zones().map(|zone| {
+        endpoint.digest(
+            b"ntcp initial sequence",
+            crate::ScopedTuple::new(tuple, Some(zone)).unwrap(),
+        )
+    });
+    assert!(digests.iter().all(|digest| *digest != legacy));
+    assert_ne!(digests[0], digests[1]);
+    assert_ne!(digests[0], digests[2]);
+    assert_ne!(digests[1], digests[2]);
 }

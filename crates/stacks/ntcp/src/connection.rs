@@ -23,7 +23,7 @@ use crate::{
 
 #[path = "connection_local_repair.rs"]
 mod local_repair;
-use local_repair::RepairUndo;
+use local_repair::{ControlUndo, RepairUndo};
 #[path = "connection_ptb.rs"]
 mod ptb;
 use ptb::PtbRepair;
@@ -448,6 +448,43 @@ pub struct Tuple {
     pub remote: SocketAddr,
 }
 
+/// A canonical tuple with the link that scopes it. The zone is present
+/// exactly when either address is IPv6 link-local, whose identity is only
+/// meaningful on one link (RFC 4007 section 6), so identical link-local
+/// address and port pairs on two links are two connections. Unscoped tuples
+/// carry no zone and keep their exact identity.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ScopedTuple {
+    pub(crate) tuple: Tuple,
+    pub(crate) zone: Option<ntcp_path::LinkId>,
+}
+impl ScopedTuple {
+    /// `None` unless `zone` is present exactly when an address of `tuple`
+    /// is IPv6 link-local.
+    pub fn new(tuple: Tuple, zone: Option<ntcp_path::LinkId>) -> Option<Self> {
+        (needs_zone(tuple) == zone.is_some()).then_some(Self { tuple, zone })
+    }
+    pub const fn tuple(self) -> Tuple {
+        self.tuple
+    }
+    pub const fn zone(self) -> Option<ntcp_path::LinkId> {
+        self.zone
+    }
+    // The identity of a raw (unmanaged) tuple, whose addresses have no link
+    // authority: never scoped.
+    pub(crate) const fn unscoped(tuple: Tuple) -> Self {
+        Self { tuple, zone: None }
+    }
+}
+
+pub(crate) fn link_local(address: core::net::IpAddr) -> bool {
+    matches!(address, core::net::IpAddr::V6(ip) if ip.is_unicast_link_local())
+}
+
+pub(crate) fn needs_zone(tuple: Tuple) -> bool {
+    link_local(tuple.local.ip()) || link_local(tuple.remote.ip())
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum LossTimer {
     Rack,
@@ -669,6 +706,8 @@ pub(crate) struct Connection {
     pub(crate) managed_path: Option<crate::PreparedPath>,
     pub(crate) managed_results: crate::endpoint::ManagedResults,
     tuple: Tuple,
+    // The link scoping `tuple`; set by the Endpoint before insertion.
+    zone: Option<ntcp_path::LinkId>,
     config: ConnectionConfig,
     state: State,
     reason: Option<CloseReason>,
@@ -792,6 +831,7 @@ pub(crate) struct Connection {
     // Optional timing evidence, separate from the retained output obligation.
     reserved_ledger: Option<crate::rack::DepartureSelection>,
     repair_undo: Option<RepairUndo>,
+    control_undo: Option<ControlUndo>,
     ptb: PtbRepair,
     local_resource: Option<LocalResource>,
     resource_probes: u32,
@@ -1048,6 +1088,7 @@ impl Connection {
             managed_path,
             managed_results: crate::endpoint::ManagedResults::default(),
             tuple,
+            zone: None,
             peer_mss: config.mss,
             receive_mss_offer: config.receive_mss_offer(receive_capability),
             received_mss: crate::receive_metadata::ReceiveMss::new(config.receive_mss_offer(receive_capability)),
@@ -1148,6 +1189,7 @@ impl Connection {
             last_departure: None,
             reserved_ledger: None,
             repair_undo: None,
+            control_undo: None,
             ptb: PtbRepair::default(),
             local_resource: None,
             resource_probes: 0,
@@ -1492,6 +1534,15 @@ impl Connection {
 
     pub(crate) fn tuple(&self) -> Tuple {
         self.tuple
+    }
+    pub(crate) fn scoped_tuple(&self) -> ScopedTuple {
+        ScopedTuple {
+            tuple: self.tuple,
+            zone: self.zone,
+        }
+    }
+    pub(crate) fn set_zone(&mut self, zone: Option<ntcp_path::LinkId>) {
+        self.zone = zone;
     }
     pub(crate) fn state(&self) -> State {
         self.state
@@ -2598,6 +2649,29 @@ impl Connection {
         {
             return Ok(false);
         }
+        self.apply_network_error(error);
+        Ok(true)
+    }
+
+    /// The advice about this connection's own reserved attempt, withdrawn
+    /// unsubmitted (`Endpoint::discard_unsubmitted`): the local Host's
+    /// authority stands in for the quoted-sequence check, which exists to
+    /// reject reports about sequence space never sent.
+    pub(crate) fn unsubmitted_network_error(
+        &mut self,
+        now: Instant,
+        error: NetworkError,
+    ) -> Result<bool, Error> {
+        self.update_time(now)?;
+        if error == NetworkError::SourceQuench || matches!(self.state, State::Closed | State::TimeWait)
+        {
+            return Ok(false);
+        }
+        self.apply_network_error(error);
+        Ok(true)
+    }
+
+    fn apply_network_error(&mut self, error: NetworkError) {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
         //= reason=Acts on adapter-classified errors only; soft errors remain nonterminal.
         //# Since these Unreachable messages indicate soft error conditions, a
@@ -2614,7 +2688,6 @@ impl Connection {
         if error == NetworkError::HardUnreachable {
             self.terminal(CloseReason::NetworkError);
         }
-        Ok(true)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
@@ -2833,6 +2906,7 @@ impl Connection {
         finished: bool,
     ) -> Result<bool, Error> {
         self.validate_reserved_output(now, d, offset, count)?;
+        self.control_undo = None;
         if count != 0 {
             if let Some(resource) = self.local_resource.take() {
                 self.application_progress_at = resource.epoch.unwrap_or(now);
@@ -3053,6 +3127,7 @@ impl Connection {
         self.reset_echo = None;
         self.reset_reply = false;
         self.repair_undo = None;
+        self.control_undo = None;
         self.reserved_retransmit_counts = None;
         self.terminal(CloseReason::Aborted);
     }
@@ -4302,6 +4377,7 @@ impl Connection {
         self.state = State::Closed;
         self.local_resource = None;
         self.repair_undo = None;
+        self.control_undo = None;
         self.abandon_ptb();
         self.congestion.commit_probe_response();
         if let Some(p) = &mut self.pmtud {
@@ -9597,6 +9673,21 @@ impl Connection {
         } else {
             None
         };
+        // A sequence-bearing control without payload (SYN, SYN-ACK, FIN)
+        // keeps its selection-time state, so a held attempt whose next hop
+        // never resolves can be withdrawn without a departure.
+        self.control_undo = (reserve
+            && self.repair_undo.is_none()
+            && count == 0
+            && flags & (SYN | FIN) != 0
+            && flags & RST == 0
+            && reset.is_none()
+            && !challenge
+            && !probe
+            && !tlp
+            && !keepalive
+            && pmtu_probe.is_none())
+        .then(|| ControlUndo::capture(self));
         let deferred_fresh = self.repair_undo.as_ref().is_some_and(|u| u.is_fresh());
         self.reserved_retransmit_counts =
             (reserve && (retransmitted || deferred_fresh) && !syn && !probe && !keepalive)

@@ -64,21 +64,57 @@ impl Owner {
         self.rollback_connection(cid);
     }
 
-    pub(super) fn connect_local(&mut self, id: u64) -> Result<SocketAddr> {
+    pub(super) fn connect_local(
+        &mut self,
+        id: u64,
+        remote: SocketAddr,
+        zone: Option<address_policy::Zone>,
+    ) -> Result<SocketAddr> {
         self.collect_paths()?;
         self.connection_options
             .retain(|p| self.endpoint.connection_exists(p.0));
         if self.connection_options.len() == self.socket_limit() {
             return Err(ENOBUFS);
         }
+        let source = self.source_for(remote, zone);
         let mut local = match self.sockets[&id].local {
             Some(local) => local,
-            None => SocketAddr::new(self.local, self.port()?),
+            None => SocketAddr::new(source, self.port()?),
         };
         if local.ip().is_unspecified() {
-            local.set_ip(self.local);
+            local.set_ip(source);
         }
         Ok(local)
+    }
+    // The source address of an unbound or wildcard-bound connection to
+    // `remote`: the address of the port whose link the connection is scoped
+    // to, else of the port whose prefix or gateway route holds the peer (the
+    // longest, as route selection prefers; that route leaves through the
+    // port), else the `io.*` port's, whose default route carries everything
+    // else.
+    fn source_for(&self, remote: SocketAddr, zone: Option<address_policy::Zone>) -> IpAddr {
+        let port = match zone {
+            Some(zone) => self.ports.iter().find(|p| p.link() == Some(zone.link)),
+            None => self
+                .ports
+                .iter()
+                .filter_map(|p| {
+                    let own = (!crate::ip::link_local(p.address)
+                        && crate::ip::network(remote.ip(), p.subnet.1)
+                            == crate::ip::network(p.subnet.0, p.subnet.1))
+                    .then_some(p.subnet.1);
+                    let gateway = p
+                        .gateways
+                        .iter()
+                        .filter(|(prefix, _)| prefix.contains(remote.ip()))
+                        .map(|(prefix, _)| prefix.length())
+                        .max();
+                    Some((own.max(gateway)?, p))
+                })
+                .max_by_key(|&(length, _)| length)
+                .map(|(_, p)| p),
+        };
+        port.map_or(self.local, |p| p.address)
     }
 
     // All active opens share admission, pre-output options, and rollback. The
@@ -88,12 +124,20 @@ impl Owner {
         id: u64,
         local: SocketAddr,
         remote: SocketAddr,
+        zone: Option<address_policy::Zone>,
         initial: Option<&[u8]>,
     ) -> Result<usize> {
         self.check_address(remote)?;
         if remote.port() == 0 {
             return Err(EINVAL);
         }
+        // A deferred open's link may have gone since its connect resolved it.
+        if zone.is_some_and(|zone| !self.zones().any(|live| live == zone)) {
+            return Err(ENODEV);
+        }
+        // A link-local local or peer address leaves only on its zone's link.
+        let scoped = ntcp::ScopedTuple::new(ntcp::Tuple { local, remote }, zone.map(|z| z.link))
+            .ok_or(EINVAL)?;
         let options = self.sockets[&id].clone();
         if let Some(authority) = options.receive_authority {
             self.endpoint
@@ -120,8 +164,8 @@ impl Owner {
             self.endpoint.enable_fast_open().map_err(engine)?;
             if let Some(host) = &mut self.host {
                 self.endpoint
-                    .connect_fast_open_with_path_provider(
-                        now, local, remote, initial, managed, cookie, policy, host,
+                    .connect_fast_open_scoped_with_path_provider(
+                        now, scoped, initial, managed, cookie, policy, host,
                     )
                     .map_err(managed_error)?
             } else {
@@ -141,7 +185,7 @@ impl Owner {
         } else {
             let cid = if let Some(host) = &mut self.host {
                 self.endpoint
-                    .connect_with_path_provider(now, local, remote, managed, host)
+                    .connect_scoped_with_path_provider(now, scoped, managed, host)
                     .map_err(managed_error)?
             } else {
                 self.endpoint
@@ -180,6 +224,7 @@ impl Owner {
         s.local = Some(local);
         s.deferred_peer = None;
         s.deferred_client_policy = None;
+        s.zone = zone;
         Ok(accepted)
     }
 }

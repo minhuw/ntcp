@@ -180,7 +180,7 @@ impl Runtime {
         Self::spawn(
             std::panic::AssertUnwindSafe(move || {
                 let mut owner = if let Some(factory) = factory {
-                    Owner::external_backend(
+                    Owner::external_backends(
                         &config,
                         factory().map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
                     )
@@ -357,6 +357,8 @@ fn host_error(error: ntcp_host::Error) -> i32 {
     match error {
         H::Endpoint(EndpointError::OutputReserved) => EAGAIN,
         H::Endpoint(error) => engine(error),
+        // Like getrandom(2) before its pool is ready.
+        H::Entropy => EAGAIN,
         H::Allocation | H::Path(P::Allocation) => ENOMEM,
         H::Capacity | H::Path(P::Capacity | P::Exhausted) => ENOBUFS,
         H::Path(P::NoRoute) => ENETUNREACH,
@@ -421,6 +423,8 @@ struct Socket {
     client_policy: Option<(SocketAddr, FastOpenClientPolicy)>,
     deferred_client_policy: Option<FastOpenClientPolicy>,
     deferred_peer: Option<SocketAddr>,
+    // The link of a socket whose local or peer address has link scope.
+    zone: Option<address_policy::Zone>,
     readiness: i32,
     readiness_generations: [u64; 5],
     keepalive: bool,
@@ -506,6 +510,7 @@ impl Socket {
             client_policy: None,
             deferred_client_policy: None,
             deferred_peer: None,
+            zone: None,
             readiness: 0,
             readiness_generations: [0; 5],
             keepalive: false,
@@ -608,7 +613,14 @@ struct Owner {
     // The opt-in local path control server (`control.socket`), served on
     // this owner thread with native descriptors and direct system calls.
     control: Option<ntcp_path_control::Server>,
-    ingress: Option<ntcp_host::IngressContext>,
+    // The ports this owner drives, the `io.*` port first, then each
+    // `port.<name>` in configuration order; bounded by configuration and
+    // allocated with the owner. Each port's interface index and live Host
+    // link form the map that resolves sin6_scope_id.
+    ports: Vec<backend::Port>,
+    // The port the next receive batch starts with, so that no port's input
+    // waits behind another's.
+    receive_cursor: usize,
     // Host input storage: the destination of each datagram reassembly
     // completes, and the IP packet and wire frame of Host ICMP output. All
     // are allocated with the Host; empty without one.
@@ -624,9 +636,9 @@ struct Owner {
     // The operator's assertion about earlier emission from `local`
     // (`io.source_quiet`), applied when the Host's allocator starts.
     source_quiet: crate::SourceQuiet,
-    tun: Option<Tun>,
-    ethernet: Option<backend::EthernetBackend>,
     sockets: BTreeMap<u64, Socket>,
+    // The `io.*` port's address: the runtime's address family and the
+    // source of connections no other port's address is selected for.
     local: IpAddr,
     epoch: Instant,
     #[cfg(test)]
@@ -639,7 +651,6 @@ struct Owner {
     detached: Vec<ConnectionId>,
     egress: Option<egress::Egress>,
     reservation_timeout_us: u64,
-    mtu_refresh: Option<output::MtuRefresh>,
     timestamp_cookie: u64,
     child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
     pending: VecDeque<Request>,
@@ -653,6 +664,21 @@ fn unicast(ip: impl Into<IpAddr>) -> bool {
     crate::ip::unicast(ip.into())
 }
 fn context(io: &crate::IoConfig) -> Result<(IpAddr, u8)> {
+    port_context(&io.interface, io.address, io.prefix)
+}
+// The kernel's assignment of `address` (with `prefix`, when configured) on
+// `interface`: the network the address was configured in.
+fn port_context(interface: &str, address: IpAddr, prefix: Option<u8>) -> Result<(IpAddr, u8)> {
+    struct Port<'a> {
+        interface: &'a str,
+        address: IpAddr,
+        prefix: Option<u8>,
+    }
+    let io = Port {
+        interface,
+        address,
+        prefix,
+    };
     let mut list = ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut list) } < 0 {
         return Err(errno());
@@ -695,7 +721,11 @@ fn context(io: &crate::IoConfig) -> Result<(IpAddr, u8)> {
                     None
                 };
                 if let Some((addr, mask)) = pair {
-                    duplicate |= addr == io.address;
+                    // A link-local address is unique only on its own link.
+                    duplicate |= addr == io.address
+                        && (!crate::ip::link_local(addr)
+                            || CStr::from_ptr(entry.ifa_name).to_bytes()
+                                == io.interface.as_bytes());
                     let (bits, ones) = match mask {
                         IpAddr::V4(v) => (32, u32::from(v).leading_ones()),
                         IpAddr::V6(v) => (128, u128::from(v).leading_ones()),
@@ -751,10 +781,24 @@ impl Owner {
         let subnet = context(&config.io)?;
         let secret = random_secret()?;
         let tcp = backend::backend_config_family(config.tcp.clone(), &tun, local)?;
-        let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
+        let mut ports = Vec::new();
+        ports
+            .try_reserve_exact(1 + config.ports.len())
+            .map_err(|_| ENOMEM)?;
+        ports.push(backend::Port::new(local, subnet, Some(tun)));
+        // Each additional TUN port is a kernel interface owning its address,
+        // exactly like the `io.*` one.
+        for port in &config.ports {
+            let tun = Tun::open(&port.interface).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+            let subnet = port_context(&port.interface, port.address, port.prefix)?;
+            let mut extra = backend::Port::new(port.address, subnet, Some(tun));
+            extra.index = backend::interface_index(&port.interface)?;
+            ports.push(extra);
+        }
+        let mut owner = Self::with_ports(ports, secret, tcp)?;
         owner.initialize_socket_config(config)?;
         owner.attach_backend_host(u64::from(index))?;
-        owner.enable_reservations(&config.io, index)?;
+        owner.enable_reservations(&config.io)?;
         Ok(owner)
     }
     fn initialize_socket_config(&mut self, config: &SocketConfig) -> Result<()> {
@@ -886,21 +930,42 @@ impl Owner {
         result
     }
 
+    // A one-port owner of `local` (fixtures and the packet-test port).
+    #[cfg(any(test, feature = "packet-test"))]
     fn with_config(
         local: impl Into<IpAddr>,
-        (address, prefix): (impl Into<IpAddr>, u8),
+        subnet: (impl Into<IpAddr>, u8),
         secret: [u8; 32],
         tun: Option<Tun>,
         config: EndpointConfig,
     ) -> Result<Self> {
-        let local = local.into();
-        let address = address.into();
+        let mut ports = Vec::new();
+        ports.try_reserve_exact(1).map_err(|_| ENOMEM)?;
+        ports.push(backend::Port::new(
+            local.into(),
+            (subnet.0.into(), subnet.1),
+            tun,
+        ));
+        Self::with_ports(ports, secret, config)
+    }
+    // An owner of `ports`, the `io.*` port first.
+    fn with_ports(
+        ports: Vec<backend::Port>,
+        secret: [u8; 32],
+        config: EndpointConfig,
+    ) -> Result<Self> {
+        let local = ports.first().ok_or(EINVAL)?.address;
+        let mut addresses = Vec::new();
+        addresses.try_reserve_exact(ports.len()).map_err(|_| ENOMEM)?;
+        addresses.extend(ports.iter().map(|port| (port.address, port.subnet)));
         let defaults = config.clone();
+        let owned = addresses.clone();
         let valid = move |ip: IpAddr| {
             if ip.is_ipv4() != local.is_ipv4() || !unicast(ip) {
                 return false;
             }
-            match (ip, address) {
+            // Never the broadcast address of a port's IPv4 subnet.
+            owned.iter().all(|&(_, (address, prefix))| match (ip, address) {
                 (IpAddr::V4(ip), IpAddr::V4(address)) => {
                     prefix > 30
                         || u32::from(ip)
@@ -908,8 +973,9 @@ impl Owner {
                 }
                 (IpAddr::V6(_), IpAddr::V6(_)) => true,
                 _ => false,
-            }
+            })
         };
+        let own = move |ip: IpAddr| addresses.iter().any(|&(address, _)| address == ip);
         let endpoint = Endpoint::new(config, secret, 0, move |r| match r {
             AddressValidation::Bind { local: bind } => {
                 // Per-socket local-address permission is checked by Op::Bind.
@@ -919,11 +985,11 @@ impl Owner {
             AddressValidation::Open {
                 local: source,
                 remote,
-            } => source == local && valid(remote),
+            } => own(source) && valid(remote),
             AddressValidation::Incoming {
                 source,
                 destination,
-            } => destination == local && valid(source),
+            } => own(destination) && valid(source),
             AddressValidation::Route { .. } => false,
         })
         .map_err(engine)?;
@@ -935,7 +1001,8 @@ impl Owner {
             fast_open_entropy: None,
             endpoint,
             host: None,
-            ingress: None,
+            ports,
+            receive_cursor: 0,
             completed: Vec::new(),
             icmp_packet: Vec::new(),
             icmp_wire: Vec::new(),
@@ -944,8 +1011,6 @@ impl Owner {
             socket_policy: crate::SocketPolicy::default(),
             segment_routes: Vec::new(),
             source_quiet: crate::SourceQuiet::Unknown,
-            tun,
-            ethernet: None,
             sockets: BTreeMap::new(),
             local,
             epoch: Instant::now(),
@@ -960,7 +1025,6 @@ impl Owner {
             detached: Vec::new(),
             egress: None,
             reservation_timeout_us: 1_000_000,
-            mtu_refresh: None,
             timestamp_cookie: 1,
             child_timestamps: Vec::new(),
             pending: VecDeque::new(),
@@ -1037,7 +1101,9 @@ impl Owner {
             .map(|mut host| host.take_identifiers())
             .transpose()
             .map_err(host_error)?;
-        self.ingress = None;
+        for port in &mut self.ports {
+            port.ingress = None;
+        }
         self.attach_backend_host_with(1, previous)
     }
     fn check_address(&self, addr: SocketAddr) -> Result<()> {
@@ -1045,14 +1111,96 @@ impl Owner {
             return Err(EAFNOSUPPORT);
         }
         if let SocketAddr::V6(v) = addr
-            && (v.scope_id() != 0
-                || v.flowinfo() != 0
-                || v.ip().to_ipv4_mapped().is_some()
-                || v.ip().is_unicast_link_local())
+            && (v.flowinfo() != 0 || v.ip().to_ipv4_mapped().is_some())
         {
             return Err(EOPNOTSUPP);
         }
         Ok(())
+    }
+    // Whether `port`'s address is assigned. On a Neighbor Discovery port it
+    // is not while tentative or once found duplicate (RFC 4862 sections 5.4
+    // and 5.4.5), as Linux inet6_bind refuses an IFA_F_TENTATIVE address,
+    // which a DAD-failed one keeps; other ports' addresses are assigned by
+    // their configuration.
+    fn assigned(&self, port: &backend::Port) -> bool {
+        let (backend::Resolution::Discovery, Some(link), IpAddr::V6(address)) =
+            (&port.resolution, port.link(), port.address)
+        else {
+            return true;
+        };
+        self.host.as_ref().is_some_and(|host| {
+            host.neighbor_address_state(link, address) == Some(ntcp_host::AddressState::Assigned)
+        })
+    }
+    // Whether `ip` is the address of one of this owner's ports.
+    fn owns(&self, ip: IpAddr) -> bool {
+        self.ports.iter().any(|port| port.address == ip)
+    }
+    // The zones of the attached ports: the live interface map.
+    fn zones(&self) -> impl Iterator<Item = address_policy::Zone> + '_ {
+        self.ports.iter().filter_map(backend::Port::zone)
+    }
+    // The zone `addr` names: for an address with link scope its nonzero
+    // sin6_scope_id resolved through the live interface map (an unknown
+    // index is ENODEV, a missing one EINVAL, as for Linux); other addresses
+    // have none and their scope is ignored, as Linux does.
+    fn resolve_zone(&self, addr: SocketAddr) -> Result<Option<address_policy::Zone>> {
+        match addr {
+            SocketAddr::V6(v) if v.ip().is_unicast_link_local() => match v.scope_id() {
+                0 => Err(EINVAL),
+                index => self
+                    .zones()
+                    .find(|zone| zone.index == index)
+                    .map(Some)
+                    .ok_or(ENODEV),
+            },
+            _ => Ok(None),
+        }
+    }
+    // The zone of a connection from socket `id` to the application address
+    // `remote`: a link-local peer's scope, which must agree with the link the
+    // socket is already on, or that link (Linux's sk_bound_dev_if rule). A
+    // zone whose link is gone stays the socket's: it is never retargeted to
+    // whichever interface now has its index.
+    fn connect_zone(&self, id: u64, remote: SocketAddr) -> Result<Option<address_policy::Zone>> {
+        let bound = self.sockets[&id].zone;
+        let zone = match remote {
+            SocketAddr::V6(v) if v.ip().is_unicast_link_local() && v.scope_id() == 0 => {
+                Some(bound.ok_or(EINVAL)?)
+            }
+            SocketAddr::V6(v) if v.ip().is_unicast_link_local() => {
+                // A different index contradicts the socket's link before any
+                // lookup; the same index may now name another link.
+                if bound.is_some_and(|bound| bound.index != v.scope_id()) {
+                    return Err(EINVAL);
+                }
+                let zone = self.resolve_zone(remote)?;
+                if bound.is_some_and(|bound| Some(bound) != zone) {
+                    return Err(EINVAL);
+                }
+                zone
+            }
+            _ => bound,
+        };
+        if zone.is_some_and(|zone| !self.zones().any(|live| live == zone)) {
+            return Err(ENODEV);
+        }
+        Ok(zone)
+    }
+    // The application zone of a connection's scoped tuple.
+    fn connection_zone(&self, cid: ConnectionId) -> Result<Option<address_policy::Zone>> {
+        let Some(link) = self
+            .endpoint
+            .retained_scoped_tuple(cid)
+            .map_err(engine)?
+            .zone()
+        else {
+            return Ok(None);
+        };
+        self.zones()
+            .find(|zone| zone.link == link)
+            .map(Some)
+            .ok_or(ENODEV)
     }
     fn socket_limit(&self) -> usize {
         #[cfg(feature = "packet-test")]
@@ -1276,7 +1424,7 @@ impl Owner {
     fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
         // Every runtime constructor enables Egress, the only output path.
         assert!(self.egress.is_some());
-        let mut input = vec![0; 65535 + if self.ethernet.is_some() { 14 } else { 0 }];
+        let mut input = vec![0; 65535 + self.link_offset()];
         // Keep in-flight batches owned through every output/backend exit.
         let mut after_output = Vec::with_capacity(BUDGET);
         'run: while !stop.load(Ordering::Acquire) {
@@ -1292,16 +1440,17 @@ impl Owner {
             if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
                 break 'run;
             }
-            if self
-                .ethernet
-                .as_mut()
-                .is_some_and(|b| b.io.reclaim_transmit(BUDGET).is_err())
-            {
+            if self.ports.iter_mut().any(|port| {
+                port.ethernet
+                    .as_mut()
+                    .is_some_and(|b| b.io.reclaim_transmit(BUDGET).is_err())
+            }) {
                 break 'run;
             }
             self.events();
             self.collect_zero_copy();
             self.service_before_output(&mut after_output);
+            self.service_discovery();
             if self.service_egress().is_err() {
                 break 'run;
             }
@@ -1446,8 +1595,10 @@ impl Owner {
         bytes: &[u8],
         stamps: ntcp::RxPacketTimestamps,
     ) -> std::result::Result<ntcp::InputDisposition, ntcp_host::Error> {
+        let arrival = self.ports[0].link();
         self.input_segmented(
             now,
+            arrival,
             ip,
             traffic_class,
             ntcp::Ipv4Options::default(),
@@ -1456,9 +1607,34 @@ impl Owner {
             None,
         )
     }
+    // The connection `tuple` arriving on `arrival` belongs to: a link-local
+    // address belongs to the arrival link. Host-less fixtures, which have
+    // no link, look the tuple up unscoped.
+    pub(super) fn arrival_connection(
+        &self,
+        tuple: ntcp::Tuple,
+        arrival: Option<ntcp_host::path::LinkId>,
+    ) -> Option<ConnectionId> {
+        match Self::arrival_zone(tuple, arrival) {
+            Some(zone) => self
+                .endpoint
+                .scoped_connection_id(ntcp::ScopedTuple::new(tuple, zone)?),
+            None => self.endpoint.connection_id(tuple),
+        }
+    }
+    // The zone of `tuple` on `arrival`; None for a Host-less fixture.
+    fn arrival_zone(
+        tuple: ntcp::Tuple,
+        arrival: Option<ntcp_host::path::LinkId>,
+    ) -> Option<Option<ntcp_host::path::LinkId>> {
+        let scoped =
+            crate::ip::link_local(tuple.local.ip()) || crate::ip::link_local(tuple.remote.ip());
+        arrival.map(|link| scoped.then_some(link))
+    }
     fn input_segmented(
         &mut self,
         now: u64,
+        arrival: Option<ntcp_host::path::LinkId>,
         ip: ntcp::IpMetadata,
         traffic_class: u8,
         options: ntcp::Ipv4Options,
@@ -1475,9 +1651,12 @@ impl Owner {
             local: SocketAddr::new(ip.destination, u16::from_be_bytes([ports[2], ports[3]])),
             remote: SocketAddr::new(ip.source, u16::from_be_bytes([ports[0], ports[1]])),
         });
-        let before = tuple.and_then(|tuple| self.endpoint.connection_id(tuple));
+        let before = tuple.and_then(|tuple| self.arrival_connection(tuple, arrival));
         let before_state = before.and_then(|cid| self.endpoint.state(cid).ok());
-        let listener = tuple.and_then(|tuple| self.endpoint.matching_listener(tuple.local));
+        let listener = tuple.and_then(|tuple| match Self::arrival_zone(tuple, arrival) {
+            Some(zone) => self.endpoint.matching_scoped_listener(tuple.local, zone),
+            None => self.endpoint.matching_listener(tuple.local),
+        });
         let listener_options = listener.and_then(|listener| {
             self.sockets
                 .values()
@@ -1516,9 +1695,11 @@ impl Owner {
             tcp_segment_size: segment_size,
         };
         let result = if let Some(host) = &mut self.host {
+            let arrival = arrival.ok_or(ntcp_host::Error::InvalidContext)?;
             self.endpoint
                 .input_with_path_provider(
                     now,
+                    arrival,
                     ip,
                     traffic_class,
                     options,
@@ -1539,7 +1720,7 @@ impl Owner {
         // Its generation-aware metadata already exists and must not be
         // duplicated or replaced with the listener's current policy.
         let new_child = tuple
-            .and_then(|tuple| self.endpoint.connection_id(tuple))
+            .and_then(|tuple| self.arrival_connection(tuple, arrival))
             .filter(|cid| {
                 Some(*cid) != before && !self.connection_options.iter().any(|p| p.0 == *cid)
             });
@@ -1906,7 +2087,10 @@ impl Owner {
     //# The option enables Fast Open on the listener socket. The option value specifies the PendingFastOpenRequests threshold, i.e., the maximum length of pending SYNs with data payload. Once enabled, the TCP implementation will respond with TFO cookies per request.
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
         if let Op::SetDestinationRoute(destination, policy) = op {
-            if !unicast(destination) || destination.is_ipv4() != self.local.is_ipv4() {
+            // Destination policies carry no zone: a link-local key would be ambiguous.
+            if !crate::ip::global_unicast(destination)
+                || destination.is_ipv4() != self.local.is_ipv4()
+            {
                 return Err(EINVAL);
             }
             self.endpoint
@@ -2037,7 +2221,10 @@ impl Owner {
                             .map(|peer| (peer, policy))
                     })
                     .transpose()?;
-                if policy.is_some_and(|(peer, _)| peer.port() == 0 || !unicast(peer.ip())) {
+                // Keyed by peer address alone, which names no zone.
+                if policy.is_some_and(|(peer, _)| {
+                    peer.port() == 0 || !crate::ip::global_unicast(peer.ip())
+                }) {
                     return Err(EINVAL);
                 }
                 self.sockets.get_mut(&id).unwrap().client_policy = policy;
@@ -2080,7 +2267,9 @@ impl Owner {
                             .map(|peer| (peer, cookie))
                     })
                     .transpose()?;
-                if credential.is_some_and(|(peer, _)| peer.port() == 0 || !unicast(peer.ip())) {
+                if credential.is_some_and(|(peer, _)| {
+                    peer.port() == 0 || !crate::ip::global_unicast(peer.ip())
+                }) {
                     return Err(EINVAL);
                 }
                 self.sockets.get_mut(&id).unwrap().server_cookie = credential;
@@ -2127,7 +2316,7 @@ impl Owner {
                 socket.fast_open_cookie_policy = Some(policy);
                 socket.fast_open_key_lease = Some(lease);
             }
-            Op::Bind(mut addr) => {
+            Op::Bind(addr) => {
                 let mut local = s.normalize_address(addr, self.local, true)?;
                 if !matches!(s.handle, Handle::Fresh)
                     || s.local.is_some()
@@ -2135,7 +2324,21 @@ impl Owner {
                 {
                     return Err(EINVAL);
                 }
-                if !s.freebind && local.ip() != self.local && !local.ip().is_unspecified() {
+                let zone = self.resolve_zone(addr)?;
+                // The application address keeps its zone apart, like the wire one.
+                let mut addr = addr;
+                if let SocketAddr::V6(v) = &mut addr {
+                    v.set_scope_id(0);
+                }
+                // A port's assigned address is local; a link-local one only
+                // on the port (link) that owns it. A tentative or duplicate
+                // one is not available (EADDRNOTAVAIL).
+                let owned = self.ports.iter().any(|port| {
+                    port.address == local.ip()
+                        && zone.is_none_or(|zone| port.link() == Some(zone.link))
+                        && self.assigned(port)
+                });
+                if !s.freebind && !owned && !local.ip().is_unspecified() {
                     return Err(EADDRNOTAVAIL);
                 }
                 if let Some(authority) = s.receive_authority {
@@ -2157,13 +2360,14 @@ impl Owner {
                 if self.sockets.iter().any(|(&other, s)| {
                     other != id
                         && !(reuse && s.reuse && matches!(s.handle, Handle::Connection(_)))
-                        && s.conflicts_binding(addr, local, new_v6only)
+                        && s.conflicts_binding(addr, local, new_v6only, zone)
                 }) {
                     return Err(EADDRINUSE);
                 }
                 let socket = self.sockets.get_mut(&id).unwrap();
                 socket.local = Some(local);
                 socket.bound_addr = Some(addr);
+                socket.zone = zone;
             }
             Op::Listen(backlog) => {
                 if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
@@ -2176,6 +2380,8 @@ impl Owner {
                 let application_timeout = user_timeout_us(s.user_timeout_ms)?;
                 let syn_retries = s.syn_retries;
                 let user_mss = s.user_mss;
+                // Exactly the bound address on its link; otherwise every link.
+                let zone = s.zone.map(|zone| zone.link);
                 let local = match s.local {
                     Some(a) => a,
                     None => {
@@ -2194,7 +2400,7 @@ impl Owner {
                 };
                 let listener = self
                     .endpoint
-                    .listen(local, backlog.clamp(1, LIMIT as i32) as usize)
+                    .listen_scoped(local, zone, backlog.clamp(1, LIMIT as i32) as usize)
                     .map_err(engine)?;
                 if let Err(e) = self.endpoint.set_listener_user_mss(listener, user_mss) {
                     let _ = self.endpoint.close_listener(listener);
@@ -2369,7 +2575,14 @@ impl Owner {
                 if let Some(index) = self.child_timestamps.iter().position(|p| p.0 == cid) {
                     child.timestamps.options = self.child_timestamps.swap_remove(index).1;
                 }
-                let peer = child.api_address(tuple.remote);
+                child.zone = match self.connection_zone(cid) {
+                    Ok(zone) => zone,
+                    Err(e) => {
+                        self.rollback_connection(cid);
+                        return Err(e);
+                    }
+                };
+                let peer = address_policy::scoped(child.api_address(tuple.remote), child.zone);
                 child.handle = Handle::Connection(cid);
                 child.local = Some(tuple.local);
                 child.connected = true;
@@ -2391,8 +2604,8 @@ impl Owner {
                 out.addr = Some(peer);
                 // Core emits Acceptable on empty->nonempty; stay readable until accept returns EAGAIN.
             }
-            Op::Connect(remote) => {
-                let remote = s.normalize_address(remote, self.local, false)?;
+            Op::Connect(addr) => {
+                let remote = s.normalize_address(addr, self.local, false)?;
                 self.check_address(remote)?;
                 if !self.check_connect(id)? {
                     return Ok(out);
@@ -2400,7 +2613,8 @@ impl Owner {
                 if remote.port() == 0 {
                     return Err(EINVAL);
                 }
-                let local = self.connect_local(id)?;
+                let zone = self.connect_zone(id, addr)?;
+                let local = self.connect_local(id, remote, zone)?;
                 if let Some(authority) = self.sockets[&id].receive_authority {
                     self.endpoint
                         .validate_fast_open_receive_authority(authority, local.ip())
@@ -2415,32 +2629,29 @@ impl Owner {
                     let socket = &self.sockets[&id];
                     let policy = socket
                         .client_policy_for(remote, self.socket_policy.fast_open_client_policy);
-                    let allowed = if let Some(cookie) = socket.server_cookie_for(remote) {
-                        self.endpoint.can_defer_fast_open_with_server_cookie(
+                    let allowed = self
+                        .endpoint
+                        .can_defer_scoped_fast_open(
                             self.now(),
                             local.ip(),
                             remote,
-                            Some(cookie),
-                        )
-                    } else {
-                        self.endpoint.can_defer_fast_open_with_policy(
-                            self.now(),
-                            local.ip(),
-                            remote,
+                            zone.map(|zone| zone.link),
+                            socket.server_cookie_for(remote),
                             policy,
                         )
-                    }
-                    .map_err(engine)?;
+                        .map_err(engine)?;
                     if allowed {
+                        // The deferred open keeps the link resolved now.
                         let s = self.sockets.get_mut(&id).unwrap();
                         s.local = Some(local);
                         s.deferred_peer = Some(remote);
                         s.deferred_client_policy = Some(policy);
+                        s.zone = zone;
                         return Ok(out);
                     }
-                    self.start_connection(id, local, remote, Some(&[]))?;
+                    self.start_connection(id, local, remote, zone, Some(&[]))?;
                 } else {
-                    self.start_connection(id, local, remote, None)?;
+                    self.start_connection(id, local, remote, zone, None)?;
                 }
                 return Err(EINPROGRESS);
             }
@@ -3164,9 +3375,10 @@ impl Owner {
                 };
             }
             Op::Name(peer) => {
-                out.addr = Some(if peer {
+                let zone = s.zone;
+                out.addr = Some(address_policy::scoped(if peer {
                     if let Some(peer) = s.deferred_peer {
-                        out.addr = Some(s.api_address(peer));
+                        out.addr = Some(address_policy::scoped(s.api_address(peer), zone));
                         return Ok(out);
                     }
                     let Handle::Connection(cid) = s.handle else {
@@ -3182,7 +3394,7 @@ impl Owner {
                     s.local
                         .map(|local| s.api_address(local))
                         .unwrap_or_else(|| SocketAddr::new(s.api_unspecified(), 0))
-                });
+                }, zone));
             }
             Op::Available => {
                 out.value = match s.handle {

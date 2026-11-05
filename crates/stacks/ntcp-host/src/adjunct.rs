@@ -727,6 +727,25 @@ impl Host {
             self.adjunct.entries[index] = Some(entry);
             return Err(Error::Unsupported);
         };
+        // On an ND-capable port the probe's next hop is resolved first; an
+        // unresolved one holds the probe, which is due again once resolved
+        // (`adjunct_settle`).
+        let held = crate::discovery::HeldOutput::Probe(entry.path);
+        let link_layer = match self.host_output_neighbor(snapshot.key(), now, held) {
+            Ok(None) => None,
+            Ok(Some(crate::NeighborHop::Resolved(mac))) => Some(mac),
+            Ok(Some(crate::NeighborHop::Held)) => {
+                entry.not_before = Instant::MAX;
+                self.adjunct.entries[index] = Some(entry);
+                return Ok(None);
+            }
+            Err(error) => {
+                self.adjunct.counters.not_sent += 1;
+                entry.not_before = now.saturating_add(self.adjunct.timeout);
+                self.adjunct.entries[index] = Some(entry);
+                return Err(error);
+            }
+        };
         let mut nonce = [0u8; NONCE + 4];
         let drawn = self
             .entropy
@@ -804,7 +823,16 @@ impl Host {
             client: None,
             options: None,
         };
-        let result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut *submit);
+        let mut resolved = |egress: UdpEgress, bytes: &[u8]| {
+            submit(
+                UdpEgress {
+                    link_layer,
+                    ..egress
+                },
+                bytes,
+            )
+        };
+        let result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut resolved);
         let outcome = match result {
             Ok(report) => {
                 self.adjunct.counters.probes += 1;
@@ -846,10 +874,42 @@ impl Host {
         Ok(Some(outcome))
     }
 
+    // The probe of `path` held for its neighbor's resolution, which ended
+    // (`resolved`) or is still waiting (None): due at once when resolved;
+    // after a failure counted unsent and retried after the probe timeout,
+    // as for other probes not sent. False when no entry holds a probe.
+    pub(crate) fn adjunct_settle(
+        &mut self,
+        path: ntcp_path::PathId,
+        resolved: Option<bool>,
+        now: Instant,
+    ) -> bool {
+        let timeout = self.adjunct.timeout;
+        let Some(entry) = self
+            .adjunct
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|e| e.path == path && e.not_before == Instant::MAX)
+        else {
+            return false;
+        };
+        match resolved {
+            None => {}
+            Some(true) => entry.not_before = now,
+            Some(false) => {
+                entry.not_before = now.saturating_add(timeout);
+                self.adjunct.counters.not_sent += 1;
+            }
+        }
+        true
+    }
+
     fn probe_path(&mut self, entry: &Entry) -> Result<PathSnapshot, Error> {
         let request = self.request(
             entry.ip.source,
             entry.ip.destination,
+            None,
             Dscp::new(entry.dscp)?,
         )?;
         let via = ScopedAddress::new(entry.ip.destination, None)?;

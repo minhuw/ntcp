@@ -16,6 +16,10 @@ pub enum FactoryRole {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathFactoryRequest {
     pub tuple: Tuple,
+    /// The link scoping `tuple`, present exactly when one of its addresses
+    /// is IPv6 link-local (`ScopedTuple`). The provider selects paths only
+    /// on that link.
+    pub zone: Option<ntcp_path::LinkId>,
     pub role: FactoryRole,
     pub listener: Option<ListenerId>,
     pub dscp: Dscp,
@@ -96,11 +100,19 @@ pub trait PathProvider {
     fn cancel(&mut self, prepared: PreparedPath);
     /// The complete IP header length, extension headers included, of the
     /// path a stateless reply with these addresses and DSCP would leave on
-    /// now, so that the Endpoint sizes the reply as it will be placed. None
-    /// when the provider states none: the reply is sized with the minimal
-    /// header and the provider's own submission check decides.
-    fn reply_header_len(&mut self, ip: IpMetadata, dscp: u8) -> Option<u16> {
-        let _ = (ip, dscp);
+    /// now, so that the Endpoint sizes the reply as it will be placed. A
+    /// `zone` (the arrival link of the input that caused the reply, present
+    /// exactly when one of its addresses is IPv6 link-local) restricts that
+    /// path to its link. None when the provider states none: the reply is
+    /// sized with the minimal header and the provider's own submission check
+    /// decides.
+    fn reply_header_len(
+        &mut self,
+        ip: IpMetadata,
+        zone: Option<ntcp_path::LinkId>,
+        dscp: u8,
+    ) -> Option<u16> {
+        let _ = (ip, zone, dscp);
         None
     }
 }
@@ -134,6 +146,8 @@ pub struct ManagedOpenOptions {
 pub struct ManagedPathInfo {
     pub binding: PreparedPath,
     pub tuple: Tuple,
+    /// The link scoping `tuple` (`ScopedTuple::zone`).
+    pub zone: Option<ntcp_path::LinkId>,
     /// Current retained outgoing selection, which can change after validated
     /// peer return-route input before the host refreshes the bound path key.
     pub forwarding_destination: core::net::IpAddr,
@@ -234,6 +248,8 @@ pub(crate) fn valid_prepared(
         && key.context() == context
         && key.source_address().address() == request.tuple.local.ip()
         && key.destination().address() == request.tuple.remote.ip()
+        // A scoped tuple's path lies on its own link.
+        && request.zone.is_none_or(|zone| key.link() == zone)
         // An SR route, whose path header carries the Segment Routing Header,
         // forwards a final destination to the first segment it derives.
         && (key.forwarding_destination().address() == destination

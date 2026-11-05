@@ -556,6 +556,7 @@ fn segment_route_setting_is_validated_and_installed() {
         &DatagramSettings::default(),
         &routes,
         0,
+        1,
     )
     .unwrap();
     let paths = network.host.paths();
@@ -637,7 +638,7 @@ fn udp_and_echo_replies_over_a_segment_route_carry_the_srh() {
         let mut a = Endpoint::new(config.clone(), [7; 32], 0,
             Box::new(tun_v6_policy("2001:db8::1".parse().unwrap()))).unwrap();
         let mut ahost =
-            TunHost::attach_routed(&mut a, &config, local.ip(), &settings, &routes, 0).unwrap();
+            TunHost::attach_routed(&mut a, &config, local.ip(), &settings, &routes, 0, 1).unwrap();
         let mut echo = UdpEcho::open(&mut ahost, &a, service, &config, &settings).unwrap();
         let mut backend = Backend::default();
         let refuse = settings.udp_mode == UdpSendMode::Refuse;

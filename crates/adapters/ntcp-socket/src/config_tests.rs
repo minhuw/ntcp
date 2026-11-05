@@ -70,7 +70,6 @@ fn parser_and_typed_validation() {
         "tcp.pacing=true # inline",
         "[section]",
         "io.backend=native",
-        "io.backend=af-packet",
         "io.next_hop_mac=02:00:00:00:00:01",
         "tcp.pacing_gain_percent=125",
         "tcp.pacing_burst_segments=2",
@@ -942,4 +941,234 @@ fn segment_routes_parse_separately_from_route_policies() {
     }
     // An IPv4 interface carries no SR route.
     assert!(SocketConfig::parse(&format!("{BASE}ipv6.srh.2001:db8:d::/48=2001:db8:5::1\n")).is_err());
+}
+
+#[test]
+fn named_ports_parse_with_the_io_port_fields_and_validation() {
+    let config = SocketConfig::parse(&format!(
+        "{BASE}io.prefix=24\nport.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.c-2.interface=ntcp2\nport.c-2.address=10.73.2.2\n"
+    ))
+    .unwrap();
+    // The `io.*` port is unchanged; additional ports keep their order.
+    assert_eq!(config.io.interface, "ntcp0");
+    assert_eq!(config.io.address, "10.73.0.2".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        config.ports,
+        vec![
+            PortConfig {
+                name: "b".into(),
+                interface: "ntcp1".into(),
+                address: "10.73.1.2".parse().unwrap(),
+                prefix: Some(24),
+                next_hop_mac: None,
+                gateways: Vec::new(),
+                neighbors: Vec::new(),
+            },
+            PortConfig {
+                name: "c-2".into(),
+                interface: "ntcp2".into(),
+                address: "10.73.2.2".parse().unwrap(),
+                prefix: None,
+                next_hop_mac: None,
+                gateways: Vec::new(),
+                neighbors: Vec::new(),
+            },
+        ]
+    );
+    // Without port keys there are no additional ports.
+    assert!(SocketConfig::parse(BASE).unwrap().ports.is_empty());
+    let af = "io.backend=af-packet\nio.interface=eth0\nio.address=10.73.0.2\nio.next_hop_mac=02:00:00:00:00:01\n";
+    let config = SocketConfig::parse(&format!(
+        "{af}port.b.interface=eth1\nport.b.address=10.73.1.2\nport.b.next_hop_mac=02:00:00:00:00:02\n"
+    ))
+    .unwrap();
+    assert_eq!(config.ports[0].next_hop_mac, Some([2, 0, 0, 0, 0, 2]));
+    let v6 = "io.interface=ntcp0\nio.address=fe80::1\n";
+    // A link-local address is unique only on its own link.
+    let config =
+        SocketConfig::parse(&format!("{v6}port.b.interface=ntcp1\nport.b.address=fe80::1\n")).unwrap();
+    assert_eq!(config.ports[0].address, "fe80::1".parse::<IpAddr>().unwrap());
+    // A TUN port and a fixed-next-hop port resolve no IP next hop, so an
+    // otherwise valid gateway route on them could never carry traffic and
+    // is refused.
+    for gateway in [
+        format!("{BASE}io.prefix=24\nport.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.gateway.10.80.0.0/16=10.73.1.1\n"),
+        format!("{v6}port.b.interface=ntcp1\nport.b.address=2001:db8:1::2\nport.b.prefix=64\nport.b.gateway.2001:db8:5::/48=fe80::fe\n"),
+        format!("{af}port.b.interface=eth1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.next_hop_mac=02:00:00:00:00:02\nport.b.gateway.10.80.0.0/16=10.73.1.1\n"),
+    ] {
+        assert!(SocketConfig::parse(&gateway).is_err(), "{gateway}");
+    }
+    for suffix in [
+        // Duplicate keys, a repeated interface and missing fields.
+        "port.b.interface=ntcp1\nport.b.interface=ntcp2\nport.b.address=10.73.1.2",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.c.interface=ntcp1\nport.c.address=10.73.2.2",
+        "port.b.interface=ntcp0\nport.b.address=10.73.1.2",
+        "port.b.address=10.73.1.2",
+        "port.b.interface=ntcp1",
+        // Unknown fields and malformed names.
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.mtu=1400",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.backend=tun",
+        "port.b!.interface=ntcp1\nport.b!.address=10.73.1.2",
+        "port..interface=ntcp1",
+        "port.b=ntcp1",
+        // One global address on two ports.
+        "port.b.interface=ntcp1\nport.b.address=10.73.0.2",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.c.interface=ntcp2\nport.c.address=10.73.1.2",
+        // The same validation as the io.* fields.
+        "port.b.interface=nt/cp\nport.b.address=10.73.1.2",
+        "port.b.interface=ntcp1\nport.b.address=224.0.0.1",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=33",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.next_hop_mac=02:00:00:00:00:02",
+        "port.b.interface=ntcp1\nport.b.address=2001:db8::2",
+        // Gateways: on the port's own link, of its family, canonical.
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.gateway.10.80.0.0/16=10.74.0.1",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.gateway.10.80.0.0/16=10.73.1.1",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.gateway.10.80.0.1/16=10.73.1.1",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.gateway.10.80.0.0/16=10.73.1.2",
+        "port.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.gateway.2001:db8::/32=10.73.1.1",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}{suffix}\n")).is_err(),
+            "{suffix}"
+        );
+    }
+    // An AF_PACKET port without a fixed next hop resolves its next hops:
+    // IPv4 through static neighbors on its prefix, which every IPv4 gateway
+    // needs, IPv6 by Neighbor Discovery (with link-local gateways).
+    let resolving = SocketConfig::parse(&format!(
+        "{af}port.b.interface=eth1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.neighbor.10.73.1.1=02:00:00:00:00:0a\nport.b.gateway.10.80.0.0/16=10.73.1.1\n"
+    ))
+    .unwrap();
+    assert_eq!(resolving.ports[0].next_hop_mac, None);
+    assert_eq!(
+        resolving.ports[0].neighbors,
+        vec![("10.73.1.1".parse().unwrap(), [2, 0, 0, 0, 0, 0xa])]
+    );
+    assert_eq!(resolving.ports[0].gateways.len(), 1);
+    let af6 = "io.backend=af-packet\nio.interface=eth0\nio.address=2001:db8::2\nio.next_hop_mac=02:00:00:00:00:01\n";
+    let resolving = SocketConfig::parse(&format!(
+        "{af6}port.b.interface=eth1\nport.b.address=fe80::1\nport.b.gateway.2001:db8:5::/48=fe80::fe\n"
+    ))
+    .unwrap();
+    assert_eq!(resolving.ports[0].gateways.len(), 1);
+    // An AF_PACKET `io.*` port without `io.next_hop_mac` resolves its next
+    // hops like a named port (D3: the fixed MAC is the legacy forwarder).
+    let io = SocketConfig::parse("io.backend=af-packet\nio.interface=eth0\nio.address=10.73.0.2\n")
+        .unwrap();
+    assert!(io.io.resolves() && io.io.gateways.is_empty());
+    let port = "port.b.interface=eth1\nport.b.address=10.73.1.2\nport.b.prefix=24";
+    for suffix in [
+        // Gateways on a resolving port: on its own link, of its family,
+        // canonical, not its own address, one route per destination, and an
+        // IPv4 next hop needs its static neighbor.
+        "port.b.neighbor.10.74.0.1=02:00:00:00:00:0a\nport.b.gateway.10.80.0.0/16=10.74.0.1",
+        "port.b.neighbor.10.73.1.1=02:00:00:00:00:0a\nport.b.gateway.10.80.0.1/16=10.73.1.1",
+        "port.b.gateway.10.80.0.0/16=10.73.1.2",
+        "port.b.neighbor.10.73.1.1=02:00:00:00:00:0a\nport.b.gateway.2001:db8::/32=10.73.1.1",
+        "port.b.gateway.10.80.0.0/16=10.73.1.1",
+        "port.b.neighbor.10.73.1.1=02:00:00:00:00:0a\nport.b.gateway.10.80.0.0/16=10.73.1.1\nport.b.gateway.10.80.0.0/16=10.73.1.3",
+        // Static neighbors: unicast on the port's prefix, not its own
+        // address, a unicast MAC, one mapping per address.
+        "port.b.neighbor.10.74.0.1=02:00:00:00:00:0a",
+        "port.b.neighbor.10.73.1.2=02:00:00:00:00:0a",
+        "port.b.neighbor.10.73.1.255=02:00:00:00:00:0a",
+        "port.b.neighbor.10.73.1.1=01:00:5e:00:00:01",
+        "port.b.neighbor.10.73.1.1=00:00:00:00:00:00",
+        "port.b.neighbor.10.73.1.1=02:00:00:00:00:0a\nport.b.neighbor.10.73.1.1=02:00:00:00:00:0b",
+        "port.b.neighbor.10.73.1.1=nonsense",
+        // A fixed-next-hop port uses no static neighbors.
+        "port.b.next_hop_mac=02:00:00:00:00:02\nport.b.neighbor.10.73.1.1=02:00:00:00:00:0a",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{af}{port}\n{suffix}\n")).is_err(),
+            "{suffix}"
+        );
+    }
+    // IPv6 resolves by Neighbor Discovery, never through static neighbors,
+    // and a TUN port uses none.
+    for config in [
+        format!("{af6}port.b.interface=eth1\nport.b.address=fe80::1\nport.b.neighbor.fe80::fe=02:00:00:00:00:0a\n"),
+        format!("{BASE}io.prefix=24\nport.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.b.neighbor.10.73.1.1=02:00:00:00:00:0a\n"),
+    ] {
+        assert!(SocketConfig::parse(&config).is_err(), "{config}");
+    }
+    // Typed configuration is validated the same way: duplicate names.
+    let mut config = SocketConfig::parse(BASE).unwrap();
+    let port = PortConfig {
+        name: "b".into(),
+        interface: "ntcp1".into(),
+        address: "10.73.1.2".parse().unwrap(),
+        prefix: None,
+        next_hop_mac: None,
+        gateways: Vec::new(),
+        neighbors: Vec::new(),
+    };
+    config.ports = vec![
+        port.clone(),
+        PortConfig {
+            interface: "ntcp2".into(),
+            address: "10.73.2.2".parse().unwrap(),
+            ..port.clone()
+        },
+    ];
+    assert!(config.validate().is_err());
+    config.ports[1].name = "c".into();
+    config.validate().unwrap();
+}
+
+// The `io.*` port resolving its next hops: `io.gateway.<prefix>` and
+// `io.neighbor.<address>` mirror the `port.<name>` keys with the same
+// validation; a fixed `io.next_hop_mac` or a TUN `io.*` port refuses them,
+// and Segment Routing routes need the fixed forwarder's default route.
+#[test]
+fn resolving_io_port_takes_gateways_and_static_neighbors() {
+    let af = "io.backend=af-packet\nio.interface=eth0\nio.address=10.73.1.2\nio.prefix=24\n";
+    let config = SocketConfig::parse(&format!(
+        "{af}io.neighbor.10.73.1.1=02:00:00:00:00:0a\nio.gateway.10.80.0.0/16=10.73.1.1\n"
+    ))
+    .unwrap();
+    assert_eq!(config.io.next_hop_mac, None);
+    assert_eq!(
+        config.io.neighbors,
+        vec![("10.73.1.1".parse().unwrap(), [2, 0, 0, 0, 0, 0xa])]
+    );
+    assert_eq!(
+        config.io.gateways,
+        vec![("10.80.0.0/16".parse().unwrap(), "10.73.1.1".parse().unwrap())]
+    );
+    let af6 = "io.backend=af-packet\nio.interface=eth0\nio.address=fe80::1\nio.prefix=64\n";
+    let config =
+        SocketConfig::parse(&format!("{af6}io.gateway.2001:db8:5::/48=fe80::fe\n")).unwrap();
+    assert_eq!(config.io.gateways.len(), 1);
+    for suffix in [
+        "io.neighbor.10.74.0.1=02:00:00:00:00:0a\nio.gateway.10.80.0.0/16=10.74.0.1",
+        "io.neighbor.10.73.1.1=02:00:00:00:00:0a\nio.gateway.10.80.0.1/16=10.73.1.1",
+        "io.gateway.10.80.0.0/16=10.73.1.2",
+        "io.gateway.10.80.0.0/16=10.73.1.1",
+        "io.neighbor.10.73.1.1=02:00:00:00:00:0a\nio.gateway.10.80.0.0/16=10.73.1.1\nio.gateway.10.80.0.0/16=10.73.1.3",
+        "io.neighbor.10.73.1.2=02:00:00:00:00:0a",
+        "io.neighbor.10.73.1.255=02:00:00:00:00:0a",
+        "io.neighbor.10.73.1.1=01:00:5e:00:00:01",
+        "io.neighbor.10.73.1.1=nonsense",
+        "io.gateway.nonsense=10.73.1.1",
+        // The legacy fixed forwarder resolves nothing.
+        "io.next_hop_mac=02:00:00:00:00:02\nio.neighbor.10.73.1.1=02:00:00:00:00:0a",
+        "io.next_hop_mac=02:00:00:00:00:02\nio.neighbor.10.73.1.1=02:00:00:00:00:0a\nio.gateway.10.80.0.0/16=10.73.1.1",
+    ] {
+        assert!(SocketConfig::parse(&format!("{af}{suffix}\n")).is_err(), "{suffix}");
+    }
+    for config in [
+        // IPv6 uses Neighbor Discovery, never static neighbors.
+        format!("{af6}io.neighbor.fe80::fe=02:00:00:00:00:0a\n"),
+        // A TUN `io.*` port resolves nothing.
+        format!("io.interface=ntcp0\nio.address=10.73.1.2\nio.prefix=24\nio.neighbor.10.73.1.1=02:00:00:00:00:0a\nio.gateway.10.80.0.0/16=10.73.1.1\n"),
+        format!("io.interface=ntcp0\nio.address=2001:db8::2\nio.gateway.2001:db8:5::/48=fe80::fe\n"),
+        // SR routes are installed through the fixed forwarder.
+        format!("{af6}ipv6.srh.2001:db8:9::/48=2001:db8:7::1\n"),
+    ] {
+        assert!(SocketConfig::parse(&config).is_err(), "{config}");
+    }
+    // The legacy form keeps its SR routes.
+    let legacy = "io.backend=af-packet\nio.interface=eth0\nio.address=2001:db8::2\nio.next_hop_mac=02:00:00:00:00:01\n";
+    assert!(SocketConfig::parse(&format!("{legacy}ipv6.srh.2001:db8:9::/48=2001:db8:7::1\n")).is_ok());
 }

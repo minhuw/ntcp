@@ -233,7 +233,7 @@ pub fn profile(flags: &str) -> Result<(IpAddr, Profile)> {
         return Err(unsupported("options require upstream baseline"));
     }
     let local = local.ok_or_else(|| unsupported("so_flags requires local=<IP>"))?;
-    if !crate::ip::unicast(local)
+    if !crate::ip::global_unicast(local)
         || local.is_ipv6() && options.link_mtu.is_some_and(|mtu| mtu < 1280)
     {
         return Err(unsupported("invalid local unicast IP"));

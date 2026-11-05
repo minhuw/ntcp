@@ -4,6 +4,7 @@ mod admin;
 mod admission;
 mod correlation;
 mod destination;
+mod discovery;
 mod dispatch;
 mod emitter;
 mod extensions;
@@ -11,8 +12,11 @@ mod fanout;
 mod fragment_icmp;
 mod ingress;
 mod ipv4_policy;
+mod neighbor;
 mod probe_receipts;
 mod reassembly;
+mod redirect;
+mod scoped;
 mod segment_routes;
 mod receive_capability;
 mod registration;
@@ -238,7 +242,7 @@ fn learn(
     mtu: u32,
 ) -> PathSnapshot {
     let request = host
-        .request(local.ip(), remote.ip(), Dscp::new(dscp).unwrap())
+        .request(local.ip(), remote.ip(), None, Dscp::new(dscp).unwrap())
         .unwrap();
     let (client, snapshot) = host.paths.acquire(request).unwrap();
     host.trusted_decrease(0, snapshot.path(), mtu).unwrap();

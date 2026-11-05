@@ -1649,6 +1649,7 @@ fn routed_placement_survives_a_failed_ticket() {
         &DatagramSettings::default(),
         &routes,
         0,
+        1,
     )
     .unwrap();
     client

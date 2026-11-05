@@ -18,7 +18,7 @@ use crate::{
     TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     TxTimestampToken,
     buffer::ReceiveBuffer,
-    connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, State, Tuple},
+    connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple, State, Tuple},
     rx_timestamp::RxTimestamps,
     schedule::{Deadlines, ReadyQueue},
     seq::Seq,
@@ -245,7 +245,7 @@ pub enum InputDisposition {
 enum Entry {
     Empty,
     Deleted,
-    Occupied(Tuple, usize),
+    Occupied(ScopedTuple, usize),
 }
 
 struct TupleTable {
@@ -264,7 +264,7 @@ impl TupleTable {
         entries.resize(count, Entry::Empty);
         Ok(Self { entries })
     }
-    fn find(&self, hash: usize, tuple: Tuple) -> Option<usize> {
+    fn find(&self, hash: usize, tuple: ScopedTuple) -> Option<usize> {
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
             match self.entries[position] {
@@ -275,7 +275,7 @@ impl TupleTable {
         }
         None
     }
-    fn insert(&mut self, hash: usize, tuple: Tuple, slot: usize) -> Result<(), EndpointError> {
+    fn insert(&mut self, hash: usize, tuple: ScopedTuple, slot: usize) -> Result<(), EndpointError> {
         // A keyed hash plus a fixed probe budget bounds hostile lookup work.
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
@@ -286,7 +286,7 @@ impl TupleTable {
         }
         Err(EndpointError::LimitReached)
     }
-    fn replace(&mut self, hash: usize, tuple: Tuple, old: usize, new: usize) -> bool {
+    fn replace(&mut self, hash: usize, tuple: ScopedTuple, old: usize, new: usize) -> bool {
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
             match self.entries[position] {
@@ -304,7 +304,7 @@ impl TupleTable {
         false
     }
 
-    fn remove(&mut self, hash: usize, tuple: Tuple, owner: usize) {
+    fn remove(&mut self, hash: usize, tuple: ScopedTuple, owner: usize) {
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
             match self.entries[position] {
@@ -372,6 +372,8 @@ struct Listener {
     handshake_retransmission_limit: Option<NonZeroU8>,
     user_mss: Option<u16>,
     address: SocketAddr,
+    // Present exactly for a link-local address of a managed Endpoint.
+    zone: Option<ntcp_path::LinkId>,
     backlog: usize,
     children: Vec<ConnectionId>,
     pending: VecDeque<ConnectionId>,
@@ -430,11 +432,23 @@ pub struct Endpoint {
     deadlines: Deadlines,
     // Stateless replies: addresses, header, IPv4 options, timestamp echo and,
     // when a managed provider stated it at queueing, the complete IP header
-    // length (extensions included) of the IPv6 path the reply leaves on.
-    control: VecDeque<(IpMetadata, Header, OutgoingIpv4Options, Option<u32>, Option<u16>)>,
+    // length (extensions included) of the IPv6 path the reply leaves on, and
+    // the arrival link of the input that caused it when one of its addresses
+    // is IPv6 link-local (the only link the reply may leave on).
+    #[allow(clippy::type_complexity)]
+    control: VecDeque<(
+        IpMetadata,
+        Header,
+        OutgoingIpv4Options,
+        Option<u32>,
+        Option<u16>,
+        Option<ntcp_path::LinkId>,
+    )>,
     // Stateless replies discarded because even their minimal form could not
     // fit the path: dropped once, never retried.
     oversized_control: u64,
+    // Scoped stateless replies whose link was gone before they drained.
+    undeliverable_control: u64,
     passive_errors: VecDeque<Event>,
     control_epoch: Instant,
     control_count: usize,
@@ -444,7 +458,7 @@ pub struct Endpoint {
     receive_pool: Vec<ReceiveBuffer>,
     // ponytail: conservative FIFO loss retention until eviction; add path-qualified
     // aging only when measured deployment behavior warrants it.
-    setup_loss_cache: VecDeque<(IpAddr, IpAddr)>,
+    setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
 }
 
 fn reserved_vec<T>(capacity: usize) -> Result<Vec<T>, EndpointError> {
@@ -566,6 +580,7 @@ impl Endpoint {
             control_epoch: now,
             control_count: 0,
             oversized_control: 0,
+            undeliverable_control: 0,
             control_turn: true,
             buffer_bytes,
             per_connection_bytes,
@@ -734,10 +749,15 @@ impl Endpoint {
     //# for some other connection.
 
     // HMAC secrecy depends on the embedding supplying an unpredictable secret.
-    fn digest(&self, domain: &[u8], tuple: Tuple) -> [u8; 32] {
+    // A scoped identity appends its complete link identity after the
+    // unscoped encoding, so unscoped digests keep their exact bytes and the
+    // same link-local pair on two links (or a recycled link) never shares an
+    // ISN, timestamp offset or lookup position.
+    fn digest(&self, domain: &[u8], scoped: ScopedTuple) -> [u8; 32] {
         let mut mac =
             Hmac::<Sha256>::new_from_slice(&self.secret).expect("HMAC accepts a 32-byte key");
         mac.update(domain);
+        let tuple = scoped.tuple();
         for address in [tuple.local, tuple.remote] {
             match address.ip() {
                 IpAddr::V4(ip) => {
@@ -751,9 +771,13 @@ impl Endpoint {
             }
             mac.update(&address.port().to_be_bytes());
         }
+        if let Some(zone) = scoped.zone() {
+            mac.update(b"zone");
+            mac.update(&zone.to_bytes());
+        }
         mac.finalize().into_bytes().into()
     }
-    fn hash(&self, tuple: Tuple) -> usize {
+    fn hash(&self, tuple: ScopedTuple) -> usize {
         let tag = self.digest(b"ntcp lookup", tuple);
         u64::from_be_bytes(tag[..8].try_into().unwrap()) as usize
     }
@@ -763,7 +787,7 @@ impl Endpoint {
     //# driven selection of initial sequence numbers (MUST-8), and SHOULD
     //# generate its initial sequence numbers with the expression:
 
-    fn isn(&mut self, tuple: Tuple) -> u32 {
+    fn isn(&mut self, tuple: ScopedTuple) -> u32 {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
         //# SHOULD
         //# generate its initial sequence numbers with the expression:
@@ -845,9 +869,10 @@ impl Endpoint {
     fn crossing_syn_authorization(
         &mut self,
         listener: ListenerId,
-        tuple: Tuple,
+        scoped: ScopedTuple,
         syn: &wire::Segment<'_>,
     ) -> CrossingSynAuthorization {
+        let tuple = scoped.tuple;
         let mut decision = CrossingSynAuthorization {
             early: false,
             response: None,
@@ -883,11 +908,12 @@ impl Endpoint {
             .count();
         let valid = !protected
             && syn.options.fast_open.is_some_and(|cookie| {
-                policy.valid(
+                policy.valid_in(
                     &self.fast_open_credentials,
                     self.now,
                     tuple.local.ip(),
                     tuple.remote.ip(),
+                    scoped.zone,
                     cookie,
                 )
             });
@@ -905,11 +931,12 @@ impl Endpoint {
             && syn.options.fast_open.is_some()
             && (!valid || policy.policy().refresh_valid_cookie())
         {
-            decision.response = policy.issue(
+            decision.response = policy.issue_in(
                 &self.fast_open_credentials,
                 self.now,
                 tuple.local.ip(),
                 tuple.remote.ip(),
+                scoped.zone,
             );
         }
         decision
@@ -924,7 +951,28 @@ impl Endpoint {
         address: SocketAddr,
         backlog: usize,
     ) -> Result<ListenerId, EndpointError> {
-        if !supported_socket(address) {
+        self.listen_scoped(address, None, backlog)
+    }
+
+    /// `listen` on a link-local address of a managed Endpoint, which names
+    /// its link: exactly that address and zone beats the family wildcard,
+    /// and identical link-local addresses on different links listen
+    /// independently. An unscoped wildcard listener accepts on every link,
+    /// each child carrying its arrival link's zone.
+    pub fn listen_scoped(
+        &mut self,
+        address: SocketAddr,
+        zone: Option<ntcp_path::LinkId>,
+        backlog: usize,
+    ) -> Result<ListenerId, EndpointError> {
+        // A raw Endpoint's link-local listener stays unscoped; a managed one
+        // needs the zone its arrivals carry.
+        let scoped = crate::connection::link_local(address.ip())
+            && (zone.is_some() || self.managed_context.is_some());
+        if !supported_socket(address)
+            || scoped != zone.is_some()
+            || zone.is_some_and(|zone| Some(zone.context()) != self.managed_context)
+        {
             return Err(EndpointError::InvalidAddress);
         }
         if address.port() == 0
@@ -946,7 +994,7 @@ impl Endpoint {
             .listeners
             .iter()
             .flatten()
-            .any(|listener| listener.address == address)
+            .any(|listener| listener.address == address && listener.zone == zone)
         {
             return Err(EndpointError::AddressInUse);
         }
@@ -976,6 +1024,7 @@ impl Endpoint {
             handshake_retransmission_limit: None,
             user_mss: self.config.connection.user_mss,
             address,
+            zone,
             backlog,
             children,
             pending,
@@ -1039,7 +1088,7 @@ impl Endpoint {
     //# (MUST-46).
 
     // Scoped to the embedding policy's bound network; base invalid addresses cannot be allowed.
-    fn admission(&self, tuple: Tuple) -> Result<(), EndpointError> {
+    fn admission(&self, tuple: ScopedTuple) -> Result<(), EndpointError> {
         self.admission_with_buffers(
             tuple,
             (
@@ -1051,10 +1100,12 @@ impl Endpoint {
 
     fn admission_with_buffers(
         &self,
-        tuple: Tuple,
+        scoped: ScopedTuple,
         capacities: (usize, usize),
     ) -> Result<(), EndpointError> {
-        if !supported_socket(tuple.local)
+        let tuple = scoped.tuple;
+        if !self.admits_zone(scoped)
+            || !supported_socket(tuple.local)
             || !supported_socket(tuple.remote)
             || tuple.local.port() == 0
             || tuple.remote.port() == 0
@@ -1068,7 +1119,28 @@ impl Endpoint {
         {
             return Err(EndpointError::InvalidAddress);
         }
-        self.resource_admission(tuple, capacities)
+        self.resource_admission(scoped, capacities)
+    }
+
+    // A zone is authority of this Endpoint's managed network context; a raw
+    // Endpoint has none, so its tuples are unscoped.
+    fn admits_zone(&self, scoped: ScopedTuple) -> bool {
+        scoped
+            .zone
+            .is_none_or(|zone| Some(zone.context()) == self.managed_context)
+    }
+
+    // A tuple's identity in the current operation: the zone of the managed
+    // factory transaction constructing it. Raw tuples carry no link
+    // authority and are unscoped.
+    fn scoped(&self, tuple: Tuple) -> ScopedTuple {
+        match self.factory_transaction {
+            Some(transaction) if transaction.request.tuple == tuple => ScopedTuple {
+                tuple,
+                zone: transaction.request.zone,
+            },
+            _ => ScopedTuple::unscoped(tuple),
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
@@ -1076,10 +1148,10 @@ impl Endpoint {
     //# Return "error: connection already exists".
     fn resource_admission(
         &self,
-        tuple: Tuple,
+        tuple: ScopedTuple,
         capacities: (usize, usize),
     ) -> Result<(), EndpointError> {
-        if tuple.local.port() == 0 || tuple.remote.port() == 0 {
+        if tuple.tuple.local.port() == 0 || tuple.tuple.remote.port() == 0 {
             return Err(EndpointError::InvalidAddress);
         }
         if self.tuples.find(self.hash(tuple), tuple).is_some() {
@@ -1270,13 +1342,14 @@ impl Endpoint {
         // drop it while returning pooled storage through the existing path.
         let mut rx_timestamps = RxTimestamps::default();
         rx_timestamps.resize(rx_ranges, available - charge)?;
+        let scoped = self.scoped(tuple);
         let mut connection_config = self.config.connection.clone();
         connection_config.timestamps = self.new_connection_timestamps();
         connection_config.send_capacity = capacities.0;
         connection_config.receive_capacity = capacities.1;
         connection_config.user_mss = options.user_mss;
         if syn.is_some()
-            && let Some(listener) = self.match_listener(tuple.local)
+            && let Some(listener) = self.match_listener(tuple.local, scoped.zone)
         {
             connection_config.user_mss = self
                 .listener(listener)
@@ -1286,7 +1359,7 @@ impl Endpoint {
         if connection_config.initial_window == crate::InitialWindow::Iw10
             && self
                 .setup_loss_cache
-                .contains(&(tuple.local.ip(), tuple.remote.ip()))
+                .contains(&(tuple.local.ip(), tuple.remote.ip(), scoped.zone))
         {
             connection_config.initial_window = crate::InitialWindow::Rfc5681;
         }
@@ -1310,9 +1383,9 @@ impl Endpoint {
         let mut accept_syn_data = syn.is_none_or(|syn| syn.options.fast_open.is_none());
         let mut filtered_syn = None;
         if let Some(syn) = syn
-            && let Some(listener) = self.match_listener(tuple.local)
+            && let Some(listener) = self.match_listener(tuple.local, scoped.zone)
         {
-            let decision = self.crossing_syn_authorization(listener, tuple, syn);
+            let decision = self.crossing_syn_authorization(listener, scoped, syn);
             early = decision.early;
             if self.fast_open.is_some()
                 && self.listeners[listener.slot]
@@ -1377,11 +1450,12 @@ impl Endpoint {
             return Err(Error::NoMemory);
         }
         if let Ok(connection) = &mut result {
+            connection.set_zone(scoped.zone);
             connection.passive_fast_open(fast_open_response, early);
             let mut domain = *b"ntcp timestamp offset\0\0\0\0";
             let len = domain.len();
             domain[len - 4..].copy_from_slice(&iss.to_be_bytes());
-            let tag = self.digest(&domain, tuple);
+            let tag = self.digest(&domain, scoped);
             connection.set_timestamp_offset(u32::from_be_bytes(tag[..4].try_into().unwrap()));
         }
         if let Some(receive) = receive {
@@ -1413,14 +1487,14 @@ impl Endpoint {
         listener: Option<ListenerId>,
         fallback: Option<ConnectionId>,
     ) -> Result<ConnectionId, EndpointError> {
-        let tuple = connection.tuple();
+        let tuple = connection.scoped_tuple();
         let admission = (|| {
             let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
             if let Some(old) = fallback {
                 if self.generations.get(old.slot) != Some(&old.generation)
                     || !self.slots[old.slot].as_ref().is_some_and(|slot| {
                         slot.mapped
-                            && slot.connection.tuple() == tuple
+                            && slot.connection.scoped_tuple() == tuple
                             && slot.connection.time_wait_valid(self.now)
                     })
                 {
@@ -1898,7 +1972,7 @@ impl Endpoint {
         self.check_clock(now)?;
         Ok(self.fast_open.as_ref().is_some_and(|service| {
             service
-                .get(now, self.fast_open_lifetime(), local, remote)
+                .get_in(now, self.fast_open_lifetime(), local, remote, None)
                 .is_some()
         }))
     }
@@ -1925,7 +1999,7 @@ impl Endpoint {
         Ok(
             (cookie.is_some() || self.has_fast_open_cookie(now, local, remote.ip())?)
                 && self.fast_open.as_ref().is_some_and(|service| {
-                    !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote)
+                    !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote, None)
                 }),
         )
     }
@@ -1943,8 +2017,32 @@ impl Endpoint {
         Ok((policy == crate::FastOpenClientPolicy::ApplicationProtected
             || self.has_fast_open_cookie(now, local, remote.ip())?)
             && self.fast_open.as_ref().is_some_and(|service| {
-                !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote)
+                !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote, None)
             }))
+    }
+
+    /// Deferral eligibility for a peer whose tuple has `zone` (Some exactly
+    /// when an address is IPv6 link-local): a supplied `cookie` as
+    /// [`Self::can_defer_fast_open_with_server_cookie`], otherwise `policy`
+    /// as [`Self::can_defer_fast_open_with_policy`], with that zone's cookie
+    /// cache and suppression.
+    pub fn can_defer_scoped_fast_open(
+        &self,
+        now: Instant,
+        local: IpAddr,
+        remote: SocketAddr,
+        zone: Option<ntcp_path::LinkId>,
+        cookie: Option<wire::FastOpenCookie>,
+        policy: crate::FastOpenClientPolicy,
+    ) -> Result<bool, EndpointError> {
+        self.check_clock(now)?;
+        let lifetime = self.fast_open_lifetime();
+        Ok(self.fast_open.as_ref().is_some_and(|service| {
+            (cookie.is_some()
+                || policy == crate::FastOpenClientPolicy::ApplicationProtected
+                || service.get_in(now, lifetime, local, remote.ip(), zone).is_some())
+                && !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote, zone)
+        }))
     }
 
     /// Copy initial data before publishing an active TFO connection. A cache
@@ -2085,14 +2183,16 @@ impl Endpoint {
         receive_authority: Option<ListenerId>,
     ) -> Result<(ConnectionId, usize), EndpointError> {
         let tuple = Tuple { local, remote };
-        self.active_admission(now, tuple, &options, receive_authority, true)?;
+        let zone = self.scoped(tuple).zone;
+        self.active_admission(now, self.scoped(tuple), &options, receive_authority, true)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
         let suppressed =
-            service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote);
-        let cached = service.get(now, self.fast_open_lifetime(), local.ip(), remote.ip());
-        let peer_mss = service.peer_mss(now, self.fast_open_lifetime(), local.ip(), remote.ip());
+            service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote, zone);
+        let cached = service.get_in(now, self.fast_open_lifetime(), local.ip(), remote.ip(), zone);
+        let peer_mss =
+            service.peer_mss(now, self.fast_open_lifetime(), local.ip(), remote.ip(), zone);
         self.clock(now)?;
-        let iss = self.isn(tuple);
+        let iss = self.isn(self.scoped(tuple));
         let mut connection = self.new_connection_with_options(
             tuple,
             iss,
@@ -2134,14 +2234,14 @@ impl Endpoint {
     pub(crate) fn active_admission(
         &self,
         now: Instant,
-        tuple: Tuple,
+        tuple: ScopedTuple,
         options: &ActiveOpenOptions,
         receive_authority: Option<ListenerId>,
         fast_open: bool,
     ) -> Result<(), EndpointError> {
         options.validate()?;
         if let Some(authority) = receive_authority {
-            self.validate_fast_open_receive_authority(authority, tuple.local.ip())?;
+            self.validate_fast_open_receive_authority(authority, tuple.tuple.local.ip())?;
         }
         self.check_clock(now)?;
         if fast_open && self.fast_open.is_none() {
@@ -2158,8 +2258,8 @@ impl Endpoint {
     ) -> Result<ConnectionId, EndpointError> {
         self.clock(now)?;
         let tuple = Tuple { local, remote };
-        self.admission(tuple)?;
-        let iss = self.isn(tuple);
+        self.admission(self.scoped(tuple))?;
+        let iss = self.isn(self.scoped(tuple));
         let connection = self.new_connection(tuple, iss, None)?;
         self.insert(connection, None, None)
     }
@@ -2210,8 +2310,9 @@ impl Endpoint {
         }
         self.clock(now)?;
         let tuple = Tuple { local, remote };
-        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
-        let iss = self.isn(tuple);
+        let scoped = self.scoped(tuple);
+        self.admission_with_buffers(scoped, (options.send_capacity, options.receive_capacity))?;
+        let iss = self.isn(scoped);
         let connection = self.new_connection_with_options(
             tuple,
             iss,
@@ -2471,7 +2572,7 @@ impl Endpoint {
     fn reclaim(&mut self, index: usize) {
         let id = self.id(index);
         let slot = self.slots[index].take().unwrap();
-        let tuple = slot.connection.tuple();
+        let tuple = slot.connection.scoped_tuple();
         if slot.mapped {
             self.tuples.remove(self.hash(tuple), tuple, index);
         }
@@ -2523,17 +2624,18 @@ impl Endpoint {
             if core::mem::take(&mut slot.connection.fast_open_negative)
                 && let Some(service) = self.fast_open.as_mut()
             {
-                let tuple = slot.connection.tuple();
-                service.fail(self.now, tuple.local.ip(), tuple.remote);
+                let scoped = slot.connection.scoped_tuple();
+                let tuple = scoped.tuple;
+                service.fail(self.now, tuple.local.ip(), tuple.remote, scoped.zone);
             }
             if let Some((cookie, mss)) = slot.connection.fast_open_learned.take()
                 && let Some(service) = self.fast_open.as_mut()
             {
-                let tuple = slot.connection.tuple();
+                let ScopedTuple { tuple, zone } = slot.connection.scoped_tuple();
                 if let Some(cookie) = cookie {
-                    service.learn(self.now, tuple.local.ip(), tuple.remote.ip(), cookie, mss);
+                    service.learn_in(self.now, tuple.local.ip(), tuple.remote.ip(), zone, cookie, mss);
                 } else if let Some(mss) = mss {
-                    service.update_mss(self.now, tuple.local.ip(), tuple.remote.ip(), mss);
+                    service.update_mss(self.now, tuple.local.ip(), tuple.remote.ip(), zone, mss);
                 }
             }
             if core::mem::take(&mut slot.connection.fast_open_peer_reset)
@@ -2559,8 +2661,8 @@ impl Endpoint {
         if let Some(slot) = &self.slots[index]
             && slot.connection.iw_setup_loss()
         {
-            let tuple = slot.connection.tuple();
-            let key = (tuple.local.ip(), tuple.remote.ip());
+            let scoped = slot.connection.scoped_tuple();
+            let key = (scoped.tuple.local.ip(), scoped.tuple.remote.ip(), scoped.zone);
             if !self.setup_loss_cache.contains(&key) {
                 if self.setup_loss_cache.len() == self.config.max_setup_cache_entries {
                     self.setup_loss_cache.pop_front();
@@ -2576,7 +2678,7 @@ impl Endpoint {
             && let Some(old) = slot.fallback
         {
             let failed = slot.connection.state() == State::Closed;
-            let tuple = slot.connection.tuple();
+            let tuple = slot.connection.scoped_tuple();
             self.slots[index].as_mut().unwrap().fallback = None;
             // Released handles are intentionally eligible; generation, tuple,
             // state, deadline and current mapping ownership must all still match.
@@ -2584,7 +2686,7 @@ impl Endpoint {
                 && self.generations.get(old.slot) == Some(&old.generation)
                 && self.slots[old.slot].as_ref().is_some_and(|slot| {
                     !slot.mapped
-                        && slot.connection.tuple() == tuple
+                        && slot.connection.scoped_tuple() == tuple
                         && slot.connection.time_wait_valid(self.now)
                 })
                 && self
@@ -2639,7 +2741,7 @@ impl Endpoint {
             self.events.remove(index);
         }
         if state == State::Closed && !reset_reserved && self.slots[index].as_ref().unwrap().mapped {
-            let tuple = self.slots[index].as_ref().unwrap().connection.tuple();
+            let tuple = self.slots[index].as_ref().unwrap().connection.scoped_tuple();
             self.tuples.remove(self.hash(tuple), tuple, index);
             self.slots[index].as_mut().unwrap().mapped = false;
         }
@@ -2701,7 +2803,11 @@ impl Endpoint {
     //# parameter is unspecified, a passive OPEN will await an incoming
     //# connection request to any local IP address and then bind the local IP
     //# address of the connection to the particular address that is used.
-    fn match_listener(&self, local: SocketAddr) -> Option<ListenerId> {
+    fn match_listener(
+        &self,
+        local: SocketAddr,
+        zone: Option<ntcp_path::LinkId>,
+    ) -> Option<ListenerId> {
         // Listener count is independently bounded; established lookup never scans it.
         let mut wildcard = None;
         for (slot, listener) in self.listeners.iter().enumerate() {
@@ -2718,7 +2824,10 @@ impl Endpoint {
                 slot,
                 generation: self.listener_generations[slot],
             };
-            if listener.address == local {
+            // Only a link-local local address is scoped by the zone.
+            if listener.address == local
+                && listener.zone == zone.filter(|_| crate::connection::link_local(local.ip()))
+            {
                 return Some(id);
             }
             if listener.address.ip().is_unspecified() {
@@ -2759,6 +2868,7 @@ impl Endpoint {
     fn reset_for(
         &mut self,
         ip: IpMetadata,
+        zone: Option<ntcp_path::LinkId>,
         segment: &wire::Segment<'_>,
         route: Option<SourceRoute>,
     ) {
@@ -2829,6 +2939,7 @@ impl Endpoint {
                 .map(|ts| ts.0)
                 .filter(|_| self.config.connection.send_ip_payload_limit >= 32),
             None,
+            zone,
         ));
         self.control_count += 1;
     }
@@ -2914,8 +3025,24 @@ impl Endpoint {
         bytes: &[u8],
         metadata: crate::RxPacketMetadata,
     ) -> Result<InputDisposition, EndpointError> {
+        self.input_scoped(now, ip, None, traffic_class, options, bytes, metadata)
+    }
+
+    // Input whose tuple is scoped by `zone` (the arrival link of a scoped
+    // managed input; raw input is unscoped).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn input_scoped(
+        &mut self,
+        now: Instant,
+        ip: IpMetadata,
+        zone: Option<ntcp_path::LinkId>,
+        traffic_class: u8,
+        options: Ipv4Options,
+        bytes: &[u8],
+        metadata: crate::RxPacketMetadata,
+    ) -> Result<InputDisposition, EndpointError> {
         let timestamps = metadata.timestamps;
-        let Some((route, segment)) = self.ingress_admission(ip, options, bytes, metadata)? else {
+        let Some((route, segment)) = self.ingress_admission(ip, zone, options, bytes, metadata)? else {
             return Ok(InputDisposition::Dropped);
         };
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
@@ -2928,6 +3055,7 @@ impl Endpoint {
             local: SocketAddr::new(ip.destination, segment.header.destination_port),
             remote: SocketAddr::new(ip.source, segment.header.source_port),
         };
+        let tuple = ScopedTuple { tuple, zone };
         let target = self.tuples.find(self.hash(tuple), tuple);
         if target.is_some_and(|index| self.is_output_reserved(self.id(index))) {
             return Err(EndpointError::OutputReserved);
@@ -2983,7 +3111,7 @@ impl Endpoint {
             self.refresh(index);
             return Ok(InputDisposition::Processed);
         }
-        if let Some(listener) = self.match_listener(tuple.local) {
+        if let Some(listener) = self.match_listener(tuple.tuple.local, zone) {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
             //# An incoming RST should be ignored.  Return.
             if segment.header.flags & RST != 0 {
@@ -2994,7 +3122,7 @@ impl Endpoint {
             //# in the LISTEN state.  An acceptable reset segment should be
             //# formed for any arriving ACK-bearing segment.
             if segment.header.flags & ACK != 0 {
-                self.reset_for(ip, &segment, route);
+                self.reset_for(ip, zone, &segment, route);
                 return Ok(InputDisposition::Processed);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
@@ -3012,7 +3140,7 @@ impl Endpoint {
             let rx_ranges = record.rx_timestamp_capacity;
             let iss = self.isn(tuple);
             let mut connection = match self.new_connection_with_buffers(
-                tuple,
+                tuple.tuple,
                 iss,
                 Some(&segment),
                 buffer_capacities,
@@ -3039,7 +3167,7 @@ impl Endpoint {
                 Err(error) => return Err(error),
             }
         }
-        self.reset_for(ip, &segment, route);
+        self.reset_for(ip, zone, &segment, route);
         Ok(InputDisposition::Dropped)
     }
 
@@ -3051,6 +3179,7 @@ impl Endpoint {
     pub(crate) fn ingress_admission<'a>(
         &self,
         ip: IpMetadata,
+        zone: Option<ntcp_path::LinkId>,
         options: Ipv4Options,
         bytes: &'a [u8],
         metadata: crate::RxPacketMetadata,
@@ -3087,10 +3216,11 @@ impl Endpoint {
             || !valid_address(ip.destination)
             || ip.source.is_ipv4() != ip.destination.is_ipv4()
             // Managed path authority needs a zone for an IPv6 link-local
-            // address (RFC 4007); this Endpoint's tuples carry none, so such
-            // input is unsupported here rather than an authority failure.
+            // address (RFC 4007): input without its arrival link is
+            // unsupported here rather than an authority failure.
             || (self.managed_context.is_some()
-                && (unzoned_link_local(ip.source) || unzoned_link_local(ip.destination)))
+                && (unzoned_link_local(ip.source) || unzoned_link_local(ip.destination))
+                && zone.is_none())
             || !(self.address_policy)(AddressValidation::Incoming {
                 source: ip.source, destination: ip.destination,
             })
@@ -3121,7 +3251,7 @@ impl Endpoint {
         now: Instant,
         target: Option<usize>,
         listener: ListenerId,
-        tuple: Tuple,
+        tuple: ScopedTuple,
         syn: &wire::Segment<'_>,
     ) -> bool {
         let record = self.listeners[listener.slot].as_ref().unwrap();
@@ -3195,16 +3325,17 @@ impl Endpoint {
     fn reopen_time_wait(
         &mut self,
         index: usize,
-        tuple: Tuple,
+        scoped: ScopedTuple,
         traffic_class: u8,
         options: Ipv4Options,
         syn: &wire::Segment<'_>,
         timestamps: RxPacketTimestamps,
     ) -> Result<InputDisposition, EndpointError> {
-        let Some(listener) = self.match_listener(tuple.local) else {
+        let tuple = scoped.tuple;
+        let Some(listener) = self.match_listener(tuple.local, scoped.zone) else {
             return Ok(InputDisposition::Dropped);
         };
-        if !self.passive_room(self.now, Some(index), listener, tuple, syn) {
+        if !self.passive_room(self.now, Some(index), listener, scoped, syn) {
             return Ok(InputDisposition::Dropped);
         }
         let record = self.listeners[listener.slot].as_ref().unwrap();
@@ -3212,7 +3343,7 @@ impl Endpoint {
         let handshake_retransmission_limit = record.handshake_retransmission_limit;
         let buffer_capacities = record.buffer_capacities;
         let rx_ranges = record.rx_timestamp_capacity;
-        let candidate = self.isn(tuple);
+        let candidate = self.isn(scoped);
         let iss = self.slots[index]
             .as_ref()
             .unwrap()
@@ -3708,6 +3839,7 @@ impl Endpoint {
         quoted_sequence: u32,
         error: crate::NetworkError,
     ) -> Result<bool, EndpointError> {
+        let tuple = ScopedTuple::unscoped(tuple);
         let Some(index) = self.tuples.find(self.hash(tuple), tuple) else {
             return Ok(false);
         };
@@ -3780,6 +3912,7 @@ impl Endpoint {
         ip_header_len: u16,
         candidate_mtu: u32,
     ) -> Result<bool, EndpointError> {
+        let tuple = ScopedTuple::unscoped(tuple);
         let Some(index) = self.tuples.find(self.hash(tuple), tuple) else {
             return Ok(false);
         };
@@ -4147,6 +4280,11 @@ impl Endpoint {
     }
     // Observe an existing connection without transferring ownership.
     pub fn connection_id(&self, tuple: Tuple) -> Option<ConnectionId> {
+        self.scoped_connection_id(ScopedTuple::unscoped(tuple))
+    }
+    /// `connection_id` for a scoped identity: identical link-local tuples on
+    /// two links name two connections.
+    pub fn scoped_connection_id(&self, tuple: ScopedTuple) -> Option<ConnectionId> {
         self.tuples
             .find(self.hash(tuple), tuple)
             .map(|index| self.id(index))
@@ -4270,6 +4408,14 @@ impl Endpoint {
     /// dropped once, never retried. For administrative reporting.
     pub fn oversized_control_replies(&self) -> u64 {
         self.oversized_control
+    }
+
+    /// Stateless replies to a link-local peer dropped because the link they
+    /// arrived on, the only one they may leave on, was removed or replaced
+    /// before they drained (`count_undeliverable_reply`): each is dropped
+    /// once, never sent on another link. For administrative reporting.
+    pub fn undeliverable_control_replies(&self) -> u64 {
+        self.undeliverable_control
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -4719,13 +4865,17 @@ impl Endpoint {
             shared.as_deref_mut(),
         );
         self.reservations[index].payload = payload;
-        let output = output?;
+        let (output, mut zone) = output?;
         if let Some(packet) = output.packet {
             if let Some(parts) = shared.filter(|p| !p.is_empty()) {
                 self.reservations[index].capture_shared(packet, out, parts, attempt)?;
             } else {
                 self.reservations[index].capture(packet, out, attempt);
             }
+            if let Some(id) = packet.connection {
+                zone = self.retained_slot(id)?.connection.scoped_tuple().zone();
+            }
+            self.reservations[index].current.as_mut().unwrap().zone = zone;
             if let Some(id) = packet.connection {
                 let departure = self.retained_slot(id)?.connection.last_departure;
                 let r = self.reservations[index].current.as_mut().unwrap();
@@ -4915,6 +5065,84 @@ impl Endpoint {
         self.cancel_local_output(attempt, Some(now))
     }
 
+    /// Withdraw an attempt certified never submitted because its next hop
+    /// could not be resolved (RFC 4861 section 7.2.2), for every segment
+    /// kind, without a departure: no RTT sample, retransmission count,
+    /// backoff step, ledger commit, departure charge or timestamp
+    /// completion. A pure ACK or RST is dropped like any lost control (the
+    /// peer's own retransmission elicits another). Retransmittable output
+    /// (SYN, SYN-ACK, data, FIN) is restored as unselected and retried by
+    /// the connection's local-failure retry clock, no earlier than the
+    /// current RTO; its application deadline still ends it. A selection
+    /// that cannot be restored exactly, or the suffix after an accepted
+    /// prefix, is released as unsent output instead: its sequence space
+    /// stays outstanding without a departure, for the connection's own loss
+    /// recovery, on the same retry clock. `error` is the owner's advice,
+    /// recorded as its soft error (RFC 1122 section 4.2.3.9: no abort).
+    /// False only for an attempt that is not the reservation's current one.
+    pub fn discard_unsubmitted(
+        &mut self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+        error: Option<crate::NetworkError>,
+    ) -> Result<bool, EndpointError> {
+        self.clock(now)?;
+        let index = attempt.reservation;
+        let Some(r) = self
+            .reservations
+            .get(index)
+            .and_then(|s| s.current.as_ref())
+        else {
+            return Ok(false);
+        };
+        if r.attempt != Some(attempt) {
+            return Ok(false);
+        }
+        let Some(id) = r.packet.connection else {
+            self.reservations[index].clear();
+            return Ok(true);
+        };
+        let flags = self.reservations[index].bytes[13];
+        let sequence = flags & (wire::SYN | wire::FIN) != 0
+            || r.departure.is_some_and(|d| d.payload != 0)
+            || self.reservations[index].is_shared();
+        let (timestamp, departure, offset) = (r.packet.tx_timestamp, r.departure, r.offset);
+        let owner = &mut self.retained_slot_mut(id)?.connection;
+        if flags & wire::RST != 0 || !sequence {
+            owner.reject_reserved_output();
+        } else if offset != 0 || !owner.cancel_reserved_unsubmitted(now)? {
+            owner.release_reserved_unsubmitted(now, departure.as_ref())?;
+        }
+        // An accepted prefix keeps the timestamp its departure owns.
+        if let Some(token) = timestamp.filter(|_| offset == 0) {
+            for source in [TxTimestampSource::Software, TxTimestampSource::Hardware] {
+                owner
+                    .tx_timestamps
+                    .cancel_transmit(token.stream_range(), source);
+            }
+        }
+        self.reservations[index].clear();
+        if let Some(error) = error
+            && self
+                .retained_slot_mut(id)?
+                .connection
+                .unsubmitted_network_error(now, error)?
+            && self.config.error_reports
+            && let Some(listener) = self.retained_slot(id)?.listener
+            && self.passive_errors.len() < self.config.max_connections
+        {
+            let tuple = self.retained_slot(id)?.connection.tuple();
+            self.passive_errors.push_back(Event::PassiveError {
+                listener,
+                tuple,
+                error,
+            });
+        }
+        self.refresh(id.slot);
+        self.rearm_pending_accept(id);
+        Ok(true)
+    }
+
     fn cancel_local_output(
         &mut self,
         attempt: crate::TransmitAttempt,
@@ -5046,8 +5274,10 @@ impl Endpoint {
         budget: usize,
     ) -> Result<PollTransmit, EndpointError> {
         self.poll_transmit_inner(now, out, budget, false, None, None, None)
+            .map(|(output, _)| output)
     }
 
+    // Also returns the zone a selected stateless reply was queued with.
     #[allow(clippy::too_many_arguments)] // Selection policy and reusable output carriers stay explicit.
     fn poll_transmit_inner(
         &mut self,
@@ -5058,7 +5288,7 @@ impl Endpoint {
         selected: Option<Option<ConnectionId>>,
         mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
         mut shared: Option<&mut Vec<crate::Payload>>,
-    ) -> Result<PollTransmit, EndpointError> {
+    ) -> Result<(PollTransmit, Option<ntcp_path::LinkId>), EndpointError> {
         self.clock(now)?;
         for _ in 0..budget {
             if !self.cleanup.is_empty() {
@@ -5078,7 +5308,7 @@ impl Endpoint {
                 && selected.is_none_or(|owner| owner.is_none())
                 && (self.control_turn || next.is_none() || selected == Some(None))
             {
-                let (ip, header, ipv4_options, mut echo, path_header) =
+                let (ip, header, ipv4_options, mut echo, path_header, zone) =
                     *self.control.front().unwrap();
                 if let Some(policy) = self.config.connection.pmtud {
                     let ip_len = match (ip.source, ip.destination) {
@@ -5116,19 +5346,22 @@ impl Endpoint {
                 let len = wire::encode(ip, header, options, &[], out).map_err(Error::Wire)?;
                 self.control.pop_front();
                 self.control_turn = false;
-                return Ok(PollTransmit {
-                    packet: Some(Transmit {
-                        connection: None,
-                        tx_timestamp: None,
-                        ecn: 0,
-                        ipv4_options,
-                        ip,
-                        len,
-                        hop_limit: self.config.hop_limit,
-                        dscp: self.config.dscp,
-                    }),
-                    more_work: self.has_pending_output(),
-                });
+                return Ok((
+                    PollTransmit {
+                        packet: Some(Transmit {
+                            connection: None,
+                            tx_timestamp: None,
+                            ecn: 0,
+                            ipv4_options,
+                            ip,
+                            len,
+                            hop_limit: self.config.hop_limit,
+                            dscp: self.config.dscp,
+                        }),
+                        more_work: self.has_pending_output(),
+                    },
+                    zone,
+                ));
             }
             let Some(index) = next else {
                 continue;
@@ -5192,32 +5425,35 @@ impl Endpoint {
                         // Preserve candidate order, but do not reclaim before capture.
                         self.output.push(index);
                     }
-                    return Ok(PollTransmit {
-                        packet: Some(Transmit {
-                            connection: Some(connection),
-                            tx_timestamp,
-                            ecn,
-                            ipv4_options,
-                            ip: IpMetadata {
-                                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
-                                //# At all other times, a previous segment has either been sent or
-                                //# received on this connection, and TCP implementations MUST use the
-                                //# same local address that was used in those previous segments (MUST-
-                                //# 45).
-                                source: tuple.local.ip(),
-                                destination: tuple.remote.ip(),
-                            },
-                            len,
-                            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
-                            //# TCP implementations
-                            //# SHOULD pass the current Differentiated Services field value without
-                            //# change to the IP layer, when it sends segments on the connection
-                            //# (SHLD-22).
-                            hop_limit,
-                            dscp,
-                        }),
-                        more_work: self.has_pending_output(),
-                    });
+                    return Ok((
+                        PollTransmit {
+                            packet: Some(Transmit {
+                                connection: Some(connection),
+                                tx_timestamp,
+                                ecn,
+                                ipv4_options,
+                                ip: IpMetadata {
+                                    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
+                                    //# At all other times, a previous segment has either been sent or
+                                    //# received on this connection, and TCP implementations MUST use the
+                                    //# same local address that was used in those previous segments (MUST-
+                                    //# 45).
+                                    source: tuple.local.ip(),
+                                    destination: tuple.remote.ip(),
+                                },
+                                len,
+                                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
+                                //# TCP implementations
+                                //# SHOULD pass the current Differentiated Services field value without
+                                //# change to the IP layer, when it sends segments on the connection
+                                //# (SHLD-22).
+                                hop_limit,
+                                dscp,
+                            }),
+                            more_work: self.has_pending_output(),
+                        },
+                        None,
+                    ));
                 }
                 Ok(None) => {
                     self.deadlines.set(
@@ -5240,10 +5476,13 @@ impl Endpoint {
                 }
             }
         }
-        Ok(PollTransmit {
-            packet: None,
-            more_work: self.has_pending_output(),
-        })
+        Ok((
+            PollTransmit {
+                packet: None,
+                more_work: self.has_pending_output(),
+            },
+            None,
+        ))
     }
 }
 
@@ -5334,9 +5573,9 @@ mod recovery_observation_tests {
                     remote: "192.0.2.2:8080".parse().unwrap(),
                 };
                 let mut endpoint = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
-                let first_isn = endpoint.isn(tuple);
+                let first_isn = endpoint.isn(ScopedTuple::unscoped(tuple));
                 endpoint.clock(4000 * scale).unwrap();
-                let next_isn = endpoint.isn(tuple);
+                let next_isn = endpoint.isn(ScopedTuple::unscoped(tuple));
                 assert_eq!(next_isn.wrapping_sub(first_isn), 1000);
                 let id = endpoint
                     .connect(4000 * scale, tuple.local, tuple.remote)
@@ -5362,14 +5601,14 @@ mod recovery_observation_tests {
                     destination: tuple.remote.ip(),
                 };
                 let incoming = wire::parse(ip, &syn).unwrap();
-                control.reset_for(ip, &incoming, None);
+                control.reset_for(ip, None, &incoming, None);
                 assert_eq!(control.control_count, 1);
                 packet(&mut control, 0);
                 control.clock(1_000_000 * scale - 1).unwrap();
-                control.reset_for(ip, &incoming, None);
+                control.reset_for(ip, None, &incoming, None);
                 assert!(control.control.is_empty());
                 control.clock(1_000_000 * scale).unwrap();
-                control.reset_for(ip, &incoming, None);
+                control.reset_for(ip, None, &incoming, None);
                 assert_eq!(control.control.len(), 1);
                 let (_, reset) = packet(&mut control, 1_000_000 * scale);
                 let mut passive = Endpoint::new(cfg.clone(), [2; 32], 0, |_| true).unwrap();
@@ -5521,7 +5760,7 @@ mod recovery_observation_tests {
             // A full bounded probe table can fail insertion after construction.
             let mut occupied = tuple;
             occupied.remote.set_port(occupied.remote.port() + 1);
-            endpoint.tuples.entries.fill(Entry::Occupied(occupied, 0));
+            endpoint.tuples.entries.fill(Entry::Occupied(ScopedTuple::unscoped(occupied), 0));
             let connection = endpoint.new_connection(tuple, 100, None).unwrap();
             assert!(endpoint.receive_pool.is_empty());
             assert_eq!(endpoint.buffer_bytes(), charge);
@@ -5810,7 +6049,7 @@ mod recovery_observation_tests {
             a.on_timeout(deadline, 16).unwrap();
             assert!(a.slot(client).unwrap().connection.iw_setup_loss());
             assert_eq!(a.setup_loss_cache.len(), 1);
-            assert_eq!(a.setup_loss_cache[0], (local.ip(), remote.ip()));
+            assert_eq!(a.setup_loss_cache[0], (local.ip(), remote.ip(), None));
             other.set_port(40_002);
             let fallback = a.connect(deadline, other, remote).unwrap();
             assert_eq!(a.transport_info(fallback).unwrap().cwnd, 4_000);
@@ -6321,7 +6560,7 @@ mod recovery_observation_tests {
             // Force failure after the complete child (including SYN metadata) exists.
             let mut occupied = tuple;
             occupied.remote.set_port(40001);
-            endpoint.tuples.entries.fill(Entry::Occupied(occupied, 0));
+            endpoint.tuples.entries.fill(Entry::Occupied(ScopedTuple::unscoped(occupied), 0));
             assert_eq!(
                 endpoint.input_with_timestamps(2, ip, 0, Ipv4Options::default(), &syn[..n], stamps),
                 Ok(InputDisposition::Dropped)
@@ -6584,6 +6823,7 @@ mod endpoint_mtu_update_tests {
                 },
                 Some(100),
                 None,
+                None,
             ));
             let mut bytes = [0; 256];
             let output = e.poll_transmit(1, &mut bytes, 16).unwrap().packet;
@@ -6632,6 +6872,7 @@ mod endpoint_mtu_update_tests {
             options,
             None,
             None,
+            None,
         ));
         e.set_endpoint_first_hop_mtu(1, 68).unwrap();
         assert!(
@@ -6660,6 +6901,10 @@ mod output_reservation_tests;
 #[cfg(test)]
 #[path = "endpoint_ptb_reserved_tests.rs"]
 mod ptb_reserved_tests;
+
+#[cfg(test)]
+#[path = "endpoint_unsubmitted_discard_tests.rs"]
+mod unsubmitted_discard_tests;
 
 #[cfg(test)]
 #[path = "endpoint_reset_defense_tests.rs"]

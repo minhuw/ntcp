@@ -662,7 +662,7 @@ impl PathService {
 }
 
 // The smaller of two optional restrictions.
-fn lower(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+pub(super) fn lower(a: Option<u32>, b: Option<u32>) -> Option<u32> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),

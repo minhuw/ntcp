@@ -293,13 +293,16 @@ pub(crate) struct Pending {
 /// keys, so one flow's evictions cannot widen into another flow's quotes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Key {
-    /// Exact addresses, protocol and ports. Every generation sending under
-    /// the same four-tuple shares it, so reuse stays ambiguous.
+    /// Exact addresses, protocol and ports, and the link of a link-local
+    /// source (`zone`). Every generation sending under the same scoped
+    /// four-tuple shares it, so reuse stays ambiguous; the same link-local
+    /// four-tuple on another link is another flow.
     Flow {
         source: IpAddr,
         destination: IpAddr,
         protocol: u8,
         ports: Option<(u16, u16)>,
+        zone: Option<LinkId>,
     },
     /// The stateless lane, whose replies go to arbitrary peers.
     Stateless,
@@ -314,9 +317,11 @@ impl Key {
                 destination: e.destination,
                 protocol: e.protocol,
                 ports: ports(e.transport),
+                zone: zone(e),
             },
         }
     }
+    // Zones are compared by `Tombstone::admits`.
     fn admits(self, quote: &QuoteKey) -> bool {
         match self {
             Self::Flow {
@@ -324,6 +329,7 @@ impl Key {
                 destination,
                 protocol,
                 ports,
+                ..
             } => {
                 (source, destination, protocol, ports)
                     == (
@@ -347,15 +353,17 @@ impl Key {
                     source: a,
                     protocol: p,
                     ports: Some((port, _)),
+                    zone: x,
                     ..
                 },
                 Self::Flow {
                     source: b,
                     protocol: q,
                     ports: Some((other_port, _)),
+                    zone: y,
                     ..
                 },
-            ) => (a, p, port) == (b, q, other_port),
+            ) => (a, x, p, port) == (b, y, q, other_port),
             // A datagram flow's non-first fragments are recorded under the
             // portless key of their addresses and protocol (see `seal`, which
             // keeps the flow's own key), so any flow bound to that source
@@ -366,27 +374,30 @@ impl Key {
                     source: a,
                     protocol: p,
                     ports: Some(_),
+                    zone: x,
                     ..
                 },
                 Self::Flow {
                     source: b,
                     protocol: q,
                     ports: None,
+                    zone: y,
                     ..
                 },
-            ) => (a, p) == (b, q),
+            ) => (a, x, p) == (b, y, q),
             _ => self == other,
         }
     }
     // What `may_share` compares for a datagram owner: its local binding.
-    fn binding(self) -> Option<(IpAddr, u8, u16)> {
+    fn binding(self) -> Option<(IpAddr, Option<LinkId>, u8, u16)> {
         match self {
             Self::Flow {
                 source,
                 protocol,
                 ports: Some((port, _)),
+                zone,
                 ..
-            } => Some((source, protocol, port)),
+            } => Some((source, zone, protocol, port)),
             _ => None,
         }
     }
@@ -427,14 +438,22 @@ impl Discarded {
         }
     }
     // Whether a discarded summary may have held a submission this quote
-    // names: one of its own flow key's class, or (unless a connection's
-    // match exists, see `correlate`) of the stateless lane.
-    fn shadows(&self, quote: &QuoteKey, connection: bool, now: Instant) -> bool {
+    // names: one of its own flow key's class (in the quote's zone), or
+    // (unless a connection's match exists, see `correlate`) of the
+    // stateless lane.
+    fn shadows(
+        &self,
+        quote: &QuoteKey,
+        zone: Option<LinkId>,
+        connection: bool,
+        now: Instant,
+    ) -> bool {
         let flow = Key::Flow {
             source: quote.source,
             destination: quote.destination,
             protocol: quote.protocol,
             ports: quoted_ports(quote.transport),
+            zone,
         };
         self.keys[self.class(flow)] > now
             || !connection && self.keys[self.class(Key::Stateless)] > now
@@ -470,6 +489,9 @@ struct Tombstone {
     protocol: Option<u8>,
     ports: Option<(u16, u16)>,
     path: Option<PathId>,
+    // The zone of every summarized submission (None: unscoped); unknown
+    // once they disagree, which only the stateless lane's key allows.
+    zone: Option<Option<LinkId>>,
     // [sequence-consuming, datagram or other; zero-length TCP point].
     classes: [Option<Class>; 2],
 }
@@ -495,6 +517,7 @@ impl Tombstone {
             protocol: Some(e.protocol),
             ports: ports(e.transport),
             path: Some(e.path),
+            zone: Some(zone(e)),
             classes,
         }
     }
@@ -507,6 +530,7 @@ impl Tombstone {
         self.protocol = merge(self.protocol, other.protocol);
         self.ports = merge(self.ports, other.ports);
         self.path = merge(self.path, other.path);
+        self.zone = merge(self.zone, other.zone);
         for (mine, theirs) in self.classes.iter_mut().zip(other.classes) {
             let Some(theirs) = theirs else {
                 continue;
@@ -520,8 +544,11 @@ impl Tombstone {
             }));
         }
     }
-    fn admits(&self, quote: &QuoteKey) -> bool {
+    // A scoped quote (`zone`) is admitted only by history of its own zone,
+    // or of zones no longer known.
+    fn admits(&self, quote: &QuoteKey, zone: Option<LinkId>) -> bool {
         self.key.admits(quote)
+            && zone.is_none_or(|zone| self.zone.is_none_or(|z| z == Some(zone)))
             && self.source.is_none_or(|a| a == quote.source)
             && self.destination.is_none_or(|a| a == quote.destination)
             && self.protocol.is_none_or(|p| p == quote.protocol)
@@ -679,6 +706,13 @@ impl Cover {
             _ => false,
         }
     }
+}
+
+// The link a submission's source address is scoped to: a link-local source
+// names an address of its link only (the zone `correlate_in` receives for
+// a quote of it), other sources are unscoped.
+fn zone(e: &Evidence) -> Option<LinkId> {
+    matches!(e.source, IpAddr::V6(v) if v.is_unicast_link_local()).then_some(e.link)
 }
 
 fn ports(selector: Selector) -> Option<(u16, u16)> {
@@ -1268,7 +1302,14 @@ impl Ledger {
     /// already delivered remains. Pure ACKs left there share that floor;
     /// their quotes name a segment of the same generation and, at a header
     /// size no candidate MTU can be below, never a path change.
-    pub fn retire_tcp(&mut self, owner: ConnectionId, unacknowledged: u32) {
+    /// `delivered` sees each record retired: data a new cumulative
+    /// acknowledgment covers.
+    pub fn retire_tcp(
+        &mut self,
+        owner: ConnectionId,
+        unacknowledged: u32,
+        mut delivered: impl FnMut(&Record),
+    ) {
         let Some(index) = self.owner_index(Owner::Tcp(owner)) else {
             return;
         };
@@ -1279,6 +1320,7 @@ impl Ledger {
                 && let Selector::Tcp { start, end, .. } = entry.record.evidence.transport
             {
                 if serial_le(end, unacknowledged) {
+                    delivered(&entry.record);
                     *self.slot_mut(index, slot) = None;
                 } else if serial_lt(start, floor) {
                     floor = start;
@@ -1332,26 +1374,52 @@ impl Ledger {
     }
 
     // Unexpired live entries (and their owner records) exactly matching a quote.
-    fn live(&self, now: Instant, quote: &QuoteKey) -> impl Iterator<Item = (usize, Entry)> + '_ {
+    fn live(
+        &self,
+        now: Instant,
+        quote: &QuoteKey,
+        zone: Option<LinkId>,
+    ) -> impl Iterator<Item = (usize, Entry)> + '_ {
         let quote = *quote;
         (0..self.owners.len())
             .flat_map(move |record| (0..self.slots(record)).map(move |slot| (record, slot)))
             .filter_map(move |(record, slot)| Some((record, self.slot(record, slot)?)))
             .filter(move |(_, entry)| {
-                (entry.retirable() || !self.expired(&entry.record, now)) && entry.matches(&quote)
+                (entry.retirable() || !self.expired(&entry.record, now))
+                    && entry.matches(&quote)
+                    && zone.is_none_or(|zone| entry.record.evidence.link == zone)
             })
     }
     // Unexpired exact evicted-datagram signatures matching a quote.
-    fn signatures(&self, now: Instant, quote: &QuoteKey) -> impl Iterator<Item = &Evidence> + '_ {
+    fn signatures(
+        &self,
+        now: Instant,
+        quote: &QuoteKey,
+        zone: Option<LinkId>,
+    ) -> impl Iterator<Item = &Evidence> + '_ {
         let quote = *quote;
         self.datagrams
             .iter()
             .flatten()
-            .filter(move |(e, until)| *until > now && evidence_matches(e, &quote))
+            .filter(move |(e, until)| {
+                *until > now
+                    && evidence_matches(e, &quote)
+                    && zone.is_none_or(|zone| e.link == zone)
+            })
             .map(|(e, _)| e)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn correlate(&self, now: Instant, quote: &QuoteKey) -> Correlation {
+        self.correlate_in(now, quote, None)
+    }
+
+    /// `correlate` within one zone: a quote whose source is link-local names
+    /// an address of the link it arrived on, so identical traffic of another
+    /// link is not a candidate, and neither the lossy history nor the
+    /// discarded summaries and blinding of another link's identical flow
+    /// deny it. Unscoped quotes (`zone` None) search every link.
+    pub fn correlate_in(&self, now: Instant, quote: &QuoteKey, zone: Option<LinkId>) -> Correlation {
         let mut live = 0;
         #[cfg(any(test, feature = "test-support"))]
         let mut unique = None;
@@ -1367,7 +1435,7 @@ impl Ledger {
                 Some(q) => merge(q, p),
             });
         };
-        for (record, entry) in self.live(now, quote) {
+        for (record, entry) in self.live(now, quote, zone) {
             live += 1;
             #[cfg(any(test, feature = "test-support"))]
             {
@@ -1393,7 +1461,7 @@ impl Ledger {
         // Exact evicted datagrams are positive evidence of their own
         // submission, but deny attribution of any live match.
         let mut signatures = 0;
-        for e in self.signatures(now, quote) {
+        for e in self.signatures(now, quote, zone) {
             signatures += 1;
             join(Some(e.path));
         }
@@ -1409,12 +1477,12 @@ impl Ledger {
         let shared = self.tombstones.iter().flatten().filter(|t| t.until > now);
         for t in shared
             .chain(self.own.iter().flatten())
-            .filter(|t| !(t.key == Key::Stateless && connection) && t.admits(quote))
+            .filter(|t| !(t.key == Key::Stateless && connection) && t.admits(quote, zone))
         {
             summarized = true;
             join(t.path);
         }
-        if self.discarded.shadows(quote, connection, now) {
+        if self.discarded.shadows(quote, zone, connection, now) {
             summarized = true;
             join(None);
         }
@@ -1458,11 +1526,11 @@ impl Ledger {
     #[cfg(test)]
     pub fn evicted_hits(&self, now: Instant, quote: &QuoteKey) -> (usize, bool) {
         let connection = self
-            .live(now, quote)
+            .live(now, quote, None)
             .any(|(_, e)| e.record.evidence.owner != Owner::Stateless);
         (
-            self.signatures(now, quote).count(),
-            self.discarded.shadows(quote, connection, now),
+            self.signatures(now, quote, None).count(),
+            self.discarded.shadows(quote, None, connection, now),
         )
     }
 }

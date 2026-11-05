@@ -55,21 +55,34 @@ impl MtuRefresh {
 }
 
 impl Owner {
-    pub(super) fn enable_reservations(
-        &mut self,
-        config: &crate::IoConfig,
-        index: u32,
-    ) -> Result<()> {
+    pub(super) fn enable_reservations(&mut self, config: &crate::IoConfig) -> Result<()> {
         self.enable_egress(config.egress_capacity, config.gso)?;
-        self.mtu_refresh = Some(MtuRefresh::spawn(move || {
-            ntcp_io::linux::local_ip_mtu(index)
-        })?);
+        // Each kernel port's MTU is queried for that port's own link.
+        for port in &mut self.ports {
+            let index = port.index;
+            port.mtu_refresh = Some(MtuRefresh::spawn(move || {
+                ntcp_io::linux::local_ip_mtu(index)
+            })?);
+        }
         self.reservation_timeout_us = u64::from(config.output_reservation_timeout_ms) * 1000;
         Ok(())
     }
 
     pub(super) fn poll_mtu_refresh(&mut self) {
-        let Some(refresh) = &mut self.mtu_refresh else {
+        for port in 0..self.ports.len() {
+            self.poll_port_mtu_refresh(port);
+        }
+    }
+    // Every port's refresh: the failing port of an EMSGSIZE is not known.
+    pub(super) fn request_mtu_refresh(&mut self) {
+        for port in &mut self.ports {
+            if let Some(refresh) = &mut port.mtu_refresh {
+                refresh.request();
+            }
+        }
+    }
+    fn poll_port_mtu_refresh(&mut self, port: usize) {
+        let Some(refresh) = &mut self.ports[port].mtu_refresh else {
             return;
         };
         let result = match refresh.result.try_recv() {
@@ -85,7 +98,8 @@ impl Owner {
         // Keep the rejected obligation parked until its original deadline.
         if let Ok(Some(mtu)) = result {
             let now = self.now();
-            let changed = if let (Some(host), Some(ingress)) = (&mut self.host, self.ingress) {
+            let ingress = self.ports[port].ingress;
+            let changed = if let (Some(host), Some(ingress)) = (&mut self.host, ingress) {
                 let changed = host
                     .paths()
                     .link(ingress.link())
@@ -99,7 +113,7 @@ impl Owner {
                 } else {
                     false
                 }
-            } else {
+            } else if port == 0 {
                 // Explicit raw Endpoint embedding used by low-level fixtures.
                 self.defaults
                     .connection
@@ -109,9 +123,12 @@ impl Owner {
                         .endpoint
                         .set_endpoint_first_hop_mtu(self.now(), mtu)
                         .is_ok()
+            } else {
+                false
             };
             if changed {
-                if let Some(policy) = &mut self.defaults.connection.pmtud {
+                // The defaults describe the `io.*` port's link.
+                if let Some(policy) = self.defaults.connection.pmtud.as_mut().filter(|_| port == 0) {
                     policy.first_hop_mtu = mtu;
                 }
                 if let Some(egress) = &mut self.egress {

@@ -340,7 +340,7 @@ class PmtudInventory(unittest.TestCase):
                          "nonzero leased Identification",
                          "every Host::udp_send and Host::udp_send_datagram UDP datagram and source fragment",
                          "with DF except on an owner-flagged route", "integration/rfc_host admin refuse case"),
-            "1191-074": ("T8", "T9", "T10", "Remaining T18", "T19"),
+            "1191-074": ("T8", "T9", "T10", "T18 receives", "Remaining T19"),
         }.items():
             self.assertEqual(rows[key]["status"], "covered" if key == "1191-050" else "TODO", key)
             self.assertNotIn("T7 phase2", rows[key]["reason"], key)

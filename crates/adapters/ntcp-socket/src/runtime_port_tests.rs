@@ -154,7 +154,7 @@ fn external(v6: bool, last: u8) -> (Owner, Arc<Mutex<Wire>>) {
         crate::EthernetPacketIo {
             io: Box::new(Io(wire.clone())),
             local_mac: [2; 6],
-            next_hop_mac: [4; 6],
+            next_hop_mac: Some([4; 6]),
         },
     )
     .unwrap();
@@ -413,7 +413,7 @@ fn native_choices_follow_fresh_entropy_even_when_descriptor_is_reused() {
 #[test]
 fn ordinary_backendless_owner_uses_os_entropy_without_packet_policy() {
     let (mut owner, _) = external(false, 2);
-    owner.ethernet = None;
+    owner.ports[0].ethernet = None;
     for _ in 0..4 {
         let id = new(&mut owner, SOCK_NONBLOCK);
         let local = owner.local;

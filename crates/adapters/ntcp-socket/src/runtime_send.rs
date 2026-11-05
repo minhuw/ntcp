@@ -287,11 +287,16 @@ impl Owner {
         }
         if !send.fast_open_started && (send.flags & MSG_FASTOPEN != 0 || deferred) {
             let socket = &self.sockets[&id];
-            let remote = if let Some(remote) = socket.deferred_peer {
-                remote
+            // A deferred open keeps the zone its connect resolved; sendto
+            // with MSG_FASTOPEN resolves the destination's scope now.
+            let (remote, zone) = if let Some(remote) = socket.deferred_peer {
+                (remote, socket.zone)
             } else {
-                socket.normalize_address(send.destination.ok_or(EINVAL)?, self.local, false)?
+                let destination = send.destination.ok_or(EINVAL)?;
+                let remote = socket.normalize_address(destination, self.local, false)?;
+                (remote, self.connect_zone(id, destination)?)
             };
+            let socket = &self.sockets[&id];
             if remote.port() == 0 {
                 return Err(EINVAL);
             }
@@ -311,8 +316,8 @@ impl Owner {
             let completion =
                 self.reserve_send_completion(id, count != 0, send.zerocopy, 0, true)?;
             let bytes = send.copy_chunk(count)?;
-            let local = self.connect_local(id)?;
-            let n = self.start_connection(id, local, remote, Some(&bytes))?;
+            let local = self.connect_local(id, remote, zone)?;
+            let n = self.start_connection(id, local, remote, zone, Some(&bytes))?;
             send.fast_open_started = true;
             send.advance(n);
             if n != 0 && completion {
@@ -399,10 +404,13 @@ impl Owner {
             }
             let (address, len) = send.sources[index];
             let address = address.checked_add(offset).ok_or(EFAULT)?;
+            // Its port is chosen later: every port must be able to send it.
             crate::zerocopy::lookup(address, count.min(len - offset))?.filter(|p| {
-                self.ethernet
-                    .as_ref()
-                    .is_some_and(|b| b.io.zero_copy_payload_supported(p))
+                self.ports.iter().all(|port| {
+                    port.ethernet
+                        .as_ref()
+                        .is_some_and(|b| b.io.zero_copy_payload_supported(p))
+                })
             })
         } else {
             None

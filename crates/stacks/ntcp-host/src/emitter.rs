@@ -513,6 +513,7 @@ impl Host {
         let egress = UdpEgress {
             link: plan.snapshot.key().link(),
             next_hop: plan.snapshot.key().next_hop(),
+            link_layer: None,
         };
         let Some(size) = plan.fragment_size else {
             let len = header + plan.data_len;

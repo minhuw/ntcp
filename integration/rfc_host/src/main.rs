@@ -255,7 +255,7 @@ fn run() -> io::Result<()> {
                 if local.is_ipv4() { 0x0800 } else { 0x86dd },
             )?),
             local_mac: [2, 0, 0, 0, 0, 2],
-            next_hop_mac: [2, 0, 0, 0, 0, 1],
+            next_hop_mac: Some([2, 0, 0, 0, 0, 1]),
         })
     })?;
     let family = if local.is_ipv4() { AF_INET } else { AF_INET6 };

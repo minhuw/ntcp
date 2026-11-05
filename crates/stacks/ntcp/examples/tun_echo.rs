@@ -425,6 +425,36 @@ mod linux {
     }
 
     impl TunHost {
+        // A passive open on `address`; a link-local one is the TUN link's.
+        fn listen(
+            &self,
+            endpoint: &mut Endpoint,
+            address: SocketAddr,
+            backlog: usize,
+        ) -> Result<ntcp::ListenerId, EndpointError> {
+            endpoint.listen_scoped(address, zone(address.ip(), self.ingress.link()), backlog)
+        }
+
+        // An active open from `local` to the unscoped `peer` through the
+        // TUN link, which is the zone of either address that is link-local.
+        fn connect(
+            &mut self,
+            endpoint: &mut Endpoint,
+            now: u64,
+            local: SocketAddr,
+            peer: SocketAddr,
+            options: ntcp::ManagedOpenOptions,
+        ) -> Result<ConnectionId, ntcp::ManagedError<ntcp_host::Error>> {
+            let link = self.ingress.link();
+            let tuple = Tuple {
+                local,
+                remote: peer,
+            };
+            let scoped = ntcp::ScopedTuple::new(tuple, zone(local.ip(), link).or(zone(peer.ip(), link)))
+                .ok_or(ntcp::ManagedError::Endpoint(EndpointError::InvalidAddress))?;
+            endpoint.connect_scoped_with_path_provider(now, scoped, options, &mut self.host)
+        }
+
         #[cfg(test)]
         fn attach(
             endpoint: &mut Endpoint,
@@ -442,11 +472,13 @@ mod linux {
             settings: &DatagramSettings,
             started: u64,
         ) -> io::Result<Self> {
-            Self::attach_routed(endpoint, config, local, settings, &[], started)
+            // A fixture TUN with interface index 1.
+            Self::attach_routed(endpoint, config, local, settings, &[], started, 1)
         }
 
         // `attach_with` installing the owner's SR routes (NTCP_IPV6_SRH)
-        // over the TUN link beside its default route.
+        // over the TUN link beside its default route, for the TUN whose
+        // interface index is `interface`.
         fn attach_routed(
             endpoint: &mut Endpoint,
             config: &EndpointConfig,
@@ -454,6 +486,7 @@ mod linux {
             settings: &DatagramSettings,
             segment_routes: &[SegmentRoute],
             started: u64,
+            interface: u32,
         ) -> io::Result<Self> {
             // Independent public lifetime identity, never derived from TCP's
             // confidential ISN/Fast Open key or an interface/address alone.
@@ -547,7 +580,7 @@ mod linux {
             let forwarder = path::ForwarderId(1);
             let ingress = host
                 .register_link(
-                    path::InterfaceKey(1),
+                    path::InterfaceKey(u64::from(interface)),
                     MTU as u32, // runtime_config checked the actual fixed TUN MTU.
                     ntcp_host::ReceiveCapabilities {
                         max_ip_packet: MAX_IP_PACKET,
@@ -569,8 +602,11 @@ mod linux {
                     ntcp_host::Forwarding::Forwarder(forwarder),
                 )
                 .map_err(host_error)?;
+            // A link-local address is the TUN link's: its zone is that link
+            // (RFC 4007 section 6), the only one this Host has.
             host.register_source(
-                path::ScopedAddress::new(local, None).map_err(|e| host_error(e.into()))?,
+                path::ScopedAddress::new(local, zone(local, ingress.link()))
+                    .map_err(|e| host_error(e.into()))?,
                 ingress.link(),
             )
             .map_err(host_error)?;
@@ -1040,13 +1076,21 @@ mod linux {
     const IPV6_HEADER: usize = 40;
 
     fn unicast_v6(ip: Ipv6Addr) -> bool {
-        // No zone handling: reject link/site-local, mapped IPv4 and loopback addresses.
+        // Reject deprecated site-local, mapped IPv4 and loopback addresses.
+        // A link-local address is accepted: it belongs to the TUN link, the
+        // only link (and so the only zone, RFC 4007 section 6) this
+        // forwarder has, and is carried with that zone.
         !ip.is_unspecified()
             && !ip.is_multicast()
             && !ip.is_loopback()
-            && !ip.is_unicast_link_local()
             && ip.segments()[0] & 0xffc0 != 0xfec0
             && ip.to_ipv4_mapped().is_none()
+    }
+
+    // The zone of `ip` on the TUN link `link`: Some exactly for a
+    // link-local address.
+    fn zone(ip: IpAddr, link: path::LinkId) -> Option<path::LinkId> {
+        matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local()).then_some(link)
     }
 
     #[cfg(test)]
@@ -1081,23 +1125,34 @@ mod linux {
             .map_err(|_| invalid("invalid outgoing IPv6 base-header packet"))
     }
 
-    fn checked_peer(value: &str, local: IpAddr) -> io::Result<SocketAddr> {
+    // The peer of an active open through the TUN whose interface index is
+    // `interface`: a link-local peer names that interface as its scope (it
+    // is on the TUN link; any other zone is not this forwarder's), any
+    // other peer carries no scope. The returned address is unscoped; the
+    // open takes the TUN link as its zone.
+    fn checked_peer(value: &str, local: IpAddr, interface: u32) -> io::Result<SocketAddr> {
         let peer: SocketAddr = value
             .parse()
             .map_err(|_| invalid("invalid peer socket address"))?;
+        let scope = match peer {
+            SocketAddr::V6(ip) if ip.flowinfo() == 0 => ip.scope_id(),
+            SocketAddr::V6(_) => u32::MAX,
+            SocketAddr::V4(_) => 0,
+        };
+        let link_local = matches!(peer.ip(), IpAddr::V6(ip) if ip.is_unicast_link_local());
         if peer.is_ipv4() != local.is_ipv4()
             || peer.port() == 0
-            || matches!(peer, SocketAddr::V6(ip) if ip.scope_id() != 0 || ip.flowinfo() != 0)
+            || scope != if link_local { interface } else { 0 }
             || !match peer.ip() {
                 IpAddr::V4(ip) => unicast(ip),
                 IpAddr::V6(ip) => unicast_v6(ip),
             }
         {
             return Err(invalid(
-                "peer must be unscoped unicast and match local address family",
+                "peer must be unicast in the local address family, scoped to the TUN interface exactly when link-local",
             ));
         }
-        Ok(peer)
+        Ok(SocketAddr::new(peer.ip(), peer.port()))
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
@@ -1228,37 +1283,73 @@ mod linux {
         }
     }
 
+    // Whether the TUN's address `address` (its scope `scope_id`) places
+    // `local` on the TUN link: both global unicast and unscoped, or both
+    // link-local with `address` scoped to the TUN (interface index
+    // `interface`); distinct, and in the same subnet.
     fn checked_interface_ipv6(
         local: Ipv6Addr,
         address: Ipv6Addr,
         mask: u128,
         scope_id: u32,
+        interface: u32,
     ) -> io::Result<()> {
         let prefix = mask.leading_ones();
         if mask != u128::MAX.checked_shl(128 - prefix).unwrap_or(0) {
             return Err(invalid("noncontiguous IPv6 interface netmask"));
         }
+        let global = |ip: Ipv6Addr| ip.segments()[0] & 0xe000 == 0x2000;
+        let scoped = if local.is_unicast_link_local() {
+            address.is_unicast_link_local() && scope_id == interface
+        } else {
+            global(local) && global(address) && scope_id == 0
+        };
         if !unicast_v6(local)
-            || local.segments()[0] & 0xe000 != 0x2000
             || !unicast_v6(address)
-            || address.segments()[0] & 0xe000 != 0x2000
-            || scope_id != 0
+            || !scoped
             || local == address
             || u128::from(local) & mask != u128::from(address) & mask
         {
             return Err(invalid(
-                "local IPv6 address must be a distinct global-unicast address in the TUN interface subnet",
+                "local IPv6 address must be a distinct global-unicast or TUN link-local address in the TUN interface subnet",
             ));
         }
         Ok(())
     }
 
-    fn interface_ipv6(tun: &Tun, local: Ipv6Addr) -> io::Result<()> {
+    // Whether the kernel's address `ip` (scope `scope_id`) is `local` on
+    // the TUN with interface index `interface`. Any kernel-owned duplicate
+    // has a local route that bypasses TUN, including addresses assigned to
+    // another interface. A link-local address is one only in its own zone:
+    // the same address on another interface is a different address.
+    fn kernel_duplicate(local: Ipv6Addr, ip: Ipv6Addr, scope_id: u32, interface: u32) -> bool {
+        ip == local && (!local.is_unicast_link_local() || scope_id == interface)
+    }
+
+    // The TUN device's actual interface name.
+    fn interface_request(tun: &Tun) -> io::Result<libc::ifreq> {
         // SAFETY: zero initializes ifreq; the live TUN fd writes its actual name.
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(tun.as_raw_fd(), libc::TUNGETIFF, &mut request) } < 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(request)
+    }
+
+    // The TUN device's actual interface index: its Host link's key and the
+    // scope of its link-local addresses.
+    fn interface_index(tun: &Tun) -> io::Result<u32> {
+        let request = interface_request(tun)?;
+        // SAFETY: the kernel NUL-terminated the name it wrote.
+        let index = unsafe { libc::if_nametoindex(request.ifr_name.as_ptr()) };
+        if index == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(index)
+    }
+
+    fn interface_ipv6(tun: &Tun, local: Ipv6Addr, interface: u32) -> io::Result<()> {
+        let request = interface_request(tun)?;
         let mut addresses = std::ptr::null_mut();
         // SAFETY: getifaddrs initializes the list pointer on success.
         if unsafe { libc::getifaddrs(&mut addresses) } < 0 {
@@ -1276,9 +1367,7 @@ mod linux {
                 {
                     let address = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
                     let ip = Ipv6Addr::from(address.sin6_addr.s6_addr);
-                    // Any kernel-owned duplicate has a local route that bypasses TUN,
-                    // including addresses assigned to another interface.
-                    kernel_owned |= ip == local;
+                    kernel_owned |= kernel_duplicate(local, ip, address.sin6_scope_id, interface);
                     if std::ffi::CStr::from_ptr(entry.ifa_name) == name
                         && !entry.ifa_netmask.is_null()
                         && (*entry.ifa_netmask).sa_family as i32 == libc::AF_INET6
@@ -1289,6 +1378,7 @@ mod linux {
                             ip,
                             u128::from_be_bytes(mask.sin6_addr.s6_addr),
                             address.sin6_scope_id,
+                            interface,
                         )
                         .is_ok();
                     }
@@ -1303,7 +1393,7 @@ mod linux {
             Ok(())
         } else {
             Err(invalid(
-                "local IPv6 address must be a distinct global-unicast address in the TUN interface subnet",
+                "local IPv6 address must be a distinct global-unicast or TUN link-local address in the TUN interface subnet",
             ))
         }
     }
@@ -2319,7 +2409,7 @@ mod linux {
         } || port == 0
         {
             return Err(invalid(
-                "expected an unscoped unicast IP address and nonzero port",
+                "expected a unicast IP address and nonzero port",
             ));
         }
         let ipv4_options_enabled = match std::env::var("NTCP_IPV4_OPTIONS") {
@@ -2330,9 +2420,12 @@ mod linux {
         if local.is_ipv6() && ipv4_options_enabled {
             return Err(invalid("IPv4 option configuration is unsupported for IPv6"));
         }
+        // A link-local peer's scope names this TUN's actual interface.
+        let mut tun = open_tun(&args[1])?;
+        let interface = interface_index(&tun)?;
         let peer = args
             .get(4)
-            .map(|value| checked_peer(value, local))
+            .map(|value| checked_peer(value, local, interface))
             .transpose()?;
         let var = |name| match std::env::var(name) {
             Ok(value) => Ok(Some(value)),
@@ -2392,13 +2485,12 @@ mod linux {
             );
         }
         let secret = acquire_secret()?;
-        let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
         let mut utc = Utc::new(start);
         let address_policy: Box<dyn Fn(AddressValidation) -> bool> = match local {
             IpAddr::V4(ip) => Box::new(tun_address_policy(ip, interface_subnet(&tun, ip)?)),
             IpAddr::V6(ip) => {
-                interface_ipv6(&tun, ip)?;
+                interface_ipv6(&tun, ip, interface)?;
                 Box::new(tun_v6_policy(ip))
             }
         };
@@ -2413,32 +2505,47 @@ mod linux {
         let mut endpoint =
             Endpoint::new(config.clone(), secret, now(start), address_policy).map_err(engine)?;
         let mut network =
-            TunHost::attach_routed(&mut endpoint, &config, local, &settings, &segment_routes, now(start))?;
+            TunHost::attach_routed(
+                &mut endpoint,
+                &config,
+                local,
+                &settings,
+                &segment_routes,
+                now(start),
+                interface,
+            )?;
         let mut control = control_server(
             &mut network.host,
             &endpoint,
             std::env::var_os("NTCP_CONTROL_SOCKET"),
             std::env::var_os("NTCP_CONTROL_ALLOW_UIDS"),
         )?;
-        let listener = endpoint
-            .listen(SocketAddr::new(local, port), MAX_FLOWS)
+        let listener = network
+            .listen(&mut endpoint, SocketAddr::new(local, port), MAX_FLOWS)
             .map_err(engine)?;
-        let mut udp = UdpEcho::open(
-            &mut network,
-            &endpoint,
-            SocketAddr::new(local, port),
-            &config,
-            &settings,
-        )?;
+        // Host UDP flows bind unscoped sources only: a link-local local
+        // address serves TCP alone.
+        let mut udp = if zone(local, network.ingress.link()).is_some() {
+            eprintln!("UDP echo unavailable on the link-local {local}");
+            None
+        } else {
+            Some(UdpEcho::open(
+                &mut network,
+                &endpoint,
+                SocketAddr::new(local, port),
+                &config,
+                &settings,
+            )?)
+        };
         let mut flows = Vec::with_capacity(MAX_FLOWS);
         if let Some(peer) = peer {
-            let id = endpoint
-                .connect_with_path_provider(
+            let id = network
+                .connect(
+                    &mut endpoint,
                     now(start),
                     SocketAddr::new(local, port),
                     peer,
                     open_options,
-                    &mut network.host,
                 )
                 .map_err(|error| host_error(error.into()))?;
             flows.push(Flow::new(id));
@@ -2465,6 +2572,7 @@ mod linux {
         let mut accepting = false;
         // Stateless replies already reported as unable to fit their path.
         let mut oversized_reported = 0;
+        let mut undeliverable_reported = 0;
         eprintln!(
             "echo listening on {local}:{port} via {} (caller-configured TUN)",
             args[1]
@@ -2570,7 +2678,19 @@ mod linux {
                 );
                 oversized_reported = oversized;
             }
-            immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
+            // A stateless reply to a link-local peer whose arrival link went
+            // away before it drained is dropped once, never sent elsewhere.
+            let undeliverable = endpoint.undeliverable_control_replies();
+            if undeliverable > undeliverable_reported {
+                eprintln!(
+                    "{} stateless TCP reply(ies) dropped: their link-local peer's link is gone",
+                    undeliverable - undeliverable_reported
+                );
+                undeliverable_reported = undeliverable;
+            }
+            if let Some(udp) = &mut udp {
+                immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
+            }
             immediate |= network.icmp_output(now(start), &mut icmp_output, &mut tun)?;
             network.host.collect(&endpoint).map_err(host_error)?;
             // Bounded control pass; the wait below is at most TICK_US, so
@@ -2612,7 +2732,7 @@ mod linux {
             wait(
                 &tun,
                 timeout_ms,
-                pending.as_ref().is_some_and(|held| !held.blocked) || udp.blocked,
+                pending.as_ref().is_some_and(|held| !held.blocked) || udp.as_ref().is_some_and(|udp| udp.blocked),
                 network.can_receive(),
             )?;
         }
@@ -3317,14 +3437,24 @@ mod linux {
             let mut jumbo = empty;
             jumbo[6] = 0;
             assert!(parse_ipv6(&jumbo[..IPV6_HEADER], local).is_none());
-            for address in [
-                "::",
-                "ff02::1",
-                "fe80::1",
-                "fec0::1",
-                "::1",
-                "::ffff:192.0.2.1",
-            ] {
+            // A link-local address is the TUN link's (its zone is carried
+            // by the Host, not the frame), so it is framed and parsed like
+            // a global one.
+            let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+            for offset in [8, 24] {
+                let mut scoped = bytes;
+                scoped[offset..offset + 16].copy_from_slice(&link_local.octets());
+                let destination = if offset == 24 { link_local } else { local };
+                assert!(parse_ipv6(&scoped[..len], destination).is_some());
+                let mut transmit = v6_transmit(20);
+                if offset == 8 {
+                    transmit.ip.source = link_local.into();
+                } else {
+                    transmit.ip.destination = link_local.into();
+                }
+                assert!(build_frame(&mut scoped, transmit, &mut Sample(0)).is_ok());
+            }
+            for address in ["::", "ff02::1", "fec0::1", "::1", "::ffff:192.0.2.1"] {
                 let address: Ipv6Addr = address.parse().unwrap();
                 for offset in [8, 24] {
                     let mut bad = bytes;
@@ -3343,18 +3473,27 @@ mod linux {
                 }
             }
             let local_ip = IpAddr::V6(local);
-            assert!(checked_peer("[2001:db8::1]:8080", local_ip).is_ok());
+            assert!(checked_peer("[2001:db8::1]:8080", local_ip, 7).is_ok());
+            // A link-local peer is scoped to the TUN (interface 7) and is
+            // returned unscoped: the open takes the TUN link as its zone.
+            assert_eq!(
+                checked_peer("[fe80::1%7]:8080", local_ip, 7).unwrap(),
+                "[fe80::1]:8080".parse().unwrap()
+            );
             for peer in [
                 "192.0.2.1:8080",
                 "[2001:db8::1]:0",
-                "[2001:db8::1%2]:8080",
+                "[2001:db8::1%7]:8080",
+                // Unscoped, or naming another interface.
                 "[fe80::1]:8080",
+                "[fe80::1%2]:8080",
                 "[ff02::1]:8080",
+                "[ff02::1%7]:8080",
                 "invalid",
             ] {
-                assert!(checked_peer(peer, local_ip).is_err());
+                assert!(checked_peer(peer, local_ip, 7).is_err(), "{peer}");
             }
-            assert!(checked_peer("[2001:db8::1]:8080", "192.0.2.2".parse().unwrap()).is_err());
+            assert!(checked_peer("[2001:db8::1]:8080", "192.0.2.2".parse().unwrap(), 7).is_err());
             let policy = tun_v6_policy(local);
             assert!(policy(AddressValidation::Bind {
                 local: local.into()
@@ -3761,11 +3900,13 @@ mod linux {
         }
 
         // The IPv6 rejected SYNs through the real TunHost ingress (extension
-        // receive profile): unspecified, multicast and unzoned link-local
-        // sources are silent discards, and a SYN whose Routing header still
-        // has Segments Left draws only the Host's Parameter Problem (code 0
-        // at its Routing Type), never a binding or a SYN-ACK. The stream
-        // and the loop keep making progress.
+        // receive profile): unspecified and multicast sources are silent
+        // discards, and a SYN whose Routing header still has Segments Left
+        // draws only the Host's Parameter Problem (code 0 at its Routing
+        // Type), never a binding or a SYN-ACK. A link-local source is no
+        // longer among them: it arrives on the TUN link, which is its zone,
+        // and is answered there. The stream and the loop keep making
+        // progress.
         #[test]
         fn framed_rejected_ipv6_syns_keep_tun_loop_and_stream_alive() {
             let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
@@ -3876,12 +4017,8 @@ mod linux {
             };
             let link_local: Ipv6Addr = "fe80::7".parse().unwrap();
             let peer: Ipv6Addr = "2001:db8::7".parse().unwrap();
-            for (index, source) in [
-                Ipv6Addr::UNSPECIFIED,
-                "ff02::1".parse().unwrap(),
-                link_local,
-            ]
-            .into_iter()
+            for (index, source) in [Ipv6Addr::UNSPECIFIED, "ff02::1".parse().unwrap()]
+                .into_iter()
             .enumerate()
             {
                 let packet = syn(source, 40000 + index as u16);
@@ -3947,7 +4084,116 @@ mod linux {
                 &[4, 0, error.payload[2], error.payload[3], 0, 0, 0, 42]
             );
             assert_eq!(&error.payload[8..], &routed[..]);
+            // The link-local source, zoned by its arrival on the TUN link:
+            // one new binding and its SYN-ACK back to it.
+            let packet = syn(link_local, 40020);
+            input_frame(&mut server_host, &mut server, 1, &packet, b.into(), false, &mut Sample(0))
+                .unwrap();
+            assert_eq!(server_host.host.binding_count(), bindings + 1);
+            let answer = super::pmtu_tests::emit(&mut server_host, &mut server, 1, a.into());
+            assert_eq!(answer.len(), 1);
+            let reply = ntcp_ip6::parse(&answer[0]).unwrap();
+            assert_eq!((reply.ip.source, reply.ip.destination), (IpAddr::V6(b), IpAddr::V6(link_local)));
+            let segment = ntcp::wire::parse(reply.ip, reply.payload).unwrap();
+            assert_eq!(segment.header.flags, ntcp::wire::SYN | ntcp::wire::ACK);
+            assert_eq!(segment.header.destination_port, 40020);
             for (time, payload) in [(2, &b"after rejected"[..]), (3, &b"second round"[..])] {
+                client.write(id, payload).unwrap();
+                exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
+                let mut received = [0; 32];
+                let count = server.read(accepted, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
+                server.write(accepted, &received[..count]).unwrap();
+                exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
+                let count = client.read(id, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
+            }
+        }
+
+        // Scoped tun_echo over its TUN link (interface 9, registered under
+        // that index): link-local addresses are the TUN link's zone, so a
+        // link-local peer named with the TUN's scope completes a framed TCP
+        // exchange whose connections carry that zone on both sides, while a
+        // scope naming another interface, or none, is refused.
+        #[test]
+        fn link_local_peer_on_the_tun_link_completes_a_scoped_exchange() {
+            let a: Ipv6Addr = "fe80::1".parse().unwrap();
+            let b: Ipv6Addr = "fe80::2".parse().unwrap();
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.nagle = false;
+            cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
+            cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
+            let settings = DatagramSettings::default();
+            let mut client_host =
+                TunHost::attach_routed(&mut client, &cfg, a.into(), &settings, &[], 0, 9).unwrap();
+            let mut server_host =
+                TunHost::attach_routed(&mut server, &cfg, b.into(), &settings, &[], 0, 9).unwrap();
+            let link = client_host.ingress.link();
+            assert_eq!(client_host.host.paths().link(link).unwrap().interface, path::InterfaceKey(9));
+            let listener = server_host
+                .listen(&mut server, SocketAddr::new(b.into(), 8080), 4)
+                .unwrap();
+            let options = ntcp::ManagedOpenOptions {
+                transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                dscp: cfg.dscp,
+                ipv4_options: Default::default(),
+                registration: None,
+                receive_authority: None,
+            };
+            let local = SocketAddr::new(a.into(), 1234);
+            for refused in ["[fe80::2%3]:8080", "[fe80::2]:8080"] {
+                assert!(checked_peer(refused, a.into(), 9).is_err(), "{refused}");
+            }
+            // Without its zone a link-local open has no link to run on.
+            assert!(client
+                .connect_with_path_provider(
+                    0,
+                    local,
+                    SocketAddr::new(b.into(), 8080),
+                    options,
+                    &mut client_host.host
+                )
+                .is_err());
+            let peer = checked_peer("[fe80::2%9]:8080", a.into(), 9).unwrap();
+            let id = client_host.connect(&mut client, 0, local, peer, options).unwrap();
+            let exchange = |client: &mut Endpoint,
+                            client_host: &mut TunHost,
+                            server: &mut Endpoint,
+                            server_host: &mut TunHost,
+                            time: u64| {
+                for _ in 0..16 {
+                    let to_server = super::pmtu_tests::emit(client_host, client, time, b.into());
+                    for frame in &to_server {
+                        let ip = ntcp_ip6::parse(frame).unwrap().ip;
+                        assert_eq!((ip.source, ip.destination), (IpAddr::V6(a), IpAddr::V6(b)));
+                        input_frame(server_host, server, time, frame, b.into(), false, &mut Sample(0))
+                            .unwrap();
+                    }
+                    let to_client = super::pmtu_tests::emit(server_host, server, time, a.into());
+                    for frame in &to_client {
+                        let ip = ntcp_ip6::parse(frame).unwrap().ip;
+                        assert_eq!((ip.source, ip.destination), (IpAddr::V6(b), IpAddr::V6(a)));
+                        input_frame(client_host, client, time, frame, a.into(), false, &mut Sample(0))
+                            .unwrap();
+                    }
+                    if to_server.is_empty() && to_client.is_empty() {
+                        return;
+                    }
+                }
+                panic!("framed exchange did not quiesce");
+            };
+            exchange(&mut client, &mut client_host, &mut server, &mut server_host, 0);
+            let accepted = server.accept(listener).unwrap();
+            assert_eq!(client.state(id).unwrap(), State::Established);
+            assert_eq!(client.retained_scoped_tuple(id).unwrap().zone(), Some(link));
+            assert_eq!(
+                server.retained_scoped_tuple(accepted).unwrap().zone(),
+                Some(server_host.ingress.link())
+            );
+            assert_eq!(server.tuple(accepted).unwrap().remote, local);
+            for (time, payload) in [(1, &b"scoped request"[..]), (2, &b"second round"[..])] {
                 client.write(id, payload).unwrap();
                 exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
                 let mut received = [0; 32];
@@ -3987,6 +4233,7 @@ mod linux {
                 &DatagramSettings::default(),
                 &routes,
                 0,
+                1,
             )
             .unwrap();
             let remote = SocketAddr::new(b.into(), 8080);
@@ -4165,6 +4412,7 @@ mod linux {
                 &DatagramSettings::default(),
                 &routes,
                 0,
+                1,
             )
             .unwrap();
             let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
@@ -4915,21 +5163,21 @@ mod linux {
         }
 
         #[test]
-        fn ipv6_interface_prefix_requires_distinct_unscoped_global_address() {
+        fn ipv6_interface_prefix_requires_distinct_global_or_tun_link_local_address() {
             let interface: Ipv6Addr = "2001:db8::2".parse().unwrap();
             let local: Ipv6Addr = "2001:db8::3".parse().unwrap();
             for prefix in 0..=127 {
                 let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
-                assert!(checked_interface_ipv6(local, interface, mask, 0).is_ok());
-                assert!(checked_interface_ipv6(interface, interface, mask, 0).is_err());
+                assert!(checked_interface_ipv6(local, interface, mask, 0, 5).is_ok());
+                assert!(checked_interface_ipv6(interface, interface, mask, 0, 5).is_err());
                 if prefix != 0 {
                     let outside = Ipv6Addr::from(u128::from(local) ^ (1 << (128 - prefix)));
-                    assert!(checked_interface_ipv6(outside, interface, mask, 0).is_err());
+                    assert!(checked_interface_ipv6(outside, interface, mask, 0, 5).is_err());
                 }
             }
-            assert!(checked_interface_ipv6(local, interface, u128::MAX, 0).is_err());
+            assert!(checked_interface_ipv6(local, interface, u128::MAX, 0, 5).is_err());
             let mask = u128::MAX << 64;
-            assert!(checked_interface_ipv6(local, interface, mask, 1).is_err());
+            assert!(checked_interface_ipv6(local, interface, mask, 1, 5).is_err());
             for ip in [
                 "2001:db8:1::3",
                 "::",
@@ -4940,14 +5188,35 @@ mod linux {
                 "fc00::3",
                 "::ffff:192.0.2.3",
             ] {
-                assert!(checked_interface_ipv6(ip.parse().unwrap(), interface, mask, 0).is_err());
+                assert!(checked_interface_ipv6(ip.parse().unwrap(), interface, mask, 0, 5).is_err());
             }
             for ip in ["fe80::2", "fec0::2", "fc00::2", "::1", "ff02::2"] {
-                assert!(checked_interface_ipv6(local, ip.parse().unwrap(), 0, 0).is_err());
+                assert!(checked_interface_ipv6(local, ip.parse().unwrap(), 0, 0, 5).is_err());
             }
             for mask in [1, u128::MAX - 2, (u128::MAX << 64) | 1] {
-                assert!(checked_interface_ipv6(local, interface, mask, 0).is_err());
+                assert!(checked_interface_ipv6(local, interface, mask, 0, 5).is_err());
             }
+            // A link-local local address is placed by a link-local TUN
+            // address scoped to the TUN (interface 5); the same address
+            // unscoped or on another interface is not the TUN link's, and
+            // the two scopes never mix.
+            let tun_link_local: Ipv6Addr = "fe80::2".parse().unwrap();
+            let scoped: Ipv6Addr = "fe80::3".parse().unwrap();
+            assert!(checked_interface_ipv6(scoped, tun_link_local, mask, 5, 5).is_ok());
+            for scope in [0, 2] {
+                assert!(checked_interface_ipv6(scoped, tun_link_local, mask, scope, 5).is_err());
+            }
+            assert!(checked_interface_ipv6(tun_link_local, tun_link_local, mask, 5, 5).is_err());
+            assert!(checked_interface_ipv6(scoped, interface, mask, 0, 5).is_err());
+            assert!(checked_interface_ipv6(local, tun_link_local, mask, 5, 5).is_err());
+            // The kernel owning the address: a global one anywhere, a
+            // link-local one only on the TUN itself.
+            assert!(kernel_duplicate(local, local, 0, 5));
+            assert!(kernel_duplicate(local, local, 2, 5));
+            assert!(!kernel_duplicate(local, interface, 0, 5));
+            assert!(kernel_duplicate(scoped, scoped, 5, 5));
+            assert!(!kernel_duplicate(scoped, scoped, 2, 5));
+            assert!(!kernel_duplicate(scoped, tun_link_local, 5, 5));
         }
 
         #[test]

@@ -17,6 +17,8 @@ pub(crate) fn ether_type(ip: IpAddr) -> u16 {
         ntcp_ethernet::ETHERTYPE_IPV6
     }
 }
+// A unicast address a socket or port may use. An IPv6 link-local one is
+// meaningful only with the zone (link) it belongs to (RFC 4007 section 6).
 pub(crate) fn unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => v.octets()[0] != 0 && v.octets()[0] < 224 && !v.is_loopback(),
@@ -24,10 +26,17 @@ pub(crate) fn unicast(ip: IpAddr) -> bool {
             !v.is_unspecified()
                 && !v.is_multicast()
                 && !v.is_loopback()
-                && !v.is_unicast_link_local()
                 && v.to_ipv4_mapped().is_none()
         }
     }
+}
+pub(crate) fn link_local(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local())
+}
+// A unicast address that identifies one node without a zone: the key of
+// per-destination configuration, which carries no link.
+pub(crate) fn global_unicast(ip: IpAddr) -> bool {
+    unicast(ip) && !link_local(ip)
 }
 pub(crate) fn network(ip: IpAddr, prefix: u8) -> Option<IpAddr> {
     match ip {

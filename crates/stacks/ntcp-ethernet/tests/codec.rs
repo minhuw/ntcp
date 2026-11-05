@@ -367,3 +367,32 @@ fn fragment_framing_passes_complete_ipv6_packets_with_faulty_extensions() {
         );
     }
 }
+
+#[test]
+fn ipv6_multicast_groups_and_their_ethernet_mapping() {
+    let address: core::net::Ipv6Addr = "fe80::2aa:ff:fe28:9c5a".parse().unwrap();
+    let group = solicited_node(address);
+    assert_eq!(
+        group,
+        "ff02::1:ff28:9c5a".parse::<core::net::Ipv6Addr>().unwrap()
+    );
+    // Addresses that share their low 24 bits share the group.
+    assert_eq!(
+        solicited_node("2001:db8::2aa:ff:fe28:9c5a".parse().unwrap()),
+        group
+    );
+    assert_eq!(
+        ipv6_multicast_mac(group),
+        Some([0x33, 0x33, 0xff, 0x28, 0x9c, 0x5a])
+    );
+    assert_eq!(
+        IPV6_ALL_NODES,
+        "ff02::1".parse::<core::net::Ipv6Addr>().unwrap()
+    );
+    assert_eq!(
+        ipv6_multicast_mac(IPV6_ALL_NODES),
+        Some([0x33, 0x33, 0, 0, 0, 1])
+    );
+    // A unicast destination has no multicast mapping.
+    assert_eq!(ipv6_multicast_mac(address), None);
+}

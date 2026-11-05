@@ -31,7 +31,9 @@ macro_rules! boundary_entry {
 
 mod config;
 mod ip;
-pub use config::{Backend, IoConfig, SegmentRoute, SocketConfig, SocketPolicy, SourceQuiet};
+pub use config::{
+    Backend, IoConfig, PortConfig, SegmentRoute, SocketConfig, SocketPolicy, SourceQuiet,
+};
 #[cfg(feature = "tfo-linux-cookie")]
 pub use ntcp::LinuxSipHash24Key;
 pub use ntcp::wire::FastOpenCookie;
@@ -232,16 +234,35 @@ fn select_config(explicit: Option<SocketConfig>) -> Result<&'static Option<Socke
 pub struct EthernetPacketIo {
     pub io: Box<dyn ntcp_io::PacketIo>,
     pub local_mac: [u8; 6],
-    pub next_hop_mac: [u8; 6],
+    /// The fixed next hop everything leaves through (the legacy forwarder
+    /// mode), or None for a port that resolves each next hop (the `io.*`
+    /// port with the `io.gateway`/`io.neighbor` configuration, or a
+    /// `config.ports` entry with its own): by Neighbor Discovery
+    /// for IPv6 (the embedding's link must deliver all-nodes and the
+    /// address's solicited-node group), through its static neighbors for
+    /// IPv4.
+    pub next_hop_mac: Option<[u8; 6]>,
 }
-type PacketIoFactory = Box<dyn FnOnce() -> std::io::Result<EthernetPacketIo> + Send>;
+type PacketIoFactory = Box<dyn FnOnce() -> std::io::Result<Vec<EthernetPacketIo>> + Send>;
 static PACKET_IO_FACTORY: Mutex<Option<PacketIoFactory>> = Mutex::new(None);
 
 /// Assign an explicitly owned address/subnet (`config.io.prefix` is required).
 /// The factory runs on the socket owner thread after lazy runtime startup.
+/// The one-port form of `configure_with_packet_ports`.
 pub fn configure_with_packet_io(
     config: SocketConfig,
     factory: impl FnOnce() -> std::io::Result<EthernetPacketIo> + Send + 'static,
+) -> std::io::Result<()> {
+    configure_with_packet_ports(config, move || factory().map(|io| vec![io]))
+}
+
+/// Userspace-owned ports: the factory returns the `io.*` port's backend
+/// first, then one for each `config.ports` entry in order, each with its
+/// explicitly assigned address and subnet (every prefix is required). The
+/// factory runs on the socket owner thread after lazy runtime startup.
+pub fn configure_with_packet_ports(
+    config: SocketConfig,
+    factory: impl FnOnce() -> std::io::Result<Vec<EthernetPacketIo>> + Send + 'static,
 ) -> std::io::Result<()> {
     if DEPTH.with(Cell::get) != 0 {
         return Err(std::io::Error::from_raw_os_error(EDEADLK));
@@ -952,7 +973,10 @@ unsafe fn address(p: *const sockaddr, len: socklen_t) -> Result<SocketAddr> {
                 u32::from_be(p.sin6_flowinfo),
                 p.sin6_scope_id,
             );
-            if addr.scope_id() != 0 || addr.flowinfo() != 0 || addr.ip().is_unicast_link_local() {
+            // sin6_scope_id stays the raw interface index: the runtime
+            // resolves it to a live link (or ignores it for an address
+            // without link scope, as Linux does).
+            if addr.flowinfo() != 0 {
                 return Err(EOPNOTSUPP);
             }
             Ok(addr.into())

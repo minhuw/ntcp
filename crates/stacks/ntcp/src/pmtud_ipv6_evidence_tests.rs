@@ -557,6 +557,10 @@ fn ipv6_same_prefix_proxy_wire_path_does_not_bypass_downstream_ptb() {
     }
 }
 
+// A raw numeric scope carries no link authority and stays rejected. Link
+// isolation comes only from a managed `ScopedTuple` whose zone is a live
+// `LinkId` (ntcp-host tests/scoped.rs: identical link-local pairs on two
+// links with independent PMTU).
 #[test]
 fn ipv6_endpoint_rejects_scoped_link_identity_instead_of_claiming_interface_isolation() {
     let mut a = Endpoint::new(

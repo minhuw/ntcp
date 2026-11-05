@@ -95,6 +95,10 @@ pub(crate) struct ReservedOutput {
     pub finished: bool,
     pub repaired: bool,
     pub departure: Option<Departure>,
+    // The link scoping the packet (`Endpoint::transmit_attempt_zone`).
+    pub zone: Option<ntcp_path::LinkId>,
+    // A stateless reply already counted as undeliverable.
+    pub undeliverable: bool,
 }
 
 impl OutputReservation {
@@ -177,6 +181,8 @@ impl OutputReservation {
             finished: true,
             repaired: false,
             departure: None,
+            zone: None,
+            undeliverable: false,
         });
         Ok(())
     }
@@ -264,6 +270,8 @@ impl OutputReservation {
             finished: true,
             repaired: false,
             departure: None,
+            zone: None,
+            undeliverable: false,
         });
     }
 

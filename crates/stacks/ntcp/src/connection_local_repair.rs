@@ -54,6 +54,66 @@ struct FreshState {
     keepalive_deadline: Option<Instant>,
 }
 
+// The selection-time state of a reserved sequence-bearing control without
+// payload (SYN, SYN-ACK or FIN): selection advanced SND.NXT, armed the RTO,
+// started the Karn sample and moved the setup or close state, none of
+// which may survive an attempt certified never submitted.
+pub(super) struct ControlUndo {
+    state: RepairUndo,
+    connection_state: State,
+    syn_pending: bool,
+    syn_retransmissions: u32,
+    syn_loss_detected: bool,
+    sack_receive: bool,
+    ecn_sent_setup: bool,
+    ecn_sent_plain: bool,
+    ecn_cwr_pending: bool,
+    initial_pacing_open: bool,
+    fin_sequence: Option<Seq>,
+    fin_standalone: bool,
+    fin_sent_at: Option<Instant>,
+}
+
+impl ControlUndo {
+    pub(super) fn capture(a: &Connection) -> Self {
+        Self {
+            state: RepairUndo::capture_state(a, None, Some(FreshState::capture(a))),
+            connection_state: a.state,
+            syn_pending: a.syn_pending,
+            syn_retransmissions: a.syn_retransmissions,
+            syn_loss_detected: a.syn_loss_detected,
+            sack_receive: a.sack_receive,
+            ecn_sent_setup: a.ecn_sent_setup,
+            ecn_sent_plain: a.ecn_sent_plain,
+            ecn_cwr_pending: a.ecn_cwr_pending,
+            initial_pacing_open: a.initial_pacing_open,
+            fin_sequence: a.fin_sequence,
+            fin_standalone: a.fin_standalone,
+            fin_sent_at: a.fin_sent_at,
+        }
+    }
+}
+
+impl FreshState {
+    fn capture(a: &Connection) -> Self {
+        Self {
+            snd_nxt: a.snd_nxt,
+            iw_epoch: a.iw_epoch,
+            iw_started: a.iw_started,
+            iw_fallback: a.iw_fallback,
+            tlp_deadline: a.tlp_deadline,
+            tlp_end: a.tlp_end,
+            tlp_flight: a.tlp_flight,
+            tlp_fresh_rtt: a.tlp_fresh_rtt,
+            last_output_ecn: a.last_output_ecn,
+            last_pmtu_output: a.last_pmtu_output,
+            cork_flush: a.cork_flush,
+            cork_deadline: a.cork_deadline,
+            keepalive_deadline: a.keepalive_deadline,
+        }
+    }
+}
+
 impl RepairUndo {
     pub(super) fn is_fresh(&self) -> bool {
         self.fresh.is_some()
@@ -80,22 +140,7 @@ impl RepairUndo {
         {
             return None;
         }
-        let fresh = FreshState {
-            snd_nxt: a.snd_nxt,
-            iw_epoch: a.iw_epoch,
-            iw_started: a.iw_started,
-            iw_fallback: a.iw_fallback,
-            tlp_deadline: a.tlp_deadline,
-            tlp_end: a.tlp_end,
-            tlp_flight: a.tlp_flight,
-            tlp_fresh_rtt: a.tlp_fresh_rtt,
-            last_output_ecn: a.last_output_ecn,
-            last_pmtu_output: a.last_pmtu_output,
-            cork_flush: a.cork_flush,
-            cork_deadline: a.cork_deadline,
-            keepalive_deadline: a.keepalive_deadline,
-        };
-        Some(Self::capture_state(a, None, Some(fresh)))
+        Some(Self::capture_state(a, None, Some(FreshState::capture(a))))
     }
 
     fn capture_state(
@@ -181,6 +226,132 @@ impl Connection {
         Ok(true)
     }
 
+    /// Withdraw a reserved selection certified never submitted because its
+    /// next hop could not be resolved (RFC 4861 section 7.2.2): restored as
+    /// if never selected, so it records no departure (no RTT sample,
+    /// retransmission count, RTO backoff, RACK or ledger commit). Its
+    /// retransmittable state waits on the local-failure retry clock: the
+    /// next attempt is no earlier than the current RTO, unbacked off, and
+    /// an expired application deadline ends the connection TimedOut. False
+    /// leaves a selection that cannot be restored wholly unchanged.
+    pub(crate) fn cancel_reserved_unsubmitted(&mut self, now: Instant) -> Result<bool, Error> {
+        self.check_time(now)?;
+        let expired = due(self.application_deadline(), now);
+        if !self.cancel_reserved_local() && !self.cancel_reserved_control() {
+            return Ok(false);
+        }
+        self.update_time(now)?;
+        if expired {
+            self.terminal(CloseReason::TimedOut);
+            return Ok(true);
+        }
+        self.unsubmitted_retry(now);
+        Ok(true)
+    }
+
+    /// Release a reserved selection certified never submitted because its
+    /// next hop could not be resolved (RFC 4861 section 7.2.2) when its
+    /// selection-time state cannot be restored exactly (selected behind an
+    /// outstanding flight, in recovery, paced, after an accepted prefix,
+    /// ...): it becomes an unsent transmission. Its sequence space stays
+    /// outstanding without a departure (no RACK commit, PMTU observation,
+    /// pacing charge, retransmission count or RTT sample), so the
+    /// connection's own loss recovery (RACK, or the retransmission timer
+    /// armed when it was selected) sends it again, no earlier than the
+    /// local-failure retry clock of a restored selection; an expired
+    /// application deadline ends the connection TimedOut.
+    pub(crate) fn release_reserved_unsubmitted(
+        &mut self,
+        now: Instant,
+        departure: Option<&crate::output_reservation::Departure>,
+    ) -> Result<(), Error> {
+        self.check_time(now)?;
+        let expired = due(self.application_deadline(), now);
+        self.update_time(now)?;
+        self.reject_reserved_output();
+        self.repair_undo = None;
+        self.control_undo = None;
+        self.reserved_retransmit_counts = None;
+        self.last_departure = None;
+        self.reserved_ledger = None;
+        self.last_output_range = None;
+        // A never-departed copy times nothing (RFC 6298 section 3, Karn).
+        if let Some(d) = departure {
+            let end = Seq(d.start).wrapping_add(if d.syn {
+                1
+            } else {
+                d.payload as u32 + u32::from(d.fin)
+            });
+            if self.sample.is_some_and(|(edge, _)| edge == end) {
+                self.sample = None;
+                self.sample_departure = None;
+            }
+        }
+        if expired {
+            self.terminal(CloseReason::TimedOut);
+            return Ok(());
+        }
+        // Outstanding sequence space always has a retransmission timer.
+        if self.flight() != 0 && self.rto_deadline.is_none() && self.persist_deadline.is_none() {
+            self.rto_deadline = Some(now.saturating_add(self.rto()));
+        }
+        self.unsubmitted_retry(now);
+        Ok(())
+    }
+
+    // Unlike a resource probe's fixed cadence, every failed resolution
+    // already spent its solicitation timeouts, and the next attempt is TCP's
+    // own retry: the same RTO-or-RTT bound as the first resource retry,
+    // without a backoff step.
+    fn unsubmitted_retry(&mut self, now: Instant) {
+        let retry_at = now.saturating_add(
+            self.rto().max(
+                self.rtt
+                    .srtt()
+                    .unwrap_or(0)
+                    .saturating_add(self.config.timebase.ticks_from_us(self.config.rto_min_us)),
+            ),
+        );
+        let epoch = self.local_resource.and_then(|r| r.epoch);
+        self.local_resource = Some(LocalResource {
+            retry_at: Some(retry_at),
+            epoch,
+        });
+        self.select_loss_timer();
+    }
+
+    fn cancel_reserved_control(&mut self) -> bool {
+        let Some(undo) = &self.control_undo else {
+            return false;
+        };
+        // A concurrent path-MSS update must not be undone with old units.
+        if self.mss != undo.state.mss {
+            return false;
+        }
+        let undo = self.control_undo.take().unwrap();
+        self.reject_reserved_output();
+        self.restore_selection(undo.state);
+        self.state = undo.connection_state;
+        self.syn_pending = undo.syn_pending;
+        self.syn_retransmissions = undo.syn_retransmissions;
+        self.syn_loss_detected = undo.syn_loss_detected;
+        self.sack_receive = undo.sack_receive;
+        self.ecn_sent_setup = undo.ecn_sent_setup;
+        self.ecn_sent_plain = undo.ecn_sent_plain;
+        self.ecn_cwr_pending = undo.ecn_cwr_pending;
+        self.initial_pacing_open = undo.initial_pacing_open;
+        self.fin_sequence = undo.fin_sequence;
+        self.fin_standalone = undo.fin_standalone;
+        self.fin_sent_at = undo.fin_sent_at;
+        self.reserved_retransmit_counts = None;
+        self.last_departure = None;
+        self.reserved_ledger = None;
+        self.last_output_range = None;
+        self.resolve_probe_response();
+        self.select_loss_timer();
+        true
+    }
+
     fn cancel_reserved_local(&mut self) -> bool {
         let Some(undo) = &self.repair_undo else {
             return false;
@@ -201,6 +372,20 @@ impl Connection {
         }
         self.reject_reserved_output();
         let undo = self.repair_undo.take().unwrap();
+        self.restore_selection(undo);
+        self.reserved_retransmit_counts = None;
+        self.last_departure = None;
+        self.reserved_ledger = None;
+        self.last_output_range = None;
+        // Withdrawing the PMTU attempt cancels its classification. Restoring
+        // admission/PRR must not resurrect a provisional congestion exemption
+        // whose evidence was discarded by reject_reserved_output().
+        self.resolve_probe_response();
+        self.select_loss_timer();
+        true
+    }
+
+    fn restore_selection(&mut self, undo: RepairUndo) {
         self.receive.restore_output(undo.receive);
         self.congestion = undo.congestion;
         self.prr = undo.prr;
@@ -243,15 +428,5 @@ impl Connection {
             self.cork_deadline = fresh.cork_deadline;
             self.keepalive_deadline = fresh.keepalive_deadline;
         }
-        self.reserved_retransmit_counts = None;
-        self.last_departure = None;
-        self.reserved_ledger = None;
-        self.last_output_range = None;
-        // Withdrawing the PMTU attempt cancels its classification. Restoring
-        // admission/PRR must not resurrect a provisional congestion exemption
-        // whose evidence was discarded by reject_reserved_output().
-        self.resolve_probe_response();
-        self.select_loss_timer();
-        true
     }
 }

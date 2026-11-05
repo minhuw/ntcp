@@ -12,7 +12,7 @@ fn owner4(last: u8) -> (Owner, Arc<Mutex<State>>) {
         crate::EthernetPacketIo {
             io: Box::new(Io(state.clone())),
             local_mac: [2; 6],
-            next_hop_mac: [4; 6],
+            next_hop_mac: Some([4; 6]),
         },
     )
     .unwrap();
@@ -440,7 +440,7 @@ fn mapped_native_socket_abi_preserves_domain_bind_names_and_fd_alias() {
         Ok(crate::EthernetPacketIo {
             io: Box::new(Io(state.clone())),
             local_mac: [2; 6],
-            next_hop_mac: [4; 6],
+            next_hop_mac: Some([4; 6]),
         })
     })
     .unwrap();

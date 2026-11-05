@@ -196,21 +196,42 @@ impl Owner {
         capacity: usize,
         gso: Option<ntcp::GsoLimits>,
     ) -> Result<()> {
-        let mut packet_capacity = if let Some(backend) = &self.ethernet {
-            backend.io.max_packet_len().unwrap_or(65535 + 14)
-        } else {
-            self.tun
-                .as_ref()
-                .and_then(|io| io.max_packet_len())
-                .unwrap_or(65535)
-        };
-        if let Some(caps) = self
-            .ethernet
-            .as_ref()
-            .and_then(|b| b.io.zero_copy_capabilities())
-        {
-            packet_capacity = packet_capacity.min(caps.max_packet_len);
+        // A slot holds a packet for whichever port it leaves through.
+        let offset = self.link_offset();
+        let mut packet_capacity = 0;
+        for port in &self.ports {
+            let capacity = if let Some(backend) = &port.ethernet {
+                let capacity = backend.io.max_packet_len().unwrap_or(65535 + 14);
+                backend
+                    .io
+                    .zero_copy_capabilities()
+                    .map_or(capacity, |caps| capacity.min(caps.max_packet_len))
+            } else {
+                port.tun
+                    .as_ref()
+                    .and_then(|io| io.max_packet_len())
+                    .unwrap_or(65535 + offset)
+            };
+            packet_capacity = packet_capacity.max(capacity);
         }
+        // Zero-copy output is chosen before the packet's port is: only when
+        // every port can send it.
+        let zero_copy = self
+            .ports
+            .iter()
+            .map(|port| {
+                port.ethernet
+                    .as_ref()
+                    .and_then(|b| b.io.zero_copy_capabilities())
+            })
+            .try_fold(None::<ntcp_io::ZeroCopyCapabilities>, |all, caps| {
+                let caps = caps?;
+                Some(Some(all.map_or(caps, |all| ntcp_io::ZeroCopyCapabilities {
+                    max_payload_segments: all.max_payload_segments.min(caps.max_payload_segments),
+                    max_packet_len: all.max_packet_len.min(caps.max_packet_len),
+                })))
+            })
+            .flatten();
         // Core charges aggregate storage separately from these scalar wire buffers.
         match gso {
             Some(limits) => self
@@ -230,11 +251,7 @@ impl Owner {
             rx_capacity,
             self.defaults.max_connections,
         )?;
-        if let Some(caps) = self
-            .ethernet
-            .as_ref()
-            .and_then(|b| b.io.zero_copy_capabilities())
-        {
+        if let Some(caps) = zero_copy {
             let segments = caps
                 .max_payload_segments
                 .min(self.defaults.connection.send_capacity);
@@ -426,8 +443,8 @@ impl Owner {
                 return Ok(());
             }
         }
-        let ethernet = self.ethernet.is_some();
-        let offset = if ethernet { 14 } else { 0 };
+        let ethernet = self.ethernet_ports();
+        let offset = self.link_offset();
         // A connection's segment is placed after the complete IP header of
         // its bound path (the base header, and an SR route's Segment
         // Routing Header); a stateless reply's path is known only once its
@@ -527,10 +544,12 @@ impl Owner {
             self.timestamp_packet(tx.tx_timestamp, &bytes[offset..offset + ip_len]);
         }
         bytes.truncate(offset + ip_len);
-        if let Some(backend) = &self.ethernet {
-            bytes[..6].copy_from_slice(&backend.next_hop);
-            bytes[6..12].copy_from_slice(&backend.local);
-            bytes[12..14].copy_from_slice(&crate::ip::ether_type(self.local).to_be_bytes());
+        if ethernet {
+            // The frame header is the leaving port's (the only port of a
+            // Host-less fixture), written again at submission for the path
+            // current then.
+            let port = context.and_then(|c| self.port_of(c.link)).unwrap_or(0);
+            self.ports[port].frame_header(bytes, None);
             if shared_len == 0 {
                 bytes.resize(bytes.len().max(60), 0);
             }
@@ -606,6 +625,7 @@ impl Owner {
             }
             // Echo Replies and errors the Host queued from input or expiry.
             self.drain_icmp_output()?;
+            self.release_unresolved(&mut egress, now)?;
             egress.candidates.clear();
             egress.candidates.extend(self.endpoint.ready_connections());
             // Outstanding tickets are excluded from core readiness, but their
@@ -657,7 +677,7 @@ impl Owner {
                 };
                 let slot = &mut egress.tx[index];
                 let entry = slot.entry.as_mut().ok_or(EIO)?;
-                let offset = if self.ethernet.is_some() { 14 } else { 0 };
+                let offset = self.link_offset();
                 let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
                 if entry.context.is_none()
                     && let Some(host) = &mut self.host
@@ -738,14 +758,12 @@ impl Owner {
                     if sources != (false, false) {
                         return Err(EOPNOTSUPP);
                     }
-                    if self.ethernet.is_none() {
+                    if !self.ethernet_ports() {
                         return Err(EIO);
                     }
                 }
-                let ingress = self.ingress;
                 let mut link = Link {
-                    ethernet: &mut self.ethernet,
-                    tun: &mut self.tun,
+                    ports: &mut self.ports,
                     #[cfg(feature = "packet-test")]
                     packets: &mut self.packets,
                 };
@@ -754,7 +772,7 @@ impl Owner {
                 let (called, accepted) = match &mut self.host {
                     // Explicit low-level Endpoint fixtures: no Host authority.
                     None => (
-                        Ok(link.transmit(&slot.bytes, &slot.shared, entry.timestamp, sources)),
+                        Ok(link.transmit(0, &slot.bytes, &slot.shared, entry.timestamp, sources)),
                         false,
                     ),
                     // The Owner is serialized through the Host transaction:
@@ -769,16 +787,50 @@ impl Owner {
                             None => host.egress_context(&mut self.endpoint, entry.attempt),
                         }
                         .and_then(|context| {
-                            attached(ingress, context)?;
+                            let port = link.attached(context.link, context.next_hop)?;
+                            let owner = entry.owner.map_or(ntcp_host::Owner::Stateless, ntcp_host::Owner::Tcp);
+                            let Some(destination) =
+                                link.destination(port, host, context, owner, now)?
+                            else {
+                                return Ok(None);
+                            };
                             let ticket = match entry.ticket.take() {
                                 Some(ticket) => ticket,
                                 None => host.submission_ticket(&mut self.endpoint, context)?,
                             };
-                            Ok((context, ticket))
+                            Ok(Some((context, port, ticket, destination)))
                         });
                         match prepared {
                             Err(error) => (Err(error), false),
-                            Ok((context, ticket)) => {
+                            Ok(None) => {
+                                // Held while its next hop is resolved: not a
+                                // transmission and no backend call, so no
+                                // reservation deadline either (resolution
+                                // ends in success or Address Unreachable,
+                                // `release_unresolved`). Polled again at the
+                                // owner's cadence.
+                                entry.blocked = None;
+                                entry.not_before = now.saturating_add(1000);
+                                egress
+                                    .scheduler
+                                    .resolve(
+                                        token,
+                                        Outcome::Retry {
+                                            not_before: entry.not_before,
+                                        },
+                                    )
+                                    .map_err(|_| EIO)?;
+                                continue;
+                            }
+                            Ok(Some((context, port, ticket, destination))) => {
+                                // This port's frame header, to the next hop
+                                // just resolved, also on the zero-copy
+                                // header copy.
+                                link.ports[port].frame_header(&mut slot.bytes, destination);
+                                if shared_len != 0 {
+                                    link.ports[port]
+                                        .frame_header(&mut slot.shared.header, destination);
+                                }
                                 let mut live = None;
                                 let mut physical = None;
                                 let submission = host.submit(
@@ -790,10 +842,16 @@ impl Owner {
                                     shared_len,
                                     |current| {
                                         live = Some(current);
-                                        if attached(ingress, current).is_err() {
+                                        // A path now leaving another way
+                                        // (another port or next hop)
+                                        // retries with that frame.
+                                        if link.attached(current.link, current.next_hop) != Ok(port)
+                                            || current.next_hop != context.next_hop
+                                        {
                                             return ntcp_host::BackendOutcome::WouldBlock;
                                         }
                                         let result = link.transmit(
+                                            port,
                                             &slot.bytes,
                                             &slot.shared,
                                             entry.timestamp,
@@ -833,7 +891,7 @@ impl Owner {
                         }
                     }
                 };
-                if let Some(backend) = &mut self.ethernet {
+                for backend in self.ports.iter_mut().filter_map(|p| p.ethernet.as_mut()) {
                     backend.finish_cancellations(&mut self.endpoint);
                 }
                 let submitted = match called {
@@ -891,7 +949,7 @@ impl Owner {
                         {
                             return Err(EIO);
                         }
-                        if self.tun.is_some() || self.packet_backend() {
+                        if self.ports.iter().any(|p| p.tun.is_some()) || self.packet_backend() {
                             self.software_transmitted(entry.timestamp, timestamps::realtime());
                         }
                         egress
@@ -955,9 +1013,7 @@ impl Owner {
                             .map_err(|_| EIO)?;
                         entry.packet = None;
                         entry.waiting_mtu = true;
-                        if let Some(refresh) = &mut self.mtu_refresh {
-                            refresh.request();
-                        }
+                        self.request_mtu_refresh();
                         if entry.owner.is_none() {
                             egress.clear(index, &mut self.host)?;
                         }
@@ -986,37 +1042,47 @@ impl Owner {
         result
     }
     // The connection a TCP segment addressed to this owner belongs to.
+    // `arrival` is the link it arrived on; None for a Host-less fixture.
     fn tcp_owner(
         &self,
+        arrival: Option<ntcp_host::path::LinkId>,
         ip: ntcp::IpMetadata,
         protocol: u8,
         payload: &[u8],
     ) -> Option<ConnectionId> {
-        if protocol != 6 || ip.destination != self.local {
+        if protocol != 6 || !self.owns(ip.destination) {
             return None;
         }
         let tcp = ntcp::wire::parse(ip, payload).ok()?;
-        self.endpoint.connection_id(ntcp::Tuple {
-            local: SocketAddr::new(ip.destination, tcp.header.destination_port),
-            remote: SocketAddr::new(ip.source, tcp.header.source_port),
-        })
+        self.arrival_connection(
+            ntcp::Tuple {
+                local: SocketAddr::new(ip.destination, tcp.header.destination_port),
+                remote: SocketAddr::new(ip.source, tcp.header.source_port),
+            },
+            arrival,
+        )
     }
     // The owner of a processed datagram, from its processed metadata rather
     // than a fresh parse. TCP only: the Host dispatcher decides ICMP
     // ownership after correlation.
     fn processed_owner(&self, datagram: ntcp_host::Processed) -> Option<ConnectionId> {
         let packet = self.host.as_ref()?.decode_datagram(datagram).ok()?;
-        self.tcp_owner(packet.ip, packet.protocol, packet.payload)
+        self.tcp_owner(
+            Some(datagram.context().link()),
+            packet.ip,
+            packet.protocol,
+            packet.payload,
+        )
     }
     // Explicit host-less Endpoint fixtures: the frame itself, with the
     // legacy ICMP mapping.
     fn ingress_owner(&self, bytes: &[u8]) -> Option<ConnectionId> {
         let packet = crate::ip::parse(bytes).ok()?;
-        if packet.ip.destination != self.local {
+        if !self.owns(packet.ip.destination) {
             return None;
         }
         if packet.protocol == 6 {
-            return self.tcp_owner(packet.ip, packet.protocol, packet.payload);
+            return self.tcp_owner(None, packet.ip, packet.protocol, packet.payload);
         }
         let feedback = ntcp_icmp::decode_icmp(bytes).ok()?;
         // Even nonterminal errors must wait for the exact reserved owner;
@@ -1075,14 +1141,15 @@ impl Owner {
                     // Full shared retention queue necessarily backpressures all RX.
                     break;
                 };
-                let (bytes, stamps, segment_size, link_multicast) =
+                let (port, bytes, stamps, segment_size, link_multicast) =
                     match self.receive_ip_packet(input)? {
                         backend::BackendReceive::Packet {
+                            port,
                             bytes,
                             stamps,
                             segment_size,
                             link_multicast,
-                        } => (bytes, stamps, segment_size, link_multicast),
+                        } => (port, bytes, stamps, segment_size, link_multicast),
                         backend::BackendReceive::Skipped => continue,
                         backend::BackendReceive::Empty => break,
                     };
@@ -1111,7 +1178,7 @@ impl Owner {
                 let mut completed = std::mem::take(&mut self.completed);
                 let outcome = (|| {
                     let Some(datagram) =
-                        self.receive_datagram(bytes, link_multicast, &mut completed)
+                        self.receive_datagram(port, bytes, link_multicast, &mut completed)
                     else {
                         return Ok(());
                     };
@@ -1165,6 +1232,99 @@ impl Owner {
 }
 
 impl Owner {
+    // Held attempts whose Neighbor Discovery ended. A resolved one is
+    // retried by its entry at the next poll, through the ordinary egress
+    // revalidation of path, link, MTU and mapping. A failed one (RFC 4861
+    // section 7.2.2) was certainly never submitted: the Endpoint withdraws
+    // it without a departure, records the Address Unreachable advice as
+    // the connection's soft error (RFC 1122 section 4.2.3.9) and retries
+    // retransmittable output on its local-failure clock, no earlier than
+    // the RTO; that next attempt resolves the neighbor again (RFC 4861
+    // section 7.3.3). A selection it cannot restore exactly is released as
+    // unsent output for the connection's own loss recovery on that clock:
+    // never held again at once, and never under the reservation deadline
+    // that abandons the connection.
+    fn release_unresolved(&mut self, egress: &mut Egress, now: u64) -> Result<()> {
+        for _ in 0..BUDGET {
+            let Some(wake) = self.host.as_mut().and_then(|h| h.neighbor_wake()) else {
+                return Ok(());
+            };
+            let ntcp_host::NeighborWake::Unreachable { advice, attempt, .. } = wake else {
+                continue;
+            };
+            let Some(index) = egress
+                .tx
+                .iter()
+                .position(|s| s.entry.as_ref().is_some_and(|e| e.attempt == attempt))
+            else {
+                continue;
+            };
+            let error = match advice {
+                ntcp_host::Advice::NetworkError(error) => Some(error),
+                ntcp_host::Advice::PacketTooBig { .. } => None,
+            };
+            if !self
+                .endpoint
+                .discard_unsubmitted(now, attempt, error)
+                .map_err(engine)?
+            {
+                return Err(EIO);
+            }
+            egress.clear(index, &mut self.host)?;
+        }
+        Ok(())
+    }
+    /// Neighbor Discovery's caller-time work on the owner thread: due
+    /// timers (reachability, probes, resolution failure, DAD), then its
+    /// control output (answers, DAD probes, solicitations) through each
+    /// port's one physical call, independently of blocked data output. A
+    /// blocked or refusing backend ends the pass, keeping the message due.
+    pub(super) fn service_discovery(&mut self) {
+        let now = self.now();
+        let Self {
+            host,
+            ports,
+            icmp_wire,
+            ..
+        } = self;
+        let Some(host) = host.as_mut() else {
+            return;
+        };
+        if host.next_neighbor_deadline().is_none_or(|at| at > now) {
+            return;
+        }
+        let _ = host.service_neighbors(now);
+        for _ in 0..BUDGET {
+            let Some(frame) = icmp_wire.get_mut(..) else {
+                return;
+            };
+            let Some(body) = frame.get_mut(14..) else {
+                return;
+            };
+            let Ok(Some(transmit)) = host.neighbor_output(now, body) else {
+                return;
+            };
+            let len = (14 + transmit.len).max(60);
+            let outcome = match ports.iter_mut().find(|p| p.link() == Some(transmit.link)) {
+                Some(port) => match (&mut port.ethernet, frame.get_mut(..len)) {
+                    (Some(backend), Some(frame)) => {
+                        frame[14 + transmit.len..].fill(0);
+                        backend.frame_header(frame, port.address, Some(transmit.destination));
+                        backend_outcome(&backend.transmit_frame(None, (false, false), frame))
+                    }
+                    _ => ntcp_host::BackendOutcome::NotSubmitted,
+                },
+                None => ntcp_host::BackendOutcome::NotSubmitted,
+            };
+            let _ = host.complete_neighbor_output(transmit.ticket, outcome, now);
+            if matches!(
+                outcome,
+                ntcp_host::BackendOutcome::WouldBlock | ntcp_host::BackendOutcome::Rejected
+            ) {
+                return;
+            }
+        }
+    }
     /// Drain the Host's Echo Replies, reassembly errors and due Echo adjunct
     /// probes (one unfragmented packet each): each message is
     /// one unfragmented packet or, for a reply beyond the connectionless
@@ -1185,12 +1345,9 @@ impl Owner {
         }
         self.set_backend_mark(0)
             .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
-        let ingress = self.ingress;
-        let local = self.local;
         let Self {
             host,
-            ethernet,
-            tun,
+            ports,
             #[cfg(feature = "packet-test")]
             packets,
             icmp_packet,
@@ -1198,33 +1355,49 @@ impl Owner {
             ..
         } = self;
         let host = host.as_mut().ok_or(EIO)?;
+        let link = Link {
+            ports,
+            #[cfg(feature = "packet-test")]
+            packets,
+        };
         for _ in 0..BUDGET {
             let result = host.icmp_output(now, icmp_packet, |egress, packet| {
-                if ingress.is_none_or(|port| port.link() != egress.link)
-                    || egress.next_hop
-                        != ntcp_host::path::ResolvedNextHop::Forwarder(
-                            ntcp_host::path::ForwarderId(1),
-                        )
-                {
+                let Ok(port) = link.attached(egress.link, egress.next_hop) else {
                     return ntcp_host::BackendOutcome::NotSubmitted;
-                }
-                let result = if let Some(backend) = ethernet {
+                };
+                // A fixed or static next hop, or on a Neighbor Discovery
+                // port the mapping the Host resolved (it holds the message
+                // while resolving and never submits it without one).
+                let destination = match (&link.ports[port].resolution, egress.next_hop) {
+                    (backend::Resolution::Fixed, _) => None,
+                    (backend::Resolution::Discovery, _) => match egress.link_layer {
+                        Some(mac) => Some(mac),
+                        None => return ntcp_host::BackendOutcome::NotSubmitted,
+                    },
+                    (backend::Resolution::Static(_), ntcp_host::path::ResolvedNextHop::Address(a)) => {
+                        match link.ports[port].static_neighbor(a.address()) {
+                            Some(mac) => Some(mac),
+                            None => return ntcp_host::BackendOutcome::NotSubmitted,
+                        }
+                    }
+                    _ => return ntcp_host::BackendOutcome::NotSubmitted,
+                };
+                let family = link.ports[port].address;
+                let result = if let Some(backend) = &mut link.ports[port].ethernet {
                     let len = (14 + packet.len()).max(60);
                     let Some(frame) = icmp_wire.get_mut(..len) else {
                         return ntcp_host::BackendOutcome::NotSubmitted;
                     };
                     frame.fill(0);
-                    frame[..6].copy_from_slice(&backend.next_hop);
-                    frame[6..12].copy_from_slice(&backend.local);
-                    frame[12..14].copy_from_slice(&crate::ip::ether_type(local).to_be_bytes());
+                    backend.frame_header(frame, family, destination);
                     frame[14..14 + packet.len()].copy_from_slice(packet);
                     backend.transmit_frame(None, (false, false), frame)
                 } else {
                     #[cfg(feature = "packet-test")]
-                    if let Some(packets) = packets {
+                    if let Some(packets) = link.packets {
                         return backend_outcome(&packets.transmit(packet));
                     }
-                    match tun {
+                    match &mut link.ports[port].tun {
                         Some(tun) => tun.transmit(packet),
                         None => return ntcp_host::BackendOutcome::NotSubmitted,
                     }
@@ -1246,44 +1419,97 @@ impl Owner {
     }
 }
 
-// The attached backend, borrowed apart from the Host and the Endpoint so its
-// one physical call can run inside the Host submission transaction.
+// The attached ports, borrowed apart from the Host and the Endpoint so a
+// port's one physical call can run inside the Host submission transaction.
 struct Link<'a> {
-    ethernet: &'a mut Option<backend::EthernetBackend>,
-    tun: &'a mut Option<Tun>,
+    ports: &'a mut [backend::Port],
     #[cfg(feature = "packet-test")]
     packets: &'a mut Option<PacketBackend>,
 }
 impl Link<'_> {
-    // Scalar or zero-copy shared header/payload; Ethernet timestamp fallback
-    // happens inside this one call.
+    // The port a path leaves through: an actual attached port whose fixed
+    // MAC/L3 endpoint implements the explicitly assigned forwarder, or a
+    // port resolving the IP next hop the path names. A legacy port
+    // supplies no IP-neighbor resolution, so a path whose next hop is an IP
+    // address is refused there, never sent to a guessed MAC.
+    fn attached(
+        &self,
+        link: ntcp_host::path::LinkId,
+        next_hop: ntcp_host::path::ResolvedNextHop,
+    ) -> core::result::Result<usize, ntcp_host::Error> {
+        use ntcp_host::path::ResolvedNextHop;
+        let port = self
+            .ports
+            .iter()
+            .position(|port| port.link() == Some(link))
+            .ok_or(ntcp_host::Error::Unsupported)?;
+        let fixed = self.ports[port].resolution == backend::Resolution::Fixed;
+        match next_hop {
+            ResolvedNextHop::Forwarder(f) if fixed && f == backend::FORWARDER => Ok(port),
+            ResolvedNextHop::Address(_) if !fixed => Ok(port),
+            _ => Err(ntcp_host::Error::Unsupported),
+        }
+    }
+    // The Ethernet destination of `context`'s attempt through `port`: None
+    // inside Some for the fixed next hop, a static neighbor's or the
+    // Neighbor Discovery cache's MAC, or None while Neighbor Discovery
+    // resolves it (the attempt is then held for `owner`). An IPv4 next hop
+    // without a static neighbor is unavailable (there is no ARP).
+    fn destination(
+        &self,
+        port: usize,
+        host: &mut ntcp_host::Host,
+        context: ntcp_host::EgressContext,
+        owner: ntcp_host::Owner,
+        now: u64,
+    ) -> core::result::Result<Option<Option<[u8; 6]>>, ntcp_host::Error> {
+        use ntcp_host::path::ResolvedNextHop;
+        let port = &self.ports[port];
+        match (&port.resolution, context.next_hop) {
+            (backend::Resolution::Fixed, _) => Ok(Some(None)),
+            (backend::Resolution::Static(_), ResolvedNextHop::Address(next_hop)) => port
+                .static_neighbor(next_hop.address())
+                .map(|mac| Some(Some(mac)))
+                .ok_or(ntcp_host::Error::Unsupported),
+            (backend::Resolution::Discovery, _) => {
+                Ok(match host.resolve_neighbor(context, owner, now)? {
+                    ntcp_host::NeighborHop::Resolved(mac) => Some(Some(mac)),
+                    ntcp_host::NeighborHop::Held => None,
+                })
+            }
+            _ => Err(ntcp_host::Error::Unsupported),
+        }
+    }
+    // Scalar or zero-copy shared header/payload through `port`; Ethernet
+    // timestamp fallback happens inside this one call.
     fn transmit(
         &mut self,
+        port: usize,
         bytes: &[u8],
         shared: &ntcp_io::OwnedPacket,
         timestamp: Option<ntcp::TxTimestampToken>,
         sources: (bool, bool),
     ) -> std::io::Result<TxOutcome> {
+        let port = &mut self.ports[port];
         if !shared.payload.is_empty() {
-            return match self.ethernet {
+            return match &mut port.ethernet {
                 Some(backend) => backend.io.transmit_zero_copy(shared),
                 None => Err(std::io::Error::from_raw_os_error(EIO)),
             };
         }
-        if let Some(backend) = self.ethernet {
+        if let Some(backend) = &mut port.ethernet {
             return backend.transmit_frame(timestamp, sources, bytes);
         }
         #[cfg(feature = "packet-test")]
         if let Some(packets) = self.packets {
             return packets.transmit(bytes);
         }
-        match self.tun {
+        match &mut port.tun {
             Some(tun) => tun.transmit(bytes),
             None => Err(std::io::Error::from_raw_os_error(EIO)),
         }
     }
 }
-
 // The backend's own statement mapped to the Host's outcome vocabulary. A
 // local rejection and EMSGSIZE certainly did not submit; the caller then
 // resolves the Endpoint side (reject_local_output or a retained
@@ -1296,23 +1522,6 @@ fn backend_outcome(result: &std::io::Result<TxOutcome>) -> ntcp_host::BackendOut
         Ok(TxOutcome::Rejected) => ntcp_host::BackendOutcome::Rejected,
         Err(error) if error.raw_os_error() == Some(EMSGSIZE) => ntcp_host::BackendOutcome::Rejected,
         Err(_) => ntcp_host::BackendOutcome::Unknown,
-    }
-}
-
-// One actual attached port. Its fixed MAC/L3 endpoint only implements the
-// explicitly assigned forwarder; it supplies no IP-neighbor or new-link
-// resolution.
-fn attached(
-    ingress: Option<ntcp_host::IngressContext>,
-    context: ntcp_host::EgressContext,
-) -> core::result::Result<(), ntcp_host::Error> {
-    if ingress.is_none_or(|port| port.link() != context.link)
-        || context.next_hop
-            != ntcp_host::path::ResolvedNextHop::Forwarder(ntcp_host::path::ForwarderId(1))
-    {
-        Err(ntcp_host::Error::Unsupported)
-    } else {
-        Ok(())
     }
 }
 

@@ -66,7 +66,7 @@ fn ip_size(frame: &[u8]) -> usize {
 fn budget(a: &mut Owner, cid: ConnectionId, mtu: u32, physical: bool) {
     if physical {
         let (refresh, _, results) = super::super::super::output::MtuRefresh::fixture();
-        a.mtu_refresh = Some(refresh);
+        a.ports[0].mtu_refresh = Some(refresh);
         results.send(Ok(Some(mtu))).unwrap();
         a.poll_mtu_refresh();
         assert_eq!(
@@ -74,7 +74,7 @@ fn budget(a: &mut Owner, cid: ConnectionId, mtu: u32, physical: bool) {
                 .as_ref()
                 .unwrap()
                 .paths()
-                .link(a.ingress.unwrap().link())
+                .link(a.ports[0].ingress.unwrap().link())
                 .unwrap()
                 .mtu,
             mtu
@@ -622,7 +622,7 @@ fn managed_scheduled_stateless_and_released_final_reset_leases_end_after_real_su
         let held = wire.lock().unwrap().offered.last().unwrap().clone();
         let ip = crate::ip::parse(ntcp_ethernet::parse_ethernet(&held).unwrap().payload).unwrap();
         assert!(ntcp::wire::parse(ip.ip, ip.payload).unwrap().header.flags & ntcp::wire::RST != 0);
-        let link = sender.ingress.unwrap().link();
+        let link = sender.ports[0].ingress.unwrap().link();
         sender
             .host
             .as_mut()
@@ -661,7 +661,7 @@ fn managed_scheduled_unattached_generation_and_ip_neighbor_mapping_never_use_glo
             .paths()
             .route(old.snapshot.key().route())
             .unwrap();
-        let ingress = a.ingress.unwrap();
+        let ingress = a.ports[0].ingress.unwrap();
         if new_link {
             let caps = a
                 .host

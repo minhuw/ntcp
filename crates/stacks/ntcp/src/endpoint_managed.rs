@@ -333,6 +333,11 @@ impl Endpoint {
             return Err(EndpointError::Connection(Error::InvalidState).into());
         }
         crate::managed_path::check_registration(&request).map_err(EndpointError::from)?;
+        let scoped = ScopedTuple::new(request.tuple, request.zone)
+            .ok_or(EndpointError::InvalidAddress)?;
+        if !self.admits_zone(scoped) {
+            return Err(EndpointError::InvalidAddress.into());
+        }
         self.validate_ipv4_options(
             IpMetadata {
                 source: request.tuple.local.ip(),
@@ -375,10 +380,28 @@ impl Endpoint {
         options: ManagedOpenOptions,
         provider: &mut P,
     ) -> Result<ConnectionId, ManagedError<P::Error>> {
-        let tuple = Tuple { local, remote };
+        self.connect_scoped_with_path_provider(
+            now,
+            ScopedTuple::unscoped(Tuple { local, remote }),
+            options,
+            provider,
+        )
+    }
+
+    /// `connect_with_path_provider` for a scoped identity: a link-local
+    /// open names the link it runs on, and its path is selected there.
+    pub fn connect_scoped_with_path_provider<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        scoped: ScopedTuple,
+        options: ManagedOpenOptions,
+        provider: &mut P,
+    ) -> Result<ConnectionId, ManagedError<P::Error>> {
+        let tuple = scoped.tuple();
+        let (local, remote) = (tuple.local, tuple.remote);
         self.active_admission(
             now,
-            tuple,
+            scoped,
             &options.transport,
             options.receive_authority,
             false,
@@ -387,6 +410,7 @@ impl Endpoint {
             .map_err(|_| EndpointError::Connection(Error::InvalidArgument))?;
         let request = PathFactoryRequest {
             tuple,
+            zone: scoped.zone(),
             role: FactoryRole::Active,
             listener: None,
             dscp,
@@ -416,10 +440,34 @@ impl Endpoint {
         policy: crate::FastOpenClientPolicy,
         provider: &mut P,
     ) -> Result<(ConnectionId, usize), ManagedError<P::Error>> {
-        let tuple = Tuple { local, remote };
+        self.connect_fast_open_scoped_with_path_provider(
+            now,
+            ScopedTuple::unscoped(Tuple { local, remote }),
+            initial,
+            options,
+            cookie,
+            policy,
+            provider,
+        )
+    }
+
+    /// `connect_fast_open_with_path_provider` for a scoped identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_fast_open_scoped_with_path_provider<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        scoped: ScopedTuple,
+        initial: &[u8],
+        options: ManagedOpenOptions,
+        cookie: Option<wire::FastOpenCookie>,
+        policy: crate::FastOpenClientPolicy,
+        provider: &mut P,
+    ) -> Result<(ConnectionId, usize), ManagedError<P::Error>> {
+        let tuple = scoped.tuple();
+        let (local, remote) = (tuple.local, tuple.remote);
         self.active_admission(
             now,
-            tuple,
+            scoped,
             &options.transport,
             options.receive_authority,
             true,
@@ -428,6 +476,7 @@ impl Endpoint {
             .map_err(|_| EndpointError::Connection(Error::InvalidArgument))?;
         let request = PathFactoryRequest {
             tuple,
+            zone: scoped.zone(),
             role: FactoryRole::Active,
             listener: None,
             dscp,
@@ -450,10 +499,13 @@ impl Endpoint {
 
     /// `outgoing_dscp` is socket/listener policy, never received DSCP. Incoming
     /// TFO receive authority is still the independent local ListenerId policy.
+    /// `arrival` is the link the packet arrived on: it scopes a tuple with
+    /// an IPv6 link-local address and is otherwise not part of its identity.
     #[allow(clippy::too_many_arguments)]
     pub fn input_with_path_provider<P: PathProvider>(
         &mut self,
         now: Instant,
+        arrival: ntcp_path::LinkId,
         ip: IpMetadata,
         traffic_class: u8,
         options: Ipv4Options,
@@ -462,34 +514,42 @@ impl Endpoint {
         outgoing_dscp: u8,
         provider: &mut P,
     ) -> Result<InputDisposition, ManagedError<P::Error>> {
-        if self.managed_context.is_none() {
+        if self.managed_context != Some(arrival.context()) {
             return Err(EndpointError::Connection(Error::InvalidState).into());
         }
+        let tuple = Tuple {
+            local: SocketAddr::new(ip.destination, 0),
+            remote: SocketAddr::new(ip.source, 0),
+        };
+        let zone = crate::connection::needs_zone(tuple).then_some(arrival);
         // Input the Endpoint discards (invalid/broadcast/multicast source or
         // destination, rejected received route, ...) prepares no path.
-        let Some((route, segment)) = self.ingress_admission(ip, options, bytes, metadata)? else {
+        let Some((route, segment)) = self.ingress_admission(ip, zone, options, bytes, metadata)?
+        else {
             return Ok(InputDisposition::Dropped);
         };
         let tuple = Tuple {
             local: SocketAddr::new(ip.destination, segment.header.destination_port),
             remote: SocketAddr::new(ip.source, segment.header.source_port),
         };
-        let target = self.tuples.find(self.hash(tuple), tuple);
+        let scoped = ScopedTuple { tuple, zone };
+        let target = self.tuples.find(self.hash(scoped), scoped);
         let replacement = target.is_some_and(|index| {
             self.config.reuse_time_wait
                 && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
         });
-        let listener = self.match_listener(tuple.local);
+        let listener = self.match_listener(tuple.local, zone);
         let queued = self.control.len();
         let result = if let Some(id) = listener
             && (target.is_none() || replacement)
             && segment.header.flags & (SYN | ACK | RST) == SYN
             // A full backlog/Endpoint or stale TIME-WAIT reuse is dropped by
             // the ordinary factory below without any path transaction.
-            && self.passive_room(now, target.filter(|_| replacement), id, tuple, &segment)
+            && self.passive_room(now, target.filter(|_| replacement), id, scoped, &segment)
         {
             let request = PathFactoryRequest {
                 tuple,
+                zone,
                 role: if replacement {
                     FactoryRole::TimeWaitReplacement
                 } else {
@@ -505,18 +565,19 @@ impl Endpoint {
                 registration: None,
             };
             self.path_factory(provider, request, |endpoint| {
-                endpoint.input_with_metadata(now, ip, traffic_class, options, bytes, metadata)
+                endpoint.input_scoped(now, ip, zone, traffic_class, options, bytes, metadata)
             })
         } else {
-            self.input_with_metadata(now, ip, traffic_class, options, bytes, metadata)
+            self.input_scoped(now, ip, zone, traffic_class, options, bytes, metadata)
                 .map_err(ManagedError::Endpoint)
         };
         // A stateless IPv6 reply this input queued is sized with the complete
-        // header of the path the provider will place it on.
+        // header of the path the provider will place it on (on its zone's
+        // link when it carries one).
         let dscp = self.config.dscp;
         for entry in self.control.iter_mut().skip(queued) {
             if entry.0.destination.is_ipv6() {
-                entry.4 = provider.reply_header_len(entry.0, dscp);
+                entry.4 = provider.reply_header_len(entry.0, entry.5, dscp);
             }
         }
         result
@@ -525,7 +586,16 @@ impl Endpoint {
     /// Use the Endpoint's own wildcard/exact listener precedence when selecting
     /// outbound listener policy before a managed passive factory transaction.
     pub fn matching_listener(&self, local: SocketAddr) -> Option<ListenerId> {
-        self.match_listener(local)
+        self.match_listener(local, None)
+    }
+
+    /// `matching_listener` for a scoped local address.
+    pub fn matching_scoped_listener(
+        &self,
+        local: SocketAddr,
+        zone: Option<ntcp_path::LinkId>,
+    ) -> Option<ListenerId> {
+        self.match_listener(local, zone)
     }
 
     /// Roll back an active factory before any SYN was submitted. A reservation
@@ -565,12 +635,17 @@ impl Endpoint {
         Ok(self.retained_slot(id)?.connection.tuple())
     }
 
+    pub fn retained_scoped_tuple(&self, id: ConnectionId) -> Result<ScopedTuple, EndpointError> {
+        Ok(self.retained_slot(id)?.connection.scoped_tuple())
+    }
+
     pub fn managed_path(&self, id: ConnectionId) -> Result<ManagedPathInfo, EndpointError> {
         let slot = self.retained_slot(id)?;
         let connection = &slot.connection;
         Ok(ManagedPathInfo {
             binding: connection.managed_path.ok_or(Error::InvalidState)?,
             tuple: connection.tuple(),
+            zone: connection.scoped_tuple().zone(),
             forwarding_destination: slot
                 .ipv4_options
                 .source_route
@@ -629,6 +704,47 @@ impl Endpoint {
             .current
             .as_ref()?;
         (r.attempt == Some(attempt)).then_some(r.emitted_packet)
+    }
+
+    /// The link scoping exactly the currently selected attempt's packet,
+    /// present only when one of its addresses is IPv6 link-local: its
+    /// connection's zone, or for a stateless reply the arrival link of the
+    /// input that caused it. Such a packet leaves only on that link. None
+    /// when `attempt` is not current.
+    pub fn transmit_attempt_zone(
+        &self,
+        attempt: crate::TransmitAttempt,
+    ) -> Option<Option<ntcp_path::LinkId>> {
+        let r = self
+            .reservations
+            .get(attempt.reservation)?
+            .current
+            .as_ref()?;
+        (r.attempt == Some(attempt)).then_some(r.zone)
+    }
+
+    /// Count the current stateless reply `attempt` as undeliverable: the
+    /// link of its zone was removed or replaced, so it can leave on no link.
+    /// Counts each reservation once however often its provider refuses it;
+    /// the embedding then discards the certainly unsubmitted attempt
+    /// (`reject_unsubmitted`). False, counting nothing, for a connection's
+    /// packet, an unscoped reply or an attempt that is not current.
+    pub fn count_undeliverable_reply(&mut self, attempt: crate::TransmitAttempt) -> bool {
+        let Some(r) = self
+            .reservations
+            .get_mut(attempt.reservation)
+            .and_then(|slot| slot.current.as_mut())
+        else {
+            return false;
+        };
+        if r.attempt != Some(attempt) || r.packet.connection.is_some() || r.zone.is_none() {
+            return false;
+        }
+        if !r.undeliverable {
+            r.undeliverable = true;
+            self.undeliverable_control += 1;
+        }
+        true
     }
 
     pub fn transmit_discovery_intent(

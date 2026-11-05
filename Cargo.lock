@@ -140,6 +140,7 @@ name = "ntcp-host"
 version = "0.0.1"
 dependencies = [
  "ntcp",
+ "ntcp-ethernet",
  "ntcp-icmp",
  "ntcp-ip",
  "ntcp-ip-common",

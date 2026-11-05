@@ -61,7 +61,7 @@ pub mod wire;
 
 pub use connection::{
     CallerTimebase, CloseReason, ConnectionConfig, ConnectionEvents, Error, Instant,
-    KeepaliveConfig, NetworkError, PacingConfig, State, TimestampGranularity, TransportInfo, Tuple,
+    KeepaliveConfig, NetworkError, PacingConfig, State, TimestampGranularity, ScopedTuple, TransportInfo, Tuple,
 };
 pub use endpoint::{
     ActiveOpenOptions, AddressValidation, ConfirmedProbe, ConnectionId, CorrelatedPmtu,

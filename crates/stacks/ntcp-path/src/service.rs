@@ -43,12 +43,27 @@ macro_rules! handle {
 }
 handle!(LinkId);
 handle!(SourceId);
+
+impl LinkId {
+    /// The complete identity (context, slot, generation) as fixed-width
+    /// big-endian octets: keyed digests of scoped identities include it, so
+    /// a recycled slot never names the same zone.
+    pub fn to_bytes(self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[..16].copy_from_slice(&self.0.context.0.to_be_bytes());
+        bytes[16..24].copy_from_slice(&(self.0.slot as u64).to_be_bytes());
+        bytes[24..].copy_from_slice(&self.0.generation.to_be_bytes());
+        bytes
+    }
+}
 handle!(RouteId);
 
 mod cache;
+mod redirect;
 #[cfg(test)]
 mod segment_route_tests;
 pub use cache::*;
+pub use redirect::NeighborLoss;
 
 /// Authoritative embedding interface key, independent of a source IP address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -316,6 +331,9 @@ pub struct PathKey {
     link: LinkId,
     next_hop: ResolvedNextHop,
     route: RouteId,
+    // The forwarding generation of the Redirect override that chose
+    // `next_hop`; 0 for the route's own next hop.
+    forwarding: u64,
 }
 
 impl PathKey {
@@ -459,6 +477,9 @@ pub struct PathService {
     // Immutable SR segment list S1..Sn of the route in the same slot and
     // generation; empty for an ordinary route. Cleared with the route.
     route_segments: Vec<Box<[Ipv6Addr]>>,
+    // Redirect overrides, one slot per cached path: the population of
+    // destinations whose first hop a Redirect can change.
+    redirects: Vec<Option<redirect::Redirect>>,
     // A shared nonwrapping generation domain prevents reuse after deletion.
     generation: u64,
     revision: u64,
@@ -480,6 +501,7 @@ impl PathService {
             (limits.clients, size_of::<Slot<Client>>()),
             (limits.routes, size_of::<RouteAdmin>()),
             (limits.routes, size_of::<Box<[Ipv6Addr]>>()),
+            (limits.paths, size_of::<Option<redirect::Redirect>>()),
         ] {
             bytes = bytes
                 .checked_add(count.checked_mul(size).ok_or(Error::Capacity)?)
@@ -509,6 +531,14 @@ impl PathService {
                     .map_err(|_| Error::Allocation)?;
                 // Empty boxed slices do not allocate.
                 records.resize_with(limits.routes, Box::default);
+                records
+            },
+            redirects: {
+                let mut records = Vec::new();
+                records
+                    .try_reserve_exact(limits.paths)
+                    .map_err(|_| Error::Allocation)?;
+                records.resize(limits.paths, None);
                 records
             },
             generation: 0,
@@ -1022,6 +1052,21 @@ impl PathService {
             },
             None => matched,
         };
+        let (next_hop, forwarding) =
+            match self.redirect_for(id, forwarding_destination, request.dscp) {
+                Some(redirect) => (
+                    ResolvedNextHop::Address(redirect.target()),
+                    redirect.generation(),
+                ),
+                None => (
+                    match route.next_hop {
+                        NextHop::OnLink => ResolvedNextHop::Address(forwarding_destination),
+                        NextHop::Gateway(g) => ResolvedNextHop::Address(g),
+                        NextHop::Forwarder(id) => ResolvedNextHop::Forwarder(id),
+                    },
+                    0,
+                ),
+            };
         Ok(ResolvedPath {
             key: PathKey {
                 context: self.context,
@@ -1031,12 +1076,9 @@ impl PathService {
                 forwarding_destination,
                 dscp: request.dscp,
                 link: route.link,
-                next_hop: match route.next_hop {
-                    NextHop::OnLink => ResolvedNextHop::Address(forwarding_destination),
-                    NextHop::Gateway(g) => ResolvedNextHop::Address(g),
-                    NextHop::Forwarder(id) => ResolvedNextHop::Forwarder(id),
-                },
+                next_hop,
                 route: id,
+                forwarding,
             },
             first_hop_mtu: link.mtu,
             link_version: link.version,

@@ -4,6 +4,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{Error, Instant, wire::FastOpenCookie};
+use ntcp_path::LinkId;
 
 /// Authorization for delivering SYN data before the handshake completes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -87,8 +88,7 @@ impl FastOpenCookiePolicy {
         matches!(self, Self::HmacSha256)
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
-    //# - GetCookie(IP_Address): returns a (new) cookie.
+    #[cfg(test)]
     pub(crate) fn issue(
         &self,
         secret: &[u8; 32],
@@ -96,10 +96,27 @@ impl FastOpenCookiePolicy {
         remote: IpAddr,
         epoch: u64,
     ) -> Option<FastOpenCookie> {
+        self.issue_in(secret, local, remote, None, epoch)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+    //# - GetCookie(IP_Address): returns a (new) cookie.
+    // `zone` scopes link-local addresses. HMAC credentials authenticate it;
+    // the raw Linux encoding hashes only the two addresses and cannot
+    // separate zones, so it issues nothing for a scoped peer, which then
+    // uses ordinary TCP.
+    pub(crate) fn issue_in(
+        &self,
+        secret: &[u8; 32],
+        local: IpAddr,
+        remote: IpAddr,
+        zone: Option<LinkId>,
+        epoch: u64,
+    ) -> Option<FastOpenCookie> {
         match self {
-            Self::HmacSha256 => Some(issue(secret, local, remote, epoch)),
+            Self::HmacSha256 => Some(issue_in(secret, local, remote, zone, epoch)),
             #[cfg(feature = "tfo-linux-cookie")]
-            Self::LinuxSipHash24(key) => key.cookie(local, remote),
+            Self::LinuxSipHash24(key) => zone.is_none().then(|| key.cookie(local, remote))?,
         }
     }
 
@@ -123,6 +140,31 @@ impl FastOpenCookiePolicy {
     //# available to be sent to the client.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
     //# 4. A server may encode other information in the cookie and accept more than one valid cookie per client at any given time. But this is server-implementation dependent and transparent to the client.
+    pub(crate) fn valid_in(
+        &self,
+        secret: &[u8; 32],
+        local: IpAddr,
+        remote: IpAddr,
+        zone: Option<LinkId>,
+        epoch: u64,
+        cookie: FastOpenCookie,
+    ) -> bool {
+        match self {
+            Self::HmacSha256 => valid_in(secret, local, remote, zone, epoch, cookie),
+            #[cfg(feature = "tfo-linux-cookie")]
+            Self::LinuxSipHash24(key) => {
+                use subtle::ConstantTimeEq;
+                if cookie.as_bytes().len() != 8 || zone.is_some() {
+                    return false;
+                }
+                key.cookie(local, remote).is_some_and(|expected| {
+                    bool::from(expected.as_bytes().ct_eq(cookie.as_bytes()))
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn valid(
         &self,
         secret: &[u8; 32],
@@ -131,19 +173,7 @@ impl FastOpenCookiePolicy {
         epoch: u64,
         cookie: FastOpenCookie,
     ) -> bool {
-        match self {
-            Self::HmacSha256 => valid(secret, local, remote, epoch, cookie),
-            #[cfg(feature = "tfo-linux-cookie")]
-            Self::LinuxSipHash24(key) => {
-                use subtle::ConstantTimeEq;
-                if cookie.as_bytes().len() != 8 {
-                    return false;
-                }
-                key.cookie(local, remote).is_some_and(|expected| {
-                    bool::from(expected.as_bytes().ct_eq(cookie.as_bytes()))
-                })
-            }
-        }
+        self.valid_in(secret, local, remote, None, epoch, cookie)
     }
 }
 
@@ -476,14 +506,16 @@ impl Credential {
         now: Instant,
         local: IpAddr,
         remote: IpAddr,
+        zone: Option<LinkId>,
         cookie: FastOpenCookie,
     ) -> bool {
         let record = registry.get(self.id);
         record.accepts(now)
-            && self.key.policy().valid(
+            && self.key.policy().valid_in(
                 self.key.secret(),
                 local,
                 remote,
+                zone,
                 now / record.epoch_ticks,
                 cookie,
             )
@@ -573,6 +605,7 @@ impl ServerCookieContext {
         }
     }
 
+    #[cfg(test)]
     pub fn valid(
         &self,
         registry: &CredentialRegistry,
@@ -581,16 +614,29 @@ impl ServerCookieContext {
         remote: IpAddr,
         cookie: FastOpenCookie,
     ) -> bool {
+        self.valid_in(registry, now, local, remote, None, cookie)
+    }
+
+    pub fn valid_in(
+        &self,
+        registry: &CredentialRegistry,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+        zone: Option<LinkId>,
+        cookie: FastOpenCookie,
+    ) -> bool {
         #[cfg(all(test, feature = "tfo-linux-cookie"))]
         let _scope = crate::endpoint::mac_cost_tests::Scope::new(0);
         self.error.is_none()
-            && (self.current.valid(registry, now, local, remote, cookie)
+            && (self.current.valid(registry, now, local, remote, zone, cookie)
                 | self
                     .retiring
                     .as_ref()
-                    .is_some_and(|old| old.valid(registry, now, local, remote, cookie)))
+                    .is_some_and(|old| old.valid(registry, now, local, remote, zone, cookie)))
     }
 
+    #[cfg(test)]
     pub fn issue(
         &self,
         registry: &CredentialRegistry,
@@ -598,16 +644,28 @@ impl ServerCookieContext {
         local: IpAddr,
         remote: IpAddr,
     ) -> Option<FastOpenCookie> {
+        self.issue_in(registry, now, local, remote, None)
+    }
+
+    pub fn issue_in(
+        &self,
+        registry: &CredentialRegistry,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+        zone: Option<LinkId>,
+    ) -> Option<FastOpenCookie> {
         #[cfg(all(test, feature = "tfo-linux-cookie"))]
         let _scope = crate::endpoint::mac_cost_tests::Scope::new(1);
         let record = registry.get(self.current.id);
         if self.error.is_some() || !record.issues(now) {
             return None;
         }
-        self.current.key.policy().issue(
+        self.current.key.policy().issue_in(
             self.current.key.secret(),
             local,
             remote,
+            zone,
             now / record.epoch_ticks,
         )
     }
@@ -629,6 +687,9 @@ pub(crate) struct CachedPeer {
     mss: Option<(u16, Instant)>,
     local: IpAddr,
     remote: IpAddr,
+    // The link scoping link-local addresses: the same pair on two links
+    // names two servers.
+    zone: Option<LinkId>,
     learned: Instant,
 }
 
@@ -636,6 +697,7 @@ pub(crate) struct CachedPeer {
 pub(crate) struct NegativeService {
     local: IpAddr,
     remote: SocketAddr,
+    zone: Option<LinkId>,
     failed: Instant,
 }
 
@@ -687,22 +749,28 @@ impl FastOpen {
         lifetime: u64,
         local: IpAddr,
         remote: SocketAddr,
+        zone: Option<LinkId>,
     ) -> bool {
         self.negative.iter().any(|e| {
-            e.local == local && e.remote == remote && now >= e.failed && now - e.failed < lifetime
+            e.local == local
+                && e.remote == remote
+                && e.zone == zone
+                && now >= e.failed
+                && now - e.failed < lifetime
         })
     }
 
-    pub fn fail(&mut self, now: Instant, local: IpAddr, remote: SocketAddr) {
+    pub fn fail(&mut self, now: Instant, local: IpAddr, remote: SocketAddr, zone: Option<LinkId>) {
         let entry = NegativeService {
             local,
             remote,
+            zone,
             failed: now,
         };
         if let Some(old) = self
             .negative
             .iter_mut()
-            .find(|e| e.local == local && e.remote == remote)
+            .find(|e| e.local == local && e.remote == remote && e.zone == zone)
         {
             *old = entry;
         } else if self.negative.len() < CAPACITY {
@@ -713,6 +781,7 @@ impl FastOpen {
         }
     }
 
+    #[cfg(test)]
     pub fn get(
         &self,
         now: Instant,
@@ -720,11 +789,22 @@ impl FastOpen {
         local: IpAddr,
         remote: IpAddr,
     ) -> Option<CachedCookie> {
-        let peer = self.peer(now, lifetime, local, remote)?;
+        self.get_in(now, lifetime, local, remote, None)
+    }
+
+    pub fn get_in(
+        &self,
+        now: Instant,
+        lifetime: u64,
+        local: IpAddr,
+        remote: IpAddr,
+        zone: Option<LinkId>,
+    ) -> Option<CachedCookie> {
+        let peer = self.peer(now, lifetime, local, remote, zone)?;
         let (cookie, learned) = peer.credential?;
         (now >= learned && now - learned < lifetime).then_some(CachedCookie {
             cookie,
-            mss: self.peer_mss(now, lifetime, local, remote),
+            mss: self.peer_mss(now, lifetime, local, remote, zone),
         })
     }
 
@@ -734,9 +814,14 @@ impl FastOpen {
         lifetime: u64,
         local: IpAddr,
         remote: IpAddr,
+        zone: Option<LinkId>,
     ) -> Option<&CachedPeer> {
         self.entries.iter().find(|e| {
-            e.local == local && e.remote == remote && now >= e.learned && now - e.learned < lifetime
+            e.local == local
+                && e.remote == remote
+                && e.zone == zone
+                && now >= e.learned
+                && now - e.learned < lifetime
         })
     }
 
@@ -746,21 +831,29 @@ impl FastOpen {
         lifetime: u64,
         local: IpAddr,
         remote: IpAddr,
+        zone: Option<LinkId>,
     ) -> Option<u16> {
-        let (mss, learned) = self.peer(now, lifetime, local, remote)?.mss?;
+        let (mss, learned) = self.peer(now, lifetime, local, remote, zone)?.mss?;
         (now >= learned && now - learned < lifetime).then_some(mss)
     }
 
     // Validated MSS observations have their own age. They neither create a
     // credential nor refresh a credential's lifetime.
-    pub fn update_mss(&mut self, now: Instant, local: IpAddr, remote: IpAddr, mss: u16) {
+    pub fn update_mss(
+        &mut self,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+        zone: Option<LinkId>,
+        mss: u16,
+    ) {
         if mss == 0 {
             return;
         }
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|e| e.local == local && e.remote == remote)
+            .find(|e| e.local == local && e.remote == remote && e.zone == zone)
         {
             if now >= entry.learned {
                 entry.mss = Some((mss, now));
@@ -772,6 +865,7 @@ impl FastOpen {
                 mss: Some((mss, now)),
                 local,
                 remote,
+                zone,
                 learned: now,
             });
         }
@@ -790,11 +884,12 @@ impl FastOpen {
     //# The client MUST cache cookies from servers for later Fast Open connections. For a multihomed client,
     //# the cookies are dependent on the client and server IP addresses. Hence, the client should cache at
     //# most one (most recently received) cookie per client and server IP address pair.
-    pub fn learn(
+    pub fn learn_in(
         &mut self,
         now: Instant,
         local: IpAddr,
         remote: IpAddr,
+        zone: Option<LinkId>,
         cookie: FastOpenCookie,
         mss: Option<u16>,
     ) {
@@ -808,12 +903,13 @@ impl FastOpen {
             mss: mss.map(|mss| (mss, now)),
             local,
             remote,
+            zone,
             learned: now,
         };
         if let Some(old) = self
             .entries
             .iter_mut()
-            .find(|e| e.local == local && e.remote == remote)
+            .find(|e| e.local == local && e.remote == remote && e.zone == zone)
         {
             if now >= old.learned {
                 // Cookie-only replies must neither invent an MSS nor renew
@@ -825,9 +921,28 @@ impl FastOpen {
             self.insert_peer(peer);
         }
     }
+
+    #[cfg(test)]
+    pub fn learn(
+        &mut self,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+        cookie: FastOpenCookie,
+        mss: Option<u16>,
+    ) {
+        self.learn_in(now, local, remote, None, cookie, mss)
+    }
 }
 
-fn address_mac(secret: &[u8; 32], local: IpAddr, remote: IpAddr) -> Hmac<Sha256> {
+// A scoped identity appends its complete link identity after the
+// addresses, so unscoped cookies keep their exact bytes.
+fn address_mac(
+    secret: &[u8; 32],
+    local: IpAddr,
+    remote: IpAddr,
+    zone: Option<LinkId>,
+) -> Hmac<Sha256> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
     mac.update(b"ntcp fast open cookie\0");
     for address in [local, remote] {
@@ -842,31 +957,54 @@ fn address_mac(secret: &[u8; 32], local: IpAddr, remote: IpAddr) -> Hmac<Sha256>
             }
         }
     }
+    if let Some(zone) = zone {
+        mac.update(b"zone");
+        mac.update(&zone.to_bytes());
+    }
     mac
 }
 
-fn mac(secret: &[u8; 32], local: IpAddr, remote: IpAddr, epoch: u64) -> Hmac<Sha256> {
-    let mut mac = address_mac(secret, local, remote);
+fn mac(
+    secret: &[u8; 32],
+    local: IpAddr,
+    remote: IpAddr,
+    zone: Option<LinkId>,
+    epoch: u64,
+) -> Hmac<Sha256> {
+    let mut mac = address_mac(secret, local, remote, zone);
     mac.update(&epoch.to_be_bytes());
     mac
 }
 
+#[cfg(test)]
 pub(crate) fn issue(
     secret: &[u8; 32],
     local: IpAddr,
     remote: IpAddr,
     epoch: u64,
 ) -> FastOpenCookie {
-    FastOpenCookie::new(&mac(secret, local, remote, epoch).finalize().into_bytes()[..8]).unwrap()
+    issue_in(secret, local, remote, None, epoch)
+}
+
+pub(crate) fn issue_in(
+    secret: &[u8; 32],
+    local: IpAddr,
+    remote: IpAddr,
+    zone: Option<LinkId>,
+    epoch: u64,
+) -> FastOpenCookie {
+    FastOpenCookie::new(&mac(secret, local, remote, zone, epoch).finalize().into_bytes()[..8])
+        .unwrap()
 }
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
 //= reason=Release measurements now exist in integration/rfc_host/check_mac_cost.py and the ignored release_mac_cost core test: both policies, IPv4/IPv6, small/64-listener tables, allocating/pooled receive storage, current/previous epochs, current/retiring keys, request/invalid/expired/revoked/length controls, actual admission/issuance multiplicities and encoded committed SYN-ACKs. Raw rounds, source/executable/toolchain provenance, clock/recorder controls and signed disabled/enabled perturbation are retained. Measured repeated HMAC key/address setup justified sharing the prefix within each two-epoch verification without persistent state; cookie bytes and both comparisons are preserved. On the measured Xeon 6230R, pooled small-listener overlap/refresh admission was approximately 6.14/7.99 microseconds for IPv4/IPv6 versus 12.35/13.12 microseconds outside the observed scopes; Linux admission was approximately 0.12-0.26 microseconds. HMAC overlap remains substantial, raw codec drift and paired observer variation limit precise speedup inference, and no arbitrary compliance percentage is asserted. Keep the complete fast-relative property TODO pending independent quantitative review/T23 disposition; any further per-credential preparation experiment must preserve resource accounting and use these same real-path boundaries.
 //# 3. The generation and verification are fast relative to the rest of SYN and SYN-ACK processing.
-pub(crate) fn valid(
+pub(crate) fn valid_in(
     secret: &[u8; 32],
     local: IpAddr,
     remote: IpAddr,
+    zone: Option<LinkId>,
     epoch: u64,
     cookie: FastOpenCookie,
 ) -> bool {
@@ -877,7 +1015,7 @@ pub(crate) fn valid(
     // once per verification to avoid repeated key setup and serialization on
     // every SYN. Only bounded stack state is cloned; no credential/cache state
     // or allocation is added, and each epoch retains a complete MAC comparison.
-    let base = address_mac(secret, local, remote);
+    let base = address_mac(secret, local, remote, zone);
     let mut current_mac = base.clone();
     current_mac.update(&epoch.to_be_bytes());
     let mut previous_mac = base;
@@ -888,6 +1026,17 @@ pub(crate) fn valid(
         .verify_truncated_left(cookie.as_bytes())
         .is_ok();
     current | previous
+}
+
+#[cfg(test)]
+pub(crate) fn valid(
+    secret: &[u8; 32],
+    local: IpAddr,
+    remote: IpAddr,
+    epoch: u64,
+    cookie: FastOpenCookie,
+) -> bool {
+    valid_in(secret, local, remote, None, epoch, cookie)
 }
 
 #[cfg(test)]
@@ -911,22 +1060,22 @@ mod tests {
             let cookie = FastOpenCookie::new(&[0; 4]).unwrap();
             let replacement = FastOpenCookie::new(&[2; 16]).unwrap();
             let mut cache = FastOpen::new().unwrap();
-            cache.update_mss(9, local, remote, 940);
-            assert_eq!(cache.peer_mss(9, 100, local, remote), Some(940));
+            cache.update_mss(9, local, remote, None, 940);
+            assert_eq!(cache.peer_mss(9, 100, local, remote, None), Some(940));
             assert!(cache.get(9, 100, local, remote).is_none());
             cache.learn(10, local, remote, cookie, Some(1460));
             cache.learn(10, other, remote, cookie, Some(1220));
             cache.learn(10, local, other, cookie, Some(536));
-            cache.update_mss(109, local, remote, 940);
+            cache.update_mss(109, local, remote, None, 940);
             let entry = cache.get(109, 100, local, remote).unwrap();
             assert_eq!(entry.mss, Some(940));
             assert_eq!(entry.cookie, cookie);
             assert!(cache.get(110, 100, local, remote).is_none());
-            assert_eq!(cache.peer_mss(110, 100, local, remote), Some(940));
+            assert_eq!(cache.peer_mss(110, 100, local, remote, None), Some(940));
             // Later observations update MSS while the credential stays expired.
-            cache.update_mss(111, local, remote, 1000);
+            cache.update_mss(111, local, remote, None, 1000);
             assert!(cache.get(111, 100, local, remote).is_none());
-            assert_eq!(cache.peer_mss(111, 100, local, remote), Some(1000));
+            assert_eq!(cache.peer_mss(111, 100, local, remote, None), Some(1000));
             assert_eq!(cache.get(109, 100, other, remote).unwrap().mss, Some(1220));
             assert_eq!(cache.get(109, 100, local, other).unwrap().mss, Some(536));
             assert_eq!(cache.next, 0);
@@ -937,17 +1086,17 @@ mod tests {
                 replacement
             );
             assert!(cache.get(212, 100, local, remote).is_none());
-            assert_eq!(cache.peer_mss(212, 100, local, remote), None);
+            assert_eq!(cache.peer_mss(212, 100, local, remote, None), None);
             // Older observations and empty wire options cannot install a key.
-            cache.update_mss(1, local, remote, 400);
+            cache.update_mss(1, local, remote, None, 400);
             assert!(cache.get(212, 100, local, remote).is_none());
             cache.learn(213, local, remote, FastOpenCookie::request(), Some(1000));
             assert!(cache.get(213, 100, local, remote).is_none());
             let mut cache = FastOpen::new().unwrap();
             cache.learn(u64::MAX - 10, local, remote, cookie, Some(1460));
-            cache.update_mss(u64::MAX, local, remote, 940);
+            cache.update_mss(u64::MAX, local, remote, None, 940);
             assert!(cache.get(u64::MAX, 10, local, remote).is_none());
-            assert_eq!(cache.peer_mss(u64::MAX, 10, local, remote), Some(940));
+            assert_eq!(cache.peer_mss(u64::MAX, 10, local, remote, None), Some(940));
         }
     }
 
@@ -961,8 +1110,8 @@ mod tests {
         cache.learn(1, local, remote, cookie, None);
         assert_eq!(cache.get(1, 100, local, remote).unwrap().cookie, cookie);
         assert_eq!(cache.get(1, 100, local, remote).unwrap().mss, None);
-        assert_eq!(cache.peer_mss(1, 100, local, remote), None);
-        cache.update_mss(2, local, remote, 940);
+        assert_eq!(cache.peer_mss(1, 100, local, remote, None), None);
+        cache.update_mss(2, local, remote, None, 940);
         cache.learn(101, local, remote, replacement, None);
         assert_eq!(cache.get(101, 100, local, remote).unwrap().mss, Some(940));
         // A newly learned cookie remains useful after the old MSS expires,
@@ -970,11 +1119,11 @@ mod tests {
         let entry = cache.get(102, 100, local, remote).unwrap();
         assert_eq!(entry.cookie, replacement);
         assert_eq!(entry.mss, None);
-        assert_eq!(cache.peer_mss(102, 100, local, remote), None);
-        cache.update_mss(103, local, remote, 1000);
+        assert_eq!(cache.peer_mss(102, 100, local, remote, None), None);
+        cache.update_mss(103, local, remote, None, 1000);
         assert_eq!(cache.get(200, 100, local, remote).unwrap().mss, Some(1000));
         assert!(cache.get(201, 100, local, remote).is_none());
-        assert_eq!(cache.peer_mss(201, 100, local, remote), Some(1000));
+        assert_eq!(cache.peer_mss(201, 100, local, remote, None), Some(1000));
     }
 
     #[test]
@@ -1087,32 +1236,32 @@ mod negative_tests {
             let mut cache = FastOpen::new().unwrap();
             let cookie = FastOpenCookie::new(&[1; 8]).unwrap();
             cache.learn(1, local, remote.ip(), cookie, Some(536));
-            cache.fail(10, local, remote);
+            cache.fail(10, local, remote, None);
             for now in [9, 10, 10 + lifetime - 1, 10 + lifetime] {
                 assert_eq!(
-                    cache.suppressed(now, lifetime, local, remote),
+                    cache.suppressed(now, lifetime, local, remote, None),
                     (10..10 + lifetime).contains(&now)
                 );
             }
-            assert!(!cache.suppressed(10, lifetime, other, remote));
-            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(other, 80)));
-            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(remote.ip(), 81)));
+            assert!(!cache.suppressed(10, lifetime, other, remote, None));
+            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(other, 80), None));
+            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(remote.ip(), 81), None));
             assert_eq!(cache.entries[0].credential.unwrap().1, 1);
             assert_eq!(cache.entries[0].mss, Some((536, 1)));
             cache.learn(11, local, remote.ip(), cookie, Some(940));
-            assert!(cache.suppressed(11, lifetime, local, remote));
-            cache.fail(20, local, remote);
+            assert!(cache.suppressed(11, lifetime, local, remote, None));
+            cache.fail(20, local, remote, None);
             assert_eq!(cache.negative.len(), 1);
-            assert!(cache.suppressed(10 + lifetime, lifetime, local, remote));
-            assert!(!cache.suppressed(20 + lifetime, lifetime, local, remote));
+            assert!(cache.suppressed(10 + lifetime, lifetime, local, remote, None));
+            assert!(!cache.suppressed(20 + lifetime, lifetime, local, remote, None));
             crate::allocation_tests::fail_after(0, || {
                 for port in 81..=145 {
-                    cache.fail(20, local, SocketAddr::new(remote.ip(), port));
+                    cache.fail(20, local, SocketAddr::new(remote.ip(), port), None);
                 }
             });
             assert_eq!(cache.negative.len(), CAPACITY);
             assert_eq!(cache.negative.capacity(), CAPACITY);
-            assert!(!cache.suppressed(20, lifetime, local, remote));
+            assert!(!cache.suppressed(20, lifetime, local, remote, None));
             assert_eq!(cache.entries[0].credential.unwrap().1, 11);
             assert_eq!(cache.entries[0].mss, Some((940, 11)));
         }
@@ -1131,7 +1280,7 @@ mod cache_management_tests {
         for n in 1..=65 {
             let remote = IpAddr::from([198, 51, 100, n]);
             cache.learn(0, local, remote, cookie, Some(536));
-            cache.fail(0, local, SocketAddr::new(remote, 80));
+            cache.fail(0, local, SocketAddr::new(remote, 80), None);
         }
         let capacities = (cache.entries.capacity(), cache.negative.capacity());
         assert_eq!((cache.next, cache.negative_next), (1, 1));
@@ -1146,9 +1295,9 @@ mod cache_management_tests {
             );
             let remote = IpAddr::from([203, 0, 113, 1]);
             cache.learn(10, local, remote, cookie, Some(940));
-            cache.fail(10, local, SocketAddr::new(remote, 80));
+            cache.fail(10, local, SocketAddr::new(remote, 80), None);
             assert_eq!(cache.get(10, 100, local, remote).unwrap().mss, Some(940));
-            assert!(cache.suppressed(10, 100, local, SocketAddr::new(remote, 80)));
+            assert!(cache.suppressed(10, 100, local, SocketAddr::new(remote, 80), None));
             assert!(
                 cache
                     .get(10, 100, local, IpAddr::from([198, 51, 100, 65]))

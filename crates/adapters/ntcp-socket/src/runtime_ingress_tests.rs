@@ -517,7 +517,7 @@ fn native_icmp_output_over_a_segment_route_carries_the_srh() {
         crate::EthernetPacketIo {
             io: Box::new(Fixture(wire.clone())),
             local_mac: [2; 6],
-            next_hop_mac: [4; 6],
+            next_hop_mac: Some([4; 6]),
         },
     )
     .unwrap();
