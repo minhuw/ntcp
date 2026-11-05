@@ -109,8 +109,8 @@ impl From<ManagedError<Error>> for Error {
 /// Actual codec/input-buffer capabilities of one link: `max_ip_packet` bounds
 /// each physical packet, fragments included. Reassembly is configured per
 /// Host (`Limits::reassembly`) and states its own reconstructed capacity
-/// (`Host::reassembly_capacity`). Neither profile supplies IPv6 extension
-/// traversal beyond the Fragment header or a standard clock.
+/// (`Host::reassembly_capacity`). IPv6 extension header traversal is the
+/// `Ipv6Receive::Extensions` profile; no profile supplies a standard clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiveCapabilities {
     pub max_ip_packet: usize,
@@ -156,10 +156,26 @@ impl Ipv4Receive {
         )
     }
 }
+/// IPv6 receive profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ipv6Receive {
     Disabled,
+    /// The upper layer directly after the base header, or after a Fragment
+    /// header directly after it; any other extension header is refused
+    /// without receive processing or errors.
     BaseHeader,
+    /// Extension headers in their actual order (RFC 8200 section 4): the
+    /// headers before any Fragment header are processed on every arriving
+    /// packet and the rest after reassembly, which keeps fragment zero's
+    /// complete unfragmentable part. Unrecognized options apply their
+    /// action; a Routing header of any type is skipped with Segments Left
+    /// zero and refused above zero, since no local address is a segment
+    /// endpoint; Hop-by-Hop Options only directly after the base header; an
+    /// unrecognized Next Header (anything but TCP, UDP, ICMPv6 and No Next
+    /// Header ends the chain) is refused. Refusals draw the RFC 4443
+    /// Parameter Problem through the Host's ICMP output and error limiter.
+    /// Jumbograms stay unsupported.
+    Extensions,
 }
 
 /// A backend explicitly assigns its forwarding contract at registration.
@@ -553,6 +569,13 @@ pub struct Host {
     attached: bool,
 }
 
+/// The IP header plan of output on one path (`Host::header_plan`).
+#[derive(Clone, Copy, Debug)]
+pub struct HeaderPlan<'a> {
+    pub segments: &'a [core::net::Ipv6Addr],
+    pub len: usize,
+}
+
 fn table<T: Clone>(count: usize, value: T) -> Result<Vec<T>, Error> {
     count
         .checked_mul(core::mem::size_of::<T>())
@@ -640,6 +663,14 @@ impl Host {
     }
     pub fn add_route(&mut self, route: path::Route) -> Result<path::RouteId, Error> {
         Ok(self.paths.add_route(route)?)
+    }
+    /// An owner-configured Segment Routing route (`PathService::add_segment_route`).
+    pub fn add_segment_route(
+        &mut self,
+        route: path::Route,
+        segments: &[core::net::Ipv6Addr],
+    ) -> Result<path::RouteId, Error> {
+        Ok(self.paths.add_segment_route(route, segments)?)
     }
     pub fn replace_route(
         &mut self,
@@ -956,8 +987,7 @@ impl Host {
         let mut snapshot = self.paths.snapshot(binding.prepared.client)?;
         // A validated peer return-route update need not invalidate the old
         // routing entry, so compare the actual outgoing selection as well.
-        if snapshot.status() != PathStatus::Valid || snapshot.key().forwarding_destination() != via
-        {
+        if snapshot.status() != PathStatus::Valid || !self.forwards_via(snapshot.key(), via) {
             let request = self.request(
                 snapshot.key().source_address().address(),
                 snapshot.key().destination().address(),
@@ -980,6 +1010,10 @@ impl Host {
             client: binding.prepared.client,
             snapshot,
         };
+        // The connection's complete headers (an SR route's Segment Routing
+        // Header included) must still fit the path: a header that no longer
+        // does fails admission rather than being cut.
+        endpoint.validate_path_budget(owner, prepared)?;
         endpoint.apply_path_budget(owner, prepared)?;
         self.bindings[index].as_mut().unwrap().prepared = prepared;
         self.paths.acknowledge(prepared.client, snapshot.stamp())?;
@@ -1392,6 +1426,26 @@ impl Host {
             }
             6 if capabilities.ipv6 == Ipv6Receive::BaseHeader => {
                 let packet = ntcp_ip6::parse(frame)?;
+                // This profile has no extension header receive processing.
+                if !packet.base_layout() {
+                    return Err(ntcp_ip::Error::ExtensionsUnsupported.into());
+                }
+                IngressPacket {
+                    ip: packet.ip,
+                    traffic_class: packet.traffic_class,
+                    protocol: packet.protocol,
+                    options: Ipv4Options::default(),
+                    payload: packet.payload,
+                }
+            }
+            // The chain's receive processing again, without errors: a
+            // datagram from `receive` passes it unchanged, and anything else
+            // is refused here as it would have been there.
+            6 if capabilities.ipv6 == Ipv6Receive::Extensions => {
+                let packet = ntcp_ip6::parse(frame)?;
+                if !ingress::processed_upper_layer(packet.protocol) {
+                    return Err(ntcp_ip::Error::ExtensionsUnsupported.into());
+                }
                 IngressPacket {
                     ip: packet.ip,
                     traffic_class: packet.traffic_class,
@@ -1585,7 +1639,7 @@ impl Host {
         let key = QuoteKey {
             source: quote.ip.source,
             destination: quote.ip.destination,
-            header_len: quote.ip_header_len,
+            header_len: u32::from(quote.ip_header_len),
             packet_len: quote.ip_packet_len,
             protocol: quote.protocol,
             transport: match (quote.fragment, quote.transport) {
@@ -1663,8 +1717,8 @@ impl Host {
             && candidate.is_none()
             && let Some(packet_len) = key
                 .packet_len
-                .checked_sub(u32::from(key.header_len))
-                .filter(|len| *len >= u32::from(key.header_len) + 20)
+                .checked_sub(key.header_len)
+                .filter(|len| *len >= key.header_len + 20)
         {
             let corrected = self.ledger.correlate(now, &QuoteKey { packet_len, ..key });
             if corrected.matches != 0 {
@@ -1680,6 +1734,17 @@ impl Host {
             }
             return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
         };
+        // Before any positive use, the quoted header plan must be the one
+        // the route generation of the matched submissions' path encoded
+        // (`quote_authorized`); a quote altered beyond legitimate segment
+        // advancement matches no submission.
+        if [correlation.path, correlation.owner.map(|r| r.evidence.path)]
+            .into_iter()
+            .flatten()
+            .any(|path| !self.quote_authorized(path, packet.payload))
+        {
+            return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
+        }
         let scoped = matches!(quote.ip.source, IpAddr::V6(v) if v.is_unicast_link_local());
         if scoped
             && correlation
@@ -1786,12 +1851,17 @@ impl Host {
         let Selector::Tcp { start, end, .. } = evidence.transport else {
             return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
         };
+        // A TCP segment's header is far below 65536 octets; a record that
+        // were not is no evidence for its report.
+        let Ok(ip_header_len) = u16::try_from(evidence.header_len) else {
+            return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
+        };
         let report = Correlated {
             segment: CorrelatedSegment {
                 start,
                 end,
                 ip_packet_len: evidence.packet_len,
-                ip_header_len: evidence.header_len,
+                ip_header_len,
             },
             path: correlation.path,
             ipv4,
@@ -1851,7 +1921,7 @@ impl Host {
                 }));
             }
         };
-        let quoted = (quoted_packet_len, segment.ip_header_len);
+        let quoted = (quoted_packet_len, u32::from(segment.ip_header_len));
         // Only a path incarnation that is still valid and still this
         // connection's binding may change any estimate. Older submissions
         // remain drop advice for their outstanding data.
@@ -1943,7 +2013,7 @@ impl Host {
         now: Instant,
         path: path::PathId,
         ipv4: bool,
-        quoted: (u32, u16),
+        quoted: (u32, u32),
         dropped: u32,
         candidate: Option<u32>,
         derived: Option<u32>,
@@ -1965,7 +2035,7 @@ impl Host {
         &self,
         path: path::PathId,
         ipv4: bool,
-        (quoted_len, header_len): (u32, u16),
+        (quoted_len, header_len): (u32, u32),
         dropped: u32,
         candidate: Option<u32>,
     ) -> Option<u32> {
@@ -1980,7 +2050,7 @@ impl Host {
                 .legacy_fallback(
                     snapshot.pmtu_estimate().ok()?,
                     quoted_len,
-                    u32::from(header_len),
+                    header_len,
                     dropped,
                 )
                 .ok(),
@@ -2016,7 +2086,7 @@ impl Host {
             let via = ScopedAddress::new(wire_destination(packet), None)?;
             let prepared = if snapshot.status() != PathStatus::Valid
                 || snapshot.key().request() != request
-                || snapshot.key().forwarding_destination() != via
+                || !self.forwards_via(snapshot.key(), via)
             {
                 // Resolve and check the actual port before changing pins or
                 // client generation. Failure leaves the held lease dirty and
@@ -2061,7 +2131,10 @@ impl Host {
         if packet.dscp != binding.snapshot.key().dscp().value()
             || packet.ip.source != binding.snapshot.key().source_address().address()
             || packet.ip.destination != binding.snapshot.key().destination().address()
-            || wire_destination(packet) != binding.snapshot.key().forwarding_destination().address()
+            || !self.forwards_via(
+                binding.snapshot.key(),
+                ScopedAddress::new(wire_destination(packet), None)?,
+            )
         {
             return Err(Error::Obsolete);
         }
@@ -2186,6 +2259,18 @@ impl Host {
         Ok(())
     }
 
+    // Whether `key` is the path that selection for the forwarding
+    // destination `via` gives: that destination itself, or, when `via` is
+    // the final destination and the route is an SR route, the first segment
+    // S1 the route derives (`PathService::resolve`).
+    fn forwards_via(&self, key: path::PathKey, via: ScopedAddress) -> bool {
+        key.forwarding_destination() == via
+            || (via == key.destination()
+                && self
+                    .header_plan(key)
+                    .is_ok_and(|plan| !plan.segments.is_empty()))
+    }
+
     fn forwarding_resolved(&self, key: path::PathKey) -> Result<(), Error> {
         if key.destination().address().is_ipv6() && self.paths.link(key.link())?.mtu < 1280 {
             return Err(Error::Unsupported);
@@ -2196,6 +2281,56 @@ impl Host {
             (Forwarding::IpNextHop, ResolvedNextHop::Address(_)) => Ok(()),
             _ => Err(Error::Unsupported),
         }
+    }
+
+    /// The IP header plan of output on the path with `key`, read from the
+    /// route generation it selected: the segment list S1..Sn of an SR route
+    /// (empty otherwise) and the complete header length H it implies (the
+    /// base header, plus the Segment Routing Header of n + 1 entries), which
+    /// is the path's `PathSnapshot::ip_header_len`. IPv4 options are the
+    /// caller's. Embeddings place an attempt's TCP segment H octets into its
+    /// frame and encode the header with `ntcp_ip6::encode_tcp_routed`
+    /// (`EgressContext::binding` names the key).
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.1
+    //= reason=Host path budgets subtract the complete IPv6 header H of the selected path, the 40-octet base header plus, on an owner-configured Segment Routing route of n segments, its 8 + 16(n + 1)-octet Segment Routing Header (Host::header_plan, PathSnapshot::ip_header_len), from the largest IP packet that can be sent: TCP takes H before construction and admission for its MSS, T16's segment quantum and send space, PLPMTUD probes, exact-range repair and retransmission in scalar, shared, reserved and software GSO output, and an indivisible header that no longer fits fails admission. Host UDP flows report MMS_S as the path budget less H and limit Refuse and Probe payloads to EMTU_S - H - 8. When source fragmentation is selected (Host::udp_send_datagram's Fragment mode and the Host's Echo Replies, where a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) EMTU_S is the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and the Host creates fragments each limited by the connectionless effective size (never above the PMTU) that repeat the unfragmentable part (base header and Segment Routing Header) before the Fragment header; Refuse and Probe modes and TCP keep EMTU_S at the PMTU (TCP never source-fragments). Host::reassembly_capacity states this Host's own EMTU_R and MMS_R, and every managed TCP factory advertises the MSS Host::receive_ip_capability derives from EMTU_R, the largest IPv6 link and the wire limit independently of the send PMTU (T16, 1191-024). Host segment_routes tests (TCP, UDP Refuse/Probe/Fragment, Echo and ICMP errors with exact chains and checksums over the final destination), the native and tun_echo placement tests and the integration/rfc_host srh cases (TCP progress through a Linux SRv6 endpoint in both embeddings, with a transit router's PTB repaired) verify it.
+    //# MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see "Fragment Header", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.
+    pub fn header_plan(&self, key: path::PathKey) -> Result<HeaderPlan<'_>, Error> {
+        let segments = self.paths.route_segments(key.route())?;
+        let len = if key.destination().address().is_ipv4() {
+            ntcp_ip::IPV4_HEADER
+        } else {
+            ntcp_ip6::header_len(segments)?
+        };
+        Ok(HeaderPlan { segments, len })
+    }
+
+    // Whether the packet quoted by the ICMP error `message` (behind its
+    // 8-octet header) carries the IP header plan that the route generation
+    // of `path`, which authorized the submission, encoded: the retained
+    // route authority of the submission, read from the path's key and the
+    // live route, with no copy kept. A quoted Segment Routing Header must
+    // be the one `ntcp_ip6::encode_routed` emitted for that generation's
+    // segments S1..Sn, directly after the base header (Routing Type 4, Hdr
+    // Ext Len 2(n + 1), Last Entry n, Flags and Tag zero, Segment List[i] =
+    // S(n + 1 - i)); only Segments Left and the base Destination Address
+    // advance in flight (RFC 8754 4.3.1.1), so Segments Left is at most n
+    // and the Destination Address is Segment List[Segments Left]. Segment
+    // List[0] is the final destination the ledger compared. A replaced or
+    // removed route declines every quote carrying a Routing header, and an
+    // ordinary route's output carries none. IPv4 quotes carry no SRH.
+    pub(crate) fn quote_authorized(&self, path: path::PathId, message: &[u8]) -> bool {
+        let Some(quoted) = message.get(8..) else {
+            return false;
+        };
+        if quoted.first().is_some_and(|b| b >> 4 == 4) {
+            return true;
+        }
+        let segments = self
+            .paths
+            .path_snapshot(path)
+            .ok()
+            .and_then(|s| self.paths.route_segments(s.key().route()).ok());
+        planned_routing(segments.unwrap_or(&[]), quoted).is_some()
     }
 
     /// Whether the IP layer must leave DF clear on this attempt's packet
@@ -2252,14 +2387,26 @@ impl Host {
         } else {
             (frame[0] << 4) | (frame[1] >> 4)
         };
-        let expected_header = transmit_header_len(&packet)?;
+        let plan = self.header_plan(live.binding.snapshot.key())?;
+        let expected_header = transmit_header_len(&packet, plan)?;
+        // The base Destination Address: the forwarding destination, which
+        // on an SR route is S1 while `ip` carries the final destination.
         let actual_destination = if packet.ip.source.is_ipv4() {
             IpAddr::V4(core::net::Ipv4Addr::new(
                 frame[16], frame[17], frame[18], frame[19],
             ))
         } else {
-            ip.destination
+            IpAddr::V6(core::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[24..40]).unwrap(),
+            ))
         };
+        // The chain is exactly the path's plan, its Segment Routing Header
+        // unadvanced (Segments Left n).
+        if packet.ip.source.is_ipv6()
+            && planned_routing(plan.segments, frame) != Some(plan.segments.len())
+        {
+            return Err(Error::Obsolete);
+        }
         if actual_destination
             != live
                 .binding
@@ -2327,7 +2474,7 @@ impl Host {
                 source: packet.ip.source,
                 destination: packet.ip.destination,
                 dscp: packet.dscp,
-                header_len: header as u16,
+                header_len: header as u32,
                 packet_len: total as u32,
                 protocol,
                 transport,
@@ -2462,9 +2609,47 @@ fn unfragmentable(frame: &[u8]) -> bool {
     }
 }
 
+// Segments Left of the IPv6 packet whose leading bytes are `quoted` when
+// its header chain is the one `ntcp_ip6::encode_routed` emits for
+// `segments` S1..Sn: no header besides a Fragment header without segments
+// (Some(0)), else exactly a Segment Routing Header directly after the base
+// header (Routing Type 4, Hdr Ext Len 2(n + 1), Last Entry n, Flags and Tag
+// zero, Segment List[i] = S(n + 1 - i)) in which only Segments Left and the
+// base Destination Address may have advanced in flight (RFC 8754 4.3.1.1):
+// Segments Left at most n and the Destination Address Segment List[Segments
+// Left]. Segment List[0] is the final destination, checked by the caller.
+fn planned_routing(segments: &[core::net::Ipv6Addr], quoted: &[u8]) -> Option<usize> {
+    use ntcp_ip_common::ipv6::{Chain, FRAGMENT, ROUTING};
+    let chain = Chain::quote(quoted).ok()?;
+    let mut headers = chain.headers().filter(|h| h.kind != FRAGMENT);
+    let (srh, rest) = match (headers.next(), headers.next()) {
+        (None, _) => return segments.is_empty().then_some(0),
+        (Some(srh), rest) => (srh, rest),
+    };
+    let n = segments.len();
+    let b = quoted.get(srh.offset..srh.offset + srh.len)?;
+    let entry = |i: usize| &b[8 + 16 * i..8 + 16 * (i + 1)];
+    let left = usize::from(b[3]);
+    (n != 0
+        && rest.is_none()
+        && srh.kind == ROUTING
+        && srh.offset == ntcp_ip_common::ipv6::BASE_HEADER
+        && srh.len == 8 + 16 * (n + 1)
+        && b[2] == 4
+        && usize::from(b[4]) == n
+        && b[5..8] == [0; 3]
+        && left <= n
+        && (1..=n).all(|i| entry(i) == segments[n - i].octets())
+        && quoted[24..40] == *entry(left))
+    .then_some(left)
+}
+
 // Complete IP header length of an Endpoint transmission: the IPv4 header
-// with its encoded options, or the base IPv6 header.
-pub(crate) fn transmit_header_len(packet: &ntcp::Transmit) -> Result<usize, Error> {
+// with its encoded options, or the IPv6 header of its path's `plan`.
+pub(crate) fn transmit_header_len(
+    packet: &ntcp::Transmit,
+    plan: HeaderPlan<'_>,
+) -> Result<usize, Error> {
     Ok(
         if let (IpAddr::V4(source), IpAddr::V4(destination)) =
             (packet.ip.source, packet.ip.destination)
@@ -2475,7 +2660,7 @@ pub(crate) fn transmit_header_len(packet: &ntcp::Transmit) -> Result<usize, Erro
                 .map_err(|e| Error::Endpoint(EndpointError::Ipv4Options(e)))?
                 .1
         } else {
-            40
+            plan.len
         },
     )
 }
@@ -2506,7 +2691,7 @@ fn live<T>(result: Result<T, EndpointError>) -> Result<Option<T>, Error> {
     }
 }
 
-fn quoted(key: &QuoteKey) -> (u32, u16) {
+fn quoted(key: &QuoteKey) -> (u32, u32) {
     (key.packet_len, key.header_len)
 }
 
@@ -2620,6 +2805,16 @@ impl PathProvider for Host {
             .release(prepared.client)
             .expect("live provisional client");
         self.bindings[index] = None;
+    }
+    // The header plan of the path `egress_context` would select for this
+    // stateless reply now; a reply without one fails there instead.
+    fn reply_header_len(&mut self, ip: IpMetadata, dscp: u8) -> Option<u16> {
+        let request = self
+            .request(ip.source, ip.destination, Dscp::new(dscp).ok()?)
+            .ok()?;
+        let via = ScopedAddress::new(ip.destination, None).ok()?;
+        let resolved = self.paths.resolve_via(request, via).ok()?;
+        u16::try_from(self.header_plan(resolved.key()).ok()?.len).ok()
     }
 }
 

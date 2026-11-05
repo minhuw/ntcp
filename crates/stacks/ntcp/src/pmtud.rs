@@ -1127,9 +1127,13 @@ impl Pmtud {
         })
     }
 
+    // A header length a valid packet of the family can have: IPv4 20..=60 in
+    // 4-octet words; IPv6 the 40-octet base plus whole 8-octet extension
+    // headers (RFC 8200 4), so a Host-proven SRH submission is judged with
+    // its complete header. The quote must still hold a minimal TCP header.
     fn plausible_quote(&self, size: u32, header: u16) -> bool {
         !((self.ipv4 && (!(20..=60).contains(&header) || !header.is_multiple_of(4)))
-            || (!self.ipv4 && header != 40)
+            || (!self.ipv4 && (header < 40 || !(header - 40).is_multiple_of(8)))
             || size < u32::from(header) + 20)
     }
 
@@ -2025,6 +2029,57 @@ mod tests {
             assert_eq!(advised.info.current_mtu, 1400);
             assert!(control.info.current_mtu < 1400);
         }
+    }
+
+    // A Host-proven IPv6 submission may carry extension headers: its quote
+    // is judged with the complete header, any length an IPv6 packet can have
+    // (the base plus whole 8-octet extensions) that leaves room for a TCP
+    // header. The ring-matched entrypoint still needs the recorded header.
+    #[test]
+    fn correlated_ipv6_quote_is_judged_with_its_complete_header() {
+        let report = |header: u16, quoted: u32| {
+            let mut p = state(false);
+            let report = p.correlated_feedback(
+                1,
+                Seq(1),
+                Seq(1001),
+                1500,
+                header,
+                quoted,
+                1400,
+                true,
+                Some(1500),
+            );
+            (report, p.info.current_mtu)
+        };
+        for header in [48, 96] {
+            assert_eq!(
+                report(header, 1500),
+                (
+                    PmtuReport {
+                        feedback: PmtuFeedback::Decreased { mtu: 1400 },
+                        derived_mtu: Some(1400),
+                    },
+                    1400
+                ),
+                "{header}"
+            );
+            // The smallest quote holding the header and a TCP header.
+            assert_eq!(report(header, u32::from(header) + 20).0.derived_mtu, Some(1400));
+            assert_eq!(
+                report(header, u32::from(header) + 19),
+                (PmtuReport::REJECTED, 1500),
+                "{header}"
+            );
+        }
+        for header in [39, 41, 44] {
+            assert_eq!(report(header, 1500), (PmtuReport::REJECTED, 1500), "{header}");
+        }
+        let mut p = state(false);
+        p.sent(Seq(1), Seq(1001), 1500, 96, false);
+        assert!(!p.feedback(2, Seq(1), 1500, 40, 1400));
+        assert!(p.feedback(2, Seq(1), 1500, 96, 1400));
+        assert_eq!(p.info.current_mtu, 1400);
     }
 
     // A current-path report below proven delivery is deferred whether or not

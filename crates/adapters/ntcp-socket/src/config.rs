@@ -3,7 +3,7 @@ use std::{
     collections::BTreeSet,
     fs::OpenOptions,
     io::{self, Read},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::unix::fs::OpenOptionsExt,
     path::Path,
 };
@@ -39,6 +39,19 @@ pub struct SocketConfig {
     /// `control.allow_uids`), separate from the `route.*` transport
     /// policies: None (the default) serves nothing.
     pub control: Option<ntcp_path_control::ControlConfig>,
+    /// Owner-configured Segment Routing routes (`ipv6.srh.<prefix>=S1,...,Sn`,
+    /// separate from the `route.*` transport policies), installed over the
+    /// configured interface beside its default route. Empty by default:
+    /// output carries no extension header.
+    pub segment_routes: Vec<SegmentRoute>,
+}
+
+/// Final destinations of `destination` are sent through `segments` S1..Sn
+/// (`PathService::add_segment_route`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentRoute {
+    pub destination: ntcp_host::path::IpPrefix,
+    pub segments: Vec<Ipv6Addr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +156,7 @@ impl SocketConfig {
             fast_open_key_lease: None,
             routes: Vec::new(),
             control: None,
+            segment_routes: Vec::new(),
             io: IoConfig {
                 backend: Backend::Tun,
                 interface: interface.into(),
@@ -244,6 +258,17 @@ impl SocketConfig {
                 .validate(&route_defaults, self.io.address.is_ipv4())
                 .map_err(|_| invalid())?;
         }
+        // Distinct IPv6 prefixes: two lists for one prefix are ambiguous.
+        for (i, route) in self.segment_routes.iter().enumerate() {
+            if !self.io.address.is_ipv6()
+                || ntcp_host::path::check_segment_route(route.destination, &route.segments).is_err()
+                || self.segment_routes[..i]
+                    .iter()
+                    .any(|other| other.destination == route.destination)
+            {
+                return Err(invalid());
+            }
+        }
         if let Some(control) = &self.control
             && (!control.socket.is_absolute()
                 || control.allow_uids.len() > ntcp_path_control::server::MAX_ALLOWED_UIDS)
@@ -295,6 +320,17 @@ impl SocketConfig {
             let (key, value) = (key.trim(), value.trim());
             if !seen.insert(key) || value.is_empty() {
                 return Err(invalid());
+            }
+            if let Some(prefix) = key.strip_prefix("ipv6.srh.") {
+                let segments = value
+                    .split(',')
+                    .map(|s| s.trim().parse::<Ipv6Addr>().map_err(|_| invalid()))
+                    .collect::<io::Result<Vec<_>>>()?;
+                config.segment_routes.push(SegmentRoute {
+                    destination: prefix.parse().map_err(|_| invalid())?,
+                    segments,
+                });
+                continue;
             }
             if let Some(route) = key.strip_prefix("route.") {
                 let (address, field) = route.rsplit_once('.').ok_or_else(invalid)?;

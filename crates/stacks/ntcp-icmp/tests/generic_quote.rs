@@ -297,12 +297,21 @@ fn inner_header_and_extension_rules_apply_to_every_protocol() {
                     decode_icmp(&ptb(true, &bad)).unwrap_err(),
                     Error::FragmentationUnsupported
                 );
-                for next in [0, 43, 50, 51, 60, 135, 139, 140] {
+                // The UDP ports read as an extension header longer than the
+                // declared packet; unsupported selectors end the chain and
+                // carry no transport semantics.
+                for next in [0, 43, 60] {
                     bad[6] = next;
                     assert_eq!(
                         decode_icmp_quote(&ptb(true, &bad)).unwrap_err(),
-                        Error::ExtensionsUnsupported
+                        Error::Length
                     );
+                }
+                for next in [50, 51, 135, 139, 140] {
+                    bad[6] = next;
+                    let quoted = decode_icmp_quote(&ptb(true, &bad)).unwrap().quoted;
+                    assert_eq!((quoted.protocol, quoted.ip_header_len), (next, 40));
+                    assert_eq!(quoted.transport, QuotedTransport::Other);
                 }
             } else {
                 let mut bad = base.clone();

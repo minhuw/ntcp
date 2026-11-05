@@ -14,8 +14,9 @@ pub struct Ethernet<'a> {
 fn ethernet_payload(ether_type: u16, payload: &[u8]) -> Result<usize, Error> {
     ip_payload(ether_type, payload, false)
 }
-// The IP packet's length; `fragments` also delimits IPv4 fragments and IPv6
-// packets carrying a Fragment header.
+// The IP packet's length; `fragments` also delimits IPv4 fragments and any
+// physically complete IPv6 packet, whose extension headers (a Fragment
+// header included) the receiving host processes.
 fn ip_payload(ether_type: u16, payload: &[u8], fragments: bool) -> Result<usize, Error> {
     let _ = (payload, fragments);
     match ether_type {
@@ -36,7 +37,10 @@ pub fn parse_ethernet(bytes: &[u8]) -> Result<Ethernet<'_>, Error> {
     frame(bytes, false)
 }
 /// `parse_ethernet` for a host that reassembles: the IP packet may also be
-/// a fragment, which the IP layer validates and reassembles.
+/// a fragment, which the IP layer validates and reassembles. IPv6 packets
+/// are framed by their base header alone, so extension headers that carry
+/// policy or length faults reach the host's receive processing and its
+/// errors; only physical truncation is refused here.
 pub fn parse_ethernet_fragment(bytes: &[u8]) -> Result<Ethernet<'_>, Error> {
     frame(bytes, true)
 }

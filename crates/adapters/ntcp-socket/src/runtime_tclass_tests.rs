@@ -474,7 +474,7 @@ fn ipv6_tclass_failed_transactions_keep_exact_sticky_and_wire_policy() {
     assert_eq!(tx.dscp, 43 >> 2);
     let mut packet = vec![0; 40 + tx.len];
     packet[40..].copy_from_slice(&bytes[..tx.len]);
-    crate::ip::encode(&mut packet, tx, 0, tx.len).unwrap();
+    crate::ip::encode(&mut packet, tx, &[], 0, tx.len).unwrap();
     let attempt = attempt.unwrap();
     assert_eq!(
         a.execute(client, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, 171))

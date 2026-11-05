@@ -784,9 +784,9 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
                 actions += usize::from(check(&model, c, &[q], now));
                 quotes += 1;
                 // RFC 1191's legacy reading of the same quote.
-                if q.packet_len >= 2 * u32::from(q.header_len) + 20 && rng.below(3) == 0 {
+                if q.packet_len >= 2 * q.header_len + 20 && rng.below(3) == 0 {
                     let shorter = QuoteKey {
-                        packet_len: q.packet_len - u32::from(q.header_len),
+                        packet_len: q.packet_len - q.header_len,
                         ..q
                     };
                     let other = ledger.correlate(now, &shorter);
@@ -862,7 +862,7 @@ fn quoted_key(frame: &[u8]) -> QuoteKey {
     QuoteKey {
         source,
         destination,
-        header_len: h as u16,
+        header_len: h as u32,
         packet_len,
         protocol,
         transport: QuotedSelector::Udp {
@@ -1045,9 +1045,9 @@ fn randomized_host_dispatch_never_acts_beyond_the_reference_model() {
                     };
                     // RFC 1191's legacy reading of a zero-MTU IPv4 report.
                     let zero = !v6 && report[20] == 3 && report[20 + 6..20 + 8] == [0, 0];
-                    if zero && key.packet_len >= 2 * u32::from(key.header_len) + 20 {
+                    if zero && key.packet_len >= 2 * key.header_len + 20 {
                         readings.push(QuoteKey {
-                            packet_len: key.packet_len - u32::from(key.header_len),
+                            packet_len: key.packet_len - key.header_len,
                             ..key
                         });
                     }

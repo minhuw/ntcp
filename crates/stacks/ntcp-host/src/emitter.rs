@@ -10,12 +10,14 @@
 //! DF clear on every packet whatever the upper layer requests (RFC 1191
 //! section 6.6, the user's recorded disposition for administratively
 //! flagged routes), source fragments and whole datagrams alike, each whole
-//! DF-clear datagram with its own leased Identification. IPv6 fragments
-//! use base header -> Fragment header -> upper layer only (RFC 8200 section
-//! 4.5), so source and final destination are the header addresses and the
-//! upper-layer checksum, computed once over the complete datagram, stays
-//! valid. IPv6 atomic fragments are never originated (RFC 8021): a datagram
-//! that fits is sent unfragmented. TCP never enters this emitter.
+//! DF-clear datagram with its own leased Identification. Every IPv6
+//! fragment repeats the unfragmentable part, the base header and on an SR
+//! route its Segment Routing Header, before the Fragment header and the
+//! fragment data (RFC 8200 section 4.5); fragment zero carries the complete
+//! upper-layer header. The upper-layer checksum, computed once over the
+//! complete datagram with the final destination, stays valid. IPv6 atomic
+//! fragments are never originated (RFC 8021): a datagram that fits is sent
+//! unfragmented. TCP never enters this emitter.
 //!
 //! The transaction reserves every local resource before the first fragment
 //! (the identifier lease and one independently sealable ledger ticket per
@@ -26,7 +28,7 @@
 //! prefix is never reported as unsent, and a whole retry is a new datagram
 //! with a new identifier.
 
-use core::net::IpAddr;
+use core::net::{IpAddr, Ipv6Addr};
 
 use ntcp::{EncodedIpv4Options, Instant, IpMetadata};
 use ntcp_path::{PathSnapshot, PathStatus};
@@ -71,7 +73,7 @@ pub struct DatagramLimits {
 /// client's budget. Fragment size = min(shared ordinary budget, max(initial,
 /// the adjunct's confirmed lower bound for the path)).
 //= https://www.rfc-editor.org/rfc/rfc4821#section-10.3
-//= reason=The Host has a separate Host-wide control for the connectionless initial eff_pmtu, DatagramLimits::connectionless (ConnectionlessSizing, crates/stacks/ntcp-host/src/emitter.rs), distinct from TCP's PLPMTUD configuration: by default RFC 4821 section 7.2's suggested 1024 octets for IPv4 and the 1280-octet IPv6 minimum link MTU, validated when the Host is created. Until the Echo adjunct confirms a larger size, Host UDP Fragment mode and Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound) cut fragments to min(shared ordinary budget, initial value), even below a 1500 first hop, and the initial value is never written into shared state or lowers another client's budget. Host tests assert the 1024/1280 effective size and fragments within it under a 1500 budget; the integration/rfc_host fragment case captures 1020-octet IPv4 and 1280-octet IPv6 reply fragments before any probe.
+//= reason=The Host has a separate Host-wide control for the connectionless initial eff_pmtu, DatagramLimits::connectionless (ConnectionlessSizing, crates/stacks/ntcp-host/src/emitter.rs), distinct from TCP's PLPMTUD configuration: by default RFC 4821 section 7.2's suggested 1024 octets for IPv4 and the 1280-octet IPv6 minimum link MTU, validated when the Host is created. Until the Echo adjunct confirms a larger size, Host UDP Fragment mode and Echo Replies (a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) cut fragments to min(shared ordinary budget, initial value), even below a 1500 first hop, and the initial value is never written into shared state or lowers another client's budget. Host tests assert the 1024/1280 effective size and fragments within it under a 1500 budget; the integration/rfc_host fragment case captures 1020-octet IPv4 and 1280-octet IPv6 reply fragments before any probe.
 //# Since connectionless protocols might not keep enough state to effectively diagnose MTU black holes, it would be more robust to err on the side of using too small of an initial MTU (e.g., 1 kByte or less) prior to probing a path to measure the MTU. For this reason, implementations that use IP fragmentation SHOULD use an initial eff_pmtu, which is selected as described in Section 7.2, except using a separate global control for the default initial eff_mtu for connectionless protocols.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionlessSizing {
@@ -204,7 +206,7 @@ impl UdpDatagramLimits {
         if self.fragments(payload_len) {
             self.effective_size as usize + transport
         } else {
-            header_len(self.path.destination.is_ipv4()) + transport
+            self.path.header_len + transport
         }
     }
 }
@@ -311,10 +313,6 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    // The complete datagram's header length, options included.
-    fn header_len(&self) -> usize {
-        header_len(self.ip.source.is_ipv4()) + self.options.map_or(0, |o| o.as_bytes().len())
-    }
     // A source route takes the datagram off the direct path the Echo
     // adjunct probes.
     fn source_routed(&self) -> bool {
@@ -323,11 +321,12 @@ impl Plan {
     }
 }
 
-enum Cutter {
+enum Cutter<'a> {
     V4(ntcp_ip::Fragmenter),
-    V6(ntcp_ip6::Fragmenter),
+    // Every fragment repeats the base header and any Segment Routing Header.
+    V6(ntcp_ip6::Fragmenter<'a>),
 }
-impl Cutter {
+impl Cutter<'_> {
     fn len(&self, offset: usize, limit: usize) -> Result<usize, Error> {
         Ok(match self {
             Self::V4(f) => f.fragment_len(offset, limit)?,
@@ -337,7 +336,7 @@ impl Cutter {
     fn header(&self, offset: usize) -> usize {
         match self {
             Self::V4(f) => f.header_len(offset),
-            Self::V6(_) => ntcp_ip6::IPV6_HEADER + ntcp_ip6::FRAGMENT_HEADER,
+            Self::V6(f) => f.header_len(),
         }
     }
     fn encode(&self, packet: &mut [u8], offset: usize, data: &[u8]) -> Result<usize, Error> {
@@ -346,6 +345,56 @@ impl Cutter {
             Self::V6(f) => f.encode(packet, offset, data)?,
         })
     }
+}
+
+// The fragmenter of one datagram: IPv4 with its options, or IPv6 with the
+// Segment Routing Header of `segments` (none: the base header alone).
+#[allow(clippy::too_many_arguments)]
+fn cutter<'a>(
+    ip: IpMetadata,
+    options: Option<&EncodedIpv4Options>,
+    segments: &'a [Ipv6Addr],
+    protocol: u8,
+    dscp: u8,
+    hop_limit: u8,
+    identification: u32,
+    data_len: usize,
+) -> Result<Cutter<'a>, Error> {
+    Ok(if ip.source.is_ipv4() {
+        let header = ntcp_ip::Header {
+            ip,
+            hop_limit,
+            dscp,
+            ecn: 0,
+            ipv4_options: Default::default(),
+        };
+        let identification = identification as u16;
+        Cutter::V4(match options {
+            Some(options) => ntcp_ip::Fragmenter::with_options(
+                header,
+                options,
+                protocol,
+                identification,
+                data_len,
+            )?,
+            None => ntcp_ip::Fragmenter::new(header, protocol, identification, data_len, 0)?,
+        })
+    } else if options.is_some() {
+        return Err(Error::Unsupported);
+    } else {
+        Cutter::V6(ntcp_ip6::Fragmenter::routed(
+            ntcp_ip6::Header {
+                ip,
+                hop_limit,
+                dscp,
+                ecn: 0,
+            },
+            segments,
+            protocol,
+            identification,
+            data_len,
+        )?)
+    })
 }
 
 /// One planned fragment as recorded in the ledger.
@@ -391,65 +440,40 @@ impl Host {
     }
 
     /// The number of fragments a datagram of `data_len` transport octets
-    /// between `ip`'s addresses with `options`, cut to `size`, needs;
-    /// Capacity beyond `max_fragments`.
+    /// between `ip`'s addresses with `options`, or over an SR route of
+    /// `segments`, cut to `size`, needs; Capacity beyond `max_fragments`.
     pub(crate) fn fragment_count(
         &self,
         ip: IpMetadata,
         options: Option<&EncodedIpv4Options>,
+        segments: &[Ipv6Addr],
         data_len: usize,
         size: usize,
     ) -> Result<usize, Error> {
-        let cutter = self.cutter(ip.source.is_ipv4(), ip, options, 17, 0, 1, 0, data_len)?;
+        let cutter = cutter(ip, options, segments, 17, 0, 1, 0, data_len)?;
         self.plan_pieces(&cutter, data_len, size, |_, _| ())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn cutter(
-        &self,
-        ipv4: bool,
-        ip: IpMetadata,
-        options: Option<&EncodedIpv4Options>,
-        protocol: u8,
-        dscp: u8,
-        hop_limit: u8,
-        identification: u32,
-        data_len: usize,
-    ) -> Result<Cutter, Error> {
-        Ok(if ipv4 {
-            let header = ntcp_ip::Header {
-                ip,
-                hop_limit,
-                dscp,
-                ecn: 0,
-                ipv4_options: Default::default(),
-            };
-            let identification = identification as u16;
-            Cutter::V4(match options {
-                Some(options) => ntcp_ip::Fragmenter::with_options(
-                    header,
-                    options,
-                    protocol,
-                    identification,
-                    data_len,
-                )?,
-                None => ntcp_ip::Fragmenter::new(header, protocol, identification, data_len, 0)?,
-            })
-        } else if options.is_some() {
-            return Err(Error::Unsupported);
-        } else {
-            Cutter::V6(ntcp_ip6::Fragmenter::new(
-                ntcp_ip6::Header {
-                    ip,
-                    hop_limit,
-                    dscp,
-                    ecn: 0,
-                },
-                protocol,
-                identification,
-                data_len,
-            )?)
-        })
+    // The complete header length of `plan`'s datagram (options included)
+    // and the segment list its route generation encodes.
+    fn plan_header(&self, plan: &Plan) -> Result<(usize, &[Ipv6Addr]), Error> {
+        let header = self.header_plan(plan.snapshot.key())?;
+        let options = plan.options.map_or(0, |o| o.as_bytes().len());
+        Ok((header.len + options, header.segments))
+    }
+
+    // `plan`'s fragmenter under its route generation's header plan.
+    fn plan_cutter(&self, plan: &Plan, identification: u32) -> Result<Cutter<'_>, Error> {
+        cutter(
+            plan.ip,
+            plan.options.as_ref(),
+            self.plan_header(plan)?.1,
+            plan.protocol,
+            plan.dscp,
+            plan.hop_limit,
+            identification,
+            plan.data_len,
+        )
     }
 
     // The path authority each fragment is revalidated against: the same
@@ -472,7 +496,7 @@ impl Host {
     /// built in `packet[..size]`. `evidence` yields each piece's record, or
     /// None for messages the ledger does not track (Host ICMP output).
     //= https://www.rfc-editor.org/rfc/rfc4821#section-4
-    //= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
+    //= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (every fragment repeats the unfragmentable part, the base header and on an owner-configured Segment Routing route its Segment Routing Header, before the Fragment header, and the first fragment holds the complete upper-layer header); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
     //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn transmit(
@@ -485,17 +509,20 @@ impl Host {
         endpoint: Option<&ntcp::Endpoint>,
         mut submit: impl FnMut(UdpEgress, &[u8]) -> BackendOutcome,
     ) -> Result<DatagramReport, DatagramError> {
-        let ipv4 = plan.ip.source.is_ipv4();
+        let header = self.plan_header(&plan)?.0;
         let egress = UdpEgress {
             link: plan.snapshot.key().link(),
             next_hop: plan.snapshot.key().next_hop(),
         };
         let Some(size) = plan.fragment_size else {
-            let len = plan.header_len() + plan.data_len;
+            let len = header + plan.data_len;
+            if packet.len() < len {
+                return Err(Error::Capacity.into());
+            }
             let piece = Piece {
                 offset: 0,
                 more: false,
-                header_len: plan.header_len(),
+                header_len: header,
                 packet_len: len,
             };
             let ticket = match (owner, evidence(piece, &packet[..len])) {
@@ -527,7 +554,8 @@ impl Host {
         }
         // Everything fallible precedes the identifier lease: the plan must
         // fit the fragment limit and the buffer before an identifier is spent.
-        let count = self.fragment_count(plan.ip, plan.options.as_ref(), plan.data_len, size)?;
+        let count =
+            self.plan_pieces(&self.plan_cutter(&plan, 0)?, plan.data_len, size, |_, _| ())?;
         if packet.len() < size + plan.data_len {
             return Err(Error::Capacity.into());
         }
@@ -541,16 +569,6 @@ impl Host {
                 self.entropy.as_mut(),
             )
             .map_err(DatagramError::Backpressure)?;
-        let cutter = self.cutter(
-            ipv4,
-            plan.ip,
-            plan.options.as_ref(),
-            plan.protocol,
-            plan.dscp,
-            plan.hop_limit,
-            identification,
-            plan.data_len,
-        )?;
         let (scratch, data) = packet.split_at_mut(size);
         let data = &data[..plan.data_len];
         // One independently sealable ticket per fragment, all reserved
@@ -565,6 +583,7 @@ impl Host {
                 .try_reserve_exact(count)
                 .map_err(|_| Error::Allocation)?;
             let mut failed = false;
+            let cutter = self.plan_cutter(&plan, identification)?;
             self.plan_pieces(&cutter, plan.data_len, size, |_, piece| {
                 let len = piece.packet_len - piece.header_len;
                 match evidence(piece, &data[piece.offset..piece.offset + len]) {
@@ -589,7 +608,7 @@ impl Host {
         }
         self.now = self.now.max(now);
         let mut report = DatagramReport {
-            ip_len: plan.header_len() + plan.data_len,
+            ip_len: header + plan.data_len,
             fragments: count,
             submitted: 0,
             possibly_submitted: 0,
@@ -600,11 +619,16 @@ impl Host {
         let mut offset = 0;
         let mut index = 0;
         while offset < plan.data_len {
-            let len = cutter.len(offset, size).map_err(DatagramError::Host)?;
-            let outcome = if index != 0 && !self.still_valid(&plan) {
+            let (len, outcome) = if index != 0 && !self.still_valid(&plan) {
                 // Authority changed: nothing more is sent under it.
-                BackendOutcome::NotSubmitted
+                (0, BackendOutcome::NotSubmitted)
             } else {
+                // Cut under the header plan of the route generation the
+                // transaction holds.
+                let cutter = self
+                    .plan_cutter(&plan, identification)
+                    .map_err(DatagramError::Host)?;
+                let len = cutter.len(offset, size).map_err(DatagramError::Host)?;
                 let packet_len = cutter
                     .encode(scratch, offset, &data[offset..offset + len])
                     .map_err(DatagramError::Host)?;
@@ -614,7 +638,7 @@ impl Host {
                     // MF, the offset and the datagram's Identification stay.
                     clear_dont_fragment(&mut scratch[..packet_len]);
                 }
-                submit(egress, &scratch[..packet_len])
+                (len, submit(egress, &scratch[..packet_len]))
             };
             let ticket = tickets.get(index).copied();
             match outcome {

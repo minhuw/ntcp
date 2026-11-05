@@ -12,7 +12,7 @@ fn quote(frame: &[u8]) -> QuoteKey {
     QuoteKey {
         source: ip.source,
         destination: ip.destination,
-        header_len: header as u16,
+        header_len: header as u32,
         packet_len: total as u32,
         protocol,
         transport: QuotedSelector::Tcp {
@@ -804,7 +804,7 @@ fn evictions_of_other_owners_never_shadow_a_unique_live_quote() {
             .connect_with_path_provider(0, second_local, remote, options(&cfg, 0), &mut host)
             .unwrap();
         let snapshot = host.binding(c1).unwrap().snapshot;
-        let header: u16 = if v6 { 40 } else { 20 };
+        let header: u32 = if v6 { 40 } else { 20 };
         let segment = |owner, from: SocketAddr, start: u32, end: u32| Evidence {
             link: ingress.link(),
             path: snapshot.path(),
@@ -813,7 +813,7 @@ fn evictions_of_other_owners_never_shadow_a_unique_live_quote() {
             destination: remote.ip(),
             dscp: 0,
             header_len: header,
-            packet_len: u32::from(header) + 20 + end.wrapping_sub(start),
+            packet_len: header + 20 + end.wrapping_sub(start),
             protocol: 6,
             transport: Selector::Tcp {
                 source_port: from.port(),

@@ -1,7 +1,7 @@
 //! Explicit serialized factory and network-budget contracts. The provider is
 //! borrowed for one transaction; it is never stored inside an Endpoint.
 use crate::{
-    ActiveOpenOptions, ConnectionId, EndpointError, Instant, Ipv4RegistrationError,
+    ActiveOpenOptions, ConnectionId, EndpointError, Instant, IpMetadata, Ipv4RegistrationError,
     Ipv4RegistrationPlan, ListenerId, OutgoingIpv4Options, RegisteredOption, Tuple,
 };
 use ntcp_path::{ClientId, ContextId, Dscp, PathSnapshot};
@@ -94,6 +94,15 @@ pub trait PathProvider {
     /// All capacity must have been reserved by prepare. Commit cannot fail.
     fn commit(&mut self, prepared: PreparedPath, connection: ConnectionId);
     fn cancel(&mut self, prepared: PreparedPath);
+    /// The complete IP header length, extension headers included, of the
+    /// path a stateless reply with these addresses and DSCP would leave on
+    /// now, so that the Endpoint sizes the reply as it will be placed. None
+    /// when the provider states none: the reply is sized with the minimal
+    /// header and the provider's own submission check decides.
+    fn reply_header_len(&mut self, ip: IpMetadata, dscp: u8) -> Option<u16> {
+        let _ = (ip, dscp);
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,7 +234,12 @@ pub(crate) fn valid_prepared(
         && key.context() == context
         && key.source_address().address() == request.tuple.local.ip()
         && key.destination().address() == request.tuple.remote.ip()
-        && key.forwarding_destination().address() == destination
+        // An SR route, whose path header carries the Segment Routing Header,
+        // forwards a final destination to the first segment it derives.
+        && (key.forwarding_destination().address() == destination
+            || (destination == request.tuple.remote.ip()
+                && destination.is_ipv6()
+                && prepared.snapshot.ip_header_len() > 40))
         && key.dscp() == request.dscp
         && prepared.snapshot.ip_packet_budget().is_ok_and(|budget| {
             let header =
@@ -238,7 +252,8 @@ pub(crate) fn valid_prepared(
                         .map(|(_, n)| 20 + n)
                         .unwrap_or(usize::MAX)
                 } else {
-                    40
+                    // The base header and any Segment Routing Header.
+                    prepared.snapshot.ip_header_len() as usize
                 };
             header
                 .checked_add(20)

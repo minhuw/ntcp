@@ -480,7 +480,8 @@ impl Endpoint {
                 && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
         });
         let listener = self.match_listener(tuple.local);
-        if let Some(id) = listener
+        let queued = self.control.len();
+        let result = if let Some(id) = listener
             && (target.is_none() || replacement)
             && segment.header.flags & (SYN | ACK | RST) == SYN
             // A full backlog/Endpoint or stale TIME-WAIT reuse is dropped by
@@ -509,7 +510,16 @@ impl Endpoint {
         } else {
             self.input_with_metadata(now, ip, traffic_class, options, bytes, metadata)
                 .map_err(ManagedError::Endpoint)
+        };
+        // A stateless IPv6 reply this input queued is sized with the complete
+        // header of the path the provider will place it on.
+        let dscp = self.config.dscp;
+        for entry in self.control.iter_mut().skip(queued) {
+            if entry.0.destination.is_ipv6() {
+                entry.4 = provider.reply_header_len(entry.0, dscp);
+            }
         }
+        result
     }
 
     /// Use the Endpoint's own wildcard/exact listener precedence when selecting
@@ -580,8 +590,7 @@ impl Endpoint {
     pub fn validate_path_budget(&self, id: ConnectionId, path: PreparedPath) -> Result<(), EndpointError> {
         let connection = &self.retained_slot(id)?.connection;
         connection.check_managed_budget(path)?;
-        let budget = path.snapshot.ip_packet_budget().map_err(|_| EndpointError::from(crate::Error::InvalidArgument))?;
-        if !connection.represents_budget(budget) {
+        if !connection.represents_budget(path) {
             return Err(crate::Error::InvalidArgument.into());
         }
         Ok(())

@@ -1132,7 +1132,7 @@ fn quote(frame: &[u8]) -> ntcp_host::QuoteKey {
     ntcp_host::QuoteKey {
         source: p.ip.source,
         destination: p.ip.destination,
-        header_len: header as u16,
+        header_len: header as u32,
         packet_len: (header + p.payload.len()) as u32,
         protocol: p.protocol,
         transport: ntcp_host::QuotedSelector::Tcp {

@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-from bridge import checksum
+from bridge import checksum, ipv6_chain
 from linux_peer import fnv, pattern
 
 HERE = Path(__file__).resolve().parent
@@ -161,16 +161,24 @@ def parse(packet):
             info.update(ident=u16(packet, 4), offset=(fragment & 0x1fff) * 8, more=bool(fragment & 0x2000))
         pseudo = source + destination + bytes([0, protocol]) + struct.pack("!H", total - hl)
     elif version == 6:
-        hl, total, protocol = 40, 40 + u16(packet, 4), packet[6]
+        total = 40 + u16(packet, 4)
         source, destination = packet[8:24], packet[24:40]
-        info = dict(family=6, df=None, fragmented=protocol == 44, ip_checksum_valid=True)
-        if protocol == 44 and total >= 48:
-            # RFC 8200 section 4.5: base header -> Fragment header -> data.
-            field = u16(packet, 42)
-            info.update(ident=struct.unpack_from("!I", packet, 44)[0], offset=field & 0xfff8,
-                        more=bool(field & 1), inner=packet[40])
-            hl = 48
-        pseudo = source + destination + struct.pack("!I", total - hl) + bytes([0, 0, 0, protocol])
+        # The whole extension chain in wire order (a truncated quote stops
+        # where its bytes end); transport checksums use the final
+        # destination, which a Segment Routing Header with Segments Left
+        # names in Segment List[0].
+        headers, protocol, hl, final, fragment = ipv6_chain(packet, total, strict=len(packet) >= total)
+        info = dict(family=6, df=None, fragmented=fragment is not None, ip_checksum_valid=True,
+                    extensions=headers, final_destination=str(ipaddress.ip_address(final)))
+        if fragment is not None:
+            # RFC 8200 section 4.5: the unfragmentable part (base header and
+            # any extension headers before it), the Fragment header, data.
+            info.update(ident=fragment["ident"], offset=fragment["offset"], more=fragment["more"],
+                        inner=fragment["inner"])
+        if protocol is None:
+            return dict(info, length=total, captured=len(packet), protocol=None, header_len=hl,
+                        source=str(ipaddress.ip_address(source)), destination=str(ipaddress.ip_address(destination)))
+        pseudo = source + final + struct.pack("!I", total - hl) + bytes([0, 0, 0, protocol])
     else:
         return None
     body = packet[hl:total]
@@ -245,9 +253,14 @@ def reassemble(events):
             header[10:12] = b"\0\0"
             struct.pack_into("!H", header, 10, checksum(bytes(header)))
         else:
-            header = bytearray(raw[:40])
-            header[6] = first["inner"]
-            struct.pack_into("!H", header, 4, size)
+            # The datagram keeps fragment zero's unfragmentable part; the
+            # Fragment header goes and its predecessor's Next Header field
+            # takes the fragmented selector (RFC 8200 section 4.5).
+            chain = first["extensions"]
+            at = next(i for i, h in enumerate(chain) if h["type"] == 44)
+            header = bytearray(raw[:chain[at]["offset"]])
+            header[chain[at - 1]["offset"] if at else 6] = first["inner"]
+            struct.pack_into("!H", header, 4, len(header) - 40 + size)
         datagram = parse(bytes(header) + bytes(data))
         datagram.update(direction=first["direction"], time_ns=max(f["time_ns"] for f in fragments),
                         raw=bytes(header) + bytes(data), sha256=None)

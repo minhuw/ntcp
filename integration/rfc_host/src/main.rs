@@ -238,6 +238,14 @@ fn run() -> io::Result<()> {
         // IPv4 route needs Identifications at once).
         config.io.source_quiet = api::SourceQuiet::Never;
     }
+    // The T17 Segment Routing case states one owner `ipv6.srh.<prefix>`
+    // line, read by the production configuration parser and installed by
+    // the runtime over t5n beside its default route.
+    if let Some(line) = std::env::var_os("T17_SEGMENT_ROUTE") {
+        let line = line.into_string().map_err(|_| io::Error::other("T17_SEGMENT_ROUTE"))?;
+        let text = format!("io.interface = t5n\nio.address = {local}\n{line}\n");
+        config.segment_routes = api::SocketConfig::parse(&text)?.segment_routes;
+    }
     api::configure_with_packet_io(config, move || {
         let name = CString::new("t5n").unwrap();
         let index = unsafe { if_nametoindex(name.as_ptr()) };

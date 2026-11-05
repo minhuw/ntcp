@@ -70,7 +70,7 @@ use ntcp_path::{
     DeliveryConfirmation, Dscp, EstimateChange, PathId, PathSnapshot, PathStatus, ScopedAddress,
 };
 
-use crate::emitter::{DatagramError, Plan, header_len};
+use crate::emitter::{DatagramError, Plan};
 use crate::{BackendOutcome, Error, Host, IngressPacket, UdpEgress};
 
 /// Octets of the unpredictable data nonce that opens every probe's data; the
@@ -188,6 +188,10 @@ enum Search {
 #[derive(Clone, Copy, Debug)]
 struct Probe {
     size: u32,
+    // The probe's complete IP header length: the base header and, on an SR
+    // path, its Segment Routing Header. A reply may omit extension headers,
+    // so only the rest of `size` is compared with it.
+    header: u32,
     identifier: u16,
     sequence: u16,
     nonce: [u8; NONCE],
@@ -708,6 +712,21 @@ impl Host {
             None => low + (high - low).div_ceil(2),
         };
         entry.search = Search::Active { low, high };
+        // The header H of the route the path selected (an SR route's
+        // Segment Routing Header included) is indivisible: a probe of
+        // `size` complete octets must hold it, the Echo header and the
+        // whole nonce, or it is not sent; it is never truncated, sent over
+        // another route or credited with data it cannot carry.
+        let header = self.header_plan(snapshot.key())?.len;
+        let Some(data_len) = (size as usize)
+            .checked_sub(header + 8)
+            .filter(|data| *data >= NONCE)
+        else {
+            self.adjunct.counters.not_sent += 1;
+            entry.not_before = now.saturating_add(self.adjunct.timeout);
+            self.adjunct.entries[index] = Some(entry);
+            return Err(Error::Unsupported);
+        };
         let mut nonce = [0u8; NONCE + 4];
         let drawn = self
             .entropy
@@ -723,9 +742,7 @@ impl Host {
         let identifier = u16::from_be_bytes([nonce[0], nonce[1]]);
         let sequence = u16::from_be_bytes([nonce[2], nonce[3]]);
         let nonce: [u8; NONCE] = nonce[4..].try_into().unwrap();
-        let header = header_len(ipv4);
         let len = size as usize;
-        let data_len = len - header - 8;
         let Some(packet) = packet.get_mut(..len) else {
             self.adjunct.entries[index] = Some(entry);
             return Err(Error::Capacity);
@@ -758,7 +775,9 @@ impl Host {
                 0,
             )?
         } else {
-            ntcp_ip6::encode_datagram(
+            // On an SR path the probe carries the route's Segment Routing
+            // Header, so it measures the path its datagrams take.
+            ntcp_ip6::encode_routed(
                 packet,
                 ntcp_ip6::Header {
                     ip,
@@ -766,6 +785,7 @@ impl Host {
                     dscp: entry.dscp,
                     ecn: 0,
                 },
+                self.header_plan(snapshot.key())?.segments,
                 protocol,
                 message,
             )?
@@ -790,6 +810,7 @@ impl Host {
                 self.adjunct.counters.probes += 1;
                 entry.probe = Some(Probe {
                     size,
+                    header: header as u32,
                     identifier,
                     sequence,
                     nonce,
@@ -849,7 +870,7 @@ impl Host {
     /// incarnation. A reply reassembled from fragments proves the same
     /// forward delivery; its return path is not measured.
     //= https://www.rfc-editor.org/rfc/rfc4821#section-10.3
-    //= reason=IP fragmentation is a packetization layer under unmodified applications here (Host UDP Fragment mode, Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound)), and it relies on Path MTU sharing plus an adjunct: fragments are cut to E, bounded by the shared PathService ordinary budget, which correlated PTBs about fragments and probes lower for every client; the Host-owned ICMP Echo adjunct (crates/stacks/ntcp-host/src/adjunct.rs) probes each path with fragmentation demand using unfragmented Echo Requests (DF on IPv4) carrying an unpredictable identifier, sequence and data nonce, sized by an RFC 4821 section 7.3 search between E (exclusive) and min(first-hop MTU, largest fragmented datagram). Only an exact, timely Echo Reply to a definitely submitted probe raises the path's confirmed lower bound and, under a learned ceiling below it, is offered to PathService::confirm_delivery (NotLarger on an unlearned path); silence and other errors lower only the search's upper bound, and a correlated PTB for a probe is an ordinary trusted decrease. Echo is used despite the preference for forward-only methods because every host implements the responder, the Host verifies its own nonce, and an exact reply proves forward delivery of the unfragmented request; a reply reassembled from fragments proves the same, so the return path limits the result only where the responder cannot deliver its reply at all (the search then stops lower, which is safe). Host tests cover the converging search, silence, forged, stale, mismatched and reassembled replies, a PTB for a probe and publication only under PathService rules; the integration/rfc_host fragment case raises IPv4 E only after a real Echo Reply and draws a real router PTB for a probe above 1280, and adjunct-silence shows that unanswered probes lower nothing.
+    //= reason=IP fragmentation is a packetization layer under unmodified applications here (Host UDP Fragment mode, Echo Replies (a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes)), and it relies on Path MTU sharing plus an adjunct: fragments are cut to E, bounded by the shared PathService ordinary budget, which correlated PTBs about fragments and probes lower for every client; the Host-owned ICMP Echo adjunct (crates/stacks/ntcp-host/src/adjunct.rs) probes each path with fragmentation demand using unfragmented Echo Requests (DF on IPv4) carrying an unpredictable identifier, sequence and data nonce, sized by an RFC 4821 section 7.3 search between E (exclusive) and min(first-hop MTU, largest fragmented datagram). Only an exact, timely Echo Reply to a definitely submitted probe raises the path's confirmed lower bound and, under a learned ceiling below it, is offered to PathService::confirm_delivery (NotLarger on an unlearned path); silence and other errors lower only the search's upper bound, and a correlated PTB for a probe is an ordinary trusted decrease. Echo is used despite the preference for forward-only methods because every host implements the responder, the Host verifies its own nonce, and an exact reply proves forward delivery of the unfragmented request; a reply reassembled from fragments proves the same, so the return path limits the result only where the responder cannot deliver its reply at all (the search then stops lower, which is safe). Host tests cover the converging search, silence, forged, stale, mismatched and reassembled replies, a PTB for a probe and publication only under PathService rules; the integration/rfc_host fragment case raises IPv4 E only after a real Echo Reply and draws a real router PTB for a probe above 1280, and adjunct-silence shows that unanswered probes lower nothing.
     //# To support IP fragmentation as a Packetization Layer under an unmodified application, an implementation SHOULD rely on the Path MTU sharing described in Section 5.2 plus an adjunct protocol to probe the Path MTU. There are a number of protocols that might be used for the purpose, such as ICMP ECHO and ECHO REPLY, or "traceroute" style UDP datagrams that trigger ICMP messages. Use of ICMP ECHO and ECHO REPLY will probe both forward and return paths, so the sender will only be able to take advantage of the minimum of the two. Other methods that probe only the forward path are preferred if available.
     pub(crate) fn adjunct_reply(
         &mut self,
@@ -860,7 +881,6 @@ impl Host {
         if reply.kind != EchoKind::Reply {
             return Err(ntcp_ip::Error::Invalid.into());
         }
-        let header = header_len(packet.ip.source.is_ipv4()) as u32;
         let found = self.adjunct.entries.iter().position(|e| {
             e.and_then(|e| e.probe.map(|p| (e, p)))
                 .is_some_and(|(e, p)| {
@@ -876,7 +896,10 @@ impl Host {
         };
         let mut entry = self.adjunct.entries[index].unwrap();
         let probe = entry.probe.unwrap();
-        let exact = header + 8 + reply.data.len() as u32 == probe.size
+        // The reply may omit the request's extension headers: its Echo
+        // message must be the request's exactly, which certifies the
+        // recorded request size on the probe's own path.
+        let exact = probe.header + 8 + reply.data.len() as u32 == probe.size
             && matches_probe(&probe.nonce, reply.data);
         // An altered or late reply, or one for an uncertain submission,
         // certifies nothing; a forged one leaves the real probe outstanding.
@@ -982,6 +1005,7 @@ impl Host {
             e.and_then(|e| e.probe.map(|p| (e, p)))
                 .is_some_and(|(e, p)| {
                     e.ip == quote.ip
+                        && self.quote_authorized(e.path, message)
                         && p.identifier == identifier
                         && p.sequence == sequence
                         && (quote.ip_packet_len == p.size
@@ -1012,7 +1036,7 @@ impl Host {
             let estimate = self.host_estimate(
                 entry.path,
                 ipv4,
-                (quote.ip_packet_len, quote.ip_header_len),
+                (quote.ip_packet_len, u32::from(quote.ip_header_len)),
                 probe.size,
                 feedback.candidate_mtu,
             );
@@ -1029,7 +1053,7 @@ impl Host {
                 now,
                 entry.path,
                 ipv4,
-                (quote.ip_packet_len, quote.ip_header_len),
+                (quote.ip_packet_len, u32::from(quote.ip_header_len)),
                 probe.size,
                 feedback.candidate_mtu,
                 None,

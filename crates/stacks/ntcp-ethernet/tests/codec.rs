@@ -327,3 +327,43 @@ fn ethernet_fragment_framing_and_padding() {
         );
     }
 }
+
+// Reassembling-host framing delimits IPv6 by the base header alone: complete
+// packets whose extension headers carry policy or length faults reach the
+// host, which originates their errors; physical truncation is refused. The
+// non-reassembling framing still refuses every extension selector.
+#[test]
+fn fragment_framing_passes_complete_ipv6_packets_with_faulty_extensions() {
+    let mut ip = vec![0u8; IPV6_HEADER + 24];
+    ip[0] = 0x60;
+    ip[4..6].copy_from_slice(&24u16.to_be_bytes());
+    ip[7] = 64;
+    ip[23] = 1;
+    ip[39] = 2;
+    let faulty: [&[u8]; 4] = [
+        // Destination Options whose PadN overruns the header.
+        &[60, 17, 0, 1, 9, 0, 0, 0, 0],
+        // Hop-by-Hop Options after a Destination Options header.
+        &[60, 0, 0, 1, 4, 0, 0, 0, 0],
+        // A Routing header with Segments Left above zero.
+        &[43, 17, 0, 0, 1, 0, 0, 0, 0],
+        // A header that claims more than the Payload Length holds.
+        &[60, 17, 7, 0, 0, 0, 0, 0, 0],
+    ];
+    for layout in faulty {
+        ip[6] = layout[0];
+        ip[40..48].copy_from_slice(&layout[1..]);
+        let mut frame = vec![0u8; 14 + ip.len()];
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+        frame[14..].copy_from_slice(&ip);
+        assert_eq!(parse_ethernet_fragment(&frame).unwrap().payload, &ip[..]);
+        assert_eq!(
+            parse_ethernet(&frame).unwrap_err(),
+            Error::ExtensionsUnsupported
+        );
+        assert_eq!(
+            parse_ethernet_fragment(&frame[..frame.len() - 1]).unwrap_err(),
+            Error::Truncated
+        );
+    }
+}

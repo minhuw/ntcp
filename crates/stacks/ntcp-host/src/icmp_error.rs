@@ -1,4 +1,5 @@
-//! ICMP errors the Host originates about datagrams it could not reassemble:
+//! ICMP errors the Host originates about packets it could not reassemble or
+//! whose IPv6 extension headers its receive processing refused:
 //! family-specific suppression, one burst-capable rate limiter for every
 //! originated error, and message construction.
 //!
@@ -11,6 +12,7 @@ use ntcp_icmp::ErrorMessage;
 use ntcp_path::LinkId;
 
 use crate::reassembly::{Arrival, Discard, admissible_source};
+use ntcp_ip6::{Fault, OptionAction};
 
 /// Token bucket for every ICMP error this Host originates: up to `burst`
 /// errors at once, refilled at `per_second`. RFC 4443 section 2.4(f)
@@ -82,40 +84,84 @@ pub(crate) enum ReassemblyError {
     /// section 3.3.2: ICMPv4 Time Exceeded code 1; RFC 8200 section 4.5:
     /// ICMPv6 Time Exceeded code 1). The invoking packet is fragment zero.
     TimeExceeded,
-    /// ICMPv6 Parameter Problem about one discarded fragment.
+    /// ICMPv6 Parameter Problem about one discarded fragment or packet.
     ParameterProblem { code: u8, pointer: u32 },
+    /// Parameter Problem Code 2 for an unrecognized option whose action is
+    /// 10: the one error here that RFC 4443 section 2.4(e.3) and (e.4) let
+    /// a packet sent as a link-layer multicast or broadcast draw.
+    ReportedOption { pointer: u32 },
 }
 
 impl ReassemblyError {
-    /// RFC 8200 section 4.5's errors for a discarded IPv6 fragment, pointing
-    /// into the base -> Fragment layout this Host accepts: a non-final
-    /// length not a multiple of 8 (code 0 at the Payload Length field), a
-    /// reassembled Payload Length beyond 65535 (code 0 at the Fragment
-    /// Offset field, octet 42) and a first fragment without the complete
-    /// header chain (code 3, pointer 0). Overlap is silent, and IPv4 defines
-    /// no error for these cases.
-    pub fn for_discard(ipv6: bool, discard: Discard) -> Option<Self> {
+    /// RFC 8200 section 4.5's errors for a discarded IPv6 fragment whose
+    /// Fragment header is at `fragment`: a non-final length not a multiple
+    /// of 8 (code 0 at the Payload Length field), a reassembled Payload
+    /// Length beyond 65535 (code 0 at the Fragment Offset field) and a first
+    /// fragment without the complete header chain (code 3, pointer 0).
+    /// Overlap is silent, and IPv4 defines no error for these cases.
+    pub fn for_discard(ipv6: bool, discard: Discard, fragment: usize) -> Option<Self> {
         if !ipv6 {
             return None;
         }
         let (code, pointer) = match discard {
             Discard::Misaligned => (0, 4),
-            Discard::Oversize => (0, 42),
+            Discard::Oversize => (0, u32::try_from(fragment + 2).ok()?),
             Discard::IncompleteHeader => (3, 0),
             _ => return None,
         };
         Some(Self::ParameterProblem { code, pointer })
     }
+
+    /// The Parameter Problem for a header chain that receive processing
+    /// refused (RFC 8200 section 4, RFC 4443 section 3.4): code 0 for an
+    /// impossible length or a Routing header with Segments Left above zero,
+    /// code 1 for a misplaced Hop-by-Hop Options header, code 2 for an
+    /// unrecognized option whose action reports it, code 3 for a first
+    /// fragment whose chain continues past it (RFC 7112). Physical
+    /// truncation and options whose action discards silently draw none.
+    pub fn for_fault(fault: Fault) -> Option<Self> {
+        let (code, pointer) = match fault {
+            Fault::Truncated | Fault::Version => return None,
+            Fault::Length { pointer } | Fault::SegmentsLeft { pointer } => (0, pointer),
+            Fault::MisplacedHopByHop { pointer } => (1, pointer),
+            Fault::Option { pointer, action } => match action {
+                OptionAction::Discard => return None,
+                OptionAction::Report => {
+                    return Some(Self::ReportedOption {
+                        pointer: u32::try_from(pointer).ok()?,
+                    });
+                }
+                OptionAction::ReportUnlessMulticast => (2, pointer),
+            },
+            Fault::IncompleteChain => (3, 0),
+        };
+        Some(Self::ParameterProblem {
+            code,
+            pointer: u32::try_from(pointer).ok()?,
+        })
+    }
+
+    /// RFC 8200 section 4: code 1 at `selector`, the Next Header octet that
+    /// names a header or protocol this host does not process.
+    pub fn unrecognized(selector: usize) -> Option<Self> {
+        Some(Self::ParameterProblem {
+            code: 1,
+            pointer: u32::try_from(selector).ok()?,
+        })
+    }
 }
 
 /// An originated error message from the invoking packet's local
 /// destination to its source, which a link-local destination limits to the
-/// arrival link. `len` octets of ICMP message were written.
+/// arrival link. `len` octets of ICMP message were written, quoting as much
+/// of the invoking packet as an extension-free outer header allows; `kind`
+/// lets the output size the quote again for the header actually selected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OriginatedError {
     pub ip: IpMetadata,
     pub link: LinkId,
     pub len: usize,
+    pub kind: ErrorMessage,
 }
 
 /// Build `error` about `invoking` (the packet as it arrived) into `message`
@@ -136,9 +182,17 @@ pub(crate) fn originate(
         IpAddr::V4(_) => ipv4_allowed(invoking),
         IpAddr::V6(_) => ipv6_allowed(invoking),
     };
-    if !allowed || arrival.link_multicast || !admissible_source(ip.source) {
+    // RFC 4443 section 2.4(e.4): a link-layer multicast or broadcast draws
+    // only the Code 2 error for an option whose action is 10.
+    let multicast_exception = matches!(error, ReassemblyError::ReportedOption { .. });
+    if !allowed || (arrival.link_multicast && !multicast_exception) || !admissible_source(ip.source)
+    {
         return None;
     }
+    // The invoking destination is a unicast address this Host owns: the
+    // Host admits no other destination (a multicast one is refused by
+    // `ipv6_allowed` as well), so the error's source is that address
+    // (RFC 4443 section 2.2(a)).
     let reply = IpMetadata {
         source: ip.destination,
         destination: ip.source,
@@ -148,17 +202,27 @@ pub(crate) fn originate(
         ReassemblyError::ParameterProblem { code, pointer } => {
             ErrorMessage::Ipv6ParameterProblem { code, pointer }
         }
+        ReassemblyError::ReportedOption { pointer } => {
+            ErrorMessage::Ipv6ParameterProblem { code: 2, pointer }
+        }
     };
     // encode_error writes only once it succeeds.
     if !limiter.available(now) {
         return None;
     }
-    let len = ntcp_icmp::encode_error(reply, kind, invoking, message).ok()?;
+    // The largest quote, for the minimal outer header; the output sizes it
+    // again for the header of the route it selects (`Host::icmp_output`).
+    let outer_header = match reply.source {
+        IpAddr::V4(_) => ntcp_ip::IPV4_HEADER,
+        IpAddr::V6(_) => ntcp_ip6::IPV6_HEADER,
+    };
+    let len = ntcp_icmp::encode_error(reply, kind, invoking, outer_header, message).ok()?;
     limiter.admit(now);
     Some(OriginatedError {
         ip: reply,
         link: arrival.link,
         len,
+        kind,
     })
 }
 
@@ -223,32 +287,54 @@ fn ipv4_allowed(b: &[u8]) -> bool {
 //   (e) An ICMPv6 error message MUST NOT be originated as a result of
 //   receiving the following:
 // An ICMPv6 error or Redirect, a packet to a multicast address or sent as a
-// link-layer multicast or broadcast (the Packet Too Big and code 2
-// exceptions do not apply to reassembly errors), or a source that is not a
-// single node. There is no IPv6 rule for non-initial fragments; but data of
-// a non-initial fragment is opaque, so one whose Fragment header names
-// ICMPv6 cannot be classified and gets no error.
+// link-layer multicast or broadcast (`originate` applies the code 2
+// exception; this Host originates no Packet Too Big), or a source that is
+// not a single node. The upper layer is found by generic framing alone, as
+// Linux's is_ineligible does with ipv6_skip_exthdr: the refusal being
+// answered may be a placement or option rule, so no such rule may hide an
+// ICMPv6 error behind it. A chain whose framing overruns the Payload Length
+// before an upper layer is not shown to be an ICMPv6 message. There is no
+// IPv6 rule for non-initial fragments; but data of a non-initial fragment
+// is opaque, so one whose Fragment header names ICMPv6 cannot be classified
+// and gets no error, nor does an ICMPv6 message without its type.
 fn ipv6_allowed(b: &[u8]) -> bool {
-    let (Some(&next), Some(destination)) = (b.get(6), b.get(24..40)) else {
+    let (Some(destination), Some(payload)) = (b.get(24..40), b.get(4..6)) else {
         return false;
     };
     if destination[0] == 0xff {
         return false;
     }
-    let (protocol, first, data) = if next == 44 {
-        let Some(fragment) = b.get(40..48) else {
+    let declared =
+        ntcp_ip6::IPV6_HEADER + usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+    let mut kind = b[6];
+    let mut offset = ntcp_ip6::IPV6_HEADER;
+    loop {
+        let len = match kind {
+            0 | 43 | 60 => match b.get(offset + 1) {
+                Some(&units) => (usize::from(units) + 1) * 8,
+                None => return false,
+            },
+            44 => match b.get(offset..offset + 4) {
+                Some(f) if u16::from_be_bytes([f[2], f[3]]) & !7 != 0 => return f[0] != 58,
+                Some(_) => ntcp_ip6::FRAGMENT_HEADER,
+                None => return false,
+            },
+            58 => {
+                return match b.get(offset).filter(|_| offset < declared) {
+                    Some(&kind) => kind >= 128 && kind != 137,
+                    None => false,
+                };
+            }
+            _ => return true,
+        };
+        // Every framed header occupies at least eight octets.
+        if offset + len > declared {
+            return true;
+        }
+        let Some(&next) = b.get(offset) else {
             return false;
         };
-        let offset = u16::from_be_bytes([fragment[2], fragment[3]]) & !7;
-        (fragment[0], offset == 0, b.get(48..))
-    } else {
-        (next, true, b.get(40..))
-    };
-    if protocol != 58 {
-        return true;
-    }
-    match (first, data.and_then(|d| d.first())) {
-        (true, Some(&kind)) => kind >= 128 && kind != 137,
-        _ => false,
+        kind = next;
+        offset += len;
     }
 }

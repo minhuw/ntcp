@@ -122,7 +122,7 @@ pub(super) fn quote_key(frame: &[u8]) -> QuoteKey {
     QuoteKey {
         source: quote.ip.source,
         destination: quote.ip.destination,
-        header_len: quote.ip_header_len,
+        header_len: u32::from(quote.ip_header_len),
         packet_len: quote.ip_packet_len,
         protocol: 6,
         transport: QuotedSelector::Tcp {
@@ -172,7 +172,7 @@ fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
         let key = QuoteKey {
             source: quote.ip.source,
             destination: quote.ip.destination,
-            header_len: quote.ip_header_len,
+            header_len: u32::from(quote.ip_header_len),
             packet_len: quote.ip_packet_len,
             protocol: 6,
             transport: QuotedSelector::Tcp {

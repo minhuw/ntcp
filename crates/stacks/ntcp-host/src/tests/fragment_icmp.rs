@@ -361,7 +361,7 @@ fn stale_and_evicted_fragment_history_keeps_its_ambiguity() {
         let key = QuoteKey {
             source: quote.quoted.ip.source,
             destination: quote.quoted.ip.destination,
-            header_len: quote.quoted.ip_header_len,
+            header_len: u32::from(quote.quoted.ip_header_len),
             packet_len: quote.quoted.ip_packet_len,
             protocol: quote.quoted.protocol,
             transport: QuotedSelector::Fragment {

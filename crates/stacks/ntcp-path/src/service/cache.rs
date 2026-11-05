@@ -61,6 +61,10 @@ pub struct PathSnapshot {
     admin_estimate: Option<u32>,
     discovery_disabled: bool,
     discovery_revision: u64,
+    // Fixed by the route generation the key selected: the base header, and
+    // an SR route's Segment Routing Header of n + 1 16-octet entries after
+    // its 8-octet fixed part (the length `ntcp_ip6::header_len` encodes).
+    ip_header_len: u32,
 }
 
 impl PathSnapshot {
@@ -124,6 +128,14 @@ impl PathSnapshot {
     /// after a disable followed by a re-enable.
     pub const fn discovery_revision(self) -> u64 {
         self.discovery_revision
+    }
+    /// The complete IP header length H of output on this path before any
+    /// IPv4 options its sender adds: the family's base header and, on an SR
+    /// route of n segments, the Segment Routing Header listing them and the
+    /// final destination (8 + 16(n + 1) octets). Fixed for the path, whose
+    /// key names the route generation.
+    pub const fn ip_header_len(self) -> u32 {
+        self.ip_header_len
     }
 
     /// Ordinary wire lengths only: IPv6's 65535 payload octets plus40 base
@@ -469,6 +481,11 @@ impl PathService {
             admin_estimate: route.policy.estimate,
             discovery_disabled: route.policy.discovery_disabled,
             discovery_revision: 0,
+            ip_header_len: match self.route_segments(resolved.key.route).map_or(0, <[_]>::len) {
+                0 if resolved.key.destination.address.is_ipv4() => 20,
+                0 => 40,
+                n => 40 + 8 + 16 * (n as u32 + 1),
+            },
         };
         let unlearned_mtu = snapshot.pmtu_estimate().unwrap();
         let restriction = match (route.restriction, route.policy.estimate) {

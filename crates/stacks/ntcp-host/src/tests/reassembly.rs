@@ -155,7 +155,7 @@ enum Out {
 fn feed_frame(r: &mut Reassembly, now: Instant, arrival: Arrival, frame: &[u8]) -> Out {
     let piece = if frame[0] >> 4 == 6 {
         let packet = ntcp_ip6::parse_fragment(frame).unwrap();
-        match Piece::ipv6(&packet) {
+        match Piece::ipv6(frame, &packet.chain) {
             Some(piece) => piece,
             None => return Out::Whole,
         }
@@ -173,9 +173,9 @@ fn feed_frame(r: &mut Reassembly, now: Instant, arrival: Arrival, frame: &[u8]) 
             let (header, addresses) = if frame[0] >> 4 == 6 {
                 (40, 8..40)
             } else {
-                (done.first_header_len, 12..20)
+                (done.first_header.len(), 12..20)
             };
-            let first = done.first_header();
+            let first = done.first_header;
             assert_eq!(first[0] >> 4, frame[0] >> 4);
             assert_eq!(first[addresses.clone()], done.packet[addresses]);
             assert!(done.first_data > 0 && done.first_data <= done.packet.len() - header);
@@ -657,7 +657,7 @@ fn rejection_markers_precede_every_error_producing_check() {
     let mut r = engine();
     for (fragment, discard) in checked(20) {
         assert_eq!(feed(&mut r, &f, 0, fragment), Out::Discarded(discard));
-        assert!(ReassemblyError::for_discard(true, discard).is_some());
+        assert!(ReassemblyError::for_discard(true, discard, 40).is_some());
     }
     assert_eq!(
         feed(&mut r, &f, 0, frag(true, 9, 0, true, &d[..32])),
@@ -673,7 +673,10 @@ fn rejection_markers_precede_every_error_producing_check() {
             Out::Discarded(Discard::Rejected)
         );
     }
-    assert_eq!(ReassemblyError::for_discard(true, Discard::Rejected), None);
+    assert_eq!(
+        ReassemblyError::for_discard(true, Discard::Rejected, 40),
+        None
+    );
     let counters = r.counters().discarded;
     assert_eq!(
         (
@@ -1211,21 +1214,21 @@ fn reassembly_errors_carry_family_codes_pointers_and_bounded_quotes() {
         SECOND,
     );
     assert_eq!(
-        ReassemblyError::for_discard(true, Discard::Misaligned),
+        ReassemblyError::for_discard(true, Discard::Misaligned, 40),
         Some(ReassemblyError::ParameterProblem {
             code: 0,
             pointer: 4
         })
     );
     assert_eq!(
-        ReassemblyError::for_discard(true, Discard::Oversize),
+        ReassemblyError::for_discard(true, Discard::Oversize, 40),
         Some(ReassemblyError::ParameterProblem {
             code: 0,
             pointer: 42
         })
     );
     assert_eq!(
-        ReassemblyError::for_discard(true, Discard::IncompleteHeader),
+        ReassemblyError::for_discard(true, Discard::IncompleteHeader, 40),
         Some(ReassemblyError::ParameterProblem {
             code: 3,
             pointer: 0
@@ -1238,14 +1241,14 @@ fn reassembly_errors_carry_family_codes_pointers_and_bounded_quotes() {
         Discard::Capacity,
         Discard::Contradiction,
     ] {
-        assert_eq!(ReassemblyError::for_discard(true, discard), None);
+        assert_eq!(ReassemblyError::for_discard(true, discard, 40), None);
     }
     for discard in [
         Discard::Misaligned,
         Discard::Oversize,
         Discard::IncompleteHeader,
     ] {
-        assert_eq!(ReassemblyError::for_discard(false, discard), None);
+        assert_eq!(ReassemblyError::for_discard(false, discard, 40), None);
     }
     for v6 in [false, true] {
         let big = data(1400, 19);
@@ -1284,7 +1287,7 @@ fn reassembly_errors_carry_family_codes_pointers_and_bounded_quotes() {
     let message = error_for(
         &mut limiter,
         0,
-        ReassemblyError::for_discard(true, Discard::Misaligned).unwrap(),
+        ReassemblyError::for_discard(true, Discard::Misaligned, 40).unwrap(),
         f.arrival(true),
         &misaligned,
     )

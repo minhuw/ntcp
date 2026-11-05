@@ -96,7 +96,7 @@ pub(super) fn ip_packet(owner: &Owner, tx: ntcp::Transmit, tcp: &[u8]) -> Vec<u8
     let header = crate::ip::header_len(tx.ip.source);
     let mut packet = vec![0; header + tcp.len()];
     packet[header..].copy_from_slice(tcp);
-    let n = crate::ip::encode(&mut packet, tx, (owner.now() / 1000) as u32, tx.len).unwrap();
+    let n = crate::ip::encode(&mut packet, tx, &[], (owner.now() / 1000) as u32, tx.len).unwrap();
     packet.truncate(n);
     packet
 }

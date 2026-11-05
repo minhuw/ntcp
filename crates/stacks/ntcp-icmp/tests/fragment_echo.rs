@@ -2,6 +2,11 @@
 use ntcp::{IpMetadata, OutgoingIpv4Options, SourceRoute};
 use ntcp_icmp::*;
 
+// The option- and extension-free header that carries an originated error.
+fn outer(ip: IpMetadata) -> usize {
+    if ip.source.is_ipv6() { 40 } else { 20 }
+}
+
 fn ip(v6: bool) -> IpMetadata {
     IpMetadata {
         source: if v6 { "2001:db8::1" } else { "192.0.2.1" }
@@ -320,6 +325,7 @@ fn echo_codec_round_trips_with_checksums_in_both_families() {
             ip(v6),
             ErrorMessage::ReassemblyTimeExceeded,
             &[0x45; 28],
+            outer(ip(v6)),
             &mut not_echo,
         )
         .unwrap();
@@ -415,6 +421,7 @@ fn reassembly_errors_quote_fragment_zero_and_truncate_to_family_limits() {
             reporter,
             ErrorMessage::ReassemblyTimeExceeded,
             first,
+            outer(reporter),
             &mut message,
         )
         .unwrap();
@@ -438,6 +445,7 @@ fn reassembly_errors_quote_fragment_zero_and_truncate_to_family_limits() {
                 reporter,
                 ErrorMessage::ReassemblyTimeExceeded,
                 first,
+                outer(reporter),
                 &mut small
             )
             .unwrap(),
@@ -449,6 +457,7 @@ fn reassembly_errors_quote_fragment_zero_and_truncate_to_family_limits() {
             reporter,
             ErrorMessage::ReassemblyTimeExceeded,
             first,
+            outer(reporter),
             &mut smaller,
         );
         if v6 {
@@ -462,6 +471,7 @@ fn reassembly_errors_quote_fragment_zero_and_truncate_to_family_limits() {
             reporter,
             ErrorMessage::ReassemblyTimeExceeded,
             &first[..60],
+            outer(reporter),
             &mut whole,
         )
         .unwrap();
@@ -472,6 +482,7 @@ fn reassembly_errors_quote_fragment_zero_and_truncate_to_family_limits() {
                 reporter,
                 ErrorMessage::ReassemblyTimeExceeded,
                 first,
+                outer(reporter),
                 &mut [0; 7]
             )
             .unwrap_err(),
@@ -496,16 +507,23 @@ fn ipv6_parameter_problem_codes_and_pointers() {
             reporter,
             ErrorMessage::Ipv6ParameterProblem { code, pointer },
             &packets[0],
+            outer(reporter),
             &mut message,
         )
         .unwrap();
         assert_eq!(&message[..2], &[4, code]);
         assert_eq!(&message[4..8], &pointer.to_be_bytes());
         assert_eq!(icmpv6_checksum(reporter, &message[..n]).unwrap(), 0);
-        if code == 0 {
-            let feedback = decode_icmp_quote(&wrap(reporter, &message[..n])).unwrap();
-            assert_eq!(feedback.kind, FeedbackKind::ParameterProblem);
-        }
+        // Every code, RFC 7112's code 3 included, is decoded.
+        let feedback = decode_icmp_quote(&wrap(reporter, &message[..n])).unwrap();
+        assert_eq!(
+            (feedback.kind, feedback.code),
+            (FeedbackKind::ParameterProblem, code)
+        );
+        assert_eq!(
+            feedback.ipv6_network_error(),
+            Some(ntcp::NetworkError::ParameterProblem)
+        );
     }
     assert_eq!(
         encode_error(
@@ -515,6 +533,7 @@ fn ipv6_parameter_problem_codes_and_pointers() {
                 pointer: 0
             },
             &packets[0],
+            outer(reporter),
             &mut [0; 100]
         )
         .unwrap_err(),
@@ -532,6 +551,7 @@ fn ipv6_parameter_problem_codes_and_pointers() {
                 pointer: 4
             },
             &[0x45; 28],
+            outer(v4),
             &mut [0; 100]
         )
         .unwrap_err(),

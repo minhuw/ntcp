@@ -876,3 +876,70 @@ fn source_quiet_assertion_is_validated_and_maps_to_continuity() {
         }
     ));
 }
+
+#[test]
+fn segment_routes_parse_separately_from_route_policies() {
+    const BASE6: &str = "io.interface=ntcp0\nio.address=2001:db8:1::2\n";
+    let default = SocketConfig::parse(BASE6).unwrap();
+    assert!(default.segment_routes.is_empty());
+    let config = SocketConfig::parse(&format!(
+        "{BASE6}ipv6.srh.2001:db8:d::/48=2001:db8:5::1, 2001:db8:6::1\n\
+         ipv6.srh.2001:db8:e::9/128=2001:db8:5::1\n\
+         route.2001:db8:d::9.mtu=1400\n"
+    ))
+    .unwrap();
+    let v6 = |s: &str| s.parse::<std::net::Ipv6Addr>().unwrap();
+    assert_eq!(
+        config.segment_routes,
+        [
+            crate::SegmentRoute {
+                destination: "2001:db8:d::/48".parse().unwrap(),
+                segments: vec![v6("2001:db8:5::1"), v6("2001:db8:6::1")],
+            },
+            crate::SegmentRoute {
+                destination: "2001:db8:e::9/128".parse().unwrap(),
+                segments: vec![v6("2001:db8:5::1")],
+            },
+        ]
+    );
+    assert_eq!(config.routes.len(), 1);
+    let max = (0..126)
+        .map(|i| format!("2001:db8:100:{i:x}::1"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(
+        SocketConfig::parse(&format!("{BASE6}ipv6.srh.2001:db8:d::/48={max}\n"))
+            .unwrap()
+            .segment_routes[0]
+            .segments
+            .len(),
+        126
+    );
+    for suffix in [
+        // Duplicate and ambiguous definitions of one prefix.
+        "ipv6.srh.2001:db8:d::/48=2001:db8:5::1\nipv6.srh.2001:db8:d::/48=2001:db8:6::1".to_string(),
+        "ipv6.srh.2001:db8:d::/48=2001:db8:5::1\nipv6.srh.2001:db8:d:0::/48=2001:db8:6::1".to_string(),
+        // IPv4, scoped, non-canonical or malformed prefixes.
+        "ipv6.srh.192.0.2.0/24=2001:db8:5::1".to_string(),
+        "ipv6.srh.fe80::/64=2001:db8:5::1".to_string(),
+        "ipv6.srh.2001:db8:d::1/48=2001:db8:5::1".to_string(),
+        "ipv6.srh.2001:db8:d::=2001:db8:5::1".to_string(),
+        "ipv6.srh.2001:db8:d::/+48=2001:db8:5::1".to_string(),
+        // Unsupported scoped, multicast, loopback, IPv4 or empty segments.
+        "ipv6.srh.2001:db8:d::/48=fe80::1".to_string(),
+        "ipv6.srh.2001:db8:d::/48=ff02::1".to_string(),
+        "ipv6.srh.2001:db8:d::/48=::1".to_string(),
+        "ipv6.srh.2001:db8:d::/48=::".to_string(),
+        "ipv6.srh.2001:db8:d::/48=192.0.2.1".to_string(),
+        "ipv6.srh.2001:db8:d::/48=2001:db8:5::1,".to_string(),
+        // 127 segments exceed the 8-bit Hdr Ext Len.
+        format!("ipv6.srh.2001:db8:d::/48={max},2001:db8:200::1"),
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE6}{suffix}\n")).is_err(),
+            "{suffix}"
+        );
+    }
+    // An IPv4 interface carries no SR route.
+    assert!(SocketConfig::parse(&format!("{BASE}ipv6.srh.2001:db8:d::/48=2001:db8:5::1\n")).is_err());
+}

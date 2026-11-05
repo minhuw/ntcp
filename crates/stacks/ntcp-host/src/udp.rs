@@ -9,7 +9,7 @@
 
 use crate::emitter::{
     DatagramError, DatagramReport, IPV4_PEER_REASSEMBLY, IPV6_PEER_REASSEMBLY, Piece, Plan,
-    ProbeRecord, UdpDatagramLimits, UdpSend, UdpSendMode, family_max, header_len,
+    ProbeRecord, UdpDatagramLimits, UdpSend, UdpSendMode, family_max,
 };
 use crate::ident::IdentifierBackpressure;
 use crate::ledger::{Evidence, FragmentPrefix, Owner, Selector};
@@ -151,6 +151,10 @@ pub struct UdpPathLimits {
     pub version: u64,
     pub mms_s: u32,
     pub max_payload: usize,
+    /// The complete IP header length H of the route the path selected: the
+    /// base header, and on an SR route its Segment Routing Header. `mms_s`
+    /// and `max_payload` subtract it.
+    pub header_len: usize,
 }
 
 /// Where the one physical call goes; the closure owns no other authority.
@@ -334,22 +338,31 @@ impl Udp {
     }
 }
 
-fn udp_limits(snapshot: ntcp_path::PathSnapshot) -> Result<UdpPathLimits, Error> {
+// `header` is the complete IP header length of the path's route
+// (`Host::header_plan`): the flow's MMS_S is the path budget less it. A
+// budget that no longer holds the indivisible header and the UDP header
+// (an SR route's Segment Routing Header after a PMTU decrease, a lower
+// administrative estimate or link MTU) admits no datagram: Unsupported,
+// never a truncated header, another route or an invented payload size.
+fn udp_limits(snapshot: ntcp_path::PathSnapshot, header: usize) -> Result<UdpPathLimits, Error> {
     let destination = snapshot.key().destination().address();
-    let header = if destination.is_ipv4() {
-        ntcp_ip::IPV4_HEADER
-    } else {
-        ntcp_ip6::IPV6_HEADER
-    };
     let budget = snapshot.ip_packet_budget().map_err(Error::from)? as usize;
+    if budget < header + ntcp_ip::UDP_HEADER {
+        return Err(Error::Unsupported);
+    }
     Ok(UdpPathLimits {
         destination,
         path: snapshot.path(),
         version: snapshot.version(),
-        mms_s: snapshot.mms_s()?,
+        mms_s: snapshot.payload_budget(
+            u32::try_from(header).map_err(|_| Error::Capacity)?,
+            0,
+            None,
+        )?,
         max_payload: budget
             .saturating_sub(header + ntcp_ip::UDP_HEADER)
             .min(usize::from(u16::MAX) - ntcp_ip::UDP_HEADER),
+        header_len: header,
     })
 }
 
@@ -502,11 +515,8 @@ impl Host {
         let (prepared, limits) = self.udp_path(id.slot, flow, remote.ip())?;
         let snapshot = prepared.snapshot;
         let ipv4 = remote.is_ipv4();
-        let header = if ipv4 {
-            ntcp_ip::IPV4_HEADER
-        } else {
-            ntcp_ip6::IPV6_HEADER
-        };
+        let plan = self.header_plan(snapshot.key())?;
+        let header = plan.len;
         let overhead = header + ntcp_ip::UDP_HEADER;
         let max_payload = limits.max_payload;
         if payload.len() > max_payload {
@@ -536,7 +546,7 @@ impl Host {
                 0,
             )
         } else {
-            ntcp_ip6::encode_udp(
+            ntcp_ip6::encode_udp_routed(
                 packet,
                 ntcp_ip6::Header {
                     ip,
@@ -544,6 +554,7 @@ impl Host {
                     dscp,
                     ecn: 0,
                 },
+                plan.segments,
                 flow.local.port(),
                 remote.port(),
                 payload.len(),
@@ -564,7 +575,7 @@ impl Host {
             source: ip.source,
             destination: ip.destination,
             dscp,
-            header_len: header as u16,
+            header_len: header as u32,
             packet_len: len as u32,
             protocol: ntcp_ip::PROTOCOL_UDP,
             transport: Selector::Udp {
@@ -700,9 +711,14 @@ impl Host {
         let current = match flow.path {
             Some(prepared) => {
                 let snapshot = self.paths.snapshot(prepared.client)?;
+                // An SR route derives the forwarding destination S1, which
+                // `forwarding` validates by reselecting.
                 (snapshot.status() == PathStatus::Valid
                     && snapshot.key().request() == request
-                    && snapshot.key().forwarding_destination() == via)
+                    && (snapshot.key().forwarding_destination() == via
+                        || self
+                            .header_plan(snapshot.key())
+                            .is_ok_and(|plan| !plan.segments.is_empty())))
                     .then_some(PreparedPath {
                         client: prepared.client,
                         snapshot,
@@ -725,7 +741,10 @@ impl Host {
                 PreparedPath { client, snapshot }
             }
         };
-        let limits = udp_limits(prepared.snapshot)?;
+        let limits = udp_limits(
+            prepared.snapshot,
+            self.header_plan(prepared.snapshot.key())?.len,
+        )?;
         // Moving the pin to another destination is not a change of that
         // destination's path: a pending change of the old one is reported
         // with its own newest limits, or not at all once it is invalid.
@@ -733,7 +752,14 @@ impl Host {
             Some(old) if old.key().destination() == prepared.snapshot.key().destination() => {
                 Some(limits)
             }
-            Some(old) if old.status() == PathStatus::Valid => Some(udp_limits(old)?),
+            // An old path that no longer admits datagrams has no limits to
+            // report.
+            Some(old) if old.status() == PathStatus::Valid => {
+                match udp_limits(old, self.header_plan(old.key())?.len) {
+                    Err(Error::Unsupported) => None,
+                    limits => Some(limits?),
+                }
+            }
             _ => None,
         };
         let record = self.udp.slots[slot].flow.as_mut().unwrap();
@@ -896,7 +922,8 @@ impl Host {
         bounds: UdpProbeBounds,
     ) -> Result<UdpDatagramLimits, Error> {
         let ipv4 = path.destination.is_ipv4();
-        let overhead = header_len(ipv4) + ntcp_ip::UDP_HEADER;
+        let header = path.header_len;
+        let overhead = header + ntcp_ip::UDP_HEADER;
         let udp_max = usize::from(u16::MAX) - ntcp_ip::UDP_HEADER;
         let floor = if ipv4 {
             IPV4_PEER_REASSEMBLY
@@ -913,7 +940,7 @@ impl Host {
         // multiple of 8 data octets (RFC 791 section 3.2, RFC 8200 section
         // 4.5); `fragment_count` applies the same cut when sending.
         let fragmentable_payload = if send.mode == UdpSendMode::Fragment {
-            let per = header_len(ipv4) + if ipv4 { 0 } else { ntcp_ip6::FRAGMENT_HEADER };
+            let per = header + if ipv4 { 0 } else { ntcp_ip6::FRAGMENT_HEADER };
             let room = (effective_size as usize).saturating_sub(per);
             let fragments = self.datagram_limits.max_fragments;
             let data = if fragments == 0 || room < 8 {
@@ -921,7 +948,7 @@ impl Host {
             } else {
                 (fragments - 1) * (room & !7) + room
             };
-            (header_len(ipv4) + data)
+            (header + data)
                 .min(guarantee as usize)
                 .min(family_max(ipv4))
                 .saturating_sub(overhead)
@@ -1026,7 +1053,7 @@ impl Host {
         let snapshot = prepared.snapshot;
         let limits = self.datagram_limits(snapshot, path, send, flow.bounds)?;
         let ipv4 = remote.is_ipv4();
-        let header = header_len(ipv4);
+        let header = path.header_len;
         let data_len = ntcp_ip::UDP_HEADER + payload.len();
         let complete = header + data_len;
         let budget = snapshot.ip_packet_budget().map_err(Error::from)? as usize;
@@ -1112,7 +1139,7 @@ impl Host {
                         0,
                     )
                 } else {
-                    ntcp_ip6::encode_udp(
+                    ntcp_ip6::encode_udp_routed(
                         packet,
                         ntcp_ip6::Header {
                             ip,
@@ -1120,6 +1147,7 @@ impl Host {
                             dscp,
                             ecn: 0,
                         },
+                        self.header_plan(snapshot.key())?.segments,
                         source_port,
                         destination_port,
                         payload.len(),
@@ -1194,7 +1222,7 @@ impl Host {
                 source: ip.source,
                 destination: ip.destination,
                 dscp,
-                header_len: piece.header_len as u16,
+                header_len: piece.header_len as u32,
                 packet_len: piece.packet_len as u32,
                 protocol: ntcp_ip::PROTOCOL_UDP,
                 transport,

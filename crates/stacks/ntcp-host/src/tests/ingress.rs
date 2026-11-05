@@ -360,6 +360,47 @@ fn echo_requests_are_answered_exactly_whole_or_reassembled() {
     }
 }
 
+// Insert a Destination Options header (one PadN) directly after the base
+// header of an IPv6 packet.
+fn with_destination_options(packet: &[u8]) -> Vec<u8> {
+    let mut out = packet[..40].to_vec();
+    out.extend_from_slice(&[packet[6], 0, 1, 4, 0, 0, 0, 0]);
+    out.extend_from_slice(&packet[40..]);
+    out[6] = 60;
+    let payload = u16::from_be_bytes([out[4], out[5]]) + 8;
+    out[4..6].copy_from_slice(&payload.to_be_bytes());
+    out
+}
+
+// The codec now walks extension chains, but the base-header receive profile
+// has no extension receive policy or variable-prefix reassembly: such
+// packets stay refused, whole or fragmented, and draw no reply.
+#[test]
+fn base_header_profile_refuses_extension_bearing_packets() {
+    let cfg = config(2);
+    let (local, remote) = addresses(true);
+    let mut a = side(local, 66, &cfg, OUTPUT);
+    let to_us = ip(remote.ip(), local.ip());
+    let request = echo(to_us, 0x1234, 78, &[0x5a; 900]);
+    let refused = Error::Codec(ntcp_ip6::Error::ExtensionsUnsupported);
+    let whole = with_destination_options(&request);
+    assert!(ntcp_ip6::parse(&whole).is_ok());
+    assert_eq!(input_frame(&mut a, 1, &whole), Err(refused));
+    assert_eq!(
+        a.0.input_icmp(&mut a.1, a.2, 1, &whole, None).unwrap_err(),
+        refused
+    );
+    for piece in fragments(&request, 22, 304) {
+        let piece = with_destination_options(&piece);
+        assert!(ntcp_ip6::parse_fragment(&piece).is_ok());
+        assert_eq!(input_frame(&mut a, 2, &piece), Err(refused));
+    }
+    assert!(drain(&mut a, 3).is_empty());
+    // The base layout itself is still answered.
+    input_frame(&mut a, 4, &request).unwrap();
+    assert_eq!(drain(&mut a, 5).len(), 1);
+}
+
 #[test]
 fn echo_service_without_output_and_blocked_backends() {
     for v6 in [false, true] {
@@ -463,6 +504,37 @@ fn reassembly_errors_reach_the_icmp_output_through_the_limiter() {
             assert_eq!(a.0.icmp_output_pending(), 0);
         }
     }
+}
+
+// An IPv4 Time Exceeded (at most 576 octets) longer than its path's size
+// is fragmented like other Host ICMP output: re-encoding at drain never
+// grows an IPv4 error's header, unlike an IPv6 error's, which is never
+// fragmented.
+#[test]
+fn ipv4_reassembly_errors_longer_than_the_path_are_fragmented() {
+    const MDL: u64 = 120_000_000;
+    let (local, remote) = addresses(false);
+    let mut a = fragmenting_side(local, 9994, false);
+    a.0.set_link_mtu(a.2.link(), 508).unwrap();
+    let to_us = ip(remote.ip(), local.ip());
+    let complete = udp(to_us, (remote.port(), local.port()), &[9; 2000]);
+    let pieces = fragments(&complete, 34, 1000);
+    input_frame(&mut a, MDL, &pieces[0]).unwrap();
+    let second = config(2).connection.timebase.units_per_second;
+    let expiry = MDL + 60 * second;
+    a.0.service_changes(&mut a.1, expiry).unwrap();
+    let frames = drain_packets(&mut a, expiry).unwrap().unwrap();
+    assert_eq!(frames.len(), 2);
+    for frame in &frames {
+        assert!(frame.len() <= 508);
+        assert_eq!(ntcp_ip_common::checksum(&frame[..20]), 0);
+    }
+    let (outer, message, _) = reconstruct(&frames);
+    assert_eq!(outer, ip(local.ip(), remote.ip()));
+    assert_eq!(&message[..2], [11, 1]);
+    assert_eq!(message.len(), 556);
+    assert_eq!(&message[8..], &pieces[0][..548]);
+    assert_eq!(ntcp_ip_common::checksum(&message), 0);
 }
 
 // One IPv6 fragment as a peer may send it, without the source fragmenter's

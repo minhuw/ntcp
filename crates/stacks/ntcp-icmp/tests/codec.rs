@@ -248,11 +248,18 @@ fn quote_lengths_and_validation() {
             Error::FragmentationUnsupported
         );
         if v6 {
+            // The quoted TCP ports read as an extension header longer than
+            // the declared packet; unsupported selectors end the chain and
+            // leave no TCP quote.
             for next in [0, 43, 50, 51, 60, 135, 139, 140] {
                 bad[6] = next;
                 assert_eq!(
                     decode_icmp(&error_packet(true, &bad)).unwrap_err(),
-                    Error::ExtensionsUnsupported
+                    if matches!(next, 0 | 43 | 60) {
+                        Error::Length
+                    } else {
+                        Error::Quote
+                    }
                 );
             }
         } else {

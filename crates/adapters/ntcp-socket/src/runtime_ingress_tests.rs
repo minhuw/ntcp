@@ -304,6 +304,77 @@ fn native_reassembly_errors_respect_link_layer_group_destinations() {
     }
 }
 
+// `packet` (IPv6, extension-free) with one Destination Options header
+// holding `options` (padded with Pad1) after its base header.
+fn with_destination_options(packet: &[u8], options: &[u8]) -> Vec<u8> {
+    let mut header = vec![packet[6], 0];
+    header.extend_from_slice(options);
+    header.resize(header.len().div_ceil(8) * 8, 0);
+    header[1] = (header.len() / 8 - 1) as u8;
+    let mut ip = packet[..40].to_vec();
+    ip.extend_from_slice(&header);
+    ip.extend_from_slice(&packet[40..]);
+    ip[6] = 60;
+    let payload = (ip.len() - 40) as u16;
+    ip[4..6].copy_from_slice(&payload.to_be_bytes());
+    ip
+}
+
+// Native Ethernet framing delimits IPv6 by its base header alone: a
+// complete packet whose Destination Options the Host refuses reaches Host
+// receive processing and its Parameter Problem (RFC 8200 section 4.2,
+// RFC 4443 section 3.4), including the code 2 exception for a link-layer
+// group destination (RFC 4443 section 2.4(e.3)); physical truncation is
+// dropped by the framing, and an option-bearing request is answered.
+#[test]
+fn native_ethernet_ingress_passes_refused_extension_chains_to_host_errors() {
+    let (mut a, wire) = native(true, 2, 2);
+    let to_us = ntcp::IpMetadata {
+        source: peer(true),
+        destination: a.local,
+    };
+    let request = echo_request(to_us, &[5; 16]);
+    let report = with_destination_options(&request, &[0x9e, 0]);
+    let unless = with_destination_options(&request, &[0xde, 0]);
+    let problems = |a: &mut Owner, frame: Vec<u8>| {
+        deliver(a, &wire, &[frame]);
+        a.service_egress().unwrap();
+        sent_icmp(&wire)
+            .into_iter()
+            .map(|(outer, message)| {
+                assert_eq!(
+                    outer,
+                    ntcp::IpMetadata {
+                        source: a.local,
+                        destination: peer(true)
+                    }
+                );
+                let pointer = u32::from_be_bytes(message[4..8].try_into().unwrap());
+                (message[0], message[1], pointer, message[8..].to_vec())
+            })
+            .collect::<Vec<_>>()
+    };
+    let sent = problems(&mut a, ethernet(UNICAST, true, &unless));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(&sent[0].3[..], &unless[..]);
+    assert_eq!((sent[0].0, sent[0].1, sent[0].2), (4, 2, 42));
+    assert!(problems(&mut a, ethernet(BROADCAST, true, &unless)).is_empty());
+    let sent = problems(&mut a, ethernet(BROADCAST, true, &report));
+    assert_eq!(
+        sent.iter().map(|p| (p.0, p.1, p.2)).collect::<Vec<_>>(),
+        [(4, 2, 42)]
+    );
+    // One octet short of its Payload Length: dropped by framing.
+    let mut short = ethernet(UNICAST, true, &unless);
+    short.truncate(14 + unless.len() - 1);
+    assert!(problems(&mut a, short).is_empty());
+    // Pad options only: the Echo Request is answered.
+    let padded = with_destination_options(&request, &[1, 2, 0, 0]);
+    let sent = problems(&mut a, ethernet(UNICAST, true, &padded));
+    assert_eq!(sent.len(), 1);
+    assert_eq!((sent[0].0, &sent[0].3[..]), (129, &request[48..]));
+}
+
 #[test]
 fn native_fragmented_tcp_is_delivered_and_retained_only_when_complete() {
     for v6 in [false, true] {
@@ -417,4 +488,117 @@ fn native_fragmented_echo_replies_wait_for_the_identifier_quiet_period() {
         (reply.kind, reply.identifier, reply.sequence, reply.data),
         (ntcp_icmp::EchoKind::Reply, 0x7a7a, 3, &data[..])
     );
+}
+
+// Over an owner-configured SR route (`ipv6.srh.*`) the native drain sends
+// Echo Replies, whole and source-fragmented, and Host Parameter Problems
+// with the route's Segment Routing Header: base Destination Address S1,
+// the full segment list with the final destination D in Segment List[0],
+// and ICMPv6 checksums computed with D. An error is cut to 1280 octets.
+#[test]
+fn native_icmp_output_over_a_segment_route_carries_the_srh() {
+    let local: IpAddr = "2001:db8::2".parse().unwrap();
+    let segments: Vec<std::net::Ipv6Addr> =
+        vec!["2001:db8:5::1".parse().unwrap(), "2001:db8:6::1".parse().unwrap()];
+    let mut config = SocketConfig::new("external", local);
+    config.io.prefix = Some(64);
+    config.tcp.connection.timestamps = false;
+    config.segment_routes = vec![crate::SegmentRoute {
+        destination: path::IpPrefix::new(peer(true), 128).unwrap(),
+        segments: segments.clone(),
+    }];
+    let wire = Arc::new(Mutex::new(State {
+        mtu: Some(1500),
+        max_packet_len: Some(2048),
+        ..Default::default()
+    }));
+    let mut a = Owner::external_backend(
+        &config,
+        crate::EthernetPacketIo {
+            io: Box::new(Fixture(wire.clone())),
+            local_mac: [2; 6],
+            next_hop_mac: [4; 6],
+        },
+    )
+    .unwrap();
+    a.test_now = Some(1000);
+    let std::net::IpAddr::V6(d) = peer(true) else {
+        unreachable!()
+    };
+    let h = 40 + 8 + 16 * 3;
+    let reply_ip = ntcp::IpMetadata {
+        source: local,
+        destination: peer(true),
+    };
+    let to_us = ntcp::IpMetadata {
+        source: peer(true),
+        destination: local,
+    };
+    let sent = |wire: &Arc<Mutex<State>>| -> Vec<Vec<u8>> {
+        let frames: Vec<_> = wire.lock().unwrap().sent.drain(..).collect();
+        frames
+            .iter()
+            .map(|frame| {
+                // Ethernet framing by hand: the link parser passes only the
+                // base layout.
+                assert_eq!((&frame[..6], &frame[6..12]), (&[4; 6][..], &[2; 6][..]));
+                assert_eq!(&frame[12..14], &[0x86, 0xdd]);
+                let ip = &frame[14..];
+                let len = 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+                let ip = &ip[..len];
+                assert_eq!(ip[6], 43);
+                assert_eq!(&ip[24..40], &segments[0].octets());
+                assert_eq!(&ip[42..44], &[4, 2]);
+                assert_eq!((ip[41], ip[44]), (6, 2));
+                assert_eq!(&ip[48..64], &d.octets());
+                assert_eq!(&ip[64..80], &segments[1].octets());
+                assert_eq!(&ip[80..96], &segments[0].octets());
+                ip.to_vec()
+            })
+            .collect()
+    };
+    // A whole reply within the connectionless size.
+    let data: Vec<u8> = (0..1000).map(|n| (n * 7) as u8).collect();
+    deliver(&mut a, &wire, &[ethernet(UNICAST, true, &echo_request(to_us, &data))]);
+    a.service_egress().unwrap();
+    let packets = sent(&wire);
+    assert_eq!(packets.len(), 1);
+    assert_eq!((packets[0].len(), packets[0][40]), (h + 8 + 1000, 58));
+    let reply = ntcp_icmp::decode_echo(reply_ip, &packets[0][h..]).unwrap();
+    assert_eq!((reply.kind, reply.data), (ntcp_icmp::EchoKind::Reply, &data[..]));
+    // A larger one leaves as fragments that repeat the SRH.
+    let data: Vec<u8> = (0..1300).map(|n| (n * 3) as u8).collect();
+    deliver(&mut a, &wire, &[ethernet(UNICAST, true, &echo_request(to_us, &data))]);
+    a.test_now = Some(200_000_000);
+    a.service_egress().unwrap();
+    let mut packets = sent(&wire);
+    // The fragmented reply is the Echo adjunct's demand for the SR path:
+    // its probe, an Echo Request carrying the SRH, follows the fragments.
+    let probe = packets.pop().unwrap();
+    assert_eq!((probe[40], probe[h]), (58, 128));
+    assert_eq!(packets.len(), 2);
+    assert_eq!(packets[0].len(), 1280);
+    let mut message = Vec::new();
+    for packet in &packets {
+        assert_eq!(packet[40], 44);
+        message.extend_from_slice(&packet[h + 8..]);
+    }
+    let reply = ntcp_icmp::decode_echo(reply_ip, &message).unwrap();
+    assert_eq!(reply.data, &data[..]);
+    // A Parameter Problem for an unknown option (action 10).
+    let mut request = echo_request(to_us, &[5; 1300]);
+    let payload = u16::from_be_bytes([request[4], request[5]]) + 8;
+    request.splice(40..40, [58, 0, 0x9e, 0, 1, 2, 0, 0]);
+    request[6] = 60;
+    request[4..6].copy_from_slice(&payload.to_be_bytes());
+    deliver(&mut a, &wire, &[ethernet(UNICAST, true, &request)]);
+    a.service_egress().unwrap();
+    let packets = sent(&wire);
+    assert_eq!(packets.len(), 1);
+    let error = &packets[0];
+    assert_eq!((error.len(), error[40]), (1280, 58));
+    assert_eq!((error[h], error[h + 1]), (4, 2));
+    assert_eq!(&error[h + 4..h + 8], &42u32.to_be_bytes());
+    assert_eq!(ntcp_icmp::icmpv6_checksum(reply_ip, &error[h..]), Ok(0));
+    assert_eq!(&error[h + 8..], &request[..1280 - h - 8]);
 }

@@ -619,6 +619,8 @@ struct Owner {
     ipv4_clock: backend::Ipv4Clock,
     defaults: EndpointConfig,
     socket_policy: crate::SocketPolicy,
+    // Installed with every Host this owner attaches.
+    segment_routes: Vec<crate::SegmentRoute>,
     // The operator's assertion about earlier emission from `local`
     // (`io.source_quiet`), applied when the Host's allocator starts.
     source_quiet: crate::SourceQuiet,
@@ -760,6 +762,7 @@ impl Owner {
         // Startup setup consumes lease time; it must not shift that origin or
         // grant a fresh interval when backend initialization completes later.
         self.source_quiet = config.io.source_quiet;
+        self.segment_routes = config.segment_routes.clone();
         self.apply_socket_config_at(config, 0)
     }
 
@@ -939,6 +942,7 @@ impl Owner {
             ipv4_clock: Default::default(),
             defaults,
             socket_policy: crate::SocketPolicy::default(),
+            segment_routes: Vec::new(),
             source_quiet: crate::SourceQuiet::Unknown,
             tun,
             ethernet: None,

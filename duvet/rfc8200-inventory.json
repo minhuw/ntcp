@@ -34,7 +34,7 @@
       "id": "8200-length", "section": "3",
       "quote": "Payload Length 16-bit unsigned integer. Length of the IPv6 payload, i.e., the rest of the packet following this IPv6 header, in octets. (Note that any extension headers (see Section 4) present are considered part of the payload, i.e., included in the length count.)",
       "status": "covered",
-      "reason": "Declared base-packet length is 40 plus the full unsigned 16-bit field, including zero; complete frames require exact bounds and checked quotes retain the original length when truncated. Extension headers, including Jumbo Payload options, remain explicitly unsupported under the existing scope.",
+      "reason": "Declared packet length is 40 plus the full unsigned 16-bit field, including zero, and bounds every extension header, which is counted inside it; complete frames require exact bounds and checked quotes retain the original length when truncated. Jumbo Payload options remain unsupported and are refused as unrecognized options.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
       "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn ipv6_bounds(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn payload_length_zero_and_no_next_header_boundaries()"]
     },
@@ -42,7 +42,7 @@
       "id": "8200-next", "section": "3",
       "quote": "Next Header 8-bit selector. Identifies the type of header immediately following the IPv6 header. Uses the same values as the IPv4 Protocol field [IANA-PN].",
       "status": "covered",
-      "reason": "Encoder emits TCP protocol 6; parser and checked quotes expose the exact selector for non-extension protocols. Known extension/fragment selectors are rejected explicitly by the atomic parser and quote decoder; only the separate fragment API admits a Fragment header. This field-format evidence does not claim extension traversal, unknown-protocol ICMP generation or full host demultiplexing; No Next Header processing is separately traced.",
+      "reason": "Encoder emits TCP protocol 6; parser and checked quotes expose the exact selector for non-extension protocols. Hop-by-Hop, Routing, Fragment and Destination Options selectors are traversed by one bounded chain walker that reports the terminal selector and the offset of the Next Header octet holding it; the extension receive profile that both supplied embeddings select answers an unrecognized terminal selector with Parameter Problem code 1 at that octet, while the explicit base-header profile still refuses extension-bearing layouts. Beyond that code 1 answer, this field-format evidence does not claim full host demultiplexing; No Next Header processing is separately traced.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
       "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn quote_header(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
     },
@@ -66,7 +66,7 @@
       "id": "8200-destination", "section": "3",
       "quote": "Destination Address 128-bit address of the intended recipient of the packet (possibly not the ultimate recipient, if a Routing header is present). See [RFC4291] and Section 4.4.",
       "status": "covered",
-      "reason": "The complete base-header address field is preserved by encode, parse and checked quotes. The routing qualification is retained in the quotation: routing-header processing and ultimate-destination derivation are unsupported, not claimed by this direct base-field codec evidence.",
+      "reason": "The complete base-header address field is preserved by encode, parse and checked quotes. The routing qualification is retained in the quotation: received packets with Segments Left above zero are refused, and checked quotes derive the final destination separately from this field by Routing type (Type 0 last address, Segment Routing Header Segment List[0], unknown types unresolved). Intermediate-node routing is not claimed by this direct base-field codec evidence.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-3",
       "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::fn encode_present(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn base_header_fields_and_checked_quotes()"]
     },
@@ -74,7 +74,7 @@
       "id": "8200-no-next", "section": "4.7",
       "quote": "The value 59 in the Next Header field of an IPv6 header or any extension header indicates that there is nothing following that header. If the Payload Length field of the IPv6 header indicates the presence of octets past the end of a header whose Next Header field contains 59, those octets must be ignored and passed on unchanged if the packet is forwarded.",
       "status": "covered",
-      "reason": "For base selector 59, empty and positive-length packets expose no transport payload after exact declared-bound checks; the borrowed input bytes and quoted length/protocol remain intact. Extension traversal and forwarding remain outside the existing endpoint scope.",
+      "reason": "Selector 59 in the base header or any traversed extension header ends the chain after exact declared-bound checks: no transport payload is exposed and the borrowed input bytes and quoted length/protocol remain intact. Forwarding remains outside the existing endpoint scope.",
       "target": "https://www.rfc-editor.org/rfc/rfc8200#section-4.7",
       "evidence": ["crates/stacks/ntcp-ip6/src/lib.rs::pub fn parse(", "crates/stacks/ntcp-ip6/tests/codec.rs::fn payload_length_zero_and_no_next_header_boundaries()"]
     },
@@ -82,7 +82,7 @@
       "id": "8200-extension-boundary", "section": "4",
       "quote": "A full implementation of IPv6 includes implementation of the following extension headers: Hop-by-Hop Options Fragment Destination Options Routing Authentication Encapsulating Security Payload",
       "status": "context",
-      "reason": "Explicit full-host boundary: the selected codec rejects these headers, except that its fragment API parses and encodes a Fragment header directly after the base header, and does not claim a full IPv6 implementation. This context is not an exception closing a selected base-header defect. Host fragmentation/reassembly, routing, security headers and jumbograms remain unsupported."
+      "reason": "Explicit full-host boundary: one bounded chain walker frames Hop-by-Hop Options, Routing, Fragment and Destination Options headers, applies unknown-option actions and refuses Routing headers with Segments Left above zero on receive, while Authentication and Encapsulating Security Payload end the chain as unsupported selectors that the Host's extension receive profile answers with Parameter Problem code 1; that profile, selected by both supplied embeddings, processes these headers before reassembly and after it, and the explicit base-header profile still refuses extension-bearing packets. It does not claim a full IPv6 implementation. This context is not an exception closing a selected base-header defect. Security headers, forwarding and jumbograms remain unsupported."
     },
     {
       "id": "8200-traffic-context", "section": "7",

@@ -76,6 +76,42 @@ def ping(family, remote, size, salt, wait):
                         sha256=hashlib.sha256(body[8:]).hexdigest())
 
 
+def ext_ping(remote, optname, header, size, salt, wait, source=None):
+    """One ICMPv6 Echo Request carrying the Linux-originated extension
+    header HEADER (RFC 3542 sticky IPV6_HOPOPTS or IPV6_DSTOPTS; the kernel
+    sets its Next Header), from SOURCE when given. Returns the Echo Reply, or the first ICMPv6 error
+    from REMOTE quoting this request (type, code, pointer), or neither."""
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+    with s:
+        s.setsockopt(socket.IPPROTO_IPV6, optname, header)
+        if source:
+            s.bind((source, 0))
+        identifier, sequence = (0x5100 + salt) & 0xffff, salt & 0xffff
+        data = pattern(size, salt)
+        message = struct.pack("!BBHHH", 128, 0, 0, identifier, sequence) + data
+        assert s.sendto(message, (remote, 0)) == len(message)
+        deadline = time.monotonic() + wait
+        while (left := deadline - time.monotonic()) > 0:
+            s.settimeout(left)
+            try:
+                body, source = s.recvfrom(65575)
+            except socket.timeout:
+                break
+            if source[0] != remote or len(body) < 8:
+                continue
+            if body[0] == 129 and struct.unpack_from("!HH", body, 4) == (identifier, sequence):
+                return dict(event="xping", reply=len(body) - 8, match=body[8:] == data, error=None)
+            # An error quotes the invoking request: its Echo identifier and
+            # sequence follow the quoted base and extension headers.
+            if body[0] < 128 and len(body) >= 8 + 40 + len(header) + 8:
+                inner = body[8 + 40 + len(header):]
+                if inner[0] == 128 and struct.unpack_from("!HH", inner, 4) == (identifier, sequence):
+                    return dict(event="xping", reply=None, error=dict(
+                        type=body[0], code=body[1], pointer=struct.unpack_from("!I", body, 4)[0],
+                        quoted_next_header=body[8 + 6], quoted_option=body[8 + 40:8 + 40 + len(header)].hex()))
+        return dict(event="xping", reply=None, error=None)
+
+
 def emit(**data):
     print(json.dumps(data, sort_keys=True), flush=True)
 
@@ -154,10 +190,16 @@ def main():
             emit(event="drain", datagrams=received)
         elif fields[0] == "ping":
             emit(**ping(family, remote, int(fields[1]), int(fields[2]), float(fields[3])))
-        elif fields[0] == "tcp":
+        elif fields[0] == "xping":
+            # OPTNAME (54 Hop-by-Hop, 59 Destination Options) and its header.
+            emit(**ext_ping(remote, int(fields[1]), bytes.fromhex(fields[2]), int(fields[3]), int(fields[4]),
+                            float(fields[5])))
+        elif fields[0] in ("tcp", "tcpfrom"):
+            # tcpfrom: the same echo stream from another local address.
+            source = fields.pop(1) if fields[0] == "tcpfrom" else local
             size, salt = int(fields[1]), int(fields[2])
             data = pattern(size, salt)
-            with socket.create_connection((remote, port), timeout=25, source_address=(local, 0)) as s:
+            with socket.create_connection((remote, port), timeout=25, source_address=(source, 0)) as s:
                 local_port = s.getsockname()[1]
                 s.sendall(data)
                 s.shutdown(socket.SHUT_WR)

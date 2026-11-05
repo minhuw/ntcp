@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 pub(crate) fn header_len(ip: IpAddr) -> usize {
     if ip.is_ipv4() { 20 } else { 40 }
 }
@@ -83,6 +83,11 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Packet<'_>, ntcp_ip_common::Error> {
         }
         6 => {
             let p = ntcp_ip6::parse(bytes)?;
+            // Like the IPv4 branch, no destination processing happens here,
+            // so only the base layout is accepted.
+            if !p.base_layout() {
+                return Err(ntcp_ip_common::Error::ExtensionsUnsupported);
+            }
             Ok(Packet {
                 ip: p.ip,
                 traffic_class: p.traffic_class,
@@ -94,16 +99,42 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Packet<'_>, ntcp_ip_common::Error> {
         _ => Err(ntcp_ip_common::Error::Version),
     }
 }
+// `segments` S1..Sn of the IPv6 path's SR route (`Host::header_plan`) put
+// a Segment Routing Header before the `present` resident TCP octets.
 pub(crate) fn encode(
     bytes: &mut [u8],
     tx: ntcp::Transmit,
+    segments: &[Ipv6Addr],
     timestamp: u32,
     present: usize,
 ) -> Result<usize, ntcp_ip_common::Error> {
     match (tx.ip.source.is_ipv4(), present == tx.len) {
         (true, true) => ntcp_ip::encode(bytes, tx, timestamp),
         (true, false) => ntcp_ip::encode_shared_header(bytes, tx, timestamp, present),
-        (false, true) => ntcp_ip6::encode(bytes, tx),
-        (false, false) => ntcp_ip6::encode_shared_header(bytes, tx, present),
+        (false, _) => ntcp_ip6::encode_tcp_routed(bytes, tx, segments, present),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The codec walks extension chains, but this parser does no destination
+    // processing: only the base layout passes.
+    #[test]
+    fn hostless_parser_refuses_extension_bearing_ipv6() {
+        let mut base = vec![0; 60];
+        base[..8].copy_from_slice(&[0x60, 0, 0, 0, 0, 20, 6, 64]);
+        base[23] = 1;
+        base[39] = 2;
+        assert_eq!(super::parse(&base).unwrap().payload.len(), 20);
+        let mut extended = base[..40].to_vec();
+        extended.extend_from_slice(&[6, 0, 1, 4, 0, 0, 0, 0]);
+        extended.extend_from_slice(&base[40..]);
+        extended[5] = 28;
+        extended[6] = 60;
+        assert!(ntcp_ip6::parse(&extended).is_ok());
+        assert_eq!(
+            super::parse(&extended).unwrap_err(),
+            ntcp_ip_common::Error::ExtensionsUnsupported
+        );
     }
 }

@@ -48,14 +48,6 @@ quote = '''
 Note that Path MTU Discovery must be performed even in cases where a node "thinks" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.
 '''
 
-# 8201-050
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
-reason = "T7 PathService checks complete caller-provided IPv6 header budgets; T8 Host applies actual base-header budgets in native/TUN factories and reserved submission, and T10 Host UDP flows read MMS_S. T13 supplies source fragmentation and reassembly: Host::udp_send_datagram's Fragment mode bounds a datagram by the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and creates fragments each limited by the connectionless effective size (never above the PMTU); Refuse mode and TCP keep EMTU_S at the PMTU (TCP never source-fragments); Host::reassembly_capacity states this Host's own EMTU_R and MMS_R. T16 implements the receive-side indication by which this Host's upper layer states its reassembly limit to the peer: every managed TCP factory (active, Fast Open, passive child and TIME-WAIT replacement) advertises the MSS Host::receive_ip_capability derives from EMTU_R, the largest live link enabled for IPv6 and the 65575-octet wire limit, less the 40-octet IPv6 and 20-octet TCP base headers (a TCP payload unit differing from both EMTU_R and MMS_R), independently of the send PMTU, as ntcp-host src/tests/receive_capability.rs, tun_echo's SYN/SYN-ACK tests in both families and the integration/rfc_host mss case's captured IPv6 offers from a two-link Host with genuine reassembly verify (1191-024). Remaining: T17 owns complete IPv6 extension-header parsing and encoding, so MMS_S subtracts extension headers beyond the Fragment header. Source fragmentation is conditional in the preserved whole quote."
-quote = '''
-MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see "Fragment Header", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.
-'''
-
 # 8201-052
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
@@ -104,14 +96,6 @@ quote = '''
 For source-routed packets (i.e. packets containing an IPv6 Routing header [RFC8200]), the source route may further qualify the local representation of a path.
 '''
 
-# 8201-060
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "The IPv6 quote decoder accepts no extension header other than a Fragment header directly after the base header and does not locate the final destination through a Routing Header/Segments Left. This is a concrete unsupported-header gap, not generic cache fanout."
-quote = '''
-Note: if the original packet contained a Routing header, the Routing header should be used to determine the location of the destination address within the original packet. If Segments Left is equal to zero, the destination address is in the Destination Address field in the IPv6 header. If Segments Left is greater than zero, the destination address is the last address (Address[n]) in the Routing header.
-'''
-
 # 8201-061
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
@@ -139,7 +123,7 @@ A loss caused by a PMTU probe indicated by the reception of a Packet Too Big mes
 # 8201-077
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
-reason = "Actor not implemented: no transport in this stack has a stack-managed non-repacketizing retransmission algorithm (TCP repacketizes its retransmissions and never enters source fragmentation). The Host IP layer does fragment: Host::udp_send_datagram's Fragment mode source-fragments a UDP datagram larger than the connectionless effective size (base header, Fragment header, upper layer; every fragment within that size), so a datagram application that resends a datagram unchanged has it fragmented by the Host."
+reason = "Actor not implemented: no transport in this stack has a stack-managed non-repacketizing retransmission algorithm (TCP repacketizes its retransmissions and never enters source fragmentation). The Host IP layer does fragment: Host::udp_send_datagram's Fragment mode source-fragments a UDP datagram larger than the connectionless effective size (every fragment repeats the base header and on an owner-configured Segment Routing route its Segment Routing Header before the Fragment header, and the first fragment holds the complete upper-layer header; every fragment within that size), so a datagram application that resends a datagram unchanged has it fragmented by the Host."
 quote = '''
 Some transport protocols are not allowed to repacketize when doing a retransmission. That is, once an attempt is made to transmit a segment of a certain size, the transport cannot split the contents of the segment into smaller segments for retransmission. In such a case, the original segment can be fragmented by the IP layer during retransmission. Subsequent segments, when transmitted for the first time, should be no larger than allowed by the Path MTU.
 '''

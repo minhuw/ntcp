@@ -3077,24 +3077,51 @@ impl Connection {
                 )
             });
         local.min(self.managed_path.map_or(usize::MAX, |path| {
-            path.snapshot.ip_packet_budget().unwrap_or(0)
+            self.managed_ip_budget(path)
                 .saturating_sub(u32::from(self.ip_header_len)) as usize
         }))
     }
 
     fn managed_payload_mss(&self) -> usize {
         self.managed_path.map_or(usize::MAX, |path| {
-            path.snapshot.ip_packet_budget().unwrap_or(0)
+            self.managed_ip_budget(path)
                 .saturating_sub(u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 })
                 .max(1) as usize
         })
     }
 
-    /// Whether `budget` complete IP octets still carry this connection's IP
-    /// header (options included), its TCP header with every option it sends
-    /// and one payload octet.
-    pub(crate) fn represents_budget(&self, budget: u32) -> bool {
-        budget >= u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 } + 1
+    // The path's packet budget for this connection. Without discovery an
+    // IPv6 connection keeps every complete packet within the IPv6 minimum
+    // link MTU, whose payload ceiling `send_ip_payload_limit` states only
+    // for the base header: an SR route's Segment Routing Header counts too.
+    fn managed_ip_budget(&self, path: crate::PreparedPath) -> u32 {
+        let budget = path.snapshot.ip_packet_budget().unwrap_or(0);
+        if self.pmtud.is_none() && !self.tuple.local.is_ipv4() {
+            budget.min(min_mtu(false))
+        } else {
+            budget
+        }
+    }
+
+    // The complete IP header this connection's packets carry on `path`: its
+    // IPv4 header with options, or the path's IPv6 header (the base header
+    // and an SR route's Segment Routing Header).
+    fn path_ip_header_len(&self, path: crate::PreparedPath) -> u16 {
+        if self.tuple.local.is_ipv4() {
+            self.ip_header_len
+        } else {
+            path.snapshot.ip_header_len() as u16
+        }
+    }
+
+    /// Whether the packet budget of `path` still carries this connection's
+    /// complete IP header on it (options and extension headers included),
+    /// its TCP header with every option it sends and one payload octet.
+    pub(crate) fn represents_budget(&self, path: crate::PreparedPath) -> bool {
+        path.snapshot.ip_packet_budget().is_ok_and(|budget| {
+            budget
+                >= u32::from(self.path_ip_header_len(path)) + 20 + if self.timestamps { 12 } else { 0 } + 1
+        })
     }
 
     /// Read-only check that `apply_managed_budget(path)` succeeds (the same
@@ -3152,6 +3179,9 @@ impl Connection {
             self.managed_results.confirmed = None;
         }
         self.managed_path = Some(path);
+        // A replacement route may add, change or drop a Segment Routing
+        // Header: every later packet is sized for the new path's header.
+        self.ip_header_len = self.path_ip_header_len(path);
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
         let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
         let local = self.pmtud.as_ref().map_or(usize::MAX, |p| {

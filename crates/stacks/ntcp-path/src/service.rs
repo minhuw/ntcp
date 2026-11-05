@@ -1,5 +1,9 @@
-use alloc::vec::Vec;
-use core::{cmp::Reverse, mem::size_of, net::IpAddr};
+use alloc::{boxed::Box, vec::Vec};
+use core::{
+    cmp::Reverse,
+    mem::size_of,
+    net::{IpAddr, Ipv6Addr},
+};
 
 use crate::{Error, Ipv4Plateaus};
 
@@ -42,6 +46,8 @@ handle!(SourceId);
 handle!(RouteId);
 
 mod cache;
+#[cfg(test)]
+mod segment_route_tests;
 pub use cache::*;
 
 /// Authoritative embedding interface key, independent of a source IP address.
@@ -95,6 +101,45 @@ impl ScopedAddress {
     }
 }
 
+/// Largest SR segment list: the Segment Routing Header carries the n
+/// segments and the final destination as 16-octet entries, and its 8-bit
+/// Hdr Ext Len counts 8-octet units after the first 8 (RFC 8200 4.4), so
+/// 2(n + 1) <= 255.
+pub(crate) const MAX_SEGMENTS: usize = 126;
+
+/// Whether `segments` S1..Sn may be configured for SR routes to
+/// `destination` (`PathService::add_segment_route`): an IPv6 prefix of
+/// final destinations beyond the link, and 1..=`MAX_SEGMENTS` segments
+/// each forwarded to beyond this link, so no scoped, multicast, loopback or
+/// unspecified address names an SR node. Embeddings check configuration
+/// with it before installation.
+pub fn check_segment_route(destination: IpPrefix, segments: &[Ipv6Addr]) -> Result<(), Error> {
+    if segments.is_empty()
+        || segments.len() > MAX_SEGMENTS
+        || !destination.network.is_ipv6()
+        || destination.scoped()
+        || segments.iter().any(|s| {
+            s.is_unspecified() || s.is_multicast() || s.is_loopback() || s.is_unicast_link_local()
+        })
+    {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(())
+}
+
+// Validated and fallibly allocated before any route mutation.
+fn segment_list(route: Route, segments: &[Ipv6Addr]) -> Result<Box<[Ipv6Addr]>, Error> {
+    if segments.is_empty() {
+        return Ok(Box::default());
+    }
+    check_segment_route(route.destination, segments)?;
+    let mut list = Vec::new();
+    list.try_reserve_exact(segments.len())
+        .map_err(|_| Error::Allocation)?;
+    list.extend_from_slice(segments);
+    Ok(list.into_boxed_slice())
+}
+
 fn is_link_local(address: IpAddr) -> bool {
     matches!(address, IpAddr::V6(v) if v.is_unicast_link_local())
 }
@@ -132,6 +177,21 @@ impl IpPrefix {
     }
     fn scoped(self) -> bool {
         self.length >= 10 && is_link_local(self.network)
+    }
+}
+
+/// `address/length` with a canonical network, as `IpPrefix::new`.
+impl core::str::FromStr for IpPrefix {
+    type Err = Error;
+    fn from_str(text: &str) -> Result<Self, Error> {
+        let (network, length) = text.split_once('/').ok_or(Error::InvalidArgument)?;
+        if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::InvalidArgument);
+        }
+        Self::new(
+            network.parse().map_err(|_| Error::InvalidArgument)?,
+            length.parse().map_err(|_| Error::InvalidArgument)?,
+        )
     }
 }
 
@@ -396,6 +456,9 @@ pub struct PathService {
     clients: Table<Client>,
     // Owner policy per route slot, preallocated beside the route table.
     route_admin: Vec<RouteAdmin>,
+    // Immutable SR segment list S1..Sn of the route in the same slot and
+    // generation; empty for an ordinary route. Cleared with the route.
+    route_segments: Vec<Box<[Ipv6Addr]>>,
     // A shared nonwrapping generation domain prevents reuse after deletion.
     generation: u64,
     revision: u64,
@@ -416,6 +479,7 @@ impl PathService {
             (limits.paths, size_of::<Slot<CachedPath>>()),
             (limits.clients, size_of::<Slot<Client>>()),
             (limits.routes, size_of::<RouteAdmin>()),
+            (limits.routes, size_of::<Box<[Ipv6Addr]>>()),
         ] {
             bytes = bytes
                 .checked_add(count.checked_mul(size).ok_or(Error::Capacity)?)
@@ -436,6 +500,15 @@ impl PathService {
                     .try_reserve_exact(limits.routes)
                     .map_err(|_| Error::Allocation)?;
                 records.resize(limits.routes, RouteAdmin::default());
+                records
+            },
+            route_segments: {
+                let mut records = Vec::new();
+                records
+                    .try_reserve_exact(limits.routes)
+                    .map_err(|_| Error::Allocation)?;
+                // Empty boxed slices do not allocate.
+                records.resize_with(limits.routes, Box::default);
                 records
             },
             generation: 0,
@@ -544,9 +617,10 @@ impl PathService {
         self.link(link)?;
         let revision = self.next_revision()?;
         self.links.slots[link.0.slot].value = None;
-        for slot in &mut self.routes.slots {
-            if slot.value.is_some_and(|r| r.link == link) {
-                slot.value = None;
+        for (slot, record) in self.routes.slots.iter_mut().enumerate() {
+            if record.value.is_some_and(|r| r.link == link) {
+                record.value = None;
+                self.route_segments[slot] = Box::default();
             }
         }
         for slot in &mut self.owners.slots {
@@ -730,12 +804,29 @@ impl PathService {
     }
 
     pub fn add_route(&mut self, route: Route) -> Result<RouteId, Error> {
+        self.add_segment_route(route, &[])
+    }
+
+    /// A Segment Routing route (RFC 8754 4.1, an SR source node, as Linux
+    /// seg6 inline encapsulation): a packet whose final destination D the
+    /// route selects carries a Segment Routing Header listing `segments`
+    /// S1..Sn and D, and is forwarded towards S1 over the route's link and
+    /// next hop. The list is immutable for the route generation; an empty
+    /// list is an ordinary route. IPv6 only, at most `MAX_SEGMENTS` unscoped
+    /// unicast segments; the list is allocated before anything changes.
+    pub fn add_segment_route(
+        &mut self,
+        route: Route,
+        segments: &[Ipv6Addr],
+    ) -> Result<RouteId, Error> {
         self.validate_route(route)?;
+        let list = segment_list(route, segments)?;
         self.check_duplicate(route, None)?;
         let slot = self.routes.free()?;
         let generation = self.next_generation()?;
         let revision = self.next_revision()?;
         let id = RouteId(self.routes.insert(self.context, slot, generation, route));
+        self.route_segments[slot] = list;
         self.generation = generation;
         self.commit_revision(revision);
         Ok(id)
@@ -743,6 +834,13 @@ impl PathService {
 
     pub fn route(&self, route: RouteId) -> Result<Route, Error> {
         self.routes.get(self.context, route.0)
+    }
+
+    /// The segment list S1..Sn of a live route generation; empty for an
+    /// ordinary route.
+    pub fn route_segments(&self, route: RouteId) -> Result<&[Ipv6Addr], Error> {
+        self.route(route)?;
+        Ok(&self.route_segments[route.0.slot])
     }
 
     /// Replacement always creates fresh authority, even for identical text.
@@ -757,9 +855,13 @@ impl PathService {
     /// exactly what a stored estimate means after `set_link_mtu` lowers its
     /// link: it caps nothing above the first hop, and search targets are
     /// clipped by the first hop.
+    /// The replacement is an ordinary route: an SR route's segment list ends
+    /// with its generation. A failed replacement changes no route,
+    /// generation, segment list or administrative policy.
     pub fn replace_route(&mut self, old: RouteId, route: Route) -> Result<RouteId, Error> {
         self.route(old)?;
         self.validate_route(route)?;
+        let list = segment_list(route, &[])?;
         self.check_duplicate(route, Some(old))?;
         let generation = self.next_generation()?;
         let revision = self.next_revision()?;
@@ -768,6 +870,7 @@ impl PathService {
             self.routes
                 .insert(self.context, old.0.slot, generation, route),
         );
+        self.route_segments[old.0.slot] = list;
         self.generation = generation;
         self.commit_revision(revision);
         Ok(id)
@@ -777,6 +880,7 @@ impl PathService {
         self.route(route)?;
         let revision = self.next_revision()?;
         self.routes.slots[route.0.slot].value = None;
+        self.route_segments[route.0.slot] = Box::default();
         self.commit_revision(revision);
         Ok(())
     }
@@ -818,6 +922,9 @@ impl PathService {
         for slot in &mut self.routes.slots {
             slot.value = None;
         }
+        for segments in &mut self.route_segments {
+            *segments = Box::default();
+        }
         for (i, &route) in routes.iter().enumerate() {
             self.routes
                 .insert(self.context, i, self.generation + i as u64 + 1, route);
@@ -828,16 +935,29 @@ impl PathService {
         Ok(())
     }
 
+    /// Selects by the final destination. A selected SR route derives the
+    /// forwarding destination S1 from its segment list.
     pub fn resolve(&self, request: PathRequest) -> Result<ResolvedPath, Error> {
-        self.resolve_via(request, request.destination)
+        self.select(request, None)
     }
 
     /// Explicit originating source-route context, never inferred from ingress.
     /// Both final and forwarding destinations participate in canonical identity.
+    /// A forwarding destination equal to the final destination is `resolve`;
+    /// any other selects by the forwarding destination among ordinary routes
+    /// only, since an SR route's prefix describes final destinations.
     pub fn resolve_via(&self, request: PathRequest, forwarding_destination: ScopedAddress) -> Result<ResolvedPath, Error> {
+        self.select(
+            request,
+            (forwarding_destination != request.destination).then_some(forwarding_destination),
+        )
+    }
+
+    fn select(&self, request: PathRequest, explicit: Option<ScopedAddress>) -> Result<ResolvedPath, Error> {
+        let matched = explicit.unwrap_or(request.destination);
         let source = self.source_address(request.source)?;
-        self.check_address(forwarding_destination)?;
-        if forwarding_destination.address.is_ipv4() != request.destination.address.is_ipv4() {
+        self.check_address(matched)?;
+        if matched.address.is_ipv4() != request.destination.address.is_ipv4() {
             return Err(Error::InvalidArgument);
         }
         self.check_address(source)?;
@@ -863,13 +983,17 @@ impl PathService {
             let Some(route) = record.value else {
                 continue;
             };
-            if !route.destination.contains(forwarding_destination.address)
+            let segment_route = !self.route_segments[slot].is_empty();
+            if !route.destination.contains(matched.address)
+                // An SR route carries final destinations of its prefix; a
+                // scoped destination's scope ends at its own link.
+                || (segment_route && (explicit.is_some() || request.destination.zone.is_some()))
                 || route.source.is_some_and(|p| !p.contains(source.address))
                 || route.dscp.is_some_and(|d| d != request.dscp)
                 // A scoped source may reach an unscoped destination, but only
                 // through its authoritative link, irrespective of precedence.
                 || source.zone.is_some_and(|zone| zone != route.link)
-                || forwarding_destination.zone.is_some_and(|zone| zone != route.link)
+                || matched.zone.is_some_and(|zone| zone != route.link)
                 || request
                     .destination
                     .zone
@@ -890,6 +1014,14 @@ impl PathService {
         }
         let (id, route) = selected.ok_or(Error::NoRoute)?;
         let link = self.link(route.link)?;
+        let forwarding_destination = match self.route_segments[id.0.slot].first() {
+            // Segments are unscoped unicast (`segment_list`).
+            Some(&first) => ScopedAddress {
+                address: IpAddr::V6(first),
+                zone: None,
+            },
+            None => matched,
+        };
         Ok(ResolvedPath {
             key: PathKey {
                 context: self.context,
@@ -919,8 +1051,14 @@ impl PathService {
             return Err(Error::ForeignContext);
         }
         self.link(key.link)?;
-        self.route(key.route)?;
-        let current = self.resolve_via(key.request(), key.forwarding_destination)?;
+        // An SR route generation's segments are immutable: reselect by the
+        // final destination and compare the derived S1 with the rest of the
+        // key, never matching S1 against the route's destination prefix.
+        let current = if self.route_segments(key.route)?.is_empty() {
+            self.resolve_via(key.request(), key.forwarding_destination)?
+        } else {
+            self.resolve(key.request())?
+        };
         if current.key != key {
             return Err(Error::SelectionChanged);
         }

@@ -168,7 +168,9 @@ pub(crate) enum Discard {
     Overlap,
     /// IPv4 overlap with different octets: the assembly is discarded.
     Conflict,
-    /// Final boundaries disagree, or data lies beyond the final length.
+    /// Final boundaries disagree, or data lies beyond the final length or,
+    /// once IPv6 fragment zero supplies the unfragmentable part, beyond the
+    /// largest Payload Length.
     Contradiction,
     /// IPv4 copied options differ from the assembly's.
     Options,
@@ -196,14 +198,24 @@ pub(crate) struct Piece<'a> {
     pub source: IpAddr,
     pub destination: IpAddr,
     /// IPv4 Protocol, or the IPv6 Fragment header's Next Header, which only
-    /// fragment zero's selects the reconstructed upper layer.
+    /// fragment zero's selects the header that follows the unfragmentable
+    /// part in the reconstructed packet.
     pub protocol: u8,
+    /// IPv6: offset of the Next Header octet that selected the Fragment
+    /// header (the base header's or the last unfragmentable extension's).
+    pub selector: usize,
+    /// IPv6 fragment zero: the protocol ending its header chain and that
+    /// header's offset within `data` (after any extension headers that
+    /// follow the Fragment header).
+    pub upper_protocol: u8,
+    pub upper: usize,
     pub identification: u32,
     pub offset: u32,
     pub more: bool,
     pub ecn: u8,
-    /// The actual header as received: IPv4 with its options, IPv6 the base
-    /// header and the Fragment header.
+    /// The actual header as received: IPv4 with its options, IPv6 the
+    /// unfragmentable part (the base header and the extension headers
+    /// before the Fragment header) and the Fragment header.
     pub header: &'a [u8],
     pub data: &'a [u8],
 }
@@ -218,23 +230,31 @@ impl<'a> Piece<'a> {
             offset: u32::from(packet.fragmentation.offset),
             more: packet.fragmentation.more_fragments,
             ecn: packet.traffic_class & 3,
+            selector: 0,
+            upper_protocol: packet.protocol,
+            upper: 0,
             header: packet.header,
             data: packet.payload,
         }
     }
-    /// None for a packet without a Fragment header.
-    pub fn ipv6(packet: &ntcp_ip6::FragmentPacket<'a>) -> Option<Self> {
-        let fragment = packet.fragment?;
+    /// The received IPv6 packet `frame` whose chain the walker validated;
+    /// None without a Fragment header.
+    pub fn ipv6(frame: &'a [u8], chain: &ntcp_ip6::Chain<'a>) -> Option<Self> {
+        let fragment = chain.fragment()?;
+        let address = |b: &[u8]| IpAddr::from(<[u8; 16]>::try_from(b).unwrap());
         Some(Self {
-            source: packet.ip.source,
-            destination: packet.ip.destination,
+            source: address(&frame[8..24]),
+            destination: address(&frame[24..40]),
             protocol: fragment.next_header,
+            selector: fragment.selector,
+            upper_protocol: chain.protocol(),
+            upper: chain.header_len() - fragment.data(),
             identification: fragment.identification,
-            offset: u32::from(fragment.offset),
+            offset: u32::from(fragment.fragment_offset),
             more: fragment.more_fragments,
-            ecn: packet.traffic_class & 3,
-            header: packet.header,
-            data: packet.payload,
+            ecn: (frame[1] >> 4) & 3,
+            header: &frame[..fragment.data()],
+            data: &frame[fragment.data()..],
         })
     }
     fn ipv6_family(&self) -> bool {
@@ -260,11 +280,13 @@ pub(crate) enum Input<'a> {
 /// A reconstructed datagram, valid until the next engine call. `packet` is
 /// a complete IP packet: fragment zero's header (IPv4 options included) with
 /// lengths, fragmentation fields, checksum and the RFC 3168 section 5.3 ECN
-/// result rewritten; an IPv6 packet has no Fragment header and fragment
-/// zero's Next Header. `first_header` is fragment zero's header exactly as
-/// it arrived, kept for quoting, and `first_data` the length of fragment
-/// zero's data, so the first fragment is `first_header` followed by that
-/// prefix of the packet's data.
+/// result rewritten; an IPv6 packet keeps fragment zero's unfragmentable
+/// part, without its Fragment header, with the Next Header that selected it
+/// repaired to the Fragment header's and the Payload Length counting the
+/// retained extension headers (RFC 8200 section 4.5). `first_header` is
+/// fragment zero's header exactly as it arrived (an IPv6 Fragment header
+/// included), and `first_data` the length of fragment zero's data, so the
+/// first fragment is `first_header` followed by that much data.
 #[derive(Debug)]
 pub(crate) struct Reassembled<'a> {
     pub packet: &'a [u8],
@@ -272,18 +294,9 @@ pub(crate) struct Reassembled<'a> {
     // Fragment zero as it arrived, for quoting by fragment-aware ICMP
     // correlation; Host dispatch reads only the reconstructed packet so far.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub first_header: [u8; 60],
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub first_header_len: usize,
+    pub first_header: &'a [u8],
     #[cfg_attr(not(test), allow(dead_code))]
     pub first_data: usize,
-}
-
-impl Reassembled<'_> {
-    #[cfg(test)]
-    pub fn first_header(&self) -> &[u8] {
-        &self.first_header[..self.first_header_len]
-    }
 }
 
 /// An assembly that expired after its fragment zero arrived: the invoking
@@ -309,10 +322,30 @@ struct Key {
     identification: u32,
 }
 
+impl Key {
+    fn new(
+        arrival: Arrival,
+        source: IpAddr,
+        destination: IpAddr,
+        protocol: Option<u8>,
+        identification: u32,
+    ) -> Self {
+        Self {
+            source,
+            destination,
+            zone: (is_link_local(source) || is_link_local(destination)).then_some(arrival.link),
+            protocol,
+            identification,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct First {
     header_len: usize,
     protocol: u8,
+    // IPv6: the offset of the Next Header octet naming the Fragment header.
+    selector: usize,
     arrival: Arrival,
 }
 
@@ -342,9 +375,10 @@ struct Descriptor {
     offset: u32,
     len: u32,
     // Start of this fragment's region in the pool; fragment zero's region
-    // begins with its header.
+    // begins with its header, which an IPv6 unfragmentable part may make
+    // longer than 255 octets.
     pool: u32,
-    header: u8,
+    header: u32,
     last: bool,
 }
 
@@ -353,7 +387,10 @@ impl Descriptor {
         self.offset + self.len
     }
     fn region(&self) -> usize {
-        usize::from(self.header) + self.len as usize
+        self.header as usize + self.len as usize
+    }
+    fn data(&self) -> usize {
+        self.pool as usize + self.header as usize
     }
 }
 
@@ -480,12 +517,39 @@ impl Reassembly {
             Ok(Admitted::Complete(c)) => Input::Complete(Reassembled {
                 packet: &self.output[..c.len],
                 arrival: c.arrival,
-                first_header: c.first_header,
-                first_header_len: c.first_header_len,
+                // Released regions keep their bytes until the next charge.
+                first_header: &self.pool[c.first_header..][..c.first_header_len],
                 first_data: c.first_data,
             }),
             Err(discard) => Input::Discarded(discard),
         }
+    }
+
+    /// Discard (counted) an arriving IPv6 fragment of `identification`
+    /// whose datagram has a live rejection marker, before receive
+    /// processing of its headers could answer it with an ICMP error (the
+    /// marker's precedence in `admit`, for a packet refused before it).
+    pub fn rejects(
+        &mut self,
+        now: Instant,
+        arrival: Arrival,
+        source: IpAddr,
+        destination: IpAddr,
+        identification: u32,
+    ) -> bool {
+        let key = Key::new(arrival, source, destination, None, identification);
+        let marked = self.marked(now, key);
+        if marked {
+            self.counters.discarded.rejected += 1;
+        }
+        marked
+    }
+
+    fn marked(&self, now: Instant, key: Key) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|s| s.rejected && s.key == key && now < s.deadline)
     }
 
     fn admit(&mut self, now: Instant, arrival: Arrival, p: Piece<'_>) -> Result<Admitted, Discard> {
@@ -499,13 +563,13 @@ impl Reassembly {
         if !self.limits.enabled() {
             return Err(Discard::Assemblies);
         }
-        let key = Key {
-            source: p.source,
-            destination: p.destination,
-            zone: (is_link_local(p.source) || is_link_local(p.destination)).then_some(arrival.link),
-            protocol: (!ipv6).then_some(p.protocol),
-            identification: p.identification,
-        };
+        let key = Key::new(
+            arrival,
+            p.source,
+            p.destination,
+            (!ipv6).then_some(p.protocol),
+            p.identification,
+        );
         // RFC 5722 section 4:
         //   When reassembling an IPv6 datagram, if one or more of its
         //   constituent fragments is determined to be an overlapping
@@ -516,12 +580,7 @@ impl Reassembly {
         // error (RFC 8200 section 4.5: no ICMP error messages for an
         // abandoned overlapping packet). After the marker's deadline the
         // key is no longer that datagram's.
-        if self
-            .slots
-            .iter()
-            .flatten()
-            .any(|s| s.rejected && s.key == key && now < s.deadline)
-        {
+        if self.marked(now, key) {
             return Err(Discard::Rejected);
         }
         let len = u32::try_from(p.data.len()).map_err(|_| Discard::Oversize)?;
@@ -538,10 +597,24 @@ impl Reassembly {
             return Err(Discard::Misaligned);
         }
         let end = p.offset.checked_add(len).ok_or(Discard::Oversize)?;
-        let base = if ipv6 { IPV6_HEADER } else { IPV4_HEADER };
-        // RFC 8200 section 4.5: a reassembled Payload Length beyond 65535;
+        // The reconstructed header: an IPv6 packet keeps fragment zero's
+        // unfragmentable part once it is held (RFC 8200 section 4.5), this
+        // fragment's own until then.
+        let base = if ipv6 {
+            self.slots
+                .iter()
+                .flatten()
+                .find(|s| s.key == key)
+                .and_then(|s| s.first)
+                .map_or(p.header.len(), |first| first.header_len)
+                - ntcp_ip6::FRAGMENT_HEADER
+        } else {
+            IPV4_HEADER
+        };
+        // RFC 8200 section 4.5: a Payload Length of the packet reassembled
+        // from this fragment beyond 65535, its extension headers included;
         // RFC 791 section 3.1: an IPv4 Total Length beyond 65535.
-        if (ipv6 && end > 65535) || (!ipv6 && end as usize + IPV4_HEADER > 65535) {
+        if (ipv6 && oversize(base, end as usize)) || (!ipv6 && end as usize + IPV4_HEADER > 65535) {
             return Err(Discard::Oversize);
         }
         let capacity = self.capacity[usize::from(ipv6)];
@@ -554,7 +627,7 @@ impl Reassembly {
         //   an ICMP Parameter Problem, Code 3, message should be sent to the
         //   source of the fragment, with the Pointer field set to zero.
         // IPv4 has no such rule: a legal tiny first fragment is accepted.
-        if ipv6 && p.offset == 0 && !upper_layer_complete(p.protocol, p.data) {
+        if ipv6 && p.offset == 0 && !upper_layer_complete(p.upper_protocol, &p.data[p.upper..]) {
             return Err(Discard::IncompleteHeader);
         }
         let copied = if ipv6 {
@@ -666,8 +739,7 @@ impl Reassembly {
             .iter()
             .filter(|d| d.offset < end && p.offset < d.end())
             .map(|d| {
-                let stored =
-                    &self.pool[d.pool as usize + usize::from(d.header)..][..d.len as usize];
+                let stored = &self.pool[d.data()..][..d.len as usize];
                 if d.offset == p.offset
                     && d.len as usize == p.data.len()
                     && d.last != p.more
@@ -727,22 +799,41 @@ impl Reassembly {
         // copy at offset zero (IPv4 overlap) stores its data only.
         let zero = p.offset == 0 && slot.first.is_none();
         let header_len = if zero { p.header.len() } else { 0 };
-        // An IPv4 datagram keeps fragment zero's actual header, options
-        // included, so its length counts against the reconstructed limit.
-        let header = match (ipv6, slot.first) {
-            (true, _) => IPV6_HEADER,
-            (false, Some(first)) => first.header_len,
-            (false, None) if zero => header_len,
-            (false, None) => IPV4_HEADER,
+        // The datagram keeps fragment zero's actual header, IPv4 options or
+        // the IPv6 unfragmentable part included, so its length counts
+        // against the reconstructed limits; every stored extent is checked
+        // again when fragment zero arrives after them.
+        let stored = if ipv6 { ntcp_ip6::FRAGMENT_HEADER } else { 0 };
+        let header = match slot.first {
+            Some(first) => first.header_len - stored,
+            None if zero => header_len - stored,
+            None if ipv6 => IPV6_HEADER,
+            None => IPV4_HEADER,
         };
-        if header + max_end.max(end) as usize > self.capacity[usize::from(ipv6)] {
+        let extent = max_end.max(end) as usize;
+        // Admission checked this fragment's own extent against its own
+        // unfragmentable part; fragment zero's arrival can still place data
+        // stored before it beyond the largest Payload Length, which no
+        // single fragment caused.
+        let refused = if ipv6 && oversize(header, extent) {
+            Some(if zero {
+                Discard::Contradiction
+            } else {
+                Discard::Oversize
+            })
+        } else if header + extent > self.capacity[usize::from(ipv6)] {
+            Some(Discard::Capacity)
+        } else {
+            None
+        };
+        if let Some(discard) = refused {
             if zero {
                 // Its header is what makes the datagram too large.
                 self.release(index);
             } else {
                 self.slots[index] = Some(slot);
             }
-            return Err(Discard::Capacity);
+            return Err(discard);
         }
         if slot.count == fragments {
             self.slots[index] = Some(slot);
@@ -768,7 +859,7 @@ impl Reassembly {
             offset: p.offset,
             len: p.data.len() as u32,
             pool: at as u32,
-            header: header_len as u8,
+            header: header_len as u32,
             last: !p.more,
         };
         let held = &mut self.descriptors[base..base + slot.count + 1];
@@ -783,6 +874,7 @@ impl Reassembly {
             slot.first = Some(First {
                 header_len,
                 protocol: p.protocol,
+                selector: p.selector,
                 arrival,
             });
         }
@@ -815,24 +907,26 @@ impl Reassembly {
         };
         let ipv6 = slot.key.source.is_ipv6();
         let zero = held[0];
-        debug_assert_eq!(
-            (zero.offset, usize::from(zero.header)),
-            (0, first.header_len)
-        );
-        let mut first_header = [0; 60];
-        first_header[..first.header_len]
-            .copy_from_slice(&self.pool[zero.pool as usize..][..first.header_len]);
-        let header = if ipv6 { IPV6_HEADER } else { first.header_len };
+        debug_assert_eq!((zero.offset, zero.header as usize), (0, first.header_len));
+        // An IPv6 packet keeps the unfragmentable part, not the Fragment
+        // header.
+        let header = if ipv6 {
+            first.header_len - ntcp_ip6::FRAGMENT_HEADER
+        } else {
+            first.header_len
+        };
         let len = header + final_len as usize;
         let out = &mut self.output[..len];
-        out[..header].copy_from_slice(&first_header[..header]);
+        out[..header].copy_from_slice(&self.pool[zero.pool as usize..][..header]);
         for d in held {
-            let data = &self.pool[d.pool as usize + usize::from(d.header)..][..d.len as usize];
+            let data = &self.pool[d.data()..][..d.len as usize];
             out[header + d.offset as usize..][..data.len()].copy_from_slice(data);
         }
         if ipv6 {
-            out[4..6].copy_from_slice(&(final_len as u16).to_be_bytes());
-            out[6] = first.protocol;
+            // Admission bounded the Payload Length by 65535.
+            let payload = (len - IPV6_HEADER) as u16;
+            out[4..6].copy_from_slice(&payload.to_be_bytes());
+            out[first.selector] = first.protocol;
             out[1] = (out[1] & !0x30) | (ecn << 4);
         } else {
             out[1] = (out[1] & !3) | ecn;
@@ -849,7 +943,7 @@ impl Reassembly {
         Ok(Admitted::Complete(Completion {
             len,
             arrival: first.arrival,
-            first_header,
+            first_header: zero.pool as usize,
             first_header_len: first.header_len,
             first_data,
         }))
@@ -949,9 +1043,17 @@ enum Admitted {
 struct Completion {
     len: usize,
     arrival: Arrival,
-    first_header: [u8; 60],
+    // Fragment zero's header in the pool.
+    first_header: usize,
     first_header_len: usize,
     first_data: usize,
+}
+
+// RFC 8200 section 4.5: the Payload Length of a packet reassembled with an
+// unfragmentable part of `header` octets and `extent` fragmentable octets
+// exceeds 65535.
+fn oversize(header: usize, extent: usize) -> bool {
+    header - IPV6_HEADER + extent > 65535
 }
 
 const NOT_ECT: u8 = 1 << 0;
@@ -1010,11 +1112,12 @@ pub(crate) fn ecn_result(seen: u8) -> Option<u8> {
 }
 
 // RFC 7112 and RFC 8200 section 4.5: fragment zero must hold the whole
-// header chain through the upper-layer header. This Host only accepts the
-// base -> Fragment -> upper layer chain, so that is the upper-layer header:
-// a TCP header through its Data Offset, UDP's 8 octets, or the 8-octet
-// fixed part every ICMPv6 message has (RFC 4443 sections 2.1, 3 and 4).
-// Other upper layers are not interpreted here.
+// header chain through the upper-layer header. The walker already required
+// every extension header after the Fragment header to lie within the
+// fragment; `data` starts at the upper-layer header: a TCP header through
+// its Data Offset, UDP's 8 octets, or the 8-octet fixed part every ICMPv6
+// message has (RFC 4443 sections 2.1, 3 and 4). No Next Header needs
+// nothing, and other upper layers are not interpreted here.
 fn upper_layer_complete(protocol: u8, data: &[u8]) -> bool {
     match protocol {
         6 => data.len() >= 20 && data.len() >= usize::from(data[12] >> 4) * 4,

@@ -1,6 +1,8 @@
 #![no_std]
 use core::net::IpAddr;
 
+pub mod ipv6;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Truncated,
@@ -42,7 +44,8 @@ pub const UDP_HEADER: usize = 8;
 // Transport checksum over the family pseudo-header (RFC 768 for IPv4, RFC 8200
 // section 8.1 for IPv6) and `upper`, which holds the complete upper-layer
 // header and data. The destination is the final destination even when an IPv4
-// source route places an intermediate hop in the header. A correctly sealed
+// source route or an IPv6 Routing header places an intermediate hop in the
+// header (`ipv6::Chain::final_destination`). A correctly sealed
 // `upper` yields zero.
 pub fn pseudo_header_checksum(
     source: IpAddr,

@@ -30,6 +30,10 @@
 //     hold the expectation and fit the 40-octet option area together; the
 //     option area and its expected route are fixed for the connection, which
 //     ends if its route changes.
+//   NTCP_IPV6_SRH=PREFIX=S1[,S2...][;PREFIX=...]  owner-configured Segment
+//     Routing routes: final destinations in each IPv6 PREFIX (canonical
+//     address/length) are sent through the unscoped unicast segments S1..Sn
+//     (at most 126). Unset, output carries no extension header.
 // The caller must configure the TUN interface (MTU 1500) and routes
 // beforehand. This adapter exchanges IP packets, not Ethernet frames; it does
 // not configure the host or implement ARP, routing, or ICMP services beyond
@@ -85,6 +89,38 @@ mod linux {
         Seconds(u64),
         // Asserted: there was no earlier emission from it at all.
         Never,
+    }
+
+    // An owner-configured SR route: final destinations of the prefix and
+    // their segments S1..Sn.
+    type SegmentRoute = (path::IpPrefix, Vec<Ipv6Addr>);
+
+    // NTCP_IPV6_SRH: `PREFIX=S1,...,Sn` entries separated by `;`, refused
+    // at startup unless every entry is valid for the IPv6 local address and
+    // no prefix is defined twice.
+    fn segment_routes(local: IpAddr, value: Option<&str>) -> io::Result<Vec<SegmentRoute>> {
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+        let refused = || invalid("NTCP_IPV6_SRH must be IPv6 PREFIX=S1[,S2...] entries separated by ;");
+        if local.is_ipv4() {
+            return Err(invalid("NTCP_IPV6_SRH needs an IPv6 local address"));
+        }
+        let mut routes: Vec<SegmentRoute> = Vec::new();
+        for entry in value.split(';') {
+            let (prefix, segments) = entry.split_once('=').ok_or_else(refused)?;
+            let prefix: path::IpPrefix = prefix.trim().parse().map_err(|_| refused())?;
+            let segments = segments
+                .split(',')
+                .map(|s| s.trim().parse::<Ipv6Addr>().map_err(|_| refused()))
+                .collect::<io::Result<Vec<_>>>()?;
+            path::check_segment_route(prefix, &segments).map_err(|_| refused())?;
+            if routes.iter().any(|(other, _)| *other == prefix) {
+                return Err(invalid("NTCP_IPV6_SRH defines a prefix twice"));
+            }
+            routes.push((prefix, segments));
+        }
+        Ok(routes)
     }
 
     // Datagram service settings: deployment knowledge the Host cannot learn
@@ -398,6 +434,7 @@ mod linux {
             Self::attach_with(endpoint, config, local, &DatagramSettings::default(), 0)
         }
 
+        #[cfg(test)]
         fn attach_with(
             endpoint: &mut Endpoint,
             config: &EndpointConfig,
@@ -405,14 +442,29 @@ mod linux {
             settings: &DatagramSettings,
             started: u64,
         ) -> io::Result<Self> {
+            Self::attach_routed(endpoint, config, local, settings, &[], started)
+        }
+
+        // `attach_with` installing the owner's SR routes (NTCP_IPV6_SRH)
+        // over the TUN link beside its default route.
+        fn attach_routed(
+            endpoint: &mut Endpoint,
+            config: &EndpointConfig,
+            local: IpAddr,
+            settings: &DatagramSettings,
+            segment_routes: &[SegmentRoute],
+            started: u64,
+        ) -> io::Result<Self> {
             // Independent public lifetime identity, never derived from TCP's
             // confidential ISN/Fast Open key or an interface/address alone.
             let identity = acquire_secret()?;
             // Occupied transport generations + one provisional factory and
             // stateless lease; one serialized rebind gets migration headroom.
-            // Peer packets never create forwarding routes.
+            // Peer packets never create forwarding routes: the default
+            // route and the owner's SR routes are all.
+            let routes = 1 + segment_routes.len();
             let (paths, mut limits) =
-                ntcp_host::managed_limits(config, 1, 1, 1, 1, 1).map_err(host_error)?;
+                ntcp_host::managed_limits(config, 1, 1, 1, routes, 1).map_err(host_error)?;
             limits.datagrams = tun_datagrams(local.is_ipv4(), settings.peer_reassembly);
             // One UDP echo flow. Its receive and advice queues match the
             // per-iteration read budget, so one loop drains what one read
@@ -508,7 +560,7 @@ mod linux {
                             ntcp_host::Ipv4Receive::Disabled
                         },
                         ipv6: if local.is_ipv6() {
-                            ntcp_host::Ipv6Receive::BaseHeader
+                            ntcp_host::Ipv6Receive::Extensions
                         } else {
                             ntcp_host::Ipv6Receive::Disabled
                         },
@@ -539,6 +591,20 @@ mod linux {
                 metric: 0,
             })
             .map_err(host_error)?;
+            for (destination, segments) in segment_routes {
+                host.add_segment_route(
+                    path::Route {
+                        destination: *destination,
+                        source: None,
+                        dscp: None,
+                        link: ingress.link(),
+                        next_hop: path::NextHop::Forwarder(forwarder),
+                        metric: 0,
+                    },
+                    segments,
+                )
+                .map_err(host_error)?;
+            }
             let mut free = Vec::new();
             free.try_reserve_exact(BUDGET)
                 .map_err(|_| host_error(ntcp_host::Error::Allocation))?;
@@ -1045,7 +1111,7 @@ mod linux {
     //# or to ICMP for processing.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-5
     //= type=implementation
-    //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class of each complete datagram (received fragments are first reassembled by the Host); extension headers other than Fragment, source fragmentation and jumbograms are scoped adapter limits.
+    //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class of each complete datagram (received fragments are first reassembled by the Host); received extension headers pass the Host's extension receive profile first; originated extension headers, source fragmentation and jumbograms are scoped adapter limits.
     //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
     fn input_frame(
         network: &mut TunHost,
@@ -1504,6 +1570,37 @@ mod linux {
         blocked: bool,
     }
 
+    // A segment is built after the base header (`build_frame`). Once its
+    // authority names the path, an SR route's Segment Routing Header goes
+    // between them (`Host::header_plan`) and the IPv6 header is encoded
+    // again over the final destination; other paths keep the frame.
+    fn place_routed(
+        host: &Host,
+        endpoint: &Endpoint,
+        context: EgressContext,
+        output: &mut [u8],
+        held: &mut PendingFrame,
+        header_len: usize,
+    ) -> Result<(), ntcp_host::Error> {
+        let plan = host.header_plan(context.binding.snapshot.key())?;
+        if plan.segments.is_empty() {
+            return Ok(());
+        }
+        let transmit = endpoint
+            .transmit_attempt_packet(held.attempt)
+            .ok_or(ntcp_host::Error::Obsolete)?;
+        let len = plan
+            .len
+            .checked_add(transmit.len)
+            .filter(|&n| n <= output.len().min(MTU))
+            .ok_or(ntcp_host::Error::Obsolete)?;
+        output.copy_within(header_len..header_len + transmit.len, plan.len);
+        held.len =
+            ntcp_ip6::encode_tcp_routed(&mut output[..len], transmit, plan.segments, transmit.len)
+                .map_err(|_| ntcp_host::Error::Obsolete)?;
+        Ok(())
+    }
+
     // The one physical TUN call, as the Host transaction's backend outcome.
     // This embedding retries the identical attempt after a refusal or EINTR;
     // any other error is an unknown outcome, kept for the caller.
@@ -1608,9 +1705,18 @@ mod linux {
             // any backend call; a held frame keeps both across retries.
             let prepared = match (held.context, held.ticket.take()) {
                 (Some(context), Some(ticket)) => Ok((context, ticket)),
-                (context, _) => context
-                    .map_or_else(|| network.host.egress_context(endpoint, held.attempt), Ok)
+                (Some(context), None) => network
+                    .host
+                    .submission_ticket(endpoint, context)
+                    .map(|ticket| (context, ticket)),
+                (None, _) => network
+                    .host
+                    .egress_context(endpoint, held.attempt)
                     .and_then(|context| {
+                        place_routed(&network.host, endpoint, context, output, held, header_len)?;
+                        // Placed exactly once: a pass after a failed ticket
+                        // keeps these bytes and asks for the ticket again.
+                        held.context = Some(context);
                         Ok((context, network.host.submission_ticket(endpoint, context)?))
                     }),
             };
@@ -2273,6 +2379,18 @@ mod linux {
             _ => return Err(invalid("NTCP_SACK must be exactly 1 or unset")),
         };
         let settings = DatagramSettings::from_env(local)?;
+        let segment_routes = match std::env::var("NTCP_IPV6_SRH") {
+            Ok(value) => segment_routes(local, Some(&value))?,
+            Err(std::env::VarError::NotPresent) => Vec::new(),
+            Err(_) => return Err(invalid("invalid NTCP_IPV6_SRH")),
+        };
+        for (prefix, segments) in &segment_routes {
+            eprintln!(
+                "SR route {}/{} through {segments:?}",
+                prefix.network(),
+                prefix.length()
+            );
+        }
         let secret = acquire_secret()?;
         let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
@@ -2295,7 +2413,7 @@ mod linux {
         let mut endpoint =
             Endpoint::new(config.clone(), secret, now(start), address_policy).map_err(engine)?;
         let mut network =
-            TunHost::attach_with(&mut endpoint, &config, local, &settings, now(start))?;
+            TunHost::attach_routed(&mut endpoint, &config, local, &settings, &segment_routes, now(start))?;
         let mut control = control_server(
             &mut network.host,
             &endpoint,
@@ -2345,6 +2463,8 @@ mod linux {
         ];
         let mut pending = None;
         let mut accepting = false;
+        // Stateless replies already reported as unable to fit their path.
+        let mut oversized_reported = 0;
         eprintln!(
             "echo listening on {local}:{port} via {} (caller-configured TUN)",
             args[1]
@@ -2439,6 +2559,17 @@ mod linux {
                 &mut utc,
                 &mut tun,
             )?;
+            // A stateless reply that cannot fit its path even without the
+            // timestamp echo (an SR route's header too long for the first
+            // hop) is dropped once by the Endpoint; the operator learns it.
+            let oversized = endpoint.oversized_control_replies();
+            if oversized > oversized_reported {
+                eprintln!(
+                    "{} stateless TCP reply(ies) dropped: too large for their path's header",
+                    oversized - oversized_reported
+                );
+                oversized_reported = oversized;
+            }
             immediate |= udp.drive(&mut network, &endpoint, now(start), &mut tun)?;
             immediate |= network.icmp_output(now(start), &mut icmp_output, &mut tun)?;
             network.host.collect(&endpoint).map_err(host_error)?;
@@ -3498,10 +3629,24 @@ mod linux {
         // silent discards: they neither terminate run() nor disturb a stream.
         #[test]
         fn framed_rejected_source_syns_keep_tun_loop_and_stream_alive() {
+            framed_rejected_ipv4_syns(false);
+        }
+
+        // With IPv4 options enabled (NTCP_IPV4_OPTIONS=1) the same holds, and
+        // a SYN whose received source route the return-route authorization
+        // refuses (its recorded hop is the subnet broadcast) is silent too:
+        // no binding, no SYN-ACK, and the stream keeps going.
+        #[test]
+        fn framed_rejected_options_enabled_syns_keep_tun_loop_and_stream_alive() {
+            framed_rejected_ipv4_syns(true);
+        }
+
+        fn framed_rejected_ipv4_syns(options_enabled: bool) {
             let a = Ipv4Addr::new(192, 0, 2, 1);
             let b = Ipv4Addr::new(192, 0, 2, 2);
             let mut cfg = EndpointConfig::default();
             cfg.connection.nagle = false;
+            cfg.ipv4_options_enabled = options_enabled;
             let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy(a)).unwrap();
             let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy(b)).unwrap();
             let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
@@ -3531,11 +3676,11 @@ mod linux {
                 for _ in 0..16 {
                     let to_server = super::pmtu_tests::emit(client_host, client, time, b.into());
                     for frame in &to_server {
-                        input_frame(server_host, server, time, frame, b.into(), false, &mut Sample(0)).unwrap();
+                        input_frame(server_host, server, time, frame, b.into(), options_enabled, &mut Sample(0)).unwrap();
                     }
                     let to_client = super::pmtu_tests::emit(server_host, server, time, a.into());
                     for frame in &to_client {
-                        input_frame(client_host, client, time, frame, a.into(), false, &mut Sample(0)).unwrap();
+                        input_frame(client_host, client, time, frame, a.into(), options_enabled, &mut Sample(0)).unwrap();
                     }
                     if to_server.is_empty() && to_client.is_empty() {
                         return;
@@ -3547,14 +3692,18 @@ mod linux {
             let accepted = server.accept(listener).unwrap();
             assert_eq!(client.state(id).unwrap(), State::Established);
             let bindings = server_host.host.binding_count();
-            for (index, source) in [
-                Ipv4Addr::UNSPECIFIED,
-                Ipv4Addr::new(224, 0, 0, 1),
-                Ipv4Addr::new(192, 0, 2, 255),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            // A completed loose source route (pointer beyond its one
+            // recorded hop) whose reversal the TUN policy refuses.
+            let refused_route = [131, 7, 8, 192, 0, 2, 255, 1];
+            let mut rejected = vec![
+                (Ipv4Addr::UNSPECIFIED, None),
+                (Ipv4Addr::new(224, 0, 0, 1), None),
+                (Ipv4Addr::new(192, 0, 2, 255), None),
+            ];
+            if options_enabled {
+                rejected.push((Ipv4Addr::new(192, 0, 2, 7), Some(refused_route)));
+            }
+            for (index, (source, route)) in rejected.into_iter().enumerate() {
                 let ip = IpMetadata {
                     source: source.into(),
                     destination: b.into(),
@@ -3581,11 +3730,18 @@ mod linux {
                     source: Ipv4Addr::new(198, 51, 100, 7).into(),
                     destination: b.into(),
                 };
-                let len = build_ipv4(&mut packet, placeholder, tcp_len, 64, 0, 0).unwrap();
+                let mut len = build_ipv4(&mut packet, placeholder, tcp_len, 64, 0, 0).unwrap();
                 packet[12..16].copy_from_slice(&source.octets());
+                if let Some(option) = route {
+                    packet.copy_within(IP_HEADER..len, IP_HEADER + option.len());
+                    packet[IP_HEADER..IP_HEADER + option.len()].copy_from_slice(&option);
+                    len += option.len();
+                    packet[0] = 0x40 | ((IP_HEADER + option.len()) / 4) as u8;
+                    packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+                }
                 reseal(&mut packet);
                 let result =
-                    input_frame(&mut server_host, &mut server, 1, &packet[..len], b.into(), false, &mut Sample(0));
+                    input_frame(&mut server_host, &mut server, 1, &packet[..len], b.into(), options_enabled, &mut Sample(0));
                 println!("framed TUN SYN from {source}: {result:?}");
                 assert!(result.is_ok());
                 assert_eq!(server_host.host.binding_count(), bindings);
@@ -3602,6 +3758,493 @@ mod linux {
                 let count = client.read(id, &mut received).unwrap();
                 assert_eq!(&received[..count], payload);
             }
+        }
+
+        // The IPv6 rejected SYNs through the real TunHost ingress (extension
+        // receive profile): unspecified, multicast and unzoned link-local
+        // sources are silent discards, and a SYN whose Routing header still
+        // has Segments Left draws only the Host's Parameter Problem (code 0
+        // at its Routing Type), never a binding or a SYN-ACK. The stream
+        // and the loop keep making progress.
+        #[test]
+        fn framed_rejected_ipv6_syns_keep_tun_loop_and_stream_alive() {
+            let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+            let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.nagle = false;
+            cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
+            cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
+            let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
+            let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
+            let remote = SocketAddr::new(b.into(), 8080);
+            let listener = server.listen(remote, 4).unwrap();
+            let id = client
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(a.into(), 1234),
+                    remote,
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                        dscp: cfg.dscp,
+                        ipv4_options: Default::default(),
+                        registration: None,
+                        receive_authority: None,
+                    },
+                    &mut client_host.host,
+                )
+                .unwrap();
+            let exchange = |client: &mut Endpoint,
+                            client_host: &mut TunHost,
+                            server: &mut Endpoint,
+                            server_host: &mut TunHost,
+                            time: u64| {
+                for _ in 0..16 {
+                    let to_server = super::pmtu_tests::emit(client_host, client, time, b.into());
+                    for frame in &to_server {
+                        input_frame(
+                            server_host,
+                            server,
+                            time,
+                            frame,
+                            b.into(),
+                            false,
+                            &mut Sample(0),
+                        )
+                        .unwrap();
+                    }
+                    let to_client = super::pmtu_tests::emit(server_host, server, time, a.into());
+                    for frame in &to_client {
+                        input_frame(
+                            client_host,
+                            client,
+                            time,
+                            frame,
+                            a.into(),
+                            false,
+                            &mut Sample(0),
+                        )
+                        .unwrap();
+                    }
+                    if to_server.is_empty() && to_client.is_empty() {
+                        return;
+                    }
+                }
+                panic!("framed exchange did not quiesce");
+            };
+            exchange(
+                &mut client,
+                &mut client_host,
+                &mut server,
+                &mut server_host,
+                0,
+            );
+            let accepted = server.accept(listener).unwrap();
+            assert_eq!(client.state(id).unwrap(), State::Established);
+            let bindings = server_host.host.binding_count();
+            let syn = |source: Ipv6Addr, port: u16| {
+                let ip = IpMetadata {
+                    source: source.into(),
+                    destination: b.into(),
+                };
+                let mut packet = [0; MTU];
+                let tcp_len = ntcp::wire::encode(
+                    ip,
+                    ntcp::wire::Header {
+                        source_port: port,
+                        destination_port: 8080,
+                        sequence: 1,
+                        acknowledgment: 0,
+                        flags: ntcp::wire::SYN,
+                        window: 1024,
+                        urgent_pointer: 0,
+                    },
+                    &[],
+                    &[],
+                    &mut packet[IPV6_HEADER..],
+                )
+                .unwrap();
+                let header = ntcp_ip6::Header {
+                    ip,
+                    hop_limit: 64,
+                    dscp: 0,
+                    ecn: 0,
+                };
+                let len = ntcp_ip6::encode_datagram(&mut packet, header, 6, tcp_len).unwrap();
+                packet[..len].to_vec()
+            };
+            let link_local: Ipv6Addr = "fe80::7".parse().unwrap();
+            let peer: Ipv6Addr = "2001:db8::7".parse().unwrap();
+            for (index, source) in [
+                Ipv6Addr::UNSPECIFIED,
+                "ff02::1".parse().unwrap(),
+                link_local,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let packet = syn(source, 40000 + index as u16);
+                let result = input_frame(
+                    &mut server_host,
+                    &mut server,
+                    1,
+                    &packet,
+                    b.into(),
+                    false,
+                    &mut Sample(0),
+                );
+                println!("framed TUN SYN from {source}: {result:?}");
+                assert!(result.is_ok());
+                assert_eq!(server_host.host.binding_count(), bindings);
+                assert!(
+                    super::pmtu_tests::emit(&mut server_host, &mut server, 1, a.into()).is_empty()
+                );
+                assert_eq!(server_host.host.icmp_output_pending(), 0);
+            }
+            // A received Type 0 Routing header naming this host as its
+            // final address, one segment left.
+            let direct = syn(peer, 40010);
+            let mut routed = direct[..IPV6_HEADER].to_vec();
+            routed.extend_from_slice(&[6, 2, 0, 1, 0, 0, 0, 0]);
+            routed.extend_from_slice(&b.octets());
+            routed.extend_from_slice(&direct[IPV6_HEADER..]);
+            routed[6] = 43;
+            let payload = (routed.len() - IPV6_HEADER) as u16;
+            routed[4..6].copy_from_slice(&payload.to_be_bytes());
+            let result = input_frame(
+                &mut server_host,
+                &mut server,
+                1,
+                &routed,
+                b.into(),
+                false,
+                &mut Sample(0),
+            );
+            assert!(result.is_ok());
+            assert_eq!(server_host.host.binding_count(), bindings);
+            assert!(super::pmtu_tests::emit(&mut server_host, &mut server, 1, a.into()).is_empty());
+            let mut output = [0; 2 * MTU];
+            let mut sent = Vec::new();
+            while let Some(outcome) = server_host
+                .host
+                .icmp_output(1, &mut output, |_, frame| {
+                    sent.push(frame.to_vec());
+                    ntcp_host::BackendOutcome::Submitted
+                })
+                .unwrap()
+            {
+                assert_eq!(outcome, ntcp_host::BackendOutcome::Submitted);
+            }
+            assert_eq!(sent.len(), 1);
+            let error = ntcp_ip6::parse(&sent[0]).unwrap();
+            assert_eq!(
+                (error.ip.source, error.ip.destination, error.protocol),
+                (IpAddr::V6(b), IpAddr::V6(peer), 58)
+            );
+            assert_eq!(
+                &error.payload[..8],
+                &[4, 0, error.payload[2], error.payload[3], 0, 0, 0, 42]
+            );
+            assert_eq!(&error.payload[8..], &routed[..]);
+            for (time, payload) in [(2, &b"after rejected"[..]), (3, &b"second round"[..])] {
+                client.write(id, payload).unwrap();
+                exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
+                let mut received = [0; 32];
+                let count = server.read(accepted, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
+                server.write(accepted, &received[..count]).unwrap();
+                exchange(&mut client, &mut client_host, &mut server, &mut server_host, time);
+                let count = client.read(id, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
+            }
+        }
+
+        // A stateless reply to a peer inside an NTCP_IPV6_SRH prefix (the
+        // reset for a SYN to a closed port or for an ACK of no connection)
+        // selects the SR route: its segment is placed after the route's
+        // Segment Routing Header once its authority names the path, it
+        // leaves toward S1 with a checksum over the final destination, and
+        // an unrelated connection keeps making progress.
+        #[test]
+        fn stateless_reply_on_a_segment_route_leaves_with_its_srh() {
+            let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+            let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+            let routed: Ipv6Addr = "2001:db8:d::9".parse().unwrap();
+            let s1: Ipv6Addr = "2001:db8:5::1".parse().unwrap();
+            let routes = segment_routes(b.into(), Some("2001:db8:d::/48=2001:db8:5::1")).unwrap();
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.nagle = false;
+            cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
+            cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
+            let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
+            let mut server_host = TunHost::attach_routed(
+                &mut server,
+                &cfg,
+                b.into(),
+                &DatagramSettings::default(),
+                &routes,
+                0,
+            )
+            .unwrap();
+            let remote = SocketAddr::new(b.into(), 8080);
+            let listener = server.listen(remote, 4).unwrap();
+            let id = client
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(a.into(), 1234),
+                    remote,
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                        dscp: cfg.dscp,
+                        ipv4_options: Default::default(),
+                        registration: None,
+                        receive_authority: None,
+                    },
+                    &mut client_host.host,
+                )
+                .unwrap();
+            let exchange = |client: &mut Endpoint,
+                            client_host: &mut TunHost,
+                            server: &mut Endpoint,
+                            server_host: &mut TunHost,
+                            time: u64| {
+                for _ in 0..16 {
+                    let to_server = super::pmtu_tests::emit(client_host, client, time, b.into());
+                    for frame in &to_server {
+                        input_frame(
+                            server_host,
+                            server,
+                            time,
+                            frame,
+                            b.into(),
+                            false,
+                            &mut Sample(0),
+                        )
+                        .unwrap();
+                    }
+                    // `emit` also asserts that no frame is left held.
+                    let to_client = super::pmtu_tests::emit(server_host, server, time, a.into());
+                    for frame in &to_client {
+                        input_frame(
+                            client_host,
+                            client,
+                            time,
+                            frame,
+                            a.into(),
+                            false,
+                            &mut Sample(0),
+                        )
+                        .unwrap();
+                    }
+                    if to_server.is_empty() && to_client.is_empty() {
+                        return;
+                    }
+                }
+                panic!("framed exchange did not quiesce");
+            };
+            exchange(
+                &mut client,
+                &mut client_host,
+                &mut server,
+                &mut server_host,
+                0,
+            );
+            let accepted = server.accept(listener).unwrap();
+            assert_eq!(client.state(id).unwrap(), State::Established);
+            let bindings = server_host.host.binding_count();
+            let segment = |port: u16, flags: u8| {
+                let ip = IpMetadata {
+                    source: routed.into(),
+                    destination: b.into(),
+                };
+                let mut packet = [0; MTU];
+                let tcp_len = ntcp::wire::encode(
+                    ip,
+                    ntcp::wire::Header {
+                        source_port: 40000,
+                        destination_port: port,
+                        sequence: 1,
+                        acknowledgment: 77,
+                        flags,
+                        window: 1024,
+                        urgent_pointer: 0,
+                    },
+                    &[],
+                    &[],
+                    &mut packet[IPV6_HEADER..],
+                )
+                .unwrap();
+                let header = ntcp_ip6::Header {
+                    ip,
+                    hop_limit: 64,
+                    dscp: 0,
+                    ecn: 0,
+                };
+                let len = ntcp_ip6::encode_datagram(&mut packet, header, 6, tcp_len).unwrap();
+                packet[..len].to_vec()
+            };
+            for (time, packet) in [
+                (1, segment(9, ntcp::wire::SYN)),
+                (2, segment(8080, ntcp::wire::ACK)),
+            ] {
+                input_frame(
+                    &mut server_host,
+                    &mut server,
+                    time,
+                    &packet,
+                    b.into(),
+                    false,
+                    &mut Sample(0),
+                )
+                .unwrap();
+                // `emit` parses the reset over its final destination.
+                let replies = super::pmtu_tests::emit(&mut server_host, &mut server, time, a.into());
+                assert_eq!(replies.len(), 1);
+                let reply = &replies[0];
+                assert_eq!((reply[6], &reply[24..40]), (43, &s1.octets()[..]));
+                assert_eq!(&reply[40..48], &[6, 4, 4, 1, 1, 0, 0, 0]);
+                assert_eq!(&reply[48..64], &routed.octets());
+                assert_eq!(&reply[64..80], &s1.octets());
+                assert_ne!(reply[80 + 13] & ntcp::wire::RST, 0);
+                assert_eq!(server_host.host.binding_count(), bindings);
+                assert_eq!(server_host.host.icmp_output_pending(), 0);
+            }
+            for (time, payload) in [(3, &b"after the SR reply"[..]), (4, &b"second round"[..])] {
+                client.write(id, payload).unwrap();
+                exchange(
+                    &mut client,
+                    &mut client_host,
+                    &mut server,
+                    &mut server_host,
+                    time,
+                );
+                let mut received = [0; 32];
+                let count = server.read(accepted, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
+                server.write(accepted, &received[..count]).unwrap();
+                exchange(
+                    &mut client,
+                    &mut client_host,
+                    &mut server,
+                    &mut server_host,
+                    time,
+                );
+                let count = client.read(id, &mut received).unwrap();
+                assert_eq!(&received[..count], payload);
+            }
+        }
+
+        // A connection to a peer inside an NTCP_IPV6_SRH prefix: every
+        // segment the client sends is placed after the route's Segment
+        // Routing Header (S1 the base Destination Address, the peer
+        // Segment List[0]) with a checksum over the peer, and the stream
+        // progresses once the final segment endpoint has processed it
+        // (Segments Left 0, Destination Address the peer). Without
+        // discovery every complete packet, SRH included, stays within the
+        // IPv6 minimum link MTU.
+        #[test]
+        fn tcp_on_a_segment_route_places_segments_after_the_srh() {
+            let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+            let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+            let s1: Ipv6Addr = "2001:db8:5::1".parse().unwrap();
+            let routes = segment_routes(a.into(), Some("2001:db8::2/128=2001:db8:5::1")).unwrap();
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.nagle = false;
+            cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
+            cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
+            assert!(cfg.connection.pmtud.is_none());
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
+            let mut client_host = TunHost::attach_routed(
+                &mut client,
+                &cfg,
+                a.into(),
+                &DatagramSettings::default(),
+                &routes,
+                0,
+            )
+            .unwrap();
+            let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
+            let remote = SocketAddr::new(b.into(), 8080);
+            let listener = server.listen(remote, 4).unwrap();
+            let id = client
+                .connect_with_path_provider(
+                    0,
+                    SocketAddr::new(a.into(), 1234),
+                    remote,
+                    ntcp::ManagedOpenOptions {
+                        transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                        dscp: cfg.dscp,
+                        ipv4_options: Default::default(),
+                        registration: None,
+                        receive_authority: None,
+                    },
+                    &mut client_host.host,
+                )
+                .unwrap();
+            let mut largest = 0;
+            let mut exchange = |client: &mut Endpoint,
+                                client_host: &mut TunHost,
+                                server: &mut Endpoint,
+                                server_host: &mut TunHost,
+                                time: u64| {
+                for _ in 0..64 {
+                    let to_server = super::pmtu_tests::emit(client_host, client, time, a.into());
+                    for frame in &to_server {
+                        // `emit` parsed the segment over the peer.
+                        assert_eq!((frame[6], &frame[24..40]), (43, &s1.octets()[..]));
+                        assert_eq!(&frame[40..48], &[6, 4, 4, 1, 1, 0, 0, 0]);
+                        assert_eq!(&frame[48..64], &b.octets());
+                        assert_eq!(&frame[64..80], &s1.octets());
+                        largest = largest.max(frame.len());
+                        let mut arrived = frame.clone();
+                        arrived[43] = 0;
+                        arrived[24..40].copy_from_slice(&b.octets());
+                        input_frame(
+                            server_host,
+                            server,
+                            time,
+                            &arrived,
+                            b.into(),
+                            false,
+                            &mut Sample(0),
+                        )
+                        .unwrap();
+                    }
+                    let to_client = super::pmtu_tests::emit(server_host, server, time, b.into());
+                    for frame in &to_client {
+                        assert_eq!(frame[6], 6);
+                        input_frame(
+                            client_host,
+                            client,
+                            time,
+                            frame,
+                            a.into(),
+                            false,
+                            &mut Sample(0),
+                        )
+                        .unwrap();
+                    }
+                    if to_server.is_empty() && to_client.is_empty() {
+                        return;
+                    }
+                }
+                panic!("framed exchange did not quiesce");
+            };
+            exchange(&mut client, &mut client_host, &mut server, &mut server_host, 0);
+            let accepted = server.accept(listener).unwrap();
+            assert_eq!(client.state(id).unwrap(), State::Established);
+            assert_eq!(client.managed_path(id).unwrap().ip_header_len, 80);
+            let payload: Vec<u8> = (0..4000).map(|i| (i % 253) as u8).collect();
+            assert_eq!(client.write(id, &payload).unwrap(), payload.len());
+            exchange(&mut client, &mut client_host, &mut server, &mut server_host, 1);
+            let mut received = vec![0; 8000];
+            let count = server.read(accepted, &mut received).unwrap();
+            assert_eq!(&received[..count], &payload[..]);
+            assert_eq!(largest, 1280);
         }
 
         // The real active open's originated options state the expected

@@ -428,7 +428,14 @@ impl Owner {
         }
         let ethernet = self.ethernet.is_some();
         let offset = if ethernet { 14 } else { 0 };
-        let header = crate::ip::header_len(self.local);
+        // A connection's segment is placed after the complete IP header of
+        // its bound path (the base header, and an SR route's Segment
+        // Routing Header); a stateless reply's path is known only once its
+        // authority is, and its segment is moved there below.
+        let bound = owner.and_then(|id| Some(self.host.as_ref()?.binding(id).ok()?.snapshot));
+        let header = bound.map_or(crate::ip::header_len(self.local), |s| {
+            s.ip_header_len() as usize
+        });
         let length = self
             .output_packet_len()
             .min(egress.packet_capacity.saturating_sub(offset));
@@ -501,7 +508,18 @@ impl Owner {
         // section 3.1) and samples no clock. A packet held for retry keeps
         // these bytes.
         let timestamp = ntcp::Ipv4Timestamp::nonstandard((now / 1000) as u32).wire_value();
-        let ip_len = crate::ip::encode(&mut bytes[offset..], tx, timestamp, tx.len - shared_len)
+        let present = tx.len - shared_len;
+        let key = context.map(|c| c.binding.snapshot.key()).or(bound.map(|s| s.key()));
+        let plan = match (&self.host, key) {
+            (Some(host), Some(key)) => host.header_plan(key).ok(),
+            _ => None,
+        };
+        let (segments, placed) = plan.map_or((&[][..], header), |p| (p.segments, p.len));
+        if tx.ip.source.is_ipv6() && placed != header {
+            bytes.resize(bytes.len().max(offset + placed + present), 0);
+            bytes.copy_within(offset + header..offset + header + present, offset + placed);
+        }
+        let ip_len = crate::ip::encode(&mut bytes[offset..], tx, segments, timestamp, present)
             .map_err(|_| EIO)?;
         // A packet identified at submission keeps its header open until then;
         // its timestamp copy is taken from the submitted header.
@@ -519,6 +537,16 @@ impl Owner {
         }
         slot.shared.header.clear();
         if shared_len != 0 {
+            // The buffer was reserved for the base header; an SR route's
+            // Segment Routing Header can exceed it. Growth that fails is
+            // backpressure: the certainly unsubmitted attempt is selected
+            // again on a later pass.
+            if slot.shared.header.try_reserve_exact(bytes.len()).is_err() {
+                if !self.endpoint.reject_unsubmitted(attempt).map_err(engine)? {
+                    return Err(EIO);
+                }
+                return Ok(());
+            }
             slot.shared.header.extend_from_slice(bytes);
         }
         let wire_bytes = (bytes.len() + shared_len).max(if ethernet { 60 } else { 0 });

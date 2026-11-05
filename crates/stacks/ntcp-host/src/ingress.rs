@@ -19,7 +19,7 @@ use ntcp::{
     EncodedIpv4Options, InputDisposition, Instant, IpMetadata, Ipv4Options, Ipv4Timestamp,
     Ipv4TimestampProvider, RxPacketMetadata,
 };
-use ntcp_icmp::EchoKind;
+use ntcp_icmp::{EchoKind, ErrorMessage};
 use ntcp_path::{Dscp, LinkId, PathStatus, ScopedAddress, SourceId};
 
 use crate::emitter::{DatagramError, Plan, header_len};
@@ -132,6 +132,9 @@ struct Queued {
     // IPv4 options sent as is with the message, kept beside its slot so
     // that they follow it through hold, rotation and displacement.
     options: Option<EncodedIpv4Options>,
+    // An error, stored with the quote for a minimal outer header and
+    // encoded again for the header its route needs when it is sent.
+    error: Option<ErrorMessage>,
     // Queueing order, which rotation does not change.
     arrival: u64,
     // An `icmp_output` attempt found it waiting for an identifier.
@@ -211,6 +214,7 @@ impl IcmpOutput {
         link: LinkId,
         len: usize,
         options: Option<EncodedIpv4Options>,
+        error: Option<ErrorMessage>,
     ) {
         let n = self.limits.messages;
         let queued = Queued {
@@ -218,6 +222,7 @@ impl IcmpOutput {
             link,
             len,
             options,
+            error,
             arrival: self.arrivals,
             held: false,
         };
@@ -353,7 +358,8 @@ pub struct ProcessedEnvelope {
     ip: IpMetadata,
     traffic_class: u8,
     protocol: u8,
-    header_len: u16,
+    // IPv6 extension headers may make it longer than 65535 octets.
+    header_len: usize,
     options: Ipv4Options,
 }
 
@@ -403,7 +409,7 @@ impl<'a> Processed<'a> {
             traffic_class: e.traffic_class,
             protocol: e.protocol,
             options: e.options,
-            payload: &self.bytes[usize::from(e.header_len)..],
+            payload: &self.bytes[e.header_len..],
         }
     }
 }
@@ -523,10 +529,18 @@ impl Host {
             }
             6 if capabilities.ipv6 == crate::Ipv6Receive::BaseHeader => {
                 let packet = ntcp_ip6::parse_fragment(frame)?;
-                let Some(piece) = Piece::ipv6(&packet) else {
+                // This profile has no extension header receive processing
+                // or reassembly of a variable unfragmentable part.
+                if !packet.base_layout() {
+                    return Err(ntcp_ip::Error::ExtensionsUnsupported.into());
+                }
+                let Some(piece) = Piece::ipv6(frame, &packet.chain) else {
                     return Ok(Received::Datagram(whole));
                 };
                 piece
+            }
+            6 if capabilities.ipv6 == crate::Ipv6Receive::Extensions => {
+                return self.receive_extensions(context, now, frame, link_multicast, out);
             }
             _ => return Err(Error::Unsupported),
         };
@@ -584,17 +598,158 @@ impl Host {
             Input::Discarded(discard) => {
                 // RFC 8200 section 4.5's Parameter Problems about this
                 // fragment; overlap and every IPv4 discard are silent.
-                if let Some(error) = ReassemblyError::for_discard(ipv6, discard)
-                    && icmp_output.limits.messages != 0
-                    && let Some(slot) = icmp_output.free()
-                    && let Some(sent) = originate(errors, now, error, arrival, frame, slot)
-                {
-                    icmp_output.counters.errors += 1;
-                    icmp_output.push(sent.ip, sent.link, sent.len, None);
+                let fragment = ntcp_ip6::IPV6_HEADER;
+                if let Some(error) = ReassemblyError::for_discard(ipv6, discard, fragment) {
+                    queue_error(errors, icmp_output, now, error, arrival, frame);
                 }
                 Ok(Received::Discarded)
             }
         }
+    }
+
+    // `receive` under `Ipv6Receive::Extensions`. Physical framing first: a
+    // packet shorter or longer than its declared length is dropped before
+    // any of its headers is examined, and the destination must be one this
+    // context owns (no multicast destination reaches option processing).
+    // A fragment of a datagram abandoned for overlap is discarded silently
+    // before any of its headers can draw an error (RFC 5722 section 4); an
+    // atomic fragment is no fragment of it (RFC 6946 section 4).
+    // Then the headers before any Fragment header are processed on this
+    // packet; an unfragmented packet, an atomic fragment and a completed
+    // datagram are processed through their whole chain, which repeats only
+    // the side-effect-free unfragmentable part of a reassembled one. A
+    // refusal queues its Parameter Problem about the packet it was found in
+    // (the reconstruction, after reassembly) and is returned.
+    fn receive_extensions<'o>(
+        &mut self,
+        context: IngressContext,
+        now: Instant,
+        frame: &'o [u8],
+        link_multicast: bool,
+        out: &'o mut [u8],
+    ) -> Result<Received<'o>, Error> {
+        let declared = ntcp_ip6::ipv6_fragment_bounds(frame)?;
+        if frame.len() != declared {
+            return Err(if frame.len() < declared {
+                ntcp_ip::Error::Truncated
+            } else {
+                ntcp_ip::Error::Length
+            }
+            .into());
+        }
+        let destination = <[u8; 16]>::try_from(&frame[24..40]).map_err(|_| Error::Unsupported)?;
+        let local = self.local_in_context(context, IpAddr::from(destination))?;
+        let arrival = Arrival {
+            link: context.link,
+            local,
+            link_multicast,
+        };
+        if let Some(fragment) = ntcp_ip6::FragmentHeader::locate(frame)
+            .filter(|f| f.fragment_offset != 0 || f.more_fragments)
+        {
+            let source = <[u8; 16]>::try_from(&frame[8..24]).map_err(|_| Error::Unsupported)?;
+            let (source, destination) = (IpAddr::from(source), IpAddr::from(destination));
+            if self
+                .reassembly
+                .rejects(now, arrival, source, destination, fragment.identification)
+            {
+                return Ok(Received::Discarded);
+            }
+        }
+        let chain = self.receive_chain(now, arrival, frame, true)?;
+        let Some(piece) = Piece::ipv6(frame, &chain) else {
+            return Ok(Received::Datagram(Datagram {
+                envelope: Envelope::physical(context, frame.len()),
+                bytes: frame,
+            }));
+        };
+        let fragment = chain.fragment().map_or(0, |f| f.offset);
+        let Self {
+            reassembly,
+            errors,
+            icmp_output,
+            ..
+        } = self;
+        let (len, arrival, reassembled) = match reassembly.input(now, arrival, piece) {
+            Input::Whole => {
+                // An atomic fragment (RFC 6946): the unfragmentable part,
+                // its selector naming the Fragment header's Next Header,
+                // followed by the data.
+                let prefix = piece.header.len() - ntcp_ip6::FRAGMENT_HEADER;
+                let len = prefix + piece.data.len();
+                let out = out.get_mut(..len).ok_or(Error::Unsupported)?;
+                out[..prefix].copy_from_slice(&frame[..prefix]);
+                out[prefix..].copy_from_slice(piece.data);
+                let payload = (len - ntcp_ip6::IPV6_HEADER) as u16;
+                out[4..6].copy_from_slice(&payload.to_be_bytes());
+                out[piece.selector] = piece.protocol;
+                (len, arrival, false)
+            }
+            Input::Held | Input::Duplicate => return Ok(Received::Held),
+            Input::Complete(done) => {
+                let len = done.packet.len();
+                out.get_mut(..len)
+                    .ok_or(Error::Unsupported)?
+                    .copy_from_slice(done.packet);
+                (len, done.arrival, true)
+            }
+            Input::Discarded(discard) => {
+                if let Some(error) = ReassemblyError::for_discard(true, discard, fragment) {
+                    queue_error(errors, icmp_output, now, error, arrival, frame);
+                }
+                return Ok(Received::Discarded);
+            }
+        };
+        let out: &'o [u8] = out;
+        let out = &out[..len];
+        self.receive_chain(now, arrival, out, false)?;
+        Ok(Received::Datagram(Datagram {
+            envelope: Envelope {
+                context: IngressContext { link: arrival.link },
+                len,
+                reassembled,
+            },
+            bytes: out,
+        }))
+    }
+
+    // Receive processing of one complete packet's chain (RFC 8200 section
+    // 4): its fault, or for a chain without a Fragment header an upper layer
+    // this Host does not process, queues the Parameter Problem and refuses
+    // the packet. A Fragment header is accepted only on an arriving packet
+    // (`fragment`); one left in a reconstruction is not reassembled again.
+    fn receive_chain<'p>(
+        &mut self,
+        now: Instant,
+        arrival: Arrival,
+        packet: &'p [u8],
+        fragment: bool,
+    ) -> Result<ntcp_ip6::Chain<'p>, Error> {
+        let (error, refused) = match ntcp_ip6::Chain::receive(packet) {
+            Ok(chain) if chain.fragment().is_some() => {
+                if fragment {
+                    return Ok(chain);
+                }
+                (None, ntcp_ip::Error::FragmentationUnsupported)
+            }
+            Ok(chain) if processed_upper_layer(chain.protocol()) => return Ok(chain),
+            Ok(chain) => (
+                ReassemblyError::unrecognized(chain.protocol_selector()),
+                ntcp_ip::Error::ExtensionsUnsupported,
+            ),
+            Err(fault) => (ReassemblyError::for_fault(fault), fault.into()),
+        };
+        if let Some(error) = error {
+            queue_error(
+                &mut self.errors,
+                &mut self.icmp_output,
+                now,
+                error,
+                arrival,
+                packet,
+            );
+        }
+        Err(refused.into())
     }
 
     // A fragment is admitted for a destination this context owns on any of
@@ -644,20 +799,14 @@ impl Host {
                         .any(|port| paths.owns_source(local, port.link).unwrap_or(false))
             },
             |expired| {
-                if icmp_output.limits.messages != 0
-                    && let Some(slot) = icmp_output.free()
-                    && let Some(sent) = originate(
-                        errors,
-                        now,
-                        ReassemblyError::TimeExceeded,
-                        expired.arrival,
-                        expired.first_fragment,
-                        slot,
-                    )
-                {
-                    icmp_output.counters.errors += 1;
-                    icmp_output.push(sent.ip, sent.link, sent.len, None);
-                }
+                queue_error(
+                    errors,
+                    icmp_output,
+                    now,
+                    ReassemblyError::TimeExceeded,
+                    expired.arrival,
+                    expired.first_fragment,
+                );
             },
         );
     }
@@ -755,7 +904,7 @@ impl Host {
                 ip: packet.ip,
                 traffic_class: packet.traffic_class,
                 protocol: packet.protocol,
-                header_len: (bytes.len() - packet.payload.len()) as u16,
+                header_len: bytes.len() - packet.payload.len(),
                 options: packet.options,
             },
             bytes,
@@ -961,7 +1110,7 @@ impl Host {
             len - 8,
         )?;
         output.counters.echo_replies += 1;
-        output.push(reply, context.link, len, options);
+        output.push(reply, context.link, len, options, None);
         Ok(EchoDisposition::Queued)
     }
 
@@ -1048,7 +1197,10 @@ impl Host {
     /// (counted unsent) while the others keep their order. A full queue with
     /// no held message drops the new message (counted dropped).
     /// `packet` holds the complete datagram plus, when it is fragmented, one
-    /// fragment: `message_bytes` + 40 + the link MTU suffices.
+    /// fragment: `message_bytes` + 40 + the link MTU suffices whatever header
+    /// the selected route adds, since a whole packet, any Segment Routing
+    /// Header included, is within the path budget and a fragmented message
+    /// is cut to at most that budget.
     ///
     /// When the queue is empty, or holds only messages waiting for an
     /// identifier, the call sends the Echo adjunct's next due probe instead
@@ -1182,8 +1334,32 @@ impl Host {
         }
         let ipv4 = ip.source.is_ipv4();
         let options = queued.options;
-        let header = header_len(ipv4) + options.map_or(0, |o| o.as_bytes().len());
-        let len = header + queued.len;
+        // The complete header H of the route selected now: an SR route's
+        // Segment Routing Header is part of it.
+        let header =
+            self.header_plan(snapshot.key())?.len + options.map_or(0, |o| o.as_bytes().len());
+        let hop_limit = self.icmp_output.limits.hop_limit;
+        let (_, message) = self.icmp_output.front().ok_or(Error::Obsolete)?;
+        // An error is encoded again, behind the header of the route selected
+        // now, from the quote stored for a minimal header: the quote is
+        // truncated (and the checksum recomputed) whenever that header is
+        // longer, at every attempt, so after WouldBlock or a route
+        // replacement the packet stays within the family's error size and an
+        // IPv6 error is never fragmented; a header that leaves no room for
+        // the ICMP header within the minimum MTU is not sent. An IPv4
+        // error's header never grows, and one longer than the path's size
+        // is fragmented like other Host ICMP output.
+        let data_len = match queued.error {
+            Some(kind) => ntcp_icmp::encode_error(
+                ip,
+                kind,
+                message.get(8..).ok_or(Error::Obsolete)?,
+                header,
+                packet.get_mut(header..).ok_or(Error::Capacity)?,
+            )?,
+            None => queued.len,
+        };
+        let len = header + data_len;
         let budget = snapshot.ip_packet_budget()? as usize;
         // The Echo adjunct probes the direct path: its confirmed size says
         // nothing about a source route.
@@ -1205,9 +1381,16 @@ impl Host {
         let fragment_size = if len <= size {
             None
         } else if fragments
+            && (ipv4 || queued.error.is_none())
             && len <= guarantee
             && self
-                .fragment_count(ip, options.as_ref(), queued.len, size)
+                .fragment_count(
+                    ip,
+                    options.as_ref(),
+                    self.header_plan(snapshot.key())?.segments,
+                    queued.len,
+                    size,
+                )
                 .is_ok()
         {
             Some(size)
@@ -1216,8 +1399,6 @@ impl Host {
         } else {
             return Err(Error::Unsupported);
         };
-        let hop_limit = self.icmp_output.limits.hop_limit;
-        let (_, message) = self.icmp_output.front().ok_or(Error::Obsolete)?;
         match fragment_size {
             Some(size) => {
                 packet
@@ -1226,12 +1407,15 @@ impl Host {
                     .copy_from_slice(message);
             }
             None => {
-                // The codec moves the message behind the options.
-                let base = header_len(ipv4);
-                packet
-                    .get_mut(base..base + queued.len)
-                    .ok_or(Error::Capacity)?
-                    .copy_from_slice(message);
+                // The codec moves the message behind the options; an error
+                // is already in place.
+                let base = if ipv4 { header_len(ipv4) } else { header };
+                if queued.error.is_none() {
+                    packet
+                        .get_mut(base..base + queued.len)
+                        .ok_or(Error::Capacity)?
+                        .copy_from_slice(message);
+                }
                 let header = ntcp_ip::Header {
                     ip,
                     hop_limit,
@@ -1241,12 +1425,12 @@ impl Host {
                 };
                 let encoded = if let Some(options) = options {
                     ntcp_ip::encode_datagram_with_options(
-                        packet, header, &options, protocol, queued.len,
+                        packet, header, &options, protocol, data_len,
                     )
                 } else if ipv4 {
-                    ntcp_ip::encode_datagram(packet, header, protocol, queued.len, 0)
+                    ntcp_ip::encode_datagram(packet, header, protocol, data_len, 0)
                 } else {
-                    ntcp_ip6::encode_datagram(
+                    ntcp_ip6::encode_routed(
                         packet,
                         ntcp_ip6::Header {
                             ip,
@@ -1254,8 +1438,9 @@ impl Host {
                             dscp: 0,
                             ecn: 0,
                         },
+                        self.header_plan(snapshot.key())?.segments,
                         protocol,
-                        queued.len,
+                        data_len,
                     )
                 };
                 if encoded? != len {
@@ -1268,7 +1453,7 @@ impl Host {
             protocol,
             dscp: 0,
             hop_limit,
-            data_len: queued.len,
+            data_len,
             fragment_size,
             snapshot,
             client: None,
@@ -1295,7 +1480,36 @@ impl Host {
             return false;
         };
         slot[..message.len()].copy_from_slice(message);
-        output.push(ip, link, message.len(), options);
+        output.push(ip, link, message.len(), options, None);
         true
     }
+}
+
+// Queue one originated error (`originate`) when the Host ICMP output is
+// enabled and has room.
+fn queue_error(
+    errors: &mut crate::icmp_error::ErrorLimiter,
+    icmp_output: &mut IcmpOutput,
+    now: Instant,
+    error: ReassemblyError,
+    arrival: Arrival,
+    invoking: &[u8],
+) {
+    if icmp_output.limits.messages != 0
+        && let Some(slot) = icmp_output.free()
+        && let Some(sent) = originate(errors, now, error, arrival, invoking, slot)
+    {
+        icmp_output.counters.errors += 1;
+        icmp_output.push(sent.ip, sent.link, sent.len, None, Some(sent.kind));
+    }
+}
+
+// The protocols that end an IPv6 header chain this Host processes: the
+// upper layers it dispatches and No Next Header (RFC 8200 section 4.7).
+// Every other selector, AH and ESP included, is unrecognized.
+pub(crate) fn processed_upper_layer(protocol: u8) -> bool {
+    matches!(
+        protocol,
+        ntcp_ip::PROTOCOL_TCP | ntcp_ip::PROTOCOL_UDP | 58 | 59
+    )
 }

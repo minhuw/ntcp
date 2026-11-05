@@ -31,7 +31,7 @@ macro_rules! boundary_entry {
 
 mod config;
 mod ip;
-pub use config::{Backend, IoConfig, SocketConfig, SocketPolicy, SourceQuiet};
+pub use config::{Backend, IoConfig, SegmentRoute, SocketConfig, SocketPolicy, SourceQuiet};
 #[cfg(feature = "tfo-linux-cookie")]
 pub use ntcp::LinuxSipHash24Key;
 pub use ntcp::wire::FastOpenCookie;

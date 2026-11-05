@@ -50,14 +50,32 @@ fn fullwidth_and_malformed_frames() {
     }
     let mut b = [0; 60];
     encode(&mut b, tx(true, 20)).unwrap();
-    for next in [0, 43, 50, 51, 60, 135, 139, 140] {
+    // Zeroed extension headers are traversed: each names Hop-by-Hop next,
+    // which may only follow the base header.
+    for next in [0, 43, 60] {
         b[6] = next;
         assert_eq!(parse(&b).unwrap_err(), Error::ExtensionsUnsupported);
+        assert_eq!(
+            ntcp_ip6::Chain::receive(&b).unwrap_err(),
+            ntcp_ip6::Fault::MisplacedHopByHop { pointer: 40 }
+        );
     }
+    // Unsupported selectors end the chain; only the base layout is what the
+    // base-header receivers accept.
+    for next in [50, 51, 135, 139, 140] {
+        b[6] = next;
+        let p = parse(&b).unwrap();
+        assert_eq!((p.protocol, p.payload.len()), (next, 20));
+        assert!(!p.base_layout());
+    }
+    b[6] = 6;
+    assert!(parse(&b).unwrap().base_layout());
     b[6] = 44;
+    b[40] = 6;
     assert_eq!(parse(&b).unwrap_err(), Error::FragmentationUnsupported);
     b[4..6].fill(0);
-    assert_eq!(parse(&b).unwrap_err(), Error::FragmentationUnsupported);
+    assert_eq!(parse(&b).unwrap_err(), Error::Length);
+    assert_eq!(parse(&b[..40]).unwrap_err(), Error::Length);
 }
 
 #[test]
@@ -169,9 +187,18 @@ fn base_header_fields_and_checked_quotes() {
     for protocol in 0..=255u8 {
         bytes[6] = protocol;
         match protocol {
-            44 => assert_eq!(parse(&bytes).unwrap_err(), Error::FragmentationUnsupported),
-            0 | 43 | 50 | 51 | 60 | 135 | 139 | 140 => {
-                assert_eq!(parse(&bytes).unwrap_err(), Error::ExtensionsUnsupported);
+            // 0xa5 data reads as a later fragment's Fragment header.
+            44 => {
+                assert_eq!(parse(&bytes).unwrap_err(), Error::FragmentationUnsupported);
+                assert_eq!(
+                    ntcp_ip6::quote_header(&bytes).unwrap_err(),
+                    Error::FragmentationUnsupported
+                );
+            }
+            // 0xa5 data reads as a Hdr Ext Len past the declared payload.
+            0 | 43 | 60 => {
+                assert_eq!(parse(&bytes).unwrap_err(), Error::Length);
+                assert_eq!(ntcp_ip6::quote_header(&bytes).unwrap_err(), Error::Length);
             }
             _ => {
                 assert_eq!(parse(&bytes).unwrap().protocol, protocol);
@@ -242,14 +269,14 @@ fn destination_hop_limit_zero_is_processed_normally() {
 
 //= https://www.rfc-editor.org/rfc/rfc8200#section-3
 //= type=test
-//= reason=Declared base-packet length is 40 plus the full unsigned 16-bit field, including zero; complete frames require exact bounds and checked quotes retain the original length when truncated. Extension headers, including Jumbo Payload options, remain explicitly unsupported under the existing scope.
+//= reason=Declared packet length is 40 plus the full unsigned 16-bit field, including zero, and bounds every extension header, which is counted inside it; complete frames require exact bounds and checked quotes retain the original length when truncated. Jumbo Payload options remain unsupported and are refused as unrecognized options.
 //# Payload Length 16-bit unsigned integer. Length of the IPv6 payload,
 //# i.e., the rest of the packet following this IPv6 header, in octets.
 //# (Note that any extension headers (see Section 4) present are considered
 //# part of the payload, i.e., included in the length count.)
 //= https://www.rfc-editor.org/rfc/rfc8200#section-4.7
 //= type=test
-//= reason=For base selector 59, empty and positive-length packets expose no transport payload after exact declared-bound checks; the borrowed input bytes and quoted length/protocol remain intact. Extension traversal and forwarding remain outside the existing endpoint scope.
+//= reason=Selector 59 in the base header or any traversed extension header ends the chain after exact declared-bound checks: no transport payload is exposed and the borrowed input bytes and quoted length/protocol remain intact. Forwarding remains outside the existing endpoint scope.
 //# The value 59 in the Next Header field of an IPv6 header or any
 //# extension header indicates that there is nothing following that
 //# header. If the Payload Length field of the IPv6 header indicates the
@@ -295,18 +322,14 @@ fn payload_length_zero_and_no_next_header_boundaries() {
             bytes[6] = protocol;
             let before = bytes;
             match protocol {
-                44 => {
-                    assert_eq!(parse(&bytes).unwrap_err(), Error::FragmentationUnsupported);
+                // An empty payload cannot hold any extension header; the
+                // Payload Length field is at fault.
+                0 | 43 | 44 | 60 => {
+                    assert_eq!(parse(&bytes).unwrap_err(), Error::Length);
+                    assert_eq!(ntcp_ip6::quote_header(&bytes).unwrap_err(), Error::Length);
                     assert_eq!(
-                        ntcp_ip6::quote_header(&bytes).unwrap_err(),
-                        Error::FragmentationUnsupported
-                    );
-                }
-                0 | 43 | 50 | 51 | 60 | 135 | 139 | 140 => {
-                    assert_eq!(parse(&bytes).unwrap_err(), Error::ExtensionsUnsupported);
-                    assert_eq!(
-                        ntcp_ip6::quote_header(&bytes).unwrap_err(),
-                        Error::ExtensionsUnsupported
+                        ntcp_ip6::Chain::receive(&bytes).unwrap_err(),
+                        ntcp_ip6::Fault::Length { pointer: 4 }
                     );
                 }
                 _ => {
@@ -339,16 +362,28 @@ fn payload_length_zero_and_no_next_header_boundaries() {
             assert_eq!(bytes, before);
         }
     }
-    // An actual Jumbo Payload option remains behind the unsupported Hop-by-Hop
-    // boundary. Neither complete packets nor truncated quotes traverse it.
+    // A jumbogram's zero Payload Length leaves no room for the Hop-by-Hop
+    // header that would carry its Jumbo Payload option, so neither complete
+    // packets nor truncated quotes reach the option.
     let mut jumbo = vec![0; 40 + 65536];
     jumbo[0] = 0x60;
     jumbo[7] = 64;
     jumbo[40..48].copy_from_slice(&[6, 0, 0xc2, 4, 0, 1, 0, 0]);
-    assert_eq!(parse(&jumbo).unwrap_err(), Error::ExtensionsUnsupported);
+    assert_eq!(parse(&jumbo).unwrap_err(), Error::Length);
     assert_eq!(
         ntcp_ip6::quote_header(&jumbo[..48]).unwrap_err(),
-        Error::ExtensionsUnsupported
+        Error::Length
+    );
+    // Within a declared payload the option is unrecognized (RFC 2675's
+    // action bits 11): discarded with a Code 2 report at its type octet.
+    jumbo[4..6].copy_from_slice(&8u16.to_be_bytes());
+    assert_eq!(parse(&jumbo[..48]).unwrap_err(), Error::Options);
+    assert_eq!(
+        ntcp_ip6::Chain::receive(&jumbo[..48]).unwrap_err(),
+        ntcp_ip6::Fault::Option {
+            pointer: 42,
+            action: ntcp_ip6::OptionAction::ReportUnlessMulticast
+        }
     );
     let before = bytes;
     assert_eq!(encode(&mut bytes, tx(true, 0)).unwrap_err(), Error::Invalid);

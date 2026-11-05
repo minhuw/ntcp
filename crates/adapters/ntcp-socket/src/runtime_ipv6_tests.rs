@@ -55,8 +55,17 @@ fn owner(last: u16) -> (Owner, Arc<Mutex<State>>) {
     owner_with_policy(last, false, 0)
 }
 fn owner_with_policy(last: u16, ecn: bool, dscp: u8) -> (Owner, Arc<Mutex<State>>) {
+    owner_with_routes(last, ecn, dscp, Vec::new())
+}
+fn owner_with_routes(
+    last: u16,
+    ecn: bool,
+    dscp: u8,
+    segment_routes: Vec<crate::SegmentRoute>,
+) -> (Owner, Arc<Mutex<State>>) {
     let local: IpAddr = format!("2001:db8::{last}").parse().unwrap();
     let mut config = SocketConfig::new("external", local);
+    config.segment_routes = segment_routes;
     config.io.prefix = Some(64);
     config.tcp.dscp = dscp;
     let c = &mut config.tcp.connection;
@@ -691,4 +700,302 @@ fn native_ipv6_administrative_small_packet_route_updates_keep_real_link_mtu() {
     assert_eq!(info.first_hop_mtu, 1520);
     assert!(info.current_mtu > 660);
     assert!(info.current_mtu <= 1520);
+}
+
+// The configured SR route is installed with the Host over the interface's
+// link and forwarder. A connection selecting it places each segment after
+// the route's Segment Routing Header (base Destination Address S1, Segment
+// List[0] the peer, a checksum over the peer), sizes it with the complete
+// header, and progresses once the final segment endpoint has processed it
+// (Segments Left 0, Destination Address the peer).
+#[test]
+fn configured_segment_route_carries_tcp_after_its_srh() {
+    let destination: ntcp_host::path::IpPrefix = "2001:db8::2/128".parse().unwrap();
+    let s1: std::net::Ipv6Addr = "2001:db8:5::1".parse().unwrap();
+    let peer: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let (mut a, sa) = owner_with_routes(
+        1,
+        false,
+        0,
+        vec![crate::SegmentRoute {
+            destination,
+            segments: vec![s1],
+        }],
+    );
+    let host = a.host.as_ref().unwrap();
+    let route = host.paths().select_route(destination).unwrap();
+    assert_eq!(host.paths().route_segments(route).unwrap(), &[s1]);
+    let default = host.paths().select_route("::/0".parse().unwrap()).unwrap();
+    assert_eq!(
+        host.paths().route(route).unwrap().next_hop,
+        host.paths().route(default).unwrap().next_hop
+    );
+    let (mut b, sb) = owner(2);
+    let l = new(&mut b);
+    b.execute(l, Op::Bind("[::]:8080".parse().unwrap()))
+        .unwrap();
+    b.execute(l, Op::Listen(2)).unwrap();
+    let client = new(&mut a);
+    assert_eq!(
+        a.execute(client, Op::Connect("[2001:db8::2]:8080".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    // The SRH of one segment: H = 40 + 8 + 16 * 2.
+    assert_eq!(a.endpoint.managed_path(cid(&a, client)).unwrap().ip_header_len, 80);
+    let mut largest = 0;
+    let mut exchange = |a: &mut Owner, b: &mut Owner| {
+        for _ in 0..32 {
+            let mut progress = false;
+            a.service_egress().unwrap();
+            while let Some(frame) = sa.lock().unwrap().sent.pop_front() {
+                // Link framing only: the chain is checked below.
+                assert_eq!(&frame[12..14], &ntcp_ethernet::ETHERTYPE_IPV6.to_be_bytes());
+                let len = ntcp_ip6::ipv6_fragment_bounds(&frame[14..]).unwrap();
+                let ip = &frame[14..14 + len];
+                assert_eq!((ip[6], &ip[24..40]), (43, &s1.octets()[..]));
+                assert_eq!(&ip[40..48], &[6, 4, 4, 1, 1, 0, 0, 0]);
+                assert_eq!(&ip[48..64], &peer.octets());
+                assert_eq!(&ip[64..80], &s1.octets());
+                let (meta, header, total, _) = ntcp_ip6::quote_header(ip).unwrap();
+                assert_eq!(total, ip.len());
+                ntcp::wire::parse(meta, &ip[header..]).unwrap();
+                largest = largest.max(ip.len());
+                let mut arrived = ip.to_vec();
+                arrived[43] = 0;
+                arrived[24..40].copy_from_slice(&peer.octets());
+                b.input_ip_metadata(&arrived, Default::default(), None);
+                progress = true;
+            }
+            b.service_egress().unwrap();
+            while let Some(frame) = sb.lock().unwrap().sent.pop_front() {
+                let ip = ntcp_ethernet::parse_ethernet(&frame).unwrap().payload;
+                assert_eq!(ip[6], 6);
+                a.input_ip_metadata(ip, Default::default(), None);
+                progress = true;
+            }
+            a.events();
+            b.events();
+            if !progress {
+                return;
+            }
+        }
+        panic!("output did not quiesce");
+    };
+    exchange(&mut a, &mut b);
+    let server = b.execute(l, Op::Accept(0)).unwrap().value as u64;
+    // The current packet size less H and the TCP header.
+    let mtu = a
+        .endpoint
+        .path_mtu_info(cid(&a, client))
+        .unwrap()
+        .unwrap()
+        .current_mtu as usize;
+    assert_eq!(
+        a.endpoint.transport_info(cid(&a, client)).unwrap().mss as usize,
+        mtu - 80 - 20
+    );
+    let payload: Vec<u8> = (0..6000).map(|i| (i % 241) as u8).collect();
+    a.execute(client, Op::Write(payload.clone())).unwrap();
+    exchange(&mut a, &mut b);
+    assert_eq!(b.execute(server, Op::Read(8000)).unwrap().bytes, payload);
+    // Full segments fill the current packet size with H.
+    assert_eq!(largest, mtu);
+}
+
+// A stateless reply (the reset for a SYN to a closed port) to a peer the SR
+// route covers is selected before its path is known: once its authority
+// names the path, the segment is moved after the route's Segment Routing
+// Header and leaves toward S1 with a checksum over the peer.
+#[test]
+fn stateless_reply_on_a_segment_route_is_placed_after_its_srh() {
+    let s1: std::net::Ipv6Addr = "2001:db8:5::1".parse().unwrap();
+    let peer: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let (mut a, sa) = owner_with_routes(
+        1,
+        false,
+        0,
+        vec![crate::SegmentRoute {
+            destination: "2001:db8::2/128".parse().unwrap(),
+            segments: vec![s1],
+        }],
+    );
+    let ip = ntcp::IpMetadata {
+        source: peer.into(),
+        destination: "2001:db8::1".parse().unwrap(),
+    };
+    let mut packet = [0; 100];
+    let tcp_len = ntcp::wire::encode(
+        ip,
+        ntcp::wire::Header {
+            source_port: 40000,
+            destination_port: 9,
+            sequence: 1,
+            acknowledgment: 0,
+            flags: ntcp::wire::SYN,
+            window: 1024,
+            urgent_pointer: 0,
+        },
+        &[],
+        &[],
+        &mut packet[40..],
+    )
+    .unwrap();
+    let header = ntcp_ip6::Header {
+        ip,
+        hop_limit: 64,
+        dscp: 0,
+        ecn: 0,
+    };
+    let len = ntcp_ip6::encode_datagram(&mut packet, header, 6, tcp_len).unwrap();
+    a.input_ip_metadata(&packet[..len], Default::default(), None);
+    a.service_egress().unwrap();
+    let frame = sa.lock().unwrap().sent.pop_front().unwrap();
+    assert!(sa.lock().unwrap().sent.is_empty());
+    let len = ntcp_ip6::ipv6_fragment_bounds(&frame[14..]).unwrap();
+    let ip = &frame[14..14 + len];
+    assert_eq!((ip[6], &ip[24..40]), (43, &s1.octets()[..]));
+    assert_eq!(&ip[40..48], &[6, 4, 4, 1, 1, 0, 0, 0]);
+    assert_eq!(&ip[48..64], &peer.octets());
+    assert_eq!(&ip[64..80], &s1.octets());
+    let (meta, header, total, _) = ntcp_ip6::quote_header(ip).unwrap();
+    assert_eq!((meta.destination, header, total), (peer.into(), 80, ip.len()));
+    let reset = ntcp::wire::parse(meta, &ip[header..]).unwrap();
+    assert_ne!(reset.header.flags & ntcp::wire::RST, 0);
+}
+
+// Shared (zero-copy) output on a two-segment SR route. The header buffer
+// built ahead of the caller's payload holds the Ethernet header, the base
+// header, the Segment Routing Header (H = 40 + 8 + 16 * 3) and the TCP
+// header with timestamps, more than the base-header reservation; the
+// payload parts are the caller's registered bytes, and the stream reaches
+// the peer once the final segment endpoint has processed it.
+#[test]
+fn shared_payload_on_a_segment_route_carries_the_srh() {
+    let s1: std::net::Ipv6Addr = "2001:db8:5::1".parse().unwrap();
+    let s2: std::net::Ipv6Addr = "2001:db8:6::1".parse().unwrap();
+    let peer: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let owner_ts = |last: u16, segment_routes: Vec<crate::SegmentRoute>| {
+        let local: IpAddr = format!("2001:db8::{last}").parse().unwrap();
+        let mut config = SocketConfig::new("external", local);
+        config.segment_routes = segment_routes;
+        config.io.prefix = Some(64);
+        let c = &mut config.tcp.connection;
+        c.timestamps = true;
+        c.delayed_ack_us = 0;
+        c.mss = 1460;
+        c.send_ip_payload_limit = 65515;
+        c.rto_min_us = 200000;
+        let state = Arc::new(Mutex::new(State::default()));
+        let mut owner = Owner::external_backend(
+            &config,
+            crate::EthernetPacketIo {
+                io: Box::new(Io(state.clone())),
+                local_mac: [2; 6],
+                next_hop_mac: [4; 6],
+            },
+        )
+        .unwrap();
+        owner.test_now = Some(0);
+        (owner, state)
+    };
+    let (mut a, sa) = owner_ts(
+        1,
+        vec![crate::SegmentRoute {
+            destination: "2001:db8::2/128".parse().unwrap(),
+            segments: vec![s1, s2],
+        }],
+    );
+    let (mut b, sb) = owner_ts(2, Vec::new());
+    let l = new(&mut b);
+    b.execute(l, Op::Bind("[::]:8080".parse().unwrap()))
+        .unwrap();
+    b.execute(l, Op::Listen(2)).unwrap();
+    let client = new(&mut a);
+    assert_eq!(
+        a.execute(client, Op::Connect("[2001:db8::2]:8080".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    assert_eq!(a.endpoint.managed_path(cid(&a, client)).unwrap().ip_header_len, 96);
+    // A's frames, copied or shared, as the final segment endpoint forwards
+    // them to B; B's replies reach A directly. Returns A's shared headers.
+    let exchange = |a: &mut Owner, b: &mut Owner, pointer: Option<*const u8>| {
+        let mut shared = Vec::new();
+        let mut offset = 0;
+        for _ in 0..32 {
+            let mut progress = false;
+            a.service_egress().unwrap();
+            let frames: Vec<Vec<u8>> = {
+                let mut s = sa.lock().unwrap();
+                let mut frames: Vec<Vec<u8>> = s.sent.drain(..).collect();
+                for p in s.held.drain(..) {
+                    shared.push(p.header.len());
+                    let mut frame = p.header.clone();
+                    for part in &p.payload {
+                        assert_eq!(Some(part.as_slice().as_ptr()), pointer.map(|p| p.wrapping_add(offset)));
+                        offset += part.len();
+                        frame.extend_from_slice(part.as_slice());
+                    }
+                    frames.push(frame);
+                }
+                frames
+            };
+            for frame in frames {
+                let len = ntcp_ip6::ipv6_fragment_bounds(&frame[14..]).unwrap();
+                let ip = &frame[14..14 + len];
+                assert_eq!((ip[6], &ip[24..40]), (43, &s1.octets()[..]));
+                assert_eq!(&ip[40..48], &[6, 6, 4, 2, 2, 0, 0, 0]);
+                assert_eq!(&ip[48..64], &peer.octets());
+                assert_eq!(&ip[64..80], &s2.octets());
+                assert_eq!(&ip[80..96], &s1.octets());
+                let (meta, header, total, _) = ntcp_ip6::quote_header(ip).unwrap();
+                assert_eq!((meta.destination, header, total), (peer.into(), 96, ip.len()));
+                ntcp::wire::parse(meta, &ip[header..]).unwrap();
+                let mut arrived = ip.to_vec();
+                arrived[43] = 0;
+                arrived[24..40].copy_from_slice(&peer.octets());
+                b.input_ip_metadata(&arrived, Default::default(), None);
+                progress = true;
+            }
+            b.service_egress().unwrap();
+            while let Some(frame) = sb.lock().unwrap().sent.pop_front() {
+                let ip = ntcp_ethernet::parse_ethernet(&frame).unwrap().payload;
+                a.input_ip_metadata(ip, Default::default(), None);
+                progress = true;
+            }
+            a.events();
+            b.events();
+            if !progress {
+                return shared;
+            }
+        }
+        panic!("output did not quiesce");
+    };
+    assert!(exchange(&mut a, &mut b, None).is_empty());
+    let server = b.execute(l, Op::Accept(0)).unwrap().value as u64;
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+        .unwrap();
+    let data: Vec<u8> = (0..1777).map(|i| (i % 239) as u8).collect();
+    let registered = crate::RegisteredPayload::register(Payload::from_vec(data.clone())).unwrap();
+    let pointer = registered.as_slice().as_ptr();
+    let (reply, rx) = mpsc::sync_channel(1);
+    let mut request = Request {
+        id: client,
+        op: Op::Send(vec![(pointer as usize, data.len())], MSG_ZEROCOPY),
+        reply,
+        deadline: None,
+        send: None,
+        closing: None,
+    };
+    assert!(a.service(&mut request));
+    assert_eq!(rx.recv().unwrap().unwrap().value, 1777);
+    let shared = exchange(&mut a, &mut b, Some(pointer));
+    // Ethernet, H and the TCP header with timestamps lead every payload.
+    assert!(!shared.is_empty());
+    assert!(shared.iter().all(|&len| len == 14 + 96 + 32), "{shared:?}");
+    assert_eq!(b.execute(server, Op::Read(2000)).unwrap().bytes, data);
+    drop(registered);
 }

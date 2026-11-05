@@ -496,3 +496,216 @@ fn fragment_mode_echoes_large_replies_within_the_stated_capacity() {
         println!("v6={v6}: 3000-octet echo as {} fragments within {capacity}", replies.len());
     }
 }
+
+// NTCP_IPV6_SRH is parsed and refused at startup, and the routes it names
+// are installed with the Host over the TUN link; a connection selecting one
+// sends its SYN after the route's Segment Routing Header.
+#[test]
+fn segment_route_setting_is_validated_and_installed() {
+    let v4: IpAddr = "192.0.2.1".parse().unwrap();
+    let v6: IpAddr = "2001:db8::1".parse().unwrap();
+    let a: Ipv6Addr = "2001:db8:5::1".parse().unwrap();
+    let b: Ipv6Addr = "2001:db8:6::1".parse().unwrap();
+    assert!(segment_routes(v6, None).unwrap().is_empty());
+    let routes = segment_routes(
+        v6,
+        Some("2001:db8:d::/48=2001:db8:5::1, 2001:db8:6::1;2001:db8:e::9/128=2001:db8:5::1"),
+    )
+    .unwrap();
+    assert_eq!(
+        routes,
+        [
+            ("2001:db8:d::/48".parse().unwrap(), vec![a, b]),
+            ("2001:db8:e::9/128".parse().unwrap(), vec![a]),
+        ]
+    );
+    let max = (0..126)
+        .map(|i| format!("2001:db8:100:{i:x}::1"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(
+        segment_routes(v6, Some(&format!("2001:db8:d::/48={max}"))).unwrap()[0].1.len(),
+        126
+    );
+    for value in [
+        "2001:db8:d::/48=2001:db8:5::1;2001:db8:d::/48=2001:db8:6::1".to_string(),
+        "2001:db8:d::/48=2001:db8:5::1;2001:db8:d:0::/48=2001:db8:6::1".to_string(),
+        "192.0.2.0/24=2001:db8:5::1".to_string(),
+        "fe80::/64=2001:db8:5::1".to_string(),
+        "2001:db8:d::1/48=2001:db8:5::1".to_string(),
+        "2001:db8:d::/48".to_string(),
+        "2001:db8:d::/48=fe80::1".to_string(),
+        "2001:db8:d::/48=ff02::1".to_string(),
+        "2001:db8:d::/48=::1".to_string(),
+        "2001:db8:d::/48=".to_string(),
+        "2001:db8:d::/48=2001:db8:5::1;".to_string(),
+        format!("2001:db8:d::/48={max},2001:db8:200::1"),
+    ] {
+        assert!(segment_routes(v6, Some(&value)).is_err(), "{value}");
+    }
+    assert!(segment_routes(v4, Some("2001:db8:d::/48=2001:db8:5::1")).is_err());
+
+    let config = runtime_config(&Backend::default(), v6, true, true, false).unwrap();
+    let mut endpoint =
+        Endpoint::new(config.clone(), [7; 32], 0, Box::new(tun_v6_policy("2001:db8::1".parse().unwrap())))
+            .unwrap();
+    let mut network = TunHost::attach_routed(
+        &mut endpoint,
+        &config,
+        v6,
+        &DatagramSettings::default(),
+        &routes,
+        0,
+    )
+    .unwrap();
+    let paths = network.host.paths();
+    for (prefix, segments) in &routes {
+        let id = paths.select_route(*prefix).unwrap();
+        assert_eq!(paths.route_segments(id).unwrap(), &segments[..]);
+    }
+    let open = ntcp::ManagedOpenOptions {
+        transport: ntcp::ActiveOpenOptions::from(&config.connection),
+        dscp: config.dscp,
+        ipv4_options: Default::default(),
+        registration: None,
+        receive_authority: None,
+    };
+    let peer: Ipv6Addr = "2001:db8:d::9".parse().unwrap();
+    endpoint
+        .connect_with_path_provider(
+            0,
+            SocketAddr::new(v6, 7),
+            SocketAddr::new(peer.into(), 80),
+            open,
+            &mut network.host,
+        )
+        .unwrap();
+    // `emit` parses the SYN over the peer, Segment List[0].
+    let frames = super::emit(&mut network, &mut endpoint, 1, v6);
+    assert_eq!(frames.len(), 1);
+    let syn = &frames[0];
+    assert_eq!((syn[6], &syn[24..40]), (43, &a.octets()[..]));
+    assert_eq!(&syn[40..48], &[6, 6, 4, 2, 2, 0, 0, 0]);
+    assert_eq!(&syn[48..64], &peer.octets());
+    assert_eq!(&syn[64..80], &b.octets());
+    assert_eq!(&syn[80..96], &a.octets());
+    assert_ne!(super::segment(syn).header.flags & ntcp::wire::SYN, 0);
+}
+
+// The packet as the final segment endpoint forwards it (RFC 8754 4.3.1.1,
+// End): Segments Left zero and the base Destination Address D.
+fn at_final_segment(packet: &[u8]) -> Vec<u8> {
+    let mut packet = packet.to_vec();
+    packet[43] = 0;
+    let destination: [u8; 16] = packet[48..64].try_into().unwrap();
+    packet[24..40].copy_from_slice(&destination);
+    packet
+}
+
+// Over an NTCP_IPV6_SRH route the UDP echo (Refuse and Fragment modes) and
+// the ICMP drain place their output behind the route's Segment Routing
+// Header (H = 96 for two segments): base Destination Address S1, the full
+// list with D in Segment List[0], checksums with D, every fragment
+// repeating it; the peer receives each reply once the final segment has
+// processed it.
+#[test]
+fn udp_and_echo_replies_over_a_segment_route_carry_the_srh() {
+    let (local, remote) = addresses(true);
+    let IpAddr::V6(d) = remote.ip() else { unreachable!() };
+    let s1: Ipv6Addr = "2001:db8:5::1".parse().unwrap();
+    let s2: Ipv6Addr = "2001:db8:6::1".parse().unwrap();
+    let routes = segment_routes(local.ip(), Some(&format!("{d}/128={s1},{s2}"))).unwrap();
+    let h = IPV6_HEADER + 8 + 16 * 3;
+    let check = |packet: &[u8], next: u8| {
+        assert_eq!((packet[6], &packet[24..40]), (43, &s1.octets()[..]));
+        assert_eq!(&packet[40..48], &[next, 6, 4, 2, 2, 0, 0, 0]);
+        assert_eq!(&packet[48..64], &d.octets());
+        assert_eq!(&packet[64..80], &s2.octets());
+        assert_eq!(&packet[80..96], &s1.octets());
+    };
+    let service = SocketAddr::new(local.ip(), 7);
+    let config = runtime_config(&Backend::default(), local.ip(), true, true, false).unwrap();
+    let (mut b, mut bhost) = endpoint(remote.ip(), true);
+    let client = bhost.host.udp_open(&b, remote, Some(service), ntcp_host::UdpOptions {
+        dscp: 0, hop_limit: 64,
+    }).unwrap();
+    for settings in [refuse_settings(), DatagramSettings {
+        peer_reassembly: Some(4136),
+        quiet: SourceQuiet::Never,
+        ..DatagramSettings::default()
+    }] {
+        let mut a = Endpoint::new(config.clone(), [7; 32], 0,
+            Box::new(tun_v6_policy("2001:db8::1".parse().unwrap()))).unwrap();
+        let mut ahost =
+            TunHost::attach_routed(&mut a, &config, local.ip(), &settings, &routes, 0).unwrap();
+        let mut echo = UdpEcho::open(&mut ahost, &a, service, &config, &settings).unwrap();
+        let mut backend = Backend::default();
+        let refuse = settings.udp_mode == UdpSendMode::Refuse;
+        let payload: Vec<u8> = (0..if refuse { 1000 } else { 3000 }).map(|n| (n * 3) as u8).collect();
+        let request = udp_request(remote, service, &payload);
+        let pieces = if refuse { vec![request] } else { fragments(&request, 83, 1400) };
+        for piece in pieces {
+            input_frame(&mut ahost, &mut a, 1, &piece, local.ip(), false, &mut Sample(0)).unwrap();
+        }
+        assert!(echo.drive(&mut ahost, &a, 1, &mut backend).unwrap());
+        assert!(echo.notes.is_empty(), "{:?}", echo.notes);
+        let replies: Vec<_> = backend.frames.drain(..).collect();
+        if refuse {
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].len(), h + 8 + payload.len());
+            check(&replies[0], 17);
+            let udp = ntcp_ip_common::parse_udp(local.ip(), remote.ip(), &replies[0][h..]).unwrap();
+            assert_eq!(udp.payload, &payload[..]);
+        } else {
+            assert_eq!(replies.len(), 3);
+            for (i, frame) in replies.iter().enumerate() {
+                check(frame, 44);
+                if i + 1 != replies.len() {
+                    assert_eq!(frame.len(), 1280);
+                }
+            }
+        }
+        for frame in &replies {
+            input_frame(&mut bhost, &mut b, 2, &at_final_segment(frame), remote.ip(), false,
+                &mut Sample(0)).unwrap();
+        }
+        let mut bytes = vec![0; 4000];
+        assert_eq!(bhost.host.udp_receive(client, &mut bytes).unwrap(),
+            Some((service, payload.len())));
+        assert_eq!(&bytes[..payload.len()], &payload[..]);
+
+        // Refuse mode's limit is the path budget less H + 8.
+        if refuse {
+            let large = vec![1; MTU - h - 7];
+            input_frame(&mut ahost, &mut a, 3, &udp_request(remote, service, &large), local.ip(),
+                false, &mut Sample(0)).unwrap();
+            assert!(echo.drive(&mut ahost, &a, 3, &mut backend).unwrap());
+            assert!(backend.frames.is_empty());
+            assert!(echo.notes.last().unwrap().contains(&format!("limit of {}", MTU - h - 8)));
+        }
+
+        // An Echo Reply through the ICMP drain.
+        let to_us = IpMetadata { source: remote.ip(), destination: local.ip() };
+        let data: Vec<u8> = (0..1000).map(|n| (n * 11) as u8).collect();
+        input_frame(&mut ahost, &mut a, 4, &echo_request(to_us, 0x5151, 9, &data), local.ip(),
+            false, &mut Sample(0)).unwrap();
+        let mut buffer = vec![0; MTU];
+        assert!(ahost.icmp_output(4, &mut buffer, &mut backend).unwrap());
+        let mut frames: Vec<_> = backend.frames.drain(..).collect();
+        // The fragmented UDP reply was the Echo adjunct's demand for the SR
+        // path: its probe, an Echo Request carrying the SRH, follows.
+        if !refuse {
+            let probe = frames.pop().unwrap();
+            check(&probe, 58);
+            assert_eq!(probe[h], 128);
+        }
+        assert_eq!(frames.len(), 1);
+        let reply = frames.pop().unwrap();
+        assert_eq!(reply.len(), h + 8 + data.len());
+        check(&reply, 58);
+        let decoded = ntcp_icmp::decode_echo(
+            IpMetadata { source: local.ip(), destination: remote.ip() }, &reply[h..]).unwrap();
+        assert_eq!((decoded.kind, decoded.sequence, decoded.data),
+            (ntcp_icmp::EchoKind::Reply, 9, &data[..]));
+    }
+}

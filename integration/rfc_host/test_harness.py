@@ -11,6 +11,7 @@ import icmp
 import mss
 import options
 import run
+import srh
 
 
 class NamespaceGuard(unittest.TestCase):
@@ -570,3 +571,90 @@ class OptionScenario(unittest.TestCase):
         }.items():
             with self.assertRaises(AssertionError, msg=name):
                 options.judge_times(times, clock, realtime)
+
+
+class SegmentRouting(unittest.TestCase):
+    D, S1, SOURCE = "2001:db8:92::2", "2001:db8:94::1", "2001:db8:91::2"
+
+    def test_srh_case_without_inherited_proof_cannot_reach_setup(self):
+        for case in srh.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(icmp, "setup") as setup, \
+                    patch.object(run, "setup") as native:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+                setup.assert_not_called()
+                native.assert_not_called()
+
+    def test_cases_cover_both_embeddings(self):
+        self.assertEqual({(c["kind"], c["family"], c["embedding"], c["scenario"]) for c in srh.cases()},
+                         {("srh", 6, "tun_echo", "transit-ptb"), ("srh", 6, "native", "endpoint")})
+        self.assertEqual(len(srh.cases()), 2)
+        self.assertFalse(any(c in icmp.cases() or c in admin.cases() or c in options.cases() or c in mss.cases()
+                             or c in run.matrix() for c in srh.cases()))
+
+    def packet(self, protocol=6, left=1, fragment=None):
+        """A TCP segment to D sent through S1: base header, SRH [D, S1],
+        optionally a Fragment header, then the transport."""
+        import ipaddress
+        d, s1, source = (ipaddress.ip_address(a).packed for a in (self.D, self.S1, self.SOURCE))
+        tcp = bytearray(struct.pack("!HHIIBBHHH", 18080, 40000, 7, 9, 5 << 4, 0x10, 1024, 0, 0)) + b"data"
+        pseudo = source + d + struct.pack("!I", len(tcp)) + b"\0\0\0\x06"
+        struct.pack_into("!H", tcp, 16, checksum(pseudo + bytes(tcp)))
+        srh = struct.pack("!BBBBBBH", 44 if fragment else protocol, 4, 4, left, 1, 0, 0) + d + s1
+        frag = struct.pack("!BBHI", protocol, 0, fragment[0] | fragment[1], 0x77) if fragment else b""
+        body = srh + frag + bytes(tcp)
+        base = struct.pack("!IHBB", 6 << 28, len(body), 43, 64) + source + s1
+        return base + body, bytes(tcp)
+
+    def test_capture_walks_the_chain_and_checks_transport_with_the_final_destination(self):
+        packet, _ = self.packet()
+        event = icmp.parse(packet)
+        self.assertEqual((event["destination"], event["final_destination"], event["header_len"]),
+                         (self.S1, self.D, 80))
+        routing, = event["extensions"]
+        self.assertEqual((routing["routing_type"], routing["segments_left"], routing["last_entry"],
+                          routing["segments"]), (4, 1, 1, [self.D, self.S1]))
+        self.assertTrue(event["checksum_valid"])
+        self.assertEqual(event["payload"], 4)
+        # With Segments Left 0 the base destination (S1 here) is final, so
+        # the same bytes no longer check.
+        zero, _ = self.packet(left=0)
+        self.assertFalse(icmp.parse(zero)["checksum_valid"])
+        # A truncated quote is walked as far as its bytes go.
+        quote = icmp.parse(packet[:60])
+        self.assertIsNone(quote["protocol"])
+        self.assertEqual(quote["destination"], self.S1)
+
+    def test_bridge_forwards_extension_bearing_tcp_and_icmpv6(self):
+        packet, _ = self.packet()
+        frame = bytes(12) + b"\x86\xdd" + packet
+        event = bridge.decode(frame)[0]
+        self.assertEqual((event["destination"], event["final_destination"]), (self.S1, self.D))
+        self.assertEqual(event["extensions"][0]["segments"], [self.D, self.S1])
+        corrupt = bytearray(frame)
+        corrupt[-1] ^= 1
+        with self.assertRaises(AssertionError):
+            bridge.decode(bytes(corrupt))
+
+    def test_reassembly_keeps_the_unfragmentable_part(self):
+        import ipaddress
+        packet, tcp = self.packet(fragment=(0, 0))
+        # Cut the transport into two fragments behind base + SRH.
+        first_data, second_data = tcp[:16], tcp[16:]
+        events = []
+        for offset, more, data in ((0, 1, first_data), (16, 0, second_data)):
+            prefix = bytearray(packet[:80 + 8])
+            struct.pack_into("!H", prefix, 80 + 2, offset | more)
+            whole = bytes(prefix) + data
+            whole = whole[:4] + struct.pack("!H", len(whole) - 40) + whole[6:]
+            event = icmp.parse(whole)
+            event.update(direction="from-ntcp", time_ns=offset, raw=whole)
+            events.append(event)
+        self.assertTrue(all(e["fragmented"] and e["header_len"] == 88 for e in events))
+        (datagram, pieces), = icmp.reassemble(events)
+        self.assertEqual(datagram["raw"][:80][40], 6, "SRH Next Header repaired")
+        self.assertEqual(datagram["raw"][6], 43)
+        self.assertEqual(len(datagram["raw"]), 80 + len(tcp))
+        self.assertTrue(datagram["checksum_valid"])
+        self.assertEqual(datagram["final_destination"], self.D)
+        self.assertEqual(str(ipaddress.ip_address(datagram["raw"][24:40])), self.S1)

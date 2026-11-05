@@ -20,7 +20,8 @@
 //! before it sends anything: none of its requests, queries included, is
 //! read or dispatched, so reconnecting denied peers never hold a slot an
 //! allowed administrator needs. They can still fill the listen backlog
-//! (`SLOTS` pending connections) between passes, which the kernel's
+//! between passes (`listen(SLOTS)`; a Linux unix stream listener holds
+//! `SLOTS + 1` pending connections), which the kernel's
 //! connection queue shares with allowed peers: a denied local process can
 //! delay an allowed administrator's connection (a blocking connect waits,
 //! a nonblocking one fails with `EAGAIN`), not exclude it from a slot.

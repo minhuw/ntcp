@@ -263,8 +263,10 @@ impl Owner {
         use ntcp_host::{Forwarding, Ipv4Receive, Ipv6Receive, ReceiveCapabilities, path};
         // Occupied transports + provisional TIME-WAIT generation + stateless
         // lane + one serialized live-class migration. No peer-created routes.
+        // The default route and each owner-configured SR route.
+        let routes = 1 + self.segment_routes.len();
         let (paths, limits) =
-            ntcp_host::managed_limits(&self.defaults, 1, 1, 1, 1, 1).map_err(host_error)?;
+            ntcp_host::managed_limits(&self.defaults, 1, 1, 1, routes, 1).map_err(host_error)?;
         // Reassembly up to the largest packet this link delivers whole (at
         // least each family's required minimum): the size TCP's receive
         // limits derive from, so a segment some narrower path fragmented
@@ -347,7 +349,7 @@ impl Owner {
                         Ipv4Receive::Disabled
                     },
                     ipv6: if self.local.is_ipv6() {
-                        Ipv6Receive::BaseHeader
+                        Ipv6Receive::Extensions
                     } else {
                         Ipv6Receive::Disabled
                     },
@@ -377,6 +379,20 @@ impl Owner {
             metric: 0,
         })
         .map_err(host_error)?;
+        for route in &self.segment_routes {
+            host.add_segment_route(
+                path::Route {
+                    destination: route.destination,
+                    source: None,
+                    dscp: None,
+                    link: ingress.link(),
+                    next_hop: path::NextHop::Forwarder(forwarder),
+                    metric: 0,
+                },
+                &route.segments,
+            )
+            .map_err(host_error)?;
+        }
         host.attach(&mut self.endpoint).map_err(host_error)?;
         let capacity = host
             .reassembly_capacity(self.local.is_ipv6())

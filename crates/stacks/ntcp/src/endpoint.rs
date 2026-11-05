@@ -428,7 +428,13 @@ pub struct Endpoint {
     advice: ReadyQueue,
     cleanup: ReadyQueue,
     deadlines: Deadlines,
-    control: VecDeque<(IpMetadata, Header, OutgoingIpv4Options, Option<u32>)>,
+    // Stateless replies: addresses, header, IPv4 options, timestamp echo and,
+    // when a managed provider stated it at queueing, the complete IP header
+    // length (extensions included) of the IPv6 path the reply leaves on.
+    control: VecDeque<(IpMetadata, Header, OutgoingIpv4Options, Option<u32>, Option<u16>)>,
+    // Stateless replies discarded because even their minimal form could not
+    // fit the path: dropped once, never retried.
+    oversized_control: u64,
     passive_errors: VecDeque<Event>,
     control_epoch: Instant,
     control_count: usize,
@@ -559,6 +565,7 @@ impl Endpoint {
             control,
             control_epoch: now,
             control_count: 0,
+            oversized_control: 0,
             control_turn: true,
             buffer_bytes,
             per_connection_bytes,
@@ -1242,7 +1249,7 @@ impl Endpoint {
             if let (IpAddr::V4(source), IpAddr::V4(destination)) = (tuple.local.ip(), tuple.remote.ip()) {
                 Some(20 + transaction.request.ipv4_options.encode(source, destination, 0, &mut [0; 40])
                     .map_err(|_| Error::InvalidArgument)?.1 as u16)
-            } else { Some(40) }
+            } else { Some(transaction.prepared.snapshot.ip_header_len() as u16) }
         } else { None };
         let capacities = (options.send_capacity, options.receive_capacity);
         let charge = Connection::allocation_bytes(
@@ -2821,6 +2828,7 @@ impl Endpoint {
                 .timestamps
                 .map(|ts| ts.0)
                 .filter(|_| self.config.connection.send_ip_payload_limit >= 32),
+            None,
         ));
         self.control_count += 1;
     }
@@ -3908,10 +3916,10 @@ impl Endpoint {
             || !(68..=65575).contains(&mtu)
             || mtu > 65535
                 && (self.listeners.iter().flatten().any(|l| l.address.is_ipv4())
-                    || self.control.iter().any(|(ip, _, _, _)| ip.source.is_ipv4()))
+                    || self.control.iter().any(|(ip, ..)| ip.source.is_ipv4()))
             || mtu < 1280
                 && (self.listeners.iter().flatten().any(|l| l.address.is_ipv6())
-                    || self.control.iter().any(|(ip, _, _, _)| ip.source.is_ipv6()))
+                    || self.control.iter().any(|(ip, ..)| ip.source.is_ipv6()))
         {
             return Err(Error::InvalidArgument.into());
         }
@@ -4255,6 +4263,13 @@ impl Endpoint {
             }
         }
         None
+    }
+
+    /// Stateless replies discarded because even their form without the
+    /// optional timestamp echo could not fit the path they leave on: each is
+    /// dropped once, never retried. For administrative reporting.
+    pub fn oversized_control_replies(&self) -> u64 {
+        self.oversized_control
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -5063,13 +5078,16 @@ impl Endpoint {
                 && selected.is_none_or(|owner| owner.is_none())
                 && (self.control_turn || next.is_none() || selected == Some(None))
             {
-                let (ip, header, ipv4_options, mut echo) = *self.control.front().unwrap();
+                let (ip, header, ipv4_options, mut echo, path_header) =
+                    *self.control.front().unwrap();
                 if let Some(policy) = self.config.connection.pmtud {
                     let ip_len = match (ip.source, ip.destination) {
                         (IpAddr::V4(source), IpAddr::V4(destination)) => {
                             20 + ipv4_options.encode(source, destination, 0, &mut [0; 40])?.1 as u32
                         }
-                        _ => 40,
+                        // The embedding places the reply after its path's
+                        // complete header (an SR route's SRH included).
+                        _ => path_header.map_or(40, u32::from),
                     };
                     let route_mtu = self
                         .destination_route(ip.destination)
@@ -5080,8 +5098,10 @@ impl Endpoint {
                         .min(route_mtu.unwrap_or(u32::MAX));
                     let budget = mtu.saturating_sub(ip_len);
                     if budget < 20 {
-                        // Stateless replies cannot fragment or drop a required source route.
+                        // Stateless replies cannot fragment or drop a required
+                        // source route or Segment Routing Header.
                         self.control.pop_front();
+                        self.oversized_control += 1;
                         continue;
                     }
                     if budget < 32 {
@@ -6563,6 +6583,7 @@ mod endpoint_mtu_update_tests {
                     ..Default::default()
                 },
                 Some(100),
+                None,
             ));
             let mut bytes = [0; 256];
             let output = e.poll_transmit(1, &mut bytes, 16).unwrap().packet;
@@ -6610,6 +6631,7 @@ mod endpoint_mtu_update_tests {
             },
             options,
             None,
+            None,
         ));
         e.set_endpoint_first_hop_mtu(1, 68).unwrap();
         assert!(
@@ -6619,6 +6641,7 @@ mod endpoint_mtu_update_tests {
                 .is_none()
         );
         assert!(e.control.is_empty());
+        assert_eq!(e.oversized_control_replies(), 1);
     }
 }
 

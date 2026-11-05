@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 """Bounded Ethernet fault network. It has no TCP endpoint or response state."""
 import hashlib
+import ipaddress
 import selectors
 import socket
 import struct
@@ -15,6 +16,82 @@ def checksum(data):
     while total >> 16:
         total = (total & 0xffff) + (total >> 16)
     return (~total) & 0xffff
+
+
+# RFC 8200 section 4: Hop-by-Hop Options, Routing, Fragment and Destination
+# Options are the extension headers these captures walk.
+EXTENSIONS = (0, 43, 44, 60)
+
+
+def ipv6_chain(ip, end, strict=True):
+    """Walk the extension headers of the IPv6 packet IP (bytes from its base
+    header; END its declared end) in wire order. Returns (headers, protocol,
+    offset, final, fragment): each header's type, offset and length (Routing
+    headers with their type-specific fields, options as hex), the terminal
+    Next Header and the offset after the chain, the 16-octet final
+    destination a transport pseudo-header uses (RFC 8200 section 8.1: the
+    last element of a Routing header whose Segments Left is nonzero, which
+    for a Segment Routing Header is Segment List[0], RFC 8754 section 2),
+    and the Fragment header's fields. The walk stops after a Fragment header
+    (later fragments are opaque until reassembly). STRICT asserts complete
+    bounds; otherwise (a truncated ICMP quote) it stops at the first header
+    the bytes do not hold and reports protocol None."""
+    end = min(end, len(ip)) if not strict else end
+    assert not strict or end <= len(ip), "IPv6 length"
+    protocol, offset, final = ip[6], 40, bytes(ip[24:40])
+    headers, fragment = [], None
+    while protocol in EXTENSIONS and fragment is None:
+        if offset + 8 > end:
+            assert not strict, "truncated extension header"
+            return headers, None, offset, final, fragment
+        length = 8 if protocol == 44 else (ip[offset + 1] + 1) * 8
+        if offset + length > end:
+            assert not strict, "extension header length"
+            return headers, None, offset, final, fragment
+        header = dict(type=protocol, offset=offset, length=length)
+        if protocol == 43:
+            kind, left = ip[offset + 2], ip[offset + 3]
+            header.update(routing_type=kind, segments_left=left)
+            if kind == 4:
+                last = ip[offset + 4]
+                assert 2 * (last + 1) <= ip[offset + 1] and left <= last + 1, "Segment Routing Header bounds"
+                segments = [bytes(ip[offset + 8 + 16 * i:offset + 24 + 16 * i]) for i in range(last + 1)]
+                header.update(last_entry=last, flags=ip[offset + 5], tag=struct.unpack_from("!H", ip, offset + 6)[0],
+                              segments=[str(ipaddress.ip_address(a)) for a in segments])
+                if left:
+                    final = segments[0]
+            elif kind == 0 and left:
+                count = ip[offset + 1] // 2
+                final = bytes(ip[offset + 8 + 16 * (count - 1):offset + 8 + 16 * count])
+        elif protocol == 44:
+            field = struct.unpack_from("!H", ip, offset + 2)[0]
+            fragment = dict(ident=struct.unpack_from("!I", ip, offset + 4)[0], offset=field & 0xfff8,
+                            more=bool(field & 1), inner=ip[offset])
+        else:
+            header["options"] = bytes(ip[offset + 2:offset + length]).hex()
+        headers.append(header)
+        protocol = ip[offset]
+        offset += length
+    return headers, protocol, offset, final, fragment
+
+
+def decode_icmp6(frame, end, headers, offset, final):
+    """A whole ICMPv6 message behind its complete header chain (JSON-safe),
+    its checksum validated over the final destination."""
+    ip = frame[14:end]
+    body = ip[offset:]
+    pseudo = ip[8:24] + final + struct.pack("!I", len(body)) + b"\0\0\0\x3a"
+    assert len(body) >= 8 and checksum(pseudo + body) == 0, "ICMPv6 checksum"
+    event = dict(family=6, protocol=58, ethernet_length=len(frame), ip_length=end - 14, header_len=offset,
+                 extensions=headers, ip_hex=ip.hex(), source=str(ipaddress.ip_address(ip[8:24])),
+                 destination=str(ipaddress.ip_address(ip[24:40])),
+                 final_destination=str(ipaddress.ip_address(final)), icmp_type=body[0], icmp_code=body[1],
+                 sha256=hashlib.sha256(ip).hexdigest(), checksum_valid=True)
+    if body[0] in (128, 129):
+        event.update(identifier=struct.unpack_from("!H", body, 4)[0], sequence=struct.unpack_from("!H", body, 6)[0])
+    elif body[0] in (1, 2, 3, 4):
+        event.update(word=struct.unpack_from("!I", body, 4)[0], quote_hex=body[8:].hex())
+    return event
 
 
 def decode_icmp(frame, hl, end):
@@ -60,12 +137,19 @@ def decode(frame, icmp=False):
         assert len(frame) >= 54 and frame[14] >> 4 == 6, "IPv6 framing"
         end = 54 + struct.unpack_from("!H", frame, 18)[0]
         assert end <= len(frame), "IPv6 length"
-        if frame[20] != 6:
+        headers, protocol, offset, final, fragment = ipv6_chain(frame[14:end], end - 14)
+        if fragment is not None:
+            return None  # no IPv6 fragments are forwarded, as before
+        if icmp and protocol == 58:
+            return decode_icmp6(frame, end, headers, offset, final)
+        if protocol != 6:
             return None
-        start = 54
-        pseudo = frame[22:54] + struct.pack("!I", end - start) + b"\0\0\0\x06"
+        start = 14 + offset
+        # The TCP checksum covers the final destination (RFC 8200 8.1).
+        pseudo = frame[22:38] + final + struct.pack("!I", end - start) + b"\0\0\0\x06"
         family = 6
-        ip = dict(df=None, ip_id=None)
+        ip = dict(df=None, ip_id=None, extensions=headers, destination=str(ipaddress.ip_address(frame[38:54])),
+                  final_destination=str(ipaddress.ip_address(final)))
     else:
         return None
     assert end - start >= 20, "short TCP"
@@ -100,8 +184,11 @@ def decode(frame, icmp=False):
 
 
 class Bridge:
-    """Forwards TCP between the two ports; with ICMP, whole IPv4 ICMP
-    messages too (the option cases), recorded but never altered."""
+    """Forwards TCP between the two ports; with ICMP, whole ICMP messages
+    too (IPv4 for the option cases, ICMPv6 for the Segment Routing case),
+    recorded but never altered. IPv6 extension headers are walked: TCP and
+    ICMPv6 behind them are forwarded with checksums over the final
+    destination."""
 
     def __init__(self, icmp=False):
         self.icmp = icmp

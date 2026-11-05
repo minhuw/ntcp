@@ -168,10 +168,13 @@ fn header(frame: &[u8]) -> usize {
     }
 }
 
-fn segment(frame: &[u8]) -> ntcp::wire::Segment<'_> {
+// A TCP segment of a frame this embedding sent, checksummed over its final
+// destination: after an SR route's Segment Routing Header, Segment List[0].
+pub(super) fn segment(frame: &[u8]) -> ntcp::wire::Segment<'_> {
     let (ip, tcp) = if frame[0] >> 4 == 6 {
-        let p = ntcp_ip6::parse(frame).unwrap();
-        (p.ip, p.payload)
+        let (ip, header, total, protocol) = ntcp_ip6::quote_header(frame).unwrap();
+        assert_eq!((total, protocol), (frame.len(), 6));
+        (ip, &frame[header..])
     } else {
         let p = ntcp_ip::parse(frame, false).unwrap();
         assert_eq!(
@@ -708,7 +711,7 @@ fn runtime_active_passive_without_timestamps_still_discovers() {
 //# that implements PAWS MUST also implement Path MTU Discovery.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (every fragment repeats the unfragmentable part, the base header and on an owner-configured Segment Routing route its Segment Routing Header, before the Fragment header, and the first fragment holds the complete upper-layer header); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 #[test]
 fn runtime_ptb_repairs_and_receiver_ack_progress() {
@@ -826,7 +829,7 @@ fn runtime_send_space_rounds_to_segments_across_pmtu_change() {
 //# that implements PAWS MUST also implement Path MTU Discovery.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to a source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (base header, Fragment header, upper layer); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (every fragment repeats the unfragmentable part, the base header and on an owner-configured Segment Routing route its Segment Routing Header, before the Fragment header, and the first fragment holds the complete upper-layer header); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 #[test]
 fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
@@ -1623,4 +1626,93 @@ fn runtime_held_attempt_repacketizes_on_shared_or_physical_decrease() {
         }
         p.progress(limit as usize, &payload);
     }
+}
+
+// A segment on an SR route is placed after the route's Segment Routing
+// Header exactly once per pending frame: when the evidence ticket cannot be
+// issued after placement, the next pass asks for the ticket again and
+// submits the very bytes placed, a valid segment over the final destination.
+#[test]
+fn routed_placement_survives_a_failed_ticket() {
+    let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let routes = segment_routes(a.into(), Some("2001:db8::2/128=2001:db8:5::1")).unwrap();
+    let mut cfg = EndpointConfig::default();
+    cfg.connection.nagle = false;
+    cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
+    cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
+    let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+    let mut host = TunHost::attach_routed(
+        &mut client,
+        &cfg,
+        a.into(),
+        &DatagramSettings::default(),
+        &routes,
+        0,
+    )
+    .unwrap();
+    client
+        .connect_with_path_provider(
+            0,
+            SocketAddr::new(a.into(), 1234),
+            SocketAddr::new(b.into(), 8080),
+            ntcp::ManagedOpenOptions {
+                transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                dscp: cfg.dscp,
+                ipv4_options: Default::default(),
+                registration: None,
+                receive_authority: None,
+            },
+            &mut host.host,
+        )
+        .unwrap();
+    // The SYN as `transmit_frames` selects and builds it, after the base
+    // header, and the frame its route's header plan makes of it.
+    let mut output = [0; MTU];
+    let (polled, attempt) = client
+        .poll_reserved_transmit(0, &mut output[IPV6_HEADER..], 1)
+        .unwrap();
+    let packet = polled.packet.unwrap();
+    let attempt = attempt.unwrap();
+    let len = build_frame(&mut output, packet, &mut Sample(0)).unwrap();
+    let context = host.host.egress_context(&mut client, attempt).unwrap();
+    let plan = host.host.header_plan(context.binding.snapshot.key()).unwrap();
+    assert_eq!(plan.len, 80);
+    let mut expected = vec![0; plan.len + packet.len];
+    expected[plan.len..].copy_from_slice(&output[IPV6_HEADER..len]);
+    ntcp_ip6::encode_tcp_routed(&mut expected, packet, plan.segments, packet.len).unwrap();
+    // A ticket already issued for this attempt refuses the pass's own.
+    let mut issued = Some(host.host.submission_ticket(&mut client, context).unwrap());
+    let mut pending = Some(PendingFrame {
+        attempt,
+        context: None,
+        ticket: None,
+        len,
+        blocked: false,
+    });
+    let mut backend = Backend::default();
+    for time in [1, 2] {
+        if time == 2 {
+            host.host.cancel_submission(issued.take().unwrap());
+        }
+        transmit_frames(
+            &mut host,
+            &mut client,
+            time,
+            &mut output,
+            &mut pending,
+            IPV6_HEADER,
+            &mut Sample(0),
+            &mut backend,
+        )
+        .unwrap();
+        if time == 1 {
+            assert!(backend.frames.is_empty());
+            assert!(pending.as_ref().is_some_and(|held| held.ticket.is_none()));
+        }
+    }
+    assert!(pending.is_none());
+    assert_eq!(backend.frames, [expected]);
+    let flags = segment(&backend.frames[0]).header.flags;
+    assert_eq!(flags & (ntcp::wire::SYN | ntcp::wire::ACK), ntcp::wire::SYN);
 }

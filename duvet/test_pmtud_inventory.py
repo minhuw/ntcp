@@ -349,9 +349,12 @@ class PmtudInventory(unittest.TestCase):
         for key in ("1191-056", "1191-057", "1191-058", "1191-074"):
             self.assertEqual(len(rows[key]["evidence"]), 2, key)
         rows6 = {p["id"]: p for p in self.inventory(8201)["paragraphs"]}
-        for key in ("8201-050", "8201-052"):
-            self.assertEqual(rows6[key]["status"], "TODO", key)
-            self.assertIn("T7 PathService", rows6[key]["reason"], key)
+        # 8201-052 stays TODO: zone propagation and multi-link ND are T18's.
+        self.assertEqual(rows6["8201-052"]["status"], "TODO")
+        for fragment in ("T7 PathService", "remain T18"):
+            self.assertIn(fragment, rows6["8201-052"]["reason"])
+        # 8201-050 closes with T17's complete header length (pinned below).
+        self.assertEqual(rows6["8201-050"]["status"], "covered")
         # T10 closes whole notification, UDP-quoted, MMS_S, deferred-report
         # and shared-cache obligations with Host change-service evidence.
         rows4821 = {p["id"]: p for p in self.inventory(4821)["paragraphs"]}
@@ -592,17 +595,63 @@ class PmtudInventory(unittest.TestCase):
                              "an identical value is a no-op", "a failed targeted probe is not reopened",
                              "Clearing removes the cap and keeps every hold"):
                 self.assertIn(fragment, rows[key]["reason"], key)
-        self.assertEqual(rows["8201-050"]["status"], "TODO")
-        for fragment in ("T13 supplies source fragmentation and reassembly", "T17 owns",
-                         "T16 implements the receive-side indication", "src/tests/receive_capability.rs",
-                         "captured IPv6 offers from a two-link Host"):
-            self.assertIn(fragment, rows["8201-050"]["reason"])
-        self.assertNotIn("T16 supplies", rows["8201-050"]["reason"])
+        # Whole-key closures of T17: the complete original quotations, the
+        # source and asserting-test citations, every annotation copy, and
+        # reasons that state the whole obligation (8201-050: the complete
+        # header H in every output mode, fragmentation and the T16 receive
+        # indication; 8201-060: decision D8's type-specific disposition and
+        # a witness whose first and last encoded addresses differ).
+        t17 = {
+            "8201-050": ("a555cbc7fdcad0ffcdd9addbd00178b0967d60c5cd740069934d5d838aaf4912", [
+                "crates/stacks/ntcp-host/src/lib.rs::    pub fn header_plan(",
+                "crates/stacks/ntcp-host/src/tests/segment_routes.rs::"
+                "fn tcp_over_a_segment_route_sizes_and_repairs_segments_with_h()"],
+                ("complete IPv6 header H", "8 + 16(n + 1)-octet Segment Routing Header",
+                 "scalar, shared, reserved and software GSO output", "EMTU_S - H - 8",
+                 "1500 octets for IPv6", "repeat the unfragmentable part",
+                 "TCP never source-fragments", "Host::reassembly_capacity",
+                 "Host::receive_ip_capability", "integration/rfc_host srh cases")),
+            "8201-060": ("7dca119cc6ea95fe712577b228622de5bb9f0d416be441d22afb128c32f551df", [
+                "crates/stacks/ntcp-ip-common/src/ipv6.rs::    pub fn final_destination(",
+                "crates/stacks/ntcp-icmp/tests/extension_quote.rs::"
+                "fn routed_quotes_correlate_with_the_type_specific_final_destination()"],
+                ("Segments Left equal to zero, the Destination Address field", "decision A, D8",
+                 "last address Address[n]", "Segment List[0]", "declines attribution",
+                 "quote-decoder evidence only: no Type 0 header is ever originated",
+                 "validated against the route generation", "first and last addresses differ",
+                 "base Destination Address S1 different from the final destination")),
+        }
+        canonical = {}
+        for key, (digest, evidence, fragments) in t17.items():
+            row = rows[key]
+            full_key = row["target"] + "\n" + " ".join(row["quote"].split())
+            self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(), digest, key)
+            self.assertEqual(row["status"], "covered", key)
+            self.assertEqual(row["evidence"], evidence, key)
+            for fragment in fragments:
+                self.assertIn(fragment, row["reason"], key)
+            self.assertNotRegex(row["reason"], r"\bRemaining\b|T17 owns|accepts no extension header", key)
+            canonical[(row["target"], normalize(row["quote"]))] = row
+        kinds = {key: set() for key in canonical}
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in source_annotations(path.read_text()):
+                key = (annotation["target"], normalize(annotation["quote"]))
+                if key in canonical:
+                    self.assertEqual(annotation["reason"], canonical[key]["reason"],
+                                     (canonical[key]["id"], str(path), annotation["line"]))
+                    kinds[key].add(annotation["kind"])
+        for key, seen in kinds.items():
+            self.assertEqual(seen, {"CITATION", "TEST"}, canonical[key]["id"])
+        todos8201 = tomllib.loads((ROOT / "duvet/rfc8201-todos.toml").read_text())
+        for key in t17:
+            self.assertFalse([t for t in todos8201.get("TODO", [])
+                              if " ".join(t["quote"].split()) == " ".join(rows[key]["quote"].split())], key)
         # No reason in these ledgers or their TOML dispositions still claims
         # that fragmentation, a Host datagram service or an allocator is absent,
         # and every mention of Host Echo Replies states how a source-routed
         # request's reply is routed and sized (T14 answers it; D15's
-        # limitation is gone).
+        # limitation is gone), qualified as IPv4 source routing: IPv6
+        # replies use only owner-configured routes (T17).
         stale = (r"raw-datagram stack|UDP/raw datagram fragmentation service|no IP fragmentation service"
                  r"|does not offer host IP fragmentation|does not require a host datagram fragmentation"
                  r"|not fragmentation-based PLPMTUD|source fragmentation, including DF on originated fragments, is not")
@@ -614,9 +663,10 @@ class PmtudInventory(unittest.TestCase):
             self.assertNotRegex(reason, stale)
             self.assertNotIn("until T14", reason)
             if "Echo Replies" in reason:
-                self.assertIn("a reply to a source-routed Echo Request takes the reversed, "
+                self.assertIn("a reply to an IPv4 source-routed Echo Request takes the reversed, "
                               "policy-authorized return route, registers no adjunct demand "
-                              "and is never sized by an adjunct-confirmed bound", reason)
+                              "and is never sized by an adjunct-confirmed bound, while IPv6 "
+                              "Echo Replies use only owner-configured routes", reason)
 
     def test_t12_closures_keep_full_keys_and_every_annotation_copy(self):
         # Whole-obligation closures: the original full target + quote, the

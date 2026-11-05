@@ -150,7 +150,9 @@ pub struct Evidence {
     pub destination: IpAddr,
     /// Original DSCP; routers may remark the quoted copy.
     pub dscp: u8,
-    pub header_len: u16,
+    /// Physical lengths, IP extension headers and options included, in the
+    /// width of a packet length so that no header length is ever narrowed.
+    pub header_len: u32,
     pub packet_len: u32,
     pub protocol: u8,
     pub transport: Selector,
@@ -169,7 +171,7 @@ pub struct Record {
 pub struct QuoteKey {
     pub source: IpAddr,
     pub destination: IpAddr,
-    pub header_len: u16,
+    pub header_len: u32,
     pub packet_len: u32,
     pub protocol: u8,
     pub transport: QuotedSelector,

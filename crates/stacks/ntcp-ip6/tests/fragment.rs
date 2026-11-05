@@ -79,12 +79,28 @@ fn base_fragment_upper_layer_round_trip_and_header_placement() {
             ntcp_ip6::quote_header(packet).unwrap_err(),
             Error::FragmentationUnsupported
         );
-        let (quoted_ip, h, total, protocol, quoted) = quote_fragment_header(packet).unwrap();
+        let (quoted_ip, chain) = quote_fragment_header(packet).unwrap();
         assert_eq!(
-            (quoted_ip, h, total, protocol),
+            (
+                quoted_ip,
+                chain.header_len(),
+                chain.declared_len(),
+                chain.protocol()
+            ),
             (ip(), 48, packet.len(), 17)
         );
-        assert_eq!(quoted, Some(fr));
+        let quoted = chain.fragment().unwrap();
+        assert_eq!(
+            (
+                quoted.next_header,
+                quoted.identification,
+                quoted.more_fragments,
+                quoted.fragment_offset
+            ),
+            (fr.next_header, fr.identification, fr.more_fragments, fr.offset)
+        );
+        assert_eq!((quoted.offset, quoted.selector, quoted.data()), (40, 6, 48));
+        assert!(p.base_layout());
     }
     assert_eq!(reassembled, data);
     // The final destination is the header destination: no Routing header,
@@ -123,23 +139,47 @@ fn received_reserved_bits_are_ignored_and_later_fragment_data_is_opaque() {
         let p = parse_fragment(&later).unwrap();
         assert_eq!(p.protocol, next);
         assert_eq!(p.fragment.unwrap().next_header, next);
+        assert_eq!(p.chain.completeness(), ntcp_ip6::Completeness::LaterFragment);
+        assert_eq!((p.chain.header_len(), p.chain.headers().count()), (48, 1));
+        assert!(p.base_layout());
         assert!(quote_fragment_header(&later).is_ok());
-        // Fragment zero selects the reconstructed upper layer, which may not
-        // continue an extension chain.
+        // Fragment zero's chain continues after the Fragment header. Here
+        // the UDP header (Hdr Ext Len 0xa0) cannot be an extension header
+        // within the fragment: RFC 7112's incomplete chain.
         let mut first = packets[0].clone();
         first[40] = next;
         match next {
-            0 | 43 | 44 | 50 | 60 | 135 => {
+            0 => {
+                assert_eq!(
+                    ntcp_ip6::Chain::receive(&first).unwrap_err(),
+                    ntcp_ip6::Fault::MisplacedHopByHop { pointer: 40 }
+                );
                 assert_eq!(
                     parse_fragment(&first).unwrap_err(),
                     Error::ExtensionsUnsupported
                 );
+            }
+            43 | 60 => {
                 assert_eq!(
-                    quote_fragment_header(&first).unwrap_err(),
-                    Error::ExtensionsUnsupported
+                    ntcp_ip6::Chain::receive(&first).unwrap_err(),
+                    ntcp_ip6::Fault::IncompleteChain
+                );
+                assert_eq!(parse_fragment(&first).unwrap_err(), Error::Length);
+                assert_eq!(quote_fragment_header(&first).unwrap_err(), Error::Length);
+            }
+            _ => {
+                let p = parse_fragment(&first).unwrap();
+                assert_eq!(p.protocol, next);
+                // A repeated Fragment header is framed; its Next Header
+                // (the UDP source port's high octet) ends the chain.
+                let terminal = if next == 44 { first[48] } else { next };
+                assert_eq!(p.chain.protocol(), terminal);
+                assert_eq!(
+                    p.base_layout(),
+                    !matches!(next, 44 | 50 | 135),
+                    "next={next}"
                 );
             }
-            _ => assert_eq!(parse_fragment(&first).unwrap().protocol, next),
         }
     }
     // Atomic fragments (offset 0, M clear) are recognized on receive.
@@ -149,7 +189,13 @@ fn received_reserved_bits_are_ignored_and_later_fragment_data_is_opaque() {
     assert_eq!((fr.offset, fr.more_fragments), (0, false));
     // Truncated or impossible Fragment headers.
     let first = &packets[0];
-    assert_eq!(parse_fragment(&first[..44]).unwrap_err(), Error::Truncated);
+    // A received packet shorter than its Payload Length is refused before
+    // any header is read, exactly as `parse` does.
+    assert_eq!(parse_fragment(&first[..44]).unwrap_err(), Error::Length);
+    assert_eq!(
+        ntcp_ip6::Chain::receive(&first[..44]).unwrap_err(),
+        ntcp_ip6::Fault::Truncated
+    );
     assert_eq!(
         quote_fragment_header(&first[..47]).unwrap_err(),
         Error::Truncated
