@@ -17950,13 +17950,13 @@ fn timestamps_rtt_validated_echo_and_karn() {
 //# <RST> segment (see Section 5.2 for details).
 //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
 //= type=test
-//= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
+//= reason=Native and tun_echo time is the characterized CLOCK_BOOTTIME provider, which rejects decreasing samples and measures suspend; other embedders owe physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
 //# Values of this
 //# clock MUST be at least approximately proportional to real time, in
 //# order to measure actual RTT.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
 //= type=test
-//= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
+//= reason=Native and tun_echo time is the characterized CLOCK_BOOTTIME provider, which rejects decreasing samples and measures suspend; other embedders owe physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
 //# The recycling time of the timestamp clock MUST be greater than
 //# MSL seconds.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
@@ -17967,7 +17967,7 @@ fn timestamps_rtt_validated_echo_and_karn() {
 //# TCP sending the option.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
 //= type=test
-//= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; physical monotonicity/rate/precision and MSL are caller obligations, not measured or declared resolution gates.
+//= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; native monotonicity comes from the characterized CLOCK_BOOTTIME provider; physical rate/precision and actual network MSL are not measured or declared resolution gates, and other embedders' clocks remain caller obligations.
 //# Based upon these considerations, we choose a timestamp clock
 //# frequency in the range 1 ms to 1 sec per tick.
 fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
@@ -18431,6 +18431,7 @@ fn timestamp_units_mixed_peer_echo_wrap_and_timebase() {
                 },
                 [1; 32],
                 0,
+                crate::SETTLED,
                 |_| true,
             )
             .unwrap();
@@ -18473,6 +18474,7 @@ fn timestamp_boundary_saturates_and_disabled_units_are_inert() {
             },
             [1; 32],
             0,
+            crate::SETTLED,
             |_| true,
         )
         .unwrap();
@@ -18726,8 +18728,8 @@ fn assert_timestamp_interop_on_serviced_clocks(
     };
     let mut peer_cfg = cfg.clone();
     peer_cfg.connection.timestamp_granularity = TimestampGranularity::Milliseconds;
-    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
-    let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
+    let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let mut b = Endpoint::new(peer_cfg, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
     let listener = b.listen(tuple().remote, 1).unwrap();
     let id = a.connect(0, tuple().local, tuple().remote).unwrap();
     transfer(&mut a, &mut b, 0);
@@ -18999,8 +19001,8 @@ fn timestamp_long_idle_connections_resume_on_serviced_endpoint_clock() {
             peer_cfg.connection.timestamps = negotiated;
             // Mixed units remain opaque to the peer, including after physical PAWS expiry.
             peer_cfg.connection.timestamp_granularity = TimestampGranularity::Milliseconds;
-            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
-            let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
+            let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+            let mut b = Endpoint::new(peer_cfg, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
             let listener = b.listen(tuple().remote, 1).unwrap();
             let id = a.connect(0, tuple().local, tuple().remote).unwrap();
             transfer(&mut a, &mut b, 0);

@@ -12,6 +12,7 @@ fn endpoint(config: ConnectionConfig, address: IpAddr, secret: u8) -> Endpoint {
         },
         [secret; 32],
         0,
+        ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
         move |request| match request {
             AddressValidation::Bind { local } | AddressValidation::Open { local, .. } => {
                 local == address

@@ -1,6 +1,8 @@
 use super::*;
 #[path = "runtime_accounting_expectations_tests.rs"]
 mod accounting_expectations_tests;
+#[path = "runtime_clock_tests.rs"]
+mod clock_tests;
 #[path = "file_transfer_tests.rs"]
 mod file_transfer_tests;
 #[path = "large_write_tests.rs"]
@@ -33,7 +35,7 @@ fn sender_metadata_failure_does_not_consume_external_producer() {
     config.connection.send_capacity = 128;
     config.connection.receive_capacity = 1;
     config.connection.mss = 64;
-    let mut probe = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+    let mut probe = Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     probe
         .connect(
             0,
@@ -104,7 +106,7 @@ pub(super) fn ip_packet(owner: &Owner, tx: ntcp::Transmit, tcp: &[u8]) -> Vec<u8
 pub(super) fn poll_packet(owner: &mut Owner) -> Option<Vec<u8>> {
     let header = crate::ip::header_len(owner.local);
     let mut tcp = vec![0; owner.output_packet_len() - header];
-    let pair = ClockPair::sample(owner);
+    let pair = ClockPair::sample(owner).unwrap();
     let tx = owner
         .endpoint
         .poll_transmit(owner.now(), &mut tcp, BUDGET)
@@ -126,7 +128,7 @@ pub(super) fn pump(a: &mut Owner, b: &mut Owner) {
             };
             for _ in 0..32 {
                 let mut bytes = [0u8; 1480];
-                let pair = ClockPair::sample(from);
+                let pair = ClockPair::sample(from).unwrap();
                 let p = from
                     .endpoint
                     .poll_transmit(from.now(), &mut bytes, 32)
@@ -194,6 +196,7 @@ fn timestamp_default_control_rejects_non_packet_backend() {
 fn client_tfo_permission_native_configuration_and_management() {
     let mut owner = owner(2);
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2));
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.socket.fast_open_client_enabled = false;
     owner.apply_socket_config(&config).unwrap();
     let id = new(&mut owner, SOCK_NONBLOCK);
@@ -1023,7 +1026,7 @@ fn option_application_failure_releases_connect_and_accept_records() {
     // Local resets retain the released record for the core's 2MSL
     // quarantine; expiry must reclaim it rather than leak a slot.
     assert_ne!(b.endpoint.buffer_bytes(), 0);
-    b.epoch -= std::time::Duration::from_micros(ntcp::ConnectionConfig::default().time_wait_us + 1);
+    b.advance_clock(ntcp::ConnectionConfig::default().time_wait_us + 1);
     b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
     assert_eq!(b.endpoint.buffer_bytes(), 0);
     b.execute(listen, Op::Set(IPPROTO_TCP, TCP_KEEPCNT, 2))

@@ -1765,6 +1765,15 @@ fn managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling()
     };
     a.execute(client, Op::Set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT))
         .unwrap();
+    // One fact bounds both quiet periods and TCP's is the longer, so a fresh
+    // start never shows TCP output waiting for identifiers: state a later
+    // emission from this source to the running allocator instead.
+    let (quiet_source, quiet_now) = (a.local, a.now());
+    a.host
+        .as_mut()
+        .unwrap()
+        .start_source_identifiers(quiet_source, quiet_now, 0)
+        .unwrap();
     // Quiet period: nothing is offered to the backend.
     a.execute(client, Op::Write(vec![1; 100])).unwrap();
     tick(&mut a);
@@ -1900,6 +1909,15 @@ fn route_disable_clears_df_on_native_output_whatever_the_socket_requests() {
         )
         .unwrap();
     host.admin_apply(&capability, &mut a.endpoint, candidate).unwrap();
+    // One fact bounds both quiet periods and TCP's is the longer, so a fresh
+    // start never shows TCP output waiting for identifiers: state a later
+    // emission from this source to the running allocator instead.
+    let (quiet_source, quiet_now) = (a.local, a.now());
+    a.host
+        .as_mut()
+        .unwrap()
+        .start_source_identifiers(quiet_source, quiet_now, 0)
+        .unwrap();
     // The quiet period after start holds the DF-clear packet unsubmitted.
     a.execute(client, Op::Write(vec![1; 3000])).unwrap();
     tick(&mut a);

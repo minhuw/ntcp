@@ -346,7 +346,8 @@ impl Owner {
                     }
                 }
             }
-            self.drain_timestamps(ClockPair::sample(self));
+            let pair = ClockPair::sample(self)?;
+            self.drain_timestamps(pair);
             self.cancel_unused_backend_timestamps();
             Ok(())
         })();
@@ -462,7 +463,7 @@ impl Owner {
         let slot = &mut egress.tx[index];
         let bytes = &mut slot.bytes;
         bytes.resize(length + offset, 0);
-        let now = self.now();
+        let now = self.clock()?;
         let output = match owner {
             Some(id) if egress.shared_segments != 0 => {
                 self.endpoint.poll_reserved_transmit_shared_for(
@@ -579,7 +580,8 @@ impl Owner {
             slot.shared.header.extend_from_slice(bytes);
         }
         let wire_bytes = (bytes.len() + shared_len).max(if ethernet { 60 } else { 0 });
-        self.drain_timestamps(ClockPair::sample(self));
+        let pair = ClockPair::sample(self)?;
+        self.drain_timestamps(pair);
         if existing.is_none() {
             let flow = egress.scheduler.open_flow(index as u64).map_err(|_| EIO)?;
             egress.tx[index].entry = Some(Entry {
@@ -625,7 +627,7 @@ impl Owner {
     pub(super) fn service_egress(&mut self) -> Result<()> {
         let mut egress = self.egress.take().unwrap();
         let result = (|| {
-            let now = self.now();
+            let now = self.clock()?;
             if let Some(host) = &mut self.host {
                 // Publish connection results and apply every dirty
                 // subscriber's budget even when it has no output. A failed
@@ -676,7 +678,7 @@ impl Owner {
                 if submitted == BUDGET {
                     break;
                 }
-                let now = self.now();
+                let now = self.clock()?;
                 let (token, index) = match egress
                     .scheduler
                     .poll_ready(now, &mut visits)
@@ -951,13 +953,15 @@ impl Owner {
                     Ok(TxOutcome::Submitted) => {
                         // The Host transaction sealed the evidence and accepted
                         // the attempt with its preflighted time.
-                        if !accepted
-                            && !self
+                        if !accepted {
+                            let now = self.clock()?;
+                            if !self
                                 .endpoint
-                                .accept_transmit(self.now(), entry.attempt)
+                                .accept_transmit(now, entry.attempt)
                                 .map_err(engine)?
-                        {
-                            return Err(EIO);
+                            {
+                                return Err(EIO);
+                            }
                         }
                         if self.ports.iter().any(|p| p.tun.is_some()) || self.packet_backend() {
                             self.software_transmitted(entry.timestamp, timestamps::realtime());
@@ -975,10 +979,12 @@ impl Owner {
                         }
                     }
                     Ok(TxOutcome::Rejected)
-                        if self
-                            .endpoint
-                            .reject_local_output(self.now(), entry.attempt)
-                            .map_err(engine)? =>
+                        if {
+                            let now = self.clock()?;
+                            self.endpoint
+                                .reject_local_output(now, entry.attempt)
+                                .map_err(engine)?
+                        } =>
                     {
                         egress
                             .scheduler
@@ -991,7 +997,7 @@ impl Owner {
                         break;
                     }
                     Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
-                        let now = self.now();
+                        let now = self.clock()?;
                         entry
                             .deadline
                             .get_or_insert(now.saturating_add(self.reservation_timeout_us));
@@ -1007,9 +1013,10 @@ impl Owner {
                             .map_err(|_| EIO)?;
                     }
                     Err(error) if error.raw_os_error() == Some(EMSGSIZE) => {
+                        let now = self.clock()?;
                         entry
                             .deadline
-                            .get_or_insert(self.now().saturating_add(self.reservation_timeout_us));
+                            .get_or_insert(now.saturating_add(self.reservation_timeout_us));
                         if !self
                             .endpoint
                             .reject_unsubmitted(entry.attempt)
@@ -1040,7 +1047,8 @@ impl Owner {
                         return Err(error.raw_os_error().unwrap_or(EIO));
                     }
                 }
-                self.drain_timestamps(ClockPair::sample(self));
+                let pair = ClockPair::sample(self)?;
+                self.drain_timestamps(pair);
                 self.cancel_unused_backend_timestamps();
             }
             if let Some(host) = &mut self.host {
@@ -1120,7 +1128,7 @@ impl Owner {
                 if let Some(deferred) = slot.icmp.take() {
                     // The token carries the validated report for this exact
                     // generation; the Host discards it as stale otherwise.
-                    let now = self.now();
+                    let now = self.clock().map_err(std::io::Error::from_raw_os_error)?;
                     if let Some(host) = &mut self.host
                         && let Ok(ntcp_host::IcmpDispatch::Deferred(again)) =
                             host.replay_icmp(&mut self.endpoint, deferred, now)
@@ -1291,7 +1299,9 @@ impl Owner {
     /// blocked or refusing backend ends that port's pass, keeping the
     /// message due, and leaves the other ports' passes alone.
     pub(super) fn service_discovery(&mut self) {
-        let now = self.now();
+        let Ok(now) = self.clock() else {
+            return;
+        };
         let Self {
             host,
             ports,
@@ -1347,7 +1357,7 @@ impl Owner {
     /// queued for the next pass; any other outcome consumes it (an ICMP
     /// message carries no transport state to repair).
     pub(super) fn drain_icmp_output(&mut self) -> Result<()> {
-        let now = self.now();
+        let now = self.clock()?;
         // Queued messages, or a due Echo adjunct probe.
         if self
             .host

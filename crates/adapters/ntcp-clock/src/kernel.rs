@@ -27,25 +27,44 @@ pub(crate) fn acquire(query: &mut impl Query) -> Facts {
     }
 }
 
+/// What the transport provider reads, all of it read-only.
+pub(crate) trait TransportQuery {
+    fn clock(&mut self, clock: Clock) -> Result<Timespec, i32>;
+    fn resolution(&mut self, clock: Clock) -> Result<Timespec, i32>;
+    /// The bytes of a `/proc` file.
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, i32>;
+}
+
 pub(crate) struct Linux;
+
+fn clock_id(clock: Clock) -> libc::clockid_t {
+    match clock {
+        Clock::Boottime => libc::CLOCK_BOOTTIME,
+        Clock::Monotonic => libc::CLOCK_MONOTONIC,
+        Clock::Realtime => libc::CLOCK_REALTIME,
+    }
+}
+
+fn timespec(ts: libc::timespec) -> Timespec {
+    Timespec {
+        seconds: i64::from(ts.tv_sec),
+        nanoseconds: i64::from(ts.tv_nsec),
+    }
+}
+
+fn clock_gettime(clock: Clock) -> Result<Timespec, i32> {
+    // SAFETY: timespec is plain data; all-zero is a valid value.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `ts` is a valid, writable timespec for the call.
+    if unsafe { libc::clock_gettime(clock_id(clock), &mut ts) } != 0 {
+        return Err(errno());
+    }
+    Ok(timespec(ts))
+}
 
 impl Query for Linux {
     fn clock(&mut self, clock: Clock) -> Result<Timespec, i32> {
-        let id = match clock {
-            Clock::Boottime => libc::CLOCK_BOOTTIME,
-            Clock::Monotonic => libc::CLOCK_MONOTONIC,
-            Clock::Realtime => libc::CLOCK_REALTIME,
-        };
-        // SAFETY: timespec is plain data; all-zero is a valid value.
-        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-        // SAFETY: `ts` is a valid, writable timespec for the call.
-        if unsafe { libc::clock_gettime(id, &mut ts) } != 0 {
-            return Err(errno());
-        }
-        Ok(Timespec {
-            seconds: i64::from(ts.tv_sec),
-            nanoseconds: i64::from(ts.tv_nsec),
-        })
+        clock_gettime(clock)
     }
 
     fn adjtimex(&mut self) -> Result<KernelTime, i32> {
@@ -69,4 +88,24 @@ impl Query for Linux {
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+impl TransportQuery for Linux {
+    fn clock(&mut self, clock: Clock) -> Result<Timespec, i32> {
+        clock_gettime(clock)
+    }
+
+    fn resolution(&mut self, clock: Clock) -> Result<Timespec, i32> {
+        // SAFETY: timespec is plain data; all-zero is a valid value.
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: `ts` is a valid, writable timespec for the call.
+        if unsafe { libc::clock_getres(clock_id(clock), &mut ts) } != 0 {
+            return Err(errno());
+        }
+        Ok(timespec(ts))
+    }
+
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, i32> {
+        std::fs::read(path).map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+    }
 }

@@ -67,8 +67,8 @@ def config():
     `port.b` on link B, the same link-local address on both, each port
     resolving its own next hops (no next_hop_mac)."""
     a, b = LINKS
-    return (f"io.backend=af-packet\nio.interface={a['native']}\nio.address={NATIVE}\nio.prefix=64\n"
-            f"port.b.interface={b['native']}\nport.b.address={NATIVE}\nport.b.prefix=64\n")
+    return (f"io.backend=af-packet\nio.interface={a['native']}\nio.address={NATIVE}\nio.prefix=64\nio.source_quiet=never\n"
+            f"port.b.interface={b['native']}\nport.b.address={NATIVE}\nport.b.prefix=64\nport.b.source_quiet=never\n")
 
 
 def solicited_node(address):

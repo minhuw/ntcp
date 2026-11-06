@@ -30,9 +30,20 @@ pub struct SocketConfig {
     /// keys as external. Some(true) manages fresh keys for either codec.
     pub fast_open_managed_keys: Option<bool>,
     pub fast_open_cookie_lifetime: ntcp::FastOpenCookieLifetime,
-    /// Trusted absolute lease in owner microseconds; external deployments must
-    /// preserve its clock mapping across restart, or provide fresh keys.
+    /// The configured key's original lease: `CLOCK_BOOTTIME` microseconds of
+    /// the boot `fast_open_key_boot_id` names (`socket.fast_open_key_not_before_us`,
+    /// `issue_until_us`, `accept_until_us`). A restarted process configured
+    /// with the same key and lease keeps these deadlines: nothing renews.
     pub fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
+    /// `socket.fast_open_key_boot_id`: the boot every configured lease
+    /// belongs to, required with a lease. Another boot's numbers mean nothing
+    /// on this one, so such a configuration is refused.
+    pub fast_open_key_boot_id: Option<ntcp_clock::BootId>,
+    /// `socket.fast_open_key.<name>`: further raw keys, each with its own
+    /// lease, that setsockopt(TCP_FASTOPEN_KEY) may select. Rotation is
+    /// operator configuration: a key configured nowhere is EINVAL.
+    #[cfg(feature = "tfo-linux-cookie")]
+    pub fast_open_keys: Vec<ConfiguredFastOpenKey>,
     pub io: IoConfig,
     pub routes: Vec<(IpAddr, ntcp::RoutePolicy)>,
     /// The owner's local path control socket (`control.socket`,
@@ -48,6 +59,14 @@ pub struct SocketConfig {
     /// `io.backend` and address family. Empty by default: the runtime owns
     /// exactly the `io.*` port.
     pub ports: Vec<PortConfig>,
+}
+
+/// One raw key and its original lease.
+#[cfg(feature = "tfo-linux-cookie")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredFastOpenKey {
+    pub key: ntcp::LinuxSipHash24Key,
+    pub lease: ntcp::FastOpenKeyLease,
 }
 
 /// One additional port: its own interface, address and prefix, with the
@@ -73,6 +92,8 @@ pub struct PortConfig {
     pub next_hop_mac: Option<[u8; 6]>,
     pub gateways: Vec<(ntcp_host::path::IpPrefix, IpAddr)>,
     pub neighbors: Vec<(IpAddr, [u8; 6])>,
+    /// `port.<name>.source_quiet`: `io.source_quiet` for this port's address.
+    pub source_quiet: SourceQuiet,
 }
 
 /// Final destinations of `destination` are sent through `segments` S1..Sn
@@ -149,6 +170,10 @@ impl IoConfig {
 /// the end of the remaining quiet period (`Continuity::QuietFor`). The
 /// assertion states a fact about the deployment; it does not shorten the
 /// MDL, and a false assertion can repeat an identifier still in flight.
+///
+/// IP emission ceasing implies TCP emission ceased, so the same fact bounds
+/// the TCP quiet time (`ntcp::Lifecycle`): the runtime's one admission
+/// deadline takes the latest fact over `io.*` and every `port.<name>`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SourceQuiet {
     #[default]
@@ -158,6 +183,25 @@ pub enum SourceQuiet {
 }
 
 impl SourceQuiet {
+    /// The same fact for the TCP lifecycle.
+    pub(crate) fn tcp(self) -> ntcp::SourceContinuity {
+        match self {
+            Self::Unknown => ntcp::SourceContinuity::Unknown,
+            Self::Seconds(seconds) => ntcp::SourceContinuity::CeasedFor(seconds),
+            Self::Never => ntcp::SourceContinuity::Never,
+        }
+    }
+
+    /// The whole seconds emission from an address is stated to have ceased
+    /// before startup; unknown states nothing.
+    pub(crate) fn quiet_seconds(self) -> Option<u64> {
+        match self {
+            Self::Unknown => None,
+            Self::Seconds(seconds) => Some(seconds),
+            Self::Never => Some(u64::MAX),
+        }
+    }
+
     /// The allocator's start for a Host started at `now`.
     pub(crate) fn continuity(self, now: u64) -> ntcp_host::Continuity {
         match self {
@@ -198,6 +242,9 @@ impl SocketConfig {
             fast_open_managed_keys: None,
             fast_open_cookie_lifetime: Default::default(),
             fast_open_key_lease: None,
+            fast_open_key_boot_id: None,
+            #[cfg(feature = "tfo-linux-cookie")]
+            fast_open_keys: Vec::new(),
             routes: Vec::new(),
             control: None,
             segment_routes: Vec::new(),
@@ -219,24 +266,118 @@ impl SocketConfig {
         }
     }
 
+    /// The latest continuity fact over every address this runtime owns.
+    pub(crate) fn continuity(&self) -> ntcp::SourceContinuity {
+        self.ports
+            .iter()
+            .fold(self.io.source_quiet.tcp(), |fact, port| {
+                fact.latest(port.source_quiet.tcp())
+            })
+    }
+
     pub(crate) fn fast_open_keys_managed(&self) -> io::Result<bool> {
-        let managed = self.fast_open_managed_keys.unwrap_or(matches!(
+        let generated = matches!(
             self.fast_open_cookie_policy,
             ntcp::FastOpenCookiePolicy::HmacSha256
-        ));
-        if managed && self.fast_open_key_lease.is_some() {
+        );
+        let managed = self.fast_open_managed_keys.unwrap_or(generated);
+        // A managed key has the lifetime the stack gives it; an external key
+        // is accepted only with its original lease.
+        if (managed && self.fast_open_key_lease.is_some())
+            || (!managed && !generated && self.fast_open_key_lease.is_none())
+        {
             return Err(invalid());
         }
         Ok(managed)
     }
 
+    // Whether anything configured here is a lease of a named boot.
+    fn leased(&self) -> bool {
+        #[cfg(feature = "tfo-linux-cookie")]
+        if !self.fast_open_keys.is_empty() {
+            return true;
+        }
+        self.fast_open_key_lease.is_some()
+    }
+
+    // The provider is read only when a lease needs it.
+    fn validate_fast_open_leases(&self) -> io::Result<()> {
+        if !self.leased() {
+            return if self.fast_open_key_boot_id.is_some() {
+                Err(invalid())
+            } else {
+                Ok(())
+            };
+        }
+        let failed = |error: ntcp_clock::TransportError| {
+            io::Error::other(format!("Fast Open key lease: {error}"))
+        };
+        let mut clock = ntcp_clock::TransportClock::new().map_err(failed)?;
+        let now = clock.sample().map_err(failed)?.ticks;
+        self.check_fast_open_leases(clock.characterization().boot_id, now)
+    }
+
+    // Leases against the running boot and its `CLOCK_BOOTTIME` microseconds.
+    // Any expired one is refused. The primary key is installed at startup, so
+    // it must have begun; a further key may be waiting for its `not_before`.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-3
+    //= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+    //# 5. The rest of the connection proceeds like a normal TCP connection. The
+    //# client can repeat many Fast Open operations once it acquires a cookie
+    //# (until the cookie is expired by the server).
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+    //= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+    //# 5. The cookie expires after a certain amount of time. The reason for
+    //# cookie expiration is detailed in the "Security Considerations" section
+    //# (Section 5). This can be done by either periodically changing the server
+    //# key used to generate cookies or including a timestamp when generating
+    //# the cookie.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+    //= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+    //# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid,
+    //# i.e., it has not expired and the cookie authenticates the client IP
+    //# address.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+    //# Once the client obtains the cookie from the target server, it can
+    //# perform subsequent TFO connections until the cookie is expired by the
+    //# server.
+    pub(crate) fn check_fast_open_leases(
+        &self,
+        boot_id: ntcp_clock::BootId,
+        now: u64,
+    ) -> io::Result<()> {
+        if self.fast_open_key_boot_id != Some(boot_id) {
+            return Err(invalid());
+        }
+        let timebase = self.tcp.connection.timebase;
+        if let Some(lease) = self.fast_open_key_lease
+            && (now >= lease.accept_until || lease.validate(now, timebase).is_err())
+        {
+            return Err(invalid());
+        }
+        #[cfg(feature = "tfo-linux-cookie")]
+        for (i, configured) in self.fast_open_keys.iter().enumerate() {
+            let lease = configured.lease;
+            let primary = matches!(
+                &self.fast_open_cookie_policy,
+                ntcp::FastOpenCookiePolicy::LinuxSipHash24(key) if *key == configured.key
+            );
+            // One key has one lease.
+            if primary
+                || self.fast_open_keys[..i].iter().any(|other| other.key == configured.key)
+                || now >= lease.accept_until
+                || lease.validate(lease.not_before, timebase).is_err()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> io::Result<()> {
         self.fast_open_keys_managed()?;
-        if let Some(lease) = self.fast_open_key_lease {
-            lease
-                .validate(lease.not_before, self.tcp.connection.timebase)
-                .map_err(|_| invalid())?;
-        }
+        self.validate_fast_open_leases()?;
         if self.io.receive_aggregation && self.io.backend != Backend::AfPacket {
             return Err(invalid());
         }
@@ -402,6 +543,8 @@ impl SocketConfig {
         let mut control_uids = None;
         let mut seen = BTreeSet::new();
         let mut ports: Vec<(&str, PortFields)> = Vec::new();
+        #[cfg(feature = "tfo-linux-cookie")]
+        let mut keys: Vec<(&str, KeyFields)> = Vec::new();
         for line in text.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -422,6 +565,31 @@ impl SocketConfig {
                 });
                 continue;
             }
+            #[cfg(feature = "tfo-linux-cookie")]
+            if let Some(rest) = key.strip_prefix("socket.fast_open_key.") {
+                let (name, field) = rest
+                    .split_once('.')
+                    .map_or((rest, None), |(name, field)| (name, Some(field)));
+                if !valid_name(name) {
+                    return Err(invalid());
+                }
+                let index = match keys.iter().position(|(n, _)| *n == name) {
+                    Some(index) => index,
+                    None => {
+                        keys.push((name, KeyFields::default()));
+                        keys.len() - 1
+                    }
+                };
+                let fields = &mut keys[index].1;
+                match field {
+                    None => fields.key = Some(raw_key(value)?),
+                    Some("not_before_us") => fields.lease.not_before = number(value)?,
+                    Some("issue_until_us") => fields.lease.issue_until = number(value)?,
+                    Some("accept_until_us") => fields.lease.accept_until = number(value)?,
+                    _ => return Err(invalid()),
+                }
+                continue;
+            }
             if let Some(rest) = key.strip_prefix("port.") {
                 let (name, field) = rest.split_once('.').ok_or_else(invalid)?;
                 if !valid_name(name) {
@@ -440,6 +608,7 @@ impl SocketConfig {
                     "address" => port.address = Some(value.parse().map_err(|_| invalid())?),
                     "prefix" => port.prefix = Some(number(value)?),
                     "next_hop_mac" => port.next_hop_mac = Some(mac(value)?),
+                    "source_quiet" => port.source_quiet = source_quiet(value)?,
                     _ => {
                         if let Some(address) = field.strip_prefix("neighbor.") {
                             port.neighbors
@@ -510,19 +679,16 @@ impl SocketConfig {
                 "socket.fast_open_key_not_before_us"
                 | "socket.fast_open_key_issue_until_us"
                 | "socket.fast_open_key_accept_until_us" => {
-                    let lease = config
-                        .fast_open_key_lease
-                        .get_or_insert(ntcp::FastOpenKeyLease {
-                            not_before: 0,
-                            issue_until: 0,
-                            accept_until: 0,
-                            units_per_second: 1_000_000,
-                        });
+                    let lease = config.fast_open_key_lease.get_or_insert(EMPTY_LEASE);
                     match key {
                         "socket.fast_open_key_not_before_us" => lease.not_before = number(value)?,
                         "socket.fast_open_key_issue_until_us" => lease.issue_until = number(value)?,
                         _ => lease.accept_until = number(value)?,
                     }
+                }
+                "socket.fast_open_key_boot_id" => {
+                    config.fast_open_key_boot_id =
+                        Some(ntcp_clock::BootId::parse(value).ok_or_else(invalid)?);
                 }
                 "socket.fast_open_key" => cookie_key = Some(value),
                 "socket.notsent_lowat" => config.socket.notsent_lowat = number(value)?,
@@ -544,12 +710,7 @@ impl SocketConfig {
                         _ => return Err(invalid()),
                     }
                 }
-                "io.source_quiet" => {
-                    config.io.source_quiet = match value {
-                        "never" => SourceQuiet::Never,
-                        seconds => SourceQuiet::Seconds(number(seconds)?),
-                    }
-                }
+                "io.source_quiet" => config.io.source_quiet = source_quiet(value)?,
                 "io.gso_max_bytes" => gso_bytes = Some(number(value)?),
                 "io.gso_max_segments" => gso_segments = Some(number(value)?),
                 "io.output_reservation_timeout_ms" => {
@@ -617,15 +778,7 @@ impl SocketConfig {
             ("hmac-sha256", None) => ntcp::FastOpenCookiePolicy::HmacSha256,
             #[cfg(feature = "tfo-linux-cookie")]
             ("linux-siphash24", Some(key)) => {
-                if key.len() != 32 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(invalid());
-                }
-                let mut bytes = [0; 16];
-                for (i, byte) in bytes.iter_mut().enumerate() {
-                    *byte =
-                        u8::from_str_radix(&key[i * 2..i * 2 + 2], 16).map_err(|_| invalid())?;
-                }
-                ntcp::FastOpenCookiePolicy::LinuxSipHash24(ntcp::LinuxSipHash24Key::new(bytes))
+                ntcp::FastOpenCookiePolicy::LinuxSipHash24(raw_key(key)?)
             }
             _ => return Err(invalid()),
         };
@@ -653,6 +806,14 @@ impl SocketConfig {
                 next_hop_mac: port.next_hop_mac,
                 gateways: port.gateways,
                 neighbors: port.neighbors,
+                source_quiet: port.source_quiet,
+            });
+        }
+        #[cfg(feature = "tfo-linux-cookie")]
+        for (_, fields) in keys {
+            config.fast_open_keys.push(ConfiguredFastOpenKey {
+                key: fields.key.ok_or_else(invalid)?,
+                lease: fields.lease,
             });
         }
         // An allow-list without a socket would be inert configuration.
@@ -684,6 +845,45 @@ impl SocketConfig {
     }
 }
 
+// A lease being parsed: an absent deadline stays zero, which validation refuses
+// unless the deadlines around it are a valid lease from the boot's start.
+const EMPTY_LEASE: ntcp::FastOpenKeyLease = ntcp::FastOpenKeyLease {
+    not_before: 0,
+    issue_until: 0,
+    accept_until: 0,
+    units_per_second: 1_000_000,
+};
+
+// The `socket.fast_open_key.<name>*` fields as they are parsed.
+#[cfg(feature = "tfo-linux-cookie")]
+struct KeyFields {
+    key: Option<ntcp::LinuxSipHash24Key>,
+    lease: ntcp::FastOpenKeyLease,
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+impl Default for KeyFields {
+    fn default() -> Self {
+        Self {
+            key: None,
+            lease: EMPTY_LEASE,
+        }
+    }
+}
+
+// Sixteen raw key bytes in hexadecimal, never a seed.
+#[cfg(feature = "tfo-linux-cookie")]
+fn raw_key(text: &str) -> io::Result<ntcp::LinuxSipHash24Key> {
+    if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let mut bytes = [0; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).map_err(|_| invalid())?;
+    }
+    Ok(ntcp::LinuxSipHash24Key::new(bytes))
+}
+
 // The `port.<name>.*` fields as they are parsed.
 #[derive(Default)]
 struct PortFields {
@@ -693,6 +893,15 @@ struct PortFields {
     next_hop_mac: Option<[u8; 6]>,
     gateways: Vec<(ntcp_host::path::IpPrefix, IpAddr)>,
     neighbors: Vec<(IpAddr, [u8; 6])>,
+    source_quiet: SourceQuiet,
+}
+
+// `SECONDS | never`, for `io.source_quiet` and `port.<name>.source_quiet`.
+fn source_quiet(value: &str) -> io::Result<SourceQuiet> {
+    Ok(match value {
+        "never" => SourceQuiet::Never,
+        seconds => SourceQuiet::Seconds(number(seconds)?),
+    })
 }
 
 // A port name is one configuration key component.

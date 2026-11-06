@@ -2,6 +2,7 @@
 use super::*;
 fn owner4(last: u8) -> (Owner, Arc<Mutex<State>>) {
     let mut config = SocketConfig::new("external", Ipv4Addr::new(192, 0, 2, last));
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(24);
     config.tcp.connection.timestamps = false;
     config.tcp.connection.delayed_ack_us = 0;
@@ -434,6 +435,7 @@ fn mapped_native_socket_abi_preserves_domain_bind_names_and_fd_alias() {
         return;
     }
     let mut config = SocketConfig::new("external", Ipv4Addr::new(192, 0, 2, 1));
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(24);
     let state = Arc::new(Mutex::new(State::default()));
     crate::configure_with_packet_io(config, move || {

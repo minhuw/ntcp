@@ -159,6 +159,20 @@ impl Runtime {
                 SocketConfig::new("test", local).tcp,
             )
             .unwrap();
+            // The ABI fixtures' one operator-configured raw key.
+            #[cfg(feature = "tfo-linux-cookie")]
+            owner
+                .external_fast_open_keys
+                .push(crate::ConfiguredFastOpenKey {
+                    key: LinuxSipHash24Key::new([0xab; 16]),
+                    lease: ntcp::FastOpenKeyLease::for_lifetime(
+                        0,
+                        Default::default(),
+                        owner.defaults.connection.timebase,
+                        false,
+                    )
+                    .unwrap(),
+                });
             while let Ok(request) = rx.recv() {
                 let result = owner.execute(request.id, request.op);
                 let _ = request.reply.send(result);
@@ -341,6 +355,10 @@ pub fn signal(fd: i32) {
         syscall(SYS_write, fd, &one, 8);
     }
 }
+fn clock_failure(error: ntcp_clock::TransportError) -> i32 {
+    eprintln!("ntcp: transport clock failed ({error})");
+    EIO
+}
 fn engine(e: EndpointError) -> i32 {
     match e {
         EndpointError::AddressInUse => EADDRINUSE,
@@ -349,6 +367,8 @@ fn engine(e: EndpointError) -> i32 {
         EndpointError::Connection(Error::WouldBlock) => EAGAIN,
         EndpointError::Connection(Error::NoMemory) => ENOMEM,
         EndpointError::Connection(Error::InvalidState) => ENOTCONN,
+        // Reaches only `start_connection`, which holds the open for it.
+        EndpointError::QuietUntil(_) => EINPROGRESS,
         _ => EINVAL,
     }
 }
@@ -418,6 +438,11 @@ struct Socket {
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
     fast_open_connect: bool,
+    // An active open refused until the lifecycle deadline, one per socket:
+    // nothing exists in the Endpoint yet. Its peer, address and zone wait in
+    // `deferred_peer`, `local` and `zone`; this holds the bytes accepted for
+    // a Fast Open SYN, or None for an ordinary open.
+    quiet_open: Option<Option<Vec<u8>>>,
     receive_authority: Option<ntcp::ListenerId>,
     server_cookie: Option<(SocketAddr, FastOpenCookie)>,
     client_policy: Option<(SocketAddr, FastOpenClientPolicy)>,
@@ -505,6 +530,7 @@ impl Socket {
             fast_open_cookie_policy: None,
             fast_open_key_lease: None,
             fast_open_connect: false,
+            quiet_open: None,
             receive_authority: None,
             server_cookie: None,
             client_policy: None,
@@ -603,8 +629,9 @@ struct ManagedFastOpenKeys {
 
 struct Owner {
     fast_open_keys: Option<ManagedFastOpenKeys>,
+    #[cfg(feature = "tfo-linux-cookie")]
+    external_fast_open_keys: Vec<crate::ConfiguredFastOpenKey>,
     fast_open_configured: bool,
-    fast_open_cookie_lifetime: ntcp::FastOpenCookieLifetime,
     #[cfg(test)]
     fast_open_entropy: Option<VecDeque<Result<[u8; 32]>>>,
     endpoint: Endpoint,
@@ -636,13 +663,28 @@ struct Owner {
     // The operator's assertion about earlier emission from `local`
     // (`io.source_quiet`), applied when the Host's allocator starts.
     source_quiet: crate::SourceQuiet,
+    // The same fact for each `port.<name>` address.
+    port_quiet: Vec<(IpAddr, crate::SourceQuiet)>,
+    // The facts this Endpoint lifecycle started from.
+    lifecycle: ntcp::Lifecycle,
+    // Whether a socket may hold an open for the lifecycle deadline.
+    quiet_opens: bool,
     sockets: BTreeMap<u64, Socket>,
     // The `io.*` port's address: the runtime's address family and the
     // source of connections no other port's address is selected for.
     local: IpAddr,
-    epoch: Instant,
+    // Transport time (CLOCK_BOOTTIME microseconds) for the Endpoint and the
+    // Host, and its first sample, where the Endpoint starts.
+    clock: ntcp_clock::TransportClock,
+    started: u64,
     #[cfg(test)]
     test_now: Option<u64>,
+    // Unit-test owners count from their construction, so fixture schedules
+    // stay literal; zero gives the provider's own ticks.
+    #[cfg(test)]
+    test_origin: u64,
+    #[cfg(test)]
+    test_clock_failure: bool,
     #[cfg(feature = "packet-test")]
     next_port: u16,
     #[cfg(test)]
@@ -795,30 +837,36 @@ impl Owner {
             extra.index = backend::interface_index(&port.interface)?;
             ports.push(extra);
         }
-        let mut owner = Self::with_ports(ports, secret, tcp)?;
+        let mut owner = Self::with_ports(ports, secret, tcp, config.continuity())?;
         owner.initialize_socket_config(config)?;
         owner.attach_backend_host(u64::from(index))?;
         owner.enable_reservations(&config.io)?;
         Ok(owner)
     }
     fn initialize_socket_config(&mut self, config: &SocketConfig) -> Result<()> {
-        // with_config establishes the owner/endpoint monotonic origin at zero.
-        // Startup setup consumes lease time; it must not shift that origin or
-        // grant a fresh interval when backend initialization completes later.
+        // Startup setup consumes lease time from the owner's first sample; it
+        // must not grant a fresh interval when backend initialization
+        // completes later.
         self.source_quiet = config.io.source_quiet;
+        self.port_quiet.clear();
+        self.port_quiet
+            .try_reserve_exact(config.ports.len())
+            .map_err(|_| ENOMEM)?;
+        self.port_quiet
+            .extend(config.ports.iter().map(|port| (port.address, port.source_quiet)));
         self.segment_routes = config.segment_routes.clone();
-        self.apply_socket_config_at(config, 0)
+        self.apply_socket_config_at(config, self.started)
     }
 
     #[cfg(test)]
     fn apply_socket_config(&mut self, config: &SocketConfig) -> Result<()> {
-        self.apply_socket_config_at(config, self.now())
+        let now = self.clock()?;
+        self.apply_socket_config_at(config, now)
     }
 
     fn apply_socket_config_at(&mut self, config: &SocketConfig, now: u64) -> Result<()> {
         let managed = config.fast_open_keys_managed().map_err(|_| EINVAL)?;
         self.socket_policy = config.socket;
-        self.fast_open_cookie_lifetime = config.fast_open_cookie_lifetime;
         self.endpoint
             .set_fast_open_cookie_lifetime(config.fast_open_cookie_lifetime);
         if managed {
@@ -870,12 +918,39 @@ impl Owner {
                     .map_err(engine)?;
             }
         }
+        #[cfg(feature = "tfo-linux-cookie")]
+        self.configure_external_fast_open_keys(config, managed)?;
         for &(destination, policy) in &config.routes {
             self.endpoint
                 .set_destination_route(now, destination, Some(policy))
                 .map_err(engine)?;
         }
         self.fast_open_configured = true;
+        Ok(())
+    }
+    // What setsockopt(TCP_FASTOPEN_KEY) may select: the primary key when it
+    // is external, and every further configured key.
+    #[cfg(feature = "tfo-linux-cookie")]
+    fn configure_external_fast_open_keys(
+        &mut self,
+        config: &SocketConfig,
+        managed: bool,
+    ) -> Result<()> {
+        let mut keys = Vec::new();
+        keys.try_reserve_exact(config.fast_open_keys.len() + 1)
+            .map_err(|_| ENOMEM)?;
+        if let (false, FastOpenCookiePolicy::LinuxSipHash24(key), Some(lease)) = (
+            managed,
+            &config.fast_open_cookie_policy,
+            config.fast_open_key_lease,
+        ) {
+            keys.push(crate::ConfiguredFastOpenKey {
+                key: key.clone(),
+                lease,
+            });
+        }
+        keys.extend(config.fast_open_keys.iter().cloned());
+        self.external_fast_open_keys = keys;
         Ok(())
     }
     fn fast_open_secret(&mut self) -> Result<[u8; 32]> {
@@ -946,13 +1021,16 @@ impl Owner {
             (subnet.0.into(), subnet.1),
             tun,
         ));
-        Self::with_ports(ports, secret, config)
+        // Fixtures and the packet-test port: an address created for this
+        // Owner, from which nothing was ever emitted.
+        Self::with_ports(ports, secret, config, ntcp::SourceContinuity::Never)
     }
     // An owner of `ports`, the `io.*` port first.
     fn with_ports(
         ports: Vec<backend::Port>,
         secret: [u8; 32],
         config: EndpointConfig,
+        continuity: ntcp::SourceContinuity,
     ) -> Result<Self> {
         let local = ports.first().ok_or(EINVAL)?.address;
         let mut addresses = Vec::new();
@@ -976,7 +1054,22 @@ impl Owner {
             })
         };
         let own = move |ip: IpAddr| addresses.iter().any(|&(address, _)| address == ip);
-        let endpoint = Endpoint::new(config, secret, 0, move |r| match r {
+        let mut clock = ntcp_clock::TransportClock::new().map_err(clock_failure)?;
+        let started = clock.sample().map_err(clock_failure)?.ticks;
+        let lifecycle = ntcp::Lifecycle {
+            boot_age: Some(clock.boot_age(started).map_err(clock_failure)?),
+            continuity,
+        };
+        // Unit-test owners model a mature host; the provider's age would
+        // make their schedules depend on the machine's uptime.
+        #[cfg(test)]
+        let lifecycle = ntcp::Lifecycle {
+            boot_age: Some(u64::MAX),
+            ..lifecycle
+        };
+        #[cfg(test)]
+        let (test_origin, started) = (started, 0);
+        let endpoint = Endpoint::new(config, secret, started, lifecycle, move |r| match r {
             AddressValidation::Bind { local: bind } => {
                 // Per-socket local-address permission is checked by Op::Bind.
                 // FREEBIND does not relax Open, Incoming, or Route policy.
@@ -995,8 +1088,9 @@ impl Owner {
         .map_err(engine)?;
         Ok(Self {
             fast_open_keys: None,
+            #[cfg(feature = "tfo-linux-cookie")]
+            external_fast_open_keys: Vec::new(),
             fast_open_configured: false,
-            fast_open_cookie_lifetime: Default::default(),
             #[cfg(test)]
             fast_open_entropy: None,
             endpoint,
@@ -1011,12 +1105,20 @@ impl Owner {
             socket_policy: crate::SocketPolicy::default(),
             segment_routes: Vec::new(),
             source_quiet: crate::SourceQuiet::Unknown,
+            port_quiet: Vec::new(),
+            lifecycle,
+            quiet_opens: false,
             sockets: BTreeMap::new(),
             local,
-            epoch: Instant::now(),
+            clock,
+            started,
             control: None,
             #[cfg(test)]
             test_now: None,
+            #[cfg(test)]
+            test_origin,
+            #[cfg(test)]
+            test_clock_failure: false,
             #[cfg(feature = "packet-test")]
             next_port: 40000,
             #[cfg(test)]
@@ -1057,7 +1159,8 @@ impl Owner {
         owner.endpoint = Endpoint::new(
             crate::packet_profile::config(profile),
             [42; 32],
-            0,
+            owner.started,
+            owner.lifecycle,
             move |r| match r {
                 AddressValidation::Bind { local: addr } => addr.is_unspecified() || unicast(addr),
                 AddressValidation::Open { local: addr, .. } => addr == local,
@@ -1066,9 +1169,33 @@ impl Owner {
             },
         )
         .map_err(engine)?;
-        owner
-            .endpoint
-            .set_fast_open_cookie_policy(crate::packet_profile::cookie_policy(profile));
+        match crate::packet_profile::cookie_policy(profile) {
+            // The script's raw key is operator configuration: a lease on the
+            // current boot, from the configured lifetime, starting at setup.
+            #[cfg(feature = "tfo-linux-cookie")]
+            FastOpenCookiePolicy::LinuxSipHash24(key) => {
+                let lease = ntcp::FastOpenKeyLease::for_lifetime(
+                    owner.started,
+                    Default::default(),
+                    crate::packet_profile::config(profile).connection.timebase,
+                    false,
+                )
+                .map_err(|_| EINVAL)?;
+                owner
+                    .endpoint
+                    .install_fast_open_key(
+                        owner.started,
+                        ntcp::FastOpenServerKey::LinuxSipHash24(key.clone()),
+                        lease,
+                        false,
+                    )
+                    .map_err(engine)?;
+                owner
+                    .external_fast_open_keys
+                    .push(crate::ConfiguredFastOpenKey { key, lease });
+            }
+            policy => owner.endpoint.set_fast_open_cookie_policy(policy),
+        }
         if matches!(profile, crate::packet_profile::Profile::Upstream(o) if o.tfo_listen) {
             owner.endpoint.enable_fast_open().map_err(engine)?;
         }
@@ -1089,11 +1216,20 @@ impl Owner {
     }
     #[cfg(all(test, feature = "packet-test"))]
     fn replace_packet_endpoint(&mut self, config: EndpointConfig) -> Result<()> {
+        self.replace_packet_lifecycle(config, self.lifecycle)
+    }
+    #[cfg(all(test, feature = "packet-test"))]
+    fn replace_packet_lifecycle(
+        &mut self,
+        config: EndpointConfig,
+        lifecycle: ntcp::Lifecycle,
+    ) -> Result<()> {
         // Configuration variants in packet fixtures still attach their actual
         // port through the production bridge before exercising socket startup.
         assert!(self.packets.is_some());
         assert_eq!(self.host.as_ref().unwrap().binding_count(), 0);
-        self.endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).map_err(engine)?;
+        self.endpoint =
+            Endpoint::new(config.clone(), [42; 32], 0, lifecycle, |_| true).map_err(engine)?;
         self.defaults = config;
         let previous = self
             .host
@@ -1291,12 +1427,55 @@ impl Owner {
             .count()
             >= self.socket_limit()
     }
-    fn now(&self) -> u64 {
+    // One transport sample, with its measured suspend passed to the
+    // Endpoint. A provider failure or a sample the Endpoint rejects is EIO:
+    // time stops being available and the owner loop ends, never a frozen time.
+    fn clock(&mut self) -> Result<u64> {
         #[cfg(test)]
-        if let Some(now) = self.test_now {
-            return now;
+        {
+            if self.test_clock_failure {
+                return Err(EIO);
+            }
+            if let Some(now) = self.test_now {
+                return Ok(now);
+            }
         }
-        self.epoch.elapsed().as_micros().min(u64::MAX as u128) as u64
+        let sample = self.clock.sample().map_err(clock_failure)?;
+        #[cfg(test)]
+        let sample = ntcp_clock::TransportSample {
+            ticks: sample.ticks.wrapping_sub(self.test_origin),
+            ..sample
+        };
+        self.accept_sample(sample)
+    }
+    fn accept_sample(&mut self, sample: ntcp_clock::TransportSample) -> Result<u64> {
+        if sample.suspended != 0 {
+            self.endpoint
+                .resume(sample.ticks, sample.suspended)
+                .map_err(|_| EIO)?;
+        }
+        Ok(sample.ticks)
+    }
+    // Fixtures read time without taking a sample of the owner's provider.
+    #[cfg(test)]
+    fn now(&self) -> u64 {
+        self.test_now.unwrap_or_else(|| {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) },
+                0
+            );
+            (time.tv_sec as u64 * 1_000_000 + time.tv_nsec as u64 / 1_000)
+                .wrapping_sub(self.test_origin)
+        })
+    }
+    // Real-clock fixtures: as if `micros` more had elapsed.
+    #[cfg(test)]
+    fn advance_clock(&mut self, micros: u64) {
+        self.test_origin = self.test_origin.wrapping_sub(micros);
     }
     fn packet_wait(&self, op: &Op) -> bool {
         #[cfg(feature = "packet-test")]
@@ -1429,14 +1608,20 @@ impl Owner {
         let mut after_output = Vec::with_capacity(BUDGET);
         'run: while !stop.load(Ordering::Acquire) {
             self.poll_mtu_refresh();
-            if self.expire_egress(self.now()).is_err() {
+            let Ok(now) = self.clock() else {
+                break;
+            };
+            if self.expire_egress(now).is_err() {
                 break;
             }
-            let now = self.now();
+            let Ok(now) = self.clock() else {
+                break;
+            };
             let _ = self.rotate_fast_open_keys(now);
             if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
+            self.release_quiet_opens(now);
             if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
                 break 'run;
             }
@@ -1552,7 +1737,9 @@ impl Owner {
     }
     // One bounded control pass at the owner clock.
     fn service_control(&mut self) {
-        let now = self.now();
+        let Ok(now) = self.clock() else {
+            return;
+        };
         if let (Some(server), Some(host)) = (&mut self.control, &mut self.host) {
             server.service(host, &mut self.endpoint, now);
         }
@@ -1689,7 +1876,9 @@ impl Owner {
             }
         }
 
-        let pair = ClockPair::sample(self);
+        // Without time the segment stays unprocessed; the owner loop ends.
+        let pair = ClockPair::sample(self)
+            .map_err(|_| EndpointError::Connection(Error::AmbiguousTimeJump))?;
         let metadata = ntcp::RxPacketMetadata {
             timestamps: stamps,
             tcp_segment_size: segment_size,
@@ -2009,7 +2198,9 @@ impl Owner {
         }
         match s.handle {
             Handle::Fresh => {
-                if s.deferred_peer.is_some() {
+                // A held open is a connection attempt: writable on its
+                // completion or failure, not while it waits.
+                if (s.deferred_peer.is_some() && s.quiet_open.is_none()) || s.error != 0 {
                     bits |= EPOLLOUT;
                 }
             }
@@ -2093,8 +2284,9 @@ impl Owner {
             {
                 return Err(EINVAL);
             }
+            let now = self.clock()?;
             self.endpoint
-                .set_destination_route(self.now(), destination, policy)
+                .set_destination_route(now, destination, policy)
                 .map_err(|error| {
                     if error == EndpointError::OutputReserved {
                         EAGAIN
@@ -2116,7 +2308,8 @@ impl Owner {
         if self.command_held(id, &op) {
             return Err(EAGAIN);
         }
-        self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
+        let now = self.clock()?;
+        self.endpoint.on_timeout(now, 0).map_err(engine)?;
         self.collect_paths()?;
         let result = self.dispatch(id, op);
         let _ = self.refresh_readiness(id);
@@ -2290,18 +2483,16 @@ impl Owner {
                     return Err(EINVAL);
                 }
                 let policy = FastOpenCookiePolicy::LinuxSipHash24(key.clone());
-                let now = self.now();
-                let lease = if s.fast_open_cookie_policy.as_ref() == Some(&policy) {
-                    s.fast_open_key_lease.ok_or(EINVAL)?
-                } else {
-                    ntcp::FastOpenKeyLease::for_lifetime(
-                        now,
-                        self.fast_open_cookie_lifetime,
-                        self.defaults.connection.timebase,
-                        false,
-                    )
-                    .map_err(|_| EINVAL)?
-                };
+                let now = self.clock()?;
+                let s = self.sockets.get(&id).ok_or(EBADF)?;
+                // Only a configured key, under its original lease: this
+                // call never starts a new lifetime.
+                let lease = self
+                    .external_fast_open_keys
+                    .iter()
+                    .find(|configured| configured.key == key)
+                    .ok_or(EINVAL)?
+                    .lease;
                 let key = ntcp::FastOpenServerKey::LinuxSipHash24(key);
                 if let Handle::Listener(listener) = s.handle {
                     self.endpoint
@@ -2444,12 +2635,16 @@ impl Owner {
                     return Err(engine(e));
                 }
                 #[cfg(feature = "tfo-linux-cookie")]
+                let now = self.clock().inspect_err(|_| {
+                    let _ = self.endpoint.close_listener(listener);
+                })?;
+                #[cfg(feature = "tfo-linux-cookie")]
                 let installed =
                     if let (Some(FastOpenCookiePolicy::LinuxSipHash24(key)), Some(lease)) =
                         (cookie_policy.clone(), cookie_lease)
                     {
                         self.endpoint.install_listener_fast_open_key(
-                            self.now(),
+                            now,
                             listener,
                             ntcp::FastOpenServerKey::LinuxSipHash24(key),
                             lease,
@@ -2626,13 +2821,14 @@ impl Owner {
                     && self.socket_policy.fast_open_client_enabled
                 {
                     self.endpoint.enable_fast_open().map_err(engine)?;
+                    let now = self.clock()?;
                     let socket = &self.sockets[&id];
                     let policy = socket
                         .client_policy_for(remote, self.socket_policy.fast_open_client_policy);
                     let allowed = self
                         .endpoint
                         .can_defer_scoped_fast_open(
-                            self.now(),
+                            now,
                             local.ip(),
                             remote,
                             zone.map(|zone| zone.link),
@@ -3395,7 +3591,7 @@ impl Owner {
             Op::Name(peer) => {
                 let zone = s.zone;
                 out.addr = Some(address_policy::scoped(if peer {
-                    if let Some(peer) = s.deferred_peer {
+                    if let Some(peer) = s.deferred_peer.filter(|_| s.quiet_open.is_none()) {
                         out.addr = Some(address_policy::scoped(s.api_address(peer), zone));
                         return Ok(out);
                     }
@@ -3452,7 +3648,7 @@ impl Owner {
             }
             #[cfg(all(test, feature = "packet-test"))]
             Op::BlockingConnect(remote) => {
-                if matches!(s.handle, Handle::Fresh) {
+                if matches!(s.handle, Handle::Fresh) && s.quiet_open.is_none() {
                     match self.dispatch(id, Op::Connect(remote)) {
                         Err(EINPROGRESS) => return Err(EAGAIN),
                         other => return other,
@@ -3521,6 +3717,10 @@ mod pmtud_profile_tests;
 #[cfg(all(test, feature = "packet-test"))]
 #[path = "runtime_handshake_error_tests.rs"]
 mod handshake_errors;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_quiet_tests.rs"]
+mod quiet;
 
 #[cfg(all(test, feature = "packet-test"))]
 #[path = "runtime_icmp_tests.rs"]

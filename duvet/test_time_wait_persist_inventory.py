@@ -88,9 +88,9 @@ class TimeWaitPersistInventories(unittest.TestCase):
             "old-ts-no-new-ts": "covered", "otherwise-drop": "covered",
             "no-old-ts-new-ts": "covered", "no-old-ts-no-new-ts": "covered",
             "bilateral-definition": "covered", "fin-definition": "covered",
-            "paws-monotonic": "TODO", "processing-boundary": "TODO",
+            "paws-monotonic": "covered", "processing-boundary": "covered",
             "stale-ts-fallback": "covered", "isn-independence": "covered",
-            "boot-quiet-time": "TODO",
+            "boot-quiet-time": "covered",
         }
         self.assertEqual({key: r["status"] for key, r in rows.items() if r["status"] != "context"}, expected)
         self.assertEqual(rows["otherwise-drop"]["branches"],
@@ -106,13 +106,42 @@ class TimeWaitPersistInventories(unittest.TestCase):
         self.assertIn("strict serial comparison is against FIN itself", rows["fin-definition"]["reason"])
         self.assertTrue(any("rfc6191_sequence_reuse_uses_peer_fin_serial_frontier" in e
                             for e in rows["fin-definition"]["evidence"]))
-        for key, reason in {
-            "paws-monotonic": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks, and T15's IPv4 UTC provider does not establish PAWS monotonicity. T20 owns the characterized monotonic TCP timestamp provider and host lifecycle this needs; dedicated complete source/test evidence remains missing.",
-            "processing-boundary": "TIME-WAIT reuse is gated in Endpoint input and reuse_syn, but no complete source/test annotation pair establishes the entire unchanged-processing obligation for SYNs in every other TCP state.",
-            "boot-quiet-time": "No host-boot quiet-time enforcement or executable embedding evidence establishes the stated 2*MSL prohibition. Endpoint construction accepts an initial clock and can immediately open connections; reboot safety cannot be exempted merely because this is an embeddable stack.",
+        # T20 closes the PAWS prerequisite, the processing boundary and the
+        # boot quiet time, each with its whole quote and a source/test pair.
+        for key, (facts, evidence) in {
+            "paws-monotonic": (
+                ("CLOCK_BOOTTIME provider", "rejects decreasing samples", "Endpoint::check_clock",
+                 "constant per-connection offset", "inherits the old incarnation's offset"),
+                ["crates/stacks/ntcp/src/endpoint.rs::fn check_clock(",
+                 "crates/stacks/ntcp/src/endpoint_time_wait_tests.rs::fn timestamps_sent_on_a_connection_and_its_reincarnation_never_decrease()"]),
+            "processing-boundary": (
+                ("reopen_time_wait", "reuse_syn", "Timestamps option", "CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING",
+                 "timestamp and sequence variants"),
+                ["crates/stacks/ntcp/src/endpoint.rs::if self.config.reuse_time_wait",
+                 "crates/stacks/ntcp/src/endpoint_time_wait_tests.rs::fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags()"]),
+            "boot-quiet-time": (
+                ("host boot + 2*MSL", "configured MSL", "restart floor", "host uptime alone never removes",
+                 "RST included", "quiet.py"),
+                ["crates/stacks/ntcp/src/lifecycle.rs::pub fn deadline(",
+                 "crates/stacks/ntcp/src/endpoint_lifecycle_tests.rs::fn each_active_factory_is_refused_before_the_deadline_and_admitted_at_it()"]),
         }.items():
-            self.assertEqual(rows[key]["reason"], reason)
+            with self.subTest(clause=key):
+                for fact in facts:
+                    self.assertIn(fact, rows[key]["reason"])
+                self.assertNotIn("T20", rows[key]["reason"])
+                self.assertEqual(rows[key]["evidence"], evidence)
         self.assertIn("2*MSL", rows["boot-quiet-time"]["quote"])
+        # The quiet time also has native socket evidence, and monotonicity the
+        # provider's own decreasing-sample tests.
+        for path, anchor, key in (
+            ("crates/adapters/ntcp-socket/src/runtime_quiet_tests.rs",
+             "fn listeners_work_and_premature_syns_draw_nothing()", "boot-quiet-time"),
+            ("crates/adapters/ntcp-clock/src/transport_tests.rs",
+             "fn decreasing_samples_are_rejected_and_the_reference_stays()", "paws-monotonic"),
+        ):
+            self.assertTrue(any(a["kind"] == "TEST" and audit.clause_key(a) == audit.clause_key(rows[key])
+                                and anchor in a["attached"]
+                                for a in audit.source_annotations((ROOT / path).read_text())), path)
         # Check every full-quote copy, including annotations not selected as the
         # ledger's primary evidence. Repaired behavior must not retain old gaps.
         closed = {audit.clause_key(rows[key]) for key, status in expected.items() if status == "covered"}

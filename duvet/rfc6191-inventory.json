@@ -16,9 +16,13 @@
       "id": "6191-paws-monotonic",
       "section": "1",
       "quote": "For the purpose of PAWS, the timestamps sent on a connection are required to be monotonically increasing.",
-      "status": "TODO",
-      "reason": "The inherited PAWS monotonicity prerequisite is not closed here: existing RFC7323 clock tests do not establish the complete obligation for caller-supplied physical clocks, and T15's IPv4 UTC provider does not establish PAWS monotonicity. T20 owns the characterized monotonic TCP timestamp provider and host lifecycle this needs; dedicated complete source/test evidence remains missing.",
-      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-1"
+      "status": "covered",
+      "reason": "Native transport ticks come from the characterized CLOCK_BOOTTIME provider, which rejects decreasing samples. Endpoint::check_clock refuses earlier input and timestamp half-range jumps, every TSval is the selected tick plus one constant per-connection offset, and TIME-WAIT reuse inherits the old incarnation's offset, so a reincarnation continues its predecessor's timestamp clock. Embedders supplying their own clock own its monotonicity.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-1",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::fn check_clock(",
+        "crates/stacks/ntcp/src/endpoint_time_wait_tests.rs::fn timestamps_sent_on_a_connection_and_its_reincarnation_never_decrease()"
+      ]
     },
     {
       "id": "6191-1-context-2",
@@ -38,9 +42,13 @@
       "id": "6191-processing-boundary",
       "section": "2",
       "quote": "The following paragraphs summarize the processing of SYN segments received for connections in the TIME-WAIT state. The processing of SYN segments received for connections in all other states is unchanged. Both the ISN (Initial Sequence Number) and the Timestamps option (if present) of the incoming SYN segment are included in the heuristics performed for allowing a high connection-establishment rate.",
-      "status": "TODO",
-      "reason": "TIME-WAIT reuse is gated in Endpoint input and reuse_syn, but no complete source/test annotation pair establishes the entire unchanged-processing obligation for SYNs in every other TCP state.",
-      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2"
+      "status": "covered",
+      "reason": "Only a SYN without ACK or RST to a TIME-WAIT connection reaches reopen_time_wait, whose reuse_syn freshness uses both the incoming sequence number and its Timestamps option when present. Reuse enabled versus disabled leaves results, state, resources, deadlines and emitted bytes identical in CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING across flag, checksum, timestamp and sequence variants.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::if self.config.reuse_time_wait",
+        "crates/stacks/ntcp/src/endpoint_time_wait_tests.rs::fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags()"
+      ]
     },
     {
       "id": "6191-2-context-2",
@@ -255,9 +263,13 @@
       "id": "6191-boot-quiet-time",
       "section": "A.1",
       "quote": "Firstly, as specified in [RFC0793], hosts must not establish new connections for a period of 2*MSL (Maximum Segment Lifetime) after they boot (this is the \"quiet time\" concept). As a result, in terms of specifications, this scenario should never occur.",
-      "status": "TODO",
-      "reason": "No host-boot quiet-time enforcement or executable embedding evidence establishes the stated 2*MSL prohibition. Endpoint construction accepts an initial clock and can immediately open connections; reboot safety cannot be exempted merely because this is an embeddable stack.",
-      "target": "https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1"
+      "status": "covered",
+      "reason": "Each Endpoint lifecycle has one TCP admission deadline from the configured MSL: the later of host boot + 2*MSL, from the provider's CLOCK_BOOTTIME boot age without the time namespace offset (unknown counts as a boot at the start), and the restart floor from the embedding's source continuity fact. Before it no active, passive, Fast Open or TIME-WAIT reuse factory creates a connection, no ISN, timestamp offset or cookie is assigned and no TCP segment, RST included, is emitted; host uptime alone never removes the restart floor. Core and native socket tests check refusal before and admission at the deadline; the rfc_host quiet.py namespace cases capture the wire.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1",
+      "evidence": [
+        "crates/stacks/ntcp/src/lifecycle.rs::pub fn deadline(",
+        "crates/stacks/ntcp/src/endpoint_lifecycle_tests.rs::fn each_active_factory_is_refused_before_the_deadline_and_admitted_at_it()"
+      ]
     },
     {
       "id": "6191-A.1-context-2",

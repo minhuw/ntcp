@@ -202,8 +202,8 @@ fn tcp_flow_over_ip_and_ethernet() {
             dscp: 37,
             ..EndpointConfig::default()
         };
-        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
-        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
         let local = SocketAddr::new(tx(v6, 0).ip.source, 1234);
         let remote = SocketAddr::new(tx(v6, 0).ip.destination, 8080);
         let listener = b.listen(remote, 1).unwrap();

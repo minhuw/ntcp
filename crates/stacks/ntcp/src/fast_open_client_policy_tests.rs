@@ -13,7 +13,7 @@ fn client(v6: bool) -> Endpoint {
         },
         ..EndpointConfig::default()
     };
-    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+    let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
     a.enable_fast_open().unwrap();
     a
 }

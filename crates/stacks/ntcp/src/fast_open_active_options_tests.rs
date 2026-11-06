@@ -15,7 +15,7 @@ fn sender(timestamps: bool, user_mss: Option<u16>) -> (Endpoint, EndpointConfig)
         },
         ..EndpointConfig::default()
     };
-    let mut endpoint = Endpoint::new(config.clone(), [3; 32], 0, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(config.clone(), [3; 32], 0, crate::SETTLED, |_| true).unwrap();
     endpoint.enable_fast_open().unwrap();
     (endpoint, config)
 }
@@ -328,7 +328,7 @@ fn packet_test_timestamp_default_controls_time_wait_reuse_without_changing_old_s
         let (mut client, config) = sender(true, None);
         let mut config = config;
         config.reuse_time_wait = true;
-        let mut server = Endpoint::new(config, [4; 32], 0, |_| true).unwrap();
+        let mut server = Endpoint::new(config, [4; 32], 0, crate::SETTLED, |_| true).unwrap();
         let (local, remote) = addresses(v6, 49400);
         let listener = server.listen(remote, 8).unwrap();
         let client_id = client.connect(0, local, remote).unwrap();

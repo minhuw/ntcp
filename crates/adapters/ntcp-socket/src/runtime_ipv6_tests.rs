@@ -98,6 +98,7 @@ fn owner_at(
     segment_routes: Vec<crate::SegmentRoute>,
 ) -> (Owner, Arc<Mutex<State>>) {
     let mut config = SocketConfig::new("external", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.segment_routes = segment_routes;
     config.io.prefix = Some(64);
     config.tcp.dscp = dscp;
@@ -911,6 +912,7 @@ fn shared_payload_on_a_segment_route_carries_the_srh() {
     let owner_ts = |last: u16, segment_routes: Vec<crate::SegmentRoute>| {
         let local: IpAddr = format!("2001:db8::{last}").parse().unwrap();
         let mut config = SocketConfig::new("external", local);
+        config.io.source_quiet = crate::SourceQuiet::Never;
         config.segment_routes = segment_routes;
         config.io.prefix = Some(64);
         let c = &mut config.tcp.connection;
@@ -1274,6 +1276,7 @@ fn a_reused_interface_index_never_retargets_a_scoped_socket() {
 // with its own frame queue.
 fn two_port_owner(first: &str, second: &str) -> (Owner, [Arc<Mutex<State>>; 2]) {
     let mut config = SocketConfig::new("external", first.parse::<IpAddr>().unwrap());
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(64);
     config.ports.push(crate::PortConfig {
         name: "b".into(),
@@ -1283,6 +1286,7 @@ fn two_port_owner(first: &str, second: &str) -> (Owner, [Arc<Mutex<State>>; 2]) 
         next_hop_mac: None,
         gateways: Vec::new(),
         neighbors: Vec::new(),
+        source_quiet: crate::SourceQuiet::Never,
     });
     let c = &mut config.tcp.connection;
     c.timestamps = false;
@@ -1648,6 +1652,7 @@ fn nd_owner_gso(
     gso: Option<ntcp::GsoLimits>,
 ) -> (Owner, [Arc<Mutex<State>>; 3]) {
     let mut config = SocketConfig::new("external", "fe80::9".parse::<IpAddr>().unwrap());
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(64);
     config.io.gso = gso;
     for name in ["b", "c"] {
@@ -1659,6 +1664,7 @@ fn nd_owner_gso(
             next_hop_mac: None,
             gateways: Vec::new(),
             neighbors: Vec::new(),
+            source_quiet: crate::SourceQuiet::Never,
         });
     }
     let c = &mut config.tcp.connection;
@@ -1861,6 +1867,7 @@ fn neighbor_discovery_ports_resolve_identical_link_local_peers_independently() {
 #[test]
 fn ipv4_gateway_routes_leave_through_static_neighbors() {
     let mut config = SocketConfig::new("external", "10.73.0.2".parse::<IpAddr>().unwrap());
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(24);
     config.ports.push(crate::PortConfig {
         name: "b".into(),
@@ -1873,6 +1880,7 @@ fn ipv4_gateway_routes_leave_through_static_neighbors() {
             ("10.73.1.1".parse().unwrap(), [2, 0, 0, 0, 0, 0xa]),
             ("10.73.1.7".parse().unwrap(), [2, 0, 0, 0, 0, 0xb]),
         ],
+        source_quiet: crate::SourceQuiet::Never,
     });
     // A valid configuration of AF_PACKET ports.
     let mut checked = config.clone();
@@ -1921,6 +1929,7 @@ fn ipv4_gateway_routes_leave_through_static_neighbors() {
 #[test]
 fn ipv4_redirects_follow_only_statically_mapped_gateways() {
     let mut config = SocketConfig::new("external", "10.73.0.2".parse::<IpAddr>().unwrap());
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(24);
     config.ports.push(crate::PortConfig {
         name: "b".into(),
@@ -1933,6 +1942,7 @@ fn ipv4_redirects_follow_only_statically_mapped_gateways() {
             ("10.73.1.1".parse().unwrap(), [2, 0, 0, 0, 0, 0xa]),
             ("10.73.1.7".parse().unwrap(), [2, 0, 0, 0, 0, 0xb]),
         ],
+        source_quiet: crate::SourceQuiet::Never,
     });
     let states = [(); 2].map(|_| Arc::new(Mutex::new(State::default())));
     let backends = states
@@ -2194,6 +2204,7 @@ fn peer_solicitations_are_answered_without_a_pending_neighbor_timer() {
 #[test]
 fn resolving_io_port_routes_through_static_neighbors_without_a_default_route() {
     let mut config = SocketConfig::new("external", "10.73.1.2".parse::<IpAddr>().unwrap());
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(24);
     config.io.gateways = vec![("10.80.0.0/16".parse().unwrap(), "10.73.1.1".parse().unwrap())];
     config.io.neighbors = vec![
@@ -2351,7 +2362,8 @@ fn unresolved_syn_is_retried_at_the_rto_and_ends_at_its_deadline() {
         assert!(now < start + 400_000_000);
         step(&mut a, now, &mut solicitations);
     }
-    let config = SocketConfig::new("external", "fe80::9".parse::<IpAddr>().unwrap());
+    let mut config = SocketConfig::new("external", "fe80::9".parse::<IpAddr>().unwrap());
+    config.io.source_quiet = crate::SourceQuiet::Never;
     let deadline = config.tcp.connection.user_timeout_us.max(180_000_000);
     assert!(now - start >= deadline, "{}", now - start);
     assert!(now - start < deadline + 4_000_000, "{}", now - start);

@@ -2648,7 +2648,7 @@ fn general_pacing_config_validation() {
                     ..crate::EndpointConfig::default()
                 },
                 [1; 32],
-                0,
+                0, crate::SETTLED,
                 |_| true
             ),
             Err(crate::EndpointError::Connection(Error::InvalidArgument))

@@ -342,7 +342,7 @@ class Capture:
     def __init__(self, name, link=socket.SOCK_RAW):
         self.socket = socket.socket(socket.AF_PACKET, link, socket.htons(3))
         self.socket.bind((name, 0))
-        self.events, self.error, self.bytes = [], None, 0
+        self.events, self.error, self.bytes, self.busy = [], None, 0, False
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -353,26 +353,47 @@ class Capture:
             while not self.stop.is_set():
                 if not select.select([self.socket], [], [], 0.1)[0]:
                     continue
-                packet, address = self.socket.recvfrom(65536)
-                event = parse(packet)
-                if event is None:
-                    continue
-                # PACKET_OUTGOING is the router kernel (or the forged-control
-                # injector) sending to ntcp; everything else came from ntcp.
-                event.update(direction="to-ntcp" if address[2] == socket.PACKET_OUTGOING else "from-ntcp",
-                             time_ns=time.monotonic_ns(), raw=packet)
                 with self.lock:
-                    self.bytes += len(packet)
-                    assert len(self.events) < 20000 and self.bytes < 64 * 1024 * 1024, "capture limit"
-                    self.events.append(event)
+                    self.busy = True
+                try:
+                    packet, address = self.socket.recvfrom(65536)
+                    event = parse(packet)
+                    if event is None:
+                        continue
+                    # PACKET_OUTGOING is the router kernel (or the forged-control
+                    # injector) sending to ntcp; everything else came from ntcp.
+                    event.update(direction="to-ntcp" if address[2] == socket.PACKET_OUTGOING else "from-ntcp",
+                                 time_ns=time.monotonic_ns(), raw=packet)
+                    with self.lock:
+                        self.bytes += len(packet)
+                        assert len(self.events) < 20000 and self.bytes < 64 * 1024 * 1024, "capture limit"
+                        self.events.append(event)
+                finally:
+                    with self.lock:
+                        self.busy = False
         except Exception as e:
             self.error = f"{type(e).__name__}: {e}"
 
+    def settle(self, timeout=1.0):
+        """Wait until every frame the kernel already queued on the tap is recorded.
+
+        A frame reaches the tap before the router forwards it, so a reply the
+        peer has reported is queued here, but the capture thread may not have
+        run yet. Idle means nothing readable and no frame in hand."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if not self.busy and not select.select([self.socket], [], [], 0)[0]:
+                    return
+            time.sleep(0.001)
+
     def mark(self):
+        self.settle()
         with self.lock:
             return len(self.events)
 
     def since(self, start):
+        self.settle()
         with self.lock:
             if self.error:
                 raise RuntimeError(self.error)
@@ -404,6 +425,9 @@ class Ntcp:
         # The UDP echo's send mode is selected explicitly per case; other
         # operational settings (deployment knowledge) are per case too.
         env["NTCP_UDP_ECHO_MODE"] = udp_mode
+        # Every namespace and address is created for its case, so nothing was
+        # emitted from it before: a true fact for both quiet periods.
+        env["NTCP_SOURCE_QUIET"] = "never"
         env.update(settings or {})
         return env
 

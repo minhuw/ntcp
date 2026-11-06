@@ -145,6 +145,7 @@ fn external(v6: bool, last: u8) -> (Owner, Arc<Mutex<Wire>>) {
     .parse()
     .unwrap();
     let mut config = SocketConfig::new("external", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(if v6 { 64 } else { 24 });
     config.tcp.connection.timestamps = false;
     config.tcp.connection.delayed_ack_us = 0;
@@ -422,4 +423,71 @@ fn ordinary_backendless_owner_uses_os_entropy_without_packet_policy() {
             .unwrap();
         assert!(name(&mut owner, id).port() >= FIRST);
     }
+}
+
+// One allocator serves the runtime, each owned address after its own fact.
+#[test]
+fn every_port_address_keeps_its_own_identifier_fact() {
+    let backend = |wire: &Arc<Mutex<Wire>>| crate::EthernetPacketIo {
+        io: Box::new(Io(wire.clone())),
+        local_mac: [2; 6],
+        next_hop_mac: Some([4; 6]),
+    };
+    let first: IpAddr = "10.73.0.2".parse().unwrap();
+    let second: IpAddr = "10.73.1.2".parse().unwrap();
+    let config = SocketConfig::parse(
+        "io.backend=af-packet\nio.interface=external\nio.address=10.73.0.2\nio.prefix=24\n\
+         io.next_hop_mac=04:04:04:04:04:04\nio.source_quiet=never\n\
+         port.b.interface=second\nport.b.address=10.73.1.2\nport.b.prefix=24\n\
+         port.b.next_hop_mac=04:04:04:04:04:04\nport.b.source_quiet=20\n",
+    )
+    .unwrap();
+    let wire = Arc::new(Mutex::new(Wire::default()));
+    let mut owner =
+        Owner::external_backends(&config, vec![backend(&wire), backend(&wire)]).unwrap();
+    let peer: IpAddr = "10.73.0.9".parse().unwrap();
+    let now = owner.now();
+    let host = owner.host.as_mut().unwrap();
+    assert!(host.lease_identification(now, first, peer, 6).is_ok());
+    assert!(matches!(
+        host.lease_identification(now, second, peer, 6),
+        Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(_) })
+    ));
+    assert_eq!(owner.endpoint.quiet_until(owner.started), Some(owner.started + 220_000_000));
+}
+
+// A port without its own fact states nothing about its address: its
+// identifiers wait the whole MDL and TCP the whole 2*MSL, whatever `io.*`
+// asserts about its own address.
+#[test]
+fn a_port_without_a_fact_keeps_both_quiet_periods_whole() {
+    let backend = |wire: &Arc<Mutex<Wire>>| crate::EthernetPacketIo {
+        io: Box::new(Io(wire.clone())),
+        local_mac: [2; 6],
+        next_hop_mac: Some([4; 6]),
+    };
+    let first: IpAddr = "10.73.0.2".parse().unwrap();
+    let second: IpAddr = "10.73.1.2".parse().unwrap();
+    let config = SocketConfig::parse(
+        "io.backend=af-packet\nio.interface=external\nio.address=10.73.0.2\nio.prefix=24\n\
+         io.next_hop_mac=04:04:04:04:04:04\nio.source_quiet=never\n\
+         port.b.interface=second\nport.b.address=10.73.1.2\nport.b.prefix=24\n\
+         port.b.next_hop_mac=04:04:04:04:04:04\n",
+    )
+    .unwrap();
+    let wire = Arc::new(Mutex::new(Wire::default()));
+    let mut owner =
+        Owner::external_backends(&config, vec![backend(&wire), backend(&wire)]).unwrap();
+    let peer: IpAddr = "10.73.0.9".parse().unwrap();
+    let now = owner.now();
+    let host = owner.host.as_mut().unwrap();
+    assert!(host.lease_identification(now, first, peer, 6).is_ok());
+    let mdl = u64::from(ntcp_host::DEFAULT_LIFETIME_SECONDS) * 1_000_000;
+    match host.lease_identification(now, second, peer, 6) {
+        Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) => {
+            assert!(until >= owner.started + mdl, "{until}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(owner.endpoint.quiet_until(owner.started), Some(owner.started + 240_000_000));
 }

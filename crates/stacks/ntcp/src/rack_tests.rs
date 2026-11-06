@@ -471,6 +471,23 @@ fn departure_fresh_ack_uses_physical_packet_boundary_and_age() {
 }
 
 #[test]
+fn transmissions_before_a_suspend_give_no_rtt_sample() {
+    let mut rack = Rack::with_capacity(24).unwrap();
+    rack.transmit(Seq(0), Seq(8), 100, false);
+    rack.discard_samples_before(1_000);
+    rack.transmit(Seq(8), Seq(16), 1_000, false);
+    let mut scoreboard = Scoreboard::new();
+    assert_eq!(sack(&mut rack, &mut scoreboard, 8, 8, 1_500, &[]), 8);
+    assert_eq!(rack.ack_sample, None);
+    assert_eq!(rack.min_rtt(), None);
+    assert_eq!(rack.latest, None);
+    assert_eq!(sack(&mut rack, &mut scoreboard, 16, 16, 1_500, &[]), 8);
+    assert_eq!(rack.ack_sample, Some(500));
+    assert_eq!(rack.min_rtt(), Some(500));
+    assert_eq!(rack.latest, Some((1_000, Seq(16))));
+}
+
+#[test]
 fn original_retry_identity_and_coverage_survive_sack_ack_and_replacement() {
     for base in [Seq(100), Seq(u32::MAX - 9)] {
         let end = base.wrapping_add(24);

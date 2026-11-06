@@ -1552,6 +1552,33 @@ fn linux_cookie_profile_applies_key_after_endpoint_replacement_without_enabling_
     );
 }
 
+// The script's tcp_fastopen_key sysctl reaches the plugin as tfo-key=: operator
+// configuration, so setsockopt may select that key and no other.
+#[test]
+#[cfg(feature = "tfo-linux-cookie")]
+fn tfo_key_is_the_one_key_setsockopt_selects() {
+    if isolated("tests::tfo_key_is_the_one_key_setsockopt_selects") {
+        return;
+    }
+    let key: [u8; 16] = core::array::from_fn(|i| i as u8 * 17);
+    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    let adapter = Adapter::start((
+        local(),
+        upstream_tests(&format!("no-timestamps,linux-cookie,tfo-key={hex}")),
+    ))
+    .unwrap();
+    let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    let set = |bytes: &[u8; 16]| unsafe {
+        ntcp_socket::setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_KEY, bytes.as_ptr().cast(), 16)
+    };
+    assert_eq!(set(&key), 0);
+    assert_eq!(set(&[0x5a; 16]), -1);
+    assert_eq!(unsafe { *__errno_location() }, EINVAL);
+    assert_eq!(set(&key), 0);
+}
+
 #[test]
 fn pmtud_fast_open_profile_retains_hmac_default() {
     if isolated("tests::pmtud_fast_open_profile_retains_hmac_default") {

@@ -101,7 +101,7 @@ fn side(
         metric: 0,
     })
     .unwrap();
-    let mut endpoint = Endpoint::new(cfg.clone(), [identity as u8; 32], 0, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(cfg.clone(), [identity as u8; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     host.attach(&mut endpoint).unwrap();
     endpoint.enable_output_reservations_with_capacity(1).unwrap();
     let first = contexts[0];
@@ -465,6 +465,9 @@ fn missing_or_mismatched_capability_rejects_construction_without_leaks() {
             let mut prepared = self.host.prepare(request)?;
             prepared.receive = self.receive;
             Ok(prepared)
+        }
+        fn check(&self, request: PathFactoryRequest) -> Result<(), Error> {
+            self.host.check(request)
         }
         fn commit(&mut self, prepared: PreparedPath, connection: ConnectionId) {
             self.host.commit(prepared, connection);

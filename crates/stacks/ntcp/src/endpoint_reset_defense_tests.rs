@@ -7,7 +7,7 @@ fn endpoint(v6: bool, units: u64) -> (Endpoint, ListenerId, Tuple) {
         ..EndpointConfig::default()
     };
     config.connection.timebase.units_per_second = units;
-    let mut e = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    let mut e = Endpoint::new(config, [42; 32], 0, crate::SETTLED, |_| true).unwrap();
     e.enable_fast_open().unwrap();
     let tuple = Tuple {
         local: if v6 {

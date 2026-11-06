@@ -35,7 +35,7 @@ fn endpoint(key: u8, v6: bool) -> Endpoint {
         },
         ..EndpointConfig::default()
     };
-    Endpoint::new(config, [key; 32], 0, |_| true).unwrap()
+    Endpoint::new(config, [key; 32], 0, crate::SETTLED, |_| true).unwrap()
 }
 fn packet(endpoint: &mut Endpoint, now: u64) -> (IpMetadata, Vec<u8>) {
     for _ in 0..32 {
@@ -104,7 +104,7 @@ fn malformed_fast_open_preserves_timestamp_validation_and_ordinary_stream() {
                 let mut cfg = EndpointConfig::default();
                 cfg.connection.timestamps = true;
                 cfg.connection.sack = true;
-                let b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
+                let b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
                 let (mut a, mut b, listener) = warm_with_server(v6, b);
                 if reserved {
                     b.enable_output_reservations().unwrap();
@@ -930,7 +930,7 @@ fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
             cfg.max_buffer_bytes = crate::connection::Connection::allocation_bytes(64, 257, 536)
                 .unwrap()
                 + crate::fast_open::FastOpen::allocation_bytes();
-            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
             a.enable_fast_open().unwrap();
             let before = a.buffer_bytes();
             let result = fail_after(failure, || {
@@ -1009,7 +1009,7 @@ fn fast_open_cache_enable_budget_exact_fit_and_idempotence() {
             max_buffer_bytes: budget,
             ..EndpointConfig::default()
         };
-        let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         if budget < charge {
             assert_eq!(
                 a.enable_fast_open(),
@@ -1047,7 +1047,7 @@ fn fast_open_cache_allocation_failure_does_not_publish_or_charge() {
         max_buffer_bytes: charge,
         ..EndpointConfig::default()
     };
-    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+    let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
     let (local, remote) = addresses(false, 40001);
     for failure in 0..2 {
         assert_eq!(
@@ -1083,7 +1083,7 @@ fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
             cfg.connection.mss = 536;
             cfg.preallocate_connections = preallocate;
             cfg.max_buffer_bytes = budget;
-            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
             assert_eq!(a.buffer_bytes(), preallocate * connection);
             if preallocate == 1 && budget < connection + cache {
                 assert_eq!(
@@ -1528,7 +1528,7 @@ fn fast_open_validated_mss_without_cookie_replacement() {
             ] {
                 let mut cfg = EndpointConfig::default();
                 cfg.connection.mss = 1460;
-                let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+                let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
                 a.enable_fast_open().unwrap();
                 let mut expected_cookie = wire::FastOpenCookie::new(&[0; 4]).unwrap();
                 for (round, expected) in [(0, 0), (1, 1000), (2, 900)] {
@@ -1591,7 +1591,7 @@ fn fast_open_cache_learning_requires_valid_synack() {
     for mode in 0..4 {
         let mut cfg = EndpointConfig::default();
         cfg.connection.mss = 1460;
-        let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         a.enable_fast_open().unwrap();
         let (local, remote) = addresses(false, 40000);
         a.connect_fast_open(0, local, remote, &[]).unwrap();
@@ -1658,7 +1658,7 @@ fn fast_open_mss_only_wire_learning_does_not_create_or_extend_credentials() {
                         .connection
                         .timebase
                         .ticks_from_us(crate::fast_open::LIFETIME_US);
-                    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+                    let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
                     a.enable_fast_open().unwrap();
                     let (local, remote) = addresses(false, 40000);
                     if warm_cache {
@@ -1727,7 +1727,7 @@ fn fast_open_disabled_listener_recognized_options_only_fallback() {
                         },
                         ..EndpointConfig::default()
                     };
-                    let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+                    let mut b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
                     let listener = b.listen(remote, 8).unwrap();
                     if service {
                         b.enable_fast_open().unwrap(); // Limit remains zero.
@@ -1826,7 +1826,7 @@ fn ordinary_and_foexp_syn_text_ack_only_syn_then_deliver_once() {
                 for retransmit in [false, true] {
                     let (local, remote) = addresses(v6, 40000);
                     let mut endpoint =
-                        Endpoint::new(EndpointConfig::default(), [2; 32], 0, |_| true).unwrap();
+                        Endpoint::new(EndpointConfig::default(), [2; 32], 0, crate::SETTLED, |_| true).unwrap();
                     if reserved {
                         endpoint.enable_output_reservations().unwrap();
                     }
@@ -1948,7 +1948,7 @@ fn fast_open_negative_endpoint_clock_expiry_and_repeated_errors() {
                 .connection
                 .timebase
                 .ticks_from_us(crate::fast_open::NEGATIVE_LIFETIME_US);
-            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
             a.enable_fast_open().unwrap();
             let (local, remote) = addresses(v6, 40000);
             a.connect_fast_open(0, local, remote, &[]).unwrap();
@@ -2089,7 +2089,7 @@ fn fast_open_negative_local_deadline_does_not_suppress_when_serviced_late() {
             let mut cfg = EndpointConfig::default();
             cfg.connection.timebase.units_per_second = units;
             let timebase = cfg.connection.timebase;
-            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
             a.enable_fast_open().unwrap();
             let (local, remote) = addresses(false, 40000);
             a.connect_fast_open(0, local, remote, &[]).unwrap();
@@ -2129,7 +2129,7 @@ fn inventory_tfo_syn_only_rejection_keeps_cookie_but_suppresses_after_data_ack()
             },
             ..EndpointConfig::default()
         };
-        let mut a = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         a.enable_fast_open().unwrap();
         let (local, remote) = addresses(v6, 40000);
         a.connect_fast_open(0, local, remote, &[]).unwrap();

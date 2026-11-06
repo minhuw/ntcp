@@ -33,7 +33,7 @@ fn next_hop(side: &Side, id: ConnectionId) -> ResolvedNextHop {
     side.0.binding(id).unwrap().snapshot.key().next_hop()
 }
 fn endpoint(cfg: &EndpointConfig, identity: u128, owned: IpAddr) -> Endpoint {
-    Endpoint::new(cfg.clone(), [identity as u8; 32], 0, move |request| match request {
+    Endpoint::new(cfg.clone(), [identity as u8; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, move |request| match request {
         ntcp::AddressValidation::Bind { local } | ntcp::AddressValidation::Open { local, .. } => {
             local == owned
         }

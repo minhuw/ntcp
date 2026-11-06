@@ -70,10 +70,18 @@
 //! tested system over a bounded interval; that does not prove future
 //! hardware behaviour. `clock_getres` and the numeric range of a value are
 //! not evidence of either cadence or accuracy.
+//!
+//! The transport time source, [`TransportClock`], is separate: it serves TCP
+//! timing, not IPv4 Timestamp values (see the `transport` module).
 
 mod kernel;
 #[cfg(test)]
 mod tests;
+mod transport;
+
+pub use transport::{
+    BootId, Characterization, NamespaceOffsets, TransportClock, TransportError, TransportSample,
+};
 
 /// RFC 791 section 3.1: a time that is not standard UTC milliseconds since
 /// midnight is marked by setting the high-order bit.
@@ -101,7 +109,7 @@ pub struct Timespec {
 }
 
 impl Timespec {
-    fn nanos(self) -> i128 {
+    pub(crate) fn nanos(self) -> i128 {
         i128::from(self.seconds) * NANOS_PER_SECOND + i128::from(self.nanoseconds)
     }
 }

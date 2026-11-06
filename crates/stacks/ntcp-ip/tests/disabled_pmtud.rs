@@ -16,6 +16,7 @@ fn disabled_ipv4_keeps_larger_codec_packets_and_peer_delivery() {
             },
             [secret; 32],
             0,
+            ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
             |_| true,
         )
         .unwrap()

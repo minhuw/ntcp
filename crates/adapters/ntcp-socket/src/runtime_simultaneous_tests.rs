@@ -19,6 +19,8 @@ fn warm_pair(profile: Profile, linux: bool) -> (Owner, Owner, u64, u64) {
     let lb = listener(&mut b, "192.0.2.2:9001".parse().unwrap());
     #[cfg(feature = "tfo-linux-cookie")]
     if linux {
+        crate::runtime::cookie_policy_tests::configure_key(&mut a, 11, Default::default());
+        crate::runtime::cookie_policy_tests::configure_key(&mut b, 29, Default::default());
         a.execute(la, Op::SetFastOpenKey(LinuxSipHash24Key::new([11; 16])))
             .unwrap();
         b.execute(lb, Op::SetFastOpenKey(LinuxSipHash24Key::new([29; 16])))

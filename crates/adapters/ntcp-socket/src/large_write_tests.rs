@@ -24,7 +24,7 @@ pub(super) fn logical_request(
 }
 pub(super) fn advance(a: &mut Owner, b: &mut Owner) {
     pump(a, b);
-    b.epoch -= std::time::Duration::from_millis(210);
+    b.advance_clock(210_000);
     b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
     pump(a, b);
 }
@@ -522,7 +522,7 @@ fn logical_zero_progress_backpressure_counts_byte_capacity_not_lowat() {
             .is_some()
         {}
         assert_eq!(a.endpoint.transport_info(cid).unwrap().notsent_bytes, 0);
-        a.epoch -= std::time::Duration::from_millis(20);
+        a.advance_clock(20_000);
         a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
         let limited = a.endpoint.transport_info(cid).unwrap().sndbuf_limited_us;
         if lowat {

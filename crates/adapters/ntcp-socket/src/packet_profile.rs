@@ -609,7 +609,7 @@ mod setup_profile_tests {
             }
             assert_eq!(config.connection.prr_pacing, paced);
             assert_eq!(config.connection.pacing.is_some(), paced);
-            let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+            let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
             let id = endpoint
                 .connect(
                     0,
@@ -749,7 +749,7 @@ mod setup_profile_tests {
         assert_eq!(config.preallocate_connections, 3);
         let preallocate = config.preallocate_connections;
         let budget = config.max_buffer_bytes;
-        let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
         let reserved = endpoint.buffer_bytes();
         let charge = reserved / preallocate;
         // The smallest 32 MiB budget step that covers the corpus maximum.
@@ -784,7 +784,7 @@ mod setup_profile_tests {
         ] {
             let mut config = config(selected(",budget224m,prealloc3"));
             config.preallocate_connections = preallocate;
-            let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+            let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
             let reserved = endpoint.buffer_bytes();
             let charge = reserved / preallocate;
             endpoint.enable_fast_open().unwrap();
@@ -810,7 +810,7 @@ mod setup_profile_tests {
         assert_eq!(config.preallocate_connections, 3);
         let attempts = config.preallocate_connections + 1;
         config.connection.mss = 0;
-        let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
         endpoint.enable_fast_open().unwrap();
         let initial = endpoint.buffer_bytes();
         for _ in 0..attempts {
@@ -915,7 +915,7 @@ mod custom_cookie_key_tests {
             ),
         ] {
             let mut endpoint =
-                ntcp::Endpoint::new(EndpointConfig::default(), [42; 32], 0, |_| true).unwrap();
+                ntcp::Endpoint::new(EndpointConfig::default(), [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
             endpoint.set_fast_open_cookie_policy(cookie_policy(selected));
             endpoint.enable_fast_open().unwrap();
             let local: IpAddr = local.parse().unwrap();

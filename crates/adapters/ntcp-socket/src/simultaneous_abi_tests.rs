@@ -58,7 +58,7 @@ fn public_authority_packet_io_early_read_peek_fionread_poll_epoll() {
         ..Default::default()
     };
     let options = ntcp::ActiveOpenOptions::from(&cfg.connection);
-    let mut b = ntcp::Endpoint::new(cfg, [29; 32], 0, |_| true).unwrap();
+    let mut b = ntcp::Endpoint::new(cfg, [29; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     b.enable_fast_open().unwrap();
     let lb = b.listen("192.0.2.2:8080".parse().unwrap(), 4).unwrap();
     b.set_listener_fast_open(lb, 4).unwrap();

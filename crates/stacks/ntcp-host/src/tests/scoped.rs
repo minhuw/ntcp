@@ -77,7 +77,7 @@ fn scoped_side_with(
         .unwrap();
         contexts.push(context);
     }
-    let mut endpoint = Endpoint::new(cfg.clone(), [identity as u8; 32], 0, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(cfg.clone(), [identity as u8; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     host.attach(&mut endpoint).unwrap();
     endpoint
         .enable_output_reservations_with_capacity(1)
@@ -947,7 +947,7 @@ fn unscoped_stateless_reset_keeps_its_bytes() {
     let frame = emit(&mut b.0, &mut b.1, 5).unwrap();
     assert_reset_for(&syn, &frame);
     // The same reply an unmanaged Endpoint emits for this SYN.
-    let mut raw = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+    let mut raw = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     let ip = IpMetadata {
         source: local.ip(),
         destination: remote.ip(),

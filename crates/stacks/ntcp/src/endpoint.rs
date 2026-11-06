@@ -194,6 +194,9 @@ pub enum EndpointError {
     InvalidAddress,
     Ipv4Options(Ipv4OptionsError),
     Registration(crate::Ipv4RegistrationError),
+    /// Refused without effect: this lifecycle creates no transport state
+    /// before the deadline. The embedding decides how to wait for it.
+    QuietUntil(Instant),
 }
 impl From<Ipv4OptionsError> for EndpointError {
     fn from(error: Ipv4OptionsError) -> Self {
@@ -422,6 +425,8 @@ pub struct Endpoint {
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
     secret: [u8; 32],
     now: Instant,
+    // This lifecycle's TCP admission deadline.
+    quiet_until: Instant,
     isn_clock: u32,
     last_isn_time: Instant,
     slots: Vec<Option<Slot>>,
@@ -493,13 +498,16 @@ impl Endpoint {
     // The caller must supply a confidential, unpredictable 32-byte key from an
     // initialized CSPRNG. The required callback captures authoritative network
     // context for this endpoint; the endpoint cannot prove the caller's policy true.
+    // A new Endpoint is a new lifecycle starting at `now`; see `Lifecycle`.
     pub fn new<F: Fn(AddressValidation) -> bool + 'static>(
         mut config: EndpointConfig,
         secret: [u8; 32],
         now: Instant,
+        lifecycle: crate::Lifecycle,
         address_policy: F,
     ) -> Result<Self, EndpointError> {
         config.validate()?;
+        let quiet_until = lifecycle.deadline(now, config.connection.timebase);
         if config.ipv4_options_enabled {
             // ponytail: reserve all 40 IPv4 option bytes; per-packet budgeting can reclaim slack later.
             config.connection.send_ip_payload_limit = config
@@ -576,6 +584,7 @@ impl Endpoint {
             secret,
             setup_loss_cache,
             now,
+            quiet_until,
             last_isn_time: now,
             slots,
             generations,
@@ -728,6 +737,10 @@ impl Endpoint {
         self.config.connection.timestamps
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-1
+    //= reason=Native transport ticks come from the characterized CLOCK_BOOTTIME provider, which rejects decreasing samples. Endpoint::check_clock refuses earlier input and timestamp half-range jumps, every TSval is the selected tick plus one constant per-connection offset, and TIME-WAIT reuse inherits the old incarnation's offset, so a reincarnation continues its predecessor's timestamp clock. Embedders supplying their own clock own its monotonicity.
+    //# For the purpose of PAWS, the timestamps sent on a connection are
+    //# required to be monotonically increasing.
     fn check_clock(&self, now: Instant) -> Result<(), EndpointError> {
         if now < self.now {
             return Err(Error::TimeWentBackwards.into());
@@ -746,6 +759,53 @@ impl Endpoint {
     fn clock(&mut self, now: Instant) -> Result<(), EndpointError> {
         self.check_clock(now)?;
         self.now = now;
+        Ok(())
+    }
+
+    /// This lifecycle's TCP admission deadline while it is ahead of `now`.
+    pub fn quiet_until(&self, now: Instant) -> Option<Instant> {
+        (now < self.quiet_until).then_some(self.quiet_until)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1
+    //= reason=Each Endpoint lifecycle has one TCP admission deadline from the configured MSL: the later of host boot + 2*MSL, from the provider's CLOCK_BOOTTIME boot age without the time namespace offset (unknown counts as a boot at the start), and the restart floor from the embedding's source continuity fact. Before it no active, passive, Fast Open or TIME-WAIT reuse factory creates a connection, no ISN, timestamp offset or cookie is assigned and no TCP segment, RST included, is emitted; host uptime alone never removes the restart floor. Core and native socket tests check refusal before and admission at the deadline; the rfc_host quiet.py namespace cases capture the wire.
+    //# Firstly, as specified in [RFC0793], hosts must not establish new
+    //# connections for a period of 2*MSL (Maximum Segment Lifetime) after they
+    //# boot (this is the "quiet time" concept). As a result, in terms of
+    //# specifications, this scenario should never occur.
+    fn quiet_gate(&self, now: Instant) -> Result<(), EndpointError> {
+        self.quiet_until(now)
+            .map_or(Ok(()), |deadline| Err(EndpointError::QuietUntil(deadline)))
+    }
+
+    /// One clock sample whose advance includes `suspended` ticks that the
+    /// clock provider measured as suspended. Such a jump may reach the
+    /// timestamp half-range without being ambiguous; only the time left after
+    /// the suspend is checked, and no intermediate sample is manufactured.
+    /// Every connection stops sampling RTT across the gap. One whose next
+    /// TSval would appear older to a peer that may still hold TS.Recent ends
+    /// with a timeout error, sending nothing; with output reserved, once the
+    /// reservation is settled. Fails without effect when the sample goes back
+    /// or `suspended` exceeds its advance.
+    pub fn resume(&mut self, now: Instant, suspended: Instant) -> Result<(), EndpointError> {
+        let advance = now
+            .checked_sub(self.now)
+            .ok_or(Error::TimeWentBackwards)?;
+        if suspended > advance {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.check_clock(now - suspended)?;
+        self.now = now;
+        for index in 0..self.slots.len() {
+            let reserved = self.is_output_reserved(self.id(index));
+            let Some(slot) = self.slots[index].as_mut() else {
+                continue;
+            };
+            if slot.connection.suspended(now)? && !reserved {
+                slot.connection.timeout(now)?;
+            }
+            self.refresh(index);
+        }
         Ok(())
     }
 
@@ -1826,19 +1886,19 @@ impl Endpoint {
     /// install fresh keys; this endpoint does not provide persistent time trust.
     /// Does not select protected mode, enable TFO, or mutate children/output.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-3
-    //= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw-key restart continuity still requires T20 trusted original lease/time mapping; the whole lifecycle remains TODO until that integration.
+    //= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
     //# 5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
-    //= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO: T6 now supplies release actual-path measurements with source/executable provenance, scoped admission/issuance counts, raw rounds and observer controls in integration/rfc_host/check_mac_cost.py; HMAC overlap remains substantial and the complete relative-cost assessment awaits independent review/T23 disposition. External raw-key restart/time continuity still requires T20.
+    //= reason=Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO: T6 now supplies release actual-path measurements with source/executable provenance, scoped admission/issuance counts, raw rounds and observer controls in integration/rfc_host/check_mac_cost.py; HMAC overlap remains substantial and the complete relative-cost assessment awaits independent review/T23 disposition. External raw keys keep their original boot-named leases across restarts; only that assessment remains.
     //# The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use "SHOULD" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
-    //= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20 integration of trusted original lease/time mapping across external raw-key restart.
+    //= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
     //# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
-    //= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. T6 now measures actual release SYN/SYN-ACK admission/issuance and remaining processing in integration/rfc_host/check_mac_cost.py, retaining raw rounds, multiplicities, source/executable provenance and observer controls; HMAC overlap remains substantial and full relative-cost assessment awaits independent review/T23 disposition. The cross-reference also still imports trusted external raw-key restart/time continuity (T20), so the whole clause remains TODO.
+    //= reason=Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. T6 now measures actual release SYN/SYN-ACK admission/issuance and remaining processing in integration/rfc_host/check_mac_cost.py, retaining raw rounds, multiplicities, source/executable provenance and observer controls; HMAC overlap remains substantial and full relative-cost assessment awaits independent review/T23 disposition. External raw keys keep their original boot-named leases across restarts; the whole clause remains TODO only for that assessment.
     //# 2. The server responds with a SYN-ACK based on the procedures in the "Server Cookie Handling" section (Section 4.1.2).
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-    //= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. The whole reuse lifecycle remains TODO for T20 trusted original lease/time mapping across external raw-key restart.
+    //= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
     //# Once the client obtains the cookie from the target server, it can perform subsequent TFO connections until the cookie is expired by the server.
     pub fn install_fast_open_key(
         &mut self,
@@ -2253,7 +2313,8 @@ impl Endpoint {
         if fast_open && self.fast_open.is_none() {
             return Err(Error::InvalidState.into());
         }
-        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))
+        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
+        self.quiet_gate(now)
     }
 
     pub fn connect(
@@ -2262,9 +2323,11 @@ impl Endpoint {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Result<ConnectionId, EndpointError> {
-        self.clock(now)?;
+        self.check_clock(now)?;
         let tuple = Tuple { local, remote };
         self.admission(self.scoped(tuple))?;
+        self.quiet_gate(now)?;
+        self.clock(now)?;
         let iss = self.isn(self.scoped(tuple));
         let connection = self.new_connection(tuple, iss, None)?;
         self.insert(connection, None, None)
@@ -2310,14 +2373,10 @@ impl Endpoint {
         options: ActiveOpenOptions,
         receive_authority: Option<ListenerId>,
     ) -> Result<ConnectionId, EndpointError> {
-        options.validate()?;
-        if let Some(authority) = receive_authority {
-            self.validate_fast_open_receive_authority(authority, local.ip())?;
-        }
-        self.clock(now)?;
         let tuple = Tuple { local, remote };
         let scoped = self.scoped(tuple);
-        self.admission_with_buffers(scoped, (options.send_capacity, options.receive_capacity))?;
+        self.active_admission(now, scoped, &options, receive_authority, false)?;
+        self.clock(now)?;
         let iss = self.isn(scoped);
         let connection = self.new_connection_with_options(
             tuple,
@@ -2547,6 +2606,8 @@ impl Endpoint {
         remote: SocketAddr,
         select_source: impl FnOnce(SocketAddr) -> Result<SocketAddr, EndpointError>,
     ) -> Result<ConnectionId, EndpointError> {
+        self.check_clock(now)?;
+        self.quiet_gate(now)?;
         self.clock(now)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
         //# If an application on a multihomed host does not specify the local IP
@@ -2878,7 +2939,9 @@ impl Endpoint {
         segment: &wire::Segment<'_>,
         route: Option<SourceRoute>,
     ) {
-        if segment.header.flags & RST != 0 || self.control.len() >= self.config.max_control_packets
+        if segment.header.flags & RST != 0
+            || self.control.len() >= self.config.max_control_packets
+            || self.quiet_until(self.now).is_some()
         {
             return;
         }
@@ -3074,6 +3137,14 @@ impl Endpoint {
             }
             // Apply freshness to the same connection requests accepted by the
             // passive factory, including SYN data and auxiliary control flags.
+            //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+            //= reason=Only a SYN without ACK or RST to a TIME-WAIT connection reaches reopen_time_wait, whose reuse_syn freshness uses both the incoming sequence number and its Timestamps option when present. Reuse enabled versus disabled leaves results, state, resources, deadlines and emitted bytes identical in CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING across flag, checksum, timestamp and sequence variants.
+            //# The following paragraphs summarize the processing of SYN segments
+            //# received for connections in the TIME-WAIT state. The processing of SYN
+            //# segments received for connections in all other states is unchanged. Both
+            //# the ISN (Initial Sequence Number) and the Timestamps option (if present)
+            //# of the incoming SYN segment are included in the heuristics performed for
+            //# allowing a high connection-establishment rate.
             if self.config.reuse_time_wait
                 && slot.connection.state() == State::TimeWait
                 && segment.header.flags & (SYN | ACK | RST) == SYN
@@ -3249,9 +3320,9 @@ impl Endpoint {
     }
 
     /// Non-constructing passive factory admission shared by the listener and
-    /// TIME-WAIT reuse factories and by the managed pre-check: backlog,
-    /// transport resources and, for reuse, the old record's reset/freshness
-    /// state. A failure is the ordinary silent resource/freshness discard.
+    /// TIME-WAIT reuse factories and by the managed pre-check: quiet time,
+    /// backlog, transport resources and, for reuse, the old record's
+    /// reset/freshness state. A failure is the ordinary silent discard.
     pub(crate) fn passive_room(
         &self,
         now: Instant,
@@ -3261,7 +3332,7 @@ impl Endpoint {
         syn: &wire::Segment<'_>,
     ) -> bool {
         let record = self.listeners[listener.slot].as_ref().unwrap();
-        if record.children.len() >= record.backlog {
+        if record.children.len() >= record.backlog || self.quiet_until(now).is_some() {
             return false;
         }
         match target {
@@ -5535,7 +5606,7 @@ mod recovery_observation_tests {
     #[test]
     fn transport_info_samples_endpoint_clock_for_dormant_connection_without_mutation() {
         let cfg = EndpointConfig::default();
-        let mut endpoint = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -5601,7 +5672,7 @@ mod recovery_observation_tests {
                     local: "192.0.2.1:40000".parse().unwrap(),
                     remote: "192.0.2.2:8080".parse().unwrap(),
                 };
-                let mut endpoint = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+                let mut endpoint = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
                 let first_isn = endpoint.isn(ScopedTuple::unscoped(tuple));
                 endpoint.clock(4000 * scale).unwrap();
                 let next_isn = endpoint.isn(ScopedTuple::unscoped(tuple));
@@ -5624,7 +5695,7 @@ mod recovery_observation_tests {
                 endpoint.clock(4000 * scale + half - 1).unwrap();
                 endpoint.clock(4000 * scale + half).unwrap();
                 // Control budget counts survive draining output until one physical second.
-                let mut control = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+                let mut control = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
                 let ip = IpMetadata {
                     source: tuple.local.ip(),
                     destination: tuple.remote.ip(),
@@ -5640,7 +5711,7 @@ mod recovery_observation_tests {
                 control.reset_for(ip, None, &incoming, None);
                 assert_eq!(control.control.len(), 1);
                 let (_, reset) = packet(&mut control, 1_000_000 * scale);
-                let mut passive = Endpoint::new(cfg.clone(), [2; 32], 0, |_| true).unwrap();
+                let mut passive = Endpoint::new(cfg.clone(), [2; 32], 0, crate::SETTLED, |_| true).unwrap();
                 passive.listen(tuple.remote, 1).unwrap();
                 passive.input(0, ip, &syn).unwrap();
                 let child = passive
@@ -5658,7 +5729,7 @@ mod recovery_observation_tests {
                 );
                 assert_eq!(passive.next_deadline(), Some(240_000_000 * scale));
                 // Absolute end-of-clock deadlines saturate, rather than wrapping early.
-                let mut end = Endpoint::new(cfg, [1; 32], u64::MAX - 1, |_| true).unwrap();
+                let mut end = Endpoint::new(cfg, [1; 32], u64::MAX - 1, crate::SETTLED, |_| true).unwrap();
                 end.connect(u64::MAX - 1, tuple.local, tuple.remote)
                     .unwrap();
                 packet(&mut end, u64::MAX - 1);
@@ -5681,7 +5752,7 @@ mod recovery_observation_tests {
             },
             ..EndpointConfig::default()
         };
-        let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -5728,7 +5799,7 @@ mod recovery_observation_tests {
                 },
                 ..EndpointConfig::default()
             };
-            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
             let id = endpoint
                 .connect(
                     0,
@@ -5783,7 +5854,7 @@ mod recovery_observation_tests {
                 local: "192.0.2.1:40000".parse().unwrap(),
                 remote: "192.0.2.2:8080".parse().unwrap(),
             };
-            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
             let charge = endpoint.per_connection_bytes;
             let pool_capacity = endpoint.receive_pool.capacity();
             // A full bounded probe table can fail insertion after construction.
@@ -5832,8 +5903,8 @@ mod recovery_observation_tests {
             local: "192.0.2.1:40000".parse().unwrap(),
             remote: "192.0.2.2:8080".parse().unwrap(),
         };
-        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
-        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
         b.listen(tuple.remote, 1).unwrap();
         a.connect(0, tuple.local, tuple.remote).unwrap();
         let (tx, bytes) = packet(&mut a, 0);
@@ -5888,8 +5959,8 @@ mod recovery_observation_tests {
             local: "192.0.2.1:40000".parse().unwrap(),
             remote: "192.0.2.2:8080".parse().unwrap(),
         };
-        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
-        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
         let listener = b.listen(tuple.remote, 4).unwrap();
         let client = a.connect(0, tuple.local, tuple.remote).unwrap();
         assert_eq!(a.connection_id(tuple), Some(client));
@@ -5980,8 +6051,8 @@ mod recovery_observation_tests {
         };
         let local = "192.0.2.1:40000".parse().unwrap();
         let remote = "192.0.2.2:8080".parse().unwrap();
-        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
-        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
         let listener = b.listen(remote, 2).unwrap();
         let client = a.connect(0, local, remote).unwrap();
         let (tx, bytes) = packet(&mut a, 0);
@@ -6033,7 +6104,7 @@ mod recovery_observation_tests {
             },
             ..EndpointConfig::default()
         };
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let mut now = 0;
         for host in [2, 3] {
             loop {
@@ -6050,7 +6121,7 @@ mod recovery_observation_tests {
             }
             .parse()
             .unwrap();
-            let mut b = Endpoint::new(cfg.clone(), [2; 32], now, |_| true).unwrap();
+            let mut b = Endpoint::new(cfg.clone(), [2; 32], now, crate::SETTLED, |_| true).unwrap();
             let listener = b.listen(remote, 4).unwrap();
             let client = a.connect(now, local, remote).unwrap();
             let (tx, bytes) = packet(&mut a, now);
@@ -6095,7 +6166,7 @@ mod recovery_observation_tests {
     }
     #[test]
     fn logical_timestamp_discard_releases_only_selected_cookie() {
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6133,7 +6204,7 @@ mod recovery_observation_tests {
         use crate::{TxStreamRange, TxTimestampOutcome as Outcome, TxTimestampRequest};
         use TxTimestampSource::{Hardware, Software};
         use TxTimestampStage::{Acknowledged, Scheduled, Transmit};
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6244,7 +6315,7 @@ mod recovery_observation_tests {
     }
     #[test]
     fn tx_timestamp_capacity_peak_budget_allocation_failure_and_buffer_resize() {
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6364,7 +6435,7 @@ mod recovery_observation_tests {
     #[test]
     fn rx_timestamp_capacity_budget_resize_rollback_and_release() {
         use crate::{RxTimestamp, TimestampClock};
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6546,7 +6617,7 @@ mod recovery_observation_tests {
                 ..Default::default()
             };
             let make = || {
-                let mut endpoint = Endpoint::new(cfg.clone(), [2; 32], 0, |_| true).unwrap();
+                let mut endpoint = Endpoint::new(cfg.clone(), [2; 32], 0, crate::SETTLED, |_| true).unwrap();
                 let listener = endpoint.listen(tuple.local, 2).unwrap();
                 endpoint
                     .set_listener_rx_timestamp_capacity(listener, 2)
@@ -6649,7 +6720,7 @@ mod recovery_observation_tests {
 
     #[test]
     fn listener_rx_timestamp_slot_reuse_defaults_and_zero_policy_preserves_legacy_limits() {
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         let address = "192.0.2.2:8080".parse().unwrap();
         let listener = endpoint.listen(address, 1).unwrap();
         endpoint
@@ -6697,6 +6768,7 @@ mod endpoint_mtu_update_tests {
             },
             [1; 32],
             0,
+            crate::SETTLED,
             |_| true,
         )
         .unwrap()
@@ -6806,7 +6878,7 @@ mod endpoint_mtu_update_tests {
             Err(Error::InvalidArgument.into())
         );
 
-        let mut disabled = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut disabled = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
         assert_eq!(
             disabled.set_endpoint_first_hop_mtu(10, 1500),
             Err(Error::InvalidArgument.into())
@@ -6829,6 +6901,7 @@ mod endpoint_mtu_update_tests {
                 },
                 [1; 32],
                 0,
+                crate::SETTLED,
                 |_| true,
             )
             .unwrap();
@@ -6936,6 +7009,14 @@ mod ptb_reserved_tests;
 mod unsubmitted_discard_tests;
 
 #[cfg(test)]
+#[path = "endpoint_suspend_tests.rs"]
+mod suspend_tests;
+
+#[cfg(test)]
+#[path = "endpoint_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
 #[path = "endpoint_reset_defense_tests.rs"]
 mod reset_defense_tests;
 
@@ -6949,7 +7030,7 @@ mod timestamp_default_control_tests {
             for future_enabled in [false, true] {
                 let mut config = EndpointConfig::default();
                 config.connection.timestamps = originally_enabled;
-                let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+                let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
                 endpoint.packet_test_timestamp_default(future_enabled);
                 assert_eq!(endpoint.new_connection_timestamps(), future_enabled);
                 assert!(endpoint.check_clock(1000).is_ok());

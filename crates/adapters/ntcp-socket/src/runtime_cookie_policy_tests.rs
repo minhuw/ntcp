@@ -559,9 +559,47 @@ fn native_first_request_rto_suppresses_service_and_keeps_ordinary_stream() {
 fn policy(byte: u8) -> FastOpenCookiePolicy {
     FastOpenCookiePolicy::LinuxSipHash24(LinuxSipHash24Key::new([byte; 16]))
 }
+// What an operator's configuration gives the owner: the key with a lease of
+// `lifetime` from now, unless the key already has its lease.
+#[cfg(feature = "tfo-linux-cookie")]
+pub(super) fn configure_key(owner: &mut Owner, byte: u8, lifetime: ntcp::FastOpenCookieLifetime) {
+    let key = LinuxSipHash24Key::new([byte; 16]);
+    if owner.external_fast_open_keys.iter().all(|k| k.key != key) {
+        let lease = ntcp::FastOpenKeyLease::for_lifetime(
+            owner.now(),
+            lifetime,
+            owner.defaults.connection.timebase,
+            false,
+        )
+        .unwrap();
+        owner
+            .external_fast_open_keys
+            .push(crate::ConfiguredFastOpenKey { key, lease });
+    }
+}
+#[cfg(feature = "tfo-linux-cookie")]
+fn set_lasting(
+    owner: &mut Owner,
+    id: u64,
+    byte: u8,
+    lifetime: ntcp::FastOpenCookieLifetime,
+) -> Result<Reply> {
+    configure_key(owner, byte, lifetime);
+    owner.execute(id, Op::SetFastOpenKey(LinuxSipHash24Key::new([byte; 16])))
+}
 #[cfg(feature = "tfo-linux-cookie")]
 fn set(owner: &mut Owner, id: u64, byte: u8) -> Result<Reply> {
-    owner.execute(id, Op::SetFastOpenKey(LinuxSipHash24Key::new([byte; 16])))
+    set_lasting(owner, id, byte, Default::default())
+}
+// The 100 microsecond keys of the deadline tests.
+#[cfg(feature = "tfo-linux-cookie")]
+fn set_short(owner: &mut Owner, id: u64, byte: u8) -> Result<Reply> {
+    set_lasting(
+        owner,
+        id,
+        byte,
+        ntcp::FastOpenCookieLifetime::from_micros(100).unwrap(),
+    )
 }
 #[cfg(feature = "tfo-linux-cookie")]
 fn syn(owner: &mut Owner, port: u16, remote_port: u16) {
@@ -615,7 +653,17 @@ fn listener(owner: &mut Owner, port: u16) -> u64 {
 fn typed_default_staging_rotation_isolation_and_failed_handles() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_cookie_policy = policy(1);
+    config.fast_open_key_lease = Some(
+        ntcp::FastOpenKeyLease::for_lifetime(
+            0,
+            Default::default(),
+            config.tcp.connection.timebase,
+            false,
+        )
+        .unwrap(),
+    );
     let mut owner =
         Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
     owner.test_now = Some(0);
@@ -699,7 +747,7 @@ fn native_exchange(
     let mut config = EndpointConfig::default();
     config.connection.timestamps = false;
     config.connection.nagle = false;
-    let mut client = Endpoint::new(config, [1; 32], now, |_| true).unwrap();
+    let mut client = Endpoint::new(config, [1; 32], now, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     client.enable_fast_open().unwrap();
     let options = ntcp::ActiveOpenOptions::from(&ntcp::ConnectionConfig::default());
     let local = SocketAddr::new(
@@ -776,6 +824,7 @@ fn unmanaged_hmac_initial_lifetime_applies_to_native_traffic() {
     for local in ["192.168.0.1", "2001:db8::2"] {
         let local: IpAddr = local.parse().unwrap();
         let mut config = SocketConfig::new("test", local);
+        config.io.source_quiet = crate::SourceQuiet::Never;
         config.fast_open_managed_keys = Some(false);
         config.fast_open_cookie_lifetime =
             ntcp::FastOpenCookieLifetime::from_micros(1_000_000).unwrap();
@@ -818,6 +867,7 @@ fn unmanaged_hmac_initial_lifetime_applies_to_native_traffic() {
 fn unmanaged_hmac_initial_entropy_failure_preserves_established_flows() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_managed_keys = Some(false);
     config.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
     let mut owner =
@@ -850,6 +900,7 @@ fn unmanaged_hmac_initial_entropy_failure_preserves_established_flows() {
 fn explicit_hmac_lease_requires_unmanaged_mode_and_enforces_deadlines() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_key_lease = Some(ntcp::FastOpenKeyLease {
         not_before: 0,
         issue_until: 50,
@@ -868,7 +919,7 @@ fn explicit_hmac_lease_requires_unmanaged_mode_and_enforces_deadlines() {
     assert!(owner.fast_open_keys.is_none());
 
     config.fast_open_managed_keys = Some(false);
-    config.validate().unwrap();
+    assert!(!config.fast_open_keys_managed().unwrap());
     owner.apply_socket_config(&config).unwrap();
     let id = listener(&mut owner, 8080);
     owner
@@ -907,6 +958,7 @@ fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows
         ] {
             let local: IpAddr = local.parse().unwrap();
             let mut config = SocketConfig::new("test", local);
+            config.io.source_quiet = crate::SourceQuiet::Never;
             config.fast_open_cookie_policy = selected;
             config.fast_open_managed_keys = Some(true);
             config.fast_open_cookie_lifetime =
@@ -914,7 +966,7 @@ fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows
             config.tcp.max_connections = 16;
             config.tcp.preallocate_connections = 16;
             config.tcp.connection.timestamps = false;
-            let mut probe = Endpoint::new(config.tcp.clone(), [42; 32], 0, |_| true).unwrap();
+            let mut probe = Endpoint::new(config.tcp.clone(), [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
             probe.enable_fast_open().unwrap();
             let lease = ntcp::FastOpenKeyLease::for_lifetime(
                 0,
@@ -992,6 +1044,7 @@ fn automatic_rotation_entropy_failures_expire_credentials_and_preserve_live_flow
     ] {
         let local: IpAddr = "192.168.0.1".parse().unwrap();
         let mut config = SocketConfig::new("test", local);
+        config.io.source_quiet = crate::SourceQuiet::Never;
         config.fast_open_cookie_policy = selected.clone();
         config.fast_open_managed_keys = Some(true);
         config.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
@@ -1059,7 +1112,7 @@ fn automatic_rotation_entropy_failures_expire_credentials_and_preserve_live_flow
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
 //= type=test
-//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
 //# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the "Security Considerations" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.
 #[cfg(feature = "tfo-linux-cookie")]
 #[test]
@@ -1086,10 +1139,8 @@ fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations(
                 let mut owner =
                     Owner::with_config(local, (local, prefix), [42; 32], None, config.tcp).unwrap();
                 owner.test_now = Some(0);
-                owner.fast_open_cookie_lifetime =
-                    ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
                 let mut id = listener(&mut owner, 8080);
-                set(&mut owner, id, 7).unwrap();
+                set_short(&mut owner, id, 7).unwrap();
                 assert_eq!(owner.endpoint.fast_open_key_registry_usage().0, 2);
                 owner
                     .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
@@ -1100,10 +1151,10 @@ fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations(
                 }
                 owner.test_now = Some(100);
                 for byte in 8..8 + length - 1 {
-                    set(&mut owner, id, byte).unwrap();
+                    set_short(&mut owner, id, byte).unwrap();
                 }
                 owner.test_now = Some(101);
-                set(&mut owner, id, 7).unwrap();
+                set_short(&mut owner, id, 7).unwrap();
                 let usage = owner.endpoint.fast_open_key_registry_usage();
                 if staged {
                     owner.execute(id, Op::Listen(24)).unwrap();
@@ -1113,7 +1164,7 @@ fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations(
                     native_exchange(&mut owner, id, 40000, Some(cookie), false).0,
                     None
                 );
-                set(&mut owner, id, 11).unwrap();
+                set_short(&mut owner, id, 11).unwrap();
                 let fresh = native_exchange(&mut owner, id, 40001, Some(cookie), false)
                     .0
                     .unwrap();
@@ -1129,7 +1180,7 @@ fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations(
                     .poll_transmit(201, &mut [0; 2048], 64)
                     .unwrap();
                 id = listener(&mut owner, 8080);
-                set(&mut owner, id, 7).unwrap();
+                set_short(&mut owner, id, 7).unwrap();
                 owner
                     .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
                     .unwrap();
@@ -1150,11 +1201,10 @@ fn native_set_key_staging_and_same_key_after_expiry_do_not_renew_lease() {
     let config = SocketConfig::new("test", local);
     let mut owner = Owner::with_config(local, (local, 32), [42; 32], None, config.tcp).unwrap();
     owner.test_now = Some(0);
-    owner.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
     let id = listener(&mut owner, 8080);
-    set(&mut owner, id, 7).unwrap();
+    set_short(&mut owner, id, 7).unwrap();
     owner.test_now = Some(50);
-    set(&mut owner, id, 7).unwrap();
+    set_short(&mut owner, id, 7).unwrap();
     assert_eq!(
         owner.sockets[&id].fast_open_key_lease.unwrap().accept_until,
         100
@@ -1169,13 +1219,13 @@ fn native_set_key_staging_and_same_key_after_expiry_do_not_renew_lease() {
     owner.test_now = Some(99);
     native_exchange(&mut owner, id, 40001, Some(cookie), true);
     owner.test_now = Some(100);
-    set(&mut owner, id, 7).unwrap();
+    set_short(&mut owner, id, 7).unwrap();
     assert_eq!(
         native_exchange(&mut owner, id, 40002, Some(cookie), false).0,
         None
     );
     owner.test_now = Some(101);
-    set(&mut owner, id, 8).unwrap();
+    set_short(&mut owner, id, 8).unwrap();
     let fresh = native_exchange(&mut owner, id, 40003, Some(cookie), false)
         .0
         .unwrap();
@@ -1187,6 +1237,7 @@ fn native_set_key_staging_and_same_key_after_expiry_do_not_renew_lease() {
 fn external_config_lease_survives_reapply_and_expired_absolute_reinstall() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_cookie_policy = policy(7);
     config.fast_open_managed_keys = Some(false);
     config.fast_open_key_lease = Some(ntcp::FastOpenKeyLease {
@@ -1233,6 +1284,207 @@ fn external_config_lease_survives_reapply_and_expired_absolute_reinstall() {
         None
     );
     assert!(replacement.fast_open_keys.is_none());
+}
+
+// A restart on one boot: each owner is a new process's Endpoint over the same
+// configuration. Simulated time models the logic; the transport clock itself
+// is covered by ntcp-clock and the namespace cases.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# 5. The rest of the connection proceeds like a normal TCP connection. The
+//# client can repeat many Fast Open operations once it acquires a cookie
+//# (until the cookie is expired by the server).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# 5. The cookie expires after a certain amount of time. The reason for
+//# cookie expiration is detailed in the "Security Considerations" section
+//# (Section 5). This can be done by either periodically changing the server
+//# key used to generate cookies or including a timestamp when generating
+//# the cookie.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid,
+//# i.e., it has not expired and the cookie authenticates the client IP
+//# address.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# Once the client obtains the cookie from the target server, it can
+//# perform subsequent TFO connections until the cookie is expired by the
+//# server.
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn owners_in_sequence_keep_the_configured_deadlines() {
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
+    let mut clock = ntcp_clock::TransportClock::new().unwrap();
+    let boot_id = clock.characterization().boot_id;
+    clock.sample().unwrap();
+    let lease = ntcp::FastOpenKeyLease {
+        not_before: 10,
+        issue_until: 50,
+        accept_until: 100,
+        units_per_second: 1_000_000,
+    };
+    let mut config = SocketConfig::new("test", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
+    config.fast_open_cookie_policy = policy(7);
+    config.fast_open_key_lease = Some(lease);
+    config.fast_open_key_boot_id = Some(boot_id);
+    let start = |now| {
+        // What refuses the same configuration once the lease is over.
+        config.check_fast_open_leases(boot_id, now).unwrap();
+        let mut owner =
+            Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
+        owner.test_now = Some(now);
+        owner.apply_socket_config(&config).unwrap();
+        let id = listener(&mut owner, 8080);
+        owner
+            .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+            .unwrap();
+        owner.execute(id, Op::Listen(24)).unwrap();
+        (owner, id)
+    };
+    let (mut first, id) = start(10);
+    let cookie = native_exchange(&mut first, id, 40000, None, false)
+        .0
+        .unwrap();
+    drop(first);
+
+    // Started later than the lease began, on the original deadlines.
+    let (mut second, id) = start(40);
+    second.test_now = Some(49);
+    native_exchange(&mut second, id, 40001, Some(cookie), true);
+    assert_eq!(
+        native_exchange(&mut second, id, 40007, None, false).0,
+        Some(cookie)
+    );
+    // Issuance stops; the cookie first issued is still accepted.
+    second.test_now = Some(50);
+    assert_eq!(
+        native_exchange(&mut second, id, 40002, None, false).0,
+        None
+    );
+    native_exchange(&mut second, id, 40008, Some(cookie), true);
+    drop(second);
+
+    // A third, past issuance: selecting the key again renews nothing.
+    let (mut third, id) = start(60);
+    assert_eq!(
+        native_exchange(&mut third, id, 40003, Some(cookie), true).0,
+        None
+    );
+    set(&mut third, id, 7).unwrap();
+    assert_eq!(third.sockets[&id].fast_open_key_lease, Some(lease));
+    assert_eq!(
+        native_exchange(&mut third, id, 40004, None, false).0,
+        None
+    );
+    third.test_now = Some(99);
+    native_exchange(&mut third, id, 40005, Some(cookie), true);
+    third.test_now = Some(100);
+    assert_eq!(
+        native_exchange(&mut third, id, 40006, Some(cookie), false).0,
+        None
+    );
+    assert!(config.check_fast_open_leases(boot_id, 100).is_err());
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# 5. The rest of the connection proceeds like a normal TCP connection. The
+//# client can repeat many Fast Open operations once it acquires a cookie
+//# (until the cookie is expired by the server).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# 5. The cookie expires after a certain amount of time. The reason for
+//# cookie expiration is detailed in the "Security Considerations" section
+//# (Section 5). This can be done by either periodically changing the server
+//# key used to generate cookies or including a timestamp when generating
+//# the cookie.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid,
+//# i.e., it has not expired and the cookie authenticates the client IP
+//# address.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# Once the client obtains the cookie from the target server, it can
+//# perform subsequent TFO connections until the cookie is expired by the
+//# server.
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn setsockopt_selects_only_a_configured_key_under_its_lease() {
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
+    let lease = |not_before, issue_until, accept_until| ntcp::FastOpenKeyLease {
+        not_before,
+        issue_until,
+        accept_until,
+        units_per_second: 1_000_000,
+    };
+    let mut config = SocketConfig::new("test", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
+    config.fast_open_cookie_policy = policy(1);
+    config.fast_open_key_lease = Some(lease(0, 200, 200));
+    config.fast_open_keys = vec![
+        crate::ConfiguredFastOpenKey {
+            key: LinuxSipHash24Key::new([2; 16]),
+            lease: lease(0, 50, 100),
+        },
+        crate::ConfiguredFastOpenKey {
+            key: LinuxSipHash24Key::new([3; 16]),
+            lease: lease(150, 300, 300),
+        },
+    ];
+    let mut owner =
+        Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
+    owner.test_now = Some(0);
+    owner.apply_socket_config(&config).unwrap();
+    let key = |byte| Op::SetFastOpenKey(LinuxSipHash24Key::new([byte; 16]));
+    let id = listener(&mut owner, 8080);
+    let usage = owner.endpoint.fast_open_key_registry_usage();
+    assert_eq!(owner.execute(id, key(9)).unwrap_err(), EINVAL);
+    assert_eq!(owner.endpoint.fast_open_key_registry_usage(), usage);
+    assert!(owner.sockets[&id].fast_open_cookie_policy.is_none());
+    assert!(owner.sockets[&id].fast_open_key_lease.is_none());
+
+    owner.execute(id, key(1)).unwrap();
+    assert_eq!(owner.sockets[&id].fast_open_key_lease, Some(lease(0, 200, 200)));
+    owner.test_now = Some(20);
+    owner.execute(id, key(2)).unwrap();
+    assert_eq!(owner.sockets[&id].fast_open_key_lease, Some(lease(0, 50, 100)));
+    // Refused on a listener too, which keeps the selected key.
+    owner
+        .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+        .unwrap();
+    owner.execute(id, Op::Listen(24)).unwrap();
+    let cookie = native_exchange(&mut owner, id, 40000, None, false)
+        .0
+        .unwrap();
+    assert_eq!(owner.execute(id, key(9)).unwrap_err(), EINVAL);
+    native_exchange(&mut owner, id, 40001, Some(cookie), true);
+    // Not before its own start.
+    assert_eq!(owner.execute(id, key(3)).unwrap_err(), EINVAL);
+    owner.test_now = Some(150);
+    owner.execute(id, key(3)).unwrap();
+    assert_eq!(owner.sockets[&id].fast_open_key_lease, Some(lease(150, 300, 300)));
+    let fresh = native_exchange(&mut owner, id, 40002, Some(cookie), false)
+        .0
+        .unwrap();
+    assert_ne!(fresh, cookie);
+    // A managed primary key is the stack's own: only the further keys apply.
+    config.fast_open_managed_keys = Some(true);
+    config.fast_open_key_lease = None;
+    owner.fast_open_entropy = Some(VecDeque::from([Ok([7; 32])]));
+    owner.apply_socket_config(&config).unwrap();
+    assert_eq!(owner.execute(id, key(1)).unwrap_err(), EINVAL);
+    owner.execute(id, key(3)).unwrap();
 }
 
 #[cfg(feature = "tfo-linux-cookie")]

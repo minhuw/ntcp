@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn owner_native_route_configuration_and_management_affect_real_connection_policies() {
     let mut config = SocketConfig::new("test", "10.73.0.2".parse::<std::net::IpAddr>().unwrap());
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.tcp.connection.pmtud = Some(ntcp::PmtudConfig::new(1500));
     let remote = "10.73.0.3".parse().unwrap();
     let policy = ntcp::RoutePolicy {

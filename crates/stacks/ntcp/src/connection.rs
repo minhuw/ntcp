@@ -44,6 +44,9 @@ pub type Instant = u64;
 // Linux compares floor-seconds (up to <1s earlier); we use exact elapsed us,
 // retaining the same conservative bound, not identical quantized deadlines.
 const PAWS_RECENT_EXPIRY_US: u64 = 2_147_000_000;
+// RFC 7323 section 5.5: a peer invalidates TS.Recent only once idle for more
+// than 24 days, whatever shorter limit this receiver applies to itself.
+const PEER_TS_RECENT_IDLE_US: u64 = 24 * 86_400 * 1_000_000;
 
 // Adaptive ACK timeout floor (Linux TCP_ATO_MIN); a shorter delayed_ack_us lowers it.
 const ACK_TIMEOUT_FLOOR_US: u64 = 40_000;
@@ -71,6 +74,11 @@ impl CallerTimebase {
 
     pub(crate) fn us_from_ticks(self, ticks: u64) -> u64 {
         ticks / (self.units_per_second / 1_000_000)
+    }
+
+    // 2*MSL in caller ticks, the TIME-WAIT floor and the lifecycle quiet time.
+    pub(crate) fn quiet_interval(self) -> u64 {
+        self.ticks_from_us(self.max_segment_lifetime_us.saturating_mul(2))
     }
 
     pub(crate) fn valid(self) -> bool {
@@ -810,6 +818,9 @@ pub(crate) struct Connection {
     reset_echo: Option<u32>,
     reset_reply: bool,
     last_timestamp_sent_at: Option<Instant>,
+    // A substantiated suspend left the next TSval older than what the peer
+    // may hold: no further output, and the next timeout service ends this.
+    timestamp_ambiguous: bool,
     mss: usize,
     peer_mss: u16,
     receive_mss_offer: u16,
@@ -1182,6 +1193,7 @@ impl Connection {
             reset_echo: None,
             reset_reply: false,
             last_timestamp_sent_at: None,
+            timestamp_ambiguous: false,
             mss,
             advertised_edge: Seq(0),
             syn_window,
@@ -1740,6 +1752,14 @@ impl Connection {
     //# of the connection (for the same direction of the data transfer), honor
     //# the incoming connection request (creating a connection in the
     //# SYN-RECEIVED state).
+    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+    //= reason=Only a SYN without ACK or RST to a TIME-WAIT connection reaches reopen_time_wait, whose reuse_syn freshness uses both the incoming sequence number and its Timestamps option when present. Reuse enabled versus disabled leaves results, state, resources, deadlines and emitted bytes identical in CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING across flag, checksum, timestamp and sequence variants.
+    //# The following paragraphs summarize the processing of SYN segments
+    //# received for connections in the TIME-WAIT state. The processing of SYN
+    //# segments received for connections in all other states is unchanged. Both
+    //# the ISN (Initial Sequence Number) and the Timestamps option (if present)
+    //# of the incoming SYN segment are included in the heuristics performed for
+    //# allowing a high connection-establishment rate.
     pub(crate) fn reuse_syn(&self, now: Instant, syn: &Segment<'_>, timestamps: bool) -> bool {
         if !self.time_wait_valid(now) {
             return false;
@@ -3911,7 +3931,7 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
-    //= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
+    //= reason=Native and tun_echo time is the characterized CLOCK_BOOTTIME provider, which rejects decreasing samples and measures suspend; other embedders owe physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
@@ -3919,6 +3939,34 @@ impl Connection {
     //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate/precision remain caller obligations; endpoint timestamp half-range gap checks are separate.
     //# The PAWS mechanism also puts a strong monotonicity requirement on the
     //# sender's timestamp clock.
+    // `now` carries a suspend the clock provider measured. Nothing measured
+    // across it is a path RTT, so in-flight transmissions stop sampling. RFC
+    // 7323 section 5.5: beyond 24 days idle the peer must have invalidated
+    // TS.Recent and ours has expired by elapsed time; within them, the
+    // returned ambiguity ends the connection.
+    pub(crate) fn suspended(&mut self, now: Instant) -> Result<bool, Error> {
+        self.check_time(now)?;
+        self.timestamp_ambiguous |= self.next_timestamp_appears_older(now);
+        self.update_time(now)?;
+        self.sample = None;
+        self.rtt_sample_after = Some(now);
+        self.rack.discard_samples_before(now);
+        Ok(self.timestamp_ambiguous)
+    }
+
+    fn next_timestamp_appears_older(&self, now: Instant) -> bool {
+        let Some(sent) = self.last_timestamp_sent_at.filter(|_| self.timestamps) else {
+            return false;
+        };
+        let tick = |at| {
+            self.config
+                .timestamp_granularity
+                .tick_in(at, self.config.timebase)
+        };
+        (tick(now) - tick(sent)) as u32 >= 1 << 31
+            && now - sent <= self.config.timebase.ticks_from_us(PEER_TS_RECENT_IDLE_US)
+    }
+
     pub(crate) fn check_time(&self, now: Instant) -> Result<(), Error> {
         if now < self.now {
             Err(Error::TimeWentBackwards)
@@ -8054,8 +8102,8 @@ impl Connection {
         mut shared: Option<&mut Vec<crate::Payload>>,
     ) -> Result<Option<usize>, Error> {
         self.check_time(now)?;
-        if self.local_resource.is_some_and(|r| r.retry_at.is_some()) {
-            return Ok(None); // Owner must service the resource timer first.
+        if self.local_resource.is_some_and(|r| r.retry_at.is_some()) || self.timestamp_ambiguous {
+            return Ok(None); // Owner must service the timer first.
         }
         let mut segmentation = None;
         // Plan entirely before encode. Even timer/clock/accounting changes
@@ -8164,7 +8212,7 @@ impl Connection {
         //# even with the window extension defined in Section 2.2, 2^31
         //# bytes must be at least two windows.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
+        //= reason=Native and tun_echo time is the characterized CLOCK_BOOTTIME provider, which rejects decreasing samples and measures suspend; other embedders owe physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
         //# The recycling time of the timestamp clock MUST be greater than
         //# MSL seconds.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
@@ -8188,7 +8236,7 @@ impl Connection {
         //# (3)  When a TSopt is sent, its TSecr field is set to the current
         //# TS.Recent value.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; physical monotonicity/rate/precision and MSL are caller obligations, not measured or declared resolution gates.
+        //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; native monotonicity comes from the characterized CLOCK_BOOTTIME provider; physical rate/precision and actual network MSL are not measured or declared resolution gates, and other embedders' clocks remain caller obligations.
         //# Based upon these considerations, we choose a timestamp clock
         //# frequency in the range 1 ms to 1 sec per tick.
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
@@ -10444,6 +10492,7 @@ impl Connection {
                 self.pacing_deadline
             },
             timestamp_wakeup,
+            self.timestamp_ambiguous.then_some(self.now),
             self.pmtud
                 .as_ref()
                 // Unlike pacing, tick consumes even a saturated due deadline.
@@ -10593,6 +10642,10 @@ impl Connection {
             self.pacer = Pacer::default();
             self.time_wait_deadline = None;
             self.ack_pending = false;
+            return Ok(());
+        }
+        if core::mem::take(&mut self.timestamp_ambiguous) {
+            self.terminal(CloseReason::TimedOut);
             return Ok(());
         }
         let terminal_deadline = self

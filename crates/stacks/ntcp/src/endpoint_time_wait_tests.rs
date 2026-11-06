@@ -233,8 +233,8 @@ fn reopened_data_syn_completes_with_real_peer_without_replay_or_double_delivery(
         cfg.connection.timestamps = true;
         cfg.reuse_time_wait = true;
         let (local, remote) = addresses();
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         a.enable_fast_open().unwrap();
         b.enable_fast_open().unwrap();
         let listener = b.listen(remote, 4).unwrap();
@@ -357,6 +357,15 @@ fn data_syn_output_reservation_preserves_old_owner_until_retry() {
     assert_eq!(b.state(old), Ok(State::TimeWait));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//= reason=Only a SYN without ACK or RST to a TIME-WAIT connection reaches reopen_time_wait, whose reuse_syn freshness uses both the incoming sequence number and its Timestamps option when present. Reuse enabled versus disabled leaves results, state, resources, deadlines and emitted bytes identical in CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING across flag, checksum, timestamp and sequence variants.
+//# The following paragraphs summarize the processing of SYN segments
+//# received for connections in the TIME-WAIT state. The processing of SYN
+//# segments received for connections in all other states is unchanged. Both
+//# the ISN (Initial Sequence Number) and the Timestamps option (if present)
+//# of the incoming SYN segment are included in the heuristics performed for
+//# allowing a high connection-establishment rate.
 #[test]
 fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
     fn observe(
@@ -364,6 +373,8 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
         scenario: u8,
         flags: u8,
         corrupt: bool,
+        timestamp: Option<u32>,
+        sequence_offset: u32,
     ) -> (std::string::String, Vec<(IpMetadata, Vec<u8>)>) {
         let mut cfg = config();
         cfg.reuse_time_wait = reuse;
@@ -377,8 +388,8 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
             source: local.ip(),
             destination: remote.ip(),
         };
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         let listener = (scenario != 0).then(|| b.listen(remote, 4).unwrap());
         let mut expected = None;
         if scenario == 2 {
@@ -448,8 +459,18 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
             window: 1024,
             urgent_pointer: 0,
         };
-        let seq = old.map_or(100, |id| b.send_progress(id).unwrap().next_write_sequence);
-        let mut syn = tw_segment_with_payload(ip, h, seq, 0, flags, Some((99, 0)), b"data");
+        let seq = old
+            .map_or(100, |id| b.send_progress(id).unwrap().next_write_sequence)
+            .wrapping_add(sequence_offset);
+        let mut syn = tw_segment_with_payload(
+            ip,
+            h,
+            seq,
+            0,
+            flags,
+            timestamp.map(|value| (value, 0)),
+            b"data",
+        );
         if corrupt {
             syn[16] ^= 1;
         }
@@ -471,6 +492,9 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
         );
         (snapshot, packets(&mut b, 4_000))
     }
+    // The reuse heuristics' inputs vary too: no Timestamps option, and a
+    // timestamp and a sequence number in each serial half-space from any
+    // frontier the connection holds, so one of each is newer and one older.
     for scenario in 0..=10 {
         for flags in [
             wire::SYN,
@@ -479,11 +503,16 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
             wire::SYN | wire::RST,
         ] {
             for corrupt in [false, true] {
-                assert_eq!(
-                    observe(false, scenario, flags, corrupt),
-                    observe(true, scenario, flags, corrupt),
-                    "scenario={scenario} flags={flags} corrupt={corrupt}"
-                );
+                for timestamp in [None, Some(99), Some(99 + (1 << 31))] {
+                    for sequence_offset in [0, 1 << 31] {
+                        assert_eq!(
+                            observe(false, scenario, flags, corrupt, timestamp, sequence_offset),
+                            observe(true, scenario, flags, corrupt, timestamp, sequence_offset),
+                            "scenario={scenario} flags={flags} corrupt={corrupt} \
+                             timestamp={timestamp:?} sequence_offset={sequence_offset}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -495,8 +524,8 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
             cfg.reuse_time_wait = reuse;
             // The shared fixture enables reuse; create ordinary closing peers here.
             let (local, remote) = addresses();
-            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-            let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+            let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
             let listener = b.listen(remote, 4).unwrap();
             let client = a.connect(0, local, remote).unwrap();
             pump(&mut a, &mut b, 1_000);
@@ -528,6 +557,114 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
         }
         assert_eq!(results[0], results[1]);
     }
+}
+
+// The (time, TSval) pairs of the packets one side sent.
+fn sent_timestamps(now: u64, packets: &[(IpMetadata, Vec<u8>)]) -> Vec<(u64, u32)> {
+    packets
+        .iter()
+        .map(|(ip, bytes)| {
+            let segment = wire::parse(*ip, bytes).unwrap();
+            (now, segment.options.timestamps.unwrap().0)
+        })
+        .collect()
+}
+
+fn exchange(a: &mut Endpoint, b: &mut Endpoint, now: u64, sent: &mut Vec<(u64, u32)>) {
+    for _ in 0..128 {
+        let ab = packets(a, now);
+        let ba = packets(b, now);
+        if ab.is_empty() && ba.is_empty() {
+            return;
+        }
+        sent.extend(sent_timestamps(now, &ba));
+        deliver(b, now, ab);
+        deliver(a, now, ba);
+    }
+    panic!("unexpected infinite packet exchange");
+}
+
+//= https://www.rfc-editor.org/rfc/rfc6191#section-1
+//= type=test
+//= reason=Native transport ticks come from the characterized CLOCK_BOOTTIME provider, which rejects decreasing samples. Endpoint::check_clock refuses earlier input and timestamp half-range jumps, every TSval is the selected tick plus one constant per-connection offset, and TIME-WAIT reuse inherits the old incarnation's offset, so a reincarnation continues its predecessor's timestamp clock. Embedders supplying their own clock own its monotonicity.
+//# For the purpose of PAWS, the timestamps sent on a connection are
+//# required to be monotonically increasing.
+#[test]
+fn timestamps_sent_on_a_connection_and_its_reincarnation_never_decrease() {
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.reuse_time_wait = true;
+    let (local, remote) = addresses();
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    let mut sent = Vec::new();
+    exchange(&mut a, &mut b, 1_000, &mut sent);
+    let server = b.accept(listener).unwrap();
+    // Sub-tick, single-tick and long steps of the millisecond cadence.
+    for (i, now) in [1_400, 2_000, 2_999, 3_000, 10_000, 10_001, 500_000]
+        .into_iter()
+        .enumerate()
+    {
+        b.write(server, &[i as u8; 100]).unwrap();
+        a.write(client, &[i as u8; 30]).unwrap();
+        exchange(&mut a, &mut b, now, &mut sent);
+    }
+    // Earlier input is refused before it can reach the connection.
+    a.write(client, b"x").unwrap();
+    let late = packets(&mut a, 500_000);
+    assert_eq!(
+        b.input(499_999, ip, &late[0].1),
+        Err(EndpointError::Connection(Error::TimeWentBackwards))
+    );
+    assert_eq!(
+        b.poll_transmit(499_999, &mut [0; 2048], 16),
+        Err(EndpointError::Connection(Error::TimeWentBackwards))
+    );
+    deliver(&mut b, 500_000, late);
+    b.shutdown(server).unwrap();
+    exchange(&mut a, &mut b, 600_000, &mut sent);
+    a.shutdown(client).unwrap();
+    let fin = packets(&mut a, 700_000);
+    let peer = wire::parse(fin[0].0, &fin[0].1).unwrap().options.timestamps.unwrap().0;
+    deliver(&mut b, 700_000, fin);
+    sent.extend(sent_timestamps(700_000, &packets(&mut b, 700_000)));
+    assert_eq!(b.state(server), Ok(State::TimeWait));
+    // A fresher request reincarnates the connection on the same clock.
+    let h = wire::Header {
+        source_port: remote.port(),
+        destination_port: local.port(),
+        sequence: 0,
+        acknowledgment: 0,
+        flags: 0,
+        window: 1024,
+        urgent_pointer: 0,
+    };
+    let syn = tw_segment_with_payload(ip, h, 7, 0, wire::SYN, Some((peer + 1, 0)), b"");
+    b.input(800_000, ip, &syn).unwrap();
+    let new = b.connection_id(Tuple {
+        local: remote,
+        remote: local,
+    });
+    assert!(new.is_some_and(|id| id != server));
+    assert_eq!(b.state(new.unwrap()), Ok(State::SynReceived));
+    let synack = sent_timestamps(800_000, &packets(&mut b, 800_000));
+    assert_eq!(synack.len(), 1);
+    sent.extend(synack);
+    assert!(sent.len() > 10);
+    let offset = sent[0].1.wrapping_sub((sent[0].0 / 1_000) as u32);
+    for (at, value) in &sent {
+        assert_eq!(value.wrapping_sub((at / 1_000) as u32), offset, "at {at}");
+    }
+    for pair in sent.windows(2) {
+        assert!(pair[1].1.wrapping_sub(pair[0].1) < 1 << 31, "{pair:?}");
+    }
+    assert_eq!(sent.last().unwrap().1.wrapping_sub(sent[0].1), 799);
 }
 
 #[test]

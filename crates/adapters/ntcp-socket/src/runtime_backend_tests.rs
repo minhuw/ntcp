@@ -278,7 +278,7 @@ fn deliver(owner: &mut Owner, peer: &mut Owner, state: &Arc<Mutex<State>>) {
             .unwrap();
     }
     // Force the peer's delayed ACK without sleeps or a NIC.
-    peer.epoch -= std::time::Duration::from_millis(250);
+    peer.advance_clock(250_000);
     peer.endpoint.on_timeout(peer.now(), BUDGET).unwrap();
     pump(peer, owner);
 }
@@ -720,6 +720,7 @@ fn pmtud_startup_uses_real_mtu_and_separate_adapter_capacity() {
     }));
     let io = Fixture(state.clone());
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2));
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.tcp.connection.mss = 8960;
     config.tcp.connection.send_ip_payload_limit = 8980;
     assert!(config.validate().is_ok());
@@ -1592,7 +1593,7 @@ fn reserved_stateless_rejection_is_best_effort_and_impossible_headers_abandon() 
     // runtime branch with a core fixture that can retain impossible IP headers.
     let mut config = a.defaults.clone();
     config.ipv4_options_enabled = true;
-    a.endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+    a.endpoint = Endpoint::new(config, [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     a.enable_egress(1, None).unwrap();
     let id = a
         .endpoint

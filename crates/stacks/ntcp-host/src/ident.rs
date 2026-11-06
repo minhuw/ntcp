@@ -134,6 +134,8 @@ pub struct IdentifierAllocator {
     lifetime: Instant,
     running: bool,
     not_before: Instant,
+    // Sources with their own continuity fact; one entry per stated address.
+    sources: Vec<(IpAddr, Instant)>,
     tuples: Vec<Option<Tuple>>,
     blocks: Vec<Instant>,
     leases: Vec<Option<Lease6>>,
@@ -155,6 +157,7 @@ impl IdentifierAllocator {
             lifetime,
             running: false,
             not_before: 0,
+            sources: Vec::new(),
             tuples: crate::table(limits.ipv4_tuples, None)?,
             blocks: crate::table(
                 limits
@@ -183,19 +186,42 @@ impl IdentifierAllocator {
         self.running = true;
         self.not_before = at.saturating_add(self.lifetime.saturating_sub(elapsed));
     }
+    // `source`'s own fact replaces the start's for it. Addresses scoped to
+    // different links can repeat, so one value keeps the latest of its facts.
+    pub(crate) fn source_quiet_for(
+        &mut self,
+        source: IpAddr,
+        at: Instant,
+        seconds: u64,
+    ) -> Result<(), Error> {
+        let elapsed = seconds.saturating_mul(self.units_per_second);
+        let until = at.saturating_add(self.lifetime.saturating_sub(elapsed));
+        if let Some(entry) = self.sources.iter_mut().find(|(s, _)| *s == source) {
+            entry.1 = entry.1.max(until);
+            return Ok(());
+        }
+        self.sources.try_reserve(1).map_err(|_| Error::Allocation)?;
+        self.sources.push((source, until));
+        Ok(())
+    }
     // A transferred allocator keeps its own quiet period; one that was
     // never started carries no continuity and cannot be transferred.
     pub(crate) fn running(&self) -> bool {
         self.running
     }
 
-    fn available(&self, now: Instant) -> Result<(), IdentifierBackpressure> {
+    fn available(&self, now: Instant, source: IpAddr) -> Result<(), IdentifierBackpressure> {
         if !self.running {
             return Err(IdentifierBackpressure::Unavailable { until: None });
         }
-        if now < self.not_before {
+        let not_before = self
+            .sources
+            .iter()
+            .find(|(s, _)| *s == source)
+            .map_or(self.not_before, |(_, until)| *until);
+        if now < not_before {
             return Err(IdentifierBackpressure::Unavailable {
-                until: Some(self.not_before),
+                until: Some(not_before),
             });
         }
         Ok(())
@@ -212,7 +238,7 @@ impl IdentifierAllocator {
         protocol: u8,
         entropy: Option<&mut Entropy>,
     ) -> Result<u32, IdentifierBackpressure> {
-        self.available(now)?;
+        self.available(now, source)?;
         match (source, destination) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => self
                 .issue_v4(now, source, destination, protocol, entropy)

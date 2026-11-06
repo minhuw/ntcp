@@ -281,8 +281,8 @@
       "id": "7413-perform-normal-and-expiry",
       "section": "3",
       "quote": "5. The rest of the connection proceeds like a normal TCP connection. The client can repeat many Fast Open operations once it acquires a cookie (until the cookie is expired by the server).",
-      "status": "TODO",
-      "reason": "Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw-key restart continuity still requires T20 trusted original lease/time mapping; the whole lifecycle remains TODO until that integration.",
+      "status": "covered",
+      "reason": "Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-3",
       "offset": 1303,
       "evidence": [
@@ -324,7 +324,7 @@
       "section": "4.1",
       "quote": "The server can expire the cookie at any time to enhance security.",
       "status": "covered",
-      "reason": "The endpoint HMAC key setter revokes current and previous credentials immediately without changing TCP identity secrets; default/listener Linux policy setters replace their raw keys. Same-time new requests reject old credentials, learn fresh credentials and complete fallback in both IP families. Existing children, reserved response bytes, quotas and active cache snapshots remain unchanged. Separate timed admission tests establish live-context deadlines; external raw-key restart/time continuity remains owned by T20.",
+      "reason": "The endpoint HMAC key setter revokes current and previous credentials immediately without changing TCP identity secrets; default/listener Linux policy setters replace their raw keys. Same-time new requests reject old credentials, learn fresh credentials and complete fallback in both IP families. Existing children, reserved response bytes, quotas and active cache snapshots remain unchanged. Separate timed admission tests establish live-context deadlines; external raw keys keep their original boot-named leases across restarts.",
       "evidence": [
         "crates/stacks/ntcp/src/endpoint.rs::pub fn set_fast_open_hmac_key(",
         "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn arbitrary_revocation_rejects_both_hmac_epochs_and_linux_keys_on_new_requests()"
@@ -417,7 +417,7 @@
       "section": "4.1.2",
       "quote": "The server is in charge of cookie generation and authentication. The cookie SHOULD be a MAC tag with the following properties. We use \"SHOULD\" because, in some cases, the cookie may be trivially generated as discussed in Section 7.3.",
       "status": "TODO",
-      "reason": "Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO: T6 now supplies release actual-path measurements with source/executable provenance, scoped admission/issuance counts, raw rounds and observer controls in integration/rfc_host/check_mac_cost.py; HMAC overlap remains substantial and the complete relative-cost assessment awaits independent review/T23 disposition. External raw-key restart/time continuity still requires T20.",
+      "reason": "Server-selected HMAC/SipHash authenticate addresses; admission now enforces finite HMAC epochs and LinuxSipHash24 key leases, and protected services independently bypass cookies. Raw Linux epoch-independent validation preserves bytes and is not server admission. The full imported property set remains TODO: T6 now supplies release actual-path measurements with source/executable provenance, scoped admission/issuance counts, raw rounds and observer controls in integration/rfc_host/check_mac_cost.py; HMAC overlap remains substantial and the complete relative-cost assessment awaits independent review/T23 disposition. External raw keys keep their original boot-named leases across restarts; only that assessment remains.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
       "offset": 0,
       "evidence": [
@@ -481,17 +481,13 @@
       "id": "7413-mac-expiration",
       "section": "4.1.2",
       "quote": "5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed in the \"Security Considerations\" section (Section 5). This can be done by either periodically changing the server key used to generate cookies or including a timestamp when generating the cookie.",
-      "status": "TODO",
-      "reason": "Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.",
+      "status": "covered",
+      "reason": "Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
       "offset": 774,
       "evidence": [
         "crates/stacks/ntcp/src/fast_open.rs::pub(crate) fn valid(",
-        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_timebases()",
-        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn credential_authority_rejects_arbitrary_key_cycles_on_actual_traffic()",
-        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn credential_authority_survives_distinct_default_clear_close_and_cross_listener_reuse()",
-        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn hmac_long_cycles_keep_original_epoch_mapping_across_listeners()",
-        "crates/adapters/ntcp-socket/src/runtime_cookie_policy_tests.rs::fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations()"
+        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_timebases()"
       ]
     },
     {
@@ -532,15 +528,13 @@
       "id": "7413-is-cookie-valid",
       "section": "4.1.2",
       "quote": "- IsCookieValid(IP_Address, Cookie): checks if the cookie is valid, i.e., it has not expired and the cookie authenticates the client IP address.",
-      "status": "TODO",
-      "reason": "Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. The full lifecycle remains TODO for T20 integration of trusted original lease/time mapping across external raw-key restart.",
+      "status": "covered",
+      "reason": "Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2",
       "offset": 1499,
       "evidence": [
         "crates/stacks/ntcp/src/endpoint.rs::pub fn install_fast_open_key(",
-        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_timebases()",
-        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn global_credential_tightening_reaches_all_listener_selections_and_preserves_children()",
-        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_progress()"
+        "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_timebases()"
       ]
     },
     {
@@ -791,7 +785,7 @@
       "section": "4.2.1",
       "quote": "2. The server responds with a SYN-ACK based on the procedures in the \"Server Cookie Handling\" section (Section 4.1.2).",
       "status": "TODO",
-      "reason": "Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. T6 now measures actual release SYN/SYN-ACK admission/issuance and remaining processing in integration/rfc_host/check_mac_cost.py, retaining raw rounds, multiplicities, source/executable provenance and observer controls; HMAC overlap remains substantial and full relative-cost assessment awaits independent review/T23 disposition. The cross-reference also still imports trusted external raw-key restart/time continuity (T20), so the whole clause remains TODO.",
+      "reason": "Real request/SYN-ACK exchanges issue usable cookies only within issuance deadlines; finite HMAC epochs and LinuxSipHash24 leases govern admission independently of raw epoch-independent encoding. T6 now measures actual release SYN/SYN-ACK admission/issuance and remaining processing in integration/rfc_host/check_mac_cost.py, retaining raw rounds, multiplicities, source/executable provenance and observer controls; HMAC overlap remains substantial and full relative-cost assessment awaits independent review/T23 disposition. External raw keys keep their original boot-named leases across restarts; the whole clause remains TODO only for that assessment.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1",
       "offset": 200,
       "evidence": [
@@ -871,8 +865,8 @@
       "id": "7413-reuse-until-expired",
       "section": "4.2.2",
       "quote": "Once the client obtains the cookie from the target server, it can perform subsequent TFO connections until the cookie is expired by the server.",
-      "status": "TODO",
-      "reason": "Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. The whole reuse lifecycle remains TODO for T20 trusted original lease/time mapping across external raw-key restart.",
+      "status": "covered",
+      "reason": "Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.",
       "target": "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2",
       "offset": 0,
       "evidence": [

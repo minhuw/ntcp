@@ -2,7 +2,7 @@
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
-reason = "Caller-contract scope: the embedding supplies monotonic, consistently scaled time in its real or simulated time domain, with sufficient precision. Instant and CallerTimebase state this precondition; caller_units_endpoint_isn_control_epoch_deadlines_and_guards tests unit conversion, backward-input rejection and timestamp half-range guards. Physical clock rate and precision belong to the provider. Violating the contract leaves protocol timing guarantees unspecified while memory safety and resource bounds remain enforced."
+reason = "Caller-contract scope: the embedding supplies monotonic, consistently scaled time in its real or simulated time domain, with sufficient precision. Instant and CallerTimebase state this precondition; caller_units_endpoint_isn_control_epoch_deadlines_and_guards tests unit conversion, backward-input rejection and timestamp half-range guards. Physical clock rate and precision belong to the provider; native and tun_echo use the characterized CLOCK_BOOTTIME provider, whose reported clock_getres is not a precision claim. Violating the contract leaves protocol timing guarantees unspecified while memory safety and resource bounds remain enforced."
 quote = '''
 Values of this
 clock MUST be at least approximately proportional to real time, in

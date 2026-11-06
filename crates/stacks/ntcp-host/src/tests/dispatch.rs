@@ -660,6 +660,7 @@ fn two_links(v6: bool, identity: u128, cfg: &EndpointConfig) -> (Side, IngressCo
             cfg.clone(),
             [identity as u8; 32],
             0,
+            ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
             move |request| match request {
                 ntcp::AddressValidation::Bind { local: address }
                 | ntcp::AddressValidation::Open { local: address, .. } => address == local.ip(),

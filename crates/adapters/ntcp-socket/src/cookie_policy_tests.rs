@@ -24,8 +24,15 @@ fn config_cookie_policy_is_explicit_and_redacted() {
         let error = SocketConfig::parse(&format!("{base}{suffix}")).unwrap_err();
         assert_eq!(error.to_string(), "invalid socket configuration");
     }
+    let mut clock = ntcp_clock::TransportClock::new().unwrap();
+    let now = clock.sample().unwrap().ticks;
+    let lease = format!(
+        "socket.fast_open_key_boot_id={}\nsocket.fast_open_key_not_before_us={now}\nsocket.fast_open_key_issue_until_us={until}\nsocket.fast_open_key_accept_until_us={until}",
+        clock.characterization().boot_id,
+        until = now + 3_600_000_000,
+    );
     let text = format!(
-        "{base}socket.fast_open_key=00112233445566778899AABBCCDDEEFF\nsocket.fast_open_cookie=linux-siphash24"
+        "{base}socket.fast_open_key=00112233445566778899AABBCCDDEEFF\nsocket.fast_open_cookie=linux-siphash24\n{lease}"
     );
     let result = SocketConfig::parse(&text);
     #[cfg(not(feature = "tfo-linux-cookie"))]
@@ -64,6 +71,10 @@ fn binary_key_public_abi_faults_lengths_aliases_and_unsupported_get() {
         #[cfg(all(feature = "linux", feature = "tfo-linux-cookie"))]
         {
             assert_eq!(set(fd, key.as_ptr().cast(), 16), 0);
+            // A key configured nowhere; the configured one above still applies.
+            let other = [0xcdu8; 16];
+            assert_eq!(set(alias, other.as_ptr().cast(), 16), -1);
+            assert_eq!(errno(), EINVAL);
             for len in [0, 4, 15, 17, 32, u32::MAX] {
                 assert_eq!(set(alias, key.as_ptr().cast(), len), -1);
                 assert_eq!(errno(), EINVAL);

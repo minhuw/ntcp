@@ -49,7 +49,6 @@ use std::{
     io::{self, BufRead, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
-    time::Instant,
 };
 
 const MTU: usize = 1500;
@@ -197,7 +196,7 @@ struct Network {
     route: path::RouteId,
     neighbor: Option<(path::RouteId, UdpFlowId)>,
     administration: ntcp_host::Administration,
-    start: Instant,
+    time: ntcp_clock::TransportClock,
     frame: Vec<u8>,
     completed: Vec<u8>,
     output: Vec<u8>,
@@ -211,8 +210,16 @@ struct Network {
 }
 
 impl Network {
-    fn now(&self) -> u64 {
-        self.start.elapsed().as_micros() as u64
+    // One transport sample (CLOCK_BOOTTIME microseconds), its measured
+    // suspend passed to the Endpoint; every failure ends the driver.
+    fn now(&mut self, endpoint: &mut Endpoint) -> io::Result<u64> {
+        let sample = self.time.sample().map_err(io::Error::other)?;
+        if sample.suspended != 0 {
+            endpoint
+                .resume(sample.ticks, sample.suspended)
+                .map_err(engine)?;
+        }
+        Ok(sample.ticks)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -225,7 +232,7 @@ impl Network {
         peer_reassembly: u32,
         adjunct: usize,
         tun: Tun,
-        start: Instant,
+        time: ntcp_clock::TransportClock,
     ) -> io::Result<Self> {
         let ipv4 = local.is_ipv4();
         let mut identity = [0u8; 16];
@@ -387,7 +394,7 @@ impl Network {
             route,
             neighbor: None,
             administration,
-            start,
+            time,
             frame: vec![0; MAX_IP_PACKET + 1],
             completed: vec![0; MAX_IP_PACKET],
             output: vec![0; largest + MTU],
@@ -400,7 +407,9 @@ impl Network {
 
     // Malformed or foreign input is a silent discard, as in any embedding.
     fn input(&mut self, endpoint: &mut Endpoint, len: usize) {
-        let now = self.now();
+        let Ok(now) = self.now(endpoint) else {
+            return;
+        };
         let packet = &self.frame[..len];
         // Pass only the complete IPv4 datagram to the exact-bounds codec.
         let packet = if packet[0] >> 4 == 4 && len >= 4 {
@@ -439,7 +448,7 @@ impl Network {
     // (reassembly and adjunct deadlines), the ICMP output drain (Echo
     // Replies and adjunct probes) and the flow's advice and datagrams.
     fn serve(&mut self, endpoint: &mut Endpoint, wait_ms: u64) -> io::Result<()> {
-        let until = self.now() + wait_ms * 1000;
+        let until = self.now(endpoint)? + wait_ms * 1000;
         loop {
             loop {
                 match self.tun.receive(&mut self.frame) {
@@ -450,7 +459,7 @@ impl Network {
                     Err(error) => return Err(error),
                 }
             }
-            let now = self.now();
+            let now = self.now(endpoint)?;
             if let Ok(report) = self.host.service_changes(endpoint, now)
                 && let Some(error) = report.first_error
             {
@@ -489,7 +498,7 @@ impl Network {
             {
                 self.datagrams += 1;
             }
-            let now = self.now();
+            let now = self.now(endpoint)?;
             if now >= until {
                 return Ok(());
             }
@@ -531,8 +540,9 @@ impl Network {
     // The flow's limits under its default send, the shared path state they
     // were read from (learned estimate, budget, revision, hold) and the
     // adjunct counters.
-    fn state(&mut self, endpoint: &Endpoint) -> io::Result<String> {
+    fn state(&mut self, endpoint: &mut Endpoint) -> io::Result<String> {
         let limits = self.limits(endpoint, None)?;
+        let now = self.now(endpoint)?;
         let snapshot = self
             .host
             .paths()
@@ -556,7 +566,7 @@ impl Network {
             self.datagrams,
             counters_json(&self.host.adjunct_counters()),
             text(self.host.icmp_output_counters()),
-            self.now()
+            now
         ))
     }
 
@@ -618,11 +628,12 @@ impl Network {
             .find(|r| r.route == route)
             .ok_or_else(|| other("route vanished".into()))?
             .generation;
+        let now = self.now(endpoint)?;
         let candidate = self
             .host
             .admin_validate(
                 &self.administration,
-                self.now(),
+                now,
                 path::AdminChange {
                     target: path::AdminTarget::Route(route),
                     expected,
@@ -674,7 +685,7 @@ impl Network {
             .map_err(|e| host_error(e.into()))?
             .learned_mtu();
         let payload = pattern(size, salt);
-        let now = self.now();
+        let now = self.now(endpoint)?;
         let buffer = before.buffer_len(size).min(self.output.len());
         let mut lengths = Vec::new();
         let Self {
@@ -726,7 +737,7 @@ impl Network {
 impl Network {
     // One application outcome report for receipt N (consumed exactly once
     // by the Host; a replay or a stale receipt is reported as its error).
-    fn report(&mut self, index: usize, outcome: &str) -> io::Result<String> {
+    fn report(&mut self, endpoint: &mut Endpoint, index: usize, outcome: &str) -> io::Result<String> {
         let outcome = match outcome {
             "success" => UdpProbeOutcome::Success,
             "isolated-loss" => UdpProbeOutcome::IsolatedLoss,
@@ -738,7 +749,7 @@ impl Network {
             .receipts
             .get(index)
             .ok_or_else(|| other(format!("no receipt {index}")))?;
-        let now = self.now();
+        let now = self.now(endpoint)?;
         Ok(
             match self
                 .host
@@ -821,9 +832,15 @@ fn run() -> io::Result<()> {
     let mut secret = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
     let tun = Tun::open(&args[1])?;
-    let start = Instant::now();
+    let mut time = ntcp_clock::TransportClock::new().map_err(io::Error::other)?;
+    let started = time.sample().map_err(io::Error::other)?.ticks;
     // The namespace's own addresses are the only ones this driver uses.
-    let mut endpoint = Endpoint::new(config.clone(), secret, 0, move |request| match request {
+    // The harness created this namespace and its addresses for this run.
+    let lifecycle = ntcp::Lifecycle {
+        boot_age: Some(time.boot_age(started).map_err(io::Error::other)?),
+        continuity: ntcp::SourceContinuity::Never,
+    };
+    let mut endpoint = Endpoint::new(config.clone(), secret, started, lifecycle, move |request| match request {
         ntcp::AddressValidation::Bind { local: bind } => bind == local,
         ntcp::AddressValidation::Open {
             local: source,
@@ -842,9 +859,9 @@ fn run() -> io::Result<()> {
         peer_reassembly,
         adjunct as usize,
         tun,
-        start,
+        time,
     )?;
-    let initial_state = network.state(&endpoint)?;
+    let initial_state = network.state(&mut endpoint)?;
     emit(format!(
         "{{\"event\":\"ready\",\"family\":{},\"local\":\"{local}\",\"peer\":\"{peer}\",\
          \"local_port\":{LOCAL_PORT},\"connectionless_initial\":{initial},\
@@ -871,13 +888,13 @@ fn run() -> io::Result<()> {
                 let sent =
                     network.send(&mut endpoint, mode, field(2)? as usize, field(3)? as usize)?;
                 network.serve(&mut endpoint, field(4)?)?;
-                let state = network.state(&endpoint)?;
+                let state = network.state(&mut endpoint)?;
                 emit(format!("{{\"event\":\"sent\",{sent},{state}}}"));
             }
             Some("report") => {
                 let report =
-                    network.report(field(1)? as usize, fields.get(2).copied().unwrap_or(""))?;
-                let state = network.state(&endpoint)?;
+                    network.report(&mut endpoint, field(1)? as usize, fields.get(2).copied().unwrap_or(""))?;
+                let state = network.state(&mut endpoint)?;
                 emit(format!("{{\"event\":\"reported\",{report},{state}}}"));
             }
             Some("neighbor") => {
@@ -903,7 +920,7 @@ fn run() -> io::Result<()> {
             }
             Some("serve") => {
                 network.serve(&mut endpoint, field(1)?)?;
-                let state = network.state(&endpoint)?;
+                let state = network.state(&mut endpoint)?;
                 emit(format!("{{\"event\":\"served\",{state}}}"));
             }
             Some(command) => return Err(other(format!("unknown command {command}"))),

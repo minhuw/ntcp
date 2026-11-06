@@ -130,7 +130,7 @@ fn reset_learning(ack: &[u8]) -> Vec<u8> {
     frame
 }
 fn refusal(syn: &[u8]) -> Vec<u8> {
-    let mut peer = ntcp::Endpoint::new(Default::default(), [19; 32], 0, |_| true).unwrap();
+    let mut peer = ntcp::Endpoint::new(Default::default(), [19; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     let p = ntcp_ip::parse(syn, false).unwrap();
     peer.input(0, p.ip, p.payload).unwrap();
     let mut bytes = [0; 2048];

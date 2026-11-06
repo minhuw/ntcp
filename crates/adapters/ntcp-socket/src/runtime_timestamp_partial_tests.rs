@@ -99,7 +99,7 @@ fn drain(f: &mut Fixture) -> Vec<(u32, usize, bool)> {
     let mut packets = Vec::new();
     for _ in 0..BUDGET {
         let mut bytes = [0; 2048];
-        let pair = ClockPair::sample(&f.owner);
+        let pair = ClockPair::sample(&mut f.owner).unwrap();
         let Some(tx) = f
             .owner
             .endpoint
@@ -143,7 +143,8 @@ fn ack(f: &mut Fixture, now: u64, data: u32) {
     f.owner.test_now = Some(now);
     f.owner.input(now, f.ip, 0, &bytes[..n]).unwrap();
     f.owner.events();
-    f.owner.drain_timestamps(ClockPair::sample(&f.owner));
+    let current = ClockPair::sample(&mut f.owner).unwrap();
+    f.owner.drain_timestamps(current);
 }
 
 #[test]

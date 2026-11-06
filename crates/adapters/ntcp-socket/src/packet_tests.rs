@@ -946,7 +946,7 @@ fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
     assert_eq!(config.max_connections, 128);
     assert_eq!(config.max_listeners, 128);
     assert_eq!(config.max_control_packets, 128);
-    let mut endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(config.clone(), [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     let reserved = endpoint.buffer_bytes();
     assert!(reserved >= 8 * 1024 * 1024);
     assert!(reserved <= config.max_buffer_bytes);
@@ -965,7 +965,7 @@ fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
     let mut insufficient = config;
     insufficient.max_buffer_bytes = reserved - 1;
     assert!(matches!(
-        Endpoint::new(insufficient, [42; 32], 0, |_| true),
+        Endpoint::new(insufficient, [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true),
         Err(EndpointError::LimitReached)
     ));
 }
@@ -997,7 +997,7 @@ fn explicit_budget128_allows_200000_sndbuf_growth() {
     ] {
         let mut limited = config.clone();
         limited.max_buffer_bytes = budget;
-        let mut endpoint = Endpoint::new(limited, [42; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(limited, [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -1032,6 +1032,7 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
             crate::packet_profile::config(settings.1),
             [42; 32],
             0,
+            ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
             |_| true,
         )
         .unwrap();
@@ -2509,7 +2510,8 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
     let deadline = owner.inner.now() + 2000;
     owner.inner.endpoint.on_timeout(deadline, BUDGET).unwrap();
     // Avoid wall-clock regression in following application operations.
-    owner.epoch = Instant::now() - Duration::from_micros(deadline);
+    let elapsed = owner.inner.now();
+    owner.advance_clock(deadline.wrapping_sub(elapsed));
     assert!(poll_frame(&mut owner).is_none());
     assert!(owner.inner.endpoint.state(old).is_err());
     owner.gc_ip_options();
@@ -2546,7 +2548,8 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
         .unwrap()
         .max(owner.inner.now());
     owner.inner.endpoint.on_timeout(expiry, BUDGET).unwrap();
-    owner.epoch = Instant::now() - Duration::from_micros(expiry);
+    let elapsed = owner.inner.now();
+    owner.advance_clock(expiry.wrapping_sub(elapsed));
     assert!(!owner.inner.endpoint.connection_exists(child));
     owner.gc_ip_options();
     assert!(owner.connection_options.is_empty());
@@ -2580,7 +2583,8 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
         .unwrap()
         .max(owner.inner.now());
     owner.inner.endpoint.on_timeout(expiry, BUDGET).unwrap();
-    owner.epoch = Instant::now() - Duration::from_micros(expiry);
+    let elapsed = owner.inner.now();
+    owner.advance_clock(expiry.wrapping_sub(elapsed));
     assert!(!owner.inner.endpoint.connection_exists(child));
     owner.gc_ip_options();
     assert!(owner.connection_options.is_empty());
@@ -2823,7 +2827,8 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
         .unwrap()
         .max(owner.inner.now());
     owner.inner.endpoint.on_timeout(expiry, BUDGET).unwrap();
-    owner.epoch = Instant::now() - Duration::from_micros(expiry);
+    let elapsed = owner.inner.now();
+    owner.advance_clock(expiry.wrapping_sub(elapsed));
     assert!(poll_frame(&mut owner).is_none());
     assert!(!owner.inner.endpoint.connection_exists(id));
     owner.gc_ip_options();
@@ -3171,7 +3176,7 @@ fn dont_packets_follow_the_source_quiet_assertion() {
         let config = inner.defaults.clone();
         inner.host = None;
         inner.ports[0].ingress = None;
-        inner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        inner.endpoint = Endpoint::new(config, [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
         inner.source_quiet = quiet;
         inner.attach_backend_host(1).unwrap();
     }

@@ -126,6 +126,8 @@ pub(crate) struct Rack {
     selection_generation: u64,
     departure_selection: Option<DepartureSelection>,
     timebase: CallerTimebase,
+    // Transmissions before this tick give no RTT sample.
+    sample_floor: u64,
     fallback: Option<Seq>,
     latest: Option<(u64, Seq)>,
     fack: Option<Seq>,
@@ -215,6 +217,7 @@ impl Rack {
             selection_generation: 0,
             departure_selection: None,
             timebase,
+            sample_floor: 0,
             fallback: None,
             latest: None,
             fack: None,
@@ -360,6 +363,10 @@ impl Rack {
         if self.latest.is_none() {
             self.rtt = rtt;
         }
+    }
+
+    pub(crate) fn discard_samples_before(&mut self, now: u64) {
+        self.sample_floor = now;
     }
 
     // Reclaim cumulative bytes without consulting SACK advice or creating
@@ -911,6 +918,7 @@ impl Rack {
                 }
                 let rtt = now.saturating_sub(r.sent);
                 let eligible = packet_complete
+                    && r.sent >= self.sample_floor
                     && (r.retransmitted || !r.original_retransmitted)
                     && (!r.retransmitted
                         || (rtt >= self.min_rtt.unwrap_or(u64::MAX)

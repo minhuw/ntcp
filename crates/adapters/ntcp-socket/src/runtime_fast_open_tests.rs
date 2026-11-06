@@ -47,6 +47,7 @@ fn tfo_setup_profile(
     let listener = tfo_listener_backlog(&mut b, backlog);
     #[cfg(feature = "tfo-linux-cookie")]
     if linux {
+        crate::runtime::cookie_policy_tests::configure_key(&mut b, 7, Default::default());
         b.execute(
             listener,
             Op::SetFastOpenKey(LinuxSipHash24Key::new([7; 16])),

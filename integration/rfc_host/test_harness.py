@@ -4,6 +4,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,7 @@ import icmp
 import mss
 import ndproxy
 import options
+import quiet
 import redirect
 import rejected
 import run
@@ -495,6 +497,10 @@ class OptionScenario(unittest.TestCase):
         self.assertIn("required_octets: 44, maximum: 40", options.OVERSIZED_REFUSAL)
         self.assertEqual(icmp.Ntcp.command("tun_echo", "198.18.1.2", "198.18.2.2:18083")[-1], "198.18.2.2:18083")
         self.assertEqual(len(icmp.Ntcp.command("tun_echo", "198.18.1.2")), 4)
+        # Every tun_echo case states the fact true of its harness-created
+        # namespace; a case may state a weaker true one.
+        self.assertEqual(icmp.Ntcp.environment("fragment", {})["NTCP_SOURCE_QUIET"], "never")
+        self.assertEqual(icmp.Ntcp.environment("fragment", {"NTCP_SOURCE_QUIET": "300"})["NTCP_SOURCE_QUIET"], "300")
 
     def originated(self, area, ttl=64, kept=None):
         """An originated SYN from ntcp to the listener with option AREA; KEPT
@@ -669,6 +675,115 @@ class SegmentRouting(unittest.TestCase):
         self.assertTrue(datagram["checksum_valid"])
         self.assertEqual(datagram["final_destination"], self.D)
         self.assertEqual(str(ipaddress.ip_address(datagram["raw"][24:40])), self.S1)
+
+
+class QuietTimeCase(unittest.TestCase):
+    """The quiet-time case's matrix pin and its capture verdict."""
+    EARLIEST, LATEST = 12_000_000, 12_010_000
+
+    def event(self, direction, at_us, flags, sport, dport, seq=100, ack=0):
+        return dict(direction=direction, time_ns=at_us * 1000, flags=flags, sport=sport, dport=dport,
+                    seq=seq, ack=ack, checksum_valid=True)
+
+    def capture(self):
+        linux = [self.event("kernel-to-native", us, 2, 40000, 18080) for us in (100_000, 1_100_000, 3_100_000, 19_100_000)]
+        native = [self.event("native-to-kernel", 12_000_500, 2, 50000, 18080, seq=7),
+                  self.event("native-to-kernel", 19_100_500, 0x12, 18080, 40000, seq=9, ack=101)]
+        return linux[:3] + native[:1] + linux[3:] + native[1:]
+
+    def judge(self, events):
+        return quiet.judge(events, 0, self.EARLIEST, self.LATEST)
+
+    def test_cases_are_pinned_and_disjoint(self):
+        cases = quiet.cases()
+        self.assertEqual({(c["kind"], c["family"], c["scenario"], c["source_quiet"]) for c in cases},
+                         {("quiet-time", 4, "startup", 228), ("quiet-time", 6, "startup", 228)})
+        others = run.matrix() + icmp.cases() + admin.cases() + options.cases() + rejected.cases()
+        self.assertFalse(any(c in others for c in cases))
+
+    def test_case_without_inherited_proof_cannot_reach_setup(self):
+        for case in quiet.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(run, "setup") as setup:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+            setup.assert_not_called()
+
+    def test_configuration_states_the_weaker_fact_through_the_production_keys(self):
+        for family in (4, 6):
+            text = quiet.config(family, 228)
+            self.assertIn("io.source_quiet = 228", text)
+            self.assertIn("io.next_hop_mac = 02:00:00:00:00:01", text)
+
+    def test_provenance_records_the_stated_fact(self):
+        self.assertTrue(run.lifecycle_provenance(quiet.cases()[0])["source_quiet"].startswith("228:"))
+
+    def test_deadline_is_the_later_of_the_restart_and_boot_floors(self):
+        mature = dict(ticks=1_000_000_000, boot_age_us=1_000_000_000)
+        self.assertEqual(quiet.deadline_us(mature, 228), 1_012_000_000)
+        young = dict(ticks=200_000_000, boot_age_us=200_000_000)
+        self.assertEqual(quiet.deadline_us(young, 228), 240_000_000)
+
+    def test_a_clean_capture_passes_with_its_evidence(self):
+        evidence = self.judge(self.capture())
+        self.assertEqual(evidence["linux_syns_during_quiet"], 3)
+        self.assertEqual(evidence["accepted_syn_us"], 19_100_000)
+        self.assertEqual(evidence["first_native_after_earliest_us"], 500)
+
+    def test_any_native_segment_before_the_deadline_fails(self):
+        for flags, sport, dport in ((2, 50000, 18080), (0x12, 18080, 40000), (4, 18080, 40000)):
+            events = self.capture()
+            events.insert(1, self.event("native-to-kernel", 900_000, flags, sport, dport, ack=101))
+            with self.assertRaises(AssertionError):
+                self.judge(events)
+
+    def test_a_reply_not_to_a_retransmission_after_the_deadline_fails(self):
+        events = [e for e in self.capture() if e["time_ns"] != 19_100_000_000]
+        with self.assertRaises(AssertionError):
+            self.judge(events)
+
+    def test_unobserved_quiet_time_fails(self):
+        events = [e for e in self.capture() if e["time_ns"] not in (1_100_000_000, 3_100_000_000)]
+        with self.assertRaises(AssertionError):
+            self.judge(events)
+
+    def test_case_record_carries_its_provenance(self):
+        """The emitted record holds the kernel, the provider-side lifecycle
+        facts (boot age, boot id, the stated fact) and the case's evidence."""
+        case = quiet.cases()[0]
+        evidence = dict(deadline_earliest_us=1, deadline_latest_us=2, frames=[], frame_count=0)
+        printed = []
+        with patch.object(quiet, "child", return_value=evidence), \
+                patch("builtins.print", lambda line, **_: printed.append(line)):
+            run.quiet_child(case, {"net": "net:[1]"})
+        tag, record = printed[0].split(" ", 1)
+        record = json.loads(record)
+        self.assertEqual(tag, "T20_QUIET_CASE")
+        self.assertEqual(record["case"], case)
+        self.assertEqual(record["evidence"], evidence)
+        self.assertEqual((record["kernel"], record["kernel_version"]), (os.uname().release, os.uname().version))
+        lifecycle = record["lifecycle"]
+        self.assertGreater(lifecycle["boot_age_seconds"], 0)
+        self.assertEqual(lifecycle["boot_id"], run.Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+        self.assertTrue(lifecycle["source_quiet"].startswith(f"{quiet.SOURCE_QUIET}:"))
+
+    def test_a_late_native_syn_fails(self):
+        events = self.capture()
+        events[3] = dict(events[3], time_ns=(self.LATEST + quiet.TIMER_SLACK_US + 1) * 1000)
+        with self.assertRaises(AssertionError):
+            self.judge(events)
+
+
+class LifecycleProvenance(unittest.TestCase):
+    def test_case_records_carry_the_providers_boot_age(self):
+        facts = run.lifecycle_provenance()
+        self.assertGreater(facts["boot_age_seconds"], 0)
+        self.assertEqual(len(facts["boot_id"]), 36)
+        self.assertTrue(facts["source_quiet"].startswith("never"))
+
+    def test_every_native_configuration_states_every_port(self):
+        text = scoped.config()
+        self.assertIn("io.source_quiet=never\n", text)
+        self.assertIn("port.b.source_quiet=never\n", text)
 
 
 class ScopedScenario(unittest.TestCase):
@@ -1383,14 +1498,24 @@ class RedirectChildChecks(unittest.TestCase):
     every failure releases all four held namespaces and the control
     directory."""
 
+    def setUp(self):
+        # The child's control directory goes under a private root: the system
+        # temporary directory is shared with every other process on the host,
+        # so its listing cannot show what the child left behind.
+        root = tempfile.TemporaryDirectory(prefix="t19-redirect-test-")
+        self.addCleanup(root.cleanup)
+        self.temporary = root.name
+        private = patch.object(tempfile, "tempdir", self.temporary)
+        private.start()
+        self.addCleanup(private.stop)
+
     def failing(self, family, change):
         world = RedirectWorld(family)
         change(world)
-        directories = set(os.listdir(redirect.tempfile.gettempdir()))
         with self.assertRaises(AssertionError):
             world.run()
         self.assert_cleaned(world)
-        self.assertEqual(set(os.listdir(redirect.tempfile.gettempdir())) - directories, set())
+        self.assertEqual(os.listdir(self.temporary), [])
 
     def assert_cleaned(self, world):
         self.assertEqual(len(world.holders), 4)
@@ -1460,14 +1585,13 @@ class RedirectChildChecks(unittest.TestCase):
 
         def failed(*args):
             raise RuntimeError("bridge add failed")
-        directories = set(os.listdir(redirect.tempfile.gettempdir()))
         with patch.object(redirect, "setup", failed), patch.object(redirect, "held_namespace", world.holder), \
                 patch("builtins.print"):
             with self.assertRaises(RuntimeError):
                 redirect.child(dict(kind="redirect", family=4, scenario="linux-router"), {}, "/fake/binary",
                                "/fake/pathctl", world.peer, world.command)
         self.assert_cleaned(world)
-        self.assertEqual(set(os.listdir(redirect.tempfile.gettempdir())) - directories, set())
+        self.assertEqual(os.listdir(self.temporary), [])
 
 
 class RejectedSynChecks(unittest.TestCase):

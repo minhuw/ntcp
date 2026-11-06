@@ -131,7 +131,7 @@ fn registered_send_waits_for_ack_and_async_backend_reclaim() {
     assert!(state.lock().unwrap().held.is_empty());
     assert!(a.egress.as_ref().unwrap().has_held());
     state.lock().unwrap().block = false;
-    a.epoch -= std::time::Duration::from_millis(2);
+    a.advance_clock(2_000);
     a.service_egress().unwrap();
     {
         let held = state.lock().unwrap();
@@ -145,7 +145,7 @@ fn registered_send_waits_for_ack_and_async_backend_reclaim() {
     }
     drop(registration); // no new admission; accepted references remain valid.
     drain_wire(&state, &mut b);
-    b.epoch -= std::time::Duration::from_millis(210);
+    b.advance_clock(210_000);
     b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
     // Service real receiver ACKs without selecting sender output via legacy poll.
     for _ in 0..BUDGET {
@@ -374,6 +374,7 @@ fn external_backend_is_created_used_and_dropped_on_owner_thread() {
                 reclaims,
             };
             let mut config = SocketConfig::new("external", Ipv4Addr::new(10, 73, 0, 2));
+            config.io.source_quiet = crate::SourceQuiet::Never;
             config.io.prefix = Some(24);
             Owner::external_backend(
                 &config,

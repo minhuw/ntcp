@@ -424,7 +424,7 @@ fn on_link_side_with(cfg: &EndpointConfig, local: SocketAddr, output: IcmpOutput
     })
     .unwrap();
     let owned = local.ip();
-    let mut endpoint = Endpoint::new(cfg.clone(), [43; 32], 0, move |request| match request {
+    let mut endpoint = Endpoint::new(cfg.clone(), [43; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, move |request| match request {
         ntcp::AddressValidation::Bind { local } | ntcp::AddressValidation::Open { local, .. } => {
             local == owned
         }

@@ -86,6 +86,7 @@ fn endpoint() -> Endpoint {
         },
         [42; 32],
         0,
+        crate::SETTLED,
         |_| true,
     )
     .unwrap()
@@ -352,7 +353,7 @@ mod linux {
 
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
     //= type=test
-    //= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. Timed interfaces require trusted original lease deadlines or fresh keys across restart. T20 must integrate that host restart/time mapping for external raw-key deployment; the whole lifecycle obligation remains TODO pending that integration.
+    //= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
     //# 5. The cookie expires after a certain amount of time. The reason for cookie expiration is detailed
     //# in the "Security Considerations" section (Section 5). This can be done by either periodically
     //# changing the server key used to generate cookies or including a timestamp when generating the cookie.
@@ -733,6 +734,7 @@ fn passive_repair_syn_data_requires_physical_ack() {
                         },
                         [42; 32],
                         0,
+                        crate::SETTLED,
                         |_| true,
                     )
                     .unwrap();
@@ -1209,20 +1211,29 @@ impl ScopedPaths {
 impl PathProvider for ScopedPaths {
     type Error = ntcp_path::Error;
     fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Self::Error> {
-        let destination = ntcp_path::ScopedAddress::new(request.tuple.remote.ip(), request.zone)?;
-        let (client, snapshot) = self.0.acquire(ntcp_path::PathRequest {
-            source: self.1,
-            destination,
-            dscp: request.dscp,
-        })?;
+        let (client, snapshot) = self.0.acquire(self.request(request)?)?;
         Ok(PreparedFactory {
             path: PreparedPath { client, snapshot },
             receive: ReceiveIpCapability::new(self.0.context(), true, 1500).unwrap(),
         })
     }
+    fn check(&self, request: PathFactoryRequest) -> Result<(), Self::Error> {
+        self.0.resolve(self.request(request)?).map(|_| ())
+    }
     fn commit(&mut self, _: PreparedPath, _: ConnectionId) {}
     fn cancel(&mut self, prepared: PreparedPath) {
         self.0.release(prepared.client).unwrap();
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+impl ScopedPaths {
+    fn request(&self, request: PathFactoryRequest) -> Result<ntcp_path::PathRequest, ntcp_path::Error> {
+        Ok(ntcp_path::PathRequest {
+            source: self.1,
+            destination: ntcp_path::ScopedAddress::new(request.tuple.remote.ip(), request.zone)?,
+            dscp: request.dscp,
+        })
     }
 }
 

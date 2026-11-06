@@ -61,8 +61,8 @@ fn config() -> EndpointConfig {
 
 fn endpoints() -> (Endpoint, Endpoint, ListenerId, ConnectionId) {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     (a, b, listener, client)
@@ -235,7 +235,7 @@ fn output_failure_stale_handles_and_memory_limits_are_explicit() {
     assert_eq!(a.write(client, b"bad"), Err(EndpointError::InvalidHandle));
     let mut limited = config();
     limited.max_buffer_bytes = 1;
-    let mut endpoint = Endpoint::new(limited, [3; 32], 0, test_policy).unwrap();
+    let mut endpoint = Endpoint::new(limited, [3; 32], 0, crate::SETTLED, test_policy).unwrap();
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
     //= type=test
     //# If there is
@@ -494,8 +494,8 @@ fn half_open_retransmissions_report_route_advice_without_accepting() {
 //# before sending the (first) SYN (MUST-44).
 fn source_selection_and_keepalive_are_per_connection_controls() {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a
         .connect_with_source(0, None, remote, |destination| {
@@ -532,7 +532,7 @@ fn source_selection_and_keepalive_are_per_connection_controls() {
 #[test]
 fn ipv6_metadata_is_rejected_instead_of_silently_misrouting() {
     use core::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-    let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
     let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
     for (flow, scope) in [(1, 0), (0, 3)] {
         let address = SocketAddr::V6(SocketAddrV6::new(ip, 8080, flow, scope));
@@ -673,7 +673,7 @@ fn lower_layer_errors_require_a_matching_outstanding_quote() {
 //# If the ACK bit is off, sequence number zero is used,
 //# <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK> If the ACK bit is on, <SEQ=SEG.ACK><CTL=RST>
 fn unknown_connection_reset_has_correct_sequence_and_never_answers_reset() {
-    let mut b = Endpoint::new(config(), [4; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [4; 32], 0, crate::SETTLED, test_policy).unwrap();
     let (local, remote) = addresses();
     let ip = IpMetadata {
         source: local.ip(),
@@ -807,8 +807,8 @@ fn disabling_error_reports_keeps_data_and_terminal_events() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.error_reports = false;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     a.connect(0, local, remote).unwrap();
     let (tuple, seq) = passive_quote(&mut a, &mut b);
@@ -829,8 +829,8 @@ fn disabling_error_reports_keeps_data_and_terminal_events() {
         Err(EndpointError::Connection(Error::WouldBlock))
     );
 
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let id = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 0);
@@ -878,7 +878,7 @@ fn warning_reports_can_be_disabled_without_suppressing_route_advice() {
     for enabled in [false, true] {
         let mut cfg = config();
         cfg.error_reports = enabled;
-        let mut a = Endpoint::new(cfg, [1; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy).unwrap();
         let id = a.connect(0, local, remote).unwrap();
         packets(&mut a, 0);
         for attempt in 0..3 {
@@ -1141,7 +1141,7 @@ fn opened_isn(endpoint: &mut Endpoint, now: u64, tuple: Tuple) -> u32 {
 fn isn_four_microsecond_clock_progresses_and_wraps() {
     let (local, remote) = addresses();
     let tuple = Tuple { local, remote };
-    let mut endpoint = Endpoint::new(config(), [7; 32], 0, test_policy).unwrap();
+    let mut endpoint = Endpoint::new(config(), [7; 32], 0, crate::SETTLED, test_policy).unwrap();
     let first = opened_isn(&mut endpoint, 0, tuple);
     use hmac::{Hmac, Mac};
     let mut prf = Hmac::<sha2::Sha256>::new_from_slice(&[7; 32]).unwrap();
@@ -1156,7 +1156,7 @@ fn isn_four_microsecond_clock_progresses_and_wraps() {
     let third = opened_isn(&mut endpoint, 44, tuple);
     assert_eq!(third, second.wrapping_add(10));
     let start = u64::from(u32::MAX - 1) * 4;
-    let mut endpoint = Endpoint::new(config(), [7; 32], start, test_policy).unwrap();
+    let mut endpoint = Endpoint::new(config(), [7; 32], start, crate::SETTLED, test_policy).unwrap();
     let before_wrap = opened_isn(&mut endpoint, start, tuple);
     let after_wrap = opened_isn(&mut endpoint, start + 12, tuple);
     assert_eq!(after_wrap, before_wrap.wrapping_add(3));
@@ -1179,7 +1179,7 @@ fn isn_depends_on_secret_and_each_tuple_component() {
     let tuple = Tuple { local, remote };
     let sample = |secret, tuple| {
         opened_isn(
-            &mut Endpoint::new(config(), secret, 0, test_policy).unwrap(),
+            &mut Endpoint::new(config(), secret, 0, crate::SETTLED, test_policy).unwrap(),
             0,
             tuple,
         )
@@ -1223,7 +1223,7 @@ fn isn_depends_on_secret_and_each_tuple_component() {
 //# This should not be reached. Drop the segment and return.
 fn listen_ignores_resets_resets_acks_and_drops_segments_without_syn() {
     let (local, remote) = addresses();
-    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let ip = IpMetadata {
         source: local.ip(),
@@ -1315,8 +1315,8 @@ fn passive_bind_matches_concrete_or_any_local_address() {
     let (local, remote) = addresses();
     for bind in [remote, "0.0.0.0:8080".parse().unwrap()] {
         for destination in [remote, "192.0.2.3:8080".parse().unwrap()] {
-            let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
-            let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+            let mut a = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+            let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
             let listener = b.listen(bind, 4).unwrap();
             let client = a.connect(0, local, destination).unwrap();
             pump(&mut a, &mut b, 0);
@@ -1470,8 +1470,8 @@ fn duplicate_listen_and_pending_open_port_sharing_preserve_existing_records() {
 #[test]
 fn explicit_source_and_wildcard_listener_bind_and_reuse_actual_local_address() {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen("0.0.0.0:8080".parse().unwrap(), 4).unwrap();
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
     //= type=test
@@ -1584,7 +1584,7 @@ fn scoped_directed_broadcasts_are_rejected_before_open_or_input() {
     let (local, remote) = addresses();
     let broadcast = "192.0.2.255:8080".parse().unwrap();
     let host: core::net::SocketAddr = "192.0.2.254:8080".parse().unwrap();
-    let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_subnet_policy(24)).unwrap();
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_subnet_policy(24)).unwrap();
     assert_eq!(
         endpoint.connect(0, local, broadcast),
         Err(EndpointError::InvalidAddress)
@@ -1648,7 +1648,7 @@ fn distinct_ingress_contexts_24_broadcast_31_host_and_ipv6_behavior() {
     let local = "192.0.2.254:40000".parse().unwrap();
     let remote = "192.0.2.255:8080".parse().unwrap();
     for prefix in [24, 31, 32] {
-        let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_subnet_policy(prefix)).unwrap();
+        let mut endpoint = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_subnet_policy(prefix)).unwrap();
         if prefix == 24 {
             assert_eq!(
                 endpoint.connect(0, local, remote),
@@ -1688,7 +1688,7 @@ fn distinct_ingress_contexts_24_broadcast_31_host_and_ipv6_behavior() {
                 .any(|(ip, _)| ip.source == remote.ip())
         );
     }
-    let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_subnet_policy(0)).unwrap();
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_subnet_policy(0)).unwrap();
     assert!(endpoint.connect(0, local, remote).is_ok()); // /0 has only 255.255.255.255 broadcast.
     assert_eq!(
         endpoint.connect(0, local, "255.255.255.255:8080".parse().unwrap()),
@@ -2108,8 +2108,8 @@ fn classic_ecn_opt_out_and_syn_timeout_fallback() {
         let (local, remote) = addresses();
         let mut cfg = config();
         cfg.connection.ecn = enabled;
-        let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         let listener = b.listen(remote, 4).unwrap();
         let id = a.connect(0, local, remote).unwrap();
         let first = ecn_packet(&mut a, 0);
@@ -2271,7 +2271,7 @@ fn optional_stream_controls_refresh_endpoint_work_and_charge_marker_storage() {
 
     let mut limited = config();
     limited.max_buffer_bytes = connection_charge(&config()) - 1;
-    let mut endpoint = Endpoint::new(limited, [3; 32], 0, test_policy).unwrap();
+    let mut endpoint = Endpoint::new(limited, [3; 32], 0, crate::SETTLED, test_policy).unwrap();
     let (local, remote) = addresses();
     assert_eq!(
         endpoint.connect(0, local, remote),
@@ -2371,8 +2371,8 @@ fn ipv4_passive_owned_return_route_replacement_and_rejected_tcp_metadata() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     a.connect(0, local, remote).unwrap();
     let (syn, bytes) = option_packet(&mut a, 0);
@@ -2437,8 +2437,8 @@ fn ipv4_active_route_precedence_and_unoverridden_active_learning() {
         let (local, remote) = addresses();
         let mut cfg = config();
         cfg.ipv4_options_enabled = true;
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         b.listen(remote, 4).unwrap();
         let options = OutgoingIpv4Options {
             source_route: explicit
@@ -2475,8 +2475,8 @@ fn ipv4_active_route_precedence_and_unoverridden_active_learning() {
 #[test]
 fn ipv4_opaque_metadata_default_admission_and_failed_input_safety() {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     // With IPv4 options disabled, Record Route, Timestamp and unknown options
@@ -2567,14 +2567,14 @@ fn ipv4_options_security_profile_validation_and_control_route() {
         source_route: Some(route),
         ..Default::default()
     };
-    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
     assert!(
         a.connect_with_ipv4_options(0, local, remote, options)
             .is_err()
     );
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let mut bad = options;
     bad.source_route = Some(SourceRoute::new(&[Ipv4Addr::new(192, 0, 2, 255)], false).unwrap());
     assert!(b.connect_with_ipv4_options(0, local, remote, bad).is_err());
@@ -2631,8 +2631,8 @@ fn ipv4_options_reserve_send_budget_without_lowering_receive_mss() {
         cfg.connection.receive_capacity = 65536;
         cfg.connection.send_ip_payload_limit = base;
         cfg.connection.receive_ip_payload_limit = 1480;
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         b.listen(remote, 4).unwrap();
         let client = a.connect(0, local, remote).unwrap();
         let (syn, bytes) = option_packet(&mut a, 0);
@@ -2648,7 +2648,7 @@ fn ipv4_options_reserve_send_budget_without_lowering_receive_mss() {
         let mut cfg = config();
         cfg.ipv4_options_enabled = true;
         cfg.connection.send_ip_payload_limit = base;
-        assert!(Endpoint::new(cfg, [1; 32], 0, test_policy).is_err());
+        assert!(Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy).is_err());
     }
 }
 
@@ -2662,8 +2662,8 @@ fn ipv4_outgoing_requests_and_received_owned_snapshot() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let request = OutgoingIpv4Options {
         source_route: Some(SourceRoute::new(&[], false).unwrap()),
@@ -2730,9 +2730,9 @@ fn time_wait_endpoint(
     u32,
 ) {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
     cfg.reuse_time_wait = true;
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 1_000);
@@ -2981,6 +2981,15 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
 //# the timestamp contained in the incoming SYN is equal to the last
 //# timestamp seen on the connection in the TIME-WAIT state (for that
 //# direction of the data transfer).
+//= https://www.rfc-editor.org/rfc/rfc6191#section-2
+//= type=test
+//= reason=Only a SYN without ACK or RST to a TIME-WAIT connection reaches reopen_time_wait, whose reuse_syn freshness uses both the incoming sequence number and its Timestamps option when present. Reuse enabled versus disabled leaves results, state, resources, deadlines and emitted bytes identical in CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING across flag, checksum, timestamp and sequence variants.
+//# The following paragraphs summarize the processing of SYN segments
+//# received for connections in the TIME-WAIT state. The processing of SYN
+//# segments received for connections in all other states is unchanged. Both
+//# the ISN (Initial Sequence Number) and the Timestamps option (if present)
+//# of the incoming SYN segment are included in the heuristics performed for
+//# allowing a high connection-establishment rate.
 #[cfg(feature = "packet-test-controls")]
 #[test]
 fn rfc6191_reuse_all_timestamp_sequence_branches() {
@@ -3324,7 +3333,7 @@ fn rfc6191_sequence_reuse_uses_peer_fin_serial_frontier() {
                         let mut cfg = config();
                         cfg.connection.timestamps = old_timestamps;
                         cfg.reuse_time_wait = true;
-                        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+                        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
                         let (local, remote) = addresses();
                         let ip = IpMetadata {
                             source: local.ip(),
@@ -3646,8 +3655,8 @@ fn timestamps_two_endpoints_reopen_and_transfer_after_time_wait() {
     cfg.connection.timestamps = true;
     cfg.reuse_time_wait = true;
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let first = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 1_000);
@@ -3732,11 +3741,11 @@ fn timestamps_endpoint_config_and_control_reset_budgets() {
     cfg.connection.timestamps = true;
     cfg.connection.send_ip_payload_limit = 39;
     assert!(matches!(
-        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
+        Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy),
         Err(EndpointError::Connection(Error::InvalidArgument))
     ));
     cfg.connection.send_ip_payload_limit = 40;
-    let mut b = Endpoint::new(cfg, [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy).unwrap();
     let (local, remote) = addresses();
     let ip = IpMetadata {
         source: local.ip(),
@@ -3769,12 +3778,12 @@ fn timestamp_ipv4_option_budget_and_paws_gate_route_updates() {
     cfg.ipv4_options_enabled = true;
     cfg.connection.send_ip_payload_limit = 79;
     assert!(matches!(
-        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
+        Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy),
         Err(EndpointError::Connection(Error::InvalidArgument))
     ));
     cfg.connection.send_ip_payload_limit = 80;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     let route = completed_route(&[8, 9]);
@@ -3857,7 +3866,7 @@ fn address_policy_roles_owned_context_and_source_selection() {
     let observed = calls.clone();
     // Owned state, with passive-only admission and no wildcard binding.
     let locals = [remote.ip()];
-    let mut endpoint = Endpoint::new(config(), [1; 32], 0, move |request| {
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, move |request| {
         observed.borrow_mut().push(request);
         match request {
             AddressValidation::Bind { local } => locals.contains(&local),
@@ -3939,7 +3948,7 @@ fn route_policy_receives_logical_pair_for_hops_and_prespecified_timestamps() {
     let observed = calls.clone();
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, move |request| {
+    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, move |request| {
         observed.borrow_mut().push(request);
         test_policy(request) && !matches!(request, AddressValidation::Route { .. })
     })
@@ -3974,7 +3983,7 @@ fn route_policy_receives_logical_pair_for_hops_and_prespecified_timestamps() {
         assert_eq!(endpoint.buffer_bytes(), 0);
         assert!(packets(&mut endpoint, 0).is_empty());
     }
-    let mut sender = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut sender = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     sender.connect(0, local, remote).unwrap();
     let (ip, bytes) = packets(&mut sender, 0).pop().unwrap();
     calls.borrow_mut().clear();
@@ -4015,7 +4024,7 @@ fn return_routes_are_authorized_with_tcp_route_policy() {
     let denied = Ipv4Addr::new(192, 0, 2, 66);
     let calls = Rc::new(RefCell::new(Vec::new()));
     let observed = calls.clone();
-    let endpoint = Endpoint::new(config(), [1; 32], 0, move |request| {
+    let endpoint = Endpoint::new(config(), [1; 32], 0, crate::SETTLED, move |request| {
         observed.borrow_mut().push(request);
         test_policy(request)
             && !matches!(request, AddressValidation::Route { hop, .. } if hop == IpAddr::V4(denied))
@@ -4060,7 +4069,7 @@ fn base_invalid_addresses_never_reach_policy() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, |_| {
+    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| {
         panic!("base checks must precede policy")
     })
     .unwrap();
@@ -4251,31 +4260,31 @@ fn receive_preallocation_validates_limits_and_overflow_before_allocating() {
     let mut cfg = config();
     cfg.preallocate_connections = cfg.max_connections + 1;
     assert!(matches!(
-        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
+        Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy),
         Err(EndpointError::LimitReached)
     ));
     cfg.preallocate_connections = 2;
     cfg.max_buffer_bytes = 2 * connection_charge(&cfg) - 1;
     assert!(matches!(
-        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
+        Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy),
         Err(EndpointError::LimitReached)
     ));
     cfg.max_buffer_bytes += 1;
-    let endpoint = Endpoint::new(cfg, [1; 32], 0, test_policy).unwrap();
+    let endpoint = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy).unwrap();
     assert_eq!(endpoint.buffer_bytes(), 2 * connection_charge(&config()));
     let mut cfg = config();
     cfg.max_connections = usize::MAX / 2;
     cfg.preallocate_connections = cfg.max_connections;
     cfg.max_buffer_bytes = usize::MAX;
     assert!(matches!(
-        Endpoint::new(cfg, [1; 32], 0, test_policy),
+        Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy),
         Err(EndpointError::LimitReached)
     ));
     let mut cfg = config();
     cfg.connection.receive_capacity = usize::MAX;
     cfg.preallocate_connections = 1;
     assert!(matches!(
-        Endpoint::new(cfg, [1; 32], 0, test_policy),
+        Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy),
         Err(EndpointError::LimitReached)
     ));
 }
@@ -4288,10 +4297,10 @@ fn receive_preallocation_failed_constructors_preserve_reserved_budget() {
         cfg.preallocate_connections = preallocate;
         cfg.connection.mss = 0;
         let charge = connection_charge(&cfg);
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         b.listen(remote, 1).unwrap();
-        let mut peer = Endpoint::new(config(), [3; 32], 0, test_policy).unwrap();
+        let mut peer = Endpoint::new(config(), [3; 32], 0, crate::SETTLED, test_policy).unwrap();
         peer.connect(0, local, remote).unwrap();
         let syn = packets(&mut peer, 0).pop().unwrap();
         for _ in 0..3 {
@@ -4318,8 +4327,8 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     cfg.preallocate_connections = 1;
     let charge = connection_charge(&cfg);
     cfg.max_buffer_bytes = 2 * charge;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
     let first = a.connect(0, local, remote).unwrap();
@@ -4461,8 +4470,8 @@ fn reset_quarantine_output_commit_exact_boundary_and_replacement_ownership() {
             let mut cfg = config();
             cfg.connection.time_wait_us = 240_000_123;
             let duration = cfg.connection.time_wait_us;
-            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-            let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+            let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
             let listener = b.listen(remote, 1).unwrap();
             let id = a.connect(0, local, remote).unwrap();
             pump(&mut a, &mut b, 0);
@@ -4580,8 +4589,8 @@ fn reset_quarantine_connection_and_byte_capacity_and_timeout_budgets() {
             cfg.max_connections = slots;
             let charge = connection_charge(&cfg);
             cfg.max_buffer_bytes = byte_slots * charge;
-            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-            let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+            let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
             let (local, remote) = addresses();
             let listener = b.listen(remote, 2).unwrap();
             if byte_slots == 0 {
@@ -4629,7 +4638,7 @@ fn reset_quarantine_connection_and_byte_capacity_and_timeout_budgets() {
     let mut cfg = config();
     cfg.max_connections = 0;
     assert!(matches!(
-        Endpoint::new(cfg, [1; 32], 0, test_policy),
+        Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy),
         Err(EndpointError::Connection(Error::InvalidArgument))
     ));
 }
@@ -4709,7 +4718,7 @@ fn reset_quarantine_excludes_received_stateless_nonterminal_and_no_reset_abort()
 fn reset_failed_child_unlinks_backlog_before_output_and_quarantine_expiry() {
     let (mut a, _, _, _) = endpoints();
     // Use a one-entry backlog, leaving the independent slot bound larger.
-    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(addresses().1, 1).unwrap();
     let (tuple, _) = passive_quote(&mut a, &mut b);
     let failed = b.connection_id(tuple).unwrap();
@@ -4839,8 +4848,8 @@ fn dsack_checksum_invalid_arrival_preserves_failed_output_report() {
     cfg.connection.sack = true;
     cfg.connection.delayed_ack_us = 0;
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 0);
@@ -4896,7 +4905,7 @@ fn rfc5961_restart_challenge_valid_reset_then_syn_retransmission() {
     let old = b.accept(listener).unwrap();
     let (local, remote) = addresses();
     // Restart discards all of the client's old TCBs, preserving the server.
-    a = Endpoint::new(config(), [99; 32], 10, test_policy).unwrap();
+    a = Endpoint::new(config(), [99; 32], 10, crate::SETTLED, test_policy).unwrap();
     let restarted = a.connect(10, local, remote).unwrap();
     let syn = packets(&mut a, 10);
     assert_eq!(syn.len(), 1);
@@ -4952,7 +4961,7 @@ fn endpoint_rejects_zero_challenge_budget_configuration() {
             cfg.connection.challenge_ack_limit = 0;
         }
         assert!(matches!(
-            Endpoint::new(cfg, [1; 32], 0, test_policy),
+            Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, test_policy),
             Err(EndpointError::Connection(Error::InvalidArgument))
         ));
     }
@@ -4990,8 +4999,8 @@ fn timestamp_privacy_echo_rtt_and_reactive_reset_without_local_enable() {
     let mut cfg = config();
     cfg.connection.timestamps = true;
     cfg.connection.delayed_ack_us = 0;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     let syn = packets(&mut a, 1_000).pop().unwrap();
@@ -5057,7 +5066,7 @@ fn timestamp_privacy_echo_rtt_and_reactive_reset_without_local_enable() {
         for flags in [wire::SYN, wire::ACK] {
             let mut cfg = config();
             cfg.connection.send_ip_payload_limit = budget;
-            let mut endpoint = Endpoint::new(cfg, [3; 32], 0, test_policy).unwrap();
+            let mut endpoint = Endpoint::new(cfg, [3; 32], 0, crate::SETTLED, test_policy).unwrap();
             let h = wire::parse(syn.0, &syn.1).unwrap().header;
             let input = tw_segment(syn.0, h, 123, 456, flags, Some((77, 0)));
             endpoint.input(1_000, syn.0, &input).unwrap();
@@ -5181,8 +5190,8 @@ fn general_pacing_saturated_deadline_does_not_rearm_endpoint() {
     });
     assert!(cfg.connection.keepalive.is_none());
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], start, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], start, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], start, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], start, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(start, local, remote).unwrap();
     pump(&mut a, &mut b, start);
@@ -5232,8 +5241,8 @@ fn pacing_endpoint_budget_case(pacing: Option<crate::PacingConfig>) {
         cfg.connection.timebase.units_per_second = 1_000_000 * scale;
         assert!(cfg.connection.prr_pacing);
         let (local, remote) = addresses();
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         let listener = b.listen(remote, 4).unwrap();
         let client = a.connect(0, local, remote).unwrap();
         pump(&mut a, &mut b, 0);
@@ -5381,7 +5390,7 @@ fn buffer_capacities_prehandshake_inheritance_and_pool_mismatch() {
     cfg.preallocate_connections = 1;
     let reserved = connection_charge(&cfg);
     cfg.max_buffer_bytes = reserved;
-    let mut limited = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut limited = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
     for allocation in 0..4 {
         assert_eq!(
             crate::allocation_tests::fail_after(allocation, || limited.connect(0, local, remote)),
@@ -5403,8 +5412,8 @@ fn buffer_capacities_prehandshake_inheritance_and_pool_mismatch() {
     assert!(limited.buffer_bytes() < reserved);
 
     cfg.max_buffer_bytes = 16 * reserved;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 2).unwrap();
     b.set_listener_buffer_capacities(listener, 4096, 131072)
         .unwrap();
@@ -5765,8 +5774,8 @@ fn tx_timestamp_retransmit_stable_range_preserves_first_observation_and_timewait
         let mut cfg = config();
         cfg.connection.timebase.units_per_second = units_per_second;
         let (local, remote) = addresses();
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
         let listener = b.listen(remote, 4).unwrap();
         let client = a.connect(0, local, remote).unwrap();
         pump(&mut a, &mut b, 0);
@@ -6020,7 +6029,7 @@ fn rx_timestamp_endpoint_validation_peek_copyout_retry_and_sources() {
 #[test]
 fn listener_rx_timestamp_snapshot_syn_third_ack_parent_change_and_reuse() {
     let (local, remote) = addresses();
-    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     assert_eq!(b.listener_rx_timestamp_capacity(listener), Ok(0));
     let charge = b.buffer_bytes();
@@ -6263,8 +6272,8 @@ fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
     cfg.connection.send_capacity = 32_768;
     cfg.connection.receive_capacity = 32_768;
     cfg.connection.pmtud = Some(PmtudConfig::new(1500));
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
     b.listen(remote, 4).unwrap();
     let id = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 1);

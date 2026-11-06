@@ -142,14 +142,14 @@ pub(super) struct ClockPair {
     realtime: u64,
 }
 impl ClockPair {
-    pub(super) fn sample(owner: &Owner) -> Self {
-        let before = owner.now();
+    pub(super) fn sample(owner: &mut Owner) -> Result<Self> {
+        let before = owner.clock()?;
         let realtime = realtime();
-        let after = owner.now();
-        Self {
+        let after = owner.clock()?;
+        Ok(Self {
             ticks: before + (after - before) / 2,
             realtime,
-        }
+        })
     }
     fn convert(self, value: u64, clock: Clock) -> Option<u64> {
         match clock {
@@ -630,7 +630,10 @@ impl Owner {
                 Clock::RealtimeNanoseconds,
             );
         }
-        self.drain_timestamps(ClockPair::sample(self));
+        // Without time the owner loop ends at its next turn.
+        if let Ok(pair) = ClockPair::sample(self) {
+            self.drain_timestamps(pair);
+        }
     }
 }
 

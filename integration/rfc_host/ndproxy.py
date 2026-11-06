@@ -63,7 +63,7 @@ def cases():
 def config(scenario):
     """The native runtime's configuration: a resolving `io.*` port on N's
     /64 (its on-link route), plus the gateway variant's route."""
-    text = f"io.backend=af-packet\nio.interface={NATIVE_PORT}\nio.address={NATIVE}\nio.prefix=64\n"
+    text = f"io.backend=af-packet\nio.interface={NATIVE_PORT}\nio.address={NATIVE}\nio.prefix=64\nio.source_quiet=never\n"
     if scenario == "gateway-ptb":
         text += f"io.gateway.{GATEWAY_PREFIX}={ROUTER_LL}\n"
     return text

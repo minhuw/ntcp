@@ -115,6 +115,7 @@ fn ipv6_tclass_fresh_syn_reset_and_ipv4_tos_remain_distinct() {
     // Linux IPv4 IP_TOS still uses byte truncation; IPv6 validation is not shared.
     for (value, expected) in [(-1, 252), (-2, 252), (256, 0), (259, 0)] {
         let mut config = SocketConfig::new("external", Ipv4Addr::new(192, 0, 2, 1));
+        config.io.source_quiet = crate::SourceQuiet::Never;
         config.io.prefix = Some(24);
         let state = Arc::new(Mutex::new(State::default()));
         let mut a = Owner::external_backend(

@@ -95,6 +95,11 @@ pub trait PathProvider {
     /// receive capability of the request's family. A provider that cannot
     /// state one fails without retaining anything.
     fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Self::Error>;
+    /// Whether `prepare` would succeed now, acquiring and retaining nothing.
+    /// An open refused only by the lifecycle's quiet time asks it first, so
+    /// that one which could not start anyway keeps its own error instead of
+    /// waiting for the deadline.
+    fn check(&self, request: PathFactoryRequest) -> Result<(), Self::Error>;
     /// All capacity must have been reserved by prepare. Commit cannot fail.
     fn commit(&mut self, prepared: PreparedPath, connection: ConnectionId);
     fn cancel(&mut self, prepared: PreparedPath);

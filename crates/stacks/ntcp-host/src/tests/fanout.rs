@@ -145,6 +145,7 @@ fn isolating_side(local: SocketAddr, identity: u128, cfg: &EndpointConfig) -> Si
         cfg.clone(),
         [identity as u8; 32],
         0,
+        ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
         move |request| match request {
             ntcp::AddressValidation::Bind { local: address }
             | ntcp::AddressValidation::Open { local: address, .. } => owned(address),

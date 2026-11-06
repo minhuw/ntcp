@@ -72,7 +72,7 @@ def config(family, control):
     gateway route for D's prefix through R1, IPv4's static neighbors for
     both routers, and the owner's control socket."""
     a = ADDRESSES[family]
-    text = (f"io.backend=af-packet\nio.interface={NATIVE_PORT}\nio.address={a['native']}\nio.prefix={a['prefix']}\n"
+    text = (f"io.backend=af-packet\nio.interface={NATIVE_PORT}\nio.address={a['native']}\nio.prefix={a['prefix']}\nio.source_quiet=never\n"
             f"io.gateway.{a['destinations']}={a['gateway_r1']}\n")
     if family == 4:
         text += f"io.neighbor.{a['r1']}={MACS[R1_UP]}\nio.neighbor.{a['r2']}={MACS[R2_UP]}\n"

@@ -158,7 +158,7 @@ impl Fixture {
             },
             ..Default::default()
         };
-        let mut endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(config, [42; 32], 0, crate::SETTLED, |_| true).unwrap();
         endpoint.enable_fast_open().unwrap();
         let ip = IpMetadata {
             source: if v6 { "2001:db8::1" } else { "192.0.2.1" }

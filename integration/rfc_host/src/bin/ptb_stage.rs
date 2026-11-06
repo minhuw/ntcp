@@ -28,7 +28,6 @@ use std::{
     io::{self, BufRead, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
-    time::Instant,
 };
 
 const MTU: usize = 1500;
@@ -66,7 +65,7 @@ struct Network {
     retained: VecDeque<(ConnectionId, Vec<u8>)>,
     held: Option<Held>,
     header_len: usize,
-    start: Instant,
+    time: ntcp_clock::TransportClock,
     clock: ntcp_clock::UtcClock,
 }
 
@@ -92,8 +91,16 @@ struct Held {
 }
 
 impl Network {
-    fn now(&self) -> u64 {
-        self.start.elapsed().as_micros() as u64
+    // One transport sample (CLOCK_BOOTTIME microseconds), its measured
+    // suspend passed to the Endpoint; every failure ends the driver.
+    fn now(&mut self, endpoint: &mut Endpoint) -> io::Result<u64> {
+        let sample = self.time.sample().map_err(io::Error::other)?;
+        if sample.suspended != 0 {
+            endpoint
+                .resume(sample.ticks, sample.suspended)
+                .map_err(engine)?;
+        }
+        Ok(sample.ticks)
     }
 
     fn attach(
@@ -101,7 +108,7 @@ impl Network {
         config: &EndpointConfig,
         local: IpAddr,
         tun: Tun,
-        start: Instant,
+        time: ntcp_clock::TransportClock,
     ) -> io::Result<Self> {
         let mut identity = [0u8; 16];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut identity)?;
@@ -168,7 +175,7 @@ impl Network {
             retained: VecDeque::new(),
             held: None,
             header_len: if local.is_ipv4() { 20 } else { 40 },
-            start,
+            time,
             clock: ntcp_clock::UtcClock::new(),
         })
     }
@@ -187,7 +194,7 @@ impl Network {
 
     // Malformed or foreign input is a silent discard, as in any embedding.
     fn input(&mut self, endpoint: &mut Endpoint, frame: &[u8]) -> io::Result<()> {
-        let now = self.now();
+        let now = self.now(endpoint)?;
         let Ok(decoded) = self.host.decode_ingress(self.ingress, frame) else {
             return Ok(());
         };
@@ -223,7 +230,7 @@ impl Network {
     }
 
     fn replay(&mut self, endpoint: &mut Endpoint) -> io::Result<()> {
-        let now = self.now();
+        let now = self.now(endpoint)?;
         for _ in 0..self.deferred.len() {
             let deferred = self.deferred.pop_front().unwrap();
             if endpoint.is_output_reserved(deferred.owner()) {
@@ -275,7 +282,7 @@ impl Network {
     // One output pass: every packet the Endpoint selects, each submitted as
     // its own physical TUN write through the Host transaction.
     fn transmit(&mut self, endpoint: &mut Endpoint, output: &mut [u8]) -> io::Result<()> {
-        let now = self.now();
+        let now = self.now(endpoint)?;
         if let Ok(report) = self.host.service_changes(endpoint, now)
             && let Some(error) = report.first_error
         {
@@ -388,8 +395,8 @@ impl Network {
         Ok(())
     }
 
-    fn wait(&self, endpoint: &Endpoint) -> io::Result<()> {
-        let now = self.now();
+    fn wait(&mut self, endpoint: &mut Endpoint) -> io::Result<()> {
+        let now = self.now(endpoint)?;
         let delay = endpoint
             .next_deadline()
             .map_or(10_000, |deadline| deadline.saturating_sub(now).min(10_000));
@@ -430,17 +437,18 @@ impl Network {
         what: &str,
         mut done: impl FnMut(&Endpoint) -> io::Result<bool>,
     ) -> io::Result<()> {
-        let deadline = self.now() + DEADLINE_US;
+        let deadline = self.now(endpoint)? + DEADLINE_US;
         loop {
             self.receive(endpoint)?;
-            endpoint.on_timeout(self.now(), BUDGET).map_err(engine)?;
+            let now = self.now(endpoint)?;
+            endpoint.on_timeout(now, BUDGET).map_err(engine)?;
             Self::drain_events(endpoint);
             self.transmit(endpoint, output)?;
             self.host.collect(endpoint).map_err(host_error)?;
             if self.held.is_none() && !endpoint.has_pending_output() && done(endpoint)? {
                 return Ok(());
             }
-            if self.now() > deadline {
+            if self.now(endpoint)? > deadline {
                 return Err(other(format!("{what} deadline")));
             }
             self.wait(endpoint)?;
@@ -505,9 +513,15 @@ fn run() -> io::Result<()> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
     let family_v4 = local.is_ipv4();
     let tun = Tun::open(&args[1])?;
-    let start = Instant::now();
+    let mut time = ntcp_clock::TransportClock::new().map_err(io::Error::other)?;
+    let started = time.sample().map_err(io::Error::other)?.ticks;
     // The namespace's own addresses are the only ones this sender opens.
-    let mut endpoint = Endpoint::new(config.clone(), secret, 0, move |request| match request {
+    // The harness created this namespace and its addresses for this run.
+    let lifecycle = ntcp::Lifecycle {
+        boot_age: Some(time.boot_age(started).map_err(io::Error::other)?),
+        continuity: ntcp::SourceContinuity::Never,
+    };
+    let mut endpoint = Endpoint::new(config.clone(), secret, started, lifecycle, move |request| match request {
         ntcp::AddressValidation::Bind { local: bind } => bind == local,
         ntcp::AddressValidation::Open {
             local: source,
@@ -517,7 +531,7 @@ fn run() -> io::Result<()> {
         ntcp::AddressValidation::Incoming { destination, .. } => destination == local,
     })
     .map_err(engine)?;
-    let mut network = Network::attach(&mut endpoint, &config, local, tun, start)?;
+    let mut network = Network::attach(&mut endpoint, &config, local, tun, time)?;
     let mut output = vec![0u8; MTU];
     let mut id = None;
     let mut written = 0usize;
@@ -543,7 +557,7 @@ fn run() -> io::Result<()> {
                     registration: None,
                     receive_authority: None,
                 };
-                let now = network.now();
+                let now = network.now(&mut endpoint)?;
                 let opened = endpoint
                     .connect_with_path_provider(
                         now,

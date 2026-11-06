@@ -158,7 +158,7 @@ mod tests {
                         ..EndpointConfig::default()
                     },
                     [1; 32],
-                    0,
+                    0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
                     |_| true,
                 )
                 .unwrap();
@@ -251,7 +251,7 @@ mod tests {
                 },
                 ..EndpointConfig::default()
             };
-            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
             let id = endpoint
                 .connect(
                     0,

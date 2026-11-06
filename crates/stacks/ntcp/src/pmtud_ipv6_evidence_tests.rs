@@ -257,6 +257,7 @@ fn ipv6_endpoint_quoted_tuple_dispatch_and_distinct_local_identity_isolation() {
         },
         [1; 32],
         0,
+        crate::SETTLED,
         |_| true,
     )
     .unwrap();
@@ -574,6 +575,7 @@ fn ipv6_endpoint_rejects_scoped_link_identity_instead_of_claiming_interface_isol
         },
         [1; 32],
         0,
+        crate::SETTLED,
         |_| true,
     )
     .unwrap();

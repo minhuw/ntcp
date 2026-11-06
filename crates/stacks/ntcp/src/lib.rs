@@ -36,6 +36,8 @@ pub use output_reservation::{GsoLimits, TransmitAttempt, TransmitSegmentation};
 mod endpoint_tests;
 mod hystart;
 mod ipv4_options;
+mod lifecycle;
+pub use lifecycle::{Lifecycle, SourceContinuity};
 mod pacing;
 mod pmtud;
 pub use pmtud::{
@@ -88,3 +90,10 @@ pub use rx_timestamp::{
 
 #[cfg(test)]
 mod destination_route_tests;
+// A modeled host that has been up longer than any quiet interval, on
+// addresses nothing was ever emitted from: fixtures start admitted.
+#[cfg(test)]
+pub(crate) const SETTLED: Lifecycle = Lifecycle {
+    boot_age: Some(Instant::MAX),
+    continuity: SourceContinuity::Never,
+};

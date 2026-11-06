@@ -289,6 +289,7 @@ fn pmtud_lifecycle_endpoint_input_before_due_timeout_preserves_search_timer() {
         },
         [1; 32],
         0,
+        crate::SETTLED,
         |_| true,
     )
     .unwrap();

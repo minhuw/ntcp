@@ -305,16 +305,17 @@ class FastOpenInventory(unittest.TestCase):
             for id in ids:
                 with self.subTest(group=group, row=id):
                     self.assertIn(rows[id]["status"], ("covered", "TODO"))
-        for id in ("mac-cost", "mac-expiration", "is-cookie-valid",
-                   "first-ack-all-repair"):
+        for id in ("mac-cost", "first-ack-all-repair"):
             self.assertEqual(rows[id]["status"], "TODO")
+        for id in ("mac-expiration", "is-cookie-valid"):
+            self.assertEqual(rows[id]["status"], "covered")
         self.assertIn("LinuxSipHash24", rows["mac-expiration"]["reason"])
         self.assertIn("absolute issue/accept deadlines", rows["mac-expiration"]["reason"])
-        self.assertIn("T20 must integrate", rows["mac-expiration"]["reason"])
+        self.assertIn("original lease in CLOCK_BOOTTIME microseconds", rows["mac-expiration"]["reason"])
         self.assertNotIn("T15", rows["mac-expiration"]["reason"])
         self.assertEqual(rows["expire-any-time"]["status"], "covered")
         self.assertTrue(rows["expire-any-time"]["reason"].endswith(
-            "external raw-key restart/time continuity remains owned by T20."))
+            "external raw keys keep their original boot-named leases across restarts."))
         for id in ("replay-app", "app-reuse", "farm-key", "nat-timestamp-cookie", "aes-example",
                    "cross-connection-cc-disable", "synack-payload-delay", "api-active-option-alternative"):
             self.assertEqual(rows[id]["status"], "exception")
@@ -353,18 +354,37 @@ class FastOpenInventory(unittest.TestCase):
                     mutate(broken)
                     with self.assertRaises(ValueError):
                         validate_selected_closure(broken, expected)
-        # Live endpoint deadlines and native rotation cannot establish trusted
-        # raw-key restart continuity, cost or broad interoperability.
-        for id in ("perform-normal-and-expiry", "server-mac-properties", "mac-expiration",
-                   "is-cookie-valid", "request-server-properties", "reuse-until-expired",
-                   "mac-cost", "compatibility"):
+        # T20 supplies external raw-key restart continuity: original leases
+        # of a named boot in CLOCK_BOOTTIME microseconds. Cost and broad
+        # interoperability stay open.
+        for id in ("server-mac-properties", "request-server-properties", "mac-cost", "compatibility"):
             self.assertEqual(rows[id]["status"], "TODO")
+        restart = (
+            ("crates/adapters/ntcp-socket/src/config.rs", "CITATION", "pub(crate) fn check_fast_open_leases("),
+            ("crates/adapters/ntcp-socket/src/runtime_cookie_policy_tests.rs", "TEST",
+             "fn owners_in_sequence_keep_the_configured_deadlines()"),
+            ("crates/adapters/ntcp-socket/src/runtime_cookie_policy_tests.rs", "TEST",
+             "fn setsockopt_selects_only_a_configured_key_under_its_lease()"),
+            ("crates/adapters/ntcp-socket/src/config_tests.rs", "TEST",
+             "fn a_lease_is_refused_unless_it_names_this_boot_and_is_unexpired()"),
+        )
+        for id in ("perform-normal-and-expiry", "mac-expiration", "is-cookie-valid", "reuse-until-expired"):
+            row = rows[id]
+            self.assertEqual(row["status"], "covered")
+            for fact in ("original lease in CLOCK_BOOTTIME microseconds", "socket.fast_open_key_boot_id",
+                         "keeps the original deadlines", "selects only a configured key"):
+                self.assertIn(fact, row["reason"])
+            for path, kind, anchor in restart:
+                self.assertTrue(any(a["kind"] == kind and audit.clause_key(a) == audit.clause_key(row)
+                                    and anchor in a["attached"] and a["reason"] == row["reason"]
+                                    for a in audit.source_annotations((ROOT / path).read_text())),
+                                (id, path, anchor))
         self.assertIn("manual key revocation", rows["reuse-until-expired"]["reason"])
         self.assertIn("same-key reinstalls cannot renew expired leases", rows["reuse-until-expired"]["reason"])
         for id in ("perform-normal-and-expiry", "server-mac-properties", "mac-expiration",
                    "is-cookie-valid", "request-server-properties", "reuse-until-expired"):
             row = rows[id]
-            self.assertIn("T20", row["reason"])
+            self.assertNotIn("T20", row["reason"])
             self.assertNotIn("T15", row["reason"])
             self.assertIn("raw", row["reason"].lower())
             self.assertEqual(row["evidence"][1],
@@ -373,16 +393,24 @@ class FastOpenInventory(unittest.TestCase):
         for id in ("server-mac-properties", "request-server-properties"):
             self.assertIn("T6", rows[id]["reason"])
         self.assertIn("endpoint-owned identity registry", rows["mac-expiration"]["reason"])
-        self.assertEqual(rows["mac-expiration"]["evidence"][2:], [
-            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn credential_authority_rejects_arbitrary_key_cycles_on_actual_traffic()",
-            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn credential_authority_survives_distinct_default_clear_close_and_cross_listener_reuse()",
-            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn hmac_long_cycles_keep_original_epoch_mapping_across_listeners()",
-            "crates/adapters/ntcp-socket/src/runtime_cookie_policy_tests.rs::fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations()",
-        ])
-        self.assertEqual(rows["is-cookie-valid"]["evidence"][2:], [
-            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn global_credential_tightening_reaches_all_listener_selections_and_preserves_children()",
-            "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_progress()",
-        ])
+        # A covered row lists one source/test pair; the further traffic
+        # evidence the TODO rows listed stays annotated with the whole quote.
+        for id, anchors in {
+            "mac-expiration": (
+                ("crates/stacks/ntcp/src/fast_open_evidence_tests.rs", "fn credential_authority_rejects_arbitrary_key_cycles_on_actual_traffic()"),
+                ("crates/stacks/ntcp/src/fast_open_evidence_tests.rs", "fn credential_authority_survives_distinct_default_clear_close_and_cross_listener_reuse()"),
+                ("crates/stacks/ntcp/src/fast_open_evidence_tests.rs", "fn hmac_long_cycles_keep_original_epoch_mapping_across_listeners()"),
+                ("crates/adapters/ntcp-socket/src/runtime_cookie_policy_tests.rs", "fn native_authority_rejects_prelisten_and_live_cycles_across_socket_generations()"),
+            ),
+            "is-cookie-valid": (
+                ("crates/stacks/ntcp/src/fast_open_evidence_tests.rs", "fn global_credential_tightening_reaches_all_listener_selections_and_preserves_children()"),
+                ("crates/stacks/ntcp/src/fast_open_evidence_tests.rs", "fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_progress()"),
+            ),
+        }.items():
+            for path, anchor in anchors:
+                self.assertTrue(any(a["kind"] == "TEST" and audit.clause_key(a) == audit.clause_key(rows[id])
+                                    and anchor in a["attached"]
+                                    for a in audit.source_annotations((ROOT / path).read_text())), (id, anchor))
         self.assertEqual(rows["rolling-keys"]["status"], "covered")
         self.assertIn("at most one retiring key", rows["rolling-keys"]["reason"])
         self.assertEqual(rows["rolling-keys"]["evidence"][0],
@@ -404,8 +432,9 @@ class FastOpenInventory(unittest.TestCase):
         for key in ("7413-server-mac-properties", "7413-request-server-properties"):
             row = rows[key]
             self.assertEqual(row["status"], "TODO")
-            self.assertIn("T20", row["reason"])
+            self.assertNotIn("T20", row["reason"])
             self.assertNotIn("T15", row["reason"])
+            self.assertIn("T23", row["reason"])
             self.assertIn("check_mac_cost.py", row["reason"])
             self.assertNotIn("unmeasured", row["reason"])
         harness = (ROOT / "crates/stacks/ntcp/src/mac_cost_tests.rs").read_text()

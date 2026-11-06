@@ -37,8 +37,8 @@ fn public_first_ack_capacity_conflicts_and_receiver_driven_completion() {
                     },
                     ..EndpointConfig::default()
                 };
-                let a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
-                let b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+                let a = Endpoint::new(config.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
                 let (mut a, mut b, listener) = warm_pair(v6, a, b);
                 b.set_listener_buffer_capacities(listener, 8192, capacity)
                     .unwrap();
@@ -263,7 +263,7 @@ fn partial_synack_rtt_repair_and_next_service_admission() {
                         },
                         ..EndpointConfig::default()
                     };
-                    let mut a = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+                    let mut a = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
                     a.enable_fast_open().unwrap();
                     if reserved {
                         a.enable_output_reservations().unwrap();

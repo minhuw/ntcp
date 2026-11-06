@@ -27,6 +27,7 @@ fn native_output(
     .parse()
     .unwrap();
     let mut config = SocketConfig::new("external", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(if v6 { 64 } else { 24 });
     config.tcp.max_connections = slots;
     config.tcp.reuse_time_wait = true;
@@ -185,6 +186,7 @@ fn standard_time(value: u32, before: Option<i128>, after: Option<i128>) -> bool 
 #[test]
 fn managed_native_startup_refuses_missing_or_failed_physical_facts() {
     let mut config = SocketConfig::new("external", Ipv4Addr::new(10, 73, 0, 2));
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(24);
     for (mtu, error, expected) in [
         (None, None, EOPNOTSUPP),
@@ -512,7 +514,7 @@ fn managed_native_live_class_capacity_failure_preserves_socket_core_client_and_d
         metric: 0,
     })
     .unwrap();
-    owner.endpoint = Endpoint::new(owner.defaults.clone(), [42; 32], 0, |_| true).unwrap();
+    owner.endpoint = Endpoint::new(owner.defaults.clone(), [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
     host.attach(&mut owner.endpoint).unwrap();
     owner.host = Some(host);
     owner.ports[0].ingress = Some(ingress);
@@ -578,6 +580,7 @@ fn managed_native_public_rust_fast_open_helper_and_fd_alias_use_production_attac
     }
     let local = Ipv4Addr::new(10, 73, 0, 2);
     let mut config = SocketConfig::new("external", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(24);
     let state = Arc::new(Mutex::new(State {
         mtu: Some(1100),

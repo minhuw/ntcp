@@ -1005,7 +1005,7 @@ mod tests {
             cfg.connection.timebase,
         )
         .unwrap();
-        let mut endpoint = Endpoint::new(cfg.clone(), [3; 32], 0, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(cfg.clone(), [3; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
         host.attach(&mut endpoint).unwrap();
         let dir = std::env::temp_dir().join(format!("ntcp-control-denied-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -3,34 +3,200 @@ use super::*;
 
 const BASE: &str = "io.interface=ntcp0\nio.address=10.73.0.2\n";
 
+// The running boot and its transport time, from the real provider: a lease is
+// checked against what the provider reads, so nothing here models that fact.
+fn this_boot() -> (ntcp_clock::BootId, u64) {
+    let mut clock = ntcp_clock::TransportClock::new().unwrap();
+    let now = clock.sample().unwrap().ticks;
+    (clock.characterization().boot_id, now)
+}
+// Another boot's id: this one with its first digit changed.
+fn other_boot(boot: ntcp_clock::BootId) -> String {
+    let text = boot.to_string();
+    let first = if text.starts_with('0') { '1' } else { '0' };
+    format!("{first}{}", &text[1..])
+}
+fn lease_lines(boot: impl std::fmt::Display, not_before: u64, issue: u64, accept: u64) -> String {
+    format!(
+        "socket.fast_open_key_boot_id={boot}\nsocket.fast_open_key_not_before_us={not_before}\nsocket.fast_open_key_issue_until_us={issue}\nsocket.fast_open_key_accept_until_us={accept}\n"
+    )
+}
+const UNMANAGED: &str = "socket.fast_open_managed_keys=false\n";
+const HOUR: u64 = 3_600_000_000;
+
 #[test]
 fn finite_cookie_lifetime_and_explicit_lease_configuration() {
-    let config = SocketConfig::parse(&format!("{BASE}socket.fast_open_managed_keys=false\nsocket.fast_open_cookie_lifetime_us=100\nsocket.fast_open_key_not_before_us=10\nsocket.fast_open_key_issue_until_us=110\nsocket.fast_open_key_accept_until_us=210\n")).unwrap();
+    let (boot, now) = this_boot();
+    let (not_before, issue_until, accept_until) = (now, now + HOUR, now + 2 * HOUR);
+    let lease = lease_lines(boot, not_before, issue_until, accept_until);
+    let config = SocketConfig::parse(&format!(
+        "{BASE}{UNMANAGED}socket.fast_open_cookie_lifetime_us=100\n{lease}"
+    ))
+    .unwrap();
     assert_eq!(config.fast_open_managed_keys, Some(false));
     assert_eq!(config.fast_open_cookie_lifetime.as_micros(), 100);
+    assert_eq!(config.fast_open_key_boot_id, Some(boot));
     assert_eq!(
         config.fast_open_key_lease.unwrap(),
         ntcp::FastOpenKeyLease {
-            not_before: 10,
-            issue_until: 110,
-            accept_until: 210,
+            not_before,
+            issue_until,
+            accept_until,
             units_per_second: 1_000_000,
         }
     );
+    let managed = lease_lines(boot, not_before, issue_until, accept_until);
+    let id = format!("socket.fast_open_key_boot_id={boot}");
+    let issue = format!("socket.fast_open_key_issue_until_us={issue_until}");
+    let accept = format!("socket.fast_open_key_accept_until_us={accept_until}");
+    let early = format!("socket.fast_open_key_accept_until_us={}", issue_until - 1);
     for suffix in [
-        "socket.fast_open_cookie_lifetime_us=0",
-        "socket.fast_open_cookie_lifetime_us=18446744073709551615",
-        "socket.fast_open_managed_keys=1",
-        "socket.fast_open_key_issue_until_us=100",
-        "socket.fast_open_key_issue_until_us=100\nsocket.fast_open_key_accept_until_us=99",
-        "socket.fast_open_managed_keys=true\nsocket.fast_open_key_issue_until_us=100\nsocket.fast_open_key_accept_until_us=200",
-        "socket.fast_open_key_issue_until_us=50\nsocket.fast_open_key_accept_until_us=100",
+        "socket.fast_open_cookie_lifetime_us=0".to_string(),
+        "socket.fast_open_cookie_lifetime_us=18446744073709551615".to_string(),
+        "socket.fast_open_managed_keys=1".to_string(),
+        format!("{id}\n{issue}"),
+        format!("{id}\n{issue}\n{early}"),
+        format!("socket.fast_open_managed_keys=true\n{managed}"),
+        format!("{id}\n{issue}\n{accept}"),
     ] {
         assert!(
             SocketConfig::parse(&format!("{BASE}{suffix}")).is_err(),
             "{suffix}"
         );
     }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc7413#section-3
+//= type=test
+//= reason=Actual IPv4/IPv6 endpoints repeatedly reuse credentials before expiry, reject expired SYN data at admission and complete ordinary TCP byte delivery with fresh-cookie learning or no-cookie fallback. HMAC keeps current/previous epochs; LinuxSipHash24 keeps raw bytes under finite key leases. Raw epoch-independent codec vectors are not server acceptance evidence. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# 5. The rest of the connection proceeds like a normal TCP connection. The
+//# client can repeat many Fast Open operations once it acquires a cookie
+//# (until the cookie is expired by the server).
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Endpoint admission enforces finite HMAC current/previous epochs and LinuxSipHash24 key leases with absolute issue/accept deadlines, including delayed service, retiring keys and same-key no-renewal through the endpoint-owned identity registry across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux validation intentionally ignores epoch, including u64::MAX, to preserve wire bytes; that raw codec result is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# 5. The cookie expires after a certain amount of time. The reason for
+//# cookie expiration is detailed in the "Security Considerations" section
+//# (Section 5). This can be done by either periodically changing the server
+//# key used to generate cookies or including a timestamp when generating
+//# the cookie.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.2
+//= type=test
+//= reason=Passive admission authenticates both address families using current/retiring bounded key contexts consulting one endpoint-owned identity/deadline registry, finite HMAC epochs and LinuxSipHash24 leases. Traffic tests reject expired and invalid credentials exactly at deadlines and complete fallback; raw Linux epoch-independent codec validation alone is not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# - IsCookieValid(IP_Address, Cookie): checks if the cookie is valid,
+//# i.e., it has not expired and the cookie authenticates the client IP
+//# address.
+//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+//= type=test
+//= reason=Repeated Fast Open, manual key revocation, finite HMAC epochs and LinuxSipHash24 key leases are exercised through actual endpoints in both IP families. Admission checks issue/accept deadlines without timer service; expired and invalid credentials complete ordinary TCP, fresh keys teach usable replacements, and same-key reinstalls cannot renew expired leases in the endpoint authority across arbitrary key cycles, policy clearing, listener generations, cross-listener reuse and native pre-listen staging. Raw Linux epoch-independent codec tests are not server acceptance. External raw keys are accepted only with their original lease in CLOCK_BOOTTIME microseconds of the boot socket.fast_open_key_boot_id names: another boot's lease, an expired lease or an external key without one is refused at configuration, a restarted process reinstalling the same key keeps the original deadlines, and setsockopt(TCP_FASTOPEN_KEY) selects only a configured key under its lease. HMAC keys are per-process secrets whose epochs derive from transport time.
+//# Once the client obtains the cookie from the target server, it can
+//# perform subsequent TFO connections until the cookie is expired by the
+//# server.
+#[test]
+fn a_lease_is_refused_unless_it_names_this_boot_and_is_unexpired() {
+    let (boot, now) = this_boot();
+    let (issue, accept) = (now + HOUR, now + 2 * HOUR);
+    let parse = |lease: String| SocketConfig::parse(&format!("{BASE}{UNMANAGED}{lease}"));
+    parse(lease_lines(boot, now, issue, accept)).unwrap();
+    // Without a boot id these are the numbers of no named clock.
+    let unnamed = lease_lines(boot, now, issue, accept);
+    let unnamed = unnamed.split_once('\n').unwrap().1.to_string();
+    assert!(parse(unnamed).is_err());
+    // A boot id names the boot of a lease; without one it is inert.
+    assert!(parse(format!("socket.fast_open_key_boot_id={boot}\n")).is_err());
+    assert!(parse(lease_lines(other_boot(boot), now, issue, accept)).is_err());
+    for malformed in ["x", "1", &boot.to_string().to_uppercase().replace('-', "_")] {
+        assert!(parse(lease_lines(malformed, now, issue, accept)).is_err());
+    }
+    // Issuance over, acceptance not: the original lease still runs.
+    parse(lease_lines(boot, now - 2, now - 1, accept)).unwrap();
+    // Already expired, and not begun for the key installed at startup.
+    assert!(parse(lease_lines(boot, now - 2, now - 1, now)).is_err());
+    assert!(parse(lease_lines(boot, now + HOUR, issue + 1, accept)).is_err());
+    // Today's process-relative numbers from before D5 are not reinterpreted.
+    assert!(parse(lease_lines(boot, 10, 110, 210)).is_err());
+
+    // The exact expiry boundary, against a stated reading of this boot.
+    let config = parse(lease_lines(boot, now, issue, accept)).unwrap();
+    config.check_fast_open_leases(boot, accept - 1).unwrap();
+    assert!(config.check_fast_open_leases(boot, accept).is_err());
+    assert!(
+        config
+            .check_fast_open_leases(ntcp_clock::BootId::parse(&other_boot(boot)).unwrap(), now)
+            .is_err()
+    );
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+const RAW: &str = "socket.fast_open_cookie=linux-siphash24\nsocket.fast_open_key=00112233445566778899aabbccddeeff\n";
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn an_external_key_needs_its_lease_and_a_generated_one_does_not() {
+    let (boot, now) = this_boot();
+    let lease = lease_lines(boot, now, now + HOUR, now + HOUR);
+    for suffix in ["", UNMANAGED] {
+        assert!(SocketConfig::parse(&format!("{BASE}{RAW}{suffix}")).is_err());
+        SocketConfig::parse(&format!("{BASE}{RAW}{suffix}{lease}")).unwrap();
+    }
+    // Managed keys and the per-process secret are the stack's own.
+    SocketConfig::parse(&format!("{BASE}{RAW}socket.fast_open_managed_keys=true\n")).unwrap();
+    SocketConfig::parse(&format!("{BASE}{UNMANAGED}")).unwrap();
+    SocketConfig::parse(BASE).unwrap();
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+#[test]
+fn further_keys_are_configured_with_their_own_leases() {
+    let (boot, now) = this_boot();
+    let primary = lease_lines(boot, now, now + HOUR, now + HOUR);
+    let key = |name: &str, hex: &str, (from, issue, accept): (u64, u64, u64)| {
+        format!(
+            "socket.fast_open_key.{name}={hex}\nsocket.fast_open_key.{name}.not_before_us={from}\nsocket.fast_open_key.{name}.issue_until_us={issue}\nsocket.fast_open_key.{name}.accept_until_us={accept}\n"
+        )
+    };
+    let (a, b) = ("0102030405060708090a0b0c0d0e0f10", "1112131415161718191a1b1c1d1e1f20");
+    let live = (now, now + HOUR, now + HOUR);
+    // Waiting for its `not_before`: a scheduled rotation.
+    let next = (now + HOUR, now + 2 * HOUR, now + 2 * HOUR);
+    let config = SocketConfig::parse(&format!(
+        "{BASE}{RAW}{primary}{}{}",
+        key("next", a, live),
+        key("later", b, next)
+    ))
+    .unwrap();
+    assert_eq!(config.fast_open_keys.len(), 2);
+    assert_eq!(
+        config.fast_open_keys[0].key,
+        ntcp::LinuxSipHash24Key::new(core::array::from_fn(|i| i as u8 + 1))
+    );
+    assert_eq!(config.fast_open_keys[1].lease.not_before, now + HOUR);
+    // They stand beside managed primary keys, under the same boot id.
+    let id = format!("socket.fast_open_key_boot_id={boot}\n");
+    SocketConfig::parse(&format!("{BASE}{id}{}", key("next", a, live))).unwrap();
+    let refused = [
+        key("next", a, live), // No boot id.
+        format!("{id}{}", key("next", a, (now - 2, now - 1, now))), // Expired.
+        format!("{id}{}", key("next", a, (now, now + HOUR, now))), // Inverted.
+        format!("{id}{}", key("next", "short", live)),
+        format!("{id}socket.fast_open_key.next.issue_until_us={}\n", now + 1), // No key.
+        format!("{id}socket.fast_open_key.next={a}\n"), // No lease.
+        format!("{id}{}socket.fast_open_key.next.other=1\n", key("next", a, live)),
+        format!("{id}{}{}", key("x", a, live), key("y", a, next)), // One key, two leases.
+    ];
+    for suffix in refused {
+        assert!(SocketConfig::parse(&format!("{BASE}{suffix}")).is_err(), "{suffix}");
+    }
+    // The primary key has its one lease.
+    let same = key("next", "00112233445566778899aabbccddeeff", live);
+    assert!(SocketConfig::parse(&format!("{BASE}{RAW}{primary}{same}")).is_err());
+}
+
+#[cfg(not(feature = "tfo-linux-cookie"))]
+#[test]
+fn further_keys_need_the_raw_codec() {
+    let suffix = "socket.fast_open_key.next=0102030405060708090a0b0c0d0e0f10\n";
+    assert!(SocketConfig::parse(&format!("{BASE}{suffix}")).is_err());
 }
 
 #[test]
@@ -944,6 +1110,29 @@ fn segment_routes_parse_separately_from_route_policies() {
 }
 
 #[test]
+fn every_named_port_states_its_own_source_quiet_fact() {
+    let two = |io: &str, b: &str| {
+        SocketConfig::parse(&format!(
+            "{BASE}{io}port.b.interface=ntcp1\nport.b.address=10.73.1.2\n{b}"
+        ))
+    };
+    let config = two("io.source_quiet=never\n", "port.b.source_quiet=30\n").unwrap();
+    assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Seconds(30));
+    assert_eq!(config.continuity(), ntcp::SourceContinuity::CeasedFor(30));
+    let config = two("io.source_quiet=never\n", "port.b.source_quiet=never\n").unwrap();
+    assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Never);
+    assert_eq!(config.continuity(), ntcp::SourceContinuity::Never);
+    // An address without a fact keeps the whole lifecycle waiting.
+    let config = two("io.source_quiet=never\n", "").unwrap();
+    assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Unknown);
+    assert_eq!(config.continuity(), ntcp::SourceContinuity::Unknown);
+    // The same parsing and validation as io.source_quiet.
+    assert!(two("", "port.b.source_quiet=soon\n").is_err());
+    assert!(two("", "port.b.source_quiet=-1\n").is_err());
+    assert!(two("io.source_quiet=soon\n", "").is_err());
+}
+
+#[test]
 fn named_ports_parse_with_the_io_port_fields_and_validation() {
     let config = SocketConfig::parse(&format!(
         "{BASE}io.prefix=24\nport.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.c-2.interface=ntcp2\nport.c-2.address=10.73.2.2\n"
@@ -963,6 +1152,7 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
                 next_hop_mac: None,
                 gateways: Vec::new(),
                 neighbors: Vec::new(),
+                source_quiet: crate::SourceQuiet::Unknown,
             },
             PortConfig {
                 name: "c-2".into(),
@@ -972,6 +1162,7 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
                 next_hop_mac: None,
                 gateways: Vec::new(),
                 neighbors: Vec::new(),
+                source_quiet: crate::SourceQuiet::Unknown,
             },
         ]
     );
@@ -1115,6 +1306,7 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
         next_hop_mac: None,
         gateways: Vec::new(),
         neighbors: Vec::new(),
+        source_quiet: crate::SourceQuiet::Unknown,
     };
     config.ports = vec![
         port.clone(),

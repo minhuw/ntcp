@@ -501,6 +501,7 @@ fn native_icmp_output_over_a_segment_route_carries_the_srh() {
     let segments: Vec<std::net::Ipv6Addr> =
         vec!["2001:db8:5::1".parse().unwrap(), "2001:db8:6::1".parse().unwrap()];
     let mut config = SocketConfig::new("external", local);
+    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(64);
     config.tcp.connection.timestamps = false;
     config.segment_routes = vec![crate::SegmentRoute {
@@ -601,4 +602,147 @@ fn native_icmp_output_over_a_segment_route_carries_the_srh() {
     assert_eq!(&error[h + 4..h + 8], &42u32.to_be_bytes());
     assert_eq!(ntcp_icmp::icmpv6_checksum(reply_ip, &error[h..]), Ok(0));
     assert_eq!(&error[h + 8..], &request[..1280 - h - 8]);
+}
+
+// TCP flags of the TCP segments the owner sent.
+fn sent_tcp_flags(wire: &Arc<Mutex<State>>) -> Vec<u8> {
+    let frames: Vec<_> = wire.lock().unwrap().sent.iter().cloned().collect();
+    frames
+        .iter()
+        .filter_map(|frame| {
+            let eth = ntcp_ethernet::parse_ethernet(frame).unwrap();
+            let (ip, protocol, payload) = if eth.payload[0] >> 4 == 6 {
+                let p = ntcp_ip6::parse(eth.payload).unwrap();
+                (p.ip, p.protocol, p.payload)
+            } else {
+                let p = ntcp_ip::parse(eth.payload, false).unwrap();
+                (p.ip, p.protocol, p.payload)
+            };
+            (protocol == 6).then(|| ntcp::wire::parse(ip, payload).unwrap().header.flags)
+        })
+        .collect()
+}
+
+// A native owner on an external port whose `io.source_quiet` states `quiet`,
+// at 1 ms after its start.
+fn stated(v6: bool, quiet: crate::SourceQuiet) -> (Owner, Arc<Mutex<State>>) {
+    let local: IpAddr = if v6 { "2001:db8::2" } else { "10.73.0.2" }.parse().unwrap();
+    let mut config = SocketConfig::new("external", local);
+    config.io.source_quiet = quiet;
+    config.io.prefix = Some(if v6 { 64 } else { 24 });
+    config.tcp.connection.timestamps = false;
+    let wire = Arc::new(Mutex::new(State {
+        mtu: Some(1500),
+        max_packet_len: Some(2048),
+        ..Default::default()
+    }));
+    let mut a = Owner::external_backend(
+        &config,
+        crate::EthernetPacketIo {
+            io: Box::new(Fixture(wire.clone())),
+            local_mac: [2; 6],
+            next_hop_mac: Some([4; 6]),
+        },
+    )
+    .unwrap();
+    a.test_now = Some(1_000);
+    (a, wire)
+}
+
+// Quiet time is TCP only. One stated fact, emission ceased 200 s before
+// start, leaves the 120 s identifier quiet period over and 40 s of the 240 s
+// TCP quiet time: the Host answers Echo Requests at once, while a SYN to a
+// listener or to a closed port draws nothing until the TCP deadline.
+#[test]
+fn echo_requests_are_answered_during_tcp_quiet_time() {
+    const DEADLINE: u64 = 40_000_000;
+    for v6 in [false, true] {
+        let (mut a, wire) = stated(v6, crate::SourceQuiet::Seconds(200));
+        let local = a.local;
+        assert_eq!(a.endpoint.quiet_until(1_000), Some(DEADLINE), "v6={v6}");
+        let listener = a.execute(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
+        a.execute(listener, Op::Bind(SocketAddr::new(local, 8080))).unwrap();
+        a.execute(listener, Op::Listen(4)).unwrap();
+
+        let to_us = ntcp::IpMetadata {
+            source: peer(v6),
+            destination: a.local,
+        };
+        let syn = |port: u16| {
+            let mut bytes = vec![0; 20];
+            let n = ntcp::wire::encode(
+                to_us,
+                ntcp::wire::Header {
+                    source_port: 40000,
+                    destination_port: port,
+                    sequence: 7,
+                    acknowledgment: 0,
+                    flags: ntcp::wire::SYN,
+                    window: 1024,
+                    urgent_pointer: 0,
+                },
+                &[],
+                &[],
+                &mut bytes,
+            )
+            .unwrap();
+            ethernet(UNICAST, v6, &complete(to_us, 6, &bytes[..n]))
+        };
+        let echo = ethernet(UNICAST, v6, &echo_request(to_us, &[3; 32]));
+        a.test_now = Some(DEADLINE - 1);
+        deliver(&mut a, &wire, &[syn(8080), syn(9), echo]);
+        a.service_egress().unwrap();
+        assert_eq!(sent_tcp_flags(&wire), vec![], "v6={v6}");
+        let replies = sent_icmp(&wire);
+        assert_eq!(replies.len(), 1, "v6={v6}");
+        let reply = ntcp_icmp::decode_echo(replies[0].0, &replies[0].1).unwrap();
+        assert_eq!((reply.kind, reply.data), (ntcp_icmp::EchoKind::Reply, &[3; 32][..]));
+
+        a.test_now = Some(DEADLINE);
+        deliver(&mut a, &wire, &[syn(8080), syn(9)]);
+        a.service_egress().unwrap();
+        let mut flags = sent_tcp_flags(&wire);
+        flags.sort();
+        assert_eq!(
+            flags,
+            vec![ntcp::wire::SYN | ntcp::wire::ACK, ntcp::wire::RST | ntcp::wire::ACK],
+            "v6={v6}"
+        );
+    }
+}
+
+// An open that could never start keeps its ordinary error during quiet time,
+// as the core's factories keep theirs: a destination without a route is
+// ENETUNREACH at connect, with nothing held, not EINPROGRESS and a failure
+// reported at the deadline.
+#[test]
+fn an_unroutable_connect_keeps_its_error_during_quiet_time() {
+    for v6 in [false, true] {
+        for quiet in [crate::SourceQuiet::Never, crate::SourceQuiet::Unknown] {
+            let (mut a, wire) = stated(v6, quiet);
+            assert_eq!(
+                a.endpoint.quiet_until(1_000).is_some(),
+                quiet == crate::SourceQuiet::Unknown
+            );
+            let remote = SocketAddr::new(peer(v6), 8080);
+            let host = a.host.as_mut().unwrap();
+            let source = host.paths().sources().next().unwrap().0;
+            let request = path::PathRequest {
+                source,
+                destination: path::ScopedAddress::new(remote.ip(), None).unwrap(),
+                dscp: path::Dscp::new(0).unwrap(),
+            };
+            let route = host.paths().resolve(request).unwrap().key().route();
+            host.remove_route(route).unwrap();
+            let id = a.execute(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
+            assert_eq!(
+                a.execute(id, Op::Connect(remote)).unwrap_err(),
+                ENETUNREACH,
+                "v6={v6} {quiet:?}"
+            );
+            assert!(a.sockets[&id].quiet_open.is_none(), "v6={v6} {quiet:?}");
+            a.service_egress().unwrap();
+            assert!(wire.lock().unwrap().sent.is_empty());
+        }
+    }
 }

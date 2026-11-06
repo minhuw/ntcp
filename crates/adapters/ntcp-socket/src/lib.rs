@@ -35,6 +35,8 @@ pub use config::{
     Backend, IoConfig, PortConfig, SegmentRoute, SocketConfig, SocketPolicy, SourceQuiet,
 };
 #[cfg(feature = "tfo-linux-cookie")]
+pub use config::ConfiguredFastOpenKey;
+#[cfg(feature = "tfo-linux-cookie")]
 pub use ntcp::LinuxSipHash24Key;
 pub use ntcp::wire::FastOpenCookie;
 pub use ntcp::{FastOpenClientPolicy, FastOpenCookiePolicy, FastOpenEarlyDataPolicy, RoutePolicy};

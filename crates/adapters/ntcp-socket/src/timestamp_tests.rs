@@ -271,7 +271,7 @@ fn timestamp_runtime_injected_hardware_rx_last_byte_and_tx_after_ack() {
     );
     a.execute(client, Op::Write(b"abcdef".to_vec())).unwrap();
     let now = a.now();
-    let pair = ClockPair::sample(&a);
+    let pair = ClockPair::sample(&mut a).unwrap();
     let mut bytes = [0; 1480];
     let tx = a
         .endpoint
@@ -326,7 +326,8 @@ fn timestamp_runtime_injected_hardware_rx_last_byte_and_tx_after_ack() {
             },
         )
         .unwrap();
-    a.drain_timestamps(ClockPair::sample(&a));
+    let current = ClockPair::sample(&mut a).unwrap();
+    a.drain_timestamps(current);
     let records = timestamp_records(&a, client);
     assert_eq!(records.len(), 2);
     assert_eq!((records[0].2, records[0].3), (1234567890, 0));
@@ -539,7 +540,8 @@ fn timestamp_runtime_pending_and_queued_ids_use_different_option_epochs() {
         .unwrap();
     let frame = ip_packet(&a, tx, &bytes[..tx.len]);
     a.timestamp_packet(tx.tx_timestamp, &frame);
-    a.drain_timestamps(ClockPair::sample(&a));
+    let current = ClockPair::sample(&mut a).unwrap();
+    a.drain_timestamps(current);
     assert_eq!(timestamp_records(&a, client)[0].1, 4);
     timestamp_set(&mut a, client, ts::OPT_TSONLY);
     a.endpoint
@@ -550,7 +552,8 @@ fn timestamp_runtime_pending_and_queued_ids_use_different_option_epochs() {
             ntcp::TxTimestampClock::RealtimeNanoseconds,
         )
         .unwrap();
-    a.drain_timestamps(ClockPair::sample(&a));
+    let current = ClockPair::sample(&mut a).unwrap();
+    a.drain_timestamps(current);
     assert_eq!(timestamp_records(&a, client)[1].1, 0);
     timestamp_set(&mut a, client, flags);
     b.input(b.now(), tx.ip, 0, &bytes[..tx.len]).unwrap();
@@ -618,7 +621,7 @@ fn timestamp_runtime_pending_tsonly_toggles_keep_actual_packet_or_drop_honestly(
                 ntcp::TxTimestampClock::RealtimeNanoseconds,
             )
             .unwrap();
-        let pair = ClockPair::sample(&a);
+        let pair = ClockPair::sample(&mut a).unwrap();
         timestamp_allocator::failing(|| a.drain_timestamps(pair));
         let records = timestamp_records(&a, client);
         if starve && !final_tsonly {
@@ -698,7 +701,7 @@ fn timestamp_runtime_joint_zerocopy_reservation_is_fallible_before_acceptance() 
             ntcp::TxTimestampClock::RealtimeNanoseconds,
         )
         .unwrap();
-    let pair = ClockPair::sample(&a);
+    let pair = ClockPair::sample(&mut a).unwrap();
     timestamp_allocator::failing(|| a.drain_timestamps(pair));
     assert_eq!(a.sockets[&client].completions.len(), 5);
     assert_eq!(a.sockets[&client].completions.capacity(), capacity);
@@ -802,7 +805,7 @@ fn timestamp_runtime_packet_allocation_failure_preserves_tsonly_completion() {
             ntcp::TxTimestampClock::RealtimeNanoseconds,
         )
         .unwrap();
-    let pair = ClockPair::sample(&a);
+    let pair = ClockPair::sample(&mut a).unwrap();
     timestamp_allocator::failing(|| a.drain_timestamps(pair));
     assert_eq!(timestamp_records(&a, client)[0].4, 0);
     assert!(a.timestamp_charge() < before);

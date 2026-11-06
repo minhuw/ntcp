@@ -18,6 +18,7 @@ fn endpoint() -> Endpoint {
         },
         [1; 32],
         0,
+        crate::SETTLED,
         |_| true,
     )
     .unwrap()

@@ -229,6 +229,10 @@ fn run() -> io::Result<()> {
     let local: IpAddr = args[2].parse().unwrap();
     let peer: IpAddr = args[3].parse().unwrap();
     let mut config = api::SocketConfig::new("t5n", local);
+    // The harness created this address in a fresh namespace for this run,
+    // so nothing was emitted from it before: this states the fact for the
+    // IP Identification and TCP quiet periods alike.
+    config.io.source_quiet = api::SourceQuiet::Never;
     config.io.backend = api::Backend::AfPacket;
     config.io.prefix = Some(if local.is_ipv4() { 24 } else { 64 });
     config.io.next_hop_mac = Some([2, 0, 0, 0, 0, 1]);
@@ -236,6 +240,17 @@ fn run() -> io::Result<()> {
     config.fast_open_cookie_lifetime =
         ntcp::FastOpenCookieLifetime::from_micros(args[6].parse().unwrap()).unwrap();
     config.fast_open_managed_keys = Some(args[7] == "1");
+    // A key's lease is transport time: CLOCK_BOOTTIME microseconds of this
+    // boot, named by its boot id.
+    let mut clock = ntcp_clock::TransportClock::new().map_err(io::Error::other)?;
+    let now = clock.sample().map_err(io::Error::other)?.ticks;
+    let life = config.fast_open_cookie_lifetime.as_micros();
+    let lease = ntcp::FastOpenKeyLease {
+        not_before: now,
+        issue_until: now + life,
+        accept_until: now + life,
+        units_per_second: 1_000_000,
+    };
     if args[4] == "linux" {
         // Raw key bytes come from the OS CSPRNG and remain raw key bytes.
         let mut key = [0; 16];
@@ -243,14 +258,20 @@ fn run() -> io::Result<()> {
         config.fast_open_cookie_policy =
             api::FastOpenCookiePolicy::LinuxSipHash24(api::LinuxSipHash24Key::new(key));
         if args[7] == "0" {
-            let life = config.fast_open_cookie_lifetime.as_micros();
-            config.fast_open_key_lease = Some(ntcp::FastOpenKeyLease {
-                not_before: 0,
-                issue_until: life,
-                accept_until: life,
-                units_per_second: 1_000_000,
-            });
+            config.fast_open_key_lease = Some(lease);
+            config.fast_open_key_boot_id = Some(clock.characterization().boot_id);
         }
+    }
+    // The `rotate` command selects this configured key: rotation is operator
+    // configuration, with the key's own lease.
+    let mut rotation = [0u8; 16];
+    if server {
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut rotation)?;
+        config.fast_open_keys.push(api::ConfiguredFastOpenKey {
+            key: api::LinuxSipHash24Key::new(rotation),
+            lease,
+        });
+        config.fast_open_key_boot_id = Some(clock.characterization().boot_id);
     }
     let disabled = args[8] == "1";
     config.socket.fast_open_client_enabled = !disabled;
@@ -261,11 +282,6 @@ fn run() -> io::Result<()> {
             socket: socket.into(),
             allow_uids: Vec::new(),
         });
-        // Those cases also state the deployment knowledge io.source_quiet
-        // = never: the harness created this address in a fresh namespace,
-        // so nothing emitted from it before (DF-clear output of a disabled
-        // IPv4 route needs Identifications at once).
-        config.io.source_quiet = api::SourceQuiet::Never;
     }
     // The T17 Segment Routing case states one owner `ipv6.srh.<prefix>`
     // line, read by the production configuration parser and installed by
@@ -315,10 +331,8 @@ fn run() -> io::Result<()> {
         }
         if fields[0] == "rotate" {
             let fd = listener.ok_or_else(|| io::Error::other("rotation needs listener"))?;
-            let mut key = [0u8; 16];
-            std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
             check(unsafe {
-                api::setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_KEY, key.as_ptr().cast(), 16)
+                api::setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_KEY, rotation.as_ptr().cast(), 16)
             })?;
             emit("{\"event\":\"rotated\",\"mechanism\":\"TCP_FASTOPEN_KEY\",\"new_policy\":\"linux-raw-cookie\",\"secret_logged\":false}".into());
             continue;
@@ -792,6 +806,10 @@ fn scoped(args: &[String]) -> io::Result<()> {
 //   listen PORT          bind [LOCAL]:PORT (retrying while tentative), listen
 //   accept ID            accept one connection on that listener
 //   connect ID PEER PORT actively open to [PEER]:PORT and wait until established
+//   start ID PEER PORT   nonblocking connect only: report what it returned
+//   pending ID           report readiness and SO_ERROR without waiting
+//   finish ID            wait for writability, then report SO_ERROR
+//   clock                report the transport provider's sample and boot age
 //   send ID N SALT       write N bytes (pattern SALT)
 //   recv ID N SALT       read and verify N bytes (pattern SALT)
 //   shutdown ID          shut down the sending direction
@@ -810,7 +828,22 @@ fn phased(args: &[String]) -> io::Result<()> {
     if index == 0 {
         return Err(io::Error::last_os_error());
     }
-    api::configure(config)?;
+    // A fixed next hop is the T5 topology: a userspace-owned port whose
+    // address the kernel does not hold, explicitly assigned as in `run`.
+    match config.io.next_hop_mac {
+        Some(next_hop_mac) => api::configure_with_packet_io(config, move || {
+            Ok(api::EthernetPacketIo {
+                io: Box::new(ntcp_io_af_packet::AfPacket::bind(
+                    index,
+                    if local.is_ipv4() { 0x0800 } else { 0x86dd },
+                )?),
+                local_mac: [2, 0, 0, 0, 0, 2],
+                next_hop_mac: Some(next_hop_mac),
+            })
+        })?,
+        None => api::configure(config)?,
+    }
+    let mut clock = ntcp_clock::TransportClock::new().map_err(io::Error::other)?;
     let family = if local.is_ipv4() { AF_INET } else { AF_INET6 };
     emit(format!(
         "{{\"event\":\"ready\",\"backend\":\"AfPacket\",\"packet_test\":false,\"local\":\"{local}\",\"index\":{index}}}"
@@ -883,6 +916,51 @@ fn phased(args: &[String]) -> io::Result<()> {
                 emit(format!(
                     "{{\"event\":\"connected\",\"id\":{id:?},\"attempts\":{attempts},{}}}",
                     connection(fd, index)?
+                ));
+            }
+            Some("start") => {
+                let peer: IpAddr = fields.get(2).and_then(|f| f.parse().ok()).ok_or_else(invalid)?;
+                let (addr, len) = address(SocketAddr::new(peer, number(3)? as u16));
+                let fd = check(unsafe { api::socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0) })?;
+                let result = unsafe { api::connect(fd, (&addr as *const sockaddr_storage).cast(), len) };
+                let error = if result < 0 {
+                    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                } else {
+                    0
+                };
+                connections.push((id.clone(), fd));
+                emit(format!(
+                    "{{\"event\":\"started\",\"id\":{id:?},\"result\":{result},\"errno\":{error}}}"
+                ));
+            }
+            Some("pending") => {
+                let fd = fd()?;
+                let mut p = pollfd {
+                    fd,
+                    events: POLLIN | POLLOUT,
+                    revents: 0,
+                };
+                check(unsafe { libc::poll(&mut p, 1, 0) })?;
+                emit(format!(
+                    "{{\"event\":\"pending\",\"id\":{id:?},\"revents\":{},\"so_error\":{}}}",
+                    p.revents,
+                    so_error(fd)?
+                ));
+            }
+            Some("finish") => {
+                let fd = fd()?;
+                wait(fd, POLLOUT, deadline)?;
+                emit(format!(
+                    "{{\"event\":\"finished\",\"id\":{id:?},\"so_error\":{}}}",
+                    so_error(fd)?
+                ));
+            }
+            Some("clock") => {
+                let ticks = clock.sample().map_err(io::Error::other)?.ticks;
+                emit(format!(
+                    "{{\"event\":\"clock\",\"ticks\":{ticks},\"boot_age_us\":{},\"boot_id\":\"{}\"}}",
+                    clock.boot_age(ticks).map_err(io::Error::other)?,
+                    clock.characterization().boot_id
                 ));
             }
             Some("send") => {

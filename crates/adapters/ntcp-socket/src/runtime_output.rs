@@ -97,7 +97,9 @@ impl Owner {
         // Failed/unchanged queries must neither spin nor kill other connections.
         // Keep the rejected obligation parked until its original deadline.
         if let Ok(Some(mtu)) = result {
-            let now = self.now();
+            let Ok(now) = self.clock() else {
+                return;
+            };
             let ingress = self.ports[port].ingress;
             let changed = if let (Some(host), Some(ingress)) = (&mut self.host, ingress) {
                 let changed = host
@@ -121,7 +123,7 @@ impl Owner {
                     .is_some_and(|p| p.first_hop_mtu != mtu)
                     && self
                         .endpoint
-                        .set_endpoint_first_hop_mtu(self.now(), mtu)
+                        .set_endpoint_first_hop_mtu(now, mtu)
                         .is_ok()
             } else {
                 false
@@ -138,9 +140,13 @@ impl Owner {
         }
     }
 
-    pub(super) fn output_wait(&self) -> std::time::Duration {
+    pub(super) fn output_wait(&mut self) -> std::time::Duration {
+        // The owner loop ends on this failure at its next turn.
+        let Ok(now) = self.clock() else {
+            return std::time::Duration::ZERO;
+        };
         let egress = self.egress.as_ref().unwrap();
-        egress.wait(self.now(), self.endpoint.next_deadline())
+        egress.wait(now, self.endpoint.next_deadline())
     }
 }
 

@@ -493,9 +493,23 @@ impl Owner {
     // process may have used the same addresses on a real link, so
     // identifiers wait one full MDL after this Host starts (and DF-clear
     // IP_PMTUDISC_DONT packets are held until then); with it, the
-    // allocator starts after the asserted quiet period (`QuietFor`).
-    fn identifier_continuity(&self) -> ntcp_host::Continuity {
-        self.source_quiet.continuity(self.now())
+    // allocator starts after the asserted quiet period (`QuietFor`). Each
+    // owned address then has its own fact; the start's is the latest of them
+    // and covers only sources this runtime does not own.
+    fn identifier_continuity(&mut self) -> Result<ntcp_host::Continuity> {
+        let latest = self
+            .port_quiet
+            .iter()
+            .fold(self.source_quiet, |fact, (_, port)| match (fact, *port) {
+                (crate::SourceQuiet::Unknown, _) | (_, crate::SourceQuiet::Unknown) => {
+                    crate::SourceQuiet::Unknown
+                }
+                (crate::SourceQuiet::Never, other) | (other, crate::SourceQuiet::Never) => other,
+                (crate::SourceQuiet::Seconds(a), crate::SourceQuiet::Seconds(b)) => {
+                    crate::SourceQuiet::Seconds(a.min(b))
+                }
+            });
+        Ok(latest.continuity(self.clock()?))
     }
 
     // Complete the constructor using the actual configured ports, the
@@ -643,11 +657,23 @@ impl Owner {
         host.set_entropy(Box::new(|bytes: &mut [u8]| {
             ports::fill(bytes).map_err(|_| ntcp_host::EntropyError)
         }));
+        let fresh = previous.is_none();
         host.start_identifiers(match previous {
             Some(allocator) => ntcp_host::Continuity::Transfer(allocator),
-            None => self.identifier_continuity(),
+            None => self.identifier_continuity()?,
         })
         .map_err(host_error)?;
+        if fresh {
+            let at = self.clock()?;
+            let own = core::iter::once((self.local, self.source_quiet))
+                .chain(self.port_quiet.iter().copied());
+            for (address, fact) in own {
+                if let Some(seconds) = fact.quiet_seconds() {
+                    host.start_source_identifiers(address, at, seconds)
+                        .map_err(host_error)?;
+                }
+            }
+        }
         for (i, &(mtu, _, max_ip_packet)) in links.iter().enumerate() {
             let receive = ReceiveCapabilities {
                         max_ip_packet,
@@ -697,7 +723,7 @@ impl Owner {
                 (true, IpAddr::V6(address)) => {
                     host.add_neighbor_address(ingress.link(), address)
                         .map_err(host_error)?;
-                    host.neighbor_membership_ready(ingress.link(), address, self.now())
+                    host.neighbor_membership_ready(ingress.link(), address, self.clock()?)
                         .map_err(host_error)?;
                 }
                 // A link-local address is this port's own, scoped by its link.
@@ -893,7 +919,7 @@ impl Owner {
             ports.push(port);
         }
         let secret = random_secret()?;
-        let mut owner = Self::with_ports(ports, secret, tcp)?;
+        let mut owner = Self::with_ports(ports, secret, tcp, config.continuity())?;
         owner.initialize_socket_config(config)?;
         owner.attach_backend_host(1)?;
         owner.enable_egress(config.io.egress_capacity, config.io.gso)?;
@@ -911,6 +937,7 @@ impl Owner {
             next_hop_mac: config.io.next_hop_mac,
             gateways: config.io.gateways.clone(),
             neighbors: config.io.neighbors.clone(),
+            source_quiet: config.io.source_quiet,
         };
         let mut ports = Vec::new();
         ports
@@ -961,7 +988,7 @@ impl Owner {
             return Err(EINVAL);
         };
         let secret = random_secret()?;
-        let mut owner = Self::with_ports(ports, secret, tcp)?;
+        let mut owner = Self::with_ports(ports, secret, tcp, config.continuity())?;
         owner.initialize_socket_config(config)?;
         owner.attach_backend_host(u64::from(index))?;
         owner.enable_reservations(&config.io)?;
@@ -1152,7 +1179,7 @@ impl Owner {
         if self.unmapped_redirect(datagram) {
             return None;
         }
-        let now = self.now();
+        let now = self.clock().ok()?;
         match self
             .host
             .as_mut()?
@@ -1238,7 +1265,7 @@ impl Owner {
         link_multicast: bool,
         out: &'a mut [u8],
     ) -> Option<ntcp_host::Datagram<'a>> {
-        let now = self.now();
+        let now = self.clock().ok()?;
         let ingress = self.ports.get(port)?.ingress?;
         match self
             .host
@@ -1257,7 +1284,7 @@ impl Owner {
         &mut self,
         datagram: ntcp_host::Datagram<'a>,
     ) -> Option<ntcp_host::Processed<'a>> {
-        let now = self.now();
+        let now = self.clock().ok()?;
         let host = self.host.as_ref()?;
         let mut recording = Recording {
             clock: &mut self.ipv4_clock,
@@ -1328,8 +1355,11 @@ impl Owner {
             return;
         }
         if p.protocol == 6 {
+            let Ok(now) = self.clock() else {
+                return;
+            };
             let _ = self.input_segmented(
-                self.now(),
+                now,
                 arrival,
                 p.ip,
                 p.traffic_class,
@@ -1351,6 +1381,9 @@ impl Owner {
             if feedback.kind == ntcp_icmp::FeedbackKind::SourceQuench {
                 return;
             }
+            let Ok(now) = self.clock() else {
+                return;
+            };
             let q = feedback.quoted;
             let tuple = ntcp::Tuple {
                 local: SocketAddr::new(q.ip.source, q.source_port),
@@ -1358,7 +1391,7 @@ impl Owner {
             };
             if feedback.kind == ntcp_icmp::FeedbackKind::PacketTooBig {
                 let _ = self.endpoint.pmtu_feedback(
-                    self.now(),
+                    now,
                     tuple,
                     q.sequence,
                     q.ip_packet_len,
@@ -1369,9 +1402,7 @@ impl Owner {
                 .ipv4_network_error()
                 .or_else(|| feedback.ipv6_network_error())
             {
-                let _ = self
-                    .endpoint
-                    .network_error(self.now(), tuple, q.sequence, error);
+                let _ = self.endpoint.network_error(now, tuple, q.sequence, error);
             }
         }
     }
@@ -1424,7 +1455,8 @@ impl Owner {
                 }
             }
         }
-        self.drain_timestamps(ClockPair::sample(self));
+        let pair = ClockPair::sample(self).map_err(std::io::Error::from_raw_os_error)?;
+        self.drain_timestamps(pair);
         self.cancel_unused_backend_timestamps();
         Ok(())
     }
