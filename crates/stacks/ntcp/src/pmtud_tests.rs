@@ -1329,3 +1329,154 @@ fn parse_ip_test(
 
 #[path = "pmtud_ipv6_evidence_tests.rs"]
 mod ipv6_evidence;
+
+// Exchanges every packet without loss and drains the receiver until the
+// sender's stream is acknowledged; the sender's retransmission timer never
+// fires (no stall waits for an RTO).
+fn drain_lossless(a: &mut Connection, b: &mut Connection, mut now: u64, received: &mut Vec<u8>) -> u64 {
+    let mut out = vec![0; 65_575];
+    let mut read = vec![0; 65_536];
+    for _ in 0..10_000 {
+        let mut moved = false;
+        while let Some(n) = a.transmit(now, &mut out).unwrap() {
+            b.input(now, &wire::parse(ip(a.tuple), &out[..n]).unwrap()).unwrap();
+            moved = true;
+        }
+        while let Some(n) = b.transmit(now, &mut out).unwrap() {
+            a.input(now, &wire::parse(ip(b.tuple), &out[..n]).unwrap()).unwrap();
+            moved = true;
+        }
+        let n = match b.read(&mut read) {
+            Err(Error::WouldBlock) => 0,
+            n => n.unwrap(),
+        };
+        received.extend_from_slice(&read[..n]);
+        moved |= n != 0;
+        if a.flight() == 0 && a.send.len() == 0 {
+            return now;
+        }
+        if !moved {
+            now = [a.next_deadline(), b.next_deadline()]
+                .into_iter()
+                .flatten()
+                .min()
+                .expect("a pending deadline")
+                .max(now + 1);
+            assert!(a.rto_deadline.is_none_or(|d| d > now), "recovery waited for an RTO");
+            a.timeout(now).unwrap();
+            b.timeout(now).unwrap();
+            assert_eq!(a.consecutive_timeouts, 0);
+        }
+    }
+    panic!("stream did not drain");
+}
+
+// Sends everything the sender has queued (or its retransmission) and drops it.
+fn send_and_drop(a: &mut Connection, now: u64) -> Vec<usize> {
+    let mut out = vec![0; 65_575];
+    let mut sizes = Vec::new();
+    while let Some(n) = a.transmit(now, &mut out).unwrap() {
+        sizes.push(n);
+    }
+    sizes
+}
+
+#[test]
+// RFC 4821 section 7.7 after an earlier fallback and delivered recovery: a
+// renewed full stop resets eff_pmtu and search_low to the initial 1024 at
+// R1 (above the loss-inferred 512) and halves at the next timeout. The
+// raising timeout keeps the byte window (RFC 4821 section 4; RFC 5681
+// section 3.1 "no more than" one SMSS) and its ssthresh, its retransmission
+// still leaves and the stream drains through the receiver without another
+// RTO; a later decrease follows the normal one-SMSS response.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+//= type=test
+//= reason=User disposition (decision A, 2026-11-06, recorded): the reset is read as bounded by independently validated path ceilings, and the MAY of even lower bounds is not selected. Pmtud::timeout takes the black-hole action at R1, the third successive data RTO without cumulative progress or an explaining ICMP message since progress, with discovery enabled: if eff_pmtu is larger than search_low it sets eff_pmtu to search_low; otherwise it sets both eff_pmtu and search_low to the initial search_low, which may raise packet size above a loss-inferred estimate, bounded by reset_ceiling (first-hop, transport and configured search maximum, route policy and initial_search_high, administrative value, negative search evidence, accepted Packet Too Big authority and the managed shared estimate), never by the connection's current eff_pmtu. Each further successive timeout halves both, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6 (also bounded by the reset ceiling), clears probe and verification state and applies the fivefold cooldown. Accepted Packet Too Big authority outlives its hold and is released only by authorized path replacement or a larger acknowledged probe. A timeout whose reset raises the MSS keeps the byte cwnd held before the raise and its ssthresh (RFC 4821 section 4, RFC 5681 section 3.1); its retransmission and go-back-N repair leave within that window and the stream completes without another RTO; a later decrease takes the one-SMSS response. A loss-only fallback never publishes to or lowers the shared estimate. Real receiver traces in both families, SACK and non-SACK, across sequence wrap: IPv4 1500 to 1024 at RTO 3 and 512 at RTO 4, delivered recovery, then a renewed full stop resets to 1024 and halves to 512; IPv6 with initial search_low 1400: 1500 to 1400 to 1280, recovery, reset to 1400 then 1280. Route policy, first-hop, administrative, Packet Too Big and shared-estimate bounds clip the reset; with discovery disabled no fallback is taken, and re-enabling it during a run takes the run's first action (ntcp pmtud_reset_trace_tests.rs and pmtud_tests.rs, ntcp-host tests/black_hole_reset.rs).
+//# The response to a detected black hole depends on the current values for search_low
+//# and eff_pmtu. If eff_pmtu is larger than search_low, set eff_pmtu to search_low.
+//# Otherwise, set both eff_pmtu and search_low to the initial value for search_low.
+//# Upon additional successive timeouts, search_low and eff_pmtu SHOULD be halved, with
+//# a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6. Even lower lower bounds
+//# MAY be permitted to support limited operation over links with MTUs that are smaller
+//# than permitted by the IP specifications.
+fn renewed_full_stop_resets_without_raising_the_byte_window() {
+    for halve in [false, true] {
+        let (mut a, mut b) = family_pair(ConnectionConfig { delayed_ack_us: 0, sack: false, ..cfg(1500) }, true, 0);
+        let data: Vec<u8> = (0..12_000u32).map(|i| (i % 251) as u8).collect();
+        let mut received = Vec::new();
+        a.write(&data[..4_000]).unwrap();
+        send_and_drop(&mut a, 40);
+        let mut expiry = 0;
+        for count in 1..=4 {
+            expiry = a.loss_timer.unwrap().1;
+            a.timeout(expiry).unwrap();
+            assert_eq!(a.consecutive_timeouts, count);
+            if count < 4 {
+                send_and_drop(&mut a, expiry);
+            }
+        }
+        let info = a.path_mtu_info().unwrap();
+        assert_eq!((info.current_mtu, info.search_low), (512, 512));
+        // Delivered recovery through the receiver clears the run.
+        let now = drain_lossless(&mut a, &mut b, expiry, &mut received);
+        assert_eq!(a.consecutive_timeouts, 0);
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, 512);
+        // New full stop.
+        a.write(&data[4_000..]).unwrap();
+        send_and_drop(&mut a, now + 1);
+        for _ in 1..=2 {
+            let expiry = a.loss_timer.unwrap().1;
+            a.timeout(expiry).unwrap();
+            send_and_drop(&mut a, expiry);
+            assert_eq!(a.path_mtu_info().unwrap().current_mtu, 512);
+        }
+        let (window, ssthresh, mss) = (a.congestion.cwnd(), a.congestion.ssthresh(), a.mss);
+        assert_eq!(window, mss as u32);
+        let expiry = a.loss_timer.unwrap().1;
+        a.timeout(expiry).unwrap();
+        let info = a.path_mtu_info().unwrap();
+        assert_eq!((info.current_mtu, info.search_low), (1024, 1024));
+        assert!(a.mss > mss);
+        // Bytes not raised: no more than one current SMSS and the window
+        // held before the raise; the repeated timeout keeps ssthresh.
+        assert_eq!(a.congestion.cwnd(), window);
+        assert_eq!(a.congestion.ssthresh(), ssthresh);
+        let mut now = expiry;
+        if halve {
+            send_and_drop(&mut a, expiry);
+            now = a.loss_timer.unwrap().1;
+            a.timeout(now).unwrap();
+            let info = a.path_mtu_info().unwrap();
+            assert_eq!((info.current_mtu, info.search_low), (512, 512));
+            assert_eq!(a.congestion.cwnd(), a.mss as u32);
+            assert_eq!(a.congestion.ssthresh(), ssthresh);
+        }
+        // The mandatory retransmission of SND.UNA leaves despite cwnd below
+        // one SMSS, within the current packet budget.
+        let una = a.snd_una;
+        let retry = wire_packet(&mut a, now, OutgoingIpv4Options::default());
+        let parsed = parse_ip_test(&retry, false).unwrap();
+        let segment = wire::parse(ip(a.tuple), parsed.payload).unwrap();
+        assert_eq!(segment.header.sequence, una.0);
+        assert!(retry.len() <= a.path_mtu_info().unwrap().current_mtu as usize);
+        b.input(now, &segment).unwrap();
+        let reply = packet(&mut b, now);
+        a.input(now, &wire::parse(ip(b.tuple), &reply).unwrap()).unwrap();
+        assert!(a.snd_una.after(una));
+        if !halve {
+            // Slow start leaves cwnd below the raised SMSS: go-back-N repair
+            // is admitted within the free window instead of waiting for a
+            // full SMSS of credit (another RTO).
+            let cwnd = a.congestion.cwnd();
+            assert!(cwnd < a.mss as u32);
+            let una = a.snd_una;
+            let repair = packet(&mut a, now);
+            let segment = wire::parse(ip(a.tuple), &repair).unwrap();
+            assert_eq!(segment.header.sequence, una.0);
+            assert!(!segment.payload.is_empty() && segment.payload.len() as u32 <= cwnd);
+            b.input(now, &segment).unwrap();
+        }
+        drain_lossless(&mut a, &mut b, now, &mut received);
+        assert_eq!(received, data);
+    }
+}

@@ -19659,10 +19659,14 @@ mod output_policy;
 mod output_reservation_policy;
 #[path = "pmtud_isolated_cc_tests.rs"]
 mod pmtud_isolated_cc;
+#[path = "pmtud_detector_boundary_tests.rs"]
+mod pmtud_detector_boundary;
 #[path = "pmtud_lifecycle_tests.rs"]
 mod pmtud_lifecycle;
 #[path = "pmtud_tests.rs"]
 mod pmtud_policy;
+#[path = "pmtud_reset_trace_tests.rs"]
+mod pmtud_reset_trace;
 #[path = "connection_ptb_tests.rs"]
 mod ptb_repair;
 #[path = "connection_ptb_scheduler_tests.rs"]

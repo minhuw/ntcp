@@ -179,6 +179,14 @@ pub(crate) struct Pmtud {
     high_limit: Option<u32>,
     // Negative network evidence survives temporary administrative clipping.
     discovered_high: Option<u32>,
+    // Lowest accepted Packet Too Big size: network authority, unlike the
+    // probe-failure evidence above, that outlives the hold and ages only by
+    // path replacement or a larger acknowledged probe. It bounds the
+    // black-hole reset, never the upward search.
+    ptb_ceiling: Option<u32>,
+    // The managed path's shared estimate (RFC 1191 section 5's current PMTU
+    // estimate): a reset bound that loss inference never publishes to.
+    shared_estimate: Option<u32>,
     low_limit: Option<u32>,
     plateaus: Ipv4Plateaus,
     // PTB hold / failed-probe suppression; Infinity never disables this timer.
@@ -196,6 +204,9 @@ pub(crate) struct Pmtud {
     // Exact span and size of the latest probe whose delivery proved its size.
     success: Option<(Seq, Seq, u32)>,
     icmp_since_progress: bool,
+    // The current full-stop run already took its first recovery action; a
+    // run whose third timeout found discovery disabled has not.
+    fallback_taken: bool,
     max_sent: u32,
     max_acked: u32,
     // ponytail: 64 recent exact packets; evicted quotes are ignored, never
@@ -276,6 +287,8 @@ impl Pmtud {
             periodic_deadline: None,
             high_limit: config.initial_search_high,
             discovered_high: None,
+            ptb_ceiling: None,
+            shared_estimate: None,
             low_limit: config.initial_search_low,
             plateaus: config.policy.ipv4_plateaus,
             deadline: None,
@@ -288,6 +301,7 @@ impl Pmtud {
             applied_pending: None,
             success: None,
             icmp_since_progress: false,
+            fallback_taken: false,
             max_sent: 0,
             max_acked: 0,
             sent: [None; 64],
@@ -596,9 +610,23 @@ impl Pmtud {
         self.applied_pending = None;
         self.success = None;
         self.discovered_high = None;
+        self.ptb_ceiling = None;
         self.info.search_low = self.initial_low.min(self.route_bound());
         self.info.search_high = self.search_ceiling();
         self.info.current_mtu = self.info.search_low;
+    }
+
+    /// The managed path's shared estimate. Within one path incarnation it
+    /// grows only through confirmed delivery, which is validated growth past
+    /// any smaller accepted PTB.
+    pub(crate) fn set_shared_estimate(&mut self, estimate: Option<u32>) {
+        if let (Some(new), Some(ceiling)) = (estimate, self.ptb_ceiling)
+            && self.shared_estimate.is_some_and(|old| new > old)
+            && new > ceiling
+        {
+            self.ptb_ceiling = None;
+        }
+        self.shared_estimate = estimate;
     }
 
     /// Challenge a shared ordinary ceiling with real TCP data. Existing local
@@ -726,7 +754,7 @@ impl Pmtud {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
-    //= reason=Real receiver NewReno/SACK/RACK traces in both families across serial wrap contrast leading-original delivery before DupThresh/RACK settling, actual leading-plus-probe loss, late leading delivery after detection, and reorder without probe loss. Finite tail/recovery proof gates isolation; other detected loss commits congestion response with unchanged MTU bounds and eventual stream progress. Existing trailing-hole, repair-copy, ECN, matching-PTB and inconclusive-RTO controls remain complementary. Full timing/reordering robustness beyond these detector conditions remains unestablished; sufficiently late leading originals are conservatively treated as other loss, not magically identified as reorder. Retain the whole timely/robust loss-reporting advice as TODO for that evidence/interpretation boundary.
+    //= reason=Real receiver NewReno/SACK/RACK traces in both families across serial wrap contrast leading-original delivery before DupThresh/RACK settling, actual leading-plus-probe loss, late leading delivery after detection, and reorder without probe loss. Table-driven detector-boundary schedules through real receiver Endpoints (pmtud_detector_boundary_tests.rs; both families, serial wrap, PRR off and on, reproducible seeds) add NewReno two versus three eligible duplicate ACKs, RFC 6675 IsLost two versus three discontiguous SACKed ranges and exactly 2*SMSS versus one byte more above the candidate, and RACK at the settling deadline - 1, = and + 1 with ACK-before-timer and timer-before-ACK orderings at equality, observed reordering and the three-SACK transition. At each boundary they lose the decisive or leading-progress ACK, batch genuine receiver ACKs at one tick, reorder leading and trailing originals and lose a repair copy, asserting the provisional classification before finite tail proof, the final isolated, other-loss or timeout outcome, MTU bounds, congestion commitment, packets within the MTU bound and complete delivery, including controls where ACK loss leaves insufficient evidence and recovery waits for a timer; seeded schedules never report an isolated probe loss when another original or a repair copy was lost. Finite tail/recovery proof gates isolation; other detected loss commits congestion response with unchanged MTU bounds and eventual stream progress. Existing trailing-hole, repair-copy, ECN, matching-PTB and inconclusive-RTO controls remain complementary. With PRR, byte-granular repair can end a NewReno isolated probe loss at the RTO, or leave the probe's tail as the RFC 6675 rescue retransmission, which commits the response: more conservative outcomes, with packet-aware recovery left to T22. Full timing/reordering robustness beyond these detector conditions remains unestablished: a finite-time ambiguity, not a missing detector function; sufficiently late leading originals are conservatively treated as other loss, not magically identified as reorder. Counterexample, for the T23 disposition: Drop the probe and withhold its leading original until after the selected loss detector fires. Through that decision, the sender's observations are identical to a run in which both packets were lost. Later delivery of the leading original cannot make the earlier decision distinguish those runs. Losing its progress ACK extends the ambiguity. Retain the whole timely/robust loss-reporting advice as TODO for that evidence/interpretation boundary.
     //# It is important that the Packetization Layer has a timely and robust mechanism for detecting and reporting losses. PLPMTUD makes MTU adjustments on the basis of detected losses. Any delays or inaccuracy in loss notification is likely to result in incorrect MTU decisions or slow convergence. It is important that the mechanism can robustly distinguish between the isolated loss of just a probe and other losses in the probe's leading and trailing windows.
 
     //= https://www.rfc-editor.org/rfc/rfc4821#section-4
@@ -1287,7 +1315,13 @@ impl Pmtud {
             }
         };
         if unchanged {
-            // Drop advice only: no estimate increase or hold restart.
+            // Drop advice only: no estimate increase or hold restart. A
+            // current-path size consistent with proven delivery still
+            // bounds a later black-hole reset, which may otherwise raise
+            // the loss-inferred estimate above it.
+            if advice != Some(false) && mtu >= self.max_acked {
+                self.record_ptb_ceiling(mtu);
+            }
             return accepted(PmtuFeedback::Unchanged);
         }
         //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
@@ -1349,6 +1383,7 @@ impl Pmtud {
         self.icmp_since_progress = true;
         self.info.current_mtu = mtu.min(self.info.current_mtu);
         self.record_upper_limit(mtu);
+        self.record_ptb_ceiling(mtu);
         self.info.search_low = self.info.search_low.min(mtu);
         if original_probe {
             if let Some(p) = &mut self.probe {
@@ -1498,6 +1533,7 @@ impl Pmtud {
             }
         }
         self.icmp_since_progress = false;
+        self.fallback_taken = false;
         for entry in &mut self.sent {
             if let Some(packet) = entry
                 && ack.at_or_after(packet.end)
@@ -1543,6 +1579,11 @@ impl Pmtud {
                     // probe still establishes a network fact for this size.
                     self.success = Some((p.start, p.end, p.size));
                     self.info.search_low = self.info.search_low.max(p.size);
+                    // Validated growth past an accepted PTB (RFC 4821
+                    // section 7.6.1) supersedes it as the reset bound.
+                    if self.ptb_ceiling.is_some_and(|c| p.size > c) {
+                        self.ptb_ceiling = None;
+                    }
                     if p.size > self.info.current_mtu {
                         // Preserve the baseline across successive verified increases.
                         self.verification
@@ -1608,6 +1649,21 @@ impl Pmtud {
         if self.info.search_low >= self.info.search_high {
             self.schedule_aging(now);
         }
+    }
+
+    fn record_ptb_ceiling(&mut self, mtu: u32) {
+        self.ptb_ceiling = Some(self.ptb_ceiling.map_or(mtu, |old| old.min(mtu)));
+    }
+
+    // Independent bounds on a black-hole reset, never the connection's own
+    // (possibly loss-inferred) estimate: first hop and transport, route
+    // policy, configured search maximum, administrative value, negative
+    // search evidence, accepted PTB authority and the shared estimate.
+    fn reset_ceiling(&self) -> u32 {
+        self.search_ceiling()
+            .min(self.discovered_high.unwrap_or(u32::MAX))
+            .min(self.ptb_ceiling.unwrap_or(u32::MAX))
+            .min(self.shared_estimate.unwrap_or(u32::MAX))
     }
 
     fn record_upper_limit(&mut self, mtu: u32) {
@@ -1719,12 +1775,22 @@ impl Pmtud {
     //# [RFC1122] expires.
 
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3
-    //= reason=Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. This is TCP timeout repair, not a new generic go-back-n transport.
+    //= reason=Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. The repair after the timeout is T19's non-SACK go-back-N after RTO: the timed-out flight is resent in order from SND.UNA under slow start, each cumulative ACK releasing the next segments below the timeout's data boundary instead of one segment per backed-off RTO; a SACK connection whose receiver reported no SACKed range after the RTO uses the same in-order selection.
     //# If the loss was detected with a timeout and repaired with go-back-n
     //# retransmission, then congestion window reduction will be necessary. The
     //# relatively high price of a failed probe in this case may merit a longer time
     //# interval until the next probe. A time interval that is five times the
     //# non-timeout failure case (Section 7.6.2) is RECOMMENDED.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+    //= reason=User disposition (decision A, 2026-11-06, recorded): the reset is read as bounded by independently validated path ceilings, and the MAY of even lower bounds is not selected. Pmtud::timeout takes the black-hole action at R1, the third successive data RTO without cumulative progress or an explaining ICMP message since progress, with discovery enabled: if eff_pmtu is larger than search_low it sets eff_pmtu to search_low; otherwise it sets both eff_pmtu and search_low to the initial search_low, which may raise packet size above a loss-inferred estimate, bounded by reset_ceiling (first-hop, transport and configured search maximum, route policy and initial_search_high, administrative value, negative search evidence, accepted Packet Too Big authority and the managed shared estimate), never by the connection's current eff_pmtu. Each further successive timeout halves both, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6 (also bounded by the reset ceiling), clears probe and verification state and applies the fivefold cooldown. Accepted Packet Too Big authority outlives its hold and is released only by authorized path replacement or a larger acknowledged probe. A timeout whose reset raises the MSS keeps the byte cwnd held before the raise and its ssthresh (RFC 4821 section 4, RFC 5681 section 3.1); its retransmission and go-back-N repair leave within that window and the stream completes without another RTO; a later decrease takes the one-SMSS response. A loss-only fallback never publishes to or lowers the shared estimate. Real receiver traces in both families, SACK and non-SACK, across sequence wrap: IPv4 1500 to 1024 at RTO 3 and 512 at RTO 4, delivered recovery, then a renewed full stop resets to 1024 and halves to 512; IPv6 with initial search_low 1400: 1500 to 1400 to 1280, recovery, reset to 1400 then 1280. Route policy, first-hop, administrative, Packet Too Big and shared-estimate bounds clip the reset; with discovery disabled no fallback is taken, and re-enabling it during a run takes the run's first action (ntcp pmtud_reset_trace_tests.rs and pmtud_tests.rs, ntcp-host tests/black_hole_reset.rs).
+    //# The response to a detected black hole depends on the current values for
+    //# search_low and eff_pmtu. If eff_pmtu is larger than search_low, set eff_pmtu to
+    //# search_low. Otherwise, set both eff_pmtu and search_low to the initial value for
+    //# search_low. Upon additional successive timeouts, search_low and eff_pmtu SHOULD
+    //# be halved, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6. Even
+    //# lower lower bounds MAY be permitted to support limited operation over links with
+    //# MTUs that are smaller than permitted by the IP specifications.
 
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
     //# If there is a full-stop timeout and there was not an ICMP message indicating a reason (PTB, Net unreachable, etc., or the ICMP message was ignored for some reason), the RECOMMENDED first recovery action is to treat this as a detected ICMP black hole as defined in [RFC2923].
@@ -1759,25 +1825,28 @@ impl Pmtud {
         //# For TCP, this occurs when the R1 timeout threshold described by
         //# [RFC1122] expires.
         if consecutive >= 3 && !self.icmp_since_progress && !self.disabled {
-            // An explicit conservative transport bound is not an undersized
-            // physical link or PTB. Recovery must never raise packet size or
-            // exceed a current administrative ceiling. Unconfigured IPv6
-            // still retains the normal 1280-byte blackhole fallback floor.
-            let ceiling = self.route_bound().min(self.info.current_mtu);
+            // The reset may raise packet size above a loss-inferred estimate
+            // left by an earlier full stop, but never above an independent
+            // bound (reset_ceiling). An explicit conservative transport
+            // bound is not an undersized physical link or PTB. Unconfigured
+            // IPv6 still retains the normal 1280-byte blackhole fallback
+            // floor; the MAY of lower floors is not selected.
+            let ceiling = self.reset_ceiling();
             let floor = min_mtu(self.ipv4).min(self.initial_low).min(ceiling);
-            let low = if consecutive == 3 {
+            if !self.fallback_taken {
+                // First action of this run, even when discovery was enabled
+                // only after its third timeout.
+                self.fallback_taken = true;
                 if self.info.current_mtu > self.info.search_low {
-                    self.info.search_low
+                    self.info.current_mtu = self.info.search_low.max(floor).min(ceiling);
                 } else {
-                    self.initial_low.min(self.info.current_mtu)
+                    self.info.current_mtu = self.initial_low.min(ceiling);
+                    self.info.search_low = self.info.current_mtu;
                 }
             } else {
-                self.info.current_mtu / 2
+                self.info.current_mtu = (self.info.current_mtu / 2).max(floor).min(ceiling);
             }
-            .max(floor)
-            .min(ceiling);
-            self.info.current_mtu = low;
-            self.info.search_low = self.info.search_low.min(low);
+            self.info.search_low = self.info.search_low.min(self.info.current_mtu);
             self.probe = None;
             self.verification = None;
             self.delay(now, cooldown.saturating_mul(5));
@@ -2533,7 +2602,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3
     //= type=test
-    //= reason=Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. This is TCP timeout repair, not a new generic go-back-n transport.
+    //= reason=Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. The repair after the timeout is T19's non-SACK go-back-N after RTO: the timed-out flight is resent in order from SND.UNA under slow start, each cumulative ACK releasing the next segments below the timeout's data boundary instead of one segment per backed-off RTO; a SACK connection whose receiver reported no SACKed range after the RTO uses the same in-order selection.
     //# If the loss was detected with a timeout and repaired with go-back-n
     //# retransmission, then congestion window reduction will be necessary. The
     //# relatively high price of a failed probe in this case may merit a longer time
@@ -2659,6 +2728,174 @@ mod tests {
         p.sent(Seq(1), Seq(1711), 1750, 20, false);
         p.ack(Seq(1711), 600_000_200, 1000, 1000);
         assert_eq!(p.info.current_mtu, 1750);
+    }
+
+    // Delivered progress of one packet of `size` at `seq` through `now`.
+    fn deliver(p: &mut Pmtud, seq: Seq, size: u32, now: Instant) -> Seq {
+        let end = seq.wrapping_add(size - 40);
+        p.sent(seq, end, size, 20, false);
+        p.ack(end, now, 1000, 1000);
+        end
+    }
+
+    // Successive timeouts `counts` of one full-stop run; returns
+    // (eff_pmtu, search_low) after each.
+    fn full_stop(p: &mut Pmtud, head: Seq, counts: core::ops::RangeInclusive<u32>, now: Instant) -> alloc::vec::Vec<(u32, u32)> {
+        counts
+            .map(|count| {
+                p.timeout(now + u64::from(count), head, count, 1000);
+                (p.info.current_mtu, p.info.search_low)
+            })
+            .collect()
+    }
+
+    // RFC 4821 section 7.7: after a fallback and delivered recovery, a
+    // renewed full stop sets both eff_pmtu and search_low to the initial
+    // search_low (above the loss-inferred value) and halves both at each
+    // further timeout down to the family floor, with the fivefold cooldown.
+    // Serial-number wrap inside the run.
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+    //= type=test
+    //= reason=User disposition (decision A, 2026-11-06, recorded): the reset is read as bounded by independently validated path ceilings, and the MAY of even lower bounds is not selected. Pmtud::timeout takes the black-hole action at R1, the third successive data RTO without cumulative progress or an explaining ICMP message since progress, with discovery enabled: if eff_pmtu is larger than search_low it sets eff_pmtu to search_low; otherwise it sets both eff_pmtu and search_low to the initial search_low, which may raise packet size above a loss-inferred estimate, bounded by reset_ceiling (first-hop, transport and configured search maximum, route policy and initial_search_high, administrative value, negative search evidence, accepted Packet Too Big authority and the managed shared estimate), never by the connection's current eff_pmtu. Each further successive timeout halves both, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6 (also bounded by the reset ceiling), clears probe and verification state and applies the fivefold cooldown. Accepted Packet Too Big authority outlives its hold and is released only by authorized path replacement or a larger acknowledged probe. A timeout whose reset raises the MSS keeps the byte cwnd held before the raise and its ssthresh (RFC 4821 section 4, RFC 5681 section 3.1); its retransmission and go-back-N repair leave within that window and the stream completes without another RTO; a later decrease takes the one-SMSS response. A loss-only fallback never publishes to or lowers the shared estimate. Real receiver traces in both families, SACK and non-SACK, across sequence wrap: IPv4 1500 to 1024 at RTO 3 and 512 at RTO 4, delivered recovery, then a renewed full stop resets to 1024 and halves to 512; IPv6 with initial search_low 1400: 1500 to 1400 to 1280, recovery, reset to 1400 then 1280. Route policy, first-hop, administrative, Packet Too Big and shared-estimate bounds clip the reset; with discovery disabled no fallback is taken, and re-enabling it during a run takes the run's first action (ntcp pmtud_reset_trace_tests.rs and pmtud_tests.rs, ntcp-host tests/black_hole_reset.rs).
+    //# The response to a detected black hole depends on the current values for
+    //# search_low and eff_pmtu. If eff_pmtu is larger than search_low, set eff_pmtu to
+    //# search_low. Otherwise, set both eff_pmtu and search_low to the initial value for
+    //# search_low. Upon additional successive timeouts, search_low and eff_pmtu SHOULD
+    //# be halved, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6. Even
+    //# lower lower bounds MAY be permitted to support limited operation over links with
+    //# MTUs that are smaller than permitted by the IP specifications.
+    fn renewed_full_stop_resets_to_the_initial_low_then_halves() {
+        for ipv4 in [true, false] {
+            let config = PmtudConfig {
+                initial_search_low: (!ipv4).then_some(1400),
+                ..PmtudConfig::new(1500)
+            };
+            let mut p = Pmtud::new(config, 1500, ipv4, 600_000_000).unwrap();
+            let (initial, halved, next) = if ipv4 { (1024, 512, 256) } else { (1400, 1280, 1280) };
+            let head = Seq(u32::MAX - 600);
+            assert_eq!(
+                full_stop(&mut p, head, 1..=4, 100),
+                [(1500, initial), (1500, initial), (initial, initial), (halved, halved)]
+            );
+            let head = deliver(&mut p, head, halved, 200);
+            assert_eq!((p.info.current_mtu, p.info.search_low), (halved, halved));
+            assert_eq!(
+                full_stop(&mut p, head, 1..=5, 300),
+                [(halved, halved), (halved, halved), (initial, initial), (halved, halved), (next, next)]
+            );
+            assert_eq!(p.deadline, Some(305 + 5000));
+            assert!(p.probe.is_none() && p.verification.is_none());
+        }
+    }
+
+    // The first action of a run and the halving floor are unchanged: IPv4
+    // halves to 68, IPv6 stays at 1280. A run whose third timeout found
+    // discovery disabled takes its first action at the first eligible later
+    // timeout instead of halving.
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+    //= type=test
+    //= reason=User disposition (decision A, 2026-11-06, recorded): the reset is read as bounded by independently validated path ceilings, and the MAY of even lower bounds is not selected. Pmtud::timeout takes the black-hole action at R1, the third successive data RTO without cumulative progress or an explaining ICMP message since progress, with discovery enabled: if eff_pmtu is larger than search_low it sets eff_pmtu to search_low; otherwise it sets both eff_pmtu and search_low to the initial search_low, which may raise packet size above a loss-inferred estimate, bounded by reset_ceiling (first-hop, transport and configured search maximum, route policy and initial_search_high, administrative value, negative search evidence, accepted Packet Too Big authority and the managed shared estimate), never by the connection's current eff_pmtu. Each further successive timeout halves both, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6 (also bounded by the reset ceiling), clears probe and verification state and applies the fivefold cooldown. Accepted Packet Too Big authority outlives its hold and is released only by authorized path replacement or a larger acknowledged probe. A timeout whose reset raises the MSS keeps the byte cwnd held before the raise and its ssthresh (RFC 4821 section 4, RFC 5681 section 3.1); its retransmission and go-back-N repair leave within that window and the stream completes without another RTO; a later decrease takes the one-SMSS response. A loss-only fallback never publishes to or lowers the shared estimate. Real receiver traces in both families, SACK and non-SACK, across sequence wrap: IPv4 1500 to 1024 at RTO 3 and 512 at RTO 4, delivered recovery, then a renewed full stop resets to 1024 and halves to 512; IPv6 with initial search_low 1400: 1500 to 1400 to 1280, recovery, reset to 1400 then 1280. Route policy, first-hop, administrative, Packet Too Big and shared-estimate bounds clip the reset; with discovery disabled no fallback is taken, and re-enabling it during a run takes the run's first action (ntcp pmtud_reset_trace_tests.rs and pmtud_tests.rs, ntcp-host tests/black_hole_reset.rs).
+    //# The response to a detected black hole depends on the current values for
+    //# search_low and eff_pmtu. If eff_pmtu is larger than search_low, set eff_pmtu to
+    //# search_low. Otherwise, set both eff_pmtu and search_low to the initial value for
+    //# search_low. Upon additional successive timeouts, search_low and eff_pmtu SHOULD
+    //# be halved, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6. Even
+    //# lower lower bounds MAY be permitted to support limited operation over links with
+    //# MTUs that are smaller than permitted by the IP specifications.
+    fn first_fallback_and_family_floor_are_unchanged() {
+        let mut p = state(true);
+        assert_eq!(
+            full_stop(&mut p, Seq(0), 1..=8, 100),
+            [(1500, 1024), (1500, 1024), (1024, 1024), (512, 512), (256, 256), (128, 128), (68, 68), (68, 68)]
+        );
+        let mut p = state(false);
+        assert_eq!(
+            full_stop(&mut p, Seq(0), 1..=5, 100),
+            [(1500, 1280), (1500, 1280), (1280, 1280), (1280, 1280), (1280, 1280)]
+        );
+        let mut p = state(true);
+        p.set_discovery_disabled(true);
+        assert_eq!(full_stop(&mut p, Seq(0), 1..=3, 100), [(1500, 1024); 3]);
+        p.set_discovery_disabled(false);
+        assert_eq!(full_stop(&mut p, Seq(0), 4..=5, 100), [(1024, 1024), (512, 512)]);
+    }
+
+    // Accepted PTB authority bounds the reset after its hold expired (which
+    // forgets the PTB's search ceiling), including a report that changed no
+    // estimate because loss inference was already lower; a larger
+    // acknowledged probe or an authorized path replacement releases it.
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+    //= type=test
+    //= reason=User disposition (decision A, 2026-11-06, recorded): the reset is read as bounded by independently validated path ceilings, and the MAY of even lower bounds is not selected. Pmtud::timeout takes the black-hole action at R1, the third successive data RTO without cumulative progress or an explaining ICMP message since progress, with discovery enabled: if eff_pmtu is larger than search_low it sets eff_pmtu to search_low; otherwise it sets both eff_pmtu and search_low to the initial search_low, which may raise packet size above a loss-inferred estimate, bounded by reset_ceiling (first-hop, transport and configured search maximum, route policy and initial_search_high, administrative value, negative search evidence, accepted Packet Too Big authority and the managed shared estimate), never by the connection's current eff_pmtu. Each further successive timeout halves both, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6 (also bounded by the reset ceiling), clears probe and verification state and applies the fivefold cooldown. Accepted Packet Too Big authority outlives its hold and is released only by authorized path replacement or a larger acknowledged probe. A timeout whose reset raises the MSS keeps the byte cwnd held before the raise and its ssthresh (RFC 4821 section 4, RFC 5681 section 3.1); its retransmission and go-back-N repair leave within that window and the stream completes without another RTO; a later decrease takes the one-SMSS response. A loss-only fallback never publishes to or lowers the shared estimate. Real receiver traces in both families, SACK and non-SACK, across sequence wrap: IPv4 1500 to 1024 at RTO 3 and 512 at RTO 4, delivered recovery, then a renewed full stop resets to 1024 and halves to 512; IPv6 with initial search_low 1400: 1500 to 1400 to 1280, recovery, reset to 1400 then 1280. Route policy, first-hop, administrative, Packet Too Big and shared-estimate bounds clip the reset; with discovery disabled no fallback is taken, and re-enabling it during a run takes the run's first action (ntcp pmtud_reset_trace_tests.rs and pmtud_tests.rs, ntcp-host tests/black_hole_reset.rs).
+    //# The response to a detected black hole depends on the current values for
+    //# search_low and eff_pmtu. If eff_pmtu is larger than search_low, set eff_pmtu to
+    //# search_low. Otherwise, set both eff_pmtu and search_low to the initial value for
+    //# search_low. Upon additional successive timeouts, search_low and eff_pmtu SHOULD
+    //# be halved, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6. Even
+    //# lower lower bounds MAY be permitted to support limited operation over links with
+    //# MTUs that are smaller than permitted by the IP specifications.
+    fn reset_is_clipped_by_accepted_ptb_authority_past_its_hold() {
+        let mut p = state(true);
+        p.sent(Seq(0), Seq(1460), 1500, 20, false);
+        assert_eq!(
+            p.legacy_report(10, Seq(0), 1500, 20, 768).feedback,
+            PmtuFeedback::Decreased { mtu: 768 }
+        );
+        p.tick(600_000_010);
+        assert_eq!(p.info.search_high, 1500);
+        let head = deliver(&mut p, Seq(1460), 768, 600_000_020);
+        assert_eq!(
+            full_stop(&mut p, head, 1..=4, 600_000_100),
+            [(768, 768), (768, 768), (768, 768), (384, 384)]
+        );
+        // Validated growth past the PTB releases it.
+        let head = deliver(&mut p, head, 384, 600_010_000);
+        p.start_probe(head, 1160, 3000, 1200);
+        p.sent(head, head.wrapping_add(1160), 1200, 20, false);
+        p.ack(head.wrapping_add(1160), 600_010_100, 1000, 1000);
+        assert_eq!((p.info.current_mtu, p.info.search_low), (1200, 1200));
+        let head = head.wrapping_add(1160);
+        assert_eq!(full_stop(&mut p, head, 3..=3, 600_020_000), [(1024, 1024)]);
+
+        // A report at or above the loss-inferred estimate is drop advice
+        // only, yet still bounds the renewed reset.
+        let mut p = state(true);
+        p.sent(Seq(0), Seq(1460), 1500, 20, false);
+        assert_eq!(full_stop(&mut p, Seq(0), 1..=4, 100)[3], (512, 512));
+        assert_eq!(p.legacy_report(110, Seq(0), 1500, 20, 1006).feedback, PmtuFeedback::Unchanged);
+        let head = deliver(&mut p, Seq(0), 512, 200);
+        assert_eq!(full_stop(&mut p, head, 1..=4, 300)[2..], [(1006, 1006), (503, 503)]);
+        // Path replacement releases every accepted PTB.
+        p.replace_network_authority();
+        let head = deliver(&mut p, head, 512, 350);
+        assert_eq!(full_stop(&mut p, head, 1..=4, 400)[2..], [(1024, 1024), (512, 512)]);
+        let head = deliver(&mut p, head, 512, 500);
+        assert_eq!(full_stop(&mut p, head, 3..=3, 600), [(1024, 1024)]);
+    }
+
+    // A managed path's shared estimate bounds the reset; its growth within
+    // the incarnation (confirmed delivery) releases a smaller accepted PTB.
+    #[test]
+    fn reset_is_clipped_by_the_shared_estimate() {
+        let mut p = state(true);
+        p.set_shared_estimate(Some(1500));
+        assert_eq!(full_stop(&mut p, Seq(0), 1..=4, 100)[3], (512, 512));
+        let head = deliver(&mut p, Seq(0), 512, 200);
+        p.set_shared_estimate(Some(900));
+        assert_eq!(full_stop(&mut p, head, 1..=3, 300)[2], (900, 900));
+        p.sent(head, head.wrapping_add(860), 900, 20, false);
+        assert_eq!(
+            p.legacy_report(400, head, 900, 20, 768).feedback,
+            PmtuFeedback::Decreased { mtu: 768 }
+        );
+        p.tick(600_000_400);
+        p.set_shared_estimate(Some(768));
+        p.set_shared_estimate(Some(1500));
+        let head = deliver(&mut p, head, 768, 600_000_500);
+        assert_eq!(full_stop(&mut p, head, 1..=3, 600_000_600)[2], (1024, 1024));
     }
 }
 

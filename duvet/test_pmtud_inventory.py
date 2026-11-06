@@ -203,11 +203,68 @@ class PmtudInventory(unittest.TestCase):
         self.assertTrue(all(count >= 2 for count in counts.values()))
         for key in ("4821-012", "4821-137", "4821-138", "4821-143", "4821-144"):
             self.assertEqual(rows[key]["status"], "covered", key)
-        # Literal unchanged-cwnd conflicts and the independent black-hole reset
-        # obligation remain unresolved; PTB classification must not close them.
-        for n, key in ((1191, "1191-082"), (8201, "8201-076"), (4821, "4821-147")):
+        # Literal unchanged-cwnd conflicts remain unresolved; PTB classification
+        # must not close them.
+        for n, key in ((1191, "1191-082"), (8201, "8201-076")):
             row = next(p for p in self.inventory(n)["paragraphs"] if p["id"] == key)
             self.assertEqual(row["status"], "TODO", key)
+
+    def test_black_hole_reset_closes_whole_quote_on_recorded_reading(self):
+        # T21 closes the whole section 7.7 response, reset and halving, on the
+        # user's recorded reading: reset bounded by independently validated
+        # ceilings, the MAY of lower bounds not selected. Real receiver traces
+        # back it; every full-quote copy carries the same reason.
+        rows = {p["id"]: p for p in self.inventory(4821)["paragraphs"]}
+        row = rows["4821-147"]
+        full_key = row["target"] + "\n" + " ".join(row["quote"].split())
+        self.assertEqual(hashlib.sha256(full_key.encode()).hexdigest(),
+                         hashlib.sha256(("https://www.rfc-editor.org/rfc/rfc4821#section-7.7\n"
+                                         "The response to a detected black hole depends on the current values for search_low and eff_pmtu. "
+                                         "If eff_pmtu is larger than search_low, set eff_pmtu to search_low. Otherwise, set both eff_pmtu "
+                                         "and search_low to the initial value for search_low. Upon additional successive timeouts, "
+                                         "search_low and eff_pmtu SHOULD be halved, with a lower bound of 68 bytes for IPv4 and 1280 bytes "
+                                         "for IPv6. Even lower lower bounds MAY be permitted to support limited operation over links with "
+                                         "MTUs that are smaller than permitted by the IP specifications.").encode()).hexdigest())
+        self.assertEqual(row["status"], "covered")
+        self.assertEqual(row["evidence"], [
+            "crates/stacks/ntcp/src/pmtud.rs::    pub fn timeout(",
+            "crates/stacks/ntcp/src/pmtud_reset_trace_tests.rs::fn renewed_full_stop_resets_to_the_initial_low_through_a_real_receiver()",
+        ])
+        for fragment in ("User disposition (decision A, 2026-11-06, recorded)",
+                         "bounded by independently validated path ceilings", "MAY of even lower bounds is not selected",
+                         "never by the connection's current eff_pmtu", "accepted Packet Too Big authority",
+                         "managed shared estimate", "keeps the byte cwnd held before the raise",
+                         "never publishes to or lowers the shared estimate", "tests/black_hole_reset.rs"):
+            self.assertIn(fragment, row["reason"])
+        self.assertNotRegex(row["reason"], r"\bTODO\b|min\(initial_low")
+        todos = tomllib.loads((ROOT / "duvet/rfc4821-todos.toml").read_text())
+        self.assertNotIn(row["target"] + "\n" + " ".join(row["quote"].split()),
+                         {r["target"] + "\n" + " ".join(r["quote"].split()) for r in todos["TODO"]})
+        # 090 stays TODO with the detector-boundary evidence and the finite-time
+        # counterexample for T23; 143 describes T19's go-back-N after RTO.
+        reason090 = rows["4821-090"]["reason"]
+        self.assertEqual(rows["4821-090"]["status"], "TODO")
+        for fragment in ("pmtud_detector_boundary_tests.rs", "exactly 2*SMSS versus one byte more",
+                         "deadline - 1, = and + 1", "not a missing detector function", "for the T23 disposition",
+                         "Drop the probe and withhold its leading original until after the selected loss detector fires. "
+                         "Through that decision, the sender's observations are identical to a run in which both packets "
+                         "were lost. Later delivery of the leading original cannot make the earlier decision distinguish "
+                         "those runs. Losing its progress ACK extends the ambiguity."):
+            self.assertIn(fragment, reason090)
+        self.assertEqual(rows["4821-143"]["status"], "covered")
+        self.assertIn("T19's non-SACK go-back-N after RTO", rows["4821-143"]["reason"])
+        self.assertNotIn("not a new generic go-back-n transport", rows["4821-143"]["reason"])
+        canonical = {(p["target"], normalize(p["quote"])): p for p in (row, rows["4821-090"], rows["4821-143"])}
+        counts = {key: 0 for key in canonical}
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in source_annotations(path.read_text()):
+                key = (annotation["target"], normalize(annotation["quote"]))
+                if key in canonical:
+                    self.assertEqual(annotation["reason"], canonical[key]["reason"],
+                                     (canonical[key]["id"], str(path), annotation["line"]))
+                    counts[key] += 1
+        self.assertGreaterEqual(counts[(row["target"], normalize(row["quote"]))], 12)
+        self.assertGreaterEqual(counts[(rows["4821-090"]["target"], normalize(rows["4821-090"]["quote"]))], 6)
 
     def test_final_bounded_evidence_keeps_full_keys_and_partial_dispositions(self):
         # Hash the full original target + quote, not a narrowed test assertion.

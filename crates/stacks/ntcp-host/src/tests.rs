@@ -2,6 +2,7 @@ extern crate std;
 mod adjunct;
 mod admin;
 mod admission;
+mod black_hole_reset;
 mod correlation;
 mod destination;
 mod discovery;

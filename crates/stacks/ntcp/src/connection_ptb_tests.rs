@@ -290,10 +290,18 @@ fn sack_split_newly_sacked_release_and_rto_takeover() {
             ack(&mut a, t + 1, s[1].1, None);
             assert_eq!(report(&mut a, t + 2, s[2], 1400, false).feedback, Unchanged);
             assert!(pending(&a).is_empty());
+            // No SACK reports a hole: the rest of the timed-out flight is
+            // resent in order under slow start before fresh data.
+            let mut out = [0; 2048];
+            for k in 2..4 {
+                let len = a.transmit(t + 3, &mut out).unwrap().unwrap();
+                assert_eq!(span(&a, &out[..len]), s[k]);
+            }
+            ack(&mut a, t + 4, s[2].1, None);
             // Bytes first sent after the RTO remain eligible.
             let fresh = (0..8).find_map(|n| {
                 let mut out = [0; 2048];
-                let len = a.transmit(t + 3 + n, &mut out).unwrap()?;
+                let len = a.transmit(t + 5 + n, &mut out).unwrap()?;
                 let sent = span(&a, &out[..len]);
                 (sent.0 == s[3].1).then_some(sent)
             });

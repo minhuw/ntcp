@@ -1616,6 +1616,14 @@ impl Congestion {
         self.reset_duplicate_acks();
     }
 
+    // RFC 5681 section 3.1 sets cwnd to no more than LW = one SMSS on a
+    // timeout; when that timeout's MTU step raised the SMSS, RFC 4821
+    // section 4 forbids raising the byte window, so the loss window is also
+    // no more than `window`, the byte cwnd preserved across the raise.
+    pub(crate) fn limit_loss_window(&mut self, window: u32) {
+        self.cwnd = self.cwnd.min(window.max(1));
+    }
+
     pub(crate) fn reset_duplicate_acks(&mut self) {
         self.duplicate_acks = 0;
     }

@@ -1045,6 +1045,7 @@ impl Connection {
                         pmtud.set_policy_revision(path.snapshot.discovery_revision());
                         pmtud.set_discovery_disabled(path.snapshot.discovery_disabled());
                         pmtud.set_administrative(path.snapshot.administrative_estimate());
+                        pmtud.set_shared_estimate(path.snapshot.pmtu_estimate().ok());
                     }
                     pmtud
                 })
@@ -3262,6 +3263,7 @@ impl Connection {
             p.set_policy_revision(path.snapshot.discovery_revision());
             p.set_discovery_disabled(path.snapshot.discovery_disabled());
             p.set_administrative(path.snapshot.administrative_estimate());
+            p.set_shared_estimate(path.snapshot.pmtu_estimate().ok());
             if let Ok(budget) = path.snapshot.pmtu_estimate() {
                 p.lower_baseline(budget);
             }
@@ -8609,11 +8611,26 @@ impl Connection {
             && !keepalive
             && self.sack_fallback.is_none()
             && let Some((high_rxt, boundary)) = self.sack_post_rto
-            && self.congestion.cwnd().saturating_sub(self.post_rto_pipe()) >= self.mss as u32
+            && self.congestion.cwnd().saturating_sub(self.post_rto_pipe())
+                >= (self.mss as u32).min(self.congestion.cwnd())
         {
+            // A timeout whose black-hole reset raised the MSS keeps cwnd
+            // below one SMSS (limit_loss_window). Then the whole free window
+            // is the repair segment: waiting for a full SMSS of credit would
+            // leave go-back-N repair to another RTO.
+            let credit = self.congestion.cwnd().saturating_sub(self.post_rto_pipe());
+            let repair_packet_mss = if self.congestion.cwnd() < self.mss as u32 {
+                repair_packet_mss.min(credit as usize)
+            } else {
+                repair_packet_mss
+            };
             if self.rack_enabled() {
                 self.rack.lowest_lost(repair_packet_mss as u32)
-            } else if !self.sack_recovery_enabled() {
+            } else if !self.sack_recovery_enabled() || self.scoreboard.ranges().is_empty() {
+                // Without SACKed data above SND.UNA no hole is reported and
+                // every byte below the timeout's boundary is unacknowledged:
+                // resend it in order under slow start, as without SACK,
+                // instead of one segment per backed-off RTO.
                 let left = if high_rxt.after(self.snd_una) {
                     high_rxt
                 } else {
@@ -10783,6 +10800,8 @@ impl Connection {
             self.initial_pacing_open = false;
             self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
             let cooldown = self.pmtu_cooldown();
+            // Byte window and segment size before this timeout's path step.
+            let (window, mss) = (self.congestion.cwnd(), self.mss);
             if let Some(p) = &mut self.pmtud {
                 p.timeout(now, self.snd_una, self.consecutive_timeouts, cooldown);
             }
@@ -10816,6 +10835,11 @@ impl Connection {
             } else {
                 self.note_iw_loss(self.snd_una);
                 self.congestion.on_timeout(self.data_flight(), self.snd_nxt);
+            }
+            if self.mss > mss {
+                // A black-hole reset raised the MSS: the loss window stays
+                // within one SMSS and the byte window held before the raise.
+                self.congestion.limit_loss_window(window);
             }
             self.ecn_cwr_pending |= self.ecn_feedback();
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
