@@ -1,0 +1,212 @@
+use std::{fmt, io, net::SocketAddr};
+
+pub use ntcp::{
+    CallerTimebase, CloseReason, EndpointConfig, Instant, Payload, RxReadTimestamps,
+    RxTimestampStatus, SendProgress, State, TimestampClock, TxStreamRange, TxTimestampClock,
+    TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ConnId {
+    pub(crate) instance: u64,
+    pub(crate) slot: usize,
+    pub(crate) generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ListenerId {
+    pub(crate) instance: u64,
+    pub(crate) slot: usize,
+    pub(crate) generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockReason {
+    SendBuffer,
+    TimestampCapacity,
+    OutputReserved,
+    Receive,
+    Accept,
+    Connecting,
+}
+
+#[derive(Debug)]
+pub enum Error {
+    InvalidConfig(&'static str),
+    InvalidHandle,
+    Capacity,
+    TimeWentBackwards,
+    WouldBlock(BlockReason),
+    Unsupported(&'static str),
+    Tcp(ntcp::EndpointError),
+    Host(ntcp_host::Error),
+    Backend(io::Error),
+    Stopped,
+    ConnectionClosed(Option<CloseReason>),
+}
+impl Error {
+    pub fn is_would_block(&self) -> bool {
+        matches!(self, Self::WouldBlock(_))
+    }
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(s) => write!(f, "invalid native network configuration: {s}"),
+            Self::InvalidHandle => f.write_str("handle belongs to another instance or generation"),
+            Self::Capacity => f.write_str("native network capacity exhausted"),
+            Self::TimeWentBackwards => f.write_str("network time went backwards"),
+            Self::WouldBlock(reason) => write!(f, "operation would block: {reason:?}"),
+            Self::Unsupported(s) => write!(f, "unsupported native operation: {s}"),
+            Self::Tcp(e) => write!(f, "TCP: {e:?}"),
+            Self::Host(e) => write!(f, "IP host: {e:?}"),
+            Self::Backend(e) => write!(f, "packet backend: {e}"),
+            Self::Stopped => f.write_str("native network has stopped"),
+            Self::ConnectionClosed(reason) => write!(f, "connection closed: {reason:?}"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+impl From<ntcp_host::Error> for Error {
+    fn from(e: ntcp_host::Error) -> Self {
+        Self::Host(e)
+    }
+}
+impl From<ntcp::EndpointError> for Error {
+    fn from(e: ntcp::EndpointError) -> Self {
+        match e {
+            ntcp::EndpointError::InvalidHandle => Self::InvalidHandle,
+            ntcp::EndpointError::LimitReached => Self::Capacity,
+            ntcp::EndpointError::OutputReserved => Self::WouldBlock(BlockReason::OutputReserved),
+            ntcp::EndpointError::Connection(ntcp::Error::TimeWentBackwards) => {
+                Self::TimeWentBackwards
+            }
+            other => Self::Tcp(other),
+        }
+    }
+}
+impl<E: Into<Error>> From<ntcp::ManagedError<E>> for Error {
+    fn from(e: ntcp::ManagedError<E>) -> Self {
+        match e {
+            ntcp::ManagedError::Provider(e) => e.into(),
+            ntcp::ManagedError::Endpoint(e) => e.into(),
+        }
+    }
+}
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteOptions {
+    pub timestamps: TxTimestampRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteReceipt {
+    pub accepted: usize,
+    pub range: TxStreamRange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadOutcome {
+    Data {
+        len: usize,
+        range: TxStreamRange,
+        // Metadata describes the last byte of this read, not every byte.
+        last_byte_timestamps: Option<RxReadTimestamps>,
+    },
+    Eof,
+    EmptyBuffer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionInfo {
+    pub local: SocketAddr,
+    pub peer: SocketAddr,
+    pub state: State,
+    pub reason: Option<CloseReason>,
+    pub application_closed: bool,
+    pub network_stopped: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Event {
+    Connected(ConnId),
+    Readable(ConnId),
+    Writable(ConnId),
+    Closed {
+        connection: ConnId,
+        reason: Option<CloseReason>,
+    },
+    Acceptable(ListenerId),
+    PassiveError {
+        listener: ListenerId,
+        peer: SocketAddr,
+        error: ntcp::NetworkError,
+    },
+    RouteAdvice {
+        local: SocketAddr,
+        peer: SocketAddr,
+    },
+    NetworkStopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimestampEvent {
+    pub connection: ConnId,
+    pub observation: TxTimestampEvent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DrainReport {
+    pub written: usize,
+    pub more: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkBudget {
+    pub receive: usize,
+    pub transmit: usize,
+    pub timers: usize,
+    pub reclaim: usize,
+}
+impl WorkBudget {
+    pub const fn new(receive: usize, transmit: usize, timers: usize, reclaim: usize) -> Self {
+        Self {
+            receive,
+            transmit,
+            timers,
+            reclaim,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DriveReport {
+    pub received: usize,
+    pub transmitted: usize,
+    pub discarded: usize,
+    pub reclaimed: usize,
+    pub more_work: bool,
+    pub tx_blocked: bool,
+    pub next_deadline: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimestampSupport {
+    pub scheduled: bool,
+    pub acknowledged: bool,
+    pub software_transmit: bool,
+    pub hardware_transmit: bool,
+    pub software_receive: bool,
+    pub hardware_receive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Counters {
+    pub received: u64,
+    pub transmitted: u64,
+    pub discarded: u64,
+    pub backend_backpressure: u64,
+    pub timestamp_metadata_lost: u64,
+    pub retained_input: usize,
+}
