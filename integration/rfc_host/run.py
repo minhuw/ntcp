@@ -20,7 +20,10 @@ from bridge import Bridge
 import admin
 import icmp
 import mss
+import ndproxy
 import options
+import redirect
+import rejected
 import scoped
 import srh
 from linux_peer import fnv, pattern
@@ -257,6 +260,30 @@ def scoped_child(case, proof):
                                             commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
 
 
+def ndproxy_child(case, proof):
+    evidence = ndproxy.child(case, proof, BINARY, Peer, command)
+    emit("T19_NDPROXY_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                                  kernel_version=os.uname().version, evidence=evidence,
+                                  build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                             commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
+def redirect_child(case, proof):
+    evidence = redirect.child(case, proof, BINARY, PATHCTL, Peer, command)
+    emit("T19_REDIRECT_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                                   kernel_version=os.uname().version, evidence=evidence,
+                                   build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                              commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
+def rejected_child(case, proof):
+    evidence = rejected.child(case, proof, TUN_ECHO, PATHCTL, command)
+    emit("T19_REJECTED_SYN_CASE", dict(schema_version=1, case=case, namespace=proof, kernel=os.uname().release,
+                                       kernel_version=os.uname().version, evidence=evidence,
+                                       build=dict(source_sha256=os.environ.get("T5_SOURCE_SHA256"),
+                                                  commit=os.environ.get("T5_BUILD_COMMIT")), exit=0))
+
+
 def admin_child(case, proof):
     run_case = dict(refuse=admin.refuse_child, reenable=admin.reenable_child).get(case["scenario"], admin.child)
     evidence = run_case(case, proof, TUN_ECHO, PATHCTL, Peer, command, emit)
@@ -400,6 +427,12 @@ def child(case):
         return srh_child(case, proof)
     if case.get("kind") == "scoped":
         return scoped_child(case, proof)
+    if case.get("kind") == "nd-proxy":
+        return ndproxy_child(case, proof)
+    if case.get("kind") == "redirect":
+        return redirect_child(case, proof)
+    if case.get("kind") == "rejected-syn":
+        return rejected_child(case, proof)
     family, role, policy, scenario = (case[k] for k in ("family", "role", "policy", "scenario"))
     kernel, native = ("198.18.0.1", "198.18.0.2") if family == 4 else ("fd54:3500::1", "fd54:3500::2")
     settings = setup(family, kernel, native)
@@ -606,11 +639,16 @@ def main():
     mss_cases = mss.cases()
     srh_cases = srh.cases()
     scoped_cases = scoped.cases()
+    ndproxy_cases = ndproxy.cases()
+    redirect_cases = redirect.cases()
+    rejected_cases = rejected.cases()
     emit("T5_NETWORK_BUILD", dict(schema_version=1, command=build, commit=commit,
                                   source_sha256=source, binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
                                   icmp_command=echo_build, icmp_cases=icmp_cases,
                                   admin_command=pathctl_build, admin_cases=admin_cases, option_cases=option_cases,
                                   mss_cases=mss_cases, srh_cases=srh_cases, scoped_cases=scoped_cases,
+                                  ndproxy_cases=ndproxy_cases, redirect_cases=redirect_cases,
+                                  rejected_cases=rejected_cases,
                                   pathctl_sha256=hashlib.sha256(PATHCTL.read_bytes()).hexdigest(),
                                   tun_echo_sha256=hashlib.sha256(TUN_ECHO.read_bytes()).hexdigest(),
                                   ptb_stage_sha256=hashlib.sha256(STAGED.read_bytes()).hexdigest(),
@@ -622,7 +660,10 @@ def main():
                                                      linux_partial="No manufactured Linux partial ACK; Linux listener buffer minimum does not produce the selected small-SYN partial case",
                                                      linux_stale="Actual TCP_FASTOPEN_KEY revocation, not clock-lease expiration",
                                                      later_host_capabilities="No host path service or Neighbor Discovery proxy in T5",
-                                                     scoped_ptb="Two directly connected link-local peers have no router to send a Packet Too Big: the two-link case's PTB is harness-injected and labelled so"),
+                                                     scoped_ptb="Two directly connected link-local peers have no router to send a Packet Too Big: the two-link case's PTB is harness-injected and labelled so",
+                                                     router_ptb="The N-R-P cases' Packet Too Big messages are generated by the Linux router namespace's kernel (its Icmp6OutPktTooBigs counter rises by the PTBs captured at N), never injected",
+                                                     router_redirect="The bridge/R1/R2/P cases' Redirects are generated by the Linux router namespace R1's kernel (its OutRedirects or Icmp6OutRedirects counter rises by the Redirects captured at N), never injected; ntcp only receives them",
+                                                     rejected_syn="The rejected-SYN cases' SYNs are harness-built, checksummed IP packets transmitted on tun_echo's TUN through AF_PACKET (no kernel routing or source validation), labelled as injected; the live stream and the accepted link-local connection are real Linux TCP"),
                                   declared_cases=cases))
     completed = 0
     stream_count = 0
@@ -634,8 +675,13 @@ def main():
     mss_completed = 0
     srh_completed = 0
     scoped_completed = 0
+    ndproxy_completed = 0
+    redirect_completed = 0
+    rejected_completed = 0
+    router_redirects = []
     injected_ptbs = []
-    for case in icmp_cases + admin_cases + option_cases + mss_cases + srh_cases + scoped_cases + cases:
+    router_ptbs = []
+    for case in icmp_cases + admin_cases + option_cases + mss_cases + srh_cases + scoped_cases + ndproxy_cases + redirect_cases + rejected_cases + cases:
         assert time.monotonic() - started < 1740, "30 minute total gate budget"
         fds = [os.open("/proc/self/ns/" + kind, os.O_RDONLY) for kind in ("net", "user")]
         try:
@@ -669,7 +715,10 @@ def main():
                    else "T14_OPTIONS_CASE " if case in option_cases
                    else "T16_MSS_CASE " if case in mss_cases
                    else "T17_SRH_CASE " if case in srh_cases
-                   else "T18_SCOPED_CASE " if case in scoped_cases else "T5_NETWORK_CASE ")
+                   else "T18_SCOPED_CASE " if case in scoped_cases
+                   else "T19_NDPROXY_CASE " if case in ndproxy_cases
+                   else "T19_REDIRECT_CASE " if case in redirect_cases
+                   else "T19_REJECTED_SYN_CASE " if case in rejected_cases else "T5_NETWORK_CASE ")
             summaries = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(tag)]
             assert len(summaries) == 1 and summaries[0]["case"] == case, "missing case summary"
             summary = summaries[0]
@@ -702,6 +751,24 @@ def main():
                                               link_a_after=ptb["link_a_after"], link_b=ptb["link_b"]))
                 scoped_completed += 1
                 continue
+            if case in ndproxy_cases:
+                namespace_ids.append(summary["namespace"])
+                ptb = summary["evidence"]["ptb"]
+                router_ptbs.append(dict(case=case, ptbs_at_native=ptb["ptbs_at_native"],
+                                        router_counter=ptb["router_counter"],
+                                        router_drops=ptb.get("router_drops")))
+                ndproxy_completed += 1
+                continue
+            if case in redirect_cases:
+                namespace_ids.append(summary["namespace"])
+                router_redirects.append(dict(case=case, redirects=summary["evidence"]["redirects"],
+                                             router_counter=summary["evidence"]["redirect_counter"]))
+                redirect_completed += 1
+                continue
+            if case in rejected_cases:
+                namespace_ids.append(summary["namespace"])
+                rejected_completed += 1
+                continue
             stream_count += summary["streams"]
             refusal_count += summary["completions"] - summary["streams"]
             namespace_ids.append(summary["namespace"])
@@ -716,11 +783,16 @@ def main():
     assert mss_completed == len(mss_cases) == 4
     assert srh_completed == len(srh_cases) == 2
     assert scoped_completed == len(scoped_cases) == 2 and len(injected_ptbs) == 1
+    assert ndproxy_completed == len(ndproxy_cases) == 4
+    assert redirect_completed == len(redirect_cases) == 2
+    assert rejected_completed == len(rejected_cases) == 2
     emit("T5_NETWORK_SUMMARY", dict(exit=0, cases=completed, streams=stream_count, refusals=refusal_count,
                                     icmp_cases=icmp_completed, admin_cases=admin_completed,
                                     option_cases=option_completed, mss_cases=mss_completed,
                                     srh_cases=srh_completed, scoped_cases=scoped_completed,
-                                    injected_ptbs=injected_ptbs, namespaces=namespace_ids, kernel=os.uname().release,
+                                    injected_ptbs=injected_ptbs, ndproxy_cases=ndproxy_completed,
+                                    router_ptbs=router_ptbs, redirect_cases=redirect_completed,
+                                    router_redirects=router_redirects, rejected_syn_cases=rejected_completed, namespaces=namespace_ids, kernel=os.uname().release,
                                     stream_sha256={name: hashlib.sha256(pattern(n, salt)).hexdigest()
                                                    for name, n, salt in (("request", 8192, 7), ("response", 6144, 11),
                                                                          ("second_request", 3072, 19), ("second_response", 1024, 23))},

@@ -250,6 +250,8 @@ fn utility_process_round_trips_both_families() {
         let paths = stdout(&pathctl(&mut server, &mut side, &socket, &["paths"]));
         let path = paths.lines().next().unwrap().to_string();
         assert_eq!(field(&path, "route"), token);
+        // The path's resolved first hop: the route's forwarder.
+        assert_eq!(field(&path, "next_hop"), "forwarder:9");
         assert_eq!(field(&path, "budget"), "1500");
         assert_eq!(field(&path, "accepted"), "1500:unlearned");
         assert_eq!(field(&path, "administrative_estimate"), "-");

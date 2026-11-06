@@ -1,19 +1,25 @@
 # SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 import ipaddress
+import json
 import os
 import struct
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
 # The harness modules beside this file, also when run by path from the root.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bridge import checksum
+from linux_peer import fnv, pattern
 import admin
 import bridge
 import icmp
 import mss
+import ndproxy
 import options
+import redirect
+import rejected
 import run
 import scoped
 import srh
@@ -771,3 +777,749 @@ class ScopedScenario(unittest.TestCase):
         self.assertEqual((scoped.lengths(out), scoped.lengths(back)), ([1500], []))
         self.assertTrue(scoped.scoped_name("[fe80::2%3]:40000", "fe80::2", 40000, 3))
         self.assertFalse(scoped.scoped_name("[fe80::2%4]:40000", "fe80::2", 40000, 3))
+
+
+class NdProxyScenario(unittest.TestCase):
+    def test_nd_proxy_cases_without_inherited_proof_cannot_reach_setup(self):
+        for case in ndproxy.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(ndproxy, "setup") as setup:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+                setup.assert_not_called()
+
+    def test_cases_cover_proxy_both_directions_black_hole_and_gateway(self):
+        self.assertEqual({(c["kind"], c["family"], c["scenario"], c["direction"]) for c in ndproxy.cases()},
+                         {("nd-proxy", 6, "proxy-ptb", "native-client"), ("nd-proxy", 6, "proxy-ptb", "native-server"),
+                          ("nd-proxy", 6, "black-hole", "native-client"),
+                          ("nd-proxy", 6, "gateway-ptb", "native-client")})
+        others = (icmp.cases() + admin.cases() + options.cases() + mss.cases() + srh.cases() + scoped.cases()
+                  + run.matrix())
+        self.assertFalse(any(c in others for c in ndproxy.cases()))
+        self.assertTrue(1280 == ndproxy.DOWNSTREAM < ndproxy.FIRST_HOP)
+        self.assertEqual(len(set(ndproxy.MACS.values())), 4)
+
+    def test_destinations_are_on_link_for_the_proxy_and_routed_for_the_gateway(self):
+        own = ipaddress.ip_network(ndproxy.NATIVE + "/64", strict=False)
+        for scenario in ("proxy-ptb", "black-hole"):
+            self.assertNotIn("gateway", ndproxy.config(scenario))
+            self.assertIn(ipaddress.ip_address(ndproxy.DESTINATIONS[scenario]), own)
+        keys = dict(line.split("=", 1) for line in ndproxy.config("gateway-ptb").splitlines())
+        self.assertEqual(keys["io.gateway." + ndproxy.GATEWAY_PREFIX], ndproxy.ROUTER_LL)
+        self.assertTrue(ipaddress.ip_address(ndproxy.ROUTER_LL).is_link_local)
+        self.assertNotIn(ipaddress.ip_address(ndproxy.DESTINATIONS["gateway-ptb"]), own)
+        self.assertIn(ipaddress.ip_address(ndproxy.DESTINATIONS["gateway-ptb"]),
+                      ipaddress.ip_network(ndproxy.GATEWAY_PREFIX))
+        for scenario in ndproxy.DESTINATIONS:
+            text = ndproxy.config(scenario)
+            self.assertNotIn("next_hop_mac", text)
+            self.assertNotIn("neighbor", text)
+            self.assertIn("io.prefix=64", text)
+
+    def test_repair_coverage_needs_every_dropped_octet(self):
+        dropped = dict(seq=0xffffff00, payload=1440)
+        whole = [dict(seq=0xffffff00, payload=1220), dict(seq=(0xffffff00 + 1220) & 0xffffffff, payload=220)]
+        self.assertTrue(ndproxy.covered(dropped, whole))
+        self.assertFalse(ndproxy.covered(dropped, whole[:1]))
+        # A segment starting before the dropped one still covers its prefix.
+        self.assertTrue(ndproxy.covered(dropped, [dict(seq=0xfffffe00, payload=256 + 1440)]))
+        self.assertFalse(ndproxy.covered(dropped, [dict(seq=0xfffffe00, payload=256)]))
+
+
+class RedirectScenario(unittest.TestCase):
+    def test_redirect_cases_without_inherited_proof_cannot_reach_setup(self):
+        for case in redirect.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(redirect, "setup") as setup:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+                setup.assert_not_called()
+
+    def test_one_case_per_family_and_configuration_follows_the_family(self):
+        self.assertEqual({(c["kind"], c["family"]) for c in redirect.cases()}, {("redirect", 4), ("redirect", 6)})
+        others = (icmp.cases() + admin.cases() + options.cases() + mss.cases() + srh.cases() + scoped.cases()
+                  + ndproxy.cases() + run.matrix())
+        self.assertFalse(any(c in others for c in redirect.cases()))
+        for family in (4, 6):
+            a = redirect.ADDRESSES[family]
+            keys = dict(line.split("=", 1) for line in redirect.config(family, "/x/control").splitlines())
+            self.assertEqual(keys["io.gateway." + a["destinations"]], a["gateway_r1"])
+            self.assertEqual(keys["control.socket"], "/x/control")
+            self.assertNotIn("io.next_hop_mac", keys)
+            local = ipaddress.ip_network(f"{a['native']}/{a['prefix']}", strict=False)
+            for name in ("destination", "other"):
+                self.assertIn(ipaddress.ip_address(a[name]), ipaddress.ip_network(a["destinations"]))
+                self.assertNotIn(ipaddress.ip_address(a[name]), local)
+            neighbors = {k for k in keys if k.startswith("io.neighbor.")}
+            if family == 4:
+                self.assertEqual(neighbors, {"io.neighbor." + a["r1"], "io.neighbor." + a["r2"]})
+                self.assertEqual((keys["io.neighbor." + a["r1"]], keys["io.neighbor." + a["r2"]]),
+                                 (redirect.MACS[redirect.R1_UP], redirect.MACS[redirect.R2_UP]))
+            else:
+                self.assertFalse(neighbors)
+                self.assertTrue(all(ipaddress.ip_address(a[k]).is_link_local for k in ("gateway_r1", "gateway_r2")))
+        self.assertEqual(len(set(redirect.MACS.values())), len(redirect.MACS))
+
+    def test_redirect_frames_decode_sender_target_and_quoted_tuple(self):
+        eth = bytes.fromhex("020000190502" "020000190501")
+        tcp = struct.pack("!HHI", 40000, 18192, 0x01020304)
+        quoted = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40, 1, 0x4000, 63, 6, 0,
+                                       bytes([10, 19, 0, 2]), bytes([10, 19, 9, 1]))) + tcp
+        body = bytearray(struct.pack("!BBH4s", 5, 1, 0, bytes([10, 19, 0, 3]))) + quoted
+        struct.pack_into("!H", body, 2, checksum(bytes(body)))
+        header = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(body), 0, 0, 64, 1, 0,
+                                       bytes([10, 19, 0, 1]), bytes([10, 19, 0, 2])))
+        struct.pack_into("!H", header, 10, checksum(bytes(header)))
+        e = redirect.frame(eth + b"\x08\x00" + bytes(header) + bytes(body))
+        self.assertEqual((e["icmp_type"], e["icmp_code"], e["gateway"], e["source"]), (5, 1, "10.19.0.3", "10.19.0.1"))
+        self.assertTrue(e["checksum_valid"])
+        self.assertEqual(e["quoted"], dict(source="10.19.0.2", destination="10.19.9.1", protocol=6, sport=40000,
+                                           dport=18192, seq=0x01020304))
+        src, dst = ipaddress.ip_address("fe80::1").packed, ipaddress.ip_address("fd19:5::2").packed
+        inner = struct.pack("!IHBB", 6 << 28, 20, 6, 63) + dst + ipaddress.ip_address("fd19:9::1").packed + tcp + bytes(12)
+        message = bytearray(struct.pack("!BBHI", 137, 0, 0, 0) + ipaddress.ip_address("fe80::3").packed
+                            + ipaddress.ip_address("fd19:9::1").packed
+                            + bytes([2, 1]) + bytes.fromhex("020000190503")
+                            + bytes([4, 1 + len(inner) // 8]) + bytes(6) + inner)
+        struct.pack_into("!H", message, 2, checksum(src + dst + struct.pack("!I", len(message)) + bytes([0, 0, 0, 58])
+                                                     + bytes(message)))
+        packet = struct.pack("!IHBB", 6 << 28, len(message), 58, 255) + src + dst + bytes(message)
+        e = redirect.frame(eth + b"\x86\xdd" + packet)
+        self.assertTrue(e["checksum_valid"])
+        self.assertEqual((e["icmp_type"], e["target"], e["redirect_destination"], e["tllao"], e["hop_limit"]),
+                         (137, "fe80::3", "fd19:9::1", "02:00:00:19:05:03", 255))
+        self.assertEqual(e["quoted"], dict(source="fd19:5::2", destination="fd19:9::1", protocol=6, sport=40000,
+                                           dport=18192, seq=0x01020304))
+
+    def test_next_hop_transition_must_be_one_way(self):
+        seg = lambda i, d: dict(index=i, eth_dst=d)
+        self.assertEqual(redirect.transition([seg(1, "r1"), seg(4, "r2"), seg(5, "r2")], "r1", "r2"), 4)
+        self.assertEqual(redirect.transition([seg(7, "r2")], "r1", "r2"), 7)
+        self.assertIsNone(redirect.transition([seg(1, "r1"), seg(2, "r1")], "r1", "r2"))
+        self.assertIsNone(redirect.transition([seg(1, "r1"), seg(2, "r2"), seg(3, "r1")], "r1", "r2"))
+        self.assertIsNone(redirect.transition([seg(1, "x"), seg(2, "r2")], "r1", "r2"))
+
+
+class RejectedSynScenario(unittest.TestCase):
+    def test_rejected_syn_cases_without_inherited_proof_cannot_reach_setup(self):
+        for case in rejected.cases():
+            with patch.dict(os.environ, {}, clear=True), patch.object(rejected, "setup") as setup:
+                with self.assertRaises(KeyError):
+                    run.child(case)
+                setup.assert_not_called()
+
+    def test_one_case_per_family_distinct_from_every_other_case(self):
+        self.assertEqual({(c["kind"], c["family"], c["embedding"]) for c in rejected.cases()},
+                         {("rejected-syn", 6, "tun_echo"), ("rejected-syn", 4, "tun_echo")})
+        others = (icmp.cases() + admin.cases() + options.cases() + mss.cases() + srh.cases() + scoped.cases()
+                  + ndproxy.cases() + redirect.cases() + run.matrix())
+        self.assertFalse(any(c in others for c in rejected.cases()))
+
+    def test_vectors_are_the_framed_sources_and_the_broadcast_recorded_hop(self):
+        self.assertEqual([v[1] for v in rejected.vectors(6)], ["::", "ff02::1"])
+        v4 = rejected.vectors(4)
+        self.assertEqual([v[1] for v in v4], ["0.0.0.0", "224.0.0.1", "192.0.2.255", "192.0.2.7"])
+        self.assertEqual(v4[-1][2], bytes([131, 7, 8, 192, 0, 2, 255, 1]))
+        subnet = ipaddress.ip_network("192.0.2.0/" + rejected.ADDRESSES[4]["prefix"])
+        self.assertEqual(ipaddress.ip_address(rejected.ADDRESSES[4]["broadcast"]), subnet.broadcast_address)
+        self.assertNotEqual(ipaddress.ip_address(rejected.CONTROL_HOP), subnet.broadcast_address)
+
+    def test_injected_syns_are_complete_and_checksummed(self):
+        packet = rejected.syn(6, "ff02::1", "2001:db8:19::2", 40001, 18080, 7)
+        e = icmp.parse(packet)
+        self.assertEqual((e["source"], e["flags"], e["sport"], e["mss"], e["length"]), ("ff02::1", 2, 40001, 1220, 64))
+        self.assertTrue(e["checksum_valid"])
+        packet = rejected.syn(4, "192.0.2.7", "192.0.2.2", 40003, 18080, 7, rejected.loose_route("192.0.2.255"))
+        e = icmp.parse(packet)
+        self.assertEqual((e["header_len"], e["ip_options"], e["flags"]), (28, "830708c00002ff01", 2))
+        self.assertTrue(e["ip_checksum_valid"] and e["checksum_valid"])
+
+    def test_source_routed_checksum_uses_the_final_destination(self):
+        packet = bytearray(rejected.syn(4, "192.0.2.2", "192.0.2.7", 18080, 40100, 9))
+        # Re-address to the first hop behind a reversed one-hop route.
+        option = bytes([131, 7, 4]) + bytes([192, 0, 2, 7]) + bytes(1)
+        packet = packet[:9] + packet[9:10] + bytes(2) + packet[12:16] + bytes([192, 0, 2, 9]) + option + packet[20:]
+        packet[0], packet[2:4] = 0x47, struct.pack("!H", len(packet))
+        self.assertTrue(rejected.routed_checksum_valid(bytes(packet)))
+        packet[-1] ^= 1
+        self.assertFalse(rejected.routed_checksum_valid(bytes(packet)))
+
+
+class FakeHolder:
+    """A held namespace that records its cleanup."""
+
+    def __init__(self, pid=None):
+        self.pid = pid or os.getpid()
+        self.killed = self.waited = False
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return 0
+
+    def poll(self):
+        return None
+
+
+class FakeCapture:
+    """A capture whose INITIAL frames are present from the start and whose
+    LATER frames arrive after the first mark (each timestamped when first
+    read, so they follow the case's own clock readings)."""
+
+    def __init__(self, initial, later):
+        self.events, self.later, self.marked, self.closed = list(initial), list(later), False, False
+
+    def mark(self):
+        self.marked = True
+        return len(self.events)
+
+    def since(self, start):
+        if self.marked and self.later:
+            base = time.monotonic_ns() + 10 ** 9
+            for i, e in enumerate(self.later):
+                e.setdefault("time_ns", base + i * 1000)
+            self.events.extend(self.later)
+            self.later = []
+        return list(self.events[start:])
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProcess:
+    """A driven process answering each line with one event (`answer`)."""
+
+    def __init__(self, args, answer):
+        self.args, self.answer, self.queue, self.closed = args, answer, [], False
+        self.ready = dict(event="ready", namespace=1)
+
+    def send(self, line):
+        self.queue.append(self.answer(line.split()))
+
+    def read(self):
+        result = self.queue.pop(0)
+        assert result["event"] != "error", result
+        return result
+
+    def close(self):
+        self.closed = True
+
+
+def stream_answer(local, queries):
+    """Answers of the native driver (LOCAL its connection names, QUERIES
+    the successive path_mtu readbacks) or, with LOCAL None, of the peer."""
+    queries = list(queries)
+
+    def answer(fields):
+        verb, name = fields[0], fields[1] if len(fields) > 1 else None
+        if verb == "recv":
+            return dict(event="received", id=name, hash=fnv(pattern(int(fields[2]), int(fields[3]))))
+        if verb in ("connect", "accept"):
+            event = "connected" if verb == "connect" else "accepted"
+            if local is None:
+                return dict(event=event, id=name, local=["fd19::d", 18190])
+            port = 40000 if name == "s" else 40001
+            return dict(event=event, id=name, local=f"[{local}]:{port}", path_mtu=ndproxy.FIRST_HOP)
+        if verb == "query":
+            return dict(event="query", id=name, path_mtu=queries.pop(0))
+        return dict(event=dict(listen="listening", send="sent", shutdown="shutdown", eof="eof",
+                               close="closed")[verb], id=name)
+    return answer
+
+
+def ipv6_bytes(length, seq, sport=40000):
+    """An IPv6/TCP packet of LENGTH octets from N to D (only its prefix
+    matters to a quote)."""
+    header = struct.pack("!IHBB", 6 << 28, length - 40, 6, 64) + ipaddress.ip_address(ndproxy.NATIVE).packed \
+        + ipaddress.ip_address(ndproxy.DESTINATIONS["proxy-ptb"]).packed
+    tcp = struct.pack("!HHII", sport, ndproxy.PEER_LISTEN, seq, 1) + bytes(12)
+    return header + tcp + bytes((i * 7) % 256 for i in range(length - 60))
+
+
+class NdProxyWorld:
+    """Fakes of every process, capture and command of one proxy-ptb
+    native-client case. By default the frames are those of a passing run:
+    R's solicited proxy NA before the first segment, oversized native
+    output after the change, R's kernel PTB (counter and upstream copy)
+    quoting it, the repair at 1280 and a later connection at 1280."""
+
+    def __init__(self):
+        n, r = ndproxy.MACS[ndproxy.NATIVE_PORT], ndproxy.MACS[ndproxy.ROUTER_UP]
+        d = ndproxy.DESTINATIONS["proxy-ptb"]
+        self.counter = 5
+        self.counter_rise = 1
+        self.queries = [1500, 1280, 1280]
+        common = dict(checksum_valid=True, hop_limit=255, icmp_code=0, extensions=[], override=False,
+                      router=False)
+        tcp = lambda t, flags, length, payload, seq, sport=40000, raw=None: dict(
+            protocol=6, direction="out", flags=flags, eth_src=n, eth_dst=r, source=ndproxy.NATIVE, destination=d,
+            ip_length=length, payload=payload, seq=seq, sport=sport, checksum_valid=True, time_ns=t,
+            raw=raw or bytes(14) + ipv6_bytes(length, seq, sport))
+        self.native_initial = [
+            dict(common, icmp_type=135, direction="out", target=d, source=ndproxy.NATIVE, destination="ff02::1:ff00:d",
+                 eth_src=n, eth_dst="33:33:ff:00:00:0d", options=[dict(type=1, value=n)], solicited=False,
+                 time_ns=1),
+            dict(common, icmp_type=136, direction="in", target=d, source=ndproxy.ROUTER_LL,
+                 destination=ndproxy.NATIVE, eth_src=r, eth_dst=n, options=[dict(type=2, value=r)], solicited=True,
+                 router=True, time_ns=2),
+            tcp(3, 0x02, 80, 0, 1000),
+            tcp(4, 0x10, 1500, 1440, 1001),
+        ]
+        self.original = tcp(None, 0x10, 1500, 1440, 0x10000)
+        self.original.pop("time_ns")
+        self.ptb = dict(icmp_type=2, direction="in", checksum_valid=True, mtu=ndproxy.DOWNSTREAM, eth_src=r, eth_dst=n,
+                        source=ndproxy.ROUTER, destination=ndproxy.NATIVE, quote=self.original["raw"][14:14 + 1232],
+                        raw=bytes(200))
+        self.repair = [tcp(None, 0x10, 1280, 1220, 0x10000), tcp(None, 0x10, 280, 220, 0x10000 + 1220)]
+        self.later = [tcp(None, 0x10, 1280, 1220, 5000, sport=40001)]
+        for e in self.repair + self.later:
+            e.pop("time_ns")
+        self.upstream_later = [dict(protocol=6, direction="in", source=ndproxy.NATIVE, ip_length=1500),
+                               dict(icmp_type=2, direction="out", source=ndproxy.ROUTER)]
+        self.downstream_later = [dict(protocol=6, direction="out", source=ndproxy.NATIVE, ip_length=1280)]
+        self.holders, self.processes, self.captures, self.commands = [], [], [], []
+
+    def native_later(self):
+        return [self.original, self.ptb, *self.repair, *self.later]
+
+    def command(self, args):
+        self.commands.append(list(map(str, args)))
+        if args[-1] == "/proc/net/snmp6":
+            lowered = any("mtu" in c and str(ndproxy.DOWNSTREAM) in c for c in self.commands)
+            return f"Icmp6OutPktTooBigs {self.counter + (self.counter_rise if lowered else 0)}\nIcmp6InMsgs 0\n"
+        if args[:3] == ["ip", "-j", "link"]:
+            return '[{"mtu": 1500}]'
+        return ""
+
+    def holder(self, proof):
+        h = FakeHolder()
+        self.holders.append(h)
+        return h
+
+    def peer(self, args):
+        native = str(args[0]) == "/fake/binary"
+        p = FakeProcess(args, stream_answer(ndproxy.NATIVE if native else None,
+                                            self.queries if native else ()))
+        self.processes.append(p)
+        return p
+
+    def capture(self, initial, later):
+        c = FakeCapture(initial, later)
+        self.captures.append(c)
+        return c
+
+    def run(self, case=None):
+        case = case or dict(kind="nd-proxy", family=6, scenario="proxy-ptb", direction="native-client")
+        settings = dict(namespaces=dict(peer=1, router=2))
+        with patch.object(ndproxy, "held_namespace", self.holder), \
+                patch.object(ndproxy, "setup", lambda *a: settings), \
+                patch.object(ndproxy.scoped, "Capture", lambda name: self.capture(self.native_initial,
+                                                                                  self.native_later())), \
+                patch.object(ndproxy, "Capture", lambda pid, name: self.capture(
+                    [], self.upstream_later if name == ndproxy.ROUTER_UP else self.downstream_later)), \
+                patch("builtins.print"):
+            return ndproxy.child(case, {}, "/fake/binary", self.peer, self.command)
+
+
+class NdProxyChildChecks(unittest.TestCase):
+    """The proxy case's own checks, driven by fakes: a router-generated PTB
+    quoting a native submission passes; an injected or uncorrelated one, or a
+    readback that stays at the first hop, fails the case; every failure
+    releases the held namespaces, processes and captures."""
+
+    def assert_cleaned(self, world):
+        self.assertEqual(len(world.holders), 2)
+        self.assertTrue(all(h.killed and h.waited for h in world.holders))
+        self.assertTrue(all(p.closed for p in world.processes))
+        self.assertTrue(all(c.closed for c in world.captures))
+
+    def test_router_generated_ptb_quoting_a_native_submission_passes(self):
+        world = NdProxyWorld()
+        evidence = world.run()
+        self.assertEqual(evidence["ptb"]["ptbs_at_native"], 1)
+        self.assertEqual(evidence["ptb"]["router_counter"]["after"] - evidence["ptb"]["router_counter"]["mid"], 1)
+        self.assertEqual(evidence["existing_query"]["path_mtu"], ndproxy.DOWNSTREAM)
+        self.assert_cleaned(world)
+
+    def test_a_ptb_the_router_kernel_did_not_count_fails(self):
+        world = NdProxyWorld()
+        world.counter_rise = 0
+        with self.assertRaises(AssertionError):
+            world.run()
+        self.assert_cleaned(world)
+
+    def test_a_ptb_absent_from_the_router_upstream_fails(self):
+        world = NdProxyWorld()
+        world.upstream_later = world.upstream_later[:1]
+        with self.assertRaises(AssertionError):
+            world.run()
+        self.assert_cleaned(world)
+
+    def test_a_ptb_from_another_sender_fails(self):
+        world = NdProxyWorld()
+        world.ptb.update(eth_src="02:00:00:19:00:99")
+        with self.assertRaises(AssertionError):
+            world.run()
+        self.assert_cleaned(world)
+
+    def test_a_ptb_quoting_no_native_submission_fails(self):
+        world = NdProxyWorld()
+        quote = bytearray(world.ptb["quote"])
+        quote[44] ^= 0xff  # the quoted TCP sequence
+        world.ptb["quote"] = bytes(quote)
+        with self.assertRaises(AssertionError):
+            world.run()
+        self.assert_cleaned(world)
+
+    def test_a_readback_still_at_the_first_hop_fails(self):
+        for queries in ([1500, 1500, 1280], [1500, 1280, 1500]):
+            world = NdProxyWorld()
+            world.queries = queries
+            with self.assertRaises(AssertionError):
+                world.run()
+            self.assert_cleaned(world)
+
+    def test_a_segment_before_the_proxy_advertisement_fails(self):
+        world = NdProxyWorld()
+        world.native_initial[2]["time_ns"] = 0
+        with self.assertRaises(AssertionError):
+            world.run()
+        self.assert_cleaned(world)
+
+    def test_failed_setup_is_raised_and_releases_both_namespaces(self):
+        world = NdProxyWorld()
+
+        def failed(*args):
+            raise RuntimeError("ip link add failed")
+        with patch.object(ndproxy, "setup", failed), patch.object(ndproxy, "held_namespace", world.holder), \
+                patch("builtins.print"):
+            with self.assertRaises(RuntimeError):
+                ndproxy.child(dict(kind="nd-proxy", family=6, scenario="proxy-ptb", direction="native-client"),
+                              {}, "/fake/binary", world.peer, world.command)
+        self.assert_cleaned(world)
+
+    def test_a_driver_timeout_is_raised_and_cleans_up(self):
+        world = NdProxyWorld()
+        original = world.peer
+
+        def peer(args):
+            p = original(args)
+            if str(args[0]) == "/fake/binary":
+                def read():
+                    raise TimeoutError("peer deadline")
+                p.read = read
+            return p
+        world.peer = peer
+        with self.assertRaises(TimeoutError):
+            world.run()
+        self.assert_cleaned(world)
+
+
+class HeldNamespace(unittest.TestCase):
+    def test_a_holder_that_never_leaves_the_harness_namespace_is_refused(self):
+        current = os.stat("/proc/self/ns/net").st_ino
+        proof = dict(net=dict(current=current, parent=current + 1))
+        holder = FakeHolder(os.getpid())
+        holder.poll = lambda: 1  # unshare failed: no namespace capability
+        with patch.object(ndproxy.subprocess, "Popen", lambda *a, **k: holder):
+            with self.assertRaises(AssertionError):
+                ndproxy.held_namespace(proof)
+
+
+class IndexedCapture(FakeCapture):
+    """FakeCapture with redirect.Capture's per-frame capture index."""
+
+    def since(self, start):
+        events = super().since(start)
+        for i, e in enumerate(self.events):
+            e["index"] = i
+        return events
+
+
+class FakePathctl:
+    """ntcp-pathctl answers from the world's state: D's replacement path
+    (next hop R2) once R1's route changed, the later client once opened."""
+
+    def __init__(self, world):
+        self.world, self.log = world, []
+
+    def paths(self):
+        w, a = self.world, self.world.a
+        moved = w.route_changed and w.moves
+        d = dict(destination=a["destination"], valid="1", route="1", token="d2" if moved else "d1",
+                 next_hop=a["gateway_r2"] if moved else a["gateway_r1"])
+        other = dict(destination=a["other"], valid="1", route="1", token="o1",
+                     next_hop=a["gateway_r2"] if w.route_changed and w.other_moves else a["gateway_r1"])
+        return [d, other]
+
+    def run(self, verb, token):
+        self.log.append((verb, token))
+        count = {"d1": 2, "d2": 3 if self.world.later_open else 2, "o1": 1}[token]
+        return type("P", (), dict(stdout="".join(f"client kind=tcp id={i}\n" for i in range(count))))()
+
+
+class RedirectWorld:
+    """Fakes of every process, capture, command and utility request of one
+    Linux-router Redirect case of FAMILY. By default the frames are those of
+    a passing run: R1's kernel Redirect (counted, sent on its bridge port)
+    naming R2 and quoting flow a's first submission after the change, the
+    flows to D moving to R2 for good and D2 staying with R1."""
+
+    def __init__(self, family):
+        self.family, self.a = family, redirect.ADDRESSES[family]
+        a, macs = self.a, redirect.MACS
+        n, r1, r2 = macs[redirect.NATIVE_PORT], macs[redirect.R1_UP], macs[redirect.R2_UP]
+        self.r1, self.r2 = r1, r2
+        self.route_changed = self.later_open = self.other_moves = False
+        self.moves = True
+        self.counter_rise = 1
+        self.ports = dict(a=40000, b=40001, e=40002, c=40003)
+        self.holders, self.processes, self.captures, self.commands = [], [], [], []
+
+        def tcp(name, via, seq, flags=0x18, payload=100):
+            destination = a["other"] if name == "e" else a["destination"]
+            return dict(protocol=6, direction="out", sport=self.ports[name], dport=redirect.PEER_LISTEN, seq=seq,
+                        flags=flags, payload=payload, eth_src=n, eth_dst=via, source=a["native"],
+                        destination=destination, checksum_valid=True,
+                        raw=bytes(14) + self.packet(destination, self.ports[name], seq))
+        self.initial = []
+        if family == 6:
+            self.initial += [dict(icmp_type=135, direction="out", target=a["gateway_r1"]),
+                             dict(icmp_type=136, direction="in", target=a["gateway_r1"], tllao=r1)]
+        self.initial += [tcp(name, r1, 1, flags=0x02, payload=0) for name in ("a", "b", "e")]
+        self.original = tcp("a", r1, 1000)
+        self.tcp = tcp
+        self.before_redirect = []
+        self.redirect = dict(direction="in", checksum_valid=True, eth_src=r1, eth_dst=n, destination=a["native"],
+                             quote=self.original["raw"][14:14 + (28 if family == 4 else 48)],
+                             quoted=dict(source=a["native"], destination=a["destination"], protocol=6,
+                                         sport=self.ports["a"], dport=redirect.PEER_LISTEN, seq=1000),
+                             raw=bytes(96))
+        if family == 4:
+            self.redirect.update(icmp_type=5, icmp_code=1, source=a["r1"], gateway=a["r2"])
+        else:
+            self.redirect.update(icmp_type=137, icmp_code=0, source=a["gateway_r1"], hop_limit=255,
+                                 target=a["gateway_r2"], redirect_destination=a["destination"], tllao=r2)
+        self.after = [tcp("a", r2, 1100), tcp("b", r2, 1000), tcp("a", r2, 1200),
+                      tcp("c", r2, 1, flags=0x02, payload=0), tcp("c", r2, 2), tcp("e", r1, 1000)]
+        self.r1_later = [dict(icmp_type=self.redirect["icmp_type"], direction="out")]
+        self.r2_later = [dict(protocol=6, direction="in", source=a["native"], eth_src=n, eth_dst=r2)]
+
+    def packet(self, destination, sport, seq):
+        src = ipaddress.ip_address(self.a["native"]).packed
+        dst = ipaddress.ip_address(destination).packed
+        tcp = struct.pack("!HHII", sport, redirect.PEER_LISTEN, seq, 1) + bytes(12) + bytes(100)
+        if self.family == 4:
+            return struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 1, 0x4000, 64, 6, 0, src, dst) + tcp
+        return struct.pack("!IHBB", 6 << 28, len(tcp), 6, 64) + src + dst + tcp
+
+    def command(self, args):
+        args = list(map(str, args))
+        self.commands.append(args)
+        if "route" in args and "replace" in args:
+            self.route_changed = True
+        count = 7 + (self.counter_rise if self.route_changed else 0)
+        if args[-1] == "/proc/net/snmp6":
+            return f"Icmp6OutRedirects {count}\nIcmp6InMsgs 0\n"
+        if args[-1] == "/proc/net/snmp":
+            return f"Ip: Forwarding\nIp: 1\nIcmp: InMsgs OutRedirects\nIcmp: 0 {count}\n"
+        if "get" in args:
+            return json.dumps([dict(dev=redirect.R1_UP, gateway=self.a["gateway_r2"])])
+        if args[:3] == ["ip", "-j", "link"]:
+            return '[{"mtu": 1500}]'
+        return ""
+
+    def holder(self, proof):
+        h = FakeHolder()
+        self.holders.append(h)
+        return h
+
+    def peer(self, args):
+        native = str(args[0]) == "/fake/binary"
+        world = self
+
+        def answer(fields):
+            verb, name = fields[0], fields[1] if len(fields) > 1 else None
+            if verb == "recv":
+                return dict(event="received", id=name, hash=fnv(pattern(int(fields[2]), int(fields[3]))))
+            if verb == "connect":
+                if name == "c":
+                    world.later_open = True
+                port = world.ports[name]
+                local = f"[{world.a['native']}]:{port}" if world.family == 6 else f"{world.a['native']}:{port}"
+                return dict(event="connected", id=name, local=local)
+            if verb == "accept":
+                return dict(event="accepted", id=name)
+            return dict(event=dict(listen="listening", send="sent", shutdown="shutdown", eof="eof",
+                                   close="closed")[verb], id=name)
+        p = FakeProcess(args, answer)
+        self.processes.append(p)
+        return p
+
+    def capture(self, interface, pid=None):
+        initial, later = dict(t19n=(self.initial, [self.original, *self.before_redirect, self.redirect, *self.after]),
+                              t19r1=([], self.r1_later), t19r2=([], self.r2_later))[interface]
+        c = IndexedCapture(initial, later)
+        self.captures.append(c)
+        return c
+
+    def run(self):
+        case = dict(kind="redirect", family=self.family, scenario="linux-router")
+        settings = dict(namespaces=dict(peer=1))
+        with patch.object(redirect, "held_namespace", self.holder), \
+                patch.object(redirect, "setup", lambda *a: settings), \
+                patch.object(redirect, "Capture", self.capture), \
+                patch.object(redirect, "quiet", lambda capture: None), \
+                patch.object(redirect.admin, "Pathctl", lambda binary, control: FakePathctl(self)), \
+                patch("builtins.print"):
+            return redirect.child(case, {}, "/fake/binary", "/fake/pathctl", self.peer, self.command)
+
+
+class RedirectChildChecks(unittest.TestCase):
+    """The Redirect cases' own causality checks, driven by fakes: only a
+    Redirect R1's kernel generated (counted, sent through its bridge port)
+    from R1, naming R2, for D and quoting N's actual first submission after
+    the change passes, with D's flows moving to R2 for good and D2 staying;
+    every failure releases all four held namespaces and the control
+    directory."""
+
+    def failing(self, family, change):
+        world = RedirectWorld(family)
+        change(world)
+        directories = set(os.listdir(redirect.tempfile.gettempdir()))
+        with self.assertRaises(AssertionError):
+            world.run()
+        self.assert_cleaned(world)
+        self.assertEqual(set(os.listdir(redirect.tempfile.gettempdir())) - directories, set())
+
+    def assert_cleaned(self, world):
+        self.assertEqual(len(world.holders), 4)
+        self.assertTrue(all(h.killed and h.waited for h in world.holders))
+        self.assertTrue(all(p.closed for p in world.processes))
+        self.assertTrue(all(c.closed for c in world.captures))
+
+    def test_a_router_generated_redirect_quoting_the_first_submission_passes(self):
+        for family in (4, 6):
+            world = RedirectWorld(family)
+            evidence = world.run()
+            self.assertEqual(evidence["redirects"], 1)
+            self.assertEqual(evidence["redirect_counter"]["after"] - evidence["redirect_counter"]["before"], 1)
+            self.assertEqual(set(evidence["switched"]), {"a", "b", "c"})
+            self.assert_cleaned(world)
+
+    def test_a_redirect_the_router_kernel_did_not_count_fails(self):
+        for family in (4, 6):
+            self.failing(family, lambda w: setattr(w, "counter_rise", 0))
+
+    def test_a_redirect_not_sent_by_r1_fails(self):
+        for family in (4, 6):
+            self.failing(family, lambda w: setattr(w, "r1_later", []))
+            self.failing(family, lambda w: w.redirect.update(eth_src=w.r2))
+            source = "r2" if family == 4 else "gateway_r2"
+            self.failing(family, lambda w: w.redirect.update(source=w.a[source]))
+
+    def test_a_redirect_to_another_target_or_for_another_destination_fails(self):
+        self.failing(4, lambda w: w.redirect.update(gateway="10.19.0.9"))
+        self.failing(6, lambda w: w.redirect.update(target="fe80::9"))
+        self.failing(6, lambda w: w.redirect.update(redirect_destination=w.a["other"]))
+        for family in (4, 6):
+            self.failing(family, lambda w: w.redirect["quoted"].update(destination=w.a["other"]))
+
+    def test_a_redirect_quoting_no_submission_fails(self):
+        for family in (4, 6):
+            def change(w):
+                quote = bytearray(w.redirect["quote"])
+                quote[-1] ^= 0xff  # the quoted TCP sequence's last octet
+                w.redirect["quote"] = bytes(quote)
+            self.failing(family, change)
+            # A quote of a later segment through R1, not the first
+            # submission after the change.
+            def later(w):
+                w.before_redirect = [w.tcp("a", w.r1, 1050)]
+                w.redirect.update(quote=w.before_redirect[0]["raw"][14:14 + len(w.redirect["quote"])],
+                                  quoted=dict(w.redirect["quoted"], seq=1050))
+            self.failing(family, later)
+
+    def test_output_that_moves_before_the_redirect_or_returns_to_r1_fails(self):
+        for family in (4, 6):
+            self.failing(family, lambda w: w.original.update(eth_dst=w.r2))
+            self.failing(family, lambda w: w.after[2].update(eth_dst=w.r1))
+            self.failing(family, lambda w: w.after[3].update(eth_dst=w.r1))
+
+    def test_another_destination_moving_too_fails(self):
+        for family in (4, 6):
+            self.failing(family, lambda w: w.after[5].update(eth_dst=w.r2))
+            self.failing(family, lambda w: setattr(w, "other_moves", True))
+
+    def test_a_pathctl_view_without_the_replacement_path_fails(self):
+        for family in (4, 6):
+            self.failing(family, lambda w: setattr(w, "moves", False))
+
+    def test_failed_setup_is_raised_and_releases_every_namespace(self):
+        world = RedirectWorld(4)
+
+        def failed(*args):
+            raise RuntimeError("bridge add failed")
+        directories = set(os.listdir(redirect.tempfile.gettempdir()))
+        with patch.object(redirect, "setup", failed), patch.object(redirect, "held_namespace", world.holder), \
+                patch("builtins.print"):
+            with self.assertRaises(RuntimeError):
+                redirect.child(dict(kind="redirect", family=4, scenario="linux-router"), {}, "/fake/binary",
+                               "/fake/pathctl", world.peer, world.command)
+        self.assert_cleaned(world)
+        self.assertEqual(set(os.listdir(redirect.tempfile.gettempdir())) - directories, set())
+
+
+class RejectedSynChecks(unittest.TestCase):
+    """The rejected-SYN case's own checks: the unscoped link-local refusal
+    must be tun_echo's stated refusal with nothing transmitted and nothing
+    reaching the listener, and echo progress counts only tun_echo's own
+    payload on the live tuple."""
+
+    class Listener:
+        def __init__(self, pending):
+            self.pending = pending
+
+        def setblocking(self, flag):
+            pass
+
+        def accept(self):
+            if self.pending:
+                return object(), ("fe80::2", 1)
+            raise BlockingIOError
+
+    def refusal(self, returncode, stderr, sent=(), pending=False):
+        capture = FakeCapture([], [dict(direction="from-ntcp", **e) for e in sent])
+        result = type("R", (), dict(returncode=returncode, stderr=stderr, stdout=""))()
+        with patch.object(rejected, "SETTLE", 0), patch.object(rejected.subprocess, "run", lambda *a, **k: result):
+            return rejected.refused_unscoped("/fake/tun_echo", capture, {}, self.Listener(pending))
+
+    def test_the_stated_refusal_with_nothing_transmitted_passes(self):
+        record = self.refusal(1, "error: " + rejected.SCOPE_REFUSAL + "\n")
+        self.assertEqual((record["exit"], record["from_ntcp_packets"], record["listener_pending"]), (1, 0, 0))
+
+    def test_an_open_that_was_not_refused_fails(self):
+        with self.assertRaises(AssertionError):
+            self.refusal(0, "")
+        with self.assertRaises(AssertionError):
+            self.refusal(1, "error: no such device\n")
+
+    def test_a_refusal_after_transmission_fails(self):
+        with self.assertRaises(AssertionError):
+            self.refusal(1, rejected.SCOPE_REFUSAL, sent=[dict(protocol=6, flags=2, destination="fe80::1")])
+
+    def test_an_open_that_reached_the_listener_fails(self):
+        with self.assertRaises(AssertionError):
+            self.refusal(1, rejected.SCOPE_REFUSAL, pending=True)
+
+    def test_echo_progress_counts_tun_echo_payload_on_the_live_tuple_once(self):
+        isn = 0xfffff000
+        live = (rejected.PORT, 50000)
+        seg = lambda seq, payload, direction="from-ntcp", tuple_=live: dict(
+            direction=direction, protocol=6, sport=tuple_[0], dport=tuple_[1], seq=seq & 0xffffffff, payload=payload)
+        events = [seg(isn + 1, 4096), seg(isn + 1, 4096),  # a retransmission
+                  seg(isn + 4097, 1000, direction="to-ntcp"), seg(isn + 4097, 2000, tuple_=(rejected.PORT, 50001))]
+        self.assertEqual(rejected.sent_end(events, live, isn), 4096)
+        events.append(seg(isn + 4097, 4096))  # across the sequence wrap
+        self.assertEqual(rejected.sent_end(events, live, isn), 8192)
+        self.assertEqual(rejected.sent_end([], live, isn), 0)

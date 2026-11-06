@@ -976,6 +976,56 @@ impl Host {
             .ok_or(Error::InvalidContext)
     }
 
+    /// RFC 1191 section 5's current Path MTU estimate (complete IP octets)
+    /// of the path `owner` is bound to, as Linux reports a connected
+    /// socket's dst_mtu through IP_MTU and IPV6_MTU: the shared estimate,
+    /// trusted decreases and administrative restrictions included
+    /// (`PathSnapshot::pmtu_estimate`), never the discovery-policy sending
+    /// limit or the connection's own search or black-hole state. A pure
+    /// read. A binding that `refresh` would move reads the path the same
+    /// selection names (`PathService::resolve_via`, then the cached valid
+    /// incarnation of that key); when no incarnation exists yet, or no route
+    /// resolves, the connection is still bound to its path and that path's
+    /// latest estimate is reported (frozen at its invalidation, decreases
+    /// learned before it included), as Linux reports a socket's cached route
+    /// until output revalidates it.
+    pub fn path_mtu_estimate(
+        &self,
+        endpoint: &Endpoint,
+        owner: ConnectionId,
+    ) -> Result<u32, Error> {
+        self.check_endpoint(endpoint)?;
+        let binding = self.binding(owner)?;
+        let current = endpoint.managed_path(owner)?;
+        if current.binding.client != binding.client {
+            return Err(Error::InvalidContext);
+        }
+        let via = scoped(current.forwarding_destination, current.zone)?;
+        let live = self.paths.snapshot(binding.client)?;
+        if live.status() == PathStatus::Valid && self.forwards_via(live.key(), via) {
+            return Ok(live.pmtu_estimate()?);
+        }
+        let selected = self
+            .request(
+                live.key().source_address().address(),
+                live.key().destination().address(),
+                current.zone,
+                live.key().dscp(),
+            )
+            .ok()
+            .and_then(|request| self.paths.resolve_via(request, via).ok())
+            .and_then(|resolved| {
+                self.paths.path_administrations().find(|path| {
+                    path.snapshot.key() == resolved.key()
+                        && path.snapshot.status() == PathStatus::Valid
+                })
+            });
+        Ok(match selected {
+            Some(path) => path.snapshot.pmtu_estimate()?,
+            None => live.last_pmtu_estimate(),
+        })
+    }
+
     /// Explicit trusted negative evidence, with RFC hold in the configured
     /// caller timebase. A fresh equal report keeps the estimate but restarts
     /// the deadline. Only `service_changes` publishing a definitely submitted

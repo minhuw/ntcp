@@ -40,14 +40,6 @@ quote = '''
 Path MTU Discovery supports multicast as well as unicast destinations. In the case of a multicast destination, copies of a packet may traverse many different paths to many different nodes. Each path may have a different PMTU, and a single multicast packet may result in multiple Packet Too Big messages, each reporting a different next-hop MTU. The minimum PMTU value across the set of paths in use determines the size of subsequent packets sent to the multicast destination.
 '''
 
-# 8201-031
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
-reason = "The enabled core has no same-link bypass: direct (on-link) and gateway routes use the same Path MTU Discovery. ipv6_same_prefix_proxy_wire_path_does_not_bypass_downstream_ptb verifies 1500-to-1280 feedback, bounded repair and real receiver progress for a same-/64 peer at the wire level, and T18's production-route Host test on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud selects an on-link route whose next hop is the destination itself, resolves it by bounded host Neighbor Discovery (NS/NA) before the SYN leaves, accepts a downstream PTB correlated with a definitely submitted data segment and lowers the path estimate to 1280 while the 1500 first-hop fact stays. Remaining T19 (AC-22): the proxy-ND namespace topology, in which a neighboring router answers Neighbor Discovery for a destination more than one hop away and a real downstream PTB arrives for it; this is not a native-IPv6-socket requirement."
-quote = '''
-Note that Path MTU Discovery must be performed even in cases where a node "thinks" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.
-'''
-
 # 8201-053
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"

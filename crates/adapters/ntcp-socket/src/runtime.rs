@@ -3351,15 +3351,33 @@ impl Owner {
                     (IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass as i32,
                     (IPPROTO_IP, IP_MTU_DISCOVER) => s.discover,
                     (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => s.ipv6_discover,
+                    // Linux reports the connected route's dst_mtu: the bound
+                    // path's estimate, never the MSS, the sending budget or
+                    // the connection's own discovery state.
                     (IPPROTO_IP, IP_MTU) | (IPPROTO_IPV6, IPV6_MTU) => {
                         let Handle::Connection(cid) = s.handle else {
                             return Err(ENOTCONN);
                         };
-                        self.endpoint
-                            .path_mtu_info(cid)
-                            .map_err(engine)?
-                            .ok_or(EOPNOTSUPP)?
-                            .current_mtu as i32
+                        match &self.host {
+                            // A connection whose path authority is already
+                            // released has no route, like Linux's reset dst.
+                            Some(host) => {
+                                host.path_mtu_estimate(&self.endpoint, cid)
+                                    .map_err(|error| match error {
+                                        ntcp_host::Error::InvalidContext => ENOTCONN,
+                                        error => host_error(error),
+                                    })? as i32
+                            }
+                            // A backend-less core fixture has no shared path:
+                            // the connection's own estimate is its only one.
+                            None => {
+                                self.endpoint
+                                    .path_mtu_info(cid)
+                                    .map_err(engine)?
+                                    .ok_or(EOPNOTSUPP)?
+                                    .current_mtu as i32
+                            }
+                        }
                     }
                     (SOL_SOCKET, SO_ZEROCOPY) => s.zerocopy as i32,
                     (IPPROTO_TCP, TCP_KEEPIDLE) => s.idle,

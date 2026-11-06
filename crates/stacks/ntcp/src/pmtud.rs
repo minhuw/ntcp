@@ -1302,7 +1302,13 @@ impl Pmtud {
             self.delay(now, self.hold);
             self.periodic_deadline = None;
             self.reset_search = true;
-            if self.pending.is_none_or(|old| old.seq != seq || mtu < old.mtu) {
+            // The earliest outstanding quote times out first: a report about
+            // later data of the same flight does not displace it, or the
+            // head's timeout would leave the decrease waiting another RTO.
+            if self
+                .pending
+                .is_none_or(|old| mtu < old.mtu || old.live.after(seq))
+            {
                 self.pending_ids += 1;
                 self.pending = Some(Pending {
                     seq,
@@ -2134,6 +2140,72 @@ mod tests {
             }
             assert_eq!(outcomes[0], Some(reported));
             assert!(outcomes[1].unwrap() < reported);
+        }
+    }
+
+    // A window of oversized originals draws one deferred report each, in
+    // sequence order: the head's timeout applies the decrease, since a report
+    // about later data never displaces the earliest outstanding quote.
+    #[test]
+    fn later_deferred_report_keeps_the_earliest_quote() {
+        for ipv4 in [true, false] {
+            let (header, size, reported) = if ipv4 {
+                (20, 1440, 1100)
+            } else {
+                (40, 1460, 1350)
+            };
+            let mut p = state(ipv4);
+            p.sent(Seq(1), Seq(1401), size, header, false);
+            p.ack(Seq(1401), 1, 1000, 1000);
+            let heads = [Seq(1401), Seq(2801), Seq(4201), Seq(5601)];
+            for start in heads {
+                p.sent(start, start.wrapping_add(1400), size, header, false);
+            }
+            let mut ids = [None; 4];
+            for (i, start) in heads.into_iter().enumerate() {
+                let report = p.correlated_feedback(
+                    2,
+                    start,
+                    start.wrapping_add(1400),
+                    size,
+                    header,
+                    size,
+                    reported,
+                    true,
+                    None,
+                );
+                assert_eq!(report.feedback, PmtuFeedback::Deferred);
+                ids[i] = p.pending_id();
+            }
+            assert!(ids.iter().all(|&id| id == ids[0]));
+            p.timeout(3, heads[0], 1, 1000);
+            assert_eq!(p.info.current_mtu, reported);
+            assert_eq!(p.take_applied_pending(), Some((ids[0].unwrap(), reported)));
+            // A lower report about later data still replaces a higher one.
+            let mut p = state(ipv4);
+            p.sent(Seq(1), Seq(1401), size, header, false);
+            p.ack(Seq(1401), 1, 1000, 1000);
+            for start in heads {
+                p.sent(start, start.wrapping_add(1400), size, header, false);
+            }
+            p.correlated_feedback(
+                2, heads[0], heads[1], size, header, size, reported, true, None,
+            );
+            let first = p.pending_id();
+            p.correlated_feedback(
+                2,
+                heads[1],
+                heads[2],
+                size,
+                header,
+                size,
+                reported - 50,
+                true,
+                None,
+            );
+            assert_ne!(p.pending_id(), first);
+            p.timeout(3, heads[0], 1, 1000);
+            assert_eq!((p.info.current_mtu, p.take_applied_pending()), (1500, None));
         }
     }
 

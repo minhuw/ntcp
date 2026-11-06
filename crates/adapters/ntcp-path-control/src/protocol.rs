@@ -12,7 +12,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 /// The big-endian body length that precedes every frame.
 pub const LENGTH_PREFIX: usize = 4;
 
@@ -240,6 +240,12 @@ pub struct PathEntry {
     pub source: IpAddr,
     pub destination: IpAddr,
     pub forwarding: IpAddr,
+    /// The resolved first hop the path's packets leave to, part of its
+    /// identity: `Gateway(a)` names the neighbor address (the destination
+    /// itself when it is on-link, a Redirect's target when one moved the
+    /// destination beneath its route), `Forwarder` the route's forwarder;
+    /// never `OnLink`.
+    pub next_hop: NextHop,
     pub dscp: u8,
     pub pins: u32,
     pub policy: Policy,
@@ -351,7 +357,7 @@ pub const PATH_ENTRY: usize = 8
     + 8
     + 1
     + 8
-    + 3 * ADDRESS
+    + 4 * ADDRESS
     + 1
     + 4
     + POLICY
@@ -452,6 +458,18 @@ impl Writer<'_> {
         }
         self.bytes.extend_from_slice(&field);
     }
+    // An address field; a forwarder is tag 0xf with its identifier.
+    fn next_hop(&mut self, hop: NextHop) {
+        match hop {
+            NextHop::OnLink => self.address(None),
+            NextHop::Gateway(a) => self.address(Some(a)),
+            NextHop::Forwarder(id) => {
+                self.u8(0xf);
+                self.u64(id);
+                self.u64(0);
+            }
+        }
+    }
     fn prefix(&mut self, p: Option<Prefix>) {
         self.address(p.map(|p| p.network));
         self.u8(p.map_or(0, |p| p.length));
@@ -511,6 +529,16 @@ impl<'a> Reader<'a> {
     }
     fn some_address(&mut self) -> Option<IpAddr> {
         self.address()?
+    }
+    fn next_hop(&mut self) -> Option<NextHop> {
+        if self.bytes.first() == Some(&0xf) {
+            self.u8()?;
+            let id = self.u64()?;
+            self.u64()?;
+            Some(NextHop::Forwarder(id))
+        } else {
+            Some(self.address()?.map_or(NextHop::OnLink, NextHop::Gateway))
+        }
     }
     fn prefix(&mut self) -> Option<Option<Prefix>> {
         let network = self.address()?;
@@ -743,15 +771,7 @@ fn route_entry(w: &mut Writer, e: &RouteEntry) {
     w.prefix(e.source);
     w.u8(e.dscp.unwrap_or(0xff));
     w.u64(e.link);
-    match e.next_hop {
-        NextHop::OnLink => w.address(None),
-        NextHop::Gateway(a) => w.address(Some(a)),
-        NextHop::Forwarder(id) => {
-            w.u8(0xf);
-            w.u64(id);
-            w.u64(0);
-        }
-    }
+    w.next_hop(e.next_hop);
     w.u32(e.metric);
     w.policy(e.policy);
 }
@@ -766,14 +786,7 @@ fn read_route_entry(r: &mut Reader) -> Option<RouteEntry> {
         v => Some(v),
     };
     let link = r.u64()?;
-    let next_hop = if r.bytes.first() == Some(&0xf) {
-        r.u8()?;
-        let id = r.u64()?;
-        r.u64()?;
-        NextHop::Forwarder(id)
-    } else {
-        r.address()?.map_or(NextHop::OnLink, NextHop::Gateway)
-    };
+    let next_hop = r.next_hop()?;
     Some(RouteEntry {
         token,
         generation,
@@ -796,6 +809,7 @@ fn path_entry(w: &mut Writer, e: &PathEntry) {
     w.address(Some(e.source));
     w.address(Some(e.destination));
     w.address(Some(e.forwarding));
+    w.next_hop(e.next_hop);
     w.u8(e.dscp);
     w.u32(e.pins);
     w.policy(e.policy);
@@ -825,6 +839,10 @@ fn read_path_entry(r: &mut Reader) -> Option<PathEntry> {
     let source_address = r.some_address()?;
     let destination = r.some_address()?;
     let forwarding = r.some_address()?;
+    let next_hop = match r.next_hop()? {
+        NextHop::OnLink => return None,
+        hop => hop,
+    };
     let dscp = r.u8()?;
     let pins = r.u32()?;
     let policy = r.policy()?;
@@ -855,6 +873,7 @@ fn read_path_entry(r: &mut Reader) -> Option<PathEntry> {
         source: source_address,
         destination,
         forwarding,
+        next_hop,
         dscp,
         pins,
         policy,
@@ -986,6 +1005,7 @@ pub(crate) fn path_revision(out: &mut Vec<u8>, e: &PathEntry) {
     w.address(Some(e.source));
     w.address(Some(e.destination));
     w.address(Some(e.forwarding));
+    w.next_hop(e.next_hop);
     w.u8(e.dscp);
     w.policy(e.policy);
     w.u8(u8::from(e.route_policy.is_some()));
@@ -1127,6 +1147,7 @@ mod tests {
             source: IpAddr::V6(Ipv6Addr::LOCALHOST),
             destination: IpAddr::V6(Ipv6Addr::LOCALHOST),
             forwarding: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            next_hop: NextHop::Forwarder(5),
             dscp: 46,
             pins: 2,
             policy: Policy {
@@ -1276,7 +1297,10 @@ mod tests {
                 Err(DecodeError::Malformed(_))
             ));
         }
-        assert_eq!(decode_request(&[2, 1]), Err(DecodeError::UnknownVersion));
+        assert_eq!(
+            decode_request(&[VERSION + 1, 1]),
+            Err(DecodeError::UnknownVersion)
+        );
         assert_eq!(
             decode_request(&[VERSION, 200]),
             Err(DecodeError::UnknownOpcode(200))

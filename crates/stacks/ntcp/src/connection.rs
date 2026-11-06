@@ -780,6 +780,8 @@ pub(crate) struct Connection {
     sack_recovery: Option<SackRecovery>,
     sack_guard: Option<Seq>,
     // Retransmitted prefix and fixed data boundary at the most recent timeout.
+    // Without SACK recovery the prefix is a go-back-N frontier: the timed-out
+    // flight is resent in order under slow start (RFC 6582 section 4).
     sack_post_rto: Option<(Seq, Seq)>,
     sack_fallback: Option<Seq>,
     scoreboard: Scoreboard,
@@ -7042,6 +7044,13 @@ impl Connection {
             self.sack_guard = None;
             self.sack_post_rto = None;
         }
+        if !self.sack_recovery_enabled()
+            && self
+                .sack_post_rto
+                .is_some_and(|(_, boundary)| ack.at_or_after(boundary))
+        {
+            self.sack_post_rto = None;
+        }
         if self.sack_fallback.is_some_and(|end| ack.at_or_after(end)) {
             self.sack_fallback = None;
         }
@@ -8551,11 +8560,21 @@ impl Connection {
             && !probe
             && !keepalive
             && self.sack_fallback.is_none()
-            && let Some((high_rxt, _)) = self.sack_post_rto
+            && let Some((high_rxt, boundary)) = self.sack_post_rto
             && self.congestion.cwnd().saturating_sub(self.post_rto_pipe()) >= self.mss as u32
         {
             if self.rack_enabled() {
                 self.rack.lowest_lost(repair_packet_mss as u32)
+            } else if !self.sack_recovery_enabled() {
+                let left = if high_rxt.after(self.snd_una) {
+                    high_rxt
+                } else {
+                    self.snd_una
+                };
+                boundary.after(left).then(|| {
+                    let count = boundary.distance_from(left).min(repair_packet_mss as u32);
+                    (left, left.wrapping_add(count))
+                })
             } else {
                 self.scoreboard.lowest_hole(
                     high_rxt,
@@ -8887,7 +8906,10 @@ impl Connection {
                         .saturating_sub(self.flight())
                         .min(self.recovery_credit(recovery)) as usize
                 }
-            } else if self.sack_post_rto.is_some() && self.sack_fallback.is_none() {
+            } else if self.sack_post_rto.is_some()
+                && self.sack_fallback.is_none()
+                && self.sack_recovery_enabled()
+            {
                 let pipe = self.post_rto_pipe();
                 if cwnd.saturating_sub(pipe) >= self.mss as u32 {
                     self.snd_wnd
@@ -10692,6 +10714,14 @@ impl Connection {
                 self.sack_guard = Some(self.data_high());
                 self.sack_post_rto = Some((self.snd_una, self.data_high()));
                 self.congestion.cancel_sack_recovery();
+            } else if !early_response && !self.handshake_pending() {
+                // Without SACK the timed-out flight is resent in order from
+                // SND.UNA under slow start (go-back-N, RFC 6582 section 4):
+                // each cumulative ACK frees cwnd for the next segments below
+                // the timeout's data boundary instead of waiting for another
+                // backed-off RTO. recover = highest sent keeps the resulting
+                // duplicate ACKs from starting fast retransmit.
+                self.sack_post_rto = Some((self.snd_una, self.data_high()));
             }
             self.reset_limited_transmit();
             self.rto_deadline = None;

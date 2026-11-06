@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use super::*;
+#[path = "runtime_path_mtu_tests.rs"]
+mod path_mtu;
 
 type Wire = Arc<Mutex<State>>;
 fn pair_output(v6: bool, gso: bool, shared: bool) -> (Owner, Owner, u64, u64, Wire, Wire) {

@@ -83,7 +83,7 @@ fn print_route(e: &RouteEntry) {
 fn print_path(e: &PathEntry) {
     println!(
         "path token={:016x} generation={} version={} valid={} route={:016x} source={} destination={} \
-         forwarding={} dscp={} pins={} {} route_policy={} effective_disabled={} \
+         forwarding={} next_hop={} dscp={} pins={} {} route_policy={} effective_disabled={} \
          administrative_estimate={} accepted={} first_hop={} learned={} restriction={} budget={} \
          retry_not_before={} negative_revision={} discovery_revision={} clients={}",
         e.token,
@@ -94,6 +94,11 @@ fn print_path(e: &PathEntry) {
         e.source,
         e.destination,
         e.forwarding,
+        match e.next_hop {
+            NextHop::OnLink => "on-link".to_string(),
+            NextHop::Gateway(a) => a.to_string(),
+            NextHop::Forwarder(id) => format!("forwarder:{id}"),
+        },
         e.dscp,
         e.pins,
         policy(e.policy),

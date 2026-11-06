@@ -298,6 +298,11 @@ fn seeded_duplex_network_faults_preserve_every_byte_and_eventually_close() {
         let (mut a, mut b, listener, client) = endpoints();
         pump(&mut a, &mut b, 0);
         let server = b.accept(listener).unwrap();
+        // Eventual delivery, not an R2 give-up: a run of losses at the
+        // 60-second backoff ceiling must not end either side before the
+        // simulation's 1000-second horizon.
+        a.set_user_timeout(client, 1_000_000_000).unwrap();
+        b.set_user_timeout(server, 1_000_000_000).unwrap();
         let a_data: Vec<u8> = (0..4096).map(|i| ((i * 7 + trial) % 251) as u8).collect();
         let b_data: Vec<u8> = (0..3072).map(|i| ((i * 13 + trial) % 253) as u8).collect();
         let (mut a_sent, mut b_sent, mut a_read, mut b_read) = (0, 0, Vec::new(), Vec::new());

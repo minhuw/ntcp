@@ -340,9 +340,11 @@ class PmtudInventory(unittest.TestCase):
                          "nonzero leased Identification",
                          "every Host::udp_send and Host::udp_send_datagram UDP datagram and source fragment",
                          "with DF except on an owner-flagged route", "integration/rfc_host admin refuse case"),
-            "1191-074": ("T8", "T9", "T10", "T18 receives", "Remaining T19"),
+            "1191-074": ("T8", "T9", "T10", "T18 receives", "integration/rfc_host redirect cases",
+                         "source_ownership_and_link_deletion_only_revoke_lost_authority",
+                         "failed_client_stays_dirty_while_others_are_served", "OutRedirects or Icmp6OutRedirects"),
         }.items():
-            self.assertEqual(rows[key]["status"], "covered" if key == "1191-050" else "TODO", key)
+            self.assertEqual(rows[key]["status"], "covered", key)
             self.assertNotIn("T7 phase2", rows[key]["reason"], key)
             for dependency in dependencies:
                 self.assertIn(dependency, rows[key]["reason"], key)
@@ -383,12 +385,44 @@ class PmtudInventory(unittest.TestCase):
             "crates/stacks/ntcp-host/src/lib.rs": "CITATION",
             "crates/stacks/ntcp-host/src/tests/scoped.rs": "TEST",
             "crates/adapters/ntcp-socket/src/runtime_ipv6_tests.rs": "TEST"})
-        # 8201-031 stays TODO for T19's proxy-ND topology only; the on-link
-        # ND route and its PMTUD are T18's implemented behavior.
-        self.assertEqual(rows6["8201-031"]["status"], "TODO")
-        for fragment in ("on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud",
-                         "bounded host Neighbor Discovery", "Remaining T19 (AC-22): the proxy-ND namespace topology"):
+        # 8201-031 and 1191-074 close with T19's namespace evidence: the
+        # proxy-ND router PTB and the Linux-router Redirects, beside the
+        # production mechanisms and Host tests, every copy carrying the reason.
+        self.assertEqual(rows6["8201-031"]["status"], "covered")
+        self.assertEqual(rows6["8201-031"]["evidence"], [
+            "crates/stacks/ntcp-path/src/service.rs::    fn select(",
+            "crates/stacks/ntcp-host/src/tests/discovery.rs::fn on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud("])
+        for fragment in ("PathService::select", "Host::resolve_neighbor",
+                         "on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud",
+                         "ipv6_same_prefix_proxy_wire_path_does_not_bypass_downstream_ptb",
+                         "bounded host Neighbor Discovery", "integration/rfc_host nd-proxy cases", "NDP proxy",
+                         "kernel-generated PTB", "Icmp6OutPktTooBigs", "IPV6_MTU", "black-hole variant",
+                         "gateway variant"):
             self.assertIn(fragment, rows6["8201-031"]["reason"])
+        expected_copies = {
+            ("8201-031", rows6["8201-031"]["target"]): {
+                "crates/stacks/ntcp-path/src/service.rs": ["CITATION"],
+                "crates/stacks/ntcp-host/src/discovery.rs": ["CITATION"],
+                "crates/stacks/ntcp-host/src/tests/discovery.rs": ["TEST"],
+                "crates/stacks/ntcp/src/pmtud_ipv6_evidence_tests.rs": ["TEST"]},
+            ("1191-074", rows["1191-074"]["target"]): {
+                "crates/stacks/ntcp-path/src/service/cache.rs": ["CITATION"],
+                "crates/stacks/ntcp-path/tests/lifecycle.rs": ["TEST"],
+                "crates/stacks/ntcp-host/src/tests/redirect.rs": ["TEST"]},
+        }
+        for (key, target), expected in expected_copies.items():
+            row = rows6.get(key) or rows[key]
+            self.assertNotRegex(row["reason"], r"\bRemaining\b|\bTODO\b", key)
+            self.assertFalse([t for n in (1191, 8201)
+                              for t in tomllib.loads((ROOT / f"duvet/rfc{n}-todos.toml").read_text()).get("TODO", [])
+                              if normalize(t["quote"]) == normalize(row["quote"])], key)
+            copies = {}
+            for path in (ROOT / "crates").rglob("*.rs"):
+                for annotation in source_annotations(path.read_text()):
+                    if (annotation["target"], normalize(annotation["quote"])) == (target, normalize(row["quote"])):
+                        self.assertEqual(annotation["reason"], row["reason"], str(path))
+                        copies.setdefault(path.relative_to(ROOT).as_posix(), []).append(annotation["kind"])
+            self.assertEqual(copies, expected, key)
         # 8201-050 closes with T17's complete header length (pinned below).
         self.assertEqual(rows6["8201-050"]["status"], "covered")
         # T10 closes whole notification, UDP-quoted, MMS_S, deferred-report

@@ -12597,12 +12597,88 @@ fn karn_discards_retransmission_samples_but_can_time_fresh_sequence_space() {
     assert!(a.sample.is_none());
     let seq = a.receive.next();
     inject(&mut a, deadline + 10, seq, Seq(105), ACK, 64, b"");
+    // Go-back-N resends the rest of the timed-out flight first, untimed.
+    let rest = packet(&mut a, deadline + 20);
+    assert_eq!(wire::parse(ip(tuple()), &rest).unwrap().payload, b"efgh");
+    assert!(a.sample.is_none());
     let fresh = packet(&mut a, deadline + 20);
     assert_eq!(wire::parse(ip(tuple()), &fresh).unwrap().payload, b"ijkl");
     assert_eq!(a.sample, Some((Seq(113), deadline + 20)));
     inject(&mut a, deadline + 30, seq, Seq(113), ACK, 64, b"");
     assert!(a.sample.is_none());
     assert_eq!(a.rto(), 1_000_000);
+}
+
+// Without SACK a timed-out flight is resent in order under slow start: each
+// cumulative ACK releases the next segments below the timeout's data
+// boundary (an ACK past the frontier skips data the receiver holds), not one
+// segment per backed-off RTO; fresh data follows the boundary.
+#[test]
+fn non_sack_timeout_resends_the_flight_go_back_n_under_slow_start() {
+    for iss in [100, u32::MAX - 150] {
+        let (mut a, _) = pair(config(4096, 100), iss);
+        a.set_nagle(false);
+        a.write(&[7; 1200]).unwrap();
+        let base = a.snd_una;
+        let mut out = vec![0; 2048];
+        let mut originals = 0;
+        while a.transmit(40, &mut out).unwrap().is_some() {
+            originals += 1;
+        }
+        assert!(originals >= 4, "{originals}");
+        let high = a.snd_nxt;
+        let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        assert_eq!(a.congestion.cwnd(), 100);
+        let sent = |a: &mut Connection, now| {
+            super::test_support::drain_wire(a, now, 2048, 16)
+                .into_iter()
+                .map(|(seq, len, _)| (Seq(seq).distance_from(base), len))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sent(&mut a, deadline), [(0, 100)]);
+        let seq = a.receive.next();
+        inject(
+            &mut a,
+            deadline + 10,
+            seq,
+            base.wrapping_add(100),
+            ACK,
+            4096,
+            b"",
+        );
+        // Slow start: two segments, both below the boundary, no fresh data.
+        assert_eq!(sent(&mut a, deadline + 10), [(100, 100), (200, 100)]);
+        assert_eq!(a.snd_nxt, high);
+        // The receiver held [200, 300): the frontier skips it.
+        inject(
+            &mut a,
+            deadline + 20,
+            seq,
+            base.wrapping_add(300),
+            ACK,
+            4096,
+            b"",
+        );
+        // cwnd 300, nothing outstanding: the rest of the flight in order,
+        // then fresh data up to the window.
+        let flight = high.distance_from(base);
+        let next = sent(&mut a, deadline + 20);
+        let expected: Vec<_> = (3..6).map(|i| (i * 100, 100)).collect();
+        assert_eq!(next, expected, "{flight}");
+        let mut now = deadline + 20;
+        while a.sack_post_rto.is_some() {
+            now += 10;
+            assert!(now < a.rto_deadline.unwrap(), "repair waited for a timeout");
+            let ack = a.data_high();
+            inject(&mut a, now, seq, ack, ACK, 4096, b"");
+            super::test_support::drain_wire(&mut a, now, 2048, 16);
+        }
+        assert!(a.snd_una.at_or_after(high));
+        assert_eq!(a.consecutive_timeouts, 0);
+        // Fresh data continues past the timed-out flight.
+        assert!(a.snd_nxt.after(high) || a.send.len() == 0);
+    }
 }
 
 #[test]

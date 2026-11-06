@@ -217,6 +217,9 @@ fn run() -> io::Result<()> {
     if args.get(1).map(String::as_str) == Some("scoped") {
         return scoped(&args);
     }
+    if args.get(1).map(String::as_str) == Some("phased") {
+        return phased(&args);
+    }
     if args.len() != 9 {
         return Err(io::Error::other(
             "role local peer policy capacity lifetime_us managed disabled",
@@ -564,8 +567,15 @@ fn name(fd: i32, peer: bool) -> io::Result<SocketAddr> {
     })?;
     decode(&storage, len)
 }
-// One connection's scoped names, send MSS and current path MTU.
+// One connection's scoped names, send MSS and current path MTU (IP_MTU or
+// IPV6_MTU by the connection's family).
 fn connection(fd: i32, index: u32) -> io::Result<String> {
+    let local = name(fd, false)?;
+    let (level, option) = if local.is_ipv4() {
+        (IPPROTO_IP, IP_MTU)
+    } else {
+        (IPPROTO_IPV6, IPV6_MTU)
+    };
     let mut bytes = [0u8; 280];
     let mut len = bytes.len() as u32;
     check(unsafe {
@@ -583,15 +593,14 @@ fn connection(fd: i32, index: u32) -> io::Result<String> {
     check(unsafe {
         api::getsockopt(
             fd,
-            IPPROTO_IPV6,
-            IPV6_MTU,
+            level,
+            option,
             (&mut mtu as *mut i32).cast(),
             &mut len,
         )
     })?;
     Ok(format!(
-        "\"index\":{index},\"local\":\"{}\",\"peer\":\"{}\",\"tcp_state\":{},\"snd_mss\":{mss},\"path_mtu\":{mtu}",
-        name(fd, false)?,
+        "\"index\":{index},\"local\":\"{local}\",\"peer\":\"{}\",\"tcp_state\":{},\"snd_mss\":{mss},\"path_mtu\":{mtu}",
         name(fd, true)?,
         bytes[0]
     ))
@@ -769,6 +778,142 @@ fn scoped(args: &[String]) -> io::Result<()> {
                     ));
                 }
                 emit(format!("{{\"event\":\"paired\",\"connections\":[{}]}}", results.join(",")));
+            }
+            Some(other) => return Err(io::Error::other(format!("unknown command {other}"))),
+        }
+    }
+    Ok(())
+}
+
+// The T19 proxy/gateway cases (`phased CONFIG`): one runtime configured from
+// the production configuration text CONFIG (a resolving `io.*` port), whose
+// named connections the harness drives phase by phase, so every stream is
+// established before the path changes. On stdin (ID names a connection):
+//   listen PORT          bind [LOCAL]:PORT (retrying while tentative), listen
+//   accept ID            accept one connection on that listener
+//   connect ID PEER PORT actively open to [PEER]:PORT and wait until established
+//   send ID N SALT       write N bytes (pattern SALT)
+//   recv ID N SALT       read and verify N bytes (pattern SALT)
+//   shutdown ID          shut down the sending direction
+//   eof ID               read EOF
+//   query ID             report names, state, send MSS and IP_MTU/IPV6_MTU
+//   close ID
+//   quit
+fn phased(args: &[String]) -> io::Result<()> {
+    if args.len() != 3 {
+        return Err(io::Error::other("phased CONFIG"));
+    }
+    let config = api::SocketConfig::parse(&args[2])?;
+    let local = config.io.address;
+    let c = CString::new(config.io.interface.as_str()).map_err(|_| io::Error::other("interface name"))?;
+    let index = unsafe { if_nametoindex(c.as_ptr()) };
+    if index == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    api::configure(config)?;
+    let family = if local.is_ipv4() { AF_INET } else { AF_INET6 };
+    emit(format!(
+        "{{\"event\":\"ready\",\"backend\":\"AfPacket\",\"packet_test\":false,\"local\":\"{local}\",\"index\":{index}}}"
+    ));
+    let mut listener = None;
+    let mut connections: Vec<(String, i32)> = Vec::new();
+    for line in io::stdin().lock().lines() {
+        let line = line?;
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let invalid = || io::Error::other(format!("invalid command {line:?}"));
+        let number = |i: usize| -> io::Result<usize> {
+            fields.get(i).and_then(|f| f.parse().ok()).ok_or_else(invalid)
+        };
+        let id = fields.get(1).map(|s| s.to_string()).unwrap_or_default();
+        let fd = || {
+            connections
+                .iter()
+                .find(|(name, _)| *name == id)
+                .map(|&(_, fd)| fd)
+                .ok_or_else(|| io::Error::other(format!("unknown connection {id:?}")))
+        };
+        let deadline = Instant::now() + Duration::from_secs(25);
+        match fields.first().copied() {
+            None => continue,
+            Some("quit") => break,
+            Some("listen") => {
+                let fd = check(unsafe { api::socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0) })?;
+                let attempts = bind_tentative(fd, SocketAddr::new(local, number(1)? as u16), deadline)?;
+                check(unsafe { api::listen(fd, 4) })?;
+                listener = Some(fd);
+                emit(format!(
+                    "{{\"event\":\"listening\",\"local\":\"{}\",\"bind_attempts\":{attempts}}}",
+                    name(fd, false)?
+                ));
+            }
+            Some("accept") => {
+                let fd = accept_one(listener.ok_or_else(|| io::Error::other("accept needs listen"))?, deadline)?;
+                connections.push((id.clone(), fd));
+                emit(format!("{{\"event\":\"accepted\",\"id\":{id:?},{}}}", connection(fd, index)?));
+            }
+            Some("connect") => {
+                let peer: IpAddr = fields.get(2).and_then(|f| f.parse().ok()).ok_or_else(invalid)?;
+                let (addr, len) = address(SocketAddr::new(peer, number(3)? as u16));
+                // The runtime refuses a source address that is still
+                // tentative (EADDRNOTAVAIL) until its Duplicate Address
+                // Detection completes: retry with a fresh socket.
+                let mut attempts = 0;
+                let fd = loop {
+                    attempts += 1;
+                    let fd = check(unsafe { api::socket(family, SOCK_STREAM | SOCK_NONBLOCK, 0) })?;
+                    if unsafe { api::connect(fd, (&addr as *const sockaddr_storage).cast(), len) } == 0 {
+                        break fd;
+                    }
+                    let error = io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(EINPROGRESS) => break fd,
+                        Some(EADDRNOTAVAIL) if Instant::now() < deadline => {
+                            check(unsafe { api::close(fd) })?;
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        _ => return Err(error),
+                    }
+                };
+                wait(fd, POLLOUT, deadline)?;
+                match so_error(fd)? {
+                    0 => {}
+                    error => return Err(io::Error::from_raw_os_error(error)),
+                }
+                connections.push((id.clone(), fd));
+                emit(format!(
+                    "{{\"event\":\"connected\",\"id\":{id:?},\"attempts\":{attempts},{}}}",
+                    connection(fd, index)?
+                ));
+            }
+            Some("send") => {
+                let (n, salt) = (number(2)?, number(3)?);
+                write_all(fd()?, &pattern(n, salt), deadline)?;
+                emit(format!("{{\"event\":\"sent\",\"id\":{id:?},\"tx\":{n},\"salt\":{salt}}}"));
+            }
+            Some("recv") => {
+                let (n, salt) = (number(2)?, number(3)?);
+                let bytes = read_exact(fd()?, n, deadline)?;
+                verify(&bytes, salt)?;
+                emit(format!(
+                    "{{\"event\":\"received\",\"id\":{id:?},\"rx\":{n},\"salt\":{salt},\"hash\":{:?}}}",
+                    hash(&bytes)
+                ));
+            }
+            Some("shutdown") => {
+                check(unsafe { api::shutdown(fd()?, SHUT_WR) })?;
+                emit(format!("{{\"event\":\"shutdown\",\"id\":{id:?}}}"));
+            }
+            Some("eof") => {
+                eof(fd()?, deadline)?;
+                emit(format!("{{\"event\":\"eof\",\"id\":{id:?}}}"));
+            }
+            Some("query") => {
+                emit(format!("{{\"event\":\"query\",\"id\":{id:?},{}}}", connection(fd()?, index)?));
+            }
+            Some("close") => {
+                check(unsafe { api::close(fd()?) })?;
+                connections.retain(|(name, _)| *name != id);
+                emit(format!("{{\"event\":\"closed\",\"id\":{id:?}}}"));
             }
             Some(other) => return Err(io::Error::other(format!("unknown command {other}"))),
         }

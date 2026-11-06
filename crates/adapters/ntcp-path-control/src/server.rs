@@ -663,6 +663,10 @@ impl Server {
                         source: key.source_address().address(),
                         destination: key.destination().address(),
                         forwarding: key.forwarding_destination().address(),
+                        next_hop: match key.next_hop() {
+                            path::ResolvedNextHop::Address(a) => NextHop::Gateway(a.address()),
+                            path::ResolvedNextHop::Forwarder(id) => NextHop::Forwarder(id.0),
+                        },
                         dscp: key.dscp().value(),
                         pins: u32::try_from(a.pins).unwrap_or(u32::MAX),
                         policy: policy(a.policy),
