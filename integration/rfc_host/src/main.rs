@@ -229,10 +229,6 @@ fn run() -> io::Result<()> {
     let local: IpAddr = args[2].parse().unwrap();
     let peer: IpAddr = args[3].parse().unwrap();
     let mut config = api::SocketConfig::new("t5n", local);
-    // The harness created this address in a fresh namespace for this run,
-    // so nothing was emitted from it before: this states the fact for the
-    // IP Identification quiet period.
-    config.io.source_quiet = api::SourceQuiet::Never;
     config.io.backend = api::Backend::AfPacket;
     config.io.prefix = Some(if local.is_ipv4() { 24 } else { 64 });
     config.io.next_hop_mac = Some([2, 0, 0, 0, 0, 1]);

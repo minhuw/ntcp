@@ -399,8 +399,8 @@ impl Owner {
     }
     // Clear DF on one encoded IPv4 header and give it a leased
     // Identification. Backpressure (the RFC 6864 ceiling of 65536
-    // non-atomic datagrams per tuple per MDL, the quiet period after start,
-    // or entropy failure) leaves the packet unchanged and unsubmittable.
+    // non-atomic datagrams per tuple per MDL, or entropy failure) leaves
+    // the packet unchanged and unsubmittable.
     pub(super) fn lease_dont_identification(
         &mut self,
         now: u64,
@@ -409,7 +409,7 @@ impl Owner {
         let host = self
             .host
             .as_mut()
-            .ok_or(ntcp_host::IdentifierBackpressure::Unavailable { until: None })?;
+            .ok_or(ntcp_host::IdentifierBackpressure::Unavailable)?;
         host.lease_df_clear(now, ip).map(|_| ())
     }
     // No TCP pacer here: core selected polling returns only currently eligible
@@ -722,10 +722,9 @@ impl Owner {
                                 .deadline
                                 .get_or_insert(now.saturating_add(self.reservation_timeout_us));
                             entry.not_before = match backpressure {
-                                ntcp_host::IdentifierBackpressure::Exhausted { retry_at }
-                                | ntcp_host::IdentifierBackpressure::Unavailable {
-                                    until: Some(retry_at),
-                                } => retry_at.max(now.saturating_add(1)),
+                                ntcp_host::IdentifierBackpressure::Exhausted { retry_at } => {
+                                    retry_at.max(now.saturating_add(1))
+                                }
                                 _ => now.saturating_add(1000),
                             };
                             egress

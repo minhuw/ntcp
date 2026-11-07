@@ -16,12 +16,13 @@
 //! every outstanding lease of the pair.
 //!
 //! Continuity: a lease outlives addresses, links, routes and the Host
-//! context itself. A replacement Host either receives this allocator, with
-//! the same timebase (`Host::take_identifiers`, `Continuity::Transfer`), or
-//! issues nothing until a full MDL after the previous context stopped
-//! emitting (`Continuity::QuietSince`). Hosts that use one source address at
-//! the same time must share one allocator; a Host never issues from an
-//! allocator another Host owns, because transfer moves it.
+//! context itself. A replacement Host in the same process receives this
+//! allocator, with the same timebase (`Host::take_identifiers`,
+//! `Continuity::Transfer`). A newly started stack assumes no earlier
+//! incarnation emitted from its sources and issues at once
+//! (`Continuity::Fresh`), as Linux does after a reboot. Hosts that use one
+//! source address at the same time must share one allocator; a Host never
+//! issues from an allocator another Host owns, because transfer moves it.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -82,9 +83,8 @@ const BLOCKS: usize = 256;
 /// value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentifierBackpressure {
-    /// No allocator is started (or the configured storage is zero), or the
-    /// quiet period of `Continuity::QuietSince` lasts until `until`.
-    Unavailable { until: Option<Instant> },
+    /// No allocator is started, or the configured storage is zero.
+    Unavailable,
     /// Every value that may be issued next is still leased (the RFC 6864
     /// ceiling of 65536 non-atomic datagrams per tuple per MDL, or a full
     /// lease table); retry at `retry_at`.
@@ -96,16 +96,9 @@ pub enum IdentifierBackpressure {
 /// How a newly started allocator relates to earlier Host contexts that used
 /// the same sources.
 pub enum Continuity {
-    /// The previous context, if any, stopped emitting at this instant of
-    /// this Host's timebase; nothing is issued until a full MDL later.
-    QuietSince(Instant),
-    /// Deployment knowledge stated at `at`: no earlier context had emitted
-    /// from these sources for at least `seconds` before it (`u64::MAX`: no
-    /// earlier emission at all, for example addresses or a link that did
-    /// not exist before this Host). Nothing is issued until a full MDL after
-    /// that emission ceased. This asserts a fact about the deployment; it
-    /// does not shorten the MDL.
-    QuietFor { at: Instant, seconds: u64 },
+    /// No earlier context's leases carry over: identifiers are issued at
+    /// once.
+    Fresh,
     /// Exclusive ownership of the previous context's allocator.
     Transfer(IdentifierAllocator),
 }
@@ -133,9 +126,6 @@ pub struct IdentifierAllocator {
     units_per_second: u64,
     lifetime: Instant,
     running: bool,
-    not_before: Instant,
-    // Sources with their own continuity fact; one entry per stated address.
-    sources: Vec<(IpAddr, Instant)>,
     tuples: Vec<Option<Tuple>>,
     blocks: Vec<Instant>,
     leases: Vec<Option<Lease6>>,
@@ -156,8 +146,6 @@ impl IdentifierAllocator {
             units_per_second,
             lifetime,
             running: false,
-            not_before: 0,
-            sources: Vec::new(),
             tuples: crate::table(limits.ipv4_tuples, None)?,
             blocks: crate::table(
                 limits
@@ -175,56 +163,13 @@ impl IdentifierAllocator {
     pub(crate) fn units_per_second(&self) -> u64 {
         self.units_per_second
     }
-    pub(crate) fn start_quiet(&mut self, stopped: Instant) {
+    pub(crate) fn start(&mut self) {
         self.running = true;
-        self.not_before = stopped.saturating_add(self.lifetime);
     }
-    // Emission ceased `seconds` before `at`: the part of the MDL that has
-    // not yet elapsed remains.
-    pub(crate) fn start_quiet_for(&mut self, at: Instant, seconds: u64) {
-        let elapsed = seconds.saturating_mul(self.units_per_second);
-        self.running = true;
-        self.not_before = at.saturating_add(self.lifetime.saturating_sub(elapsed));
-    }
-    // `source`'s own fact replaces the start's for it. Addresses scoped to
-    // different links can repeat, so one value keeps the latest of its facts.
-    pub(crate) fn source_quiet_for(
-        &mut self,
-        source: IpAddr,
-        at: Instant,
-        seconds: u64,
-    ) -> Result<(), Error> {
-        let elapsed = seconds.saturating_mul(self.units_per_second);
-        let until = at.saturating_add(self.lifetime.saturating_sub(elapsed));
-        if let Some(entry) = self.sources.iter_mut().find(|(s, _)| *s == source) {
-            entry.1 = entry.1.max(until);
-            return Ok(());
-        }
-        self.sources.try_reserve(1).map_err(|_| Error::Allocation)?;
-        self.sources.push((source, until));
-        Ok(())
-    }
-    // A transferred allocator keeps its own quiet period; one that was
-    // never started carries no continuity and cannot be transferred.
+    // One that was never started carries no continuity and cannot be
+    // transferred.
     pub(crate) fn running(&self) -> bool {
         self.running
-    }
-
-    fn available(&self, now: Instant, source: IpAddr) -> Result<(), IdentifierBackpressure> {
-        if !self.running {
-            return Err(IdentifierBackpressure::Unavailable { until: None });
-        }
-        let not_before = self
-            .sources
-            .iter()
-            .find(|(s, _)| *s == source)
-            .map_or(self.not_before, |(_, until)| *until);
-        if now < not_before {
-            return Err(IdentifierBackpressure::Unavailable {
-                until: Some(not_before),
-            });
-        }
-        Ok(())
     }
 
     /// Issue the Identification of one non-atomic datagram whose last
@@ -238,7 +183,9 @@ impl IdentifierAllocator {
         protocol: u8,
         entropy: Option<&mut Entropy>,
     ) -> Result<u32, IdentifierBackpressure> {
-        self.available(now, source)?;
+        if !self.running {
+            return Err(IdentifierBackpressure::Unavailable);
+        }
         match (source, destination) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => self
                 .issue_v4(now, source, destination, protocol, entropy)
@@ -246,7 +193,7 @@ impl IdentifierAllocator {
             (IpAddr::V6(source), IpAddr::V6(destination)) => {
                 self.issue_v6(now, source, destination, entropy)
             }
-            _ => Err(IdentifierBackpressure::Unavailable { until: None }),
+            _ => Err(IdentifierBackpressure::Unavailable),
         }
     }
 
@@ -275,7 +222,7 @@ impl IdentifierAllocator {
                         .min();
                     return Err(match retry_at {
                         Some(retry_at) => IdentifierBackpressure::Exhausted { retry_at },
-                        None => IdentifierBackpressure::Unavailable { until: None },
+                        None => IdentifierBackpressure::Unavailable,
                     });
                 };
                 // RFC 7739 section 5.1: a per-destination counter starting
@@ -325,7 +272,7 @@ impl IdentifierAllocator {
         else {
             return Err(match self.leases.iter().flatten().map(|l| l.expires).min() {
                 Some(retry_at) => IdentifierBackpressure::Exhausted { retry_at },
-                None => IdentifierBackpressure::Unavailable { until: None },
+                None => IdentifierBackpressure::Unavailable,
             });
         };
         let entropy = entropy.ok_or(IdentifierBackpressure::Entropy)?;

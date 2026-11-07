@@ -517,8 +517,8 @@ fn udp_echo_serves_a_link_local_address_on_the_tun_link() {
     let mut ae = Endpoint::new(cfg.clone(), [7; 32], 0, tun_v6_policy(a)).unwrap();
     let mut be = Endpoint::new(cfg.clone(), [8; 32], 0, tun_v6_policy(b)).unwrap();
     let settings = refuse_settings();
-    let mut ahost = TunHost::attach_routed(&mut ae, &cfg, a.into(), &settings, &[], 0, 9).unwrap();
-    let mut bhost = TunHost::attach_routed(&mut be, &cfg, b.into(), &settings, &[], 0, 9).unwrap();
+    let mut ahost = TunHost::attach_routed(&mut ae, &cfg, a.into(), &settings, &[], 9).unwrap();
+    let mut bhost = TunHost::attach_routed(&mut be, &cfg, b.into(), &settings, &[], 9).unwrap();
     let service = SocketAddr::new(a.into(), 7);
     let mut echo = UdpEcho::open(&mut ahost, &ae, service, &cfg, &settings).unwrap();
     // The link-local service is the TUN link's; unscoped it names none.

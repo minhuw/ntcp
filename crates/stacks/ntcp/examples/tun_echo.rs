@@ -11,10 +11,6 @@
 //   NTCP_PEER_REASSEMBLY_IPV4 / NTCP_PEER_REASSEMBLY_IPV6=OCTETS  the
 //     complete reconstructed IP datagram the peers can reassemble, for the
 //     local family only; unset keeps the receiver guarantee (576 / 1500).
-//   NTCP_SOURCE_QUIET=SECONDS|never  earlier emission from LOCAL_IP ceased
-//     at least SECONDS before startup (never: there was none, for example a
-//     newly created address). Unset, no IP Identification is issued for one
-//     maximum datagram lifetime (120 s) after startup.
 //   NTCP_CONTROL_SOCKET=PATH  opt-in local path control socket (absolute
 //     pathname in a private 0700 directory owned by this uid) for
 //     ntcp-pathctl: route and path query, discovery disable/enable,
@@ -80,17 +76,6 @@ mod linux {
         io::Error::other(format!("IP host: {error:?}"))
     }
 
-    // How earlier emission from the local address relates to this process.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum SourceQuiet {
-        // Unknown: an earlier process may have emitted from it until now.
-        Unknown,
-        // Asserted: it ceased at least this many seconds before startup.
-        Seconds(u64),
-        // Asserted: there was no earlier emission from it at all.
-        Never,
-    }
-
     // An owner-configured SR route: final destinations of the prefix and
     // their segments S1..Sn.
     type SegmentRoute = (path::IpPrefix, Vec<Ipv6Addr>);
@@ -131,7 +116,6 @@ mod linux {
         // Complete reconstructed IP octets the peers reassemble, for the
         // local family; None keeps RFC 1122 / RFC 8200's guarantee.
         peer_reassembly: Option<u32>,
-        quiet: SourceQuiet,
     }
 
     impl Default for DatagramSettings {
@@ -139,7 +123,6 @@ mod linux {
             Self {
                 udp_mode: UdpSendMode::Fragment,
                 peer_reassembly: None,
-                quiet: SourceQuiet::Unknown,
             }
         }
     }
@@ -152,7 +135,6 @@ mod linux {
             udp_mode: Option<&str>,
             ipv4_capacity: Option<&str>,
             ipv6_capacity: Option<&str>,
-            quiet: Option<&str>,
         ) -> io::Result<Self> {
             let udp_mode = match udp_mode {
                 None | Some("fragment") => UdpSendMode::Fragment,
@@ -182,17 +164,9 @@ mod linux {
                         })
                 })
                 .transpose()?;
-            let quiet = match quiet {
-                None => SourceQuiet::Unknown,
-                Some("never") => SourceQuiet::Never,
-                Some(value) => SourceQuiet::Seconds(value.parse().map_err(|_| {
-                    invalid("NTCP_SOURCE_QUIET must be whole seconds or never")
-                })?),
-            };
             Ok(Self {
                 udp_mode,
                 peer_reassembly,
-                quiet,
             })
         }
 
@@ -202,35 +176,12 @@ mod linux {
                 Err(std::env::VarError::NotPresent) => Ok(None),
                 Err(_) => Err(invalid(&format!("invalid {name}"))),
             };
-            let (mode, v4, v6, quiet) = (
+            let (mode, v4, v6) = (
                 var("NTCP_UDP_ECHO_MODE")?,
                 var("NTCP_PEER_REASSEMBLY_IPV4")?,
                 var("NTCP_PEER_REASSEMBLY_IPV6")?,
-                var("NTCP_SOURCE_QUIET")?,
             );
-            Self::parse(
-                local,
-                mode.as_deref(),
-                v4.as_deref(),
-                v6.as_deref(),
-                quiet.as_deref(),
-            )
-        }
-
-        // The allocator's start: one full MDL after earlier emission from
-        // the local address may have ceased (RFC 6864 section 4.3).
-        fn continuity(&self, started: u64) -> Continuity {
-            match self.quiet {
-                SourceQuiet::Unknown => Continuity::QuietSince(started),
-                SourceQuiet::Seconds(seconds) => Continuity::QuietFor {
-                    at: started,
-                    seconds,
-                },
-                SourceQuiet::Never => Continuity::QuietFor {
-                    at: started,
-                    seconds: u64::MAX,
-                },
-            }
+            Self::parse(local, mode.as_deref(), v4.as_deref(), v6.as_deref())
         }
 
         fn report(&self, local: IpAddr) -> String {
@@ -246,22 +197,9 @@ mod linux {
                 ),
             };
             let lifetime = ntcp_host::DEFAULT_LIFETIME_SECONDS;
-            let identifiers = match self.quiet {
-                SourceQuiet::Unknown => format!(
-                    "none for {lifetime} s (earlier emission from {local} is unknown)"
-                ),
-                SourceQuiet::Seconds(seconds) => format!(
-                    "none for {} s (asserted: emission from {local} ceased {seconds} s before \
-                     startup)",
-                    u64::from(lifetime).saturating_sub(seconds)
-                ),
-                SourceQuiet::Never => {
-                    format!("immediately (asserted: no earlier emission from {local})")
-                }
-            };
             format!(
                 "datagram settings: UDP echo mode {mode}; peer reassembly capacity {capacity}; \
-                 IP identifiers {identifiers}; MDL {lifetime} s"
+                 MDL {lifetime} s"
             )
         }
     }
@@ -461,7 +399,7 @@ mod linux {
             config: &EndpointConfig,
             local: IpAddr,
         ) -> io::Result<Self> {
-            Self::attach_with(endpoint, config, local, &DatagramSettings::default(), 0)
+            Self::attach_with(endpoint, config, local, &DatagramSettings::default())
         }
 
         #[cfg(test)]
@@ -470,10 +408,9 @@ mod linux {
             config: &EndpointConfig,
             local: IpAddr,
             settings: &DatagramSettings,
-            started: u64,
         ) -> io::Result<Self> {
             // A fixture TUN with interface index 1.
-            Self::attach_routed(endpoint, config, local, settings, &[], started, 1)
+            Self::attach_routed(endpoint, config, local, settings, &[], 1)
         }
 
         // `attach_with` installing the owner's SR routes (NTCP_IPV6_SRH)
@@ -485,7 +422,6 @@ mod linux {
             local: IpAddr,
             settings: &DatagramSettings,
             segment_routes: &[SegmentRoute],
-            started: u64,
             interface: u32,
         ) -> io::Result<Self> {
             // Independent public lifetime identity, never derived from TCP's
@@ -575,7 +511,9 @@ mod linux {
             host.set_entropy(Box::new(|bytes: &mut [u8]| {
                 os_entropy(bytes).map_err(|_| ntcp_host::EntropyError)
             }));
-            host.start_identifiers(settings.continuity(started))
+            // A newly started stack assumes no earlier incarnation emitted
+            // from its address: identifiers are issued at once.
+            host.start_identifiers(Continuity::Fresh)
                 .map_err(host_error)?;
             let forwarder = path::ForwarderId(1);
             let ingress = host
@@ -1588,8 +1526,7 @@ mod linux {
     }
 
     // TCP frames on a discovery-disabled IPv4 route or path that wait for an
-    // Identification (the allocator's start quiet period, or the RFC 6864
-    // ceiling of their tuple). Only such a frame waits: it keeps its owner's
+    // Identification (the RFC 6864 ceiling of their tuple). Only such a frame waits: it keeps its owner's
     // reservation, evidence ticket and bytes and is retried at its own time
     // while other owners' output continues, as the native runtime's
     // scheduler retries only the affected entry. An owner has at most one
@@ -1625,10 +1562,9 @@ mod linux {
         // otherwise (none stated) at the loop's next tick.
         fn retry_at(time: u64, backpressure: ntcp_host::IdentifierBackpressure) -> u64 {
             match backpressure {
-                ntcp_host::IdentifierBackpressure::Exhausted { retry_at }
-                | ntcp_host::IdentifierBackpressure::Unavailable {
-                    until: Some(retry_at),
-                } => retry_at.max(time.saturating_add(1)),
+                ntcp_host::IdentifierBackpressure::Exhausted { retry_at } => {
+                    retry_at.max(time.saturating_add(1))
+                }
                 _ => time.saturating_add(TICK_US),
             }
         }
@@ -2312,7 +2248,7 @@ mod linux {
                              datagram limit of {max_payload}"
                         ))
                     }
-                    // No identifier (quiet period, MDL ceiling, entropy):
+                    // No identifier (MDL ceiling, entropy):
                     // a reply the path carries whole still goes whole.
                     Err(DatagramError::Backpressure(_))
                         if send.mode == UdpSendMode::Fragment
@@ -2539,7 +2475,6 @@ mod linux {
         let started = time.ticks()?;
         let mut endpoint = Endpoint::new(config.clone(), secret, started, address_policy)
             .map_err(engine)?;
-        let current = time.now(&mut endpoint)?;
         let mut network =
             TunHost::attach_routed(
                 &mut endpoint,
@@ -2547,7 +2482,6 @@ mod linux {
                 local,
                 &settings,
                 &segment_routes,
-                current,
                 interface,
             )?;
         let mut control = control_server(
@@ -2905,13 +2839,13 @@ mod linux {
         }
 
         // Identifier backpressure holds only the frame that needs one.
-        // Inside the allocator's start quiet period (the default: earlier
-        // emission from the address is unknown), the SYN of a connection
-        // whose exact path the owner made discovery-disabled must leave DF
-        // clear with a leased Identification, so it waits with its own
-        // reservation, while a connection to a neighbor destination still
-        // sends its SYN with DF. Once identifiers can be issued, the held SYN
-        // leaves DF clear with a nonzero leased Identification.
+        // While the RFC 6864 ceiling withholds the identifiers of its tuple,
+        // the SYN of a connection whose exact path the owner made
+        // discovery-disabled must leave DF clear with a leased
+        // Identification, so it waits with its own reservation, while a
+        // connection to a neighbor destination still sends its SYN with DF.
+        // Once identifiers can be issued, the held SYN leaves DF clear with a
+        // nonzero leased Identification.
         #[test]
         fn identifier_backpressure_holds_only_the_df_clear_frame() {
             use ntcp_io::{PacketIo, PacketLayer};
@@ -2950,6 +2884,17 @@ mod linux {
             };
             let disabled: SocketAddr = "10.0.0.1:8080".parse().unwrap();
             let neighbor: SocketAddr = "10.0.0.3:8080".parse().unwrap();
+            // Every Identification of the held SYN's tuple leased at 0: the
+            // next one is issued a full MDL later.
+            let mut leased = 0;
+            while network
+                .host
+                .lease_identification(0, local.into(), disabled.ip(), 6)
+                .is_ok()
+            {
+                leased += 1;
+            }
+            assert_eq!(leased, 65536);
             let held = endpoint
                 .connect_with_path_provider(
                     0,
@@ -3244,7 +3189,6 @@ mod linux {
                     .unwrap();
             };
             set(&mut network, &mut endpoint, true);
-            // After the start quiet period the DF-clear lease succeeds.
             transmit_frames(
                 &mut network,
                 &mut endpoint,
@@ -4162,9 +4106,9 @@ mod linux {
             let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
             let settings = DatagramSettings::default();
             let mut client_host =
-                TunHost::attach_routed(&mut client, &cfg, a.into(), &settings, &[], 0, 9).unwrap();
+                TunHost::attach_routed(&mut client, &cfg, a.into(), &settings, &[], 9).unwrap();
             let mut server_host =
-                TunHost::attach_routed(&mut server, &cfg, b.into(), &settings, &[], 0, 9).unwrap();
+                TunHost::attach_routed(&mut server, &cfg, b.into(), &settings, &[], 9).unwrap();
             let link = client_host.ingress.link();
             assert_eq!(client_host.host.paths().link(link).unwrap().interface, path::InterfaceKey(9));
             let listener = server_host
@@ -4267,7 +4211,6 @@ mod linux {
                 b.into(),
                 &DatagramSettings::default(),
                 &routes,
-                0,
                 1,
             )
             .unwrap();
@@ -4446,7 +4389,6 @@ mod linux {
                 a.into(),
                 &DatagramSettings::default(),
                 &routes,
-                0,
                 1,
             )
             .unwrap();

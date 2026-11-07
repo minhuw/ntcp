@@ -374,7 +374,6 @@ fn external_backend_is_created_used_and_dropped_on_owner_thread() {
                 reclaims,
             };
             let mut config = SocketConfig::new("external", Ipv4Addr::new(10, 73, 0, 2));
-            config.io.source_quiet = crate::SourceQuiet::Never;
             config.io.prefix = Some(24);
             Owner::external_backend(
                 &config,

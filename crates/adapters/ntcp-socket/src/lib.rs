@@ -31,9 +31,7 @@ macro_rules! boundary_entry {
 
 mod config;
 mod ip;
-pub use config::{
-    Backend, IoConfig, PortConfig, SegmentRoute, SocketConfig, SocketPolicy, SourceQuiet,
-};
+pub use config::{Backend, IoConfig, PortConfig, SegmentRoute, SocketConfig, SocketPolicy};
 #[cfg(feature = "tfo-linux-cookie")]
 pub use config::ConfiguredFastOpenKey;
 #[cfg(feature = "tfo-linux-cookie")]

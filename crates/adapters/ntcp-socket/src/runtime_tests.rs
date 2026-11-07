@@ -196,7 +196,6 @@ fn timestamp_default_control_rejects_non_packet_backend() {
 fn client_tfo_permission_native_configuration_and_management() {
     let mut owner = owner(2);
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2));
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.socket.fast_open_client_enabled = false;
     owner.apply_socket_config(&config).unwrap();
     let id = new(&mut owner, SOCK_NONBLOCK);

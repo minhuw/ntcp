@@ -425,9 +425,6 @@ class Ntcp:
         # The UDP echo's send mode is selected explicitly per case; other
         # operational settings (deployment knowledge) are per case too.
         env["NTCP_UDP_ECHO_MODE"] = udp_mode
-        # Every namespace and address is created for its case, so nothing was
-        # emitted from it before: a true fact for both quiet periods.
-        env["NTCP_SOURCE_QUIET"] = "never"
         env.update(settings or {})
         return env
 
@@ -1170,17 +1167,13 @@ def child(case, proof, binary, Peer, command, emit, staged_binary=None, driver_b
             evidence.update(driver_configuration=dict(
                 connectionless_initial=initial, peer_reassembly=PEER_REASSEMBLY, adjunct_paths=config["adjunct"],
                 stated="deployment configuration of this case (Linux peer reassembles 65535-octet datagrams)",
-                identifier_continuity=driver.ready["continuity"], mdl_seconds=driver.ready["mdl_seconds"],
-                source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission"))
+                identifier_continuity=driver.ready["continuity"], mdl_seconds=driver.ready["mdl_seconds"]))
         elif scenario == "fragment":
             # Fragment mode with the Linux peer's reassembly capacity stated
-            # (deployment knowledge). The harness created the ntcp address in
-            # a fresh namespace for this case, so it asserts that nothing
-            # emitted from it before (decision D14; recorded as evidence).
+            # (deployment knowledge).
             ntcp = Ntcp(binary, a["ntcp"], "fragment", {
-                f"NTCP_PEER_REASSEMBLY_IPV{family}": str(PEER_REASSEMBLY), "NTCP_SOURCE_QUIET": "never"})
-            evidence.update(tun_echo_udp_mode=ntcp.udp_mode, tun_echo_settings=ntcp.settings,
-                            source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission")
+                f"NTCP_PEER_REASSEMBLY_IPV{family}": str(PEER_REASSEMBLY)})
+            evidence.update(tun_echo_udp_mode=ntcp.udp_mode, tun_echo_settings=ntcp.settings)
         else:
             # These cases' evidence is whole UDP replies and the refusal of
             # oversize ones (the path payload limit wording): Refuse mode.

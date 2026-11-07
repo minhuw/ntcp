@@ -45,12 +45,7 @@ fn side(local: SocketAddr, identity: u128) -> Side {
         }
         Ok(())
     }));
-    side.0
-        .start_identifiers(Continuity::QuietFor {
-            at: 0,
-            seconds: u64::MAX,
-        })
-        .unwrap();
+    side.0.start_identifiers(Continuity::Fresh).unwrap();
     side
 }
 

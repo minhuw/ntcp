@@ -720,7 +720,6 @@ fn pmtud_startup_uses_real_mtu_and_separate_adapter_capacity() {
     }));
     let io = Fixture(state.clone());
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2));
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.tcp.connection.mss = 8960;
     config.tcp.connection.send_ip_payload_limit = 8980;
     assert!(config.validate().is_ok());

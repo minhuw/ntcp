@@ -17,7 +17,6 @@ mod neighbor;
 mod probe_receipts;
 mod reassembly;
 mod redirect;
-mod lifecycle;
 mod scoped;
 mod segment_routes;
 mod receive_capability;
@@ -91,12 +90,7 @@ fn managed_identified(
         out.fill(0x5a);
         Ok(())
     }));
-    side.0
-        .start_identifiers(Continuity::QuietFor {
-            at: 0,
-            seconds: u64::MAX,
-        })
-        .unwrap();
+    side.0.start_identifiers(Continuity::Fresh).unwrap();
     side
 }
 fn managed_configured(

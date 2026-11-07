@@ -207,8 +207,7 @@ fn disabled_ipv4_route_clears_df_and_applies_the_sending_limit_to_tcp() {
 
 // Without an available identifier a DF-clear packet cannot be built: the
 // rewrite is refused and leaves the bytes untouched, so the embedding holds
-// the packet (never sending a reused value) and retries after the quiet
-// period.
+// the packet (never sending a reused value) and retries.
 #[test]
 fn df_clear_rewrite_backpressures_without_touching_the_packet() {
     let cfg = config(2);
@@ -232,20 +231,14 @@ fn df_clear_rewrite_backpressures_without_touching_the_packet() {
     // Not started: unavailable.
     assert_eq!(
         a.0.lease_df_clear(5, &mut frame),
-        Err(IdentifierBackpressure::Unavailable { until: None })
+        Err(IdentifierBackpressure::Unavailable)
     );
     assert_eq!(frame, original);
-    // Started after an earlier context stopped at 0: quiet for one MDL.
     a.0.set_entropy(std::boxed::Box::new(|out: &mut [u8]| {
         out.fill(0);
         Ok(())
     }));
-    a.0.start_identifiers(Continuity::QuietSince(0)).unwrap();
-    assert_eq!(
-        a.0.lease_df_clear(MDL - 1, &mut frame),
-        Err(IdentifierBackpressure::Unavailable { until: Some(MDL) })
-    );
-    assert_eq!(frame, original);
+    a.0.start_identifiers(Continuity::Fresh).unwrap();
     // Then every lease is distinct and nonzero (a leased 0 is skipped)
     // until the RFC 6864 ceiling of the tuple holds the packet.
     let mut seen = std::collections::BTreeSet::new();
@@ -313,7 +306,7 @@ const UDP: UdpLimits = UdpLimits {
     probe_receipts: 2,
 };
 
-fn udp_side(identity: u128, quiet: bool) -> Side {
+fn udp_side(identity: u128) -> Side {
     let (local, _) = addresses(false);
     let mut side = managed_limited(local, identity, config(2), false, None, None, |p, mut l| {
         l.datagrams = DatagramLimits {
@@ -338,16 +331,7 @@ fn udp_side(identity: u128, quiet: bool) -> Side {
         out.fill(0x33);
         Ok(())
     }));
-    side.0
-        .start_identifiers(if quiet {
-            Continuity::QuietSince(0)
-        } else {
-            Continuity::QuietFor {
-                at: 0,
-                seconds: u64::MAX,
-            }
-        })
-        .unwrap();
+    side.0.start_identifiers(Continuity::Fresh).unwrap();
     side
 }
 
@@ -395,7 +379,7 @@ fn disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments() {
         mode: UdpSendMode::Probe,
         peer_capability: None,
     };
-    let mut a = udp_side(9960, false);
+    let mut a = udp_side(9960);
     let (local, remote) = addresses(false);
     let remote = SocketAddr::new(remote.ip(), 7);
     let flow = a.0.udp_open(&a.1, local, Some(remote), UdpOptions { dscp: 0, hop_limit: 64 }).unwrap();
@@ -465,46 +449,6 @@ fn disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments() {
     }
 }
 
-// Identifier backpressure on the disabled route: during the start quiet
-// period no DF-clear datagram (whole or fragmented) leaves and nothing is
-// submitted; after it the same send succeeds with a leased Identification.
-#[test]
-fn disabled_ipv4_route_udp_output_waits_for_the_quiet_period() {
-    let mut a = udp_side(9970, true);
-    let (local, remote) = addresses(false);
-    let remote = SocketAddr::new(remote.ip(), 7);
-    let flow = a.0.udp_open(&a.1, local, Some(remote), UdpOptions { dscp: 0, hop_limit: 64 }).unwrap();
-    let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
-    let route = a.0.paths().path_snapshot(path).unwrap().key().route();
-    set_route(&mut a, route, disabled(None), 10);
-    for send in [
-        UdpSend {
-            mode: UdpSendMode::Refuse,
-            peer_capability: None,
-        },
-        UdpSend {
-            mode: UdpSendMode::Fragment,
-            peer_capability: Some(4000),
-        },
-    ] {
-        let payload = vec![6; if send.mode == UdpSendMode::Refuse { 200 } else { 1500 }];
-        let (result, sent) = udp_send(&mut a, 20, flow, send, &payload);
-        assert_eq!(
-            result.err(),
-            Some(DatagramError::Backpressure(IdentifierBackpressure::Unavailable {
-                until: Some(MDL)
-            }))
-        );
-        assert!(sent.is_empty());
-        let (result, sent) = udp_send(&mut a, MDL, flow, send, &payload);
-        let report = result.unwrap();
-        assert!(!sent.is_empty());
-        for packet in &sent {
-            assert_eq!(Some(u32::from(assert_df_clear(packet))), report.identification);
-        }
-    }
-}
-
 fn udp_send_whole(
     a: &mut Side,
     now: u64,
@@ -520,9 +464,10 @@ fn udp_send_whole(
     (result, sent)
 }
 
-// The T9 whole-datagram API on a disabled IPv4 route: during the start
-// quiet period nothing is submitted (identifier backpressure, its evidence
-// reservation released); afterwards each datagram leaves without DF with
+// The T9 whole-datagram API on a disabled IPv4 route: without an
+// identifier (an entropy failure) nothing is submitted (identifier
+// backpressure, its evidence reservation released); afterwards each
+// datagram leaves without DF with
 // its own nonzero leased Identification and a valid header checksum,
 // within the 576-octet forwarder sending limit. Re-enabled, it is atomic
 // again: DF set and Identification 0.
@@ -533,10 +478,10 @@ fn udp_send_whole(
 //# We therefore believe that the IP layer should store PMTU information and that the ICMP layer should process received Datagram Too Big messages. The packetization layers must still be able to respond to changes in the Path MTU, by changing the size of the datagrams they send, and must also be able to specify that datagrams are sent with the DF bit set. We do not want the IP layer to simply set the DF bit in every packet, since it is possible that a packetization layer, perhaps a UDP application outside the kernel, is unable to change its datagram size. Protocols involving intentional fragmentation, while inelegant, are sometimes successful (NFS being the primary example), and we do not want to break such protocols.
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
 //= type=test
-//= reason=The suggested route flag is set through Host::administration and by the ntcp-pathctl utility. Outside flagged routes IPv4 packets carry DF (the atomic encoder and every source fragment) except the application-requested IP_PMTUDISC_DONT TCP output, each with an Identification leased from the Host allocator. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. The administrative model exists: PathService stores owner policy (discovery disable and an administrative PMTU estimate) per forwarding route and per exact resolved path under compare-and-set generations and keeps a route's administrative restriction (the lowest value its estimate imposed on a path) across idle path eviction and upward sets until the route's estimate is cleared, and its outstanding administrative hold across clears as well, and installs later paths of the route under them, so reacquisition never promotes a deferred upward value; Host::administration issues a Host-instance-bound capability for query (the administrative estimate, the accepted network estimate with its provenance, each client's usable size, TCP transport ceilings, and the TCP and Echo adjunct search diagnostic), read-only candidate validation and apply. Each estimate operation compares with the path's accepted network estimate: a downward value lowers it at once with a fresh negative revision and a hold of max(old, now + 600 seconds), notifies every client of the path in the same administration transaction and caps the search and confirmed growth while set; an equal value is a no-op; an upward value changes no accepted estimate, hold, search lower bound, current size or confirmed bound and defines a search transition: it caps TCP PLPMTUD and the Host Echo adjunct search, and once per value the first probe the existing hold, cooldown, loss-recovery, data/window and adjunct-demand rules allow targets it (clipped by the first-hop, transport and negative-evidence bounds; the deferral or clip is reported), so the accepted estimate grows only through an acknowledged or echoed unfragmented probe and PathService::confirm_delivery, and a failed targeted probe is not reopened by later revisions; clearing removes the cap for live and later paths and keeps every hold, while a live path incarnation keeps the accepted estimate a restriction lowered (no older larger value is restored), which relaxes only through confirmed delivery there. Size proof follows the final submitted bytes: a TCP record raises max_acked or search_low or reaches confirm_delivery only when its submitted packet was unfragmentable (IPv4 DF set, certified from Host::submit's physical receipt for managed output), so DF-clear IP_PMTUDISC_DONT output proves no size. Every change is one serialized Host::admin_apply transaction: it validates read-only every TCP binding on each affected path (complete option-bearing headers plus one payload octet), failing with nothing changed, then stores the policy and applies each binding's new snapshot, each UDP flow's change notification and the Echo adjunct state at once; best-effort output never blocks a change: a held stateless output lease is revalidated by the submission barrier and a queued ICMP message is sized at emission, exactly as after a trusted PTB decrease (one that no longer fits is refused or counted unsent), so a remote peer cannot hold the owner's restriction off; the IPv4 plateau table and RFC 4821 search aging (existing TCP connections at once, future ones before their first output) are administered through the same capability. The discovery-disable flag is enforced on existing and future users: no TCP PLPMTUD probe, Echo adjunct probe or UDP Probe-mode datagram (refused with DiscoveryDisabled) leaves a flagged path and the submission barrier refuses any packet above its ordinary budget; TCP stops size-search changes (probe success, implicit growth, isolated-loss narrowing, verification and black-hole fallback) while loss recovery continues; each change invalidates outstanding TCP and adjunct size results selected under the previous policy; and on IPv6 the path's packet budget is at most 1280 octets, which every physical packet of existing and newly created users obeys (Host tests: TCP output and retransmissions, SYN, SYN-ACK, FIN and RST control segments and stateless resets, each physical software-GSO segment of an aggregate held across the disable and of new aggregates, UDP Refuse and Fragment, and Echo replies). On IPv4 the flag leaves DF clear on the packets of the route or path whatever the upper layer requests (RFC 1191 section 6.6, the user's recorded decision B): TCP segments including control segments and connections created with PLPMTUD, whole UDP datagrams of Host::udp_send and Host::udp_send_datagram and Host source fragments of UDP Fragment mode and Echo replies (MF, offsets and the datagram's one Identification kept, every rewritten header checksum recomputed), each DF-clear datagram carrying an Identification leased from the Host allocator (the RFC 6864 ceiling and the start quiet period hold output instead of reusing a value); its sending limit is the RFC 1122 section 3.3.3 EMTU_S: the owner's administrative value when set (never above the accepted estimate), otherwise at most 576 octets through a gateway or forwarder and the accepted estimate within the link MTU on-link, the packet budget existing and future TCP, UDP Refuse and Fragment, Echo replies and udp_datagram_limits use. The TCP submission barrier (Host::submit) refuses a DF-set IPv4 packet on such a path; Host::clears_dont_fragment and Host::lease_df_clear apply the rewrite at each physical submission in the native runtime (a route disable dominates the socket's IP_MTU_DISCOVER) and tun_echo, and DF-clear deliveries prove no size (Host tests in ntcp-host src/tests/ipv4_policy.rs, PathService tests of the on-link, gateway and forwarder limits). A DF-clear datagram is non-atomic, so such a route needs exactly these leased Identifications (RFC 6864). T12 stage 6 adds the system utility: the ntcp-path-control crate's opt-in local control socket (an absolute pathname Unix stream socket of mode 0600 in a private 0700 directory owned by the owner; every request, queries included, authorized on the accepted descriptor by its kernel SO_PEERCRED uid against an allow-list defaulting to the owner's effective uid, without a root bypass and failing closed; a versioned length-prefixed binary protocol with fixed-width fields, frame and page bounds derived from the largest encoded messages, bounded peer slots, per-pass work, frame-completion, reply-drain and idle deadlines, and explicit statuses for malformed, oversized, unknown-version, unknown-opcode, unauthorized and stale requests, which change nothing), served from the owner loop of the native runtime (control.socket, control.allow_uids, separate from route.*; native descriptors and direct system calls on the owner thread, before the held-output early continue) and of tun_echo (NTCP_CONTROL_SOCKET), through the Host-bound administration capability, and the ntcp-pathctl utility: paginated route and path queries carrying a listing revision (generations, policy, the cached administrative estimate, the accepted estimate with provenance, the shared packet budget, holds and revisions, and per client the usable size, transport ceilings and deferred growth with its reason), discovery disable and enable and administrative estimate set and clear on a route or an exact path under compare-and-set generations, the IPv4 plateau table and search aging (real utility process round trips in ntcp-path-control tests/control.rs, the native runtime and tun_echo tests). Namespace evidence (integration/rfc_host admin and native-admin cases): after ntcp-pathctl disables discovery on an IPv4 route or path of tun_echo or the native runtime, every captured packet, TCP control segments and UDP source fragments included, has DF clear and its own nonzero leased Identification, at most 576 octets through a Forwarder route or at most the administrative value when one is set, while another destination through the same route keeps DF on its packets and fragments. Host::udp_send, the T9 whole-datagram API that tun_echo's Refuse-mode UDP echo replies use, leaves its IPv4 datagrams on such a route DF clear with a leased Identification as well, holding a datagram on identifier backpressure (UdpSendError::Backpressure) and refusing one above the sending limit with its payload limit (ntcp-host test disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams); the integration/rfc_host admin refuse case captures tun_echo's Refuse-mode replies after ntcp-pathctl disables discovery on its IPv4 path: DF clear, distinct nonzero Identifications and at most 576 octets, a larger reply refused locally with the 548-octet payload limit, while the neighbor destination keeps DF and re-enabling restores it. Route isolation of the IPv4 policy is shown in-process: ntcp-host test disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments disables one of two routes sharing a link and next hop, whose fragments leave DF clear while the other route keeps DF on its fragments; on the wire, the integration/rfc_host icmp route-isolation case gives the datagram_drive Host a second route (the same link and Forwarder next hop, selected by DSCP): after the owner disables discovery on its default route, that route's source fragments leave DF clear with one nonzero leased Identification per datagram and at most 576 octets, while the neighboring enabled route keeps DF on its fragments and the peer reassembles both.
+//= reason=The suggested route flag is set through Host::administration and by the ntcp-pathctl utility. Outside flagged routes IPv4 packets carry DF (the atomic encoder and every source fragment) except the application-requested IP_PMTUDISC_DONT TCP output, each with an Identification leased from the Host allocator. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. The administrative model exists: PathService stores owner policy (discovery disable and an administrative PMTU estimate) per forwarding route and per exact resolved path under compare-and-set generations and keeps a route's administrative restriction (the lowest value its estimate imposed on a path) across idle path eviction and upward sets until the route's estimate is cleared, and its outstanding administrative hold across clears as well, and installs later paths of the route under them, so reacquisition never promotes a deferred upward value; Host::administration issues a Host-instance-bound capability for query (the administrative estimate, the accepted network estimate with its provenance, each client's usable size, TCP transport ceilings, and the TCP and Echo adjunct search diagnostic), read-only candidate validation and apply. Each estimate operation compares with the path's accepted network estimate: a downward value lowers it at once with a fresh negative revision and a hold of max(old, now + 600 seconds), notifies every client of the path in the same administration transaction and caps the search and confirmed growth while set; an equal value is a no-op; an upward value changes no accepted estimate, hold, search lower bound, current size or confirmed bound and defines a search transition: it caps TCP PLPMTUD and the Host Echo adjunct search, and once per value the first probe the existing hold, cooldown, loss-recovery, data/window and adjunct-demand rules allow targets it (clipped by the first-hop, transport and negative-evidence bounds; the deferral or clip is reported), so the accepted estimate grows only through an acknowledged or echoed unfragmented probe and PathService::confirm_delivery, and a failed targeted probe is not reopened by later revisions; clearing removes the cap for live and later paths and keeps every hold, while a live path incarnation keeps the accepted estimate a restriction lowered (no older larger value is restored), which relaxes only through confirmed delivery there. Size proof follows the final submitted bytes: a TCP record raises max_acked or search_low or reaches confirm_delivery only when its submitted packet was unfragmentable (IPv4 DF set, certified from Host::submit's physical receipt for managed output), so DF-clear IP_PMTUDISC_DONT output proves no size. Every change is one serialized Host::admin_apply transaction: it validates read-only every TCP binding on each affected path (complete option-bearing headers plus one payload octet), failing with nothing changed, then stores the policy and applies each binding's new snapshot, each UDP flow's change notification and the Echo adjunct state at once; best-effort output never blocks a change: a held stateless output lease is revalidated by the submission barrier and a queued ICMP message is sized at emission, exactly as after a trusted PTB decrease (one that no longer fits is refused or counted unsent), so a remote peer cannot hold the owner's restriction off; the IPv4 plateau table and RFC 4821 search aging (existing TCP connections at once, future ones before their first output) are administered through the same capability. The discovery-disable flag is enforced on existing and future users: no TCP PLPMTUD probe, Echo adjunct probe or UDP Probe-mode datagram (refused with DiscoveryDisabled) leaves a flagged path and the submission barrier refuses any packet above its ordinary budget; TCP stops size-search changes (probe success, implicit growth, isolated-loss narrowing, verification and black-hole fallback) while loss recovery continues; each change invalidates outstanding TCP and adjunct size results selected under the previous policy; and on IPv6 the path's packet budget is at most 1280 octets, which every physical packet of existing and newly created users obeys (Host tests: TCP output and retransmissions, SYN, SYN-ACK, FIN and RST control segments and stateless resets, each physical software-GSO segment of an aggregate held across the disable and of new aggregates, UDP Refuse and Fragment, and Echo replies). On IPv4 the flag leaves DF clear on the packets of the route or path whatever the upper layer requests (RFC 1191 section 6.6, the user's recorded decision B): TCP segments including control segments and connections created with PLPMTUD, whole UDP datagrams of Host::udp_send and Host::udp_send_datagram and Host source fragments of UDP Fragment mode and Echo replies (MF, offsets and the datagram's one Identification kept, every rewritten header checksum recomputed), each DF-clear datagram carrying an Identification leased from the Host allocator (the RFC 6864 ceiling holds output instead of reusing a value); its sending limit is the RFC 1122 section 3.3.3 EMTU_S: the owner's administrative value when set (never above the accepted estimate), otherwise at most 576 octets through a gateway or forwarder and the accepted estimate within the link MTU on-link, the packet budget existing and future TCP, UDP Refuse and Fragment, Echo replies and udp_datagram_limits use. The TCP submission barrier (Host::submit) refuses a DF-set IPv4 packet on such a path; Host::clears_dont_fragment and Host::lease_df_clear apply the rewrite at each physical submission in the native runtime (a route disable dominates the socket's IP_MTU_DISCOVER) and tun_echo, and DF-clear deliveries prove no size (Host tests in ntcp-host src/tests/ipv4_policy.rs, PathService tests of the on-link, gateway and forwarder limits). A DF-clear datagram is non-atomic, so such a route needs exactly these leased Identifications (RFC 6864). T12 stage 6 adds the system utility: the ntcp-path-control crate's opt-in local control socket (an absolute pathname Unix stream socket of mode 0600 in a private 0700 directory owned by the owner; every request, queries included, authorized on the accepted descriptor by its kernel SO_PEERCRED uid against an allow-list defaulting to the owner's effective uid, without a root bypass and failing closed; a versioned length-prefixed binary protocol with fixed-width fields, frame and page bounds derived from the largest encoded messages, bounded peer slots, per-pass work, frame-completion, reply-drain and idle deadlines, and explicit statuses for malformed, oversized, unknown-version, unknown-opcode, unauthorized and stale requests, which change nothing), served from the owner loop of the native runtime (control.socket, control.allow_uids, separate from route.*; native descriptors and direct system calls on the owner thread, before the held-output early continue) and of tun_echo (NTCP_CONTROL_SOCKET), through the Host-bound administration capability, and the ntcp-pathctl utility: paginated route and path queries carrying a listing revision (generations, policy, the cached administrative estimate, the accepted estimate with provenance, the shared packet budget, holds and revisions, and per client the usable size, transport ceilings and deferred growth with its reason), discovery disable and enable and administrative estimate set and clear on a route or an exact path under compare-and-set generations, the IPv4 plateau table and search aging (real utility process round trips in ntcp-path-control tests/control.rs, the native runtime and tun_echo tests). Namespace evidence (integration/rfc_host admin and native-admin cases): after ntcp-pathctl disables discovery on an IPv4 route or path of tun_echo or the native runtime, every captured packet, TCP control segments and UDP source fragments included, has DF clear and its own nonzero leased Identification, at most 576 octets through a Forwarder route or at most the administrative value when one is set, while another destination through the same route keeps DF on its packets and fragments. Host::udp_send, the T9 whole-datagram API that tun_echo's Refuse-mode UDP echo replies use, leaves its IPv4 datagrams on such a route DF clear with a leased Identification as well, holding a datagram on identifier backpressure (UdpSendError::Backpressure) and refusing one above the sending limit with its payload limit (ntcp-host test disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams); the integration/rfc_host admin refuse case captures tun_echo's Refuse-mode replies after ntcp-pathctl disables discovery on its IPv4 path: DF clear, distinct nonzero Identifications and at most 576 octets, a larger reply refused locally with the 548-octet payload limit, while the neighbor destination keeps DF and re-enabling restores it. Route isolation of the IPv4 policy is shown in-process: ntcp-host test disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments disables one of two routes sharing a link and next hop, whose fragments leave DF clear while the other route keeps DF on its fragments; on the wire, the integration/rfc_host icmp route-isolation case gives the datagram_drive Host a second route (the same link and Forwarder next hop, selected by DSCP): after the owner disables discovery on its default route, that route's source fragments leave DF clear with one nonzero leased Identification per datagram and at most 576 octets, while the neighboring enabled route keeps DF on its fragments and the peer reassembles both.
 //# The former can be accomplished by associating a flag with the routing entry; when a packet is sent via a route with this flag set, the IP layer leaves the DF bit clear no matter what the upper layer requests.
 fn disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams() {
-    let mut a = udp_side(9980, true);
+    let mut a = udp_side(9980);
     let (local, remote) = addresses(false);
     let remote = SocketAddr::new(remote.ip(), 7);
     let flow = a.0.udp_open(&a.1, local, Some(remote), UdpOptions { dscp: 0, hop_limit: 64 }).unwrap();
@@ -552,14 +497,17 @@ fn disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams() {
         udp_send_whole(&mut a, 20, flow, &[2; 549]).0,
         Err(UdpSendError::TooBig { max_payload: 548 })
     );
+    a.0.set_entropy(std::boxed::Box::new(|_: &mut [u8]| Err(EntropyError)));
     let (result, sent) = udp_send_whole(&mut a, 20, flow, &[2; 548]);
     assert_eq!(
         result,
-        Err(UdpSendError::Backpressure(IdentifierBackpressure::Unavailable {
-            until: Some(MDL)
-        }))
+        Err(UdpSendError::Backpressure(IdentifierBackpressure::Entropy))
     );
     assert!(sent.is_empty());
+    a.0.set_entropy(std::boxed::Box::new(|out: &mut [u8]| {
+        out.fill(0x33);
+        Ok(())
+    }));
     let mut seen = Vec::new();
     for (now, len) in [(MDL, 548), (MDL + 1, 100)] {
         let (result, sent) = udp_send_whole(&mut a, now, flow, &vec![3; len]);
@@ -599,7 +547,7 @@ fn disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments() {
         mode: UdpSendMode::Fragment,
         peer_capability: Some(4000),
     };
-    let mut a = udp_side(9980, false);
+    let mut a = udp_side(9980);
     let (local, remote) = addresses(false);
     let remote = SocketAddr::new(remote.ip(), 7);
     let defaulted = a.0.udp_open(&a.1, local, Some(remote), UdpOptions { dscp: 0, hop_limit: 64 }).unwrap();

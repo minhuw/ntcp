@@ -363,58 +363,40 @@ fn echo_replies_carry_processed_options_through_the_tun_drain() {
 fn datagram_settings_are_validated_and_reported() {
     let v4: IpAddr = "192.0.2.1".parse().unwrap();
     let v6: IpAddr = "2001:db8::1".parse().unwrap();
-    let parse = |local, mode, a, b, quiet| DatagramSettings::parse(local, mode, a, b, quiet);
-    assert_eq!(parse(v4, None, None, None, None).unwrap(), DatagramSettings::default());
-    let stated = parse(v4, Some("refuse"), Some("4096"), None, Some("30")).unwrap();
+    let parse = |local, mode, a, b| DatagramSettings::parse(local, mode, a, b);
+    assert_eq!(parse(v4, None, None, None).unwrap(), DatagramSettings::default());
+    let stated = parse(v4, Some("refuse"), Some("4096"), None).unwrap();
     assert_eq!(stated, DatagramSettings {
         udp_mode: UdpSendMode::Refuse,
         peer_reassembly: Some(4096),
-        quiet: SourceQuiet::Seconds(30),
     });
-    assert_eq!(parse(v6, None, None, Some("65575"), Some("never")).unwrap().quiet,
-        SourceQuiet::Never);
-    for (local, mode, a, b, quiet) in [
-        (v4, Some("split"), None, None, None),
-        (v4, None, Some("575"), None, None),
-        (v4, None, Some("65536"), None, None),
-        (v4, None, Some("many"), None, None),
-        (v4, None, None, Some("2000"), None),
-        (v6, None, None, Some("1499"), None),
-        (v6, None, Some("2000"), None, None),
-        (v6, None, None, None, Some("-1")),
-        (v6, None, None, None, Some("soon")),
+    assert_eq!(parse(v6, None, None, Some("65575")).unwrap().peer_reassembly, Some(65575));
+    for (local, mode, a, b) in [
+        (v4, Some("split"), None, None),
+        (v4, None, Some("575"), None),
+        (v4, None, Some("65536"), None),
+        (v4, None, Some("many"), None),
+        (v4, None, None, Some("2000")),
+        (v6, None, None, Some("1499")),
+        (v6, None, Some("2000"), None),
     ] {
-        let error = parse(local, mode, a, b, quiet).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:?} {a:?} {b:?} {quiet:?}");
+        let error = parse(local, mode, a, b).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:?} {a:?} {b:?}");
     }
     assert!(stated.report(v4).contains("refuse (whole replies only)"));
     assert!(stated.report(v4).contains("4096 octets (stated)"));
-    assert!(stated.report(v4).contains("none for 90 s (asserted"));
     assert!(DatagramSettings::default().report(v6).contains("1500 octets (receiver guarantee)"));
-    // The allocator starts one MDL after earlier emission may have ceased.
-    let second = 1_000_000;
-    for (quiet, until) in [
-        (SourceQuiet::Unknown, Some(120 * second)),
-        (SourceQuiet::Seconds(30), Some(90 * second)),
-        (SourceQuiet::Seconds(500), None),
-        (SourceQuiet::Never, None),
-    ] {
-        let settings = DatagramSettings { quiet, ..DatagramSettings::default() };
-        let (_, mut host) = endpoint_with_settings(v6, true, false, &settings);
-        let lease = host.host.lease_identification(0, v6, "2001:db8::2".parse().unwrap(), 17);
-        match until {
-            Some(until) => assert_eq!(lease,
-                Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) })),
-            None => assert!(lease.is_ok(), "{quiet:?}: {lease:?}"),
-        }
-    }
+    // The allocator issues from startup on.
+    let (_, mut host) = endpoint_with_settings(v6, true, false, &DatagramSettings::default());
+    let lease = host.host.lease_identification(0, v6, "2001:db8::2".parse().unwrap(), 17);
+    assert!(lease.is_ok(), "{lease:?}");
 }
 
 // Fragment mode (the default) with the peers' stated reassembly capacity:
 // a reply beyond the TUN packet leaves as fragments of the connectionless
 // effective size (1024 IPv4, 1280 IPv6), every IPv4 one with DF, and the
-// peer Host reassembles the exact payload. Without the capacity, or before
-// an identifier can be issued, it is refused or sent whole, never split.
+// peer Host reassembles the exact payload. Without the capacity, or when no
+// identifier can be issued, it is refused or sent whole, never split.
 #[test]
 fn fragment_mode_echoes_large_replies_within_the_stated_capacity() {
     for v6 in [false, true] {
@@ -432,7 +414,6 @@ fn fragment_mode_echoes_large_replies_within_the_stated_capacity() {
 
         let settings = DatagramSettings {
             peer_reassembly: Some(capacity),
-            quiet: SourceQuiet::Never,
             ..DatagramSettings::default()
         };
         let (mut a, mut ahost) = endpoint_with_settings(local.ip(), true, false, &settings);
@@ -463,7 +444,7 @@ fn fragment_mode_echoes_large_replies_within_the_stated_capacity() {
 
         // Without a stated capacity the receiver guarantee (576 / 1500)
         // cannot hold 3000 octets: refused in Fragment mode's own terms.
-        let plain = DatagramSettings { quiet: SourceQuiet::Never, ..DatagramSettings::default() };
+        let plain = DatagramSettings::default();
         let (mut a, mut ahost) = endpoint_with_settings(local.ip(), true, false, &plain);
         let mut echo = UdpEcho::open(&mut ahost, &a, service, &config, &plain).unwrap();
         for piece in fragments(&request, 82, 1400) {
@@ -476,11 +457,11 @@ fn fragment_mode_echoes_large_replies_within_the_stated_capacity() {
         assert_eq!(echo.notes, [format!("UDP echo of 3000 octets to {remote} refused: exceeds \
             the datagram limit of {limit} (peer reassembly capacity {guarantee})")]);
 
-        // Within the default quiet period no identifier exists: the 3000
-        // octets cannot leave, while a reply the path carries whole does.
-        let quiet = DatagramSettings { peer_reassembly: Some(capacity), ..DatagramSettings::default() };
-        let (mut a, mut ahost) = endpoint_with_settings(local.ip(), true, false, &quiet);
-        let mut echo = UdpEcho::open(&mut ahost, &a, service, &config, &quiet).unwrap();
+        // Without entropy no identifier can be issued: the 3000 octets
+        // cannot leave, while a reply the path carries whole does.
+        let (mut a, mut ahost) = endpoint_with_settings(local.ip(), true, false, &settings);
+        ahost.host.set_entropy(Box::new(|_: &mut [u8]| Err(ntcp_host::EntropyError)));
+        let mut echo = UdpEcho::open(&mut ahost, &a, service, &config, &settings).unwrap();
         for piece in fragments(&request, 83, 1400) {
             input_frame(&mut ahost, &mut a, 1, &piece, local.ip(), false, &mut Sample(0)).unwrap();
         }
@@ -555,7 +536,6 @@ fn segment_route_setting_is_validated_and_installed() {
         v6,
         &DatagramSettings::default(),
         &routes,
-        0,
         1,
     )
     .unwrap();
@@ -632,13 +612,12 @@ fn udp_and_echo_replies_over_a_segment_route_carry_the_srh() {
     }).unwrap();
     for settings in [refuse_settings(), DatagramSettings {
         peer_reassembly: Some(4136),
-        quiet: SourceQuiet::Never,
         ..DatagramSettings::default()
     }] {
         let mut a = Endpoint::new(config.clone(), [7; 32], 0,
             Box::new(tun_v6_policy("2001:db8::1".parse().unwrap()))).unwrap();
         let mut ahost =
-            TunHost::attach_routed(&mut a, &config, local.ip(), &settings, &routes, 0, 1).unwrap();
+            TunHost::attach_routed(&mut a, &config, local.ip(), &settings, &routes, 1).unwrap();
         let mut echo = UdpEcho::open(&mut ahost, &a, service, &config, &settings).unwrap();
         let mut backend = Backend::default();
         let refuse = settings.udp_mode == UdpSendMode::Refuse;

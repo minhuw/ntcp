@@ -488,30 +488,6 @@ fn join_groups(io: &AfPacket, index: u32, address: std::net::Ipv6Addr) -> Result
 }
 
 impl Owner {
-    // What this Host can truthfully assert about earlier emission from its
-    // sources. Without the operator's `io.source_quiet` assertion an earlier
-    // process may have used the same addresses on a real link, so
-    // identifiers wait one full MDL after this Host starts (and DF-clear
-    // IP_PMTUDISC_DONT packets are held until then); with it, the
-    // allocator starts after the asserted quiet period (`QuietFor`). Each
-    // owned address then has its own fact; the start's is the latest of them
-    // and covers only sources this runtime does not own.
-    fn identifier_continuity(&mut self) -> Result<ntcp_host::Continuity> {
-        let latest = self
-            .port_quiet
-            .iter()
-            .fold(self.source_quiet, |fact, (_, port)| match (fact, *port) {
-                (crate::SourceQuiet::Unknown, _) | (_, crate::SourceQuiet::Unknown) => {
-                    crate::SourceQuiet::Unknown
-                }
-                (crate::SourceQuiet::Never, other) | (other, crate::SourceQuiet::Never) => other,
-                (crate::SourceQuiet::Seconds(a), crate::SourceQuiet::Seconds(b)) => {
-                    crate::SourceQuiet::Seconds(a.min(b))
-                }
-            });
-        Ok(latest.continuity(self.clock()?))
-    }
-
     // Complete the constructor using the actual configured ports, the
     // `io.*` port (`interface` is its interface index) first.
     // InterfaceKey is an embedding assignment within an independently minted
@@ -657,23 +633,14 @@ impl Owner {
         host.set_entropy(Box::new(|bytes: &mut [u8]| {
             ports::fill(bytes).map_err(|_| ntcp_host::EntropyError)
         }));
-        let fresh = previous.is_none();
+        // A replacement Host in this process takes over the allocator with
+        // its leases; a newly started runtime assumes no earlier incarnation
+        // emitted from its addresses and issues at once.
         host.start_identifiers(match previous {
             Some(allocator) => ntcp_host::Continuity::Transfer(allocator),
-            None => self.identifier_continuity()?,
+            None => ntcp_host::Continuity::Fresh,
         })
         .map_err(host_error)?;
-        if fresh {
-            let at = self.clock()?;
-            let own = core::iter::once((self.local, self.source_quiet))
-                .chain(self.port_quiet.iter().copied());
-            for (address, fact) in own {
-                if let Some(seconds) = fact.quiet_seconds() {
-                    host.start_source_identifiers(address, at, seconds)
-                        .map_err(host_error)?;
-                }
-            }
-        }
         for (i, &(mtu, _, max_ip_packet)) in links.iter().enumerate() {
             let receive = ReceiveCapabilities {
                         max_ip_packet,
@@ -937,7 +904,6 @@ impl Owner {
             next_hop_mac: config.io.next_hop_mac,
             gateways: config.io.gateways.clone(),
             neighbors: config.io.neighbors.clone(),
-            source_quiet: config.io.source_quiet,
         };
         let mut ports = Vec::new();
         ports

@@ -53,7 +53,7 @@ fn side(local: SocketAddr, identity: u128, signatures: usize) -> Side {
         *s = s.wrapping_add(1);
         Ok(())
     }));
-    side.0.start_identifiers(Continuity::QuietSince(0)).unwrap();
+    side.0.start_identifiers(Continuity::Fresh).unwrap();
     side
 }
 

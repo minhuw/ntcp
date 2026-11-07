@@ -92,8 +92,6 @@ pub struct PortConfig {
     pub next_hop_mac: Option<[u8; 6]>,
     pub gateways: Vec<(ntcp_host::path::IpPrefix, IpAddr)>,
     pub neighbors: Vec<(IpAddr, [u8; 6])>,
-    /// `port.<name>.source_quiet`: `io.source_quiet` for this port's address.
-    pub source_quiet: SourceQuiet,
 }
 
 /// Final destinations of `destination` are sent through `segments` S1..Sn
@@ -140,65 +138,12 @@ pub struct IoConfig {
     pub egress_capacity: usize,
     pub gso: Option<ntcp::GsoLimits>,
     pub receive_aggregation: bool,
-    /// `io.source_quiet`: when earlier emission from `address` ceased, the
-    /// same operational assertion as tun_echo's NTCP_SOURCE_QUIET.
-    pub source_quiet: SourceQuiet,
 }
 
 impl IoConfig {
     /// An AF_PACKET port without `next_hop_mac`: it resolves its next hops.
     pub(crate) fn resolves(&self) -> bool {
         self.backend == Backend::AfPacket && self.next_hop_mac.is_none()
-    }
-}
-
-/// `io.source_quiet = SECONDS | never`: deployment knowledge of when IP
-/// packets were last emitted from the configured source address before this
-/// runtime started. The Host's identifier allocator issues no IPv4
-/// Identification for a source until one maximum datagram lifetime (MDL,
-/// 120 s; RFC 6864 sections 1 and 3.2) after earlier emission from it may
-/// have ceased, so a datagram still in the network can never share an
-/// identifier with a new one (RFC 6864 section 4.3). Unset (`Unknown`, the
-/// default), an earlier process may have emitted from the address until
-/// now: identifiers wait a full MDL after startup
-/// (`Continuity::QuietSince(start)`). Consequently a connection with
-/// IP_PMTUDISC_DONT cannot send its DF-clear packets until one MDL after
-/// startup; they are held as explicit backpressure, never sent with a
-/// reused identifier. `SECONDS` asserts that emission ceased at least that
-/// many whole seconds before startup, `never` that there was none (for
-/// example an address created for this runtime); identifiers then start at
-/// the end of the remaining quiet period (`Continuity::QuietFor`). The
-/// assertion states a fact about the deployment; it does not shorten the
-/// MDL, and a false assertion can repeat an identifier still in flight.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SourceQuiet {
-    #[default]
-    Unknown,
-    Seconds(u64),
-    Never,
-}
-
-impl SourceQuiet {
-    /// The whole seconds emission from an address is stated to have ceased
-    /// before startup; unknown states nothing.
-    pub(crate) fn quiet_seconds(self) -> Option<u64> {
-        match self {
-            Self::Unknown => None,
-            Self::Seconds(seconds) => Some(seconds),
-            Self::Never => Some(u64::MAX),
-        }
-    }
-
-    /// The allocator's start for a Host started at `now`.
-    pub(crate) fn continuity(self, now: u64) -> ntcp_host::Continuity {
-        match self {
-            Self::Unknown => ntcp_host::Continuity::QuietSince(now),
-            Self::Seconds(seconds) => ntcp_host::Continuity::QuietFor { at: now, seconds },
-            Self::Never => ntcp_host::Continuity::QuietFor {
-                at: now,
-                seconds: u64::MAX,
-            },
-        }
     }
 }
 
@@ -248,7 +193,6 @@ impl SocketConfig {
                 egress_capacity: crate::runtime::BUDGET,
                 gso: None,
                 receive_aggregation: false,
-                source_quiet: SourceQuiet::Unknown,
             },
         }
     }
@@ -586,7 +530,6 @@ impl SocketConfig {
                     "address" => port.address = Some(value.parse().map_err(|_| invalid())?),
                     "prefix" => port.prefix = Some(number(value)?),
                     "next_hop_mac" => port.next_hop_mac = Some(mac(value)?),
-                    "source_quiet" => port.source_quiet = source_quiet(value)?,
                     _ => {
                         if let Some(address) = field.strip_prefix("neighbor.") {
                             port.neighbors
@@ -688,7 +631,6 @@ impl SocketConfig {
                         _ => return Err(invalid()),
                     }
                 }
-                "io.source_quiet" => config.io.source_quiet = source_quiet(value)?,
                 "io.gso_max_bytes" => gso_bytes = Some(number(value)?),
                 "io.gso_max_segments" => gso_segments = Some(number(value)?),
                 "io.output_reservation_timeout_ms" => {
@@ -784,7 +726,6 @@ impl SocketConfig {
                 next_hop_mac: port.next_hop_mac,
                 gateways: port.gateways,
                 neighbors: port.neighbors,
-                source_quiet: port.source_quiet,
             });
         }
         #[cfg(feature = "tfo-linux-cookie")]
@@ -871,15 +812,6 @@ struct PortFields {
     next_hop_mac: Option<[u8; 6]>,
     gateways: Vec<(ntcp_host::path::IpPrefix, IpAddr)>,
     neighbors: Vec<(IpAddr, [u8; 6])>,
-    source_quiet: SourceQuiet,
-}
-
-// `SECONDS | never`, for `io.source_quiet` and `port.<name>.source_quiet`.
-fn source_quiet(value: &str) -> io::Result<SourceQuiet> {
-    Ok(match value {
-        "never" => SourceQuiet::Never,
-        seconds => SourceQuiet::Seconds(number(seconds)?),
-    })
 }
 
 // A port name is one configuration key component.

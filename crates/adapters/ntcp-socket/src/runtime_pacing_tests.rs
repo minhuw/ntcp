@@ -4,7 +4,6 @@ use super::*;
 fn paced_owner(last: u8) -> Owner {
     let local = Ipv4Addr::new(10, 73, 0, last);
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     // These rate/deadline tests explicitly select the ordinary bucket.
     // Default startup bursts are covered by the common-profile wire test.
     config.tcp.connection.pacing = Some(ntcp::PacingConfig {
@@ -149,7 +148,6 @@ fn pacing_production_config_transfers_idles_and_half_closes_without_prr() {
 fn typed_core_settings_reach_native_connections() {
     let local = Ipv4Addr::new(10, 73, 0, 2);
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.tcp.dscp = 11;
     config.tcp.hop_limit = 33;
     let c = &mut config.tcp.connection;

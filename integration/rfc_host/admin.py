@@ -138,7 +138,7 @@ def child(case, proof, binary, pathctl_binary, Peer, command, emit):
         assert neighbor.ready["namespace"] == peer.ready["namespace"], neighbor.ready
         capture = icmp.Capture(icmp.TUN)
         ntcp = icmp.Ntcp(binary, a["ntcp"], "fragment", {
-            f"NTCP_PEER_REASSEMBLY_IPV{family}": str(icmp.PEER_REASSEMBLY), "NTCP_SOURCE_QUIET": "never",
+            f"NTCP_PEER_REASSEMBLY_IPV{family}": str(icmp.PEER_REASSEMBLY),
             "NTCP_CONTROL_SOCKET": str(socket_path)})
         mode = os.stat(socket_path).st_mode
         directory_mode = os.stat(directory).st_mode
@@ -147,7 +147,6 @@ def child(case, proof, binary, pathctl_binary, Peer, command, emit):
         ctl = Pathctl(pathctl_binary, socket_path)
         evidence.update(tun_echo_settings=ntcp.settings, control_socket_mode=oct(stat.S_IMODE(mode)),
                         control_directory_mode=oct(stat.S_IMODE(directory_mode)), euid=os.geteuid(),
-                        source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission",
                         allow_list="default (the owner's effective uid); a second-uid SO_PEERCRED denial needs a "
                                    "second mapped uid, which this one-uid user namespace cannot provide (covered "
                                    "by the ntcp-path-control and runtime control tests)")
@@ -392,8 +391,7 @@ def refuse_child(case, proof, binary, pathctl_binary, Peer, command, emit):
         neighbor = Peer(["nsenter", "-t", str(peer.p.pid), "-n", sys.executable, "-B", HERE / "icmp_peer.py",
                          a["egress_peer"], a["ntcp"], icmp.PORT])
         capture = icmp.Capture(icmp.TUN)
-        ntcp = icmp.Ntcp(binary, a["ntcp"], "refuse", {"NTCP_SOURCE_QUIET": "never",
-                                                       "NTCP_CONTROL_SOCKET": str(socket_path)})
+        ntcp = icmp.Ntcp(binary, a["ntcp"], "refuse", {"NTCP_CONTROL_SOCKET": str(socket_path)})
         ctl = Pathctl(pathctl_binary, socket_path)
 
         def udp(who, size, salt, wait=2.0):
@@ -451,8 +449,7 @@ def refuse_child(case, proof, binary, pathctl_binary, Peer, command, emit):
         evidence.update(settings=settings, tun_echo_settings=ntcp.settings, initial_path=target, disabled_state=state,
                         baseline=summary(baseline), disabled=summary(disabled), leased_ids=ids,
                         refusal=refusal.group(0), neighbor=summary(neighbor_packets), reenabled=summary(reenabled),
-                        utility_requests=len(ctl.log), ntcp_stderr=ntcp.since(0)[-12:],
-                        source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission")
+                        utility_requests=len(ctl.log), ntcp_stderr=ntcp.since(0)[-12:])
     finally:
         primary = sys.exc_info()[0] is not None
         errors = []
@@ -520,7 +517,7 @@ def reenable_child(case, proof, binary, pathctl_binary, Peer, command, emit):
         settings = icmp.setup(family, 1500, command, peer.p.pid)
         capture = icmp.Capture(icmp.TUN)
         ntcp = icmp.Ntcp(binary, a["ntcp"], "fragment", {
-            f"NTCP_PEER_REASSEMBLY_IPV{family}": str(icmp.PEER_REASSEMBLY), "NTCP_SOURCE_QUIET": "never",
+            f"NTCP_PEER_REASSEMBLY_IPV{family}": str(icmp.PEER_REASSEMBLY),
             "NTCP_CONTROL_SOCKET": str(socket_path)})
         ctl = Pathctl(pathctl_binary, socket_path)
 
@@ -668,8 +665,7 @@ def reenable_child(case, proof, binary, pathctl_binary, Peer, command, emit):
                            silence=dict(rule=silence, counters=dropped)),
             grown=dict(path=grown, clients=grown_clients, probes=[public_probe(p) for p in sent],
                        confirmed=confirmed, adjunct_usable=usable),
-            utility_requests=len(ctl.log), ntcp_stderr=ntcp.since(0)[-12:],
-            source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission")
+            utility_requests=len(ctl.log), ntcp_stderr=ntcp.since(0)[-12:])
     finally:
         primary = sys.exc_info()[0] is not None
         errors = []

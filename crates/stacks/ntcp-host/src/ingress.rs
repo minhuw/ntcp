@@ -1268,9 +1268,9 @@ impl Host {
     /// queue is empty. An error consumes the message unsent (counted).
     /// On a discovery-disabled IPv4 route every message leaves DF clear and
     /// needs a leased Identification (RFC 1191 section 6.6, RFC 6864): while
-    /// the allocator's start quiet period or the RFC 6864 ceiling withholds
-    /// one, the message stays queued (nothing submitted) and is sized again
-    /// at the next attempt; an identifier is never reused. Only that message
+    /// the RFC 6864 ceiling withholds one, the message stays queued (nothing
+    /// submitted) and is sized again at the next attempt; an identifier is
+    /// never reused. Only that message
     /// waits: it moves behind the other queued messages and the call goes on
     /// with the next one, so output to other destinations is not held behind
     /// it. WouldBlock when every queued message waits for an identifier and
@@ -1382,11 +1382,7 @@ impl Host {
             result = self.transmit(now, plan, packet, |_, _| None, None, None, &mut resolved);
             if let Err(DatagramError::Backpressure(backpressure)) = result
                 && clears_df
-                && matches!(
-                    backpressure,
-                    IdentifierBackpressure::Unavailable { until: Some(_) }
-                        | IdentifierBackpressure::Exhausted { .. }
-                )
+                && matches!(backpressure, IdentifierBackpressure::Exhausted { .. })
             {
                 // Nothing was submitted (the lease precedes every packet):
                 // held output, retried on a later pass.
@@ -1421,10 +1417,10 @@ impl Host {
                 Err(match error {
                     DatagramError::Host(error) => error,
                     // No identifier on a route that keeps DF for a message
-                    // the budget cannot carry whole (quiet period, MDL
-                    // ceiling), or none can ever be issued (no allocator,
-                    // entropy failure): the message is not sent rather than
-                    // held at the head of the queue.
+                    // the budget cannot carry whole (MDL ceiling), or none
+                    // can ever be issued (no allocator, entropy failure): the
+                    // message is not sent rather than held at the head of the
+                    // queue.
                     _ => Error::Capacity,
                 })
             }

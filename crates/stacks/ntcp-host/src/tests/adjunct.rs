@@ -80,7 +80,7 @@ fn side_with(local: SocketAddr, identity: u128, datagrams: DatagramLimits) -> Si
         }
         Ok(())
     }));
-    side.0.start_identifiers(Continuity::QuietSince(0)).unwrap();
+    side.0.start_identifiers(Continuity::Fresh).unwrap();
     side
 }
 

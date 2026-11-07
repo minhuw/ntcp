@@ -236,8 +236,7 @@ fn ip_mtu_of_discovery_disabled_sockets_and_routes_is_the_estimate_not_the_budge
         // IPv6 at most 1280.
         assert_eq!(snapshot.ip_packet_budget(), Ok(if v6 { 1280 } else { 576 }));
         assert_eq!(query_is_pure(&mut a, client), 1500);
-        // Connecting already binds the path (an IPv4 DF-clear SYN may still
-        // wait for the identifier quiet period).
+        // Connecting already binds the path.
         let later = connecting(&mut a, &b, &[]);
         assert_eq!(query_is_pure(&mut a, later), 1500);
         route_policy(

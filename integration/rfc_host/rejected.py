@@ -218,7 +218,7 @@ def child(case, proof, binary, pathctl, command):
     interface = setup(family, command)
     directory = tempfile.mkdtemp(prefix="t19-rejected-control-")
     socket_path = Path(directory) / "control.sock"
-    settings = {"NTCP_SOURCE_QUIET": "never", "NTCP_CONTROL_SOCKET": str(socket_path)}
+    settings = {"NTCP_CONTROL_SOCKET": str(socket_path)}
     if family == 4:
         settings["NTCP_IPV4_OPTIONS"] = "1"
     evidence = dict(case=case, interface=interface, tun_echo_settings=settings, settle_s=SETTLE,

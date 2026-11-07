@@ -436,12 +436,11 @@ fn native_fragmented_tcp_is_delivered_and_retained_only_when_complete() {
 }
 
 // An IPv6 Echo Reply beyond the 1280 link needs source fragments, within
-// RFC 8200's 1500-octet reassembly guarantee: none until one maximum
-// datagram lifetime after start (no identifier can be issued; the reply is
-// counted unsent), then fragments drawn on the kernel CSPRNG's
-// unpredictable Identification, drained through the same port.
+// RFC 8200's 1500-octet reassembly guarantee: fragments drawn on the kernel
+// CSPRNG's unpredictable Identification from startup on, drained through
+// the same port.
 #[test]
-fn native_fragmented_echo_replies_wait_for_the_identifier_quiet_period() {
+fn native_fragmented_echo_replies_draw_unpredictable_identifiers() {
     let (mut a, wire) = native(true, 2, 2);
     let to_us = ntcp::IpMetadata {
         source: peer(true),
@@ -455,11 +454,6 @@ fn native_fragmented_echo_replies_wait_for_the_identifier_quiet_period() {
             .map(|piece| ethernet(UNICAST, true, piece))
             .collect()
     };
-    deliver(&mut a, &wire, &frames(71));
-    a.service_egress().unwrap();
-    assert!(wire.lock().unwrap().sent.is_empty());
-    assert_eq!(a.host.as_ref().unwrap().icmp_output_counters().unsent, 1);
-    a.test_now = Some(121_000_000);
     deliver(&mut a, &wire, &frames(72));
     a.service_egress().unwrap();
     let sent: Vec<_> = wire.lock().unwrap().sent.drain(..).collect();
@@ -501,7 +495,6 @@ fn native_icmp_output_over_a_segment_route_carries_the_srh() {
     let segments: Vec<std::net::Ipv6Addr> =
         vec!["2001:db8:5::1".parse().unwrap(), "2001:db8:6::1".parse().unwrap()];
     let mut config = SocketConfig::new("external", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.io.prefix = Some(64);
     config.tcp.connection.timestamps = false;
     config.segment_routes = vec![crate::SegmentRoute {

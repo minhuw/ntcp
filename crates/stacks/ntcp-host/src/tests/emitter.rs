@@ -55,7 +55,7 @@ fn side(local: SocketAddr, identity: u128, limits: DatagramLimits) -> Side {
     });
     side.0
         .set_entropy(counter_entropy(Arc::new(Mutex::new(0x5a))));
-    side.0.start_identifiers(Continuity::QuietSince(0)).unwrap();
+    side.0.start_identifiers(Continuity::Fresh).unwrap();
     side
 }
 
@@ -112,7 +112,7 @@ fn send(
 ) -> (Result<DatagramReport, DatagramError>, Vec<Vec<u8>>) {
     let mut packet = vec![0; 8192];
     let mut sent = Vec::new();
-    // Identifiers start one MDL after the predecessor stopped at 0.
+    // Every send happens one MDL into the test's time.
     let result = a.0.udp_send_datagram(
         &a.1,
         MDL + now,
@@ -133,7 +133,7 @@ fn send(
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-4
 //= type=test
-//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (every fragment repeats the unfragmentable part, the base header and on an owner-configured Segment Routing route its Segment Routing Header, before the Fragment header, and the first fragment holds the complete upper-layer header); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_follow_the_source_quiet_assertion). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
+//= reason=Host fragmentation mimics IPv6 and happens only in the host: Host UDP datagrams in Fragment mode and the Host's Echo Replies (a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) leave through one datagram emitter (Host::transmit, crates/stacks/ntcp-host/src/emitter.rs) that cuts an IPv4 datagram larger than the connectionless effective size with ntcp_ip::Fragmenter, which sets DF on every fragment, just as it cuts IPv6 (every fragment repeats the unfragmentable part, the base header and on an owner-configured Segment Routing route its Segment Routing Header, before the Fragment header, and the first fragment holds the complete upper-layer header); the atomic IPv4 encoder (encode_present) sets DF on every unfragmented packet, and TCP never enters source fragmentation. Host tests assert DF on every IPv4 fragment and packet of a fragmented send, the tun_echo IPv4 path asserts DF on TCP packets and PLPMTUD probes, and the integration/rfc_host fragment, fragment-ptb and adjunct-silence cases check DF on every captured IPv4 fragment and probe. User disposition of the SHOULD (recorded): an application that sets IP_MTU_DISCOVER=IP_PMTUDISC_DONT on a native socket gets its ordinary IPv4 TCP output without DF, an application-requested exception; every such packet carries an Identification leased from the Host allocator for its (source, destination, TCP) tuple, the RFC 6864 ceiling holds the packet instead of reusing a value, its PLPMTUD probes keep DF and TCP is never source-fragmented (ntcp-socket tests managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling and dont_packets_are_identified_from_startup). User disposition for administratively flagged routes (recorded decision B): on an IPv4 route or path whose owner disabled discovery (RFC 1191 section 6.6, which RFC 4821 does not update) every packet of TCP, Host::udp_send, Host::udp_send_datagram and Echo replies, Host source fragments included, leaves DF clear with a leased Identification and a recomputed header checksum under the RFC 1122 section 3.3.3 sending limit, and no probe is sent there; fragments on enabled routes keep DF (ntcp-host tests disabled_ipv4_route_clears_df_on_udp_datagrams_and_source_fragments, disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments and disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams).
 //# All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-8
 //= type=test
@@ -428,7 +428,7 @@ fn partial_and_unknown_outcomes_at_every_fragment_boundary() {
 }
 
 #[test]
-fn identifiers_backpressure_without_entropy_or_before_the_quiet_period() {
+fn identifiers_backpressure_without_entropy_or_before_the_start() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
         let cfg = config(2);
@@ -446,26 +446,14 @@ fn identifiers_backpressure_without_entropy_or_before_the_quiet_period() {
         assert_eq!(
             result,
             Err(DatagramError::Backpressure(
-                IdentifierBackpressure::Unavailable { until: None }
+                IdentifierBackpressure::Unavailable
             ))
         );
         assert!(sent.is_empty());
-        // Quiet for a full MDL after the previous context stopped at 10.
-        a.0.start_identifiers(Continuity::QuietSince(MDL + 10)).unwrap();
+        a.0.start_identifiers(Continuity::Fresh).unwrap();
         assert_eq!(
-            a.0.start_identifiers(Continuity::QuietSince(MDL + 10)),
+            a.0.start_identifiers(Continuity::Fresh),
             Err(Error::InvalidContext)
-        );
-        let (result, _) = send(&mut a, 11, flow, Some(big), &[1; 3000], |_| {
-            BackendOutcome::Submitted
-        });
-        assert_eq!(
-            result,
-            Err(DatagramError::Backpressure(
-                IdentifierBackpressure::Unavailable {
-                    until: Some(10 + 2 * MDL)
-                }
-            ))
         );
         // No entropy: no weak fallback.
         let (result, _) = send(&mut a, 10 + MDL, flow, Some(big), &[1; 3000], |_| {
@@ -507,8 +495,7 @@ fn ipv4_identifiers_are_unique_per_tuple_until_the_mdl_ceiling() {
         1_000_000,
     )
     .unwrap();
-    // Quiet until one MDL after a predecessor stopped at 0.
-    allocator.start_quiet(0);
+    allocator.start();
     const B: u64 = MDL;
     let mut entropy = counter_entropy(Arc::new(Mutex::new(0xff)));
     let (s, d): (IpAddr, IpAddr) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
@@ -555,7 +542,7 @@ fn ipv6_identifiers_check_every_live_lease_and_bound_collisions() {
         1_000_000,
     )
     .unwrap();
-    allocator.start_quiet(0);
+    allocator.start();
     const B: u64 = 1_000_000;
     let (s, d): (IpAddr, IpAddr) = (
         "2001:db8::1".parse().unwrap(),
@@ -759,34 +746,6 @@ fn reported_limits_and_buffer_follow_the_send_decision_between_the_two_sizes() {
         assert_eq!(refuse.fragmentable_payload, 0);
         assert!(!refuse.fragments(payload.len()));
         assert_eq!(refuse.buffer_len(payload.len()), complete);
-    }
-}
-
-#[test]
-fn asserted_quiet_periods_count_from_when_emission_ceased() {
-    let (local, remote) = addresses(true);
-    let second = 1_000_000;
-    for (seconds, available) in [(0, MDL), (30, MDL - 30 * second), (u64::MAX, 0)] {
-        let mut a = managed_limited(local, 91, config(2), false, None, None, |p, mut l| {
-            l.datagrams = datagrams(1280);
-            let (p, l) = managed_udp_limits(p, l, UDP).unwrap();
-            (p, l, 1)
-        });
-        a.0.set_entropy(counter_entropy(Arc::new(Mutex::new(3))));
-        a.0.start_identifiers(Continuity::QuietFor { at: 0, seconds })
-            .unwrap();
-        if available != 0 {
-            assert_eq!(
-                a.0.lease_identification(available - 1, local.ip(), remote.ip(), 17),
-                Err(IdentifierBackpressure::Unavailable {
-                    until: Some(available)
-                })
-            );
-        }
-        assert!(
-            a.0.lease_identification(available, local.ip(), remote.ip(), 17)
-                .is_ok()
-        );
     }
 }
 

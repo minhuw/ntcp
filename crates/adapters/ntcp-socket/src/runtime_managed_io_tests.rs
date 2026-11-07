@@ -1025,19 +1025,6 @@ fn managed_scheduled_held_tfo_above_an_owner_value_fails_its_owner_with_or_witho
         let offers = wa.lock().unwrap().offered.len();
         wa.lock().unwrap().block = false;
         tick(&mut a);
-        if disable {
-            // DF-clear output waits for the start quiet period first.
-            let (source, destination, at) = (a.local, b.local, a.now());
-            if let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = a
-                .host
-                .as_mut()
-                .unwrap()
-                .lease_identification(at, source, destination, 6)
-            {
-                a.test_now = Some(until);
-                b.test_now = Some(until);
-            }
-        }
         a.service_egress().unwrap();
         assert_eq!(wa.lock().unwrap().offered.len(), offers, "disable={disable}");
         assert!(wa.lock().unwrap().sent.is_empty());
@@ -1740,9 +1727,9 @@ fn managed_native_timestamp_fallback_and_msgsize_rejection_reuse_the_attempt_tic
 
 // IP_PMTUDISC_DONT through production egress: every ordinary IPv4 packet is
 // DF-clear with its own leased Identification, a PLPMTUD probe of the same
-// connection keeps DF, and identifier backpressure (the quiet period after
-// start, then the per-tuple MDL ceiling) holds the reservation unsubmitted
-// until an identifier can be issued.
+// connection keeps DF, and identifier backpressure (the per-tuple MDL
+// ceiling) holds the reservation unsubmitted until an identifier can be
+// issued.
 #[test]
 fn managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling() {
     fn fields(frame: &[u8]) -> (bool, u16) {
@@ -1765,29 +1752,7 @@ fn managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling()
     };
     a.execute(client, Op::Set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT))
         .unwrap();
-    // One fact bounds both quiet periods and TCP's is the longer, so a fresh
-    // start never shows TCP output waiting for identifiers: state a later
-    // emission from this source to the running allocator instead.
-    let (quiet_source, quiet_now) = (a.local, a.now());
-    a.host
-        .as_mut()
-        .unwrap()
-        .start_source_identifiers(quiet_source, quiet_now, 0)
-        .unwrap();
-    // Quiet period: nothing is offered to the backend.
     a.execute(client, Op::Write(vec![1; 100])).unwrap();
-    tick(&mut a);
-    a.service_egress().unwrap();
-    assert!(wa.lock().unwrap().offered.is_empty());
-    assert_eq!(
-        a.egress.as_ref().unwrap().blocked(cid),
-        Some(ntcp_host::Error::Capacity)
-    );
-    let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = lease(&mut a)
-    else {
-        panic!("identifiers wait for the quiet period");
-    };
-    at(&mut a, &mut b, until);
     complete(&mut a, &mut b, &wa, &wb, cid, 100);
     assert_eq!(b.execute(server, Op::Read(400)).unwrap().bytes, vec![1; 100]);
 
@@ -1876,8 +1841,7 @@ fn managed_dont_leases_identifiers_keeps_df_on_probes_and_holds_at_the_ceiling()
 // discovery on the IPv4 route, every packet of a connection that never asked
 // for IP_PMTUDISC_DONT (and then one that asks for IP_PMTUDISC_DO) leaves
 // without DF, with its own leased Identification and a recomputed header
-// checksum, within the 576-octet sending limit of the forwarder next hop;
-// the start quiet period holds it unsubmitted first.
+// checksum, within the 576-octet sending limit of the forwarder next hop.
 #[test]
 fn route_disable_clears_df_on_native_output_whatever_the_socket_requests() {
     use ntcp_host::path::{AdminChange, AdminPolicy, AdminTarget};
@@ -1909,36 +1873,7 @@ fn route_disable_clears_df_on_native_output_whatever_the_socket_requests() {
         )
         .unwrap();
     host.admin_apply(&capability, &mut a.endpoint, candidate).unwrap();
-    // One fact bounds both quiet periods and TCP's is the longer, so a fresh
-    // start never shows TCP output waiting for identifiers: state a later
-    // emission from this source to the running allocator instead.
-    let (quiet_source, quiet_now) = (a.local, a.now());
-    a.host
-        .as_mut()
-        .unwrap()
-        .start_source_identifiers(quiet_source, quiet_now, 0)
-        .unwrap();
-    // The quiet period after start holds the DF-clear packet unsubmitted.
     a.execute(client, Op::Write(vec![1; 3000])).unwrap();
-    tick(&mut a);
-    a.service_egress().unwrap();
-    assert!(wa.lock().unwrap().offered.is_empty());
-    assert_eq!(
-        a.egress.as_ref().unwrap().blocked(cid),
-        Some(ntcp_host::Error::Capacity)
-    );
-    let (source, destination) = (a.local, b.local);
-    let at = a.now();
-    let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = a
-        .host
-        .as_mut()
-        .unwrap()
-        .lease_identification(at, source, destination, 6)
-    else {
-        panic!("identifiers wait for the quiet period");
-    };
-    a.test_now = Some(until);
-    b.test_now = Some(until);
     complete(&mut a, &mut b, &wa, &wb, cid, 3000);
     a.execute(client, Op::Set(IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO))
         .unwrap();
@@ -2016,17 +1951,6 @@ fn held_df_clear_packet_follows_a_reenable_unless_the_socket_asks_for_dont() {
                 .unwrap();
         }
         set_route(&mut a, cid, true);
-        // Past the start quiet period, so the DF-clear lease succeeds.
-        let (source, destination, now) = (a.local, b.local, a.now());
-        if let Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(until) }) = a
-            .host
-            .as_mut()
-            .unwrap()
-            .lease_identification(now, source, destination, 6)
-        {
-            a.test_now = Some(until);
-            b.test_now = Some(until);
-        }
         wa.lock().unwrap().block = true;
         a.execute(client, Op::Write(vec![3; 400])).unwrap();
         a.service_egress().unwrap();

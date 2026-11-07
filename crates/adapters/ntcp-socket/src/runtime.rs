@@ -652,11 +652,6 @@ struct Owner {
     socket_policy: crate::SocketPolicy,
     // Installed with every Host this owner attaches.
     segment_routes: Vec<crate::SegmentRoute>,
-    // The operator's assertion about earlier emission from `local`
-    // (`io.source_quiet`), applied when the Host's allocator starts.
-    source_quiet: crate::SourceQuiet,
-    // The same fact for each `port.<name>` address.
-    port_quiet: Vec<(IpAddr, crate::SourceQuiet)>,
     sockets: BTreeMap<u64, Socket>,
     // The `io.*` port's address: the runtime's address family and the
     // source of connections no other port's address is selected for.
@@ -835,13 +830,6 @@ impl Owner {
         // Startup setup consumes lease time from the owner's first sample; it
         // must not grant a fresh interval when backend initialization
         // completes later.
-        self.source_quiet = config.io.source_quiet;
-        self.port_quiet.clear();
-        self.port_quiet
-            .try_reserve_exact(config.ports.len())
-            .map_err(|_| ENOMEM)?;
-        self.port_quiet
-            .extend(config.ports.iter().map(|port| (port.address, port.source_quiet)));
         self.segment_routes = config.segment_routes.clone();
         self.apply_socket_config_at(config, self.started)
     }
@@ -1078,8 +1066,6 @@ impl Owner {
             defaults,
             socket_policy: crate::SocketPolicy::default(),
             segment_routes: Vec::new(),
-            source_quiet: crate::SourceQuiet::Unknown,
-            port_quiet: Vec::new(),
             sockets: BTreeMap::new(),
             local,
             clock,
@@ -1178,9 +1164,6 @@ impl Owner {
                 FastOpenClientPolicy::ApplicationProtected;
         }
         owner.packets = Some(PacketBackend::new(profile, local, options.queue_capacity)?);
-        // The packet-test port is an in-process queue created with this
-        // Owner: nothing emitted before it existed can be in flight on it.
-        owner.source_quiet = crate::SourceQuiet::Never;
         owner.attach_backend_host(1)?;
         owner.enable_egress(options.egress_capacity, crate::packet_profile::gso(profile))?;
         Ok(owner)

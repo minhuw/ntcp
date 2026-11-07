@@ -995,54 +995,6 @@ fn explicit_client_early_policy_parser_keeps_authenticated_default() {
 }
 
 #[test]
-fn source_quiet_assertion_is_validated_and_maps_to_continuity() {
-    assert_eq!(
-        SocketConfig::parse(BASE).unwrap().io.source_quiet,
-        SourceQuiet::Unknown
-    );
-    for (value, expected) in [
-        ("never", SourceQuiet::Never),
-        ("0", SourceQuiet::Seconds(0)),
-        ("300", SourceQuiet::Seconds(300)),
-        ("18446744073709551615", SourceQuiet::Seconds(u64::MAX)),
-    ] {
-        let config = SocketConfig::parse(&format!("{BASE}io.source_quiet={value}\n")).unwrap();
-        assert_eq!(config.io.source_quiet, expected, "{value}");
-    }
-    for value in [
-        "Never",
-        "forever",
-        "-1",
-        "+5",
-        "1.5",
-        "120s",
-        "18446744073709551616",
-        "never\nio.source_quiet=never",
-    ] {
-        assert!(
-            SocketConfig::parse(&format!("{BASE}io.source_quiet={value}\n")).is_err(),
-            "{value}"
-        );
-    }
-    // Unknown keeps the strict default: a full MDL after startup.
-    assert!(matches!(
-        SourceQuiet::Unknown.continuity(7),
-        ntcp_host::Continuity::QuietSince(7)
-    ));
-    assert!(matches!(
-        SourceQuiet::Seconds(30).continuity(7),
-        ntcp_host::Continuity::QuietFor { at: 7, seconds: 30 }
-    ));
-    assert!(matches!(
-        SourceQuiet::Never.continuity(7),
-        ntcp_host::Continuity::QuietFor {
-            at: 7,
-            seconds: u64::MAX
-        }
-    ));
-}
-
-#[test]
 fn segment_routes_parse_separately_from_route_policies() {
     const BASE6: &str = "io.interface=ntcp0\nio.address=2001:db8:1::2\n";
     let default = SocketConfig::parse(BASE6).unwrap();
@@ -1110,26 +1062,6 @@ fn segment_routes_parse_separately_from_route_policies() {
 }
 
 #[test]
-fn every_named_port_states_its_own_source_quiet_fact() {
-    let two = |io: &str, b: &str| {
-        SocketConfig::parse(&format!(
-            "{BASE}{io}port.b.interface=ntcp1\nport.b.address=10.73.1.2\n{b}"
-        ))
-    };
-    let config = two("io.source_quiet=never\n", "port.b.source_quiet=30\n").unwrap();
-    assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Seconds(30));
-    let config = two("io.source_quiet=never\n", "port.b.source_quiet=never\n").unwrap();
-    assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Never);
-    // An address without a fact states nothing.
-    let config = two("io.source_quiet=never\n", "").unwrap();
-    assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Unknown);
-    // The same parsing and validation as io.source_quiet.
-    assert!(two("", "port.b.source_quiet=soon\n").is_err());
-    assert!(two("", "port.b.source_quiet=-1\n").is_err());
-    assert!(two("io.source_quiet=soon\n", "").is_err());
-}
-
-#[test]
 fn named_ports_parse_with_the_io_port_fields_and_validation() {
     let config = SocketConfig::parse(&format!(
         "{BASE}io.prefix=24\nport.b.interface=ntcp1\nport.b.address=10.73.1.2\nport.b.prefix=24\nport.c-2.interface=ntcp2\nport.c-2.address=10.73.2.2\n"
@@ -1149,7 +1081,6 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
                 next_hop_mac: None,
                 gateways: Vec::new(),
                 neighbors: Vec::new(),
-                source_quiet: crate::SourceQuiet::Unknown,
             },
             PortConfig {
                 name: "c-2".into(),
@@ -1159,7 +1090,6 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
                 next_hop_mac: None,
                 gateways: Vec::new(),
                 neighbors: Vec::new(),
-                source_quiet: crate::SourceQuiet::Unknown,
             },
         ]
     );
@@ -1303,7 +1233,6 @@ fn named_ports_parse_with_the_io_port_fields_and_validation() {
         next_hop_mac: None,
         gateways: Vec::new(),
         neighbors: Vec::new(),
-        source_quiet: crate::SourceQuiet::Unknown,
     };
     config.ports = vec![
         port.clone(),

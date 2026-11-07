@@ -800,19 +800,18 @@ impl Host {
         self.entropy = Some(entropy);
     }
     /// Start issuing identifiers for non-atomic datagrams. Nothing is issued
-    /// before this: the Host cannot know on its own whether an earlier
-    /// context emitted from its sources within the maximum datagram
-    /// lifetime. A transferred allocator must come from a started Host
-    /// (`take_identifiers`) with the same timebase units; its leases and any
-    /// remaining quiet period carry over. Instants are this Host's caller
-    /// timebase, which the transferring embedding must share.
+    /// before this. A fresh allocator issues at once: a newly started stack
+    /// assumes no earlier incarnation emitted from its sources. A
+    /// transferred allocator must come from a started Host
+    /// (`take_identifiers`) with the same timebase units; its leases carry
+    /// over. Instants are this Host's caller timebase, which the
+    /// transferring embedding must share.
     pub fn start_identifiers(&mut self, continuity: Continuity) -> Result<(), Error> {
         if self.identifiers.running() {
             return Err(Error::InvalidContext);
         }
         match continuity {
-            Continuity::QuietSince(stopped) => self.identifiers.start_quiet(stopped),
-            Continuity::QuietFor { at, seconds } => self.identifiers.start_quiet_for(at, seconds),
+            Continuity::Fresh => self.identifiers.start(),
             Continuity::Transfer(allocator) => {
                 if !allocator.running()
                     || allocator.units_per_second() != self.timebase.units_per_second
@@ -824,21 +823,6 @@ impl Host {
             }
         }
         Ok(())
-    }
-    /// State `source`'s own fact on a started allocator: no earlier context
-    /// had emitted from it for at least `seconds` before `at`
-    /// (`Continuity::QuietFor`). Other sources keep the start's continuity,
-    /// so that continuity must hold for any source without its own fact.
-    pub fn start_source_identifiers(
-        &mut self,
-        source: IpAddr,
-        at: Instant,
-        seconds: u64,
-    ) -> Result<(), Error> {
-        if !self.identifiers.running() {
-            return Err(Error::InvalidContext);
-        }
-        self.identifiers.source_quiet_for(source, at, seconds)
     }
     /// Move this Host's allocator out for a successor context, with every
     /// live lease. This Host issues no identifier afterwards.

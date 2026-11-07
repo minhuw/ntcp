@@ -313,8 +313,6 @@ def native_admin_child(case, proof):
     try:
         os.environ["T12_CONTROL_SOCKET"] = str(socket_path)
         try:
-            # The control socket also makes the binary state io.source_quiet
-            # = never (harness-created address in a fresh namespace).
             n = Peer([BINARY, "client", native, kernel, "hmac", 65536, 3_600_000_000, 1, 0])
         finally:
             os.environ.pop("T12_CONTROL_SOCKET")
@@ -385,8 +383,7 @@ def native_admin_child(case, proof):
                         utility=disabled.stdout.strip(), baseline=summary(baseline), disabled=summary(off),
                         leased_ids=len(ids) if ids else None, reenabled=summary(on),
                         control_socket_mode=oct(stat.S_IMODE(mode)), utility_requests=len(ctl.log),
-                        allow_list="default (the owner's effective uid)", source_quiet="never",
-                        source_quiet_assertion="harness-created address in a fresh namespace: no earlier emission")
+                        allow_list="default (the owner's effective uid)")
     finally:
         primary = sys.exc_info()[0] is not None
         errors = []

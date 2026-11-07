@@ -653,7 +653,6 @@ fn listener(owner: &mut Owner, port: u16) -> u64 {
 fn typed_default_staging_rotation_isolation_and_failed_handles() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_cookie_policy = policy(1);
     config.fast_open_key_lease = Some(
         ntcp::FastOpenKeyLease::for_lifetime(
@@ -824,7 +823,6 @@ fn unmanaged_hmac_initial_lifetime_applies_to_native_traffic() {
     for local in ["192.168.0.1", "2001:db8::2"] {
         let local: IpAddr = local.parse().unwrap();
         let mut config = SocketConfig::new("test", local);
-        config.io.source_quiet = crate::SourceQuiet::Never;
         config.fast_open_managed_keys = Some(false);
         config.fast_open_cookie_lifetime =
             ntcp::FastOpenCookieLifetime::from_micros(1_000_000).unwrap();
@@ -867,7 +865,6 @@ fn unmanaged_hmac_initial_lifetime_applies_to_native_traffic() {
 fn unmanaged_hmac_initial_entropy_failure_preserves_established_flows() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_managed_keys = Some(false);
     config.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
     let mut owner =
@@ -900,7 +897,6 @@ fn unmanaged_hmac_initial_entropy_failure_preserves_established_flows() {
 fn explicit_hmac_lease_requires_unmanaged_mode_and_enforces_deadlines() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_key_lease = Some(ntcp::FastOpenKeyLease {
         not_before: 0,
         issue_until: 50,
@@ -958,7 +954,6 @@ fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows
         ] {
             let local: IpAddr = local.parse().unwrap();
             let mut config = SocketConfig::new("test", local);
-            config.io.source_quiet = crate::SourceQuiet::Never;
             config.fast_open_cookie_policy = selected;
             config.fast_open_managed_keys = Some(true);
             config.fast_open_cookie_lifetime =
@@ -1044,7 +1039,6 @@ fn automatic_rotation_entropy_failures_expire_credentials_and_preserve_live_flow
     ] {
         let local: IpAddr = "192.168.0.1".parse().unwrap();
         let mut config = SocketConfig::new("test", local);
-        config.io.source_quiet = crate::SourceQuiet::Never;
         config.fast_open_cookie_policy = selected.clone();
         config.fast_open_managed_keys = Some(true);
         config.fast_open_cookie_lifetime = ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
@@ -1237,7 +1231,6 @@ fn native_set_key_staging_and_same_key_after_expiry_do_not_renew_lease() {
 fn external_config_lease_survives_reapply_and_expired_absolute_reinstall() {
     let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_cookie_policy = policy(7);
     config.fast_open_managed_keys = Some(false);
     config.fast_open_key_lease = Some(ntcp::FastOpenKeyLease {
@@ -1329,7 +1322,6 @@ fn owners_in_sequence_keep_the_configured_deadlines() {
         units_per_second: 1_000_000,
     };
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_cookie_policy = policy(7);
     config.fast_open_key_lease = Some(lease);
     config.fast_open_key_boot_id = Some(boot_id);
@@ -1429,7 +1421,6 @@ fn setsockopt_selects_only_a_configured_key_under_its_lease() {
         units_per_second: 1_000_000,
     };
     let mut config = SocketConfig::new("test", local);
-    config.io.source_quiet = crate::SourceQuiet::Never;
     config.fast_open_cookie_policy = policy(1);
     config.fast_open_key_lease = Some(lease(0, 200, 200));
     config.fast_open_keys = vec![

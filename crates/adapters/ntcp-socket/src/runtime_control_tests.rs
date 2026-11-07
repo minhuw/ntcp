@@ -96,7 +96,6 @@ fn runtime_with(
             let local: IpAddr = if v6 { "2001:db8::5" } else { "10.73.0.5" }.parse().unwrap();
             let peer: IpAddr = if v6 { "2001:db8::6" } else { "10.73.0.6" }.parse().unwrap();
             let mut config = SocketConfig::new("external", local);
-            config.io.source_quiet = crate::SourceQuiet::Never;
             config.io.prefix = Some(if v6 { 64 } else { 24 });
             config.tcp.max_connections = 2;
             config.io.egress_capacity = 2;

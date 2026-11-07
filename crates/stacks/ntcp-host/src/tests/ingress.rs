@@ -851,6 +851,14 @@ fn reconstruct(frames: &[Vec<u8>]) -> (IpMetadata, Vec<u8>, Vec<(usize, bool, Op
 }
 
 fn fragmenting_side(local: SocketAddr, identity: u128, capacity: bool) -> Side {
+    let mut side = unstarted_fragmenting_side(local, identity, capacity);
+    side.0.start_identifiers(Continuity::Fresh).unwrap();
+    side
+}
+
+// `fragmenting_side` whose identifier allocator is not started: no
+// identifier can be issued.
+fn unstarted_fragmenting_side(local: SocketAddr, identity: u128, capacity: bool) -> Side {
     let cfg = config(2);
     let mut side = managed_limited(local, identity, cfg, false, None, None, |p, mut l| {
         l.datagrams = DatagramLimits {
@@ -879,9 +887,22 @@ fn fragmenting_side(local: SocketAddr, identity: u128, capacity: bool) -> Side {
         }
         Ok(())
     }));
-    // The previous context stopped at 0: identifiers start one MDL later.
-    side.0.start_identifiers(Continuity::QuietSince(0)).unwrap();
     side
+}
+
+// Lease every Identification of the (local, `destination`, ICMP) tuple at
+// 0: the RFC 6864 ceiling withholds the next one until a full MDL later.
+fn withhold_identifiers(a: &mut Side, destination: IpAddr) {
+    let (local, _) = addresses(false);
+    let mut leased = 0;
+    while a.0.lease_identification(0, local.ip(), destination, 1).is_ok() {
+        leased += 1;
+    }
+    assert_eq!(leased, 65536);
+    assert!(matches!(
+        a.0.lease_identification(0, local.ip(), destination, 1),
+        Err(IdentifierBackpressure::Exhausted { .. })
+    ));
 }
 
 #[test]
@@ -924,27 +945,24 @@ fn fragmented_echo_requests_get_fragmented_replies_within_the_peer_capacity() {
         }
         assert_eq!(message.len() + header, request.len());
 
-        // Without an identifier (still within the quiet period) a reply
-        // the path carries whole goes out whole; a larger one is unsent.
-        let mut quiet = fragmenting_side(local, 76, true);
+        // Without an identifier (no allocator started) a reply the path
+        // carries whole goes out whole; a larger one is unsent.
+        let mut unstarted = unstarted_fragmenting_side(local, 76, true);
         let medium: Vec<u8> = vec![4; 1300];
         for piece in fragments(&echo(to_us, 1, 1, &medium), 24, 1200) {
-            input_frame(&mut quiet, 1, &piece).unwrap();
+            input_frame(&mut unstarted, 1, &piece).unwrap();
         }
-        let frames = drain_packets(&mut quiet, 2).unwrap().unwrap();
+        let frames = drain_packets(&mut unstarted, 2).unwrap().unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), header + 8 + medium.len());
         if !v6 {
             assert_eq!(frames[0][6] & 0x40, 0x40);
         }
         for piece in fragments(&request, 25, 1200) {
-            input_frame(&mut quiet, 3, &piece).unwrap();
+            input_frame(&mut unstarted, 3, &piece).unwrap();
         }
-        assert_eq!(
-            drain_packets(&mut quiet, 4),
-            Err(Error::Unsupported)
-        );
-        assert_eq!(quiet.0.icmp_output_counters().unsent, 1);
+        assert_eq!(drain_packets(&mut unstarted, 4), Err(Error::Unsupported));
+        assert_eq!(unstarted.0.icmp_output_counters().unsent, 1);
 
         // Without the stated capacity only the receiver guarantee holds
         // (576 IPv4, 1500 IPv6): the 2028/2048-octet reply exceeds it and
@@ -1178,16 +1196,17 @@ fn echo_replies_on_a_discovery_disabled_ipv4_route_are_df_clear_fragments_within
 }
 
 // On a discovery-disabled IPv4 route every Echo Reply leaves DF clear and
-// needs a leased Identification, whole or fragmented. Inside the
-// allocator's start quiet period the reply is held at the head of the
-// queue (WouldBlock, nothing submitted, nothing counted unsent) and is sent
-// once an identifier can be issued: held output, never a reused value.
+// needs a leased Identification, whole or fragmented. While the RFC 6864
+// ceiling withholds one the reply is held at the head of the queue
+// (WouldBlock, nothing submitted, nothing counted unsent) and is sent once
+// an identifier can be issued: held output, never a reused value.
 #[test]
 fn df_clear_echo_replies_are_held_while_no_identifier_can_be_issued() {
     const MDL: u64 = 120_000_000;
     let (local, remote) = addresses(false);
     for size in [100usize, 1420] {
         let mut a = fragmenting_side(local, 9993 + size as u128, true);
+        withhold_identifiers(&mut a, remote.ip());
         let capability = a.0.administration();
         let prefix = path::IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap();
         let route = a.0.admin_select_route(&capability, prefix).unwrap();
@@ -1242,8 +1261,8 @@ fn df_clear_echo_replies_are_held_while_no_identifier_can_be_issued() {
 }
 
 // Identifier backpressure holds only the message that needs an identifier.
-// With one destination's path discovery-disabled (DF clear) and the
-// allocator's start quiet period active, its Echo Reply waits while the
+// With one destination's path discovery-disabled (DF clear) and its
+// identifiers withheld by the RFC 6864 ceiling, its Echo Reply waits while the
 // reply to a destination on the enabled path, queued behind it, leaves at
 // once with DF; the held reply goes out DF-clear with a leased
 // Identification once one can be issued.
@@ -1253,6 +1272,7 @@ fn an_identifier_blocked_reply_does_not_hold_other_destinations_output() {
     let (local, remote) = addresses(false);
     let neighbor: IpAddr = "198.51.100.7".parse().unwrap();
     let mut a = fragmenting_side(local, 9995, true);
+    withhold_identifiers(&mut a, remote.ip());
     // Create the path to `remote` (an enabled-path reply needs no identifier).
     let data = [0x5a; 64];
     input_frame(&mut a, 1, &echo(ip(remote.ip(), local.ip()), 0x6001, 1, &data)).unwrap();
@@ -1314,14 +1334,15 @@ fn an_identifier_blocked_reply_does_not_hold_other_destinations_output() {
 }
 
 // Parent decision D22: a message held for an identifier never keeps a new
-// one out of the queue. `fragmenting_side` with the allocator's start quiet
-// period, discovery disabled on the exact path to `remote` (DF clear): the
+// one out of the queue. `fragmenting_side` with the identifiers to `remote`
+// withheld until one MDL, discovery disabled on the exact path to it (DF clear): the
 // queued replies to it are held by an icmp_output attempt. Returns the
 // side, the neighbor on an enabled path and the disabled path.
 fn held_replies_side(identity: u128) -> (Side, IpAddr, path::PathId) {
     let (local, remote) = addresses(false);
     let neighbor: IpAddr = "198.51.100.7".parse().unwrap();
     let mut a = fragmenting_side(local, identity, true);
+    withhold_identifiers(&mut a, remote.ip());
     let data = [0x5a; 64];
     input_frame(
         &mut a,
@@ -1387,7 +1408,7 @@ fn echo_queued_on(a: &mut Side, path: path::PathId) -> usize {
 }
 
 // The remaining held replies leave DF clear with fresh Identifications once
-// the quiet period ends, in their queueing order.
+// identifiers can be issued again, in their queueing order.
 fn assert_held_replies_leave(a: &mut Side, now: u64, sequences: &[u16]) {
     let (local, remote) = addresses(false);
     let mut identifications = Vec::new();
@@ -1412,11 +1433,11 @@ fn assert_held_replies_leave(a: &mut Side, now: u64, sequences: &[u16]) {
     assert_eq!(drain_packets(a, now), Ok(None));
 }
 
-// D22 (a): replies held during the quiet period fill the queue; an enabled
+// D22 (a): replies held for an identifier fill the queue; an enabled
 // neighbor's Echo Request is still answered. Its reply takes the place of
 // the longest-waiting held reply (counted unsent, not dropped) and the next
 // icmp_output call submits it with DF; the other held replies follow once
-// the quiet period ends, DF clear with fresh Identifications.
+// identifiers can be issued again, DF clear with fresh Identifications.
 #[test]
 fn a_new_reply_displaces_the_longest_held_reply_from_a_full_queue() {
     const MDL: u64 = 120_000_000;
@@ -1467,7 +1488,7 @@ fn a_reassembly_error_displaces_a_held_reply_from_a_full_queue() {
     hold_three_replies(&mut a, 3);
     let before = a.0.icmp_output_counters();
     let second = config(2).connection.timebase.units_per_second;
-    assert!(60 * second + 3 < MDL, "expires within the quiet period");
+    assert!(60 * second + 3 < MDL, "expires while identifiers are withheld");
     a.0.service_changes(&mut a.1, 60 * second + 3).unwrap();
     let after = a.0.icmp_output_counters();
     assert_eq!(after.errors, before.errors + 1);
@@ -1485,7 +1506,7 @@ fn a_reassembly_error_displaces_a_held_reply_from_a_full_queue() {
 }
 
 // D22 (c) and (d): only a held message gives way. A queue full of replies
-// that were never attempted (on the disabled path within the quiet period),
+// that were never attempted (on the disabled path, identifiers withheld),
 // or that an attempt found blocked by the backend rather than waiting for an
 // identifier, drops the new request and counts it dropped.
 #[test]

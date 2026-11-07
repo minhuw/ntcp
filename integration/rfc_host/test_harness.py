@@ -496,10 +496,6 @@ class OptionScenario(unittest.TestCase):
         self.assertIn("required_octets: 44, maximum: 40", options.OVERSIZED_REFUSAL)
         self.assertEqual(icmp.Ntcp.command("tun_echo", "198.18.1.2", "198.18.2.2:18083")[-1], "198.18.2.2:18083")
         self.assertEqual(len(icmp.Ntcp.command("tun_echo", "198.18.1.2")), 4)
-        # Every tun_echo case states the fact true of its harness-created
-        # namespace; a case may state a weaker true one.
-        self.assertEqual(icmp.Ntcp.environment("fragment", {})["NTCP_SOURCE_QUIET"], "never")
-        self.assertEqual(icmp.Ntcp.environment("fragment", {"NTCP_SOURCE_QUIET": "300"})["NTCP_SOURCE_QUIET"], "300")
 
     def originated(self, area, ttl=64, kept=None):
         """An originated SYN from ntcp to the listener with option AREA; KEPT
@@ -674,13 +670,6 @@ class SegmentRouting(unittest.TestCase):
         self.assertTrue(datagram["checksum_valid"])
         self.assertEqual(datagram["final_destination"], self.D)
         self.assertEqual(str(ipaddress.ip_address(datagram["raw"][24:40])), self.S1)
-
-
-class SourceQuietStatements(unittest.TestCase):
-    def test_every_native_configuration_states_every_port(self):
-        text = scoped.config()
-        self.assertIn("io.source_quiet=never\n", text)
-        self.assertIn("port.b.source_quiet=never\n", text)
 
 
 class ScopedScenario(unittest.TestCase):

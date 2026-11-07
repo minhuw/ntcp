@@ -33,10 +33,9 @@
 // octets: deployment configuration stated per case (and recorded by the
 // harness). ADJUNCT_PATHS sizes the Echo adjunct (0 disables it).
 //
-// Identifier continuity (decision D14): the harness creates the namespace,
-// the TUN and LOCAL_IP for this run, so nothing emitted from LOCAL_IP
-// before; the driver asserts that freshness (Continuity::QuietFor with no
-// earlier emission) and reports the assertion in its ready line.
+// Identifier continuity: a newly started Host assumes no earlier
+// incarnation emitted from LOCAL_IP and issues at once (Continuity::Fresh),
+// as its ready line reports.
 use ntcp::{Endpoint, EndpointConfig, EndpointError};
 use ntcp_host::{
     AdjunctCounters, BackendOutcome, Continuity, DatagramReport, Host, IngressContext,
@@ -315,12 +314,8 @@ impl Network {
                 .and_then(|mut f| f.read_exact(bytes))
                 .map_err(|_| ntcp_host::EntropyError)
         }));
-        // D14: harness-created namespace and address, no earlier emission.
-        host.start_identifiers(Continuity::QuietFor {
-            at: 0,
-            seconds: u64::MAX,
-        })
-        .map_err(host_error)?;
+        host.start_identifiers(Continuity::Fresh)
+            .map_err(host_error)?;
         let forwarder = path::ForwarderId(1);
         let ingress = host
             .register_link(
@@ -861,7 +856,7 @@ fn run() -> io::Result<()> {
         "{{\"event\":\"ready\",\"family\":{},\"local\":\"{local}\",\"peer\":\"{peer}\",\
          \"local_port\":{LOCAL_PORT},\"connectionless_initial\":{initial},\
          \"peer_reassembly\":{peer_reassembly},\"adjunct_paths\":{adjunct},\
-         \"continuity\":\"QuietFor(no earlier emission: harness-created namespace and address)\",\
+         \"continuity\":\"Fresh\",\
          \"mdl_seconds\":{},{initial_state}}}",
         if local.is_ipv4() { 4 } else { 6 },
         ntcp_host::DEFAULT_LIFETIME_SECONDS

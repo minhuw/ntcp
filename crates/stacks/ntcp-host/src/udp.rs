@@ -190,9 +190,9 @@ pub enum UdpSendError {
         max_payload: usize,
     },
     /// A DF-clear IPv4 datagram (a discovery-disabled route) has no
-    /// Identification available now (the RFC 6864 ceiling, the start quiet
-    /// period or entropy); nothing was recorded, and the caller holds the
-    /// datagram and retries rather than reuse a value.
+    /// Identification available now (the RFC 6864 ceiling or entropy);
+    /// nothing was recorded, and the caller holds the datagram and retries
+    /// rather than reuse a value.
     Backpressure(IdentifierBackpressure),
     /// The backend certainly did not submit it; nothing was recorded.
     NotSubmitted(BackendOutcome),
