@@ -239,7 +239,9 @@ fn capacity_errors_leave_no_state() {
     assert!(!cache.release(2));
     assert_eq!(cache.resolve(0, OTHER_IP, 0, 1), Ok(Resolution::Held));
     // Construction and registration bounds.
+    assert!(cache.has_link(0) && !cache.has_link(1));
     assert!(cache.add_link(1, OTHER, &mut half).is_ok());
+    assert!(cache.has_link(1));
     assert_eq!(cache.add_link(2, OTHER, &mut half), Err(Error::Capacity));
     assert_eq!(cache.add_link(1, OTHER, &mut half), Err(Error::Duplicate));
     assert_eq!(

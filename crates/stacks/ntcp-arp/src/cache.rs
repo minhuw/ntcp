@@ -308,6 +308,12 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
 
     // Links.
 
+    /// Whether `link` is registered: an embedding serving several kinds of
+    /// port asks before it routes a packet or address here.
+    pub fn has_link(&self, link: L) -> bool {
+        self.interface(link).is_some()
+    }
+
     /// Register an Ethernet link with its MAC; its ReachableTime is drawn
     /// from `random`.
     pub fn add_link(

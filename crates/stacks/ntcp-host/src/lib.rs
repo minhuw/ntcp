@@ -54,11 +54,13 @@ pub use admin::{AdminCandidate, AdminClient, Administration, AffectedPath, Clien
 mod neighbor;
 use neighbor::Neighbors;
 pub use neighbor::{AddressState, NdPort, NeighborLimits};
+pub use ntcp_arp::{ArpCounters, ArpState};
 // Neighbor cache inspection for the tests of embeddings (`Host::neighbor`).
 #[cfg(any(test, feature = "test-support"))]
 pub use neighbor::NeighborState;
 mod redirect;
 pub use redirect::{RedirectOutcome, RedirectRejection};
+mod arp;
 mod discovery;
 pub use discovery::{NeighborHop, NeighborReport, NeighborTicket, NeighborTransmit, NeighborWake};
 mod udp;
@@ -218,6 +220,9 @@ pub struct Limits {
     pub datagrams: DatagramLimits,
     /// Neighbor Discovery for ND-capable ports; none by default.
     pub neighbors: NeighborLimits,
+    /// ARP for the IPv4 next hops of neighbor ports, the same quantities
+    /// for that family (the answers are ARP replies); none by default.
+    pub ipv4_neighbors: NeighborLimits,
 }
 
 /// Fragmented datagrams this Host context can receive, per family: what it
@@ -307,6 +312,7 @@ pub fn managed_limits(
             icmp_output: IcmpOutputLimits::default(),
             datagrams: DatagramLimits::default(),
             neighbors: NeighborLimits::default(),
+            ipv4_neighbors: NeighborLimits::default(),
         },
     ))
 }
@@ -581,6 +587,7 @@ pub struct Host {
     identifiers: Allocator,
     adjunct: Adjunct,
     neighbors: Neighbors<discovery::HeldOutput>,
+    ipv4_neighbors: arp::Ipv4Neighbors,
     // Addresses ND ingress found duplicate since the last
     // `service_neighbors` report, which carries them to the owner.
     unreported_duplicates: usize,
@@ -665,6 +672,11 @@ impl Host {
                 path_limits.links,
                 timebase.units_per_second,
             )?,
+            ipv4_neighbors: arp::Ipv4Neighbors::new(
+                limits.ipv4_neighbors,
+                path_limits.links,
+                timebase.units_per_second,
+            )?,
             unreported_duplicates: 0,
             entropy: None,
             now: 0,
@@ -684,6 +696,10 @@ impl Host {
         // An ND-capable port's IPv6 addresses are published by DAD
         // (`add_neighbor_address`), never at once.
         if address.address().is_ipv6() && self.neighbors.port(link).is_some() {
+            return Err(Error::Unsupported);
+        }
+        // Likewise its IPv4 addresses, which ARP must also answer for.
+        if address.address().is_ipv4() && self.ipv4_neighbors.has_link(link) {
             return Err(Error::Unsupported);
         }
         Ok(self.paths.register_source(address, link)?)
@@ -905,6 +921,7 @@ impl Host {
         self.port(context.link)?;
         self.paths.remove_link(context.link)?;
         self.neighbors.remove_port(context.link);
+        self.ipv4_neighbors.remove_link(context.link);
         let slot = self
             .ports
             .iter()
@@ -1417,6 +1434,7 @@ impl Host {
         let Self {
             ledger,
             neighbors,
+            ipv4_neighbors,
             bindings,
             entropy,
             now,
@@ -1442,18 +1460,24 @@ impl Host {
             let ResolvedNextHop::Address(next_hop) = snapshot.key().next_hop() else {
                 return;
             };
-            let IpAddr::V6(next_hop) = next_hop.address() else {
-                return;
-            };
             // A confirmation without entropy for its ReachableTime is lost,
             // like an unsent hint; NUD then probes.
-            let _ = neighbors.confirm(
-                evidence.link,
-                next_hop,
-                record.committed_at,
-                *now,
-                entropy.as_mut(),
-            );
+            let _ = match next_hop.address() {
+                IpAddr::V6(next_hop) => neighbors.confirm(
+                    evidence.link,
+                    next_hop,
+                    record.committed_at,
+                    *now,
+                    entropy.as_mut(),
+                ),
+                IpAddr::V4(next_hop) => ipv4_neighbors.confirm(
+                    evidence.link,
+                    next_hop,
+                    record.committed_at,
+                    *now,
+                    entropy.as_mut(),
+                ),
+            };
         });
     }
 

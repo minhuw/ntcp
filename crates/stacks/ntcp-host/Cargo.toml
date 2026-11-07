@@ -18,3 +18,4 @@ ntcp-ip-common = { path = "../ntcp-ip-common", version = "0.0.1" }
 ntcp-ip6 = { path = "../ntcp-ip6", version = "0.0.1" }
 ntcp-icmp = { path = "../ntcp-icmp", version = "0.0.1" }
 ntcp-ethernet = { path = "../ntcp-ethernet", version = "0.0.1" }
+ntcp-arp = { path = "../ntcp-arp", version = "0.0.1" }

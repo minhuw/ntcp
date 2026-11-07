@@ -26,7 +26,8 @@ const DELAY_FIRST_PROBE_TIME_MS: u64 = 5_000;
 const MAX_RTR_SOLICITATION_DELAY_MS: u64 = 1_000;
 
 /// Neighbor Discovery storage of one Host, all of it allocated at creation;
-/// the default (nothing) supports no ND-capable port.
+/// the default (nothing) supports no ND-capable port. `Limits::ipv4_neighbors`
+/// states the same quantities for ARP.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NeighborLimits {
     /// Neighbor cache entries, shared by every ND-capable port.

@@ -1,5 +1,6 @@
 extern crate std;
 mod adjunct;
+mod arp;
 mod admin;
 mod admission;
 mod black_hole_reset;

@@ -1,8 +1,9 @@
 // The Host side of Neighbor Discovery: ND-capable Ethernet port
 // registration, configured addresses under Duplicate Address Detection, ND
 // ingress ahead of ordinary destination admission, control output and
-// caller-time service (`neighbor` holds the state).
-use core::net::{IpAddr, Ipv6Addr};
+// caller-time service (`neighbor` holds the state). The same calls resolve
+// the IPv4 next hops of a neighbor port by ARP (`arp` holds that state).
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ntcp::{Instant, IpMetadata};
 use ntcp_icmp::{
     ND_HOP_LIMIT, NeighborAdvertisement, NeighborMessage, NeighborSolicitation, decode_neighbor,
@@ -13,33 +14,45 @@ use crate::neighbor::{
     AddressState, Control, ControlOutcome, ControlToken, Destination, NdEvent, NdPort, Resolution,
 };
 use crate::{
-    Advice, BackendOutcome, EgressContext, Error, Forwarding, Host, IngressContext, Owner,
-    ReceiveCapabilities, Received, ResolvedNextHop,
+    Advice, BackendOutcome, EgressContext, Error, Forwarding, Host, IngressContext, Ipv4Receive,
+    Ipv6Receive, Owner, ReceiveCapabilities, Received, ResolvedNextHop,
 };
 use ntcp::TransmitAttempt;
+#[cfg(any(test, feature = "test-support"))]
+use ntcp_arp::ArpState;
 
 const ICMPV6: u8 = 58;
 const SOLICITATION: u8 = 135;
 const ADVERTISEMENT: u8 = 136;
 const REDIRECT: u8 = 137;
 
-/// One ND control packet written by `Host::neighbor_output`: a complete
-/// IPv6 packet of `len` octets for `link`, to the Ethernet `destination`
-/// (a 33:33 group or a resolved neighbor). Its ticket completes it.
+/// One neighbor control packet written by `Host::neighbor_output`: `len`
+/// octets for `link`, carried in an Ethernet frame of type `ethertype` to
+/// `destination`: a complete IPv6 ND packet (to a 33:33 group or a resolved
+/// neighbor), or an ARP body (broadcast, or unicast to the station it
+/// answers or probes). Its ticket completes it.
 #[must_use = "an uncompleted ND transmission is polled again"]
 #[derive(Debug, Eq, PartialEq)]
 pub struct NeighborTransmit {
     pub link: LinkId,
     pub destination: [u8; 6],
+    pub ethertype: u16,
     pub len: usize,
     pub ticket: NeighborTicket,
 }
 
-/// Authority to report the outcome of one ND control packet.
+/// Authority to report the outcome of one neighbor control packet.
 #[derive(Debug, Eq, PartialEq)]
 pub struct NeighborTicket {
     context: crate::ContextId,
-    token: ControlToken,
+    token: Token,
+}
+
+// The cache a control packet came from.
+#[derive(Debug, Eq, PartialEq)]
+enum Token {
+    Nd(ControlToken),
+    Arp(crate::arp::ControlToken),
 }
 
 /// One caller-time Neighbor Discovery pass (`Host::service_neighbors`).
@@ -53,7 +66,7 @@ pub struct NeighborReport {
     pub first_error: Option<Error>,
 }
 
-/// The Ethernet next hop of one IPv6 output attempt on an ND-capable port
+/// The Ethernet next hop of one output attempt on a neighbor port
 /// (`Host::resolve_neighbor`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NeighborHop {
@@ -75,7 +88,8 @@ pub enum NeighborWake {
         owner: Owner,
         attempt: TransmitAttempt,
     },
-    /// Resolution failed (RFC 4861 section 7.2.2): the owner's advice is
+    /// Resolution failed (RFC 4861 section 7.2.2; for an IPv4 next hop,
+    /// ARP's requests went unanswered): the owner's advice is
     /// Address Unreachable, which RFC 4443 classes as a soft error; the
     /// attempt was never transmitted.
     Unreachable {
@@ -107,12 +121,15 @@ fn v6(address: IpAddr) -> Option<Ipv6Addr> {
 }
 
 impl Host {
-    /// Register an ND-capable Ethernet port: its IPv6 next hops are resolved
-    /// by this Host's Neighbor Discovery (`Forwarding::IpNextHop`), its IPv6
-    /// addresses are configured through `add_neighbor_address` and stay
-    /// tentative until Duplicate Address Detection completes, and its
-    /// ReachableTime is drawn from the Host's entropy, which must be set.
-    /// Needs `Limits::neighbors` storage.
+    /// Register a neighbor Ethernet port: its next hops are resolved by this
+    /// Host (`Forwarding::IpNextHop`), its addresses are configured through
+    /// `add_neighbor_address`, and its ReachableTime is drawn from the
+    /// Host's entropy, which must be set. IPv6 next hops are resolved by
+    /// Neighbor Discovery, whose addresses stay tentative until Duplicate
+    /// Address Detection completes (`Limits::neighbors` storage). When the
+    /// port receives IPv4 and `Limits::ipv4_neighbors` provides storage, its
+    /// IPv4 next hops are resolved by ARP; such a port that does not
+    /// receive IPv6 takes no Neighbor Discovery storage.
     pub fn register_neighbor_port(
         &mut self,
         interface: InterfaceKey,
@@ -120,34 +137,51 @@ impl Host {
         receive: ReceiveCapabilities,
         port: NdPort,
     ) -> Result<IngressContext, Error> {
-        if self.neighbors.ports_free() == 0 {
+        let arp = receive.ipv4 != Ipv4Receive::Disabled && self.ipv4_neighbors.enabled();
+        let nd = receive.ipv6 != Ipv6Receive::Disabled || !arp;
+        if nd && self.neighbors.ports_free() == 0 {
             return Err(Error::Capacity);
         }
         if self.entropy.is_none() {
             return Err(Error::Entropy);
         }
         let context = self.register_link(interface, mtu, receive, Forwarding::IpNextHop)?;
-        if let Err(error) = self
-            .neighbors
-            .add_port(context.link, port, self.entropy.as_mut())
-        {
+        let mut added = if nd {
+            self.neighbors
+                .add_port(context.link, port, self.entropy.as_mut())
+        } else {
+            Ok(())
+        };
+        if arp && added.is_ok() {
+            added = self
+                .ipv4_neighbors
+                .add_link(context.link, port.mac, self.entropy.as_mut());
+        }
+        if let Err(error) = added {
             self.remove_link(context)?;
             return Err(error);
         }
         Ok(context)
     }
 
-    /// Configure `address` on an ND-capable port. It is tentative (no
-    /// ordinary traffic leaves from it and none is received for it) until
-    /// DAD, which starts once `neighbor_membership_ready` states its groups
-    /// are joined, completes in `service_neighbors`; with DupAddrDetectTransmits
-    /// 0 it is published at once.
+    /// Configure `address` on a neighbor port. An IPv6 address is tentative
+    /// (no ordinary traffic leaves from it and none is received for it)
+    /// until DAD, which starts once `neighbor_membership_ready` states its
+    /// groups are joined, completes in `service_neighbors`; with
+    /// DupAddrDetectTransmits 0 it is published at once. An IPv4 address on
+    /// a port that resolves IPv4 by ARP is published at once (no conflict
+    /// detection): ARP answers requests for it, and the port's first one is
+    /// the source of its requests.
     pub fn add_neighbor_address(
         &mut self,
         link: LinkId,
-        address: Ipv6Addr,
+        address: impl Into<IpAddr>,
     ) -> Result<AddressState, Error> {
         self.port(link)?;
+        let address = match address.into() {
+            IpAddr::V6(address) => address,
+            IpAddr::V4(address) => return self.add_ipv4_neighbor_address(link, address),
+        };
         let zone = address.is_unicast_link_local().then_some(link);
         // Checked before DAD, which would otherwise publish nothing.
         ScopedAddress::new(IpAddr::V6(address), zone)?;
@@ -159,6 +193,44 @@ impl Host {
             return Err(error);
         }
         Ok(state)
+    }
+
+    fn add_ipv4_neighbor_address(
+        &mut self,
+        link: LinkId,
+        address: Ipv4Addr,
+    ) -> Result<AddressState, Error> {
+        if !self.ipv4_neighbors.has_link(link) {
+            return Err(Error::InvalidContext);
+        }
+        let scoped = ScopedAddress::new(IpAddr::V4(address), None)?;
+        self.ipv4_neighbors.add_local(link, address)?;
+        if let Err(error) = self.paths.register_source(scoped, link) {
+            self.ipv4_neighbors.remove_local(link, address);
+            return Err(error.into());
+        }
+        Ok(AddressState::Assigned)
+    }
+
+    /// Configure a permanent mapping for an IPv4 neighbor on a port that
+    /// resolves IPv4 by ARP: it never expires and what ARP learns never
+    /// replaces it. Neighbor Discovery keeps no such entries (`Unsupported`
+    /// for an IPv6 neighbor).
+    pub fn add_static_neighbor(
+        &mut self,
+        link: LinkId,
+        address: IpAddr,
+        mac: [u8; 6],
+        now: Instant,
+    ) -> Result<(), Error> {
+        self.port(link)?;
+        let IpAddr::V4(address) = address else {
+            return Err(Error::Unsupported);
+        };
+        if !self.ipv4_neighbors.has_link(link) {
+            return Err(Error::Unsupported);
+        }
+        self.ipv4_neighbors.add_permanent(link, address, mac, now)
     }
 
     /// The embedding has joined all-nodes and `address`'s solicited-node
@@ -190,27 +262,53 @@ impl Host {
         self.neighbors.state(link, address)
     }
 
-    /// Apply every Neighbor Discovery timer due at `now` (reachability,
-    /// probing, resolution failure and DAD completion).
+    /// Inspection for tests of embeddings that serve IPv4 neighbor ports:
+    /// the ARP entry for `address` on `link`, its state and MAC.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn ipv4_neighbor(
+        &self,
+        link: LinkId,
+        address: Ipv4Addr,
+    ) -> Option<(ArpState, Option<[u8; 6]>)> {
+        self.ipv4_neighbors.entry(link, address)
+    }
+
+    /// Apply every Neighbor Discovery and ARP timer due at `now`
+    /// (reachability, probing, resolution failure and DAD completion).
     pub fn service_neighbors(&mut self, now: Instant) -> NeighborReport {
         let mut report = NeighborReport {
             duplicates: core::mem::take(&mut self.unreported_duplicates),
             ..NeighborReport::default()
         };
         let Self {
-            neighbors, paths, ..
+            neighbors,
+            ipv4_neighbors,
+            paths,
+            ..
         } = self;
         neighbors.service(now, &mut |event| apply(paths, event, &mut report));
+        ipv4_neighbors.service(now, &mut |link, address| {
+            lost(
+                paths,
+                link,
+                IpAddr::V4(address),
+                None,
+                ntcp_path::NeighborLoss::Unreachable,
+                &mut report,
+            )
+        });
         self.settle_held_icmp(now);
         report
     }
 
     /// The Ethernet next hop of `context`'s output attempt, held for
-    /// `owner` on an ND-capable port: its IPv6 next hop's cached mapping
-    /// (the first use of a STALE one starts DELAY; STALE, DELAY and PROBE
-    /// never block output), or Held while it is resolved. Exhausted neighbor
-    /// or pending storage is backpressure (`Error::Capacity`) that leaves no
-    /// entry behind.
+    /// `owner` on a neighbor port: its next hop's cached mapping (the first
+    /// use of a STALE one starts DELAY; STALE, DELAY and PROBE never block
+    /// output), or Held while it is resolved, by Neighbor Discovery for an
+    /// IPv6 next hop and by ARP for an IPv4 one (`Unsupported` on a port
+    /// that does not resolve the family). Exhausted neighbor or pending
+    /// storage is backpressure (`Error::Capacity`) that leaves no entry
+    /// behind.
     //= https://www.rfc-editor.org/rfc/rfc8201#section-3
     //= reason=No same-link bypass: PathService::select resolves an on-link route's next hop to the destination itself and keys, estimates and correlates that path exactly as a gateway path, so on-link destinations get the same shared estimate, Packet Too Big processing and PLPMTUD; the Host resolves the next hop by bounded host Neighbor Discovery (Host::resolve_neighbor holds output until an NS/NA exchange maps it), which changes no Path MTU state. Host test on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud: an on-link route is resolved by NS/NA before the SYN leaves and a downstream PTB correlated with a definitely submitted data segment lowers the path estimate to 1280 while the 1500 first-hop fact stays; core wire test ipv6_same_prefix_proxy_wire_path_does_not_bypass_downstream_ptb: 1500-to-1280 feedback, bounded repair and real receiver progress for a same-/64 peer. Namespace evidence (T19, AC-22; integration/rfc_host nd-proxy cases): the native runtime selects a destination inside its /64 through its on-link route, and a Linux router answers its Neighbor Solicitation for that destination, which lies behind it, as an NDP proxy (proxy_ndp with ip -6 neigh add proxy); no native segment precedes the solicited proxy NA and every segment carries the router's MAC with the destination's IPv6 address. After the router's downstream link falls from 1500 to 1280 its kernel-generated PTB (MTU 1280, valid checksum, Icmp6OutPktTooBigs rising by the PTBs captured) quotes a captured native packet larger than 1280, the dropped range is repaired in packets of at most 1280 octets, complete bidirectional hashed streams reach EOF with the native runtime as client and as server, the 1500-octet first-hop MTU stays, and existing and new sockets report 1280 through IPV6_MTU. The black-hole variant (the router's outgoing PTBs dropped by an owned nft rule) still delivers the stream through connection-local PLPMTUD fallback without a shared-estimate change, and the gateway variant shows the same PTB processing through an io.gateway route resolved by NS/NA.
     //# Note that Path MTU Discovery must be performed even in cases where a node "thinks" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.
@@ -224,12 +322,33 @@ impl Host {
         let ResolvedNextHop::Address(next_hop) = context.next_hop else {
             return Err(Error::Unsupported);
         };
-        let next_hop = v6(next_hop.address()).ok_or(Error::Unsupported)?;
         let held = HeldOutput::Transport {
             owner,
             attempt: context.attempt,
         };
-        self.neighbor_hop(context.link, next_hop, now, held)
+        match next_hop.address() {
+            IpAddr::V6(next_hop) => self.neighbor_hop(context.link, next_hop, now, held),
+            IpAddr::V4(next_hop) => self.ipv4_hop(context.link, next_hop, now, held),
+        }
+    }
+
+    // The IPv4 next hop's disposition for `held`, resolved by ARP.
+    fn ipv4_hop(
+        &mut self,
+        link: LinkId,
+        next_hop: Ipv4Addr,
+        now: Instant,
+        held: HeldOutput,
+    ) -> Result<NeighborHop, Error> {
+        if !self.ipv4_neighbors.has_link(link) {
+            return Err(Error::Unsupported);
+        }
+        Ok(
+            match self.ipv4_neighbors.resolve(link, next_hop, now, held)? {
+                Some(mac) => NeighborHop::Resolved(mac),
+                None => NeighborHop::Held,
+            },
+        )
     }
 
     // The next hop's disposition for `held`; a Redirect's router target
@@ -257,16 +376,20 @@ impl Host {
     /// The next held attempt whose resolution ended, removed from the
     /// pending set.
     pub fn neighbor_wake(&mut self) -> Option<NeighborWake> {
-        let (slot, held, mac) = self
-            .neighbors
-            .next_pending(|held| matches!(held, HeldOutput::Transport { .. }))?;
-        self.neighbors.release(slot);
+        let transport = |held: &HeldOutput| matches!(held, HeldOutput::Transport { .. });
+        let (held, resolved) = match self.neighbors.next_pending(|held| transport(&held)) {
+            Some((slot, held, mac)) => {
+                self.neighbors.release(slot);
+                (held, mac.is_some())
+            }
+            None => self.ipv4_neighbors.next_wake(transport)?,
+        };
         let HeldOutput::Transport { owner, attempt } = held else {
             return None;
         };
-        Some(match mac {
-            Some(_) => NeighborWake::Retry { owner, attempt },
-            None => NeighborWake::Unreachable {
+        Some(match resolved {
+            true => NeighborWake::Retry { owner, attempt },
+            false => NeighborWake::Unreachable {
                 owner,
                 attempt,
                 advice: Advice::NetworkError(ntcp::NetworkError::SoftUnreachable),
@@ -278,7 +401,8 @@ impl Host {
     // through `key`, resolved as transport output is (RFC 4861 sections
     // 7.2.2 and 7.3.3): None where the embedding resolves the next hop (a
     // port that is not ND-capable), a cached mapping (the first use of a
-    // STALE one starts DELAY), or Held while it is resolved for `held`.
+    // STALE one starts DELAY), or Held while it is resolved for `held`; an
+    // IPv4 next hop on a port that resolves IPv4 by ARP is resolved there.
     // Exhausted neighbor or pending storage is `Error::Capacity`.
     pub(crate) fn host_output_neighbor(
         &mut self,
@@ -286,6 +410,12 @@ impl Host {
         now: Instant,
         held: HeldOutput,
     ) -> Result<Option<NeighborHop>, Error> {
+        if let ResolvedNextHop::Address(next_hop) = key.next_hop()
+            && let IpAddr::V4(next_hop) = next_hop.address()
+            && self.ipv4_neighbors.has_link(key.link())
+        {
+            return Ok(Some(self.ipv4_hop(key.link(), next_hop, now, held)?));
+        }
         if self.neighbors.port(key.link()).is_none() {
             return Ok(None);
         }
@@ -317,12 +447,63 @@ impl Host {
                 self.neighbors.release(slot);
             }
         }
+        // ARP yields only ended records; one whose message or probe is gone
+        // stays until its resolution ends.
+        let host_output = |held: &HeldOutput| !matches!(held, HeldOutput::Transport { .. });
+        while let Some((held, resolved)) = self.ipv4_neighbors.next_wake(host_output) {
+            match held {
+                HeldOutput::Transport { .. } => {}
+                HeldOutput::Icmp(arrival) => {
+                    self.icmp_output_settle(arrival, Some(resolved));
+                }
+                HeldOutput::Probe(path) => {
+                    self.adjunct_settle(path, Some(resolved), now);
+                }
+            }
+        }
     }
 
     /// The earliest caller time at which `service_neighbors` or
     /// `neighbor_output` has work.
     pub fn next_neighbor_deadline(&self) -> Option<Instant> {
-        self.neighbors.next_deadline()
+        let ipv4 = self.ipv4_neighbors.next_deadline();
+        match self.neighbors.next_deadline() {
+            Some(ipv6) => Some(ipv4.map_or(ipv6, |ipv4| ipv4.min(ipv6))),
+            None => ipv4,
+        }
+    }
+
+    /// ARP input: the body of an ARP frame (EtherType 0x0806; Ethernet
+    /// padding may follow it) received on a port that resolves IPv4 by ARP,
+    /// which the embedding addressed to this port's MAC or to broadcast.
+    /// It learns and confirms mappings, may release held output, and queues
+    /// the reply to a request for one of the port's IPv4 addresses for
+    /// `neighbor_output`. ARP is not IP, so it does not pass `receive`,
+    /// whose input is an IP packet: the embedding, which parses the
+    /// Ethernet header, routes it here by its EtherType.
+    pub fn receive_arp(
+        &mut self,
+        context: IngressContext,
+        now: Instant,
+        body: &[u8],
+    ) -> Result<(), Error> {
+        self.port(context.link)?;
+        if !self.ipv4_neighbors.has_link(context.link) {
+            return Err(Error::Unsupported);
+        }
+        let Self {
+            ipv4_neighbors,
+            entropy,
+            ..
+        } = self;
+        ipv4_neighbors.receive(context.link, body, now, entropy.as_mut())?;
+        self.settle_held_icmp(now);
+        Ok(())
+    }
+
+    /// Cumulative ARP counters of every port (zero without ARP storage).
+    pub fn arp_counters(&self) -> crate::ArpCounters {
+        self.ipv4_neighbors.counters()
     }
 
     // ND ingress on an ND-capable port, before ordinary destination
@@ -405,13 +586,14 @@ impl Host {
             })
     }
 
-    /// Write `link`'s next due ND control packet (answers, DAD probes, then
-    /// resolution and unreachability solicitations) into `out`. It is
-    /// independent of data output and of other ports: neither blocked data
-    /// nor another port's blocked transmit path holds it back. A
-    /// solicitation counts, and its RetransTimer spacing starts, only once
-    /// `complete_neighbor_output` reports it possibly or definitely
-    /// submitted.
+    /// Write `link`'s next due neighbor control packet into `out`: ND
+    /// (answers, DAD probes, then resolution and unreachability
+    /// solicitations), then ARP (replies, then broadcast requests and
+    /// unicast probes). It is independent of data output and of other
+    /// ports: neither blocked data nor another port's blocked transmit path
+    /// holds it back. A solicitation or request counts, and its
+    /// RetransTimer spacing starts, only once `complete_neighbor_output`
+    /// reports it possibly or definitely submitted.
     pub fn neighbor_output(
         &mut self,
         link: LinkId,
@@ -419,7 +601,20 @@ impl Host {
         out: &mut [u8],
     ) -> Result<Option<NeighborTransmit>, Error> {
         let Some((control, token)) = self.neighbors.next_control(link, now) else {
-            return Ok(None);
+            let Some((destination, len, token)) = self.ipv4_neighbors.output(link, now, out)?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(NeighborTransmit {
+                link,
+                destination,
+                ethertype: ntcp_ethernet::ETHERTYPE_ARP,
+                len,
+                ticket: NeighborTicket {
+                    context: self.paths.context(),
+                    token: Token::Arp(token),
+                },
+            }));
         };
         let (link, source, destination, mac, message) = match control {
             Control::Solicit {
@@ -489,10 +684,11 @@ impl Host {
         Ok(Some(NeighborTransmit {
             link,
             destination: mac,
+            ethertype: ntcp_ethernet::ETHERTYPE_IPV6,
             len,
             ticket: NeighborTicket {
                 context: self.paths.context(),
-                token,
+                token: Token::Nd(token),
             },
         }))
     }
@@ -505,7 +701,9 @@ impl Host {
     /// DAD probe's own copy is then expected. `WouldBlock`, `Rejected` and
     /// `NotSubmitted` (certainly unsent) consume nothing and leave the
     /// solicitation due. An answer ends on any outcome except `WouldBlock`
-    /// and `Rejected`, which keep it for a retry.
+    /// and `Rejected`, which keep it for a retry. An ARP request is
+    /// consumed and spaced like a resolution solicitation, and an ARP reply
+    /// ends like an answer.
     pub fn complete_neighbor_output(
         &mut self,
         ticket: NeighborTicket,
@@ -515,13 +713,29 @@ impl Host {
         if ticket.context != self.paths.context() {
             return Err(Error::InvalidContext);
         }
-        let outcome = match outcome {
-            BackendOutcome::Submitted => ControlOutcome::Submitted,
-            BackendOutcome::Unknown => ControlOutcome::Uncertain,
-            BackendOutcome::WouldBlock | BackendOutcome::Rejected => ControlOutcome::Blocked,
-            BackendOutcome::NotSubmitted => ControlOutcome::Failed,
-        };
-        self.neighbors.complete(ticket.token, outcome, now);
+        match ticket.token {
+            Token::Nd(token) => {
+                let outcome = match outcome {
+                    BackendOutcome::Submitted => ControlOutcome::Submitted,
+                    BackendOutcome::Unknown => ControlOutcome::Uncertain,
+                    BackendOutcome::WouldBlock | BackendOutcome::Rejected => {
+                        ControlOutcome::Blocked
+                    }
+                    BackendOutcome::NotSubmitted => ControlOutcome::Failed,
+                };
+                self.neighbors.complete(token, outcome, now);
+            }
+            Token::Arp(token) => {
+                use ntcp_arp::ControlOutcome as Arp;
+                let outcome = match outcome {
+                    BackendOutcome::Submitted => Arp::Submitted,
+                    BackendOutcome::Unknown => Arp::Uncertain,
+                    BackendOutcome::WouldBlock | BackendOutcome::Rejected => Arp::Blocked,
+                    BackendOutcome::NotSubmitted => Arp::Failed,
+                };
+                self.ipv4_neighbors.complete(token, outcome, now);
+            }
+        }
         Ok(())
     }
 }
@@ -551,11 +765,24 @@ fn apply(paths: &mut PathService, event: NdEvent, report: &mut NeighborReport) {
                 _ => ntcp_path::NeighborLoss::NotRouter,
             };
             let zone = address.is_unicast_link_local().then_some(link);
-            if let Err(error) = ScopedAddress::new(IpAddr::V6(address), zone)
-                .and_then(|neighbor| paths.end_redirects(link, neighbor, loss))
-            {
-                report.first_error.get_or_insert(error.into());
-            }
+            lost(paths, link, IpAddr::V6(address), zone, loss, report);
         }
+    }
+}
+
+// A lost neighbor ends the Redirects through it. A failed IPv4 neighbor is
+// lost as an unreachable one: ARP reports no other loss.
+fn lost(
+    paths: &mut PathService,
+    link: LinkId,
+    address: IpAddr,
+    zone: Option<LinkId>,
+    loss: ntcp_path::NeighborLoss,
+    report: &mut NeighborReport,
+) {
+    if let Err(error) = ScopedAddress::new(address, zone)
+        .and_then(|neighbor| paths.end_redirects(link, neighbor, loss))
+    {
+        report.first_error.get_or_insert(error.into());
     }
 }
