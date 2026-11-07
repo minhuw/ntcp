@@ -3,7 +3,7 @@
 mod config;
 mod driver;
 mod types;
-pub use config::{Link, NetworkConfig};
+pub use config::{EthernetNextHop, Link, NetworkConfig};
 pub use types::*;
 
 use ntcp::{AddressValidation, Endpoint, EndpointError, Tuple};
@@ -70,7 +70,14 @@ pub struct Network<P: PacketIo> {
     tx: Vec<driver::TxSlot>,
     // Slots in `tx` holding a pending frame.
     tx_pending: usize,
+    // Slots in `tx` holding a frame whose next hop ARP is resolving.
+    tx_held: usize,
+    // An ARP packet was taken in since held output was last released: a
+    // resolution may have ended.
+    arp_input: bool,
     tx_cursor: usize,
+    // The one transmit slot of ARP control frames (empty without ARP).
+    control: Vec<u8>,
     rx: Vec<u8>,
     completed: Vec<u8>,
     retained: VecDeque<driver::RetainedInput>,
@@ -101,6 +108,24 @@ fn bytes(capacity: usize) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+// ARP draws each ReachableTime at random so that stations do not probe in
+// step. The draws are a keyed SipHash of a counter under std's per-process
+// random keys: unpredictable without a system call per draw, of which TCP
+// progress makes one per confirmation.
+fn entropy() -> ntcp_host::Entropy {
+    use std::hash::BuildHasher;
+    let keys = std::collections::hash_map::RandomState::new();
+    let mut counter = 0u64;
+    Box::new(move |out: &mut [u8]| {
+        for chunk in out.chunks_mut(8) {
+            counter = counter.wrapping_add(1);
+            let value = keys.hash_one(counter).to_be_bytes();
+            chunk.copy_from_slice(&value[..chunk.len()]);
+        }
+        Ok(())
+    })
+}
+
 impl<P: PacketIo> Network<P> {
     // The embedding supplies a confidential CSPRNG-generated TCP secret and
     // monotonic caller ticks in config.tcp.connection.timebase. Device/queue
@@ -116,61 +141,98 @@ impl<P: PacketIo> Network<P> {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Capacity)?;
         let local = config.local_address;
-        let (path_limits, limits) = ntcp_host::managed_limits(&config.tcp, 1, 1, 1, 1, 0)?;
+        let arp = config.arp();
+        let routes = match arp {
+            Some((_, _, Some(_))) => 2,
+            _ => 1,
+        };
+        let (path_limits, mut limits) = ntcp_host::managed_limits(&config.tcp, 1, 1, 1, routes, 0)?;
+        let owners = config
+            .tcp
+            .max_connections
+            .checked_add(1)
+            .ok_or(Error::Capacity)?;
+        if arp.is_some() {
+            // One held attempt per output lane; a reply per requester, each
+            // of which the request also adds as an entry.
+            limits.ipv4_neighbors = ntcp_host::NeighborLimits {
+                entries: config
+                    .neighbor_entries
+                    .checked_add(config.static_neighbors.len())
+                    .ok_or(Error::Capacity)?,
+                pending_packets: owners,
+                addresses: 1,
+                answers: config.neighbor_entries,
+            };
+        }
         let mut host = Host::new(
             path::ContextId::new(u128::from(instance)),
             path_limits,
             limits,
             config.tcp.connection.timebase,
         )?;
-        let ingress = host.register_link(
-            path::InterfaceKey(1),
-            config.mtu,
-            ntcp_host::ReceiveCapabilities {
-                max_ip_packet: config.mtu as usize,
-                ipv4: if local.is_ipv4() {
-                    ntcp_host::Ipv4Receive::Enabled {
-                        interpretation: false,
-                        source_routes: false,
-                    }
-                } else {
-                    ntcp_host::Ipv4Receive::Disabled
-                },
-                ipv6: if local.is_ipv6() {
-                    ntcp_host::Ipv6Receive::Extensions
-                } else {
-                    ntcp_host::Ipv6Receive::Disabled
-                },
-                gro: false,
+        let receive = ntcp_host::ReceiveCapabilities {
+            max_ip_packet: config.mtu as usize,
+            ipv4: if local.is_ipv4() {
+                ntcp_host::Ipv4Receive::Enabled {
+                    interpretation: false,
+                    source_routes: false,
+                }
+            } else {
+                ntcp_host::Ipv4Receive::Disabled
             },
-            ntcp_host::Forwarding::Forwarder(path::ForwarderId(1)),
-        )?;
-        let zone = local.is_ipv6()
-            && match local {
-                std::net::IpAddr::V6(a) => a.is_unicast_link_local(),
-                _ => false,
-            };
-        host.register_source(
-            path::ScopedAddress::new(local, zone.then_some(ingress.link()))
-                .map_err(|e| Error::Host(e.into()))?,
-            ingress.link(),
-        )?;
-        host.add_route(path::Route {
-            destination: path::IpPrefix::new(
-                if local.is_ipv4() {
-                    "0.0.0.0".parse().unwrap()
-                } else {
-                    "::".parse().unwrap()
-                },
-                0,
-            )
-            .map_err(|e| Error::Host(e.into()))?,
-            source: None,
-            dscp: None,
-            link: ingress.link(),
-            next_hop: path::NextHop::Forwarder(path::ForwarderId(1)),
-            metric: 0,
-        })?;
+            ipv6: if local.is_ipv6() {
+                ntcp_host::Ipv6Receive::Extensions
+            } else {
+                ntcp_host::Ipv6Receive::Disabled
+            },
+            gro: false,
+        };
+        let ingress = match (arp, config.link) {
+            (Some((local, prefix_len, gateway)), Link::Ethernet { local_mac, .. }) => {
+                host.set_entropy(entropy());
+                let ingress = host.register_neighbor_port(
+                    path::InterfaceKey(1),
+                    config.mtu,
+                    receive,
+                    ntcp_host::NdPort::new(local_mac),
+                )?;
+                let link = ingress.link();
+                host.add_neighbor_address(link, local)?;
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(prefix_len))
+                    .unwrap_or(0);
+                let prefix = std::net::Ipv4Addr::from(u32::from(local) & mask);
+                let gateway = gateway.map(|g| {
+                    path::NextHop::Gateway(
+                        path::ScopedAddress::new(std::net::IpAddr::V4(g), None)
+                            .expect("validated gateway"),
+                    )
+                });
+                for (prefix, prefix_len, next_hop) in [
+                    (prefix, prefix_len, Some(path::NextHop::OnLink)),
+                    (std::net::Ipv4Addr::UNSPECIFIED, 0, gateway),
+                ] {
+                    let Some(next_hop) = next_hop else {
+                        continue;
+                    };
+                    host.add_route(path::Route {
+                        destination: path::IpPrefix::new(prefix.into(), prefix_len)
+                            .map_err(|e| Error::Host(e.into()))?,
+                        source: None,
+                        dscp: None,
+                        link,
+                        next_hop,
+                        metric: 0,
+                    })?;
+                }
+                for &(address, mac) in &config.static_neighbors {
+                    host.add_static_neighbor(link, address.into(), mac, now)?;
+                }
+                ingress
+            }
+            _ => Self::fixed_link(&mut host, &config, receive)?,
+        };
         let mut endpoint =
             Endpoint::new(
                 config.tcp.clone(),
@@ -184,11 +246,6 @@ impl<P: PacketIo> Network<P> {
                 },
             )?;
         host.attach(&mut endpoint)?;
-        let owners = config
-            .tcp
-            .max_connections
-            .checked_add(1)
-            .ok_or(Error::Capacity)?;
         endpoint.enable_output_reservations_with_capacity(owners)?;
         let retained = config.retained_receive_packets.unwrap_or(owners);
         let ip_capacity = config.mtu as usize;
@@ -200,6 +257,12 @@ impl<P: PacketIo> Network<P> {
                 pending: None,
             });
         }
+        // An ARP frame: 14 octets of header and the 28-octet body, padded.
+        let control = if arp.is_some() {
+            bytes(60)?
+        } else {
+            Vec::new()
+        };
         let mut receive_free = Vec::new();
         receive_free
             .try_reserve_exact(retained)
@@ -257,7 +320,10 @@ impl<P: PacketIo> Network<P> {
             backend_clocks,
             tx,
             tx_pending: 0,
+            tx_held: 0,
+            arp_input: false,
             tx_cursor: 0,
+            control,
             // Capture an oversized physical frame safely before the Host rejects it.
             rx: bytes(65575 + 14)?,
             completed: bytes(ip_capacity)?,
@@ -269,6 +335,48 @@ impl<P: PacketIo> Network<P> {
             failure: None,
         })
     }
+    // A link whose fixed MAC or L3 endpoint is the forwarder of every
+    // destination: the owned address and a default route through it.
+    fn fixed_link(
+        host: &mut Host,
+        config: &NetworkConfig,
+        receive: ntcp_host::ReceiveCapabilities,
+    ) -> Result<IngressContext> {
+        let local = config.local_address;
+        let ingress = host.register_link(
+            path::InterfaceKey(1),
+            config.mtu,
+            receive,
+            ntcp_host::Forwarding::Forwarder(path::ForwarderId(1)),
+        )?;
+        let zone = local.is_ipv6()
+            && match local {
+                std::net::IpAddr::V6(a) => a.is_unicast_link_local(),
+                _ => false,
+            };
+        host.register_source(
+            path::ScopedAddress::new(local, zone.then_some(ingress.link()))
+                .map_err(|e| Error::Host(e.into()))?,
+            ingress.link(),
+        )?;
+        host.add_route(path::Route {
+            destination: path::IpPrefix::new(
+                if local.is_ipv4() {
+                    "0.0.0.0".parse().unwrap()
+                } else {
+                    "::".parse().unwrap()
+                },
+                0,
+            )
+            .map_err(|e| Error::Host(e.into()))?,
+            source: None,
+            dscp: None,
+            link: ingress.link(),
+            next_hop: path::NextHop::Forwarder(path::ForwarderId(1)),
+            metric: 0,
+        })?;
+        Ok(ingress)
+    }
     pub fn config(&self) -> &NetworkConfig {
         &self.config
     }
@@ -278,6 +386,7 @@ impl<P: PacketIo> Network<P> {
     pub fn counters(&self) -> Counters {
         Counters {
             retained_input: self.retained.len(),
+            resolution_failures: self.host.arp_counters().resolution_failures,
             ..self.counters
         }
     }

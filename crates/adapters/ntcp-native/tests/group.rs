@@ -101,7 +101,7 @@ fn config(address: IpAddr, ethernet: bool, side: u8) -> NetworkConfig {
     if ethernet {
         config.link = Link::Ethernet {
             local_mac: [2, 0, 0, 0, 0, side],
-            next_hop_mac: [2, 0, 0, 0, 0, 3 - side],
+            next_hop: EthernetNextHop::Fixed([2, 0, 0, 0, 0, 3 - side]),
         };
     }
     config

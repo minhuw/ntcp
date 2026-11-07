@@ -4532,6 +4532,23 @@ impl Endpoint {
             || !self.control.is_empty()
             || !self.cleanup.is_empty()
     }
+    /// Output waiting to be polled, apart from attempts held in output
+    /// reservations: an embedding that keeps a reserved attempt waiting on
+    /// an event of its own (a next hop being resolved) has no work to poll
+    /// for while this is false.
+    pub fn has_queued_output(&self) -> bool {
+        let lane_free = |owner| {
+            self.reservation_of(owner).is_none_or(|index| {
+                self.reservations[index]
+                    .current
+                    .as_ref()
+                    .is_some_and(|r| r.attempt.is_none())
+            })
+        };
+        self.ready_connections().next().is_some()
+            || !self.control.is_empty() && lane_free(None)
+            || !self.cleanup.is_empty()
+    }
     pub fn buffer_bytes(&self) -> usize {
         self.buffer_bytes
     }

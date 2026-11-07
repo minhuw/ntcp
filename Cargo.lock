@@ -236,6 +236,7 @@ name = "ntcp-native"
 version = "0.0.1"
 dependencies = [
  "ntcp",
+ "ntcp-arp",
  "ntcp-ethernet",
  "ntcp-host",
  "ntcp-io",

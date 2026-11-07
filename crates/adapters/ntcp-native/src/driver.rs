@@ -1,7 +1,7 @@
 use super::*;
 use ntcp_host::{
-    BackendOutcome, DeferredIcmp, EgressContext, IcmpDispatch, Processed, ProcessedEnvelope,
-    Received, Submission, SubmissionTicket,
+    Advice, BackendOutcome, DeferredIcmp, EgressContext, IcmpDispatch, NeighborHop, NeighborWake,
+    Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
     ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, TimestampUnit, TxOutcome,
@@ -13,6 +13,9 @@ pub(super) struct PendingFrame {
     context: Option<EgressContext>,
     ticket: Option<SubmissionTicket>,
     ip_len: usize,
+    // Waiting while ARP resolves its next hop: not retried before the
+    // Host's wake, and no backend backpressure.
+    held: bool,
 }
 pub(super) struct TxSlot {
     pub bytes: Vec<u8>,
@@ -160,7 +163,11 @@ impl<P: PacketIo> Network<P> {
                         frame.payload
                     }
                     Err(_) => {
-                        report.discarded += 1;
+                        // ARP rides its own EtherType, which the IP parser
+                        // refuses.
+                        if self.control.is_empty() || !self.arp_input(&rx[..packet.len]) {
+                            report.discarded += 1;
+                        }
                         continue;
                     }
                 }
@@ -178,13 +185,23 @@ impl<P: PacketIo> Network<P> {
         if !self.retained.is_empty() {
             report.more_work = true;
         }
+        // Control frames due now take at most half the transmit budget,
+        // rounded up, before data, so data cannot starve them nor they data.
+        let mut control = 0;
+        if !self.control.is_empty() {
+            self.service_neighbors(now)?;
+            control = self.control_output(now, budget.transmit.div_ceil(2), report)?;
+        }
+        let mut data = 0;
         // Once the endpoint offers nothing and no slot holds a frame to retry,
-        // further polls at this instant cannot transmit anything.
+        // further polls at this instant cannot transmit anything. A held
+        // frame is not retried before its wake.
         let mut exhausted = false;
-        for _ in 0..budget.transmit {
-            if exhausted && self.tx_pending == 0 {
+        for _ in control..budget.transmit {
+            if exhausted && self.tx_pending == 0 || self.tx_held == self.tx.len() {
                 break;
             }
+            data += 1;
             let index = self.tx_cursor;
             self.tx_cursor = (index + 1) % self.tx.len();
             let mut slot = std::mem::replace(
@@ -195,17 +212,24 @@ impl<P: PacketIo> Network<P> {
                 },
             );
             let was_pending = slot.pending.is_some();
+            let was_held = slot.pending.as_ref().is_some_and(|p| p.held);
             let result = self.transmit_slot(&mut slot, report);
             let still_pending = slot.pending.is_some();
+            let still_held = slot.pending.as_ref().is_some_and(|p| p.held);
             self.tx[index] = slot;
-            match (was_pending, still_pending) {
-                (false, true) => self.tx_pending += 1,
-                (true, false) => self.tx_pending -= 1,
-                _ => {}
-            }
+            // Only frames to retry count as pending.
+            self.tx_pending += usize::from(still_pending && !still_held);
+            self.tx_pending -= usize::from(was_pending && !was_held);
+            self.tx_held += usize::from(still_held);
+            self.tx_held -= usize::from(was_held);
             // A settled retry may release output, so poll again after it.
             let idle = result?;
             exhausted = idle || exhausted && was_pending && still_pending;
+        }
+        // Requests for next hops data output just began resolving, within
+        // what is left.
+        if !self.control.is_empty() {
+            self.control_output(now, budget.transmit - control - data, report)?;
         }
         if budget.reclaim != 0 {
             report.reclaimed = self
@@ -222,13 +246,166 @@ impl<P: PacketIo> Network<P> {
             .into_iter()
             .chain(self.host.next_reassembly_deadline())
             .min();
+        if !self.control.is_empty()
+            && let Some(at) = self.host.next_neighbor_deadline()
+        {
+            report.next_deadline = Some(report.next_deadline.map_or(at, |d| d.min(at)));
+        }
         debug_assert_eq!(
             self.tx_pending,
-            self.tx.iter().filter(|s| s.pending.is_some()).count()
+            self.tx
+                .iter()
+                .filter(|s| s.pending.as_ref().is_some_and(|p| !p.held))
+                .count()
+        );
+        debug_assert_eq!(
+            self.tx_held,
+            self.tx
+                .iter()
+                .filter(|s| s.pending.as_ref().is_some_and(|p| p.held))
+                .count()
         );
         report.tx_blocked |= self.tx_pending != 0;
-        if self.endpoint.has_pending_output() {
+        // A held frame's reservation waits for its wake, not for a poll.
+        if if self.tx_held == 0 {
+            self.endpoint.has_pending_output()
+        } else {
+            self.tx_pending != 0 || self.endpoint.has_queued_output()
+        } {
             report.more_work = true;
+        }
+        Ok(())
+    }
+    // An ARP frame addressed to this port or to broadcast, for the Host's
+    // ARP; frames to other stations are not this port's to learn from.
+    fn arp_input(&mut self, bytes: &[u8]) -> bool {
+        let Link::Ethernet { local_mac, .. } = self.config.link else {
+            return false;
+        };
+        let Ok(frame) = ntcp_ethernet::parse_ethernet_arp(bytes) else {
+            return false;
+        };
+        if frame.destination != local_mac && frame.destination != ntcp_ethernet::BROADCAST {
+            return false;
+        }
+        self.counters.arp_received += 1;
+        let taken = self
+            .host
+            .receive_arp(self.ingress, self.now, frame.payload)
+            .is_ok();
+        self.arp_input |= taken;
+        taken
+    }
+    // ARP's due timers, then held frames whose resolution ended.
+    fn service_neighbors(&mut self, now: Instant) -> Result<()> {
+        let due = self
+            .host
+            .next_neighbor_deadline()
+            .is_some_and(|at| at <= now);
+        if due {
+            self.host.service_neighbors(now);
+        }
+        // A resolution ends only on ARP input or a timer. Its wakes are
+        // taken then even when no frame is held: the held records of
+        // frames given up meanwhile must not keep their slots in the held
+        // table, which would refuse every later resolution.
+        if self.tx_held == 0 && !due && !std::mem::take(&mut self.arp_input) {
+            return Ok(());
+        }
+        self.arp_input = false;
+        self.release_resolved()
+    }
+    // Up to `limit` due ARP control frames (replies, requests, probes)
+    // through their own slot; returns how many were tried.
+    fn control_output(
+        &mut self,
+        now: Instant,
+        limit: usize,
+        report: &mut DriveReport,
+    ) -> Result<usize> {
+        let Link::Ethernet { local_mac, .. } = self.config.link else {
+            return Ok(0);
+        };
+        let link = self.ingress.link();
+        let mut used = 0;
+        while used < limit {
+            let Some(transmit) = self
+                .host
+                .neighbor_output(link, now, &mut self.control[14..])?
+            else {
+                break;
+            };
+            used += 1;
+            let end = 14 + transmit.len;
+            self.control[..6].copy_from_slice(&transmit.destination);
+            self.control[6..12].copy_from_slice(&local_mac);
+            self.control[12..14].copy_from_slice(&transmit.ethertype.to_be_bytes());
+            self.control[end..].fill(0);
+            let mut failure = None;
+            let outcome = match self.io.transmit(&self.control) {
+                Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
+                Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => BackendOutcome::WouldBlock,
+                Err(error) => {
+                    failure = Some(error);
+                    BackendOutcome::Unknown
+                }
+            };
+            self.host
+                .complete_neighbor_output(transmit.ticket, outcome, now)?;
+            match outcome {
+                BackendOutcome::Submitted => {
+                    report.transmitted += 1;
+                    self.counters.arp_sent += 1;
+                }
+                BackendOutcome::WouldBlock => {
+                    report.tx_blocked = true;
+                    self.counters.backend_backpressure += 1;
+                    break;
+                }
+                _ => return Err(Error::Backend(failure.unwrap())),
+            }
+        }
+        Ok(used)
+    }
+    // Held frames whose resolution ended. A resolved one is retried by the
+    // transmit loop, which resolves it again. A failed one was certainly
+    // never submitted: as ntcp-socket does for Neighbor Discovery, the
+    // Endpoint withdraws it without a departure, records the Address
+    // Unreachable advice as the connection's soft error and retries
+    // retransmittable output on its own clock, no earlier than the RTO.
+    fn release_resolved(&mut self) -> Result<()> {
+        while let Some(wake) = self.host.neighbor_wake() {
+            let (attempt, advice) = match wake {
+                NeighborWake::Retry { attempt, .. } => (attempt, None),
+                NeighborWake::Unreachable {
+                    attempt, advice, ..
+                } => (attempt, Some(advice)),
+            };
+            // A frame given up meanwhile (its connection aborted) is gone.
+            let Some(index) = self.tx.iter().position(|s| {
+                s.pending
+                    .as_ref()
+                    .is_some_and(|p| p.held && p.attempt == attempt)
+            }) else {
+                continue;
+            };
+            self.tx_held -= 1;
+            let slot = &mut self.tx[index];
+            match advice {
+                None => {
+                    slot.pending.as_mut().unwrap().held = false;
+                    self.tx_pending += 1;
+                }
+                Some(advice) => {
+                    slot.pending = None;
+                    let error = match advice {
+                        Advice::NetworkError(error) => Some(error),
+                        Advice::PacketTooBig { .. } => None,
+                    };
+                    self.endpoint
+                        .discard_unsubmitted(self.now, attempt, error)?;
+                }
+            }
         }
         Ok(())
     }
@@ -391,9 +568,19 @@ impl<P: PacketIo> Network<P> {
                 }
                 Err(e) => return Err(e.into()),
             };
-            report.more_work |= poll.more_work;
+            // Held frames' reservations are not output to poll for. On a
+            // resolving link the poll's view, taken before its packet may
+            // be held, is left to the drive's final account.
+            let more_work = if self.tx_held == 0 {
+                poll.more_work
+            } else {
+                self.tx_pending != 0 || self.endpoint.has_queued_output()
+            };
+            if poll.packet.is_none() || self.control.is_empty() {
+                report.more_work |= more_work;
+            }
             let Some(packet) = poll.packet else {
-                return Ok(!poll.more_work);
+                return Ok(!more_work);
             };
             let attempt = attempt.ok_or(Error::InvalidHandle)?;
             let ip_len = if packet.ip.source.is_ipv4() {
@@ -404,10 +591,13 @@ impl<P: PacketIo> Network<P> {
             .map_err(|e| Error::Host(e.into()))?;
             if let Link::Ethernet {
                 local_mac,
-                next_hop_mac,
+                next_hop,
             } = self.config.link
             {
-                slot.bytes[..6].copy_from_slice(&next_hop_mac);
+                // An ARP-resolved destination is written once resolved.
+                if let EthernetNextHop::Fixed(next_hop_mac) = next_hop {
+                    slot.bytes[..6].copy_from_slice(&next_hop_mac);
+                }
                 slot.bytes[6..12].copy_from_slice(&local_mac);
                 slot.bytes[12..14].copy_from_slice(
                     &(if packet.ip.source.is_ipv4() {
@@ -428,9 +618,13 @@ impl<P: PacketIo> Network<P> {
                 context: None,
                 ticket: None,
                 ip_len,
+                held: false,
             });
         }
         let pending = slot.pending.as_mut().unwrap();
+        if pending.held {
+            return Ok(false);
+        }
         let context = match pending.context {
             Some(context) => context,
             None => match self
@@ -454,6 +648,27 @@ impl<P: PacketIo> Network<P> {
                 Err(error) => return Err(error.into()),
             },
         };
+        // The next hop is resolved before each new ticket; a blocked frame
+        // keeps its ticket and the destination resolved for it.
+        if pending.ticket.is_none() && !self.control.is_empty() {
+            let owner = pending.owner.map_or(Owner::Stateless, Owner::Tcp);
+            match self.host.resolve_neighbor(context, owner, self.now) {
+                Ok(NeighborHop::Resolved(mac)) => slot.bytes[..6].copy_from_slice(&mac),
+                Ok(NeighborHop::Held) => {
+                    pending.held = true;
+                    return Ok(false);
+                }
+                // No neighbor entry or held record is free: the attempt is
+                // withdrawn unsubmitted, retried on TCP's own clock.
+                Err(ntcp_host::Error::Capacity) => {
+                    self.endpoint
+                        .discard_unsubmitted(self.now, pending.attempt, None)?;
+                    slot.pending = None;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         let ticket = match pending.ticket.take() {
             Some(ticket) => ticket,
             None => self.host.submission_ticket(&mut self.endpoint, context)?,
@@ -541,11 +756,15 @@ impl<P: PacketIo> Network<P> {
                 continue;
             }
             if abort {
-                if self.tx_pending != 0 {
+                if self.tx_pending != 0 || self.tx_held != 0 {
                     for slot in &mut self.tx {
                         if slot.pending.as_ref().is_some_and(|p| p.owner == Some(core)) {
                             let pending = slot.pending.take().unwrap();
-                            self.tx_pending -= 1;
+                            if pending.held {
+                                self.tx_held -= 1;
+                            } else {
+                                self.tx_pending -= 1;
+                            }
                             if let Some(ticket) = pending.ticket {
                                 self.host.cancel_submission(ticket);
                             }

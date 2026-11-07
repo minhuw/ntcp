@@ -209,4 +209,9 @@ pub struct Counters {
     pub backend_backpressure: u64,
     pub timestamp_metadata_lost: u64,
     pub retained_input: usize,
+    // ARP frames accepted (to this port's MAC or broadcast) and submitted.
+    pub arp_received: u64,
+    pub arp_sent: u64,
+    // ARP resolutions and unreachability probes that failed.
+    pub resolution_failures: u64,
 }
