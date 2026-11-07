@@ -90,7 +90,7 @@ class TimeWaitPersistInventories(unittest.TestCase):
             "bilateral-definition": "covered", "fin-definition": "covered",
             "paws-monotonic": "covered", "processing-boundary": "covered",
             "stale-ts-fallback": "covered", "isn-independence": "covered",
-            "boot-quiet-time": "covered",
+            "boot-quiet-time": "exception",
         }
         self.assertEqual({key: r["status"] for key, r in rows.items() if r["status"] != "context"}, expected)
         self.assertEqual(rows["otherwise-drop"]["branches"],
@@ -106,8 +106,8 @@ class TimeWaitPersistInventories(unittest.TestCase):
         self.assertIn("strict serial comparison is against FIN itself", rows["fin-definition"]["reason"])
         self.assertTrue(any("rfc6191_sequence_reuse_uses_peer_fin_serial_frontier" in e
                             for e in rows["fin-definition"]["evidence"]))
-        # T20 closes the PAWS prerequisite, the processing boundary and the
-        # boot quiet time, each with its whole quote and a source/test pair.
+        # T20 closes the PAWS prerequisite and the processing boundary, each
+        # with its whole quote and a source/test pair.
         for key, (facts, evidence) in {
             "paws-monotonic": (
                 ("CLOCK_BOOTTIME provider", "rejects decreasing samples", "Endpoint::check_clock",
@@ -119,23 +119,25 @@ class TimeWaitPersistInventories(unittest.TestCase):
                  "timestamp and sequence variants"),
                 ["crates/stacks/ntcp/src/endpoint.rs::if self.config.reuse_time_wait",
                  "crates/stacks/ntcp/src/endpoint_time_wait_tests.rs::fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags()"]),
-            "boot-quiet-time": (
-                ("host boot + 2*MSL", "configured MSL", "restart floor", "host uptime alone never removes",
-                 "RST included", "quiet.py"),
-                ["crates/stacks/ntcp/src/lifecycle.rs::pub fn deadline(",
-                 "crates/stacks/ntcp/src/endpoint_lifecycle_tests.rs::fn each_active_factory_is_refused_before_the_deadline_and_admitted_at_it()"]),
         }.items():
             with self.subTest(clause=key):
                 for fact in facts:
                     self.assertIn(fact, rows[key]["reason"])
                 self.assertNotIn("T20", rows[key]["reason"])
                 self.assertEqual(rows[key]["evidence"], evidence)
-        self.assertIn("2*MSL", rows["boot-quiet-time"]["quote"])
-        # The quiet time also has native socket evidence, and monotonicity the
-        # provider's own decreasing-sample tests.
+        # The boot quiet time is a deliberate Linux-compatible deviation: no
+        # evidence is claimed and no source or test annotation cites it.
+        quiet = rows["boot-quiet-time"]
+        self.assertIn("2*MSL", quiet["quote"])
+        self.assertNotIn("evidence", quiet)
+        for fact in ("Linux-compatible", "no startup quiet time", "no earlier incarnation",
+                     "RFC 9293 section 3.4.1", "timestamp offsets (PAWS)", "TIME-WAIT"):
+            self.assertIn(fact, quiet["reason"])
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                self.assertNotEqual(audit.clause_key(annotation), audit.clause_key(quiet), str(path))
+        # Monotonicity also has the provider's own decreasing-sample tests.
         for path, anchor, key in (
-            ("crates/adapters/ntcp-socket/src/runtime_quiet_tests.rs",
-             "fn listeners_work_and_premature_syns_draw_nothing()", "boot-quiet-time"),
             ("crates/adapters/ntcp-clock/src/transport_tests.rs",
              "fn decreasing_samples_are_rejected_and_the_reference_stays()", "paws-monotonic"),
         ):

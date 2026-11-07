@@ -233,8 +233,8 @@ fn reopened_data_syn_completes_with_real_peer_without_replay_or_double_delivery(
         cfg.connection.timestamps = true;
         cfg.reuse_time_wait = true;
         let (local, remote) = addresses();
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
         a.enable_fast_open().unwrap();
         b.enable_fast_open().unwrap();
         let listener = b.listen(remote, 4).unwrap();
@@ -388,8 +388,8 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
             source: local.ip(),
             destination: remote.ip(),
         };
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
         let listener = (scenario != 0).then(|| b.listen(remote, 4).unwrap());
         let mut expected = None;
         if scenario == 2 {
@@ -524,8 +524,8 @@ fn reuse_toggle_preserves_non_time_wait_states_and_non_request_flags() {
             cfg.reuse_time_wait = reuse;
             // The shared fixture enables reuse; create ordinary closing peers here.
             let (local, remote) = addresses();
-            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
-            let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
+            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+            let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
             let listener = b.listen(remote, 4).unwrap();
             let client = a.connect(0, local, remote).unwrap();
             pump(&mut a, &mut b, 1_000);
@@ -599,8 +599,8 @@ fn timestamps_sent_on_a_connection_and_its_reincarnation_never_decrease() {
         source: local.ip(),
         destination: remote.ip(),
     };
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     let mut sent = Vec::new();

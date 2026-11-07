@@ -547,7 +547,7 @@ fn segment_route_setting_is_validated_and_installed() {
 
     let config = runtime_config(&Backend::default(), v6, true, true, false).unwrap();
     let mut endpoint =
-        Endpoint::new(config.clone(), [7; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, Box::new(tun_v6_policy("2001:db8::1".parse().unwrap())))
+        Endpoint::new(config.clone(), [7; 32], 0, Box::new(tun_v6_policy("2001:db8::1".parse().unwrap())))
             .unwrap();
     let mut network = TunHost::attach_routed(
         &mut endpoint,
@@ -635,7 +635,7 @@ fn udp_and_echo_replies_over_a_segment_route_carry_the_srh() {
         quiet: SourceQuiet::Never,
         ..DatagramSettings::default()
     }] {
-        let mut a = Endpoint::new(config.clone(), [7; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
+        let mut a = Endpoint::new(config.clone(), [7; 32], 0,
             Box::new(tun_v6_policy("2001:db8::1".parse().unwrap()))).unwrap();
         let mut ahost =
             TunHost::attach_routed(&mut a, &config, local.ip(), &settings, &routes, 0, 1).unwrap();

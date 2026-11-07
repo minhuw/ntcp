@@ -76,11 +76,6 @@ impl CallerTimebase {
         ticks / (self.units_per_second / 1_000_000)
     }
 
-    // 2*MSL in caller ticks, the TIME-WAIT floor and the lifecycle quiet time.
-    pub(crate) fn quiet_interval(self) -> u64 {
-        self.ticks_from_us(self.max_segment_lifetime_us.saturating_mul(2))
-    }
-
     pub(crate) fn valid(self) -> bool {
         matches!(self.units_per_second, 1_000_000 | 1_000_000_000)
             && (1..=255_000_000).contains(&self.max_segment_lifetime_us)

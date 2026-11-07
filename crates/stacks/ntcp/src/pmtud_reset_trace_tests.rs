@@ -88,7 +88,6 @@ impl Trace {
             },
             [2; 32],
             0,
-            crate::SETTLED,
             |_| true,
         )
         .unwrap();

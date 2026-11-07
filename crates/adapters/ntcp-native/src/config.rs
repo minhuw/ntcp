@@ -30,10 +30,6 @@ pub struct NetworkConfig {
     pub timestamp_clock_capacity: usize,
     // None derives one receive-retention slot per output owner.
     pub retained_receive_packets: Option<usize>,
-    // What the caller knows about the host boot and earlier emission from
-    // `local_address`, in its own clock's ticks. The default asserts nothing:
-    // no TCP connection is admitted until 2*MSL after the network starts.
-    pub lifecycle: ntcp::Lifecycle,
 }
 impl NetworkConfig {
     pub fn new(local_address: IpAddr, mtu: u32) -> Self {
@@ -48,7 +44,6 @@ impl NetworkConfig {
             rx_timestamp_ranges: 0,
             timestamp_clock_capacity: 2,
             retained_receive_packets: None,
-            lifecycle: ntcp::Lifecycle::default(),
         }
     }
     pub(crate) fn validate(&self, io: &impl PacketIo) -> Result<()> {

@@ -1,0 +1,9 @@
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1"
+reason = "Deliberate Linux-compatible deviation: no startup quiet time. As Linux does after a reboot, a newly started Endpoint assumes no earlier incarnation and admits connections at once; it relies on RFC 9293 section 3.4.1 secret-keyed clock ISNs (an HMAC of the tuple under a per-Endpoint secret plus a 4 us clock), per-connection timestamp offsets (PAWS) and TIME-WAIT for the connections it closed."
+quote = """
+Firstly, as specified in [RFC0793], hosts must not establish new
+connections for a period of 2*MSL (Maximum Segment Lifetime) after they
+boot (this is the "quiet time" concept). As a result, in terms of
+specifications, this scenario should never occur.
+"""

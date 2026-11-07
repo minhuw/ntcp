@@ -15,7 +15,7 @@ fn client() -> (Endpoint, ActiveOpenOptions) {
         ..Default::default()
     };
     let options = ActiveOpenOptions::from(&config.connection);
-    let mut a = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let mut a = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
     a.enable_fast_open().unwrap();
     (a, options)
 }
@@ -101,7 +101,7 @@ fn cold_admission_modes_complete_stream_and_use_learned_mss() {
                 let mut cfg = EndpointConfig::default();
                 cfg.connection.mss = 940;
                 cfg.connection.nagle = false;
-                let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let mut b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
                 b.enable_fast_open().unwrap();
                 let listener = b.listen(remote, 8).unwrap();
                 b.set_listener_fast_open(listener, 4).unwrap();
@@ -218,7 +218,7 @@ fn absent_synack_mss_keeps_cookie_supplied_and_protected_admission_cold() {
                 cfg.connection.mss = 940;
                 cfg.connection.timestamps = false;
                 cfg.connection.nagle = false;
-                let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let mut b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
                 b.enable_fast_open().unwrap();
                 let listener = b.listen(remote, 8).unwrap();
                 b.set_listener_fast_open(listener, 4).unwrap();
@@ -356,7 +356,7 @@ fn cold_and_learned_admission_obey_independent_resource_and_path_bounds() {
                         send_capacity: capacity,
                         ..ActiveOpenOptions::from(&cfg.connection)
                     };
-                    let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+                    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
                     a.enable_fast_open().unwrap();
                     if reserved {
                         a.enable_output_reservations().unwrap();

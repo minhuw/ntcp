@@ -28,28 +28,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
     let mut config = NetworkConfig::new(local, 1500);
     config.tcp.max_connections = 4;
-    // TCP admission waits for the quiet time (2*MSL after host boot and after
-    // earlier emission from LOCAL_IP). Boot age comes from CLOCK_BOOTTIME;
-    // NTCP_SOURCE_QUIET=SECONDS|never states when emission from LOCAL_IP
-    // ceased (never: a newly created address). Unset waits the full 2*MSL.
-    let boot_age = {
-        let mut clock = ntcp_clock::TransportClock::new()?;
-        let ticks = clock.sample()?.ticks;
-        clock.boot_age(ticks)?
-    };
-    let continuity = match std::env::var("NTCP_SOURCE_QUIET").ok().as_deref() {
-        None => ntcp::SourceContinuity::Unknown,
-        Some("never") => ntcp::SourceContinuity::Never,
-        Some(seconds) => ntcp::SourceContinuity::CeasedFor(
-            seconds
-                .parse()
-                .map_err(|_| "NTCP_SOURCE_QUIET must be whole seconds or never")?,
-        ),
-    };
-    config.lifecycle = ntcp::Lifecycle {
-        boot_age: Some(boot_age),
-        continuity,
-    };
     let mut network = Network::new(config, Tun::open(&args[1])?, secret, 0)?;
     let mut requests = Vec::new();
     for seed in 0..4 {

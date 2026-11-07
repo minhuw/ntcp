@@ -92,11 +92,6 @@ fn wires(layer: PacketLayer) -> (Wire, Wire) {
 }
 fn config(address: IpAddr, ethernet: bool, side: u8) -> NetworkConfig {
     let mut config = NetworkConfig::new(address, 1500);
-    // The simulated link and its addresses exist only for this test.
-    config.lifecycle = ntcp::Lifecycle {
-        boot_age: Some(u64::MAX),
-        continuity: ntcp::SourceContinuity::Never,
-    };
     config.tcp.max_connections = 8;
     config.tcp.max_listeners = 2;
     config.tcp.connection.send_capacity = 256;

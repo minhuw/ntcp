@@ -74,7 +74,6 @@ fn endpoint_with_reuse(c: ConnectionConfig, secret: u8, reuse_time_wait: bool) -
         },
         [secret; 32],
         0,
-        ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
         |_| true,
     )
     .unwrap()

@@ -97,75 +97,9 @@ fn endpoint_with_settings(
         IpAddr::V4(ip) => Box::new(tun_address_policy(ip, (ip, 24))),
         IpAddr::V6(ip) => Box::new(tun_v6_policy(ip)),
     };
-    let mut endpoint = Endpoint::new(config.clone(), [7; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, policy).unwrap();
+    let mut endpoint = Endpoint::new(config.clone(), [7; 32], 0, policy).unwrap();
     let network = TunHost::attach_with(&mut endpoint, &config, local, settings, 0).unwrap();
     (endpoint, network)
-}
-
-// run()'s listener and active open with nothing stated: simulated time, the
-// logic of the slow start and no evidence about a physical clock.
-#[test]
-fn premature_syn_is_dropped_and_the_active_open_waits_for_the_deadline() {
-    const QUIET: u64 = 240_000_000;
-    for v6 in [false, true] {
-        let (local, remote) = addresses(v6);
-        let settings = DatagramSettings::default();
-        assert_eq!(settings.continuity_fact(), ntcp::SourceContinuity::Unknown);
-        let lifecycle = ntcp::Lifecycle {
-            boot_age: Some(u64::MAX),
-            continuity: settings.continuity_fact(),
-        };
-        let config = runtime_config(&Backend::default(), local.ip(), false, true, false).unwrap();
-        let policy: Box<dyn Fn(AddressValidation) -> bool> = match local.ip() {
-            IpAddr::V4(ip) => Box::new(tun_address_policy(ip, (ip, 24))),
-            IpAddr::V6(ip) => Box::new(tun_v6_policy(ip)),
-        };
-        let mut a = Endpoint::new(config.clone(), [7; 32], 0, lifecycle, policy).unwrap();
-        let mut ahost = TunHost::attach_with(&mut a, &config, local.ip(), &settings, 0).unwrap();
-        let listener = a.listen(local, MAX_FLOWS).unwrap();
-        let (mut b, mut bhost) = endpoint(remote.ip(), false);
-        let options = ntcp::ManagedOpenOptions {
-            transport: ntcp::ActiveOpenOptions::from(&config.connection),
-            dscp: config.dscp,
-            ipv4_options: Default::default(),
-            registration: None,
-            receive_authority: None,
-        };
-        b.connect_with_path_provider(1, remote, local, options, &mut bhost.host)
-            .unwrap();
-        let syn = emit(&mut bhost, &mut b, 1, local.ip());
-        assert_eq!(syn.len(), 1);
-
-        let mut peer = Some(remote);
-        let mut flows = Vec::new();
-        input_frame(&mut ahost, &mut a, QUIET - 1, &syn[0], local.ip(), false, &mut Sample(0)).unwrap();
-        open_when_admitted(&mut ahost, &mut a, QUIET - 1, local, &mut peer, options, &mut flows).unwrap();
-        assert!(emit(&mut ahost, &mut a, QUIET - 1, remote.ip()).is_empty());
-        assert_eq!(a.listener_queue_info(listener).unwrap().0, 0);
-        assert_eq!((peer, flows.len()), (Some(remote), 0));
-
-        open_when_admitted(&mut ahost, &mut a, QUIET, local, &mut peer, options, &mut flows).unwrap();
-        assert_eq!((peer, flows.len()), (None, 1));
-        let opened = emit(&mut ahost, &mut a, QUIET, remote.ip());
-        assert_eq!(opened.len(), 1);
-        let flags = segment(&opened[0]).header.flags;
-        assert_eq!(flags & (ntcp::wire::SYN | ntcp::wire::ACK), ntcp::wire::SYN);
-        open_when_admitted(&mut ahost, &mut a, QUIET, local, &mut peer, options, &mut flows).unwrap();
-        assert_eq!(flows.len(), 1);
-    }
-}
-
-#[test]
-fn the_source_quiet_setting_states_the_lifecycle_fact() {
-    let local = addresses(false).0.ip();
-    for (value, fact) in [
-        (None, ntcp::SourceContinuity::Unknown),
-        (Some("never"), ntcp::SourceContinuity::Never),
-        (Some("30"), ntcp::SourceContinuity::CeasedFor(30)),
-    ] {
-        let settings = DatagramSettings::parse(local, None, None, None, value).unwrap();
-        assert_eq!(settings.continuity_fact(), fact);
-    }
 }
 
 // These assertions use the same constructor, dispatcher and output loop as run.
@@ -1239,7 +1173,6 @@ fn stale_registration_route_terminates_the_flow() {
         cfg.clone(),
         [9; 32],
         0,
-        ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
         tun_address_policy(
             "192.0.2.1".parse().unwrap(),
             ("192.0.2.1".parse().unwrap(), 24),
@@ -1324,7 +1257,6 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
         cfg.clone(),
         [9; 32],
         0,
-        ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
         tun_address_policy(
             "192.0.2.1".parse().unwrap(),
             ("192.0.2.1".parse().unwrap(), 24),
@@ -1709,7 +1641,7 @@ fn routed_placement_survives_a_failed_ticket() {
     cfg.connection.nagle = false;
     cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
     cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
-    let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(a)).unwrap();
+    let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
     let mut host = TunHost::attach_routed(
         &mut client,
         &cfg,

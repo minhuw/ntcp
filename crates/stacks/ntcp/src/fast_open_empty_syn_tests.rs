@@ -25,7 +25,7 @@ fn server_with_service(
         },
         ..EndpointConfig::default()
     };
-    let mut endpoint = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
     if service {
         endpoint.enable_fast_open().unwrap();
     }

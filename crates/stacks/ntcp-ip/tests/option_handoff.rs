@@ -32,8 +32,8 @@ fn checksummed_frames_carry_opaque_options_through_tcp_handshake_and_data() {
                 ipv4_options_enabled: enabled,
                 ..Default::default()
             };
-            let mut client = Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
-            let mut server = Endpoint::new(config, [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+            let mut client = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+            let mut server = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
             let local = "192.0.2.1:1234".parse().unwrap();
             let remote = "192.0.2.2:8080".parse().unwrap();
             let listener = server.listen(remote, 1).unwrap();

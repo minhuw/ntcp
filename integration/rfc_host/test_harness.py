@@ -19,7 +19,6 @@ import icmp
 import mss
 import ndproxy
 import options
-import quiet
 import redirect
 import rejected
 import run
@@ -677,109 +676,7 @@ class SegmentRouting(unittest.TestCase):
         self.assertEqual(str(ipaddress.ip_address(datagram["raw"][24:40])), self.S1)
 
 
-class QuietTimeCase(unittest.TestCase):
-    """The quiet-time case's matrix pin and its capture verdict."""
-    EARLIEST, LATEST = 12_000_000, 12_010_000
-
-    def event(self, direction, at_us, flags, sport, dport, seq=100, ack=0):
-        return dict(direction=direction, time_ns=at_us * 1000, flags=flags, sport=sport, dport=dport,
-                    seq=seq, ack=ack, checksum_valid=True)
-
-    def capture(self):
-        linux = [self.event("kernel-to-native", us, 2, 40000, 18080) for us in (100_000, 1_100_000, 3_100_000, 19_100_000)]
-        native = [self.event("native-to-kernel", 12_000_500, 2, 50000, 18080, seq=7),
-                  self.event("native-to-kernel", 19_100_500, 0x12, 18080, 40000, seq=9, ack=101)]
-        return linux[:3] + native[:1] + linux[3:] + native[1:]
-
-    def judge(self, events):
-        return quiet.judge(events, 0, self.EARLIEST, self.LATEST)
-
-    def test_cases_are_pinned_and_disjoint(self):
-        cases = quiet.cases()
-        self.assertEqual({(c["kind"], c["family"], c["scenario"], c["source_quiet"]) for c in cases},
-                         {("quiet-time", 4, "startup", 228), ("quiet-time", 6, "startup", 228)})
-        others = run.matrix() + icmp.cases() + admin.cases() + options.cases() + rejected.cases()
-        self.assertFalse(any(c in others for c in cases))
-
-    def test_case_without_inherited_proof_cannot_reach_setup(self):
-        for case in quiet.cases():
-            with patch.dict(os.environ, {}, clear=True), patch.object(run, "setup") as setup:
-                with self.assertRaises(KeyError):
-                    run.child(case)
-            setup.assert_not_called()
-
-    def test_configuration_states_the_weaker_fact_through_the_production_keys(self):
-        for family in (4, 6):
-            text = quiet.config(family, 228)
-            self.assertIn("io.source_quiet = 228", text)
-            self.assertIn("io.next_hop_mac = 02:00:00:00:00:01", text)
-
-    def test_provenance_records_the_stated_fact(self):
-        self.assertTrue(run.lifecycle_provenance(quiet.cases()[0])["source_quiet"].startswith("228:"))
-
-    def test_deadline_is_the_later_of_the_restart_and_boot_floors(self):
-        mature = dict(ticks=1_000_000_000, boot_age_us=1_000_000_000)
-        self.assertEqual(quiet.deadline_us(mature, 228), 1_012_000_000)
-        young = dict(ticks=200_000_000, boot_age_us=200_000_000)
-        self.assertEqual(quiet.deadline_us(young, 228), 240_000_000)
-
-    def test_a_clean_capture_passes_with_its_evidence(self):
-        evidence = self.judge(self.capture())
-        self.assertEqual(evidence["linux_syns_during_quiet"], 3)
-        self.assertEqual(evidence["accepted_syn_us"], 19_100_000)
-        self.assertEqual(evidence["first_native_after_earliest_us"], 500)
-
-    def test_any_native_segment_before_the_deadline_fails(self):
-        for flags, sport, dport in ((2, 50000, 18080), (0x12, 18080, 40000), (4, 18080, 40000)):
-            events = self.capture()
-            events.insert(1, self.event("native-to-kernel", 900_000, flags, sport, dport, ack=101))
-            with self.assertRaises(AssertionError):
-                self.judge(events)
-
-    def test_a_reply_not_to_a_retransmission_after_the_deadline_fails(self):
-        events = [e for e in self.capture() if e["time_ns"] != 19_100_000_000]
-        with self.assertRaises(AssertionError):
-            self.judge(events)
-
-    def test_unobserved_quiet_time_fails(self):
-        events = [e for e in self.capture() if e["time_ns"] not in (1_100_000_000, 3_100_000_000)]
-        with self.assertRaises(AssertionError):
-            self.judge(events)
-
-    def test_case_record_carries_its_provenance(self):
-        """The emitted record holds the kernel, the provider-side lifecycle
-        facts (boot age, boot id, the stated fact) and the case's evidence."""
-        case = quiet.cases()[0]
-        evidence = dict(deadline_earliest_us=1, deadline_latest_us=2, frames=[], frame_count=0)
-        printed = []
-        with patch.object(quiet, "child", return_value=evidence), \
-                patch("builtins.print", lambda line, **_: printed.append(line)):
-            run.quiet_child(case, {"net": "net:[1]"})
-        tag, record = printed[0].split(" ", 1)
-        record = json.loads(record)
-        self.assertEqual(tag, "T20_QUIET_CASE")
-        self.assertEqual(record["case"], case)
-        self.assertEqual(record["evidence"], evidence)
-        self.assertEqual((record["kernel"], record["kernel_version"]), (os.uname().release, os.uname().version))
-        lifecycle = record["lifecycle"]
-        self.assertGreater(lifecycle["boot_age_seconds"], 0)
-        self.assertEqual(lifecycle["boot_id"], run.Path("/proc/sys/kernel/random/boot_id").read_text().strip())
-        self.assertTrue(lifecycle["source_quiet"].startswith(f"{quiet.SOURCE_QUIET}:"))
-
-    def test_a_late_native_syn_fails(self):
-        events = self.capture()
-        events[3] = dict(events[3], time_ns=(self.LATEST + quiet.TIMER_SLACK_US + 1) * 1000)
-        with self.assertRaises(AssertionError):
-            self.judge(events)
-
-
-class LifecycleProvenance(unittest.TestCase):
-    def test_case_records_carry_the_providers_boot_age(self):
-        facts = run.lifecycle_provenance()
-        self.assertGreater(facts["boot_age_seconds"], 0)
-        self.assertEqual(len(facts["boot_id"]), 36)
-        self.assertTrue(facts["source_quiet"].startswith("never"))
-
+class SourceQuietStatements(unittest.TestCase):
     def test_every_native_configuration_states_every_port(self):
         text = scoped.config()
         self.assertIn("io.source_quiet=never\n", text)

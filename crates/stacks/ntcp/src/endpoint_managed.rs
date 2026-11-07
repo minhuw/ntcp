@@ -347,14 +347,10 @@ impl Endpoint {
             && (self.address_policy)(check)
     }
 
-    // `quiet` is the lifecycle deadline that alone refused an active open:
-    // the open is checked as far as it can be without acquiring anything,
-    // and then refused with it.
     fn path_factory<P: PathProvider, T>(
         &mut self,
         provider: &mut P,
         request: PathFactoryRequest,
-        quiet: Option<Instant>,
         operation: impl FnOnce(&mut Self) -> Result<T, EndpointError>,
     ) -> Result<T, ManagedError<P::Error>> {
         let context = self
@@ -376,10 +372,6 @@ impl Endpoint {
             },
             request.ipv4_options,
         )?;
-        if let Some(deadline) = quiet {
-            provider.check(request).map_err(ManagedError::Provider)?;
-            return Err(EndpointError::QuietUntil(deadline).into());
-        }
         let crate::PreparedFactory {
             path: prepared,
             receive,
@@ -434,13 +426,13 @@ impl Endpoint {
     ) -> Result<ConnectionId, ManagedError<P::Error>> {
         let tuple = scoped.tuple();
         let (local, remote) = (tuple.local, tuple.remote);
-        let quiet = quiet_only(self.active_admission(
+        self.active_admission(
             now,
             scoped,
             &options.transport,
             options.receive_authority,
             false,
-        ))?;
+        )?;
         let dscp = ntcp_path::Dscp::new(options.dscp)
             .map_err(|_| EndpointError::Connection(Error::InvalidArgument))?;
         let request = PathFactoryRequest {
@@ -452,7 +444,7 @@ impl Endpoint {
             ipv4_options: options.ipv4_options,
             registration: options.registration,
         };
-        self.path_factory(provider, request, quiet, |endpoint| {
+        self.path_factory(provider, request, |endpoint| {
             endpoint.connect_with_receive_authority(
                 now,
                 local,
@@ -500,13 +492,13 @@ impl Endpoint {
     ) -> Result<(ConnectionId, usize), ManagedError<P::Error>> {
         let tuple = scoped.tuple();
         let (local, remote) = (tuple.local, tuple.remote);
-        let quiet = quiet_only(self.active_admission(
+        self.active_admission(
             now,
             scoped,
             &options.transport,
             options.receive_authority,
             true,
-        ))?;
+        )?;
         let dscp = ntcp_path::Dscp::new(options.dscp)
             .map_err(|_| EndpointError::Connection(Error::InvalidArgument))?;
         let request = PathFactoryRequest {
@@ -518,7 +510,7 @@ impl Endpoint {
             ipv4_options: options.ipv4_options,
             registration: options.registration,
         };
-        self.path_factory(provider, request, quiet, |endpoint| {
+        self.path_factory(provider, request, |endpoint| {
             endpoint.connect_fast_open_authorized(
                 now,
                 local,
@@ -599,7 +591,7 @@ impl Endpoint {
                 },
                 registration: None,
             };
-            self.path_factory(provider, request, None, |endpoint| {
+            self.path_factory(provider, request, |endpoint| {
                 endpoint.input_scoped(now, ip, zone, traffic_class, options, bytes, metadata)
             })
         } else {
@@ -828,15 +820,5 @@ impl Endpoint {
             return None;
         }
         r.departure?.discovery
-    }
-}
-
-// An active admission refused only by the lifecycle's quiet time, as its
-// deadline; any other refusal stays an error.
-fn quiet_only(admission: Result<(), EndpointError>) -> Result<Option<Instant>, EndpointError> {
-    match admission {
-        Ok(()) => Ok(None),
-        Err(EndpointError::QuietUntil(deadline)) => Ok(Some(deadline)),
-        Err(error) => Err(error),
     }
 }

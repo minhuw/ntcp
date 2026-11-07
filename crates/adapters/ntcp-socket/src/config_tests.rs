@@ -1118,14 +1118,11 @@ fn every_named_port_states_its_own_source_quiet_fact() {
     };
     let config = two("io.source_quiet=never\n", "port.b.source_quiet=30\n").unwrap();
     assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Seconds(30));
-    assert_eq!(config.continuity(), ntcp::SourceContinuity::CeasedFor(30));
     let config = two("io.source_quiet=never\n", "port.b.source_quiet=never\n").unwrap();
     assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Never);
-    assert_eq!(config.continuity(), ntcp::SourceContinuity::Never);
-    // An address without a fact keeps the whole lifecycle waiting.
+    // An address without a fact states nothing.
     let config = two("io.source_quiet=never\n", "").unwrap();
     assert_eq!(config.ports[0].source_quiet, crate::SourceQuiet::Unknown);
-    assert_eq!(config.continuity(), ntcp::SourceContinuity::Unknown);
     // The same parsing and validation as io.source_quiet.
     assert!(two("", "port.b.source_quiet=soon\n").is_err());
     assert!(two("", "port.b.source_quiet=-1\n").is_err());

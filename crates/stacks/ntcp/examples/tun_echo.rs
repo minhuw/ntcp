@@ -14,11 +14,7 @@
 //   NTCP_SOURCE_QUIET=SECONDS|never  earlier emission from LOCAL_IP ceased
 //     at least SECONDS before startup (never: there was none, for example a
 //     newly created address). Unset, no IP Identification is issued for one
-//     maximum datagram lifetime (120 s) after startup. The same fact bounds
-//     the TCP quiet time: before the admission deadline logged at startup,
-//     the later of 2*MSL (240 s) after host boot and 2*MSL after emission
-//     from LOCAL_IP may have ceased, no TCP segment leaves. The listener
-//     stays up, SYNs are dropped and the active open waits for the deadline.
+//     maximum datagram lifetime (120 s) after startup.
 //   NTCP_CONTROL_SOCKET=PATH  opt-in local path control socket (absolute
 //     pathname in a private 0700 directory owned by this uid) for
 //     ntcp-pathctl: route and path query, discovery disable/enable,
@@ -219,15 +215,6 @@ mod linux {
                 v6.as_deref(),
                 quiet.as_deref(),
             )
-        }
-
-        // The same fact for the TCP lifecycle.
-        fn continuity_fact(&self) -> ntcp::SourceContinuity {
-            match self.quiet {
-                SourceQuiet::Unknown => ntcp::SourceContinuity::Unknown,
-                SourceQuiet::Seconds(seconds) => ntcp::SourceContinuity::CeasedFor(seconds),
-                SourceQuiet::Never => ntcp::SourceContinuity::Never,
-            }
         }
 
         // The allocator's start: one full MDL after earlier emission from
@@ -1589,10 +1576,6 @@ mod linux {
             self.0.sample().map(|s| s.ticks).map_err(io::Error::other)
         }
 
-        fn boot_age(&self, ticks: u64) -> io::Result<u64> {
-            self.0.boot_age(ticks).map_err(io::Error::other)
-        }
-
         fn now(&mut self, endpoint: &mut Endpoint) -> io::Result<u64> {
             let sample = self.0.sample().map_err(io::Error::other)?;
             if sample.suspended != 0 {
@@ -2554,11 +2537,7 @@ mod linux {
             receive_authority: None,
         };
         let started = time.ticks()?;
-        let lifecycle = ntcp::Lifecycle {
-            boot_age: Some(time.boot_age(started)?),
-            continuity: settings.continuity_fact(),
-        };
-        let mut endpoint = Endpoint::new(config.clone(), secret, started, lifecycle, address_policy)
+        let mut endpoint = Endpoint::new(config.clone(), secret, started, address_policy)
             .map_err(engine)?;
         let current = time.now(&mut endpoint)?;
         let mut network =
@@ -2588,7 +2567,19 @@ mod linux {
             &settings,
         )?;
         let mut flows = Vec::with_capacity(MAX_FLOWS);
-        let mut active_open = peer;
+        if let Some(peer) = peer {
+            let current = time.now(&mut endpoint)?;
+            let id = network
+                .connect(
+                    &mut endpoint,
+                    current,
+                    SocketAddr::new(local, port),
+                    peer,
+                    open_options,
+                )
+                .map_err(|error| host_error(error.into()))?;
+            flows.push(Flow::new(id));
+        }
         // One byte beyond the largest non-jumbo IPv6 datagram: a truncated
         // oversized frame cannot masquerade as an exact-length base-header packet.
         // IPv4 total-length handling remains unchanged.
@@ -2617,31 +2608,10 @@ mod linux {
             args[1]
         );
         eprintln!("{}", settings.report(local));
-        let current = time.now(&mut endpoint)?;
-        match endpoint.quiet_until(current) {
-            Some(deadline) => eprintln!(
-                "TCP admission deadline: {} us from now (boot age {} us)",
-                deadline - current,
-                time.boot_age(current)?
-            ),
-            None => eprintln!(
-                "TCP admission deadline passed (boot age {} us)",
-                time.boot_age(current)?
-            ),
-        }
         loop {
             let mut immediate = false;
             let current = time.now(&mut endpoint)?;
             network.replay(&mut endpoint, current)?;
-            open_when_admitted(
-                &mut network,
-                &mut endpoint,
-                current,
-                SocketAddr::new(local, port),
-                &mut active_open,
-                open_options,
-                &mut flows,
-            )?;
             for _ in 0..BUDGET {
                 if !network.can_receive() {
                     break;
@@ -2801,29 +2771,6 @@ mod linux {
                 network.can_receive(),
             )?;
         }
-    }
-
-    // The active open to PEER_SOCKET_ADDR, once its lifecycle admits one.
-    fn open_when_admitted(
-        network: &mut TunHost,
-        endpoint: &mut Endpoint,
-        now: u64,
-        local: SocketAddr,
-        peer: &mut Option<SocketAddr>,
-        options: ntcp::ManagedOpenOptions,
-        flows: &mut Vec<Flow>,
-    ) -> io::Result<()> {
-        if endpoint.quiet_until(now).is_some() {
-            return Ok(());
-        }
-        let Some(remote) = peer.take() else {
-            return Ok(());
-        };
-        let id = network
-            .connect(endpoint, now, local, remote, options)
-            .map_err(|error| host_error(error.into()))?;
-        flows.push(Flow::new(id));
-        Ok(())
     }
 
     // The opt-in control server (NTCP_CONTROL_SOCKET), bound with this
@@ -2992,7 +2939,7 @@ mod linux {
             };
             let config = EndpointConfig::default();
             let mut endpoint =
-                Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(local)).unwrap();
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
             let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
             let options = || ntcp::ManagedOpenOptions {
                 transport: ntcp::ActiveOpenOptions::from(&config.connection),
@@ -3128,7 +3075,7 @@ mod linux {
                 ..Default::default()
             };
             let mut endpoint =
-                Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(local)).unwrap();
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
             let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
             let destination: SocketAddr = "10.0.0.1:8080".parse().unwrap();
             let hop = Ipv4Addr::new(10, 0, 0, 9);
@@ -3250,7 +3197,7 @@ mod linux {
             };
             let config = EndpointConfig::default();
             let mut endpoint =
-                Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(local)).unwrap();
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
             let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
             let remote: SocketAddr = "10.0.0.1:8080".parse().unwrap();
             let id = endpoint
@@ -3366,7 +3313,7 @@ mod linux {
             };
             let config = EndpointConfig::default();
             let mut endpoint =
-                Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(local)).unwrap();
+                Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
             let mut network = TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
             let id = endpoint
                 .connect_with_path_provider(
@@ -3664,8 +3611,8 @@ mod linux {
             cfg.connection.nagle = false;
             cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
             cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
-            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(a)).unwrap();
-            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(b)).unwrap();
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
             let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
             let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
             let local = SocketAddr::new(a.into(), 1234);
@@ -3795,7 +3742,7 @@ mod linux {
             let broadcast = Ipv4Addr::new(192, 0, 2, 255);
             let host = Ipv4Addr::new(192, 0, 2, 1);
             let mut endpoint =
-                Endpoint::new(EndpointConfig::default(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(local)).unwrap();
+                Endpoint::new(EndpointConfig::default(), [1; 32], 0, test_policy(local)).unwrap();
             endpoint
                 .listen(SocketAddr::new(local.into(), 8080), 1)
                 .unwrap();
@@ -3874,8 +3821,8 @@ mod linux {
             let mut cfg = EndpointConfig::default();
             cfg.connection.nagle = false;
             cfg.ipv4_options_enabled = options_enabled;
-            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(a)).unwrap();
-            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(b)).unwrap();
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy(b)).unwrap();
             let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
             let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
             let remote = SocketAddr::new(b.into(), 8080);
@@ -4003,8 +3950,8 @@ mod linux {
             cfg.connection.nagle = false;
             cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
             cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
-            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(a)).unwrap();
-            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(b)).unwrap();
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
             let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
             let mut server_host = TunHost::attach(&mut server, &cfg, b.into()).unwrap();
             let remote = SocketAddr::new(b.into(), 8080);
@@ -4211,8 +4158,8 @@ mod linux {
             cfg.connection.nagle = false;
             cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
             cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
-            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(a)).unwrap();
-            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(b)).unwrap();
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
             let settings = DatagramSettings::default();
             let mut client_host =
                 TunHost::attach_routed(&mut client, &cfg, a.into(), &settings, &[], 0, 9).unwrap();
@@ -4311,8 +4258,8 @@ mod linux {
             cfg.connection.nagle = false;
             cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
             cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
-            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(a)).unwrap();
-            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(b)).unwrap();
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
             let mut client_host = TunHost::attach(&mut client, &cfg, a.into()).unwrap();
             let mut server_host = TunHost::attach_routed(
                 &mut server,
@@ -4491,8 +4438,8 @@ mod linux {
             cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
             cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
             assert!(cfg.connection.pmtud.is_none());
-            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(a)).unwrap();
-            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(b)).unwrap();
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
             let mut client_host = TunHost::attach_routed(
                 &mut client,
                 &cfg,
@@ -4756,7 +4703,7 @@ mod linux {
                         Ipv4RegistrationPlan::new(local.into(), peer.into(), outgoing, &expected)
                             .unwrap();
                     let mut endpoint =
-                        Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(local)).unwrap();
+                        Endpoint::new(config.clone(), [1; 32], 0, test_policy(local)).unwrap();
                     let mut network =
                         TunHost::attach(&mut endpoint, &config, local.into()).unwrap();
                     endpoint
@@ -4997,9 +4944,9 @@ mod linux {
                     ..Default::default()
                 };
                 let mut client =
-                    Endpoint::new(cfg.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(source)).unwrap();
+                    Endpoint::new(cfg.clone(), [1; 32], 0, test_policy(source)).unwrap();
                 let mut server =
-                    Endpoint::new(cfg.clone(), [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(destination)).unwrap();
+                    Endpoint::new(cfg.clone(), [2; 32], 0, test_policy(destination)).unwrap();
                 let mut client_host = TunHost::attach(&mut client, &cfg, source.into()).unwrap();
                 let mut server_host =
                     TunHost::attach(&mut server, &cfg, destination.into()).unwrap();
@@ -5385,13 +5332,12 @@ mod linux {
                 cfg.clone(),
                 [1; 32],
                 0,
-                ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never },
                 test_policy(Ipv4Addr::new(10, 0, 0, 1)),
             )
             .unwrap();
             cfg.dscp = 37;
             let mut server =
-                Endpoint::new(cfg, [2; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, test_policy(Ipv4Addr::new(10, 0, 0, 2))).unwrap();
+                Endpoint::new(cfg, [2; 32], 0, test_policy(Ipv4Addr::new(10, 0, 0, 2))).unwrap();
             let local = "10.0.0.1:1234".parse().unwrap();
             let remote = "10.0.0.2:8080".parse().unwrap();
             let listener = server.listen(remote, 1).unwrap();

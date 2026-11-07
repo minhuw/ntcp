@@ -747,7 +747,7 @@ fn native_exchange(
     let mut config = EndpointConfig::default();
     config.connection.timestamps = false;
     config.connection.nagle = false;
-    let mut client = Endpoint::new(config, [1; 32], now, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+    let mut client = Endpoint::new(config, [1; 32], now, |_| true).unwrap();
     client.enable_fast_open().unwrap();
     let options = ntcp::ActiveOpenOptions::from(&ntcp::ConnectionConfig::default());
     let local = SocketAddr::new(
@@ -966,7 +966,7 @@ fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows
             config.tcp.max_connections = 16;
             config.tcp.preallocate_connections = 16;
             config.tcp.connection.timestamps = false;
-            let mut probe = Endpoint::new(config.tcp.clone(), [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+            let mut probe = Endpoint::new(config.tcp.clone(), [42; 32], 0, |_| true).unwrap();
             probe.enable_fast_open().unwrap();
             let lease = ntcp::FastOpenKeyLease::for_lifetime(
                 0,

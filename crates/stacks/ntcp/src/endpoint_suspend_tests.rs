@@ -73,8 +73,8 @@ const START: u64 = 10_000_000;
 
 fn established(granularity: TimestampGranularity) -> Pair {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(granularity), [1; 32], START, crate::SETTLED, |_| true).unwrap();
-    let mut b = Endpoint::new(config(granularity), [2; 32], START, crate::SETTLED, |_| true).unwrap();
+    let mut a = Endpoint::new(config(granularity), [1; 32], START, |_| true).unwrap();
+    let mut b = Endpoint::new(config(granularity), [2; 32], START, |_| true).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(START, local, remote).unwrap();
     pump(&mut a, &mut b, START);
@@ -223,8 +223,8 @@ fn a_connection_without_timestamps_ignores_the_serial_order() {
     let mut config = config(TimestampGranularity::Microseconds);
     config.connection.timestamps = false;
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config.clone(), [1; 32], START, crate::SETTLED, |_| true).unwrap();
-    let mut b = Endpoint::new(config, [2; 32], START, crate::SETTLED, |_| true).unwrap();
+    let mut a = Endpoint::new(config.clone(), [1; 32], START, |_| true).unwrap();
+    let mut b = Endpoint::new(config, [2; 32], START, |_| true).unwrap();
     b.listen(remote, 4).unwrap();
     let client = a.connect(START, local, remote).unwrap();
     pump(&mut a, &mut b, START);
@@ -337,8 +337,8 @@ fn a_reserved_connection_ends_once_its_reservation_is_settled() {
     let mut config = config(TimestampGranularity::Microseconds);
     config.connection.nagle = false;
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config.clone(), [1; 32], START, crate::SETTLED, |_| true).unwrap();
-    let mut b = Endpoint::new(config, [2; 32], START, crate::SETTLED, |_| true).unwrap();
+    let mut a = Endpoint::new(config.clone(), [1; 32], START, |_| true).unwrap();
+    let mut b = Endpoint::new(config, [2; 32], START, |_| true).unwrap();
     a.enable_output_reservations().unwrap();
     b.listen(remote, 4).unwrap();
     let client = a.connect(START, local, remote).unwrap();

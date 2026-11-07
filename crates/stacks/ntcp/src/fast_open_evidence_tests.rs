@@ -14,7 +14,7 @@ fn peer(key: u8) -> (Endpoint, ActiveOpenOptions) {
         ..Default::default()
     };
     let options = ActiveOpenOptions::from(&config.connection);
-    let mut endpoint = Endpoint::new(config, [key; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(config, [key; 32], 0, |_| true).unwrap();
     endpoint.enable_fast_open().unwrap();
     (endpoint, options)
 }
@@ -190,7 +190,7 @@ fn timed_credentials_enforce_issue_accept_retirement_and_no_renewal_in_both_time
                         ..Default::default()
                     };
                     let tb = config.connection.timebase;
-                    let mut server = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+                    let mut server = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
                     server.enable_fast_open().unwrap();
                     let (_, remote) = addresses(v6, 40000);
                     let listener = server.listen(remote, 24).unwrap();
@@ -1138,7 +1138,7 @@ fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_p
             },
             ..Default::default()
         };
-        let mut probe = Endpoint::new(config.clone(), [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut probe = Endpoint::new(config.clone(), [2; 32], 0, |_| true).unwrap();
         probe.enable_fast_open().unwrap();
         let lease = FastOpenKeyLease {
             not_before: 0,
@@ -1157,7 +1157,6 @@ fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_p
             },
             [2; 32],
             0,
-            crate::SETTLED,
             |_| true,
         )
         .unwrap();
@@ -1236,7 +1235,7 @@ fn timed_key_interfaces_reject_bad_units_overflow_and_clock_rollback() {
         let mut config = EndpointConfig::default();
         config.connection.timestamps = false;
         config.connection.timebase = tb;
-        let mut endpoint = Endpoint::new(config, [2; 32], 10, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(config, [2; 32], 10, |_| true).unwrap();
         let valid = FastOpenKeyLease::for_lifetime(10, lifetime, tb, true).unwrap();
         for invalid in [
             FastOpenKeyLease {

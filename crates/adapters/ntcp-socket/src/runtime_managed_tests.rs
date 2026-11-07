@@ -514,7 +514,7 @@ fn managed_native_live_class_capacity_failure_preserves_socket_core_client_and_d
         metric: 0,
     })
     .unwrap();
-    owner.endpoint = Endpoint::new(owner.defaults.clone(), [42; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+    owner.endpoint = Endpoint::new(owner.defaults.clone(), [42; 32], 0, |_| true).unwrap();
     host.attach(&mut owner.endpoint).unwrap();
     owner.host = Some(host);
     owner.ports[0].ingress = Some(ingress);

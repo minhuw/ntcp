@@ -367,8 +367,6 @@ fn engine(e: EndpointError) -> i32 {
         EndpointError::Connection(Error::WouldBlock) => EAGAIN,
         EndpointError::Connection(Error::NoMemory) => ENOMEM,
         EndpointError::Connection(Error::InvalidState) => ENOTCONN,
-        // Reaches only `start_connection`, which holds the open for it.
-        EndpointError::QuietUntil(_) => EINPROGRESS,
         _ => EINVAL,
     }
 }
@@ -438,11 +436,6 @@ struct Socket {
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
     fast_open_connect: bool,
-    // An active open refused until the lifecycle deadline, one per socket:
-    // nothing exists in the Endpoint yet. Its peer, address and zone wait in
-    // `deferred_peer`, `local` and `zone`; this holds the bytes accepted for
-    // a Fast Open SYN, or None for an ordinary open.
-    quiet_open: Option<Option<Vec<u8>>>,
     receive_authority: Option<ntcp::ListenerId>,
     server_cookie: Option<(SocketAddr, FastOpenCookie)>,
     client_policy: Option<(SocketAddr, FastOpenClientPolicy)>,
@@ -530,7 +523,6 @@ impl Socket {
             fast_open_cookie_policy: None,
             fast_open_key_lease: None,
             fast_open_connect: false,
-            quiet_open: None,
             receive_authority: None,
             server_cookie: None,
             client_policy: None,
@@ -665,10 +657,6 @@ struct Owner {
     source_quiet: crate::SourceQuiet,
     // The same fact for each `port.<name>` address.
     port_quiet: Vec<(IpAddr, crate::SourceQuiet)>,
-    // The facts this Endpoint lifecycle started from.
-    lifecycle: ntcp::Lifecycle,
-    // Whether a socket may hold an open for the lifecycle deadline.
-    quiet_opens: bool,
     sockets: BTreeMap<u64, Socket>,
     // The `io.*` port's address: the runtime's address family and the
     // source of connections no other port's address is selected for.
@@ -837,7 +825,7 @@ impl Owner {
             extra.index = backend::interface_index(&port.interface)?;
             ports.push(extra);
         }
-        let mut owner = Self::with_ports(ports, secret, tcp, config.continuity())?;
+        let mut owner = Self::with_ports(ports, secret, tcp)?;
         owner.initialize_socket_config(config)?;
         owner.attach_backend_host(u64::from(index))?;
         owner.enable_reservations(&config.io)?;
@@ -1021,16 +1009,13 @@ impl Owner {
             (subnet.0.into(), subnet.1),
             tun,
         ));
-        // Fixtures and the packet-test port: an address created for this
-        // Owner, from which nothing was ever emitted.
-        Self::with_ports(ports, secret, config, ntcp::SourceContinuity::Never)
+        Self::with_ports(ports, secret, config)
     }
     // An owner of `ports`, the `io.*` port first.
     fn with_ports(
         ports: Vec<backend::Port>,
         secret: [u8; 32],
         config: EndpointConfig,
-        continuity: ntcp::SourceContinuity,
     ) -> Result<Self> {
         let local = ports.first().ok_or(EINVAL)?.address;
         let mut addresses = Vec::new();
@@ -1056,20 +1041,9 @@ impl Owner {
         let own = move |ip: IpAddr| addresses.iter().any(|&(address, _)| address == ip);
         let mut clock = ntcp_clock::TransportClock::new().map_err(clock_failure)?;
         let started = clock.sample().map_err(clock_failure)?.ticks;
-        let lifecycle = ntcp::Lifecycle {
-            boot_age: Some(clock.boot_age(started).map_err(clock_failure)?),
-            continuity,
-        };
-        // Unit-test owners model a mature host; the provider's age would
-        // make their schedules depend on the machine's uptime.
-        #[cfg(test)]
-        let lifecycle = ntcp::Lifecycle {
-            boot_age: Some(u64::MAX),
-            ..lifecycle
-        };
         #[cfg(test)]
         let (test_origin, started) = (started, 0);
-        let endpoint = Endpoint::new(config, secret, started, lifecycle, move |r| match r {
+        let endpoint = Endpoint::new(config, secret, started, move |r| match r {
             AddressValidation::Bind { local: bind } => {
                 // Per-socket local-address permission is checked by Op::Bind.
                 // FREEBIND does not relax Open, Incoming, or Route policy.
@@ -1106,8 +1080,6 @@ impl Owner {
             segment_routes: Vec::new(),
             source_quiet: crate::SourceQuiet::Unknown,
             port_quiet: Vec::new(),
-            lifecycle,
-            quiet_opens: false,
             sockets: BTreeMap::new(),
             local,
             clock,
@@ -1160,7 +1132,6 @@ impl Owner {
             crate::packet_profile::config(profile),
             [42; 32],
             owner.started,
-            owner.lifecycle,
             move |r| match r {
                 AddressValidation::Bind { local: addr } => addr.is_unspecified() || unicast(addr),
                 AddressValidation::Open { local: addr, .. } => addr == local,
@@ -1216,20 +1187,11 @@ impl Owner {
     }
     #[cfg(all(test, feature = "packet-test"))]
     fn replace_packet_endpoint(&mut self, config: EndpointConfig) -> Result<()> {
-        self.replace_packet_lifecycle(config, self.lifecycle)
-    }
-    #[cfg(all(test, feature = "packet-test"))]
-    fn replace_packet_lifecycle(
-        &mut self,
-        config: EndpointConfig,
-        lifecycle: ntcp::Lifecycle,
-    ) -> Result<()> {
         // Configuration variants in packet fixtures still attach their actual
         // port through the production bridge before exercising socket startup.
         assert!(self.packets.is_some());
         assert_eq!(self.host.as_ref().unwrap().binding_count(), 0);
-        self.endpoint =
-            Endpoint::new(config.clone(), [42; 32], 0, lifecycle, |_| true).map_err(engine)?;
+        self.endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).map_err(engine)?;
         self.defaults = config;
         let previous = self
             .host
@@ -1621,7 +1583,6 @@ impl Owner {
             if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
-            self.release_quiet_opens(now);
             if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
                 break 'run;
             }
@@ -2198,9 +2159,7 @@ impl Owner {
         }
         match s.handle {
             Handle::Fresh => {
-                // A held open is a connection attempt: writable on its
-                // completion or failure, not while it waits.
-                if (s.deferred_peer.is_some() && s.quiet_open.is_none()) || s.error != 0 {
+                if s.deferred_peer.is_some() {
                     bits |= EPOLLOUT;
                 }
             }
@@ -3591,7 +3550,7 @@ impl Owner {
             Op::Name(peer) => {
                 let zone = s.zone;
                 out.addr = Some(address_policy::scoped(if peer {
-                    if let Some(peer) = s.deferred_peer.filter(|_| s.quiet_open.is_none()) {
+                    if let Some(peer) = s.deferred_peer {
                         out.addr = Some(address_policy::scoped(s.api_address(peer), zone));
                         return Ok(out);
                     }
@@ -3648,7 +3607,7 @@ impl Owner {
             }
             #[cfg(all(test, feature = "packet-test"))]
             Op::BlockingConnect(remote) => {
-                if matches!(s.handle, Handle::Fresh) && s.quiet_open.is_none() {
+                if matches!(s.handle, Handle::Fresh) {
                     match self.dispatch(id, Op::Connect(remote)) {
                         Err(EINPROGRESS) => return Err(EAGAIN),
                         other => return other,
@@ -3717,10 +3676,6 @@ mod pmtud_profile_tests;
 #[cfg(all(test, feature = "packet-test"))]
 #[path = "runtime_handshake_error_tests.rs"]
 mod handshake_errors;
-
-#[cfg(all(test, feature = "packet-test"))]
-#[path = "runtime_quiet_tests.rs"]
-mod quiet;
 
 #[cfg(all(test, feature = "packet-test"))]
 #[path = "runtime_icmp_tests.rs"]

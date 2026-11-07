@@ -453,14 +453,13 @@ fn every_port_address_keeps_its_own_identifier_fact() {
         host.lease_identification(now, second, peer, 6),
         Err(ntcp_host::IdentifierBackpressure::Unavailable { until: Some(_) })
     ));
-    assert_eq!(owner.endpoint.quiet_until(owner.started), Some(owner.started + 220_000_000));
 }
 
 // A port without its own fact states nothing about its address: its
-// identifiers wait the whole MDL and TCP the whole 2*MSL, whatever `io.*`
-// asserts about its own address.
+// identifiers wait the whole MDL, whatever `io.*` asserts about its own
+// address.
 #[test]
-fn a_port_without_a_fact_keeps_both_quiet_periods_whole() {
+fn a_port_without_a_fact_keeps_its_identifier_quiet_period_whole() {
     let backend = |wire: &Arc<Mutex<Wire>>| crate::EthernetPacketIo {
         io: Box::new(Io(wire.clone())),
         local_mac: [2; 6],
@@ -489,5 +488,4 @@ fn a_port_without_a_fact_keeps_both_quiet_periods_whole() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(owner.endpoint.quiet_until(owner.started), Some(owner.started + 240_000_000));
 }

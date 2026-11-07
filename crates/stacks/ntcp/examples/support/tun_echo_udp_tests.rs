@@ -514,8 +514,8 @@ fn udp_echo_serves_a_link_local_address_on_the_tun_link() {
     let a: Ipv6Addr = "fe80::1".parse().unwrap();
     let b: Ipv6Addr = "fe80::2".parse().unwrap();
     let cfg = config(a.into());
-    let mut ae = Endpoint::new(cfg.clone(), [7; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(a)).unwrap();
-    let mut be = Endpoint::new(cfg.clone(), [8; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, tun_v6_policy(b)).unwrap();
+    let mut ae = Endpoint::new(cfg.clone(), [7; 32], 0, tun_v6_policy(a)).unwrap();
+    let mut be = Endpoint::new(cfg.clone(), [8; 32], 0, tun_v6_policy(b)).unwrap();
     let settings = refuse_settings();
     let mut ahost = TunHost::attach_routed(&mut ae, &cfg, a.into(), &settings, &[], 0, 9).unwrap();
     let mut bhost = TunHost::attach_routed(&mut be, &cfg, b.into(), &settings, &[], 0, 9).unwrap();

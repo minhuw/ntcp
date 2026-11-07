@@ -1,6 +1,6 @@
 //! Characterized Linux transport time: non-coarse `CLOCK_BOOTTIME` in
-//! microseconds, the elapsed real time including suspend, so that MSL, quiet
-//! time, TIME-WAIT and key lifetimes are real durations. Linux TCP itself
+//! microseconds, the elapsed real time including suspend, so that MSL,
+//! TIME-WAIT and key lifetimes are real durations. Linux TCP itself
 //! uses `CLOCK_MONOTONIC` (`include/net/tcp.h`).
 //!
 //! [`TransportClock::new`] records the clock identity, the `clock_getres`
@@ -130,11 +130,6 @@ pub enum TransportError {
     OffsetsRead { errno: i32 },
     /// The time namespace offsets are not the two clocks' offsets.
     OffsetsMalformed,
-    /// The namespace offset leaves no positive host boot age.
-    BootAge {
-        ticks: u64,
-        boottime_offset_ns: i128,
-    },
 }
 
 impl fmt::Display for TransportError {
@@ -157,13 +152,6 @@ impl fmt::Display for TransportError {
             Self::BootIdMalformed => write!(f, "malformed {BOOT_ID_PATH}"),
             Self::OffsetsRead { errno } => write!(f, "reading {OFFSETS_PATH}: errno {errno}"),
             Self::OffsetsMalformed => write!(f, "malformed {OFFSETS_PATH}"),
-            Self::BootAge {
-                ticks,
-                boottime_offset_ns,
-            } => write!(
-                f,
-                "no host boot age from {ticks} us with boottime offset {boottime_offset_ns} ns"
-            ),
         }
     }
 }
@@ -256,13 +244,6 @@ impl TransportClock {
         self.reference = Some(reference);
         Ok(sample)
     }
-
-    /// The host's uptime in microseconds at `ticks`: `CLOCK_BOOTTIME` minus
-    /// the namespace's boottime offset, so a namespace offset never makes the
-    /// host look older than it is.
-    pub fn boot_age(&self, ticks: u64) -> Result<u64, TransportError> {
-        boot_age(ticks, self.characterization.offsets.boottime_ns)
-    }
 }
 
 fn nanos(clock: Clock, reading: Timespec) -> Result<i128, TransportError> {
@@ -315,19 +296,6 @@ fn advance(
             offset_ns: boottime - before,
         },
     ))
-}
-
-fn boot_age(ticks: u64, boottime_offset_ns: i128) -> Result<u64, TransportError> {
-    // The offset rounds up: a fraction of a microsecond must not add age.
-    let offset_us = -(-boottime_offset_ns).div_euclid(NANOS_PER_MICROSECOND);
-    let age = i128::from(ticks) - offset_us;
-    u64::try_from(age)
-        .ok()
-        .filter(|&age| age > 0)
-        .ok_or(TransportError::BootAge {
-            ticks,
-            boottime_offset_ns,
-        })
 }
 
 fn parse_boot_id(text: &[u8]) -> Option<BootId> {

@@ -271,14 +271,6 @@ impl Owner {
     //# TFO cookie request automatically. The caller needs to write the data again when the socket is
     //# connected.
     fn send_step(&mut self, id: u64, send: &mut LogicalSend, blocking: bool) -> Result<()> {
-        // An open held for the lifecycle deadline is a connection attempt.
-        if self.sockets.get(&id).ok_or(EBADF)?.quiet_open.is_some() {
-            return Err(if send.flags & MSG_FASTOPEN != 0 && !send.fast_open_started {
-                EALREADY
-            } else {
-                EAGAIN
-            });
-        }
         let deferred = self.sockets.get(&id).ok_or(EBADF)?.deferred_peer.is_some();
         // Permission belongs to the logical call. A call already admitted
         // before a policy change keeps its handshake/tail and completion ownership.
@@ -318,14 +310,6 @@ impl Owner {
             let count = send.total.min(BYTES).min(socket.send_capacity);
             if lowat == 0 && send.total != 0 {
                 return Err(EAGAIN);
-            }
-            // A blocking implicit connect waits here for the lifecycle
-            // deadline, owning nothing and interruptible like any waiter.
-            if blocking {
-                let now = self.clock()?;
-                if self.endpoint.quiet_until(now).is_some() {
-                    return Err(EAGAIN);
-                }
             }
             // Crucially precedes local-port allocation, core connection, and
             // clearing the deferred peer. EFAULT leaves the socket retryable.
@@ -662,11 +646,7 @@ impl Owner {
         count: usize,
         flags: i32,
     ) -> Result<i32> {
-        let socket = self.sockets.get(&id).ok_or(EBADF)?;
-        if socket.quiet_open.is_some() {
-            return Err(EAGAIN);
-        }
-        if socket.deferred_peer.is_some() {
+        if self.sockets.get(&id).ok_or(EBADF)?.deferred_peer.is_some() {
             return Err(EOPNOTSUPP);
         }
         if count == 0 {

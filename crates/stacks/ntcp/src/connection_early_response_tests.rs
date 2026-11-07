@@ -883,7 +883,6 @@ fn public_pair_policy(
             },
             [key; 32],
             0,
-            crate::SETTLED,
             |_| true,
         )
         .unwrap()

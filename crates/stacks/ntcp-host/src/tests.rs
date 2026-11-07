@@ -152,24 +152,6 @@ fn managed_limited(
     denied_hop: Option<IpAddr>,
     adjust: impl FnOnce(path::Limits, Limits) -> (path::Limits, Limits, usize),
 ) -> (Host, Endpoint, IngressContext) {
-    // A modeled mature host on addresses nothing was ever emitted from.
-    let lifecycle = ntcp::Lifecycle {
-        boot_age: Some(u64::MAX),
-        continuity: ntcp::SourceContinuity::Never,
-    };
-    managed_lifecycle(local, identity, cfg, gso, path_capacity, denied_hop, adjust, lifecycle)
-}
-#[allow(clippy::too_many_arguments)]
-fn managed_lifecycle(
-    local: SocketAddr,
-    identity: u128,
-    cfg: EndpointConfig,
-    gso: bool,
-    path_capacity: Option<usize>,
-    denied_hop: Option<IpAddr>,
-    adjust: impl FnOnce(path::Limits, Limits) -> (path::Limits, Limits, usize),
-    lifecycle: ntcp::Lifecycle,
-) -> (Host, Endpoint, IngressContext) {
     let (paths, limits) = managed_limits(&cfg, 1, 1, 1, 4, 1).unwrap();
     let (mut paths, limits, reservations) = adjust(paths, limits);
     if let Some(capacity) = path_capacity {
@@ -218,7 +200,7 @@ fn managed_lifecycle(
         metric: 0,
     })
     .unwrap();
-    let mut endpoint = Endpoint::new(cfg, [identity as u8; 32], 0, lifecycle, move |request| match request {
+    let mut endpoint = Endpoint::new(cfg, [identity as u8; 32], 0, move |request| match request {
         ntcp::AddressValidation::Bind { local: address }
         | ntcp::AddressValidation::Open { local: address, .. } => address == local.ip(),
         ntcp::AddressValidation::Incoming { destination, .. } => destination == local.ip(),

@@ -1593,7 +1593,7 @@ fn reserved_stateless_rejection_is_best_effort_and_impossible_headers_abandon() 
     // runtime branch with a core fixture that can retain impossible IP headers.
     let mut config = a.defaults.clone();
     config.ipv4_options_enabled = true;
-    a.endpoint = Endpoint::new(config, [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+    a.endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
     a.enable_egress(1, None).unwrap();
     let id = a
         .endpoint

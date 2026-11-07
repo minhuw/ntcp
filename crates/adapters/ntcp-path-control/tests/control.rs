@@ -112,7 +112,7 @@ fn side_with(
         metric: 0,
     })
     .unwrap();
-    let mut endpoint = Endpoint::new(cfg.clone(), [7; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, move |request| match request {
+    let mut endpoint = Endpoint::new(cfg.clone(), [7; 32], 0, move |request| match request {
         ntcp::AddressValidation::Bind { local: address }
         | ntcp::AddressValidation::Open { local: address, .. } => address == local.ip(),
         ntcp::AddressValidation::Incoming { destination, .. } => destination == local.ip(),

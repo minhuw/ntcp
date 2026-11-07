@@ -169,7 +169,6 @@ fn endpoint_route_update_is_connection_local_and_does_not_change_template() {
             },
             [1; 32],
             0,
-            crate::SETTLED,
             |_| true,
         )
         .unwrap();
@@ -201,7 +200,6 @@ fn endpoint_route_update_rejects_reserved_scalar_without_clock_or_packet_mutatio
         },
         [1; 32],
         0,
-        crate::SETTLED,
         |_| true,
     )
     .unwrap();
@@ -248,7 +246,6 @@ fn endpoint_route_update_rejects_held_gso_and_preserves_descriptor() {
             },
             [1; 32],
             0,
-            crate::SETTLED,
             |_| true,
         )
         .unwrap()
@@ -321,7 +318,6 @@ fn endpoint_route_update_rejects_stale_generation_and_disabled_discovery() {
         },
         [1; 32],
         0,
-        crate::SETTLED,
         |_| true,
     )
     .unwrap();

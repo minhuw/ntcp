@@ -493,7 +493,6 @@ fn pmtud_config_endpoint_policy_update_preserves_reserved_output_and_is_transact
         },
         [1; 32],
         0,
-        crate::SETTLED,
         |_| true,
     )
     .unwrap();
@@ -540,7 +539,6 @@ fn pmtud_config_endpoint_template_link_update_preserves_creation_policy() {
         },
         [1; 32],
         0,
-        crate::SETTLED,
         |_| true,
     )
     .unwrap();

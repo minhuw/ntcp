@@ -194,9 +194,6 @@ pub enum EndpointError {
     InvalidAddress,
     Ipv4Options(Ipv4OptionsError),
     Registration(crate::Ipv4RegistrationError),
-    /// Refused without effect: this lifecycle creates no transport state
-    /// before the deadline. The embedding decides how to wait for it.
-    QuietUntil(Instant),
 }
 impl From<Ipv4OptionsError> for EndpointError {
     fn from(error: Ipv4OptionsError) -> Self {
@@ -425,8 +422,6 @@ pub struct Endpoint {
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
     secret: [u8; 32],
     now: Instant,
-    // This lifecycle's TCP admission deadline.
-    quiet_until: Instant,
     isn_clock: u32,
     last_isn_time: Instant,
     slots: Vec<Option<Slot>>,
@@ -498,16 +493,13 @@ impl Endpoint {
     // The caller must supply a confidential, unpredictable 32-byte key from an
     // initialized CSPRNG. The required callback captures authoritative network
     // context for this endpoint; the endpoint cannot prove the caller's policy true.
-    // A new Endpoint is a new lifecycle starting at `now`; see `Lifecycle`.
     pub fn new<F: Fn(AddressValidation) -> bool + 'static>(
         mut config: EndpointConfig,
         secret: [u8; 32],
         now: Instant,
-        lifecycle: crate::Lifecycle,
         address_policy: F,
     ) -> Result<Self, EndpointError> {
         config.validate()?;
-        let quiet_until = lifecycle.deadline(now, config.connection.timebase);
         if config.ipv4_options_enabled {
             // ponytail: reserve all 40 IPv4 option bytes; per-packet budgeting can reclaim slack later.
             config.connection.send_ip_payload_limit = config
@@ -584,7 +576,6 @@ impl Endpoint {
             secret,
             setup_loss_cache,
             now,
-            quiet_until,
             last_isn_time: now,
             slots,
             generations,
@@ -760,22 +751,6 @@ impl Endpoint {
         self.check_clock(now)?;
         self.now = now;
         Ok(())
-    }
-
-    /// This lifecycle's TCP admission deadline while it is ahead of `now`.
-    pub fn quiet_until(&self, now: Instant) -> Option<Instant> {
-        (now < self.quiet_until).then_some(self.quiet_until)
-    }
-
-    //= https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1
-    //= reason=Each Endpoint lifecycle has one TCP admission deadline from the configured MSL: the later of host boot + 2*MSL, from the provider's CLOCK_BOOTTIME boot age without the time namespace offset (unknown counts as a boot at the start), and the restart floor from the embedding's source continuity fact. Before it no active, passive, Fast Open or TIME-WAIT reuse factory creates a connection, no ISN, timestamp offset or cookie is assigned and no TCP segment, RST included, is emitted; host uptime alone never removes the restart floor. Core and native socket tests check refusal before and admission at the deadline; the rfc_host quiet.py namespace cases capture the wire.
-    //# Firstly, as specified in [RFC0793], hosts must not establish new
-    //# connections for a period of 2*MSL (Maximum Segment Lifetime) after they
-    //# boot (this is the "quiet time" concept). As a result, in terms of
-    //# specifications, this scenario should never occur.
-    fn quiet_gate(&self, now: Instant) -> Result<(), EndpointError> {
-        self.quiet_until(now)
-            .map_or(Ok(()), |deadline| Err(EndpointError::QuietUntil(deadline)))
     }
 
     /// One clock sample whose advance includes `suspended` ticks that the
@@ -2313,8 +2288,7 @@ impl Endpoint {
         if fast_open && self.fast_open.is_none() {
             return Err(Error::InvalidState.into());
         }
-        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
-        self.quiet_gate(now)
+        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))
     }
 
     pub fn connect(
@@ -2326,7 +2300,6 @@ impl Endpoint {
         self.check_clock(now)?;
         let tuple = Tuple { local, remote };
         self.admission(self.scoped(tuple))?;
-        self.quiet_gate(now)?;
         self.clock(now)?;
         let iss = self.isn(self.scoped(tuple));
         let connection = self.new_connection(tuple, iss, None)?;
@@ -2607,7 +2580,6 @@ impl Endpoint {
         select_source: impl FnOnce(SocketAddr) -> Result<SocketAddr, EndpointError>,
     ) -> Result<ConnectionId, EndpointError> {
         self.check_clock(now)?;
-        self.quiet_gate(now)?;
         self.clock(now)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
         //# If an application on a multihomed host does not specify the local IP
@@ -2941,7 +2913,6 @@ impl Endpoint {
     ) {
         if segment.header.flags & RST != 0
             || self.control.len() >= self.config.max_control_packets
-            || self.quiet_until(self.now).is_some()
         {
             return;
         }
@@ -3320,9 +3291,9 @@ impl Endpoint {
     }
 
     /// Non-constructing passive factory admission shared by the listener and
-    /// TIME-WAIT reuse factories and by the managed pre-check: quiet time,
-    /// backlog, transport resources and, for reuse, the old record's
-    /// reset/freshness state. A failure is the ordinary silent discard.
+    /// TIME-WAIT reuse factories and by the managed pre-check: backlog,
+    /// transport resources and, for reuse, the old record's reset/freshness
+    /// state. A failure is the ordinary silent discard.
     pub(crate) fn passive_room(
         &self,
         now: Instant,
@@ -3332,7 +3303,7 @@ impl Endpoint {
         syn: &wire::Segment<'_>,
     ) -> bool {
         let record = self.listeners[listener.slot].as_ref().unwrap();
-        if record.children.len() >= record.backlog || self.quiet_until(now).is_some() {
+        if record.children.len() >= record.backlog {
             return false;
         }
         match target {
@@ -5608,7 +5579,7 @@ mod recovery_observation_tests {
     #[test]
     fn transport_info_samples_endpoint_clock_for_dormant_connection_without_mutation() {
         let cfg = EndpointConfig::default();
-        let mut endpoint = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -5674,7 +5645,7 @@ mod recovery_observation_tests {
                     local: "192.0.2.1:40000".parse().unwrap(),
                     remote: "192.0.2.2:8080".parse().unwrap(),
                 };
-                let mut endpoint = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let mut endpoint = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
                 let first_isn = endpoint.isn(ScopedTuple::unscoped(tuple));
                 endpoint.clock(4000 * scale).unwrap();
                 let next_isn = endpoint.isn(ScopedTuple::unscoped(tuple));
@@ -5697,7 +5668,7 @@ mod recovery_observation_tests {
                 endpoint.clock(4000 * scale + half - 1).unwrap();
                 endpoint.clock(4000 * scale + half).unwrap();
                 // Control budget counts survive draining output until one physical second.
-                let mut control = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let mut control = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
                 let ip = IpMetadata {
                     source: tuple.local.ip(),
                     destination: tuple.remote.ip(),
@@ -5713,7 +5684,7 @@ mod recovery_observation_tests {
                 control.reset_for(ip, None, &incoming, None);
                 assert_eq!(control.control.len(), 1);
                 let (_, reset) = packet(&mut control, 1_000_000 * scale);
-                let mut passive = Endpoint::new(cfg.clone(), [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let mut passive = Endpoint::new(cfg.clone(), [2; 32], 0, |_| true).unwrap();
                 passive.listen(tuple.remote, 1).unwrap();
                 passive.input(0, ip, &syn).unwrap();
                 let child = passive
@@ -5731,7 +5702,7 @@ mod recovery_observation_tests {
                 );
                 assert_eq!(passive.next_deadline(), Some(240_000_000 * scale));
                 // Absolute end-of-clock deadlines saturate, rather than wrapping early.
-                let mut end = Endpoint::new(cfg, [1; 32], u64::MAX - 1, crate::SETTLED, |_| true).unwrap();
+                let mut end = Endpoint::new(cfg, [1; 32], u64::MAX - 1, |_| true).unwrap();
                 end.connect(u64::MAX - 1, tuple.local, tuple.remote)
                     .unwrap();
                 packet(&mut end, u64::MAX - 1);
@@ -5754,7 +5725,7 @@ mod recovery_observation_tests {
             },
             ..EndpointConfig::default()
         };
-        let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -5801,7 +5772,7 @@ mod recovery_observation_tests {
                 },
                 ..EndpointConfig::default()
             };
-            let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
             let id = endpoint
                 .connect(
                     0,
@@ -5856,7 +5827,7 @@ mod recovery_observation_tests {
                 local: "192.0.2.1:40000".parse().unwrap(),
                 remote: "192.0.2.2:8080".parse().unwrap(),
             };
-            let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
             let charge = endpoint.per_connection_bytes;
             let pool_capacity = endpoint.receive_pool.capacity();
             // A full bounded probe table can fail insertion after construction.
@@ -5905,8 +5876,8 @@ mod recovery_observation_tests {
             local: "192.0.2.1:40000".parse().unwrap(),
             remote: "192.0.2.2:8080".parse().unwrap(),
         };
-        let mut a = Endpoint::new(config.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
-        let mut b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
         b.listen(tuple.remote, 1).unwrap();
         a.connect(0, tuple.local, tuple.remote).unwrap();
         let (tx, bytes) = packet(&mut a, 0);
@@ -5961,8 +5932,8 @@ mod recovery_observation_tests {
             local: "192.0.2.1:40000".parse().unwrap(),
             remote: "192.0.2.2:8080".parse().unwrap(),
         };
-        let mut a = Endpoint::new(config.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
-        let mut b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
         let listener = b.listen(tuple.remote, 4).unwrap();
         let client = a.connect(0, tuple.local, tuple.remote).unwrap();
         assert_eq!(a.connection_id(tuple), Some(client));
@@ -6053,8 +6024,8 @@ mod recovery_observation_tests {
         };
         let local = "192.0.2.1:40000".parse().unwrap();
         let remote = "192.0.2.2:8080".parse().unwrap();
-        let mut a = Endpoint::new(config.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
-        let mut b = Endpoint::new(config, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
         let listener = b.listen(remote, 2).unwrap();
         let client = a.connect(0, local, remote).unwrap();
         let (tx, bytes) = packet(&mut a, 0);
@@ -6106,7 +6077,7 @@ mod recovery_observation_tests {
             },
             ..EndpointConfig::default()
         };
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
         let mut now = 0;
         for host in [2, 3] {
             loop {
@@ -6123,7 +6094,7 @@ mod recovery_observation_tests {
             }
             .parse()
             .unwrap();
-            let mut b = Endpoint::new(cfg.clone(), [2; 32], now, crate::SETTLED, |_| true).unwrap();
+            let mut b = Endpoint::new(cfg.clone(), [2; 32], now, |_| true).unwrap();
             let listener = b.listen(remote, 4).unwrap();
             let client = a.connect(now, local, remote).unwrap();
             let (tx, bytes) = packet(&mut a, now);
@@ -6168,7 +6139,7 @@ mod recovery_observation_tests {
     }
     #[test]
     fn logical_timestamp_discard_releases_only_selected_cookie() {
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6206,7 +6177,7 @@ mod recovery_observation_tests {
         use crate::{TxStreamRange, TxTimestampOutcome as Outcome, TxTimestampRequest};
         use TxTimestampSource::{Hardware, Software};
         use TxTimestampStage::{Acknowledged, Scheduled, Transmit};
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6317,7 +6288,7 @@ mod recovery_observation_tests {
     }
     #[test]
     fn tx_timestamp_capacity_peak_budget_allocation_failure_and_buffer_resize() {
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6437,7 +6408,7 @@ mod recovery_observation_tests {
     #[test]
     fn rx_timestamp_capacity_budget_resize_rollback_and_release() {
         use crate::{RxTimestamp, TimestampClock};
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
         let id = endpoint
             .connect(
                 0,
@@ -6619,7 +6590,7 @@ mod recovery_observation_tests {
                 ..Default::default()
             };
             let make = || {
-                let mut endpoint = Endpoint::new(cfg.clone(), [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let mut endpoint = Endpoint::new(cfg.clone(), [2; 32], 0, |_| true).unwrap();
                 let listener = endpoint.listen(tuple.local, 2).unwrap();
                 endpoint
                     .set_listener_rx_timestamp_capacity(listener, 2)
@@ -6722,7 +6693,7 @@ mod recovery_observation_tests {
 
     #[test]
     fn listener_rx_timestamp_slot_reuse_defaults_and_zero_policy_preserves_legacy_limits() {
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
         let address = "192.0.2.2:8080".parse().unwrap();
         let listener = endpoint.listen(address, 1).unwrap();
         endpoint
@@ -6770,7 +6741,6 @@ mod endpoint_mtu_update_tests {
             },
             [1; 32],
             0,
-            crate::SETTLED,
             |_| true,
         )
         .unwrap()
@@ -6880,7 +6850,7 @@ mod endpoint_mtu_update_tests {
             Err(Error::InvalidArgument.into())
         );
 
-        let mut disabled = Endpoint::new(EndpointConfig::default(), [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut disabled = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
         assert_eq!(
             disabled.set_endpoint_first_hop_mtu(10, 1500),
             Err(Error::InvalidArgument.into())
@@ -6903,7 +6873,6 @@ mod endpoint_mtu_update_tests {
                 },
                 [1; 32],
                 0,
-                crate::SETTLED,
                 |_| true,
             )
             .unwrap();
@@ -7015,10 +6984,6 @@ mod unsubmitted_discard_tests;
 mod suspend_tests;
 
 #[cfg(test)]
-#[path = "endpoint_lifecycle_tests.rs"]
-mod lifecycle_tests;
-
-#[cfg(test)]
 #[path = "endpoint_reset_defense_tests.rs"]
 mod reset_defense_tests;
 
@@ -7032,7 +6997,7 @@ mod timestamp_default_control_tests {
             for future_enabled in [false, true] {
                 let mut config = EndpointConfig::default();
                 config.connection.timestamps = originally_enabled;
-                let mut endpoint = Endpoint::new(config, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+                let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
                 endpoint.packet_test_timestamp_default(future_enabled);
                 assert_eq!(endpoint.new_connection_timestamps(), future_enabled);
                 assert!(endpoint.check_clock(1000).is_ok());

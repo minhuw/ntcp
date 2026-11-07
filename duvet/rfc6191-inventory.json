@@ -257,26 +257,22 @@
       "section": "A.1",
       "quote": "This section clarifies how this algorithm would operate in case a computer reboots, keeps the same IP address, loses memory of the previous timestamps, and then tries to reestablish a previous connection.",
       "status": "context",
-      "reason": "Reboot scenario explanation: lost peer timestamp history can defeat reuse, falling back to ordinary TIME-WAIT. The explicit boot quiet-time obligation is separately TODO."
+      "reason": "Reboot scenario explanation: lost peer timestamp history can defeat reuse, falling back to ordinary TIME-WAIT. The explicit boot quiet-time obligation is separately recorded as an exception."
     },
     {
       "id": "6191-boot-quiet-time",
       "section": "A.1",
       "quote": "Firstly, as specified in [RFC0793], hosts must not establish new connections for a period of 2*MSL (Maximum Segment Lifetime) after they boot (this is the \"quiet time\" concept). As a result, in terms of specifications, this scenario should never occur.",
-      "status": "covered",
-      "reason": "Each Endpoint lifecycle has one TCP admission deadline from the configured MSL: the later of host boot + 2*MSL, from the provider's CLOCK_BOOTTIME boot age without the time namespace offset (unknown counts as a boot at the start), and the restart floor from the embedding's source continuity fact. Before it no active, passive, Fast Open or TIME-WAIT reuse factory creates a connection, no ISN, timestamp offset or cookie is assigned and no TCP segment, RST included, is emitted; host uptime alone never removes the restart floor. Core and native socket tests check refusal before and admission at the deadline; the rfc_host quiet.py namespace cases capture the wire.",
-      "target": "https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1",
-      "evidence": [
-        "crates/stacks/ntcp/src/lifecycle.rs::pub fn deadline(",
-        "crates/stacks/ntcp/src/endpoint_lifecycle_tests.rs::fn each_active_factory_is_refused_before_the_deadline_and_admitted_at_it()"
-      ]
+      "status": "exception",
+      "reason": "Deliberate Linux-compatible deviation: no startup quiet time. As Linux does after a reboot, a newly started Endpoint assumes no earlier incarnation and admits connections at once; it relies on RFC 9293 section 3.4.1 secret-keyed clock ISNs (an HMAC of the tuple under a per-Endpoint secret plus a 4 us clock), per-connection timestamp offsets (PAWS) and TIME-WAIT for the connections it closed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#appendix-A.1"
     },
     {
       "id": "6191-A.1-context-2",
       "section": "A.1",
       "quote": "If a host does not comply with the \"quiet time concept\", a connection request might be sent to a remote host while there is a previous incarnation of the same connection in the TIME-WAIT state at the remote host. In such a scenario, as a result of having lost memory of previous timestamps, the resulting timestamps might not be monotonically increasing, and hence the proposed algorithm might be unable to recycle the previous incarnation of the connection that is in the TIME-WAIT state. This case corresponds to the current state of affairs without the algorithm proposed in this document.",
       "status": "context",
-      "reason": "Reboot scenario explanation: lost peer timestamp history can defeat reuse, falling back to ordinary TIME-WAIT. The explicit boot quiet-time obligation is separately TODO."
+      "reason": "Reboot scenario explanation: lost peer timestamp history can defeat reuse, falling back to ordinary TIME-WAIT. The explicit boot quiet-time obligation is separately recorded as an exception."
     }
   ]
 }

@@ -6,9 +6,6 @@ impl Owner {
     // existing transport. TCP establishment alone must not imply SS_CONNECTED.
     pub(super) fn check_connect(&mut self, id: u64) -> Result<bool> {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
-        if s.quiet_open.is_some() {
-            return Err(EALREADY);
-        }
         if s.deferred_peer.is_some() {
             return Err(EISCONN);
         }
@@ -29,15 +26,7 @@ impl Owner {
     pub(super) fn complete_connect(&mut self, id: u64) -> Result<()> {
         let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
         let Handle::Connection(cid) = s.handle else {
-            if s.quiet_open.is_some() {
-                return Err(EAGAIN);
-            }
-            // A held open that failed to start never had a connection.
-            return Err(if s.error != 0 {
-                core::mem::take(&mut s.error)
-            } else {
-                ENOTCONN
-            });
+            return Err(ENOTCONN);
         };
         match self.endpoint.state(cid).map_err(engine)? {
             State::SynSent | State::SynReceived => return Err(EAGAIN),
@@ -171,7 +160,7 @@ impl Owner {
         };
         let cookie = options.server_cookie_for(remote);
         let policy = options.client_policy_for(remote, self.socket_policy.fast_open_client_policy);
-        let opened: Result<_> = (|| Ok(if let Some(initial) = initial {
+        let (cid, accepted) = if let Some(initial) = initial {
             self.endpoint.enable_fast_open().map_err(engine)?;
             if let Some(host) = &mut self.host {
                 self.endpoint
@@ -210,12 +199,6 @@ impl Owner {
                     .map_err(engine)?
             };
             (cid, 0)
-        }))();
-        let (cid, accepted) = match opened {
-            // Quiet time is the Endpoint's last admission check, so this
-            // attempt is otherwise valid now.
-            Err(EINPROGRESS) => return self.hold_open(id, now, local, remote, zone, initial),
-            opened => opened?,
         };
         if let Err(e) = self.apply_options(cid, &options) {
             // Serialized factory: no input or output can have observed this
@@ -243,104 +226,6 @@ impl Owner {
         s.deferred_client_policy = None;
         s.zone = zone;
         Ok(accepted)
-    }
-
-    // Keep one refused open on its socket until the lifecycle deadline. Bytes
-    // follow Fast Open's own admission: without a usable cookie a client
-    // accepts none and requests one, so the caller writes them again.
-    fn hold_open(
-        &mut self,
-        id: u64,
-        now: u64,
-        local: SocketAddr,
-        remote: SocketAddr,
-        zone: Option<address_policy::Zone>,
-        initial: Option<&[u8]>,
-    ) -> Result<usize> {
-        let socket = &self.sockets[&id];
-        let mut held = None;
-        if let Some(initial) = initial {
-            let eligible = self
-                .endpoint
-                .can_defer_scoped_fast_open(
-                    now,
-                    local.ip(),
-                    remote,
-                    zone.map(|zone| zone.link),
-                    socket.server_cookie_for(remote),
-                    socket.client_policy_for(remote, self.socket_policy.fast_open_client_policy),
-                )
-                .map_err(engine)?;
-            let mut bytes = Vec::new();
-            if eligible {
-                bytes.try_reserve_exact(initial.len()).map_err(|_| ENOMEM)?;
-                bytes.extend_from_slice(initial);
-            }
-            held = Some(bytes);
-        }
-        let accepted = held.as_ref().map_or(0, Vec::len);
-        let s = self.sockets.get_mut(&id).unwrap();
-        s.quiet_open = Some(held);
-        s.deferred_peer = Some(remote);
-        s.local = Some(local);
-        s.zone = zone;
-        self.quiet_opens = true;
-        Ok(accepted)
-    }
-
-    // Past the lifecycle deadline the owner loop starts every held open. A
-    // start that fails is that socket's connect failure, reported through
-    // readiness and SO_ERROR as a failed handshake is.
-    pub(super) fn release_quiet_opens(&mut self, now: u64) {
-        if !self.quiet_opens || self.endpoint.quiet_until(now).is_some() {
-            return;
-        }
-        self.quiet_opens = false;
-        while let Some(id) = self
-            .sockets
-            .iter()
-            .find_map(|(&id, s)| s.quiet_open.is_some().then_some(id))
-        {
-            let s = self.sockets.get_mut(&id).unwrap();
-            let held = s.quiet_open.take().flatten();
-            let remote = s.deferred_peer.take();
-            let (local, zone) = (s.local, s.zone);
-            let (Some(remote), Some(local)) = (remote, local) else {
-                continue;
-            };
-            if let Err(error) = self.start_held_open(id, local, remote, zone, held) {
-                let s = self.sockets.get_mut(&id).unwrap();
-                s.deferred_client_policy = None;
-                s.error = error;
-            }
-            let _ = self.refresh_readiness(id);
-        }
-    }
-
-    fn start_held_open(
-        &mut self,
-        id: u64,
-        local: SocketAddr,
-        remote: SocketAddr,
-        zone: Option<address_policy::Zone>,
-        held: Option<Vec<u8>>,
-    ) -> Result<()> {
-        let accepted = self.start_connection(id, local, remote, zone, held.as_deref())?;
-        // Bytes beyond the SYN's room follow it under ordinary send admission.
-        let Some(rest) = held.as_ref().map(|bytes| &bytes[accepted..]) else {
-            return Ok(());
-        };
-        let Handle::Connection(cid) = self.sockets[&id].handle else {
-            return Err(EIO);
-        };
-        if rest.is_empty() || self.endpoint.write(cid, rest) == Ok(rest.len()) {
-            return Ok(());
-        }
-        self.endpoint.cancel_unsubmitted_open(cid).map_err(engine)?;
-        let s = self.sockets.get_mut(&id).unwrap();
-        s.handle = Handle::Fresh;
-        s.connect_pending = false;
-        Err(ENOBUFS)
     }
 }
 

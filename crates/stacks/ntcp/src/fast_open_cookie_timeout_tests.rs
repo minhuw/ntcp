@@ -15,7 +15,7 @@ fn cold(scale: u64, reserved: bool) -> Endpoint {
         },
         ..EndpointConfig::default()
     };
-    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
     endpoint.enable_fast_open().unwrap();
     if reserved {
         endpoint.enable_output_reservations().unwrap();

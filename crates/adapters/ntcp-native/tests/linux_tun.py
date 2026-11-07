@@ -13,9 +13,6 @@ import sys
 import threading
 
 ROOT = Path(__file__).resolve().parents[4]
-# The native address is created in a fresh namespace for this run: nothing
-# was ever emitted from it, so only the boot floor of the TCP quiet time applies.
-FRESH_ADDRESS = dict(os.environ, NTCP_SOURCE_QUIET='never')
 
 def cmd(*args):
     subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
@@ -32,7 +29,7 @@ def inside(binary, client_binary, family, parent_namespace):
     else:
         kernel, native, prefix, af = 'fd73::1', 'fd73::2', '64', socket.AF_INET6
         cmd('ip', '-6', 'addr', 'add', kernel + '/' + prefix, 'dev', 'native0', 'nodad')
-    process = subprocess.Popen([binary, 'native0', native, '9000'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=FRESH_ADDRESS)
+    process = subprocess.Popen([binary, 'native0', native, '9000'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
@@ -100,7 +97,7 @@ def inside(binary, client_binary, family, parent_namespace):
                 return count
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as servers:
             pending = [servers.submit(echo) for _ in range(4)]
-            completed = subprocess.run([client_binary, 'native0', native, kernel, '9001'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=25, env=FRESH_ADDRESS)
+            completed = subprocess.run([client_binary, 'native0', native, kernel, '9001'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=25)
             if completed.returncode:
                 raise RuntimeError('native client failed: ' + completed.stderr)
             if completed.stdout.strip() != 'ROUNDTRIP 4 1048576':

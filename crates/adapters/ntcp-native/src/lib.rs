@@ -174,7 +174,6 @@ impl<P: PacketIo> Network<P> {
                 config.tcp.clone(),
                 secret,
                 now,
-                config.lifecycle,
                 move |request| match request {
                     AddressValidation::Bind { local: address }
                     | AddressValidation::Open { local: address, .. } => address == local,

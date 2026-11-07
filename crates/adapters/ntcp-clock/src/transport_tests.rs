@@ -416,35 +416,6 @@ fn clock_read_errors_name_the_clock() {
     }
 }
 
-#[test]
-fn host_boot_age_removes_the_namespace_offset() {
-    // A namespace that presents a host booted ten days earlier.
-    let ten_days = 864_000 * NS;
-    assert_eq!(boot_age(864_000_000_000 + 5, ten_days), Ok(5));
-    assert_eq!(boot_age(5, 0), Ok(5));
-    // One behind the host's clock: the host is older than the reading.
-    assert_eq!(boot_age(5, -NS), Ok(1_000_005));
-    // A fraction of a microsecond of offset rounds the age down.
-    assert_eq!(boot_age(5, 1), Ok(4));
-    for (ticks, offset) in [(5, ten_days), (5, 5_000), (0, 0)] {
-        assert_eq!(
-            boot_age(ticks, offset),
-            Err(TransportError::BootAge {
-                ticks,
-                boottime_offset_ns: offset,
-            })
-        );
-    }
-    // More than the ticks' range.
-    assert_eq!(
-        boot_age(u64::MAX, -NS),
-        Err(TransportError::BootAge {
-            ticks: u64::MAX,
-            boottime_offset_ns: -NS,
-        })
-    );
-}
-
 /// Observations of the clocks of the host running this test. They show what
 /// this kernel did during the test, nothing about other hardware or about
 /// the clock's accuracy; everything above tests parsing and arithmetic.
@@ -498,45 +469,30 @@ mod host_observations {
         );
     }
 
-    #[test]
-    fn boot_age_is_positive() {
-        let mut clock = TransportClock::new().unwrap();
-        let ticks = clock.sample().unwrap().ticks;
-        eprintln!(
-            "observed: {:?}, boot age {} us",
-            clock.characterization(),
-            clock.boot_age(ticks).unwrap()
-        );
-        assert!(clock.boot_age(ticks).unwrap() > 0);
-    }
-
     const NAMESPACED: &str = "NTCP_CLOCK_TIME_NAMESPACE_CHILD";
 
-    // The provider inside a time namespace: its offsets, ticks and boot age.
+    // The provider inside a time namespace: its offsets and ticks.
     fn report() {
         let mut clock = TransportClock::new().unwrap();
         let ticks = clock.sample().unwrap().ticks;
         let offsets = clock.characterization().offsets;
         println!(
-            "NAMESPACED {} {} {ticks} {}",
-            offsets.monotonic_ns,
-            offsets.boottime_ns,
-            clock.boot_age(ticks).unwrap()
+            "NAMESPACED {} {} {ticks}",
+            offsets.monotonic_ns, offsets.boottime_ns
         );
     }
 
     /// A real time namespace (`unshare --time`, a user namespace for the
     /// privilege) whose boottime offset presents a host booted a day earlier:
-    /// the provider inside reads the offset and reports the host's own boot
-    /// age, bracketed by readings outside. The host's clock is not touched.
-    /// Without namespace support this fails, it never skips.
+    /// the provider inside reads the offset, and its ticks carry it, bracketed
+    /// by readings outside. The host's clock is not touched. Without
+    /// namespace support this fails, it never skips.
     #[test]
-    fn a_time_namespace_offset_leaves_the_host_boot_age() {
+    fn a_time_namespace_offset_is_characterized() {
         if std::env::var_os(NAMESPACED).is_some() {
             return report();
         }
-        let name =
-            "transport::tests::host_observations::a_time_namespace_offset_leaves_the_host_boot_age";
+        let name = "transport::tests::host_observations::a_time_namespace_offset_is_characterized";
         let offset_s: i64 = 86_400;
         let before = read(Clock::Boottime) / NANOS_PER_MICROSECOND;
         let output = std::process::Command::new("unshare")
@@ -560,22 +516,18 @@ mod host_observations {
             .unwrap_or_else(|| panic!("no report from the namespace: {stdout}"));
         let fields: Vec<i128> = report
             .split(' ')
-            .take(4)
+            .take(3)
             .map(|f| f.parse().unwrap())
             .collect();
-        let (monotonic_ns, boottime_ns, ticks, age) = (fields[0], fields[1], fields[2], fields[3]);
+        let (monotonic_ns, boottime_ns, ticks) = (fields[0], fields[1], fields[2]);
         eprintln!(
             "observed in a time namespace: offset {offset_s} s, boot id {}, ticks {ticks} us, \
-             boot age {age} us, host {before}..{after} us",
+             host {before}..{after} us",
             TransportClock::new().unwrap().characterization().boot_id
         );
         let offset_us = i128::from(offset_s) * 1_000_000;
         assert_eq!((monotonic_ns, boottime_ns), (0, offset_us * 1_000));
-        // The namespace's clock carries the offset; the boot age does not.
+        // The namespace's clock carries the offset.
         assert!((before + offset_us..=after + offset_us).contains(&ticks));
-        assert!(
-            (before..=after).contains(&age),
-            "boot age {age} outside {before}..{after}"
-        );
     }
 }

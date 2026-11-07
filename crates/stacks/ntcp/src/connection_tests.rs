@@ -18431,7 +18431,6 @@ fn timestamp_units_mixed_peer_echo_wrap_and_timebase() {
                 },
                 [1; 32],
                 0,
-                crate::SETTLED,
                 |_| true,
             )
             .unwrap();
@@ -18474,7 +18473,6 @@ fn timestamp_boundary_saturates_and_disabled_units_are_inert() {
             },
             [1; 32],
             0,
-            crate::SETTLED,
             |_| true,
         )
         .unwrap();
@@ -18728,8 +18726,8 @@ fn assert_timestamp_interop_on_serviced_clocks(
     };
     let mut peer_cfg = cfg.clone();
     peer_cfg.connection.timestamp_granularity = TimestampGranularity::Milliseconds;
-    let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
-    let mut b = Endpoint::new(peer_cfg, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+    let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
     let listener = b.listen(tuple().remote, 1).unwrap();
     let id = a.connect(0, tuple().local, tuple().remote).unwrap();
     transfer(&mut a, &mut b, 0);
@@ -19001,8 +18999,8 @@ fn timestamp_long_idle_connections_resume_on_serviced_endpoint_clock() {
             peer_cfg.connection.timestamps = negotiated;
             // Mixed units remain opaque to the peer, including after physical PAWS expiry.
             peer_cfg.connection.timestamp_granularity = TimestampGranularity::Milliseconds;
-            let mut a = Endpoint::new(cfg, [1; 32], 0, crate::SETTLED, |_| true).unwrap();
-            let mut b = Endpoint::new(peer_cfg, [2; 32], 0, crate::SETTLED, |_| true).unwrap();
+            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
             let listener = b.listen(tuple().remote, 1).unwrap();
             let id = a.connect(0, tuple().local, tuple().remote).unwrap();
             transfer(&mut a, &mut b, 0);

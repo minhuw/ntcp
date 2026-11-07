@@ -919,7 +919,7 @@ impl Owner {
             ports.push(port);
         }
         let secret = random_secret()?;
-        let mut owner = Self::with_ports(ports, secret, tcp, config.continuity())?;
+        let mut owner = Self::with_ports(ports, secret, tcp)?;
         owner.initialize_socket_config(config)?;
         owner.attach_backend_host(1)?;
         owner.enable_egress(config.io.egress_capacity, config.io.gso)?;
@@ -988,7 +988,7 @@ impl Owner {
             return Err(EINVAL);
         };
         let secret = random_secret()?;
-        let mut owner = Self::with_ports(ports, secret, tcp, config.continuity())?;
+        let mut owner = Self::with_ports(ports, secret, tcp)?;
         owner.initialize_socket_config(config)?;
         owner.attach_backend_host(u64::from(index))?;
         owner.enable_reservations(&config.io)?;

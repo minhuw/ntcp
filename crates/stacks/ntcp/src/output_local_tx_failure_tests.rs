@@ -49,7 +49,6 @@ fn local_failure_endpoint() -> (Endpoint, ConnectionId, u32) {
         },
         [1; 32],
         0,
-        crate::SETTLED,
         |_| true,
     )
     .unwrap();

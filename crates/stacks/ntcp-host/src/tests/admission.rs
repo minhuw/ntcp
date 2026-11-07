@@ -2,18 +2,15 @@ use super::*;
 use std::println;
 
 // Counts provider transactions while delegating to the real Host authority.
-pub(super) struct Counting<'a> {
-    pub(super) host: &'a mut Host,
-    pub(super) prepared: usize,
+struct Counting<'a> {
+    host: &'a mut Host,
+    prepared: usize,
 }
 impl PathProvider for Counting<'_> {
     type Error = Error;
     fn prepare(&mut self, request: PathFactoryRequest) -> Result<ntcp::PreparedFactory, Error> {
         self.prepared += 1;
         self.host.prepare(request)
-    }
-    fn check(&self, request: PathFactoryRequest) -> Result<(), Error> {
-        self.host.check(request)
     }
     fn commit(&mut self, prepared: PreparedPath, connection: ConnectionId) {
         self.host.commit(prepared, connection);
@@ -23,7 +20,7 @@ impl PathProvider for Counting<'_> {
     }
 }
 
-pub(super) fn syn(ip: IpMetadata, port: u16) -> Vec<u8> {
+fn syn(ip: IpMetadata, port: u16) -> Vec<u8> {
     let mut tcp = vec![0; 20];
     let len = ntcp::wire::encode(
         ip,
@@ -57,7 +54,7 @@ fn ipv4_frame(ip: IpMetadata, tcp: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(tcp);
     frame
 }
-pub(super) fn usage(host: &Host) -> (usize, usize, usize, usize) {
+fn usage(host: &Host) -> (usize, usize, usize, usize) {
     let usage = host.paths().usage();
     (
         host.binding_count(),
@@ -66,7 +63,7 @@ pub(super) fn usage(host: &Host) -> (usize, usize, usize, usize) {
         usage.clients,
     )
 }
-pub(super) fn core_input(
+fn core_input(
     peer: &mut (Host, Endpoint, IngressContext),
     now: u64,
     ip: IpMetadata,

@@ -8,7 +8,7 @@ fn administrative_sequences_preserve_authoritative_identity_and_nonincreasing_bo
     for seed in 0..16u64 {
         let mut config = EndpointConfig::default();
         config.connection.timestamps = false;
-        let mut endpoint = Endpoint::new(config, [42; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
         let address = "192.0.2.1:8080".parse().unwrap();
         let mut listener = endpoint.listen(address, 8).unwrap();
         let keys = [
@@ -111,7 +111,7 @@ fn registry_capacity_and_allocation_failure_are_atomic_and_legacy_revocation_blo
     use crate::{FastOpenCookieLifetime, FastOpenKeyLease, FastOpenServerKey};
     let mut config = EndpointConfig::default();
     config.connection.timestamps = false;
-    let mut endpoint = Endpoint::new(config, [42; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let mut endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
     let address = "192.0.2.1:8080".parse().unwrap();
     let listener = endpoint.listen(address, 8).unwrap();
     endpoint
@@ -234,7 +234,7 @@ fn registry_capacity_and_allocation_failure_are_atomic_and_legacy_revocation_blo
 #[test]
 fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection() {
     for v6 in [false, true] {
-        let mut endpoint = Endpoint::new(EndpointConfig::default(), [42; 32], 0, crate::SETTLED, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [42; 32], 0, |_| true).unwrap();
         let tuple = Tuple {
             local: if v6 {
                 "[2001:db8::1]:8080"
@@ -329,7 +329,7 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
 fn scoped_tuple_digests_separate_zones_and_keep_unscoped_bytes() {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let endpoint = Endpoint::new(EndpointConfig::default(), [5; 32], 0, crate::SETTLED, |_| true).unwrap();
+    let endpoint = Endpoint::new(EndpointConfig::default(), [5; 32], 0, |_| true).unwrap();
     let tuple = Tuple {
         local: "[fe80::1]:1000".parse().unwrap(),
         remote: "[fe80::2]:8080".parse().unwrap(),

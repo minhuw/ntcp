@@ -121,8 +121,8 @@ fn handshake_limit_time_wait_reuse_snapshots_listener() {
     cfg.connection.timestamps = true;
     cfg.reuse_time_wait = true;
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, crate::SETTLED, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let first = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 1_000);

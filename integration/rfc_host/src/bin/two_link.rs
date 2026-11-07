@@ -596,12 +596,7 @@ fn run() -> io::Result<()> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut secret)?;
     let mut time = ntcp_clock::TransportClock::new().map_err(io::Error::other)?;
     let started = time.sample().map_err(io::Error::other)?.ticks;
-    // The harness created this namespace and its addresses for this run.
-    let lifecycle = ntcp::Lifecycle {
-        boot_age: Some(time.boot_age(started).map_err(io::Error::other)?),
-        continuity: ntcp::SourceContinuity::Never,
-    };
-    let mut endpoint = Endpoint::new(config.clone(), secret, started, lifecycle, move |request| match request {
+    let mut endpoint = Endpoint::new(config.clone(), secret, started, move |request| match request {
         ntcp::AddressValidation::Bind { local: bind } => bind == local,
         ntcp::AddressValidation::Open { local: source, .. } => source == local,
         ntcp::AddressValidation::Route { source, .. } => source == local,

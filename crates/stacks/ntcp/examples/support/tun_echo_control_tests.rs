@@ -84,7 +84,7 @@ fn tun_echo_serves_pathctl_processes_and_control_is_opt_in() {
             .parse()
             .unwrap();
         let config = EndpointConfig::default();
-        let mut endpoint = Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+        let mut endpoint = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
         let mut network = TunHost::attach(&mut endpoint, &config, local).unwrap();
         endpoint
             .connect_with_path_provider(

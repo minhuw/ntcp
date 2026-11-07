@@ -72,7 +72,6 @@ fn endpoint(key: u8, nano: bool, reserved: bool) -> Endpoint {
         },
         [key; 32],
         0,
-        crate::SETTLED,
         |_| true,
     )
     .unwrap();

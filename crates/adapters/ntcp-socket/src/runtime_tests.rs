@@ -35,7 +35,7 @@ fn sender_metadata_failure_does_not_consume_external_producer() {
     config.connection.send_capacity = 128;
     config.connection.receive_capacity = 1;
     config.connection.mss = 64;
-    let mut probe = Endpoint::new(config.clone(), [1; 32], 0, ntcp::Lifecycle { boot_age: Some(u64::MAX), continuity: ntcp::SourceContinuity::Never }, |_| true).unwrap();
+    let mut probe = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
     probe
         .connect(
             0,

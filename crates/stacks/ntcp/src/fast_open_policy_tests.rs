@@ -86,7 +86,6 @@ fn endpoint() -> Endpoint {
         },
         [42; 32],
         0,
-        crate::SETTLED,
         |_| true,
     )
     .unwrap()
@@ -734,7 +733,6 @@ fn passive_repair_syn_data_requires_physical_ack() {
                         },
                         [42; 32],
                         0,
-                        crate::SETTLED,
                         |_| true,
                     )
                     .unwrap();
@@ -1211,29 +1209,20 @@ impl ScopedPaths {
 impl PathProvider for ScopedPaths {
     type Error = ntcp_path::Error;
     fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Self::Error> {
-        let (client, snapshot) = self.0.acquire(self.request(request)?)?;
+        let destination = ntcp_path::ScopedAddress::new(request.tuple.remote.ip(), request.zone)?;
+        let (client, snapshot) = self.0.acquire(ntcp_path::PathRequest {
+            source: self.1,
+            destination,
+            dscp: request.dscp,
+        })?;
         Ok(PreparedFactory {
             path: PreparedPath { client, snapshot },
             receive: ReceiveIpCapability::new(self.0.context(), true, 1500).unwrap(),
         })
     }
-    fn check(&self, request: PathFactoryRequest) -> Result<(), Self::Error> {
-        self.0.resolve(self.request(request)?).map(|_| ())
-    }
     fn commit(&mut self, _: PreparedPath, _: ConnectionId) {}
     fn cancel(&mut self, prepared: PreparedPath) {
         self.0.release(prepared.client).unwrap();
-    }
-}
-
-#[cfg(feature = "tfo-linux-cookie")]
-impl ScopedPaths {
-    fn request(&self, request: PathFactoryRequest) -> Result<ntcp_path::PathRequest, ntcp_path::Error> {
-        Ok(ntcp_path::PathRequest {
-            source: self.1,
-            destination: ntcp_path::ScopedAddress::new(request.tuple.remote.ip(), request.zone)?,
-            dscp: request.dscp,
-        })
     }
 }
 

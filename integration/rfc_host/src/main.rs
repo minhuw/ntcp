@@ -231,7 +231,7 @@ fn run() -> io::Result<()> {
     let mut config = api::SocketConfig::new("t5n", local);
     // The harness created this address in a fresh namespace for this run,
     // so nothing was emitted from it before: this states the fact for the
-    // IP Identification and TCP quiet periods alike.
+    // IP Identification quiet period.
     config.io.source_quiet = api::SourceQuiet::Never;
     config.io.backend = api::Backend::AfPacket;
     config.io.prefix = Some(if local.is_ipv4() { 24 } else { 64 });
@@ -809,7 +809,6 @@ fn scoped(args: &[String]) -> io::Result<()> {
 //   start ID PEER PORT   nonblocking connect only: report what it returned
 //   pending ID           report readiness and SO_ERROR without waiting
 //   finish ID            wait for writability, then report SO_ERROR
-//   clock                report the transport provider's sample and boot age
 //   send ID N SALT       write N bytes (pattern SALT)
 //   recv ID N SALT       read and verify N bytes (pattern SALT)
 //   shutdown ID          shut down the sending direction
@@ -843,7 +842,6 @@ fn phased(args: &[String]) -> io::Result<()> {
         })?,
         None => api::configure(config)?,
     }
-    let mut clock = ntcp_clock::TransportClock::new().map_err(io::Error::other)?;
     let family = if local.is_ipv4() { AF_INET } else { AF_INET6 };
     emit(format!(
         "{{\"event\":\"ready\",\"backend\":\"AfPacket\",\"packet_test\":false,\"local\":\"{local}\",\"index\":{index}}}"
@@ -953,14 +951,6 @@ fn phased(args: &[String]) -> io::Result<()> {
                 emit(format!(
                     "{{\"event\":\"finished\",\"id\":{id:?},\"so_error\":{}}}",
                     so_error(fd)?
-                ));
-            }
-            Some("clock") => {
-                let ticks = clock.sample().map_err(io::Error::other)?.ticks;
-                emit(format!(
-                    "{{\"event\":\"clock\",\"ticks\":{ticks},\"boot_age_us\":{},\"boot_id\":\"{}\"}}",
-                    clock.boot_age(ticks).map_err(io::Error::other)?,
-                    clock.characterization().boot_id
                 ));
             }
             Some("send") => {

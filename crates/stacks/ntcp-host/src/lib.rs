@@ -2389,43 +2389,6 @@ impl Host {
                     .is_ok_and(|plan| !plan.segments.is_empty()))
     }
 
-    // Everything a factory's preparation decides before it acquires
-    // anything: the receive capability, a free binding, and the path
-    // request and forwarding destination it would acquire.
-    fn factory_path(
-        &self,
-        request: PathFactoryRequest,
-    ) -> Result<(ntcp::ReceiveIpCapability, usize, PathRequest, ScopedAddress), Error> {
-        if !self.attached {
-            return Err(Error::InvalidContext);
-        }
-        // Derived before anything is acquired, so that a Host without a
-        // receive capability for the family retains nothing.
-        let receive = self.receive_ip_capability(request.tuple.local.is_ipv6())?;
-        let index = self
-            .bindings
-            .iter()
-            .position(Option::is_none)
-            .ok_or(Error::Capacity)?;
-        let destination = request
-            .ipv4_options
-            .source_route
-            .and_then(|r| r.hops().first().copied())
-            .map(IpAddr::V4)
-            .unwrap_or(request.tuple.remote.ip());
-        let zone = request.zone;
-        let request = self.request(
-            request.tuple.local.ip(),
-            request.tuple.remote.ip(),
-            zone,
-            request.dscp,
-        )?;
-        let via = scoped(destination, zone)?;
-        let resolved = self.paths.resolve_via(request, via)?;
-        self.forwarding_resolved(resolved.key())?;
-        Ok((receive, index, request, via))
-    }
-
     fn forwarding_resolved(&self, key: path::PathKey) -> Result<(), Error> {
         if key.destination().address().is_ipv6() && self.paths.link(key.link())?.mtu < 1280 {
             return Err(Error::Unsupported);
@@ -2975,8 +2938,34 @@ impl PathProvider for Host {
     //= reason=Each IPv6 link keeps its own Path MTU information. PathService keys learned estimates by context, source, destination with its zone, routing DSCP, link, next hop and route generation, and a link-local destination carries an authoritative LinkId zone (context, slot, generation) with which Host::prepare selects and acquires the path on exactly that link before TCP construction. T18 carries this scoped tuple through Endpoint and Host factories, listeners (an exact address and zone beats the wildcard; wildcard children carry the arrival link), TIME-WAIT, digests, Fast Open and MSS caches, Host UDP flows and zone-constrained ICMP correlation; the native runtime resolves sin6_scope_id through its interface-index-to-live-link map over a bounded collection of configured ports, each with its own link, addresses and routes, and IPv6 Ethernet ports resolve next hops by bounded host Neighbor Discovery. Host tests (ntcp-host src/tests/scoped.rs) keep identical link-local pairs on two links as separate connections and UDP flows, and a PTB correlated with one link's submission lowers only that link's estimate; the native two-port test neighbor_discovery_ports_keep_path_mtu_per_link probes each connection up to its own link MTU (1500 and 1400), and a checksummed PTB quoting a packet definitely submitted on one port lowers only that port's estimate and packet sizes while the other port's estimate and both first-hop MTUs stay unchanged; the integration/rfc_host scoped two-link case (one native runtime owning two veth links of MTU 1500 and 1400 to one Linux peer namespace, identical link-local pairs, captured DAD and NS/NA, hashed TCP streams on both links) shows a checksummed, harness-injected PTB quoting a captured packet on link A lowering only A's learned PMTU and packet sizes while link B keeps 1400-octet packets and both first-hop MTUs stay unchanged, and later connections start at their own link's value.
     //# Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.
     fn prepare(&mut self, request: PathFactoryRequest) -> Result<PreparedFactory, Error> {
+        if !self.attached {
+            return Err(Error::InvalidContext);
+        }
+        // Derived before anything is acquired, so that a Host without a
+        // receive capability for the family retains nothing.
+        let receive = self.receive_ip_capability(request.tuple.local.is_ipv6())?;
+        let index = self
+            .bindings
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Error::Capacity)?;
+        let destination = request
+            .ipv4_options
+            .source_route
+            .and_then(|r| r.hops().first().copied())
+            .map(IpAddr::V4)
+            .unwrap_or(request.tuple.remote.ip());
         let plan = request.registration;
-        let (receive, index, request, via) = self.factory_path(request)?;
+        let zone = request.zone;
+        let request = self.request(
+            request.tuple.local.ip(),
+            request.tuple.remote.ip(),
+            zone,
+            request.dscp,
+        )?;
+        let via = scoped(destination, zone)?;
+        let resolved = self.paths.resolve_via(request, via)?;
+        self.forwarding_resolved(resolved.key())?;
         let (client, snapshot) = self.paths.acquire_via(request, via)?;
         let prepared = PreparedPath { client, snapshot };
         // A planned open is authorized for exactly the authority selected
@@ -2993,9 +2982,6 @@ impl PathProvider for Host {
             path: prepared,
             receive,
         })
-    }
-    fn check(&self, request: PathFactoryRequest) -> Result<(), Error> {
-        self.factory_path(request).map(|_| ())
     }
     fn commit(&mut self, prepared: PreparedPath, connection: ConnectionId) {
         let binding = self

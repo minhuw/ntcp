@@ -170,10 +170,6 @@ impl IoConfig {
 /// the end of the remaining quiet period (`Continuity::QuietFor`). The
 /// assertion states a fact about the deployment; it does not shorten the
 /// MDL, and a false assertion can repeat an identifier still in flight.
-///
-/// IP emission ceasing implies TCP emission ceased, so the same fact bounds
-/// the TCP quiet time (`ntcp::Lifecycle`): the runtime's one admission
-/// deadline takes the latest fact over `io.*` and every `port.<name>`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SourceQuiet {
     #[default]
@@ -183,15 +179,6 @@ pub enum SourceQuiet {
 }
 
 impl SourceQuiet {
-    /// The same fact for the TCP lifecycle.
-    pub(crate) fn tcp(self) -> ntcp::SourceContinuity {
-        match self {
-            Self::Unknown => ntcp::SourceContinuity::Unknown,
-            Self::Seconds(seconds) => ntcp::SourceContinuity::CeasedFor(seconds),
-            Self::Never => ntcp::SourceContinuity::Never,
-        }
-    }
-
     /// The whole seconds emission from an address is stated to have ceased
     /// before startup; unknown states nothing.
     pub(crate) fn quiet_seconds(self) -> Option<u64> {
@@ -264,15 +251,6 @@ impl SocketConfig {
                 source_quiet: SourceQuiet::Unknown,
             },
         }
-    }
-
-    /// The latest continuity fact over every address this runtime owns.
-    pub(crate) fn continuity(&self) -> ntcp::SourceContinuity {
-        self.ports
-            .iter()
-            .fold(self.io.source_quiet.tcp(), |fact, port| {
-                fact.latest(port.source_quiet.tcp())
-            })
     }
 
     pub(crate) fn fast_open_keys_managed(&self) -> io::Result<bool> {

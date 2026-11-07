@@ -24,7 +24,7 @@ impl Passive {
         let mut config = config();
         config.connection.timestamps = false;
         config.connection.delayed_ack_us = 0;
-        let mut endpoint = Endpoint::new(config, [2; 32], 0, crate::SETTLED, test_policy).unwrap();
+        let mut endpoint = Endpoint::new(config, [2; 32], 0, test_policy).unwrap();
         if tfo {
             endpoint.enable_fast_open().unwrap();
         }
