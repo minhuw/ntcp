@@ -50,7 +50,31 @@ impl AfPacket {
     // Protocol is a host-order EtherType (e.g. ETH_P_ALL). No interface settings
     // or promiscuous membership are changed. CAP_NET_RAW is required.
     pub fn bind(ifindex: u32, protocol: u16) -> io::Result<Self> {
-        if ifindex == 0 || ifindex > i32::MAX as u32 || protocol == 0 {
+        if protocol == libc::ETH_P_ALL as u16 {
+            Self::bind_filtered(ifindex, None)
+        } else {
+            Self::bind_protocols(ifindex, &[protocol])
+        }
+    }
+    // Received frames of any of `protocols` (host-order EtherTypes, at most
+    // eight), never this socket's own transmissions: a port that resolves
+    // its IPv4 next hops by ARP needs ARP beside IP on one socket.
+    pub fn bind_protocols(ifindex: u32, protocols: &[u16]) -> io::Result<Self> {
+        if protocols.is_empty()
+            || protocols.len() > 8
+            || protocols
+                .iter()
+                .any(|&p| p == 0 || p == libc::ETH_P_ALL as u16)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid interface index or protocol",
+            ));
+        }
+        Self::bind_filtered(ifindex, Some(protocols))
+    }
+    fn bind_filtered(ifindex: u32, protocols: Option<&[u16]>) -> io::Result<Self> {
+        if ifindex == 0 || ifindex > i32::MAX as u32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid interface index or protocol",
@@ -91,48 +115,48 @@ impl AfPacket {
         {
             return Err(io::Error::last_os_error());
         }
-        if protocol != libc::ETH_P_ALL as u16 {
+        if let Some(protocols) = protocols {
             // Protocol-specific taps run after Linux may clear VLAN metadata.
             // Use the early ALL tap, filtering skb protocol in-kernel instead.
             // Specific-protocol taps do not receive outgoing packets.
-            let mut instructions = [
-                libc::sock_filter {
-                    code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-                    jt: 0,
-                    jf: 0,
-                    k: (libc::SKF_AD_OFF + libc::SKF_AD_PKTTYPE) as u32,
-                },
-                libc::sock_filter {
-                    code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                    jt: 3,
-                    jf: 0,
-                    k: libc::PACKET_OUTGOING as u32,
-                },
-                libc::sock_filter {
-                    code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-                    jt: 0,
-                    jf: 0,
-                    k: (libc::SKF_AD_OFF + libc::SKF_AD_PROTOCOL) as u32,
-                },
-                libc::sock_filter {
-                    code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                    jt: 0,
-                    jf: 1,
-                    k: u32::from(protocol),
-                },
-                libc::sock_filter {
-                    code: (libc::BPF_RET | libc::BPF_K) as u16,
-                    jt: 0,
-                    jf: 0,
-                    k: u32::MAX,
-                },
-                libc::sock_filter {
-                    code: (libc::BPF_RET | libc::BPF_K) as u16,
-                    jt: 0,
-                    jf: 0,
-                    k: 0,
-                },
-            ];
+            let statement = |code: u32, k: u32, jt: u8, jf: u8| libc::sock_filter {
+                code: code as u16,
+                jt,
+                jf,
+                k,
+            };
+            let count = protocols.len() as u8;
+            let mut instructions = Vec::with_capacity(protocols.len() + 5);
+            instructions.push(statement(
+                libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+                (libc::SKF_AD_OFF + libc::SKF_AD_PKTTYPE) as u32,
+                0,
+                0,
+            ));
+            // Outgoing: to the drop after the protocol tests.
+            instructions.push(statement(
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                libc::PACKET_OUTGOING as u32,
+                count + 1,
+                0,
+            ));
+            instructions.push(statement(
+                libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+                (libc::SKF_AD_OFF + libc::SKF_AD_PROTOCOL) as u32,
+                0,
+                0,
+            ));
+            // A matching protocol: to the accept after the drop.
+            for (index, &protocol) in protocols.iter().enumerate() {
+                instructions.push(statement(
+                    libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                    u32::from(protocol),
+                    count - index as u8,
+                    0,
+                ));
+            }
+            instructions.push(statement(libc::BPF_RET | libc::BPF_K, 0, 0, 0));
+            instructions.push(statement(libc::BPF_RET | libc::BPF_K, u32::MAX, 0, 0));
             let filter = libc::sock_fprog {
                 len: instructions.len() as u16,
                 filter: instructions.as_mut_ptr(),
@@ -551,6 +575,12 @@ pub(crate) mod tests {
             );
         }
         assert!(AfPacket::bind(i32::MAX as u32, 3).is_err());
+        for protocols in [&[][..], &[0x0800, 0], &[3], &[0x0800; 9]] {
+            assert_eq!(
+                AfPacket::bind_protocols(1, protocols).err().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
         // Loopback is not Ethernet, even when CAP_NET_RAW is available.
         let name = c"lo";
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };

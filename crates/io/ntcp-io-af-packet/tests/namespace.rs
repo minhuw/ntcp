@@ -190,6 +190,26 @@ fn isolated_roundtrips() {
     ready(b.as_raw_fd());
     assert_eq!(b.receive(&mut out).unwrap(), Some(frame.len()));
     assert_eq!(&out[..frame.len()], frame);
+    // Several protocols on one socket, without its own transmissions.
+    drop(other);
+    let mut both = AfPacket::bind_protocols(index("nio-b"), &[0x88b5, 0x88b6]).unwrap();
+    let mut third = frame;
+    third[12..14].copy_from_slice(&0x88b7u16.to_be_bytes());
+    for sent in [&frame, &third, &unrelated] {
+        a.transmit(sent).unwrap();
+    }
+    for expected in [&frame, &unrelated] {
+        ready(both.as_raw_fd());
+        assert_eq!(both.receive(&mut out).unwrap(), Some(expected.len()));
+        assert_eq!(&out[..expected.len()], expected);
+    }
+    assert_eq!(both.receive(&mut out).unwrap(), None);
+    both.transmit(&frame).unwrap();
+    ready(a.as_raw_fd());
+    while a.receive(&mut out).unwrap().is_some() {}
+    assert_eq!(both.receive(&mut out).unwrap(), None);
+    drop(both);
+    while b.receive(&mut out).unwrap().is_some() {}
 
     for (name, flags) in [
         ("nio-pi", libc::IFF_TUN),
