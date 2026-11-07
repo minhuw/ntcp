@@ -323,8 +323,9 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
     }
 }
 
-// The tuple digests (lookup, ISN and timestamp-offset domains) keep their
-// unscoped bytes and separate zones, including a recycled link slot.
+// The tuple digests (ISN and timestamp-offset domains) keep their unscoped
+// bytes and separate zones, including a recycled link slot. The lookup hash
+// reads the same tuple encoding and separates the zones too.
 #[test]
 fn scoped_tuple_digests_separate_zones_and_keep_unscoped_bytes() {
     use hmac::{Hmac, Mac};
@@ -356,4 +357,10 @@ fn scoped_tuple_digests_separate_zones_and_keep_unscoped_bytes() {
     assert_ne!(digests[0], digests[1]);
     assert_ne!(digests[0], digests[2]);
     assert_ne!(digests[1], digests[2]);
+    let hashes = crate::fast_open_policy_tests::zones()
+        .map(|zone| endpoint.hash(crate::ScopedTuple::new(tuple, Some(zone)).unwrap()));
+    assert!(hashes.iter().all(|hash| *hash != endpoint.hash(unscoped)));
+    assert_ne!(hashes[0], hashes[1]);
+    assert_ne!(hashes[0], hashes[2]);
+    assert_ne!(hashes[1], hashes[2]);
 }

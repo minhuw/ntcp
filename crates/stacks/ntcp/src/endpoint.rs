@@ -429,6 +429,8 @@ pub struct Endpoint {
     config: EndpointConfig,
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
     secret: [u8; 32],
+    // SipHash key of the connection-table hash (`hash`), derived from `secret`.
+    lookup_key: [u8; 16],
     now: Instant,
     isn_clock: u32,
     last_isn_time: Instant,
@@ -473,6 +475,35 @@ pub struct Endpoint {
     // ponytail: conservative FIFO loss retention until eviction; add path-qualified
     // aging only when measured deployment behavior warrants it.
     setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
+}
+
+fn keyed_mac(secret: &[u8; 32], domain: &[u8]) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
+    mac.update(domain);
+    mac
+}
+
+// Family-tagged addresses and ports, then the link identity of a scoped
+// tuple: the input of the tuple digests and of the lookup hash.
+fn encode_tuple(scoped: ScopedTuple, mut write: impl FnMut(&[u8])) {
+    let tuple = scoped.tuple();
+    for address in [tuple.local, tuple.remote] {
+        match address.ip() {
+            IpAddr::V4(ip) => {
+                write(&[4]);
+                write(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                write(&[6]);
+                write(&ip.octets());
+            }
+        }
+        write(&address.port().to_be_bytes());
+    }
+    if let Some(zone) = scoped.zone() {
+        write(b"zone");
+        write(&zone.to_bytes());
+    }
 }
 
 fn reserved_vec<T>(capacity: usize) -> Result<Vec<T>, EndpointError> {
@@ -585,6 +616,11 @@ impl Endpoint {
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
             config,
             routes: Vec::new(),
+            lookup_key: keyed_mac(&secret, b"ntcp lookup key")
+                .finalize()
+                .into_bytes()[..16]
+                .try_into()
+                .unwrap(),
             secret,
             setup_loss_cache,
             now,
@@ -807,32 +843,19 @@ impl Endpoint {
     // same link-local pair on two links (or a recycled link) never shares an
     // ISN, timestamp offset or lookup position.
     fn digest(&self, domain: &[u8], scoped: ScopedTuple) -> [u8; 32] {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.secret).expect("HMAC accepts a 32-byte key");
-        mac.update(domain);
-        let tuple = scoped.tuple();
-        for address in [tuple.local, tuple.remote] {
-            match address.ip() {
-                IpAddr::V4(ip) => {
-                    mac.update(&[4]);
-                    mac.update(&ip.octets());
-                }
-                IpAddr::V6(ip) => {
-                    mac.update(&[6]);
-                    mac.update(&ip.octets());
-                }
-            }
-            mac.update(&address.port().to_be_bytes());
-        }
-        if let Some(zone) = scoped.zone() {
-            mac.update(b"zone");
-            mac.update(&zone.to_bytes());
-        }
+        let mut mac = keyed_mac(&self.secret, domain);
+        encode_tuple(scoped, |bytes| mac.update(bytes));
         mac.finalize().into_bytes().into()
     }
+    // The connection-table hash runs for every segment, so it is a keyed
+    // SipHash-1-3 of the digest's tuple encoding, not an HMAC. Its key is
+    // secret-derived and the hash never leaves the endpoint: hostile tuples
+    // cannot be chosen to collide, and the probe budget bounds the rest.
     fn hash(&self, tuple: ScopedTuple) -> usize {
-        let tag = self.digest(b"ntcp lookup", tuple);
-        u64::from_be_bytes(tag[..8].try_into().unwrap()) as usize
+        use core::hash::Hasher;
+        let mut hash = siphasher::sip::SipHasher13::new_with_key(&self.lookup_key);
+        encode_tuple(tuple, |bytes| hash.write(bytes));
+        hash.finish() as usize
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
     //= reason=isn adds the four-microsecond clock to the tuple-and-secret HMAC below.

@@ -13,14 +13,14 @@ include = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", 
 
 [features]
 packet-test-controls = []
-tfo-linux-cookie = ["dep:siphasher", "dep:subtle"]
+tfo-linux-cookie = ["dep:subtle"]
 
 [dependencies]
 ntcp-path = { path = "../ntcp-path", version = "0.0.1" }
 ntcp-buffer = { path = "../../net/ntcp-buffer", version = "0.0.1" }
 hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }
-siphasher = { version = "1", default-features = false, optional = true }
+siphasher = { version = "1", default-features = false }
 subtle = { version = "2.6", default-features = false, optional = true }
 
 [dev-dependencies]
