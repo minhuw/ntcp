@@ -78,16 +78,22 @@ int ntcp_dpdk_rx_timestamp_status(uint16_t port, uint16_t queue,
     return 0;
 }
 
-int ntcp_dpdk_receive(uint16_t port, uint16_t queue, uint8_t *out,
+uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
+                                  struct rte_mbuf **packets, uint16_t count) {
+    return rte_eth_rx_burst(port, queue, packets, count);
+}
+
+void ntcp_dpdk_packet_free(void *packet) {
+    rte_pktmbuf_free(packet);
+}
+
+int ntcp_dpdk_receive(void *packet, uint8_t *out,
                       size_t capacity, size_t *length, int timestamp_offset,
                       uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid) {
-    struct rte_mbuf *m;
+    struct rte_mbuf *m = packet;
     *length = 0;
     *timestamp = 0;
     *timestamp_valid = 0;
-    // ponytail: burst one; batch only if profiling shows call overhead matters.
-    if (rte_eth_rx_burst(port, queue, &m, 1) == 0)
-        return 0;
     // PacketIo carries bytes only: stripped tags and coalesced packets cannot
     // be reconstructed from offload metadata without changing its contract.
     int result = -ENOTSUP;

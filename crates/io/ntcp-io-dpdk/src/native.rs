@@ -4,10 +4,20 @@ use ntcp_io::{
     TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit, TransmitTime, TxOutcome,
     TxSchedulingCapabilities, TxTimestampRequest,
 };
-use std::{ffi::c_void, io, marker::PhantomData, ptr::NonNull, rc::Rc};
+use std::{
+    ffi::c_void,
+    io,
+    marker::PhantomData,
+    ptr::{self, NonNull},
+    rc::Rc,
+};
 
 /// Maximum complete frame size accepted by the bounded copy shim.
 pub const MAX_PACKET_LEN: usize = 65_535;
+
+// rte_eth_rx_burst requires a count divisible by eight to support every PMD.
+// Use the smallest portable burst to bound prefetching for the one-packet API.
+const RX_BURST_LEN: usize = 8;
 
 #[path = "segmentation.rs"]
 mod segmentation;
@@ -47,9 +57,11 @@ unsafe extern "C" {
         supported: *mut i32,
         enabled: *mut i32,
     ) -> i32;
+    fn ntcp_dpdk_receive_burst(port: u16, queue: u16, packets: *mut *mut c_void, count: u16)
+    -> u16;
+    fn ntcp_dpdk_packet_free(packet: *mut c_void);
     fn ntcp_dpdk_receive(
-        port: u16,
-        queue: u16,
+        packet: *mut c_void,
         out: *mut u8,
         capacity: usize,
         len: *mut usize,
@@ -85,14 +97,18 @@ struct TimestampConfig {
 }
 
 /// Borrows an already started Ethernet port and its queues. Owns no EAL,
-/// devices, pools, or threads. Each operation submits at most one frame;
-/// explicit zero-copy submission retains external payload leases until reclaim.
+/// devices, pools, or threads. Each operation returns or submits at most one frame;
+/// RX retains prefetched mbufs until delivery or drop. Explicit zero-copy submission
+/// retains external payload leases until reclaim.
 /// Not Send/Sync: the host must enforce DPDK lcore and queue scheduling rules.
 pub struct Dpdk {
     port: u16,
     rx_queue: u16,
     tx_queue: u16,
     pool: NonNull<c_void>,
+    rx_packets: [*mut c_void; RX_BURST_LEN],
+    rx_next: usize,
+    rx_count: usize,
     tso: Option<TsoConfig>,
     shared_limit: Option<u16>,
     rx_timestamp: Option<TimestampConfig>,
@@ -139,6 +155,9 @@ impl Dpdk {
             rx_queue,
             tx_queue,
             pool,
+            rx_packets: [ptr::null_mut(); RX_BURST_LEN],
+            rx_next: 0,
+            rx_count: 0,
             tso: None,
             shared_limit: None,
             rx_timestamp: None,
@@ -267,6 +286,16 @@ impl Dpdk {
     }
 }
 
+impl Drop for Dpdk {
+    fn drop(&mut self) {
+        for &packet in &self.rx_packets[self.rx_next..self.rx_count] {
+            // SAFETY: unread burst entries are owned mbuf chains. The host
+            // keeps EAL and the pool live until the adapter has been dropped.
+            unsafe { ntcp_dpdk_packet_free(packet) };
+        }
+    }
+}
+
 // Keep the default Unsupported TX timestamp methods: SEND_ON_TIMESTAMP is
 // launch scheduling, and timesync TX targets PTP, not ordinary TCP completion.
 impl PacketIo for Dpdk {
@@ -366,14 +395,31 @@ impl PacketIo for Dpdk {
     }
 
     fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
+        if self.rx_next == self.rx_count {
+            self.rx_next = 0;
+            // SAFETY: the live queue is exclusively borrowed, and the array can
+            // hold the requested burst. Each returned mbuf transfers to us.
+            self.rx_count = unsafe {
+                ntcp_dpdk_receive_burst(
+                    self.port,
+                    self.rx_queue,
+                    self.rx_packets.as_mut_ptr(),
+                    RX_BURST_LEN as u16,
+                )
+            } as usize;
+            if self.rx_count == 0 {
+                return Ok(None);
+            }
+        }
+        let packet = std::mem::replace(&mut self.rx_packets[self.rx_next], ptr::null_mut());
+        self.rx_next += 1;
         let (mut len, mut timestamp, mut valid) = (0, 0, 0);
         let config = self.rx_timestamp;
-        // SAFETY: slice/outputs writable; construction guarantees live exclusive
-        // queues. Cached offset/flag were validated against the dynamic registry.
+        // SAFETY: the shim consumes this owned mbuf chain on success or error;
+        // slice/outputs are writable, and the cached offset/flag were validated.
         match unsafe {
             ntcp_dpdk_receive(
-                self.port,
-                self.rx_queue,
+                packet,
                 out.as_mut_ptr(),
                 out.len(),
                 &mut len,
@@ -383,7 +429,6 @@ impl PacketIo for Dpdk {
                 &mut valid,
             )
         } {
-            0 => Ok(None),
             1 => Ok(Some(ReceivedPacket {
                 len,
                 tcp_segment_size: None,

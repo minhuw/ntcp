@@ -10,7 +10,11 @@ int ntcp_dpdk_tx_scheduling_check(uint16_t port, uint16_t queue);
 int ntcp_dpdk_rx_timestamp_lookup(int *offset, uint64_t *flag);
 int ntcp_dpdk_rx_timestamp_status(uint16_t port, uint16_t queue,
                                    int *supported, int *enabled);
-int ntcp_dpdk_receive(uint16_t port, uint16_t queue, uint8_t *out,
+struct rte_mbuf;
+uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
+                                  struct rte_mbuf **packets, uint16_t count);
+void ntcp_dpdk_packet_free(void *packet);
+int ntcp_dpdk_receive(void *packet, uint8_t *out,
                       size_t capacity, size_t *length, int timestamp_offset,
                       uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid);
 int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,

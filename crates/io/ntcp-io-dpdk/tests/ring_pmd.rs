@@ -17,6 +17,7 @@ unsafe extern "C" {
     fn ntcp_test_register_timestamp();
     fn ntcp_test_timestamp(value: u64, valid: i32, corrupt: i32);
     fn ntcp_test_tx_count() -> u32;
+    fn ntcp_test_rx_count() -> u32;
     fn ntcp_test_transformed(kind: u32);
     fn ntcp_test_hold(leave: u32);
     fn ntcp_test_release();
@@ -241,9 +242,136 @@ fn real_ring_pmd_copy_and_ownership() {
                 ntcp_test_release();
             }
         } // Ending the adapter lifetime does not stop the borrowed port/pool.
+        buffered_receive_ownership(port as u16, pool);
         let mut again = Dpdk::from_borrowed(port as u16, 0, 0, pool).unwrap();
         assert_eq!(again.transmit(&[1; 64]).unwrap(), TxOutcome::Submitted);
         ntcp_test_loopback();
         assert_eq!(again.receive(&mut out).unwrap(), Some(64));
+    }
+}
+
+// The real PMD queue distinguishes packets still owned by the host from a
+// prefetched burst owned by the adapter, including on errors and destruction.
+unsafe fn buffered_receive_ownership(port: u16, pool: *mut c_void) {
+    unsafe {
+        let mut out = [0xa5; 256];
+        {
+            let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
+            for sequence in 0..12u8 {
+                assert_eq!(io.transmit(&[sequence; 64]).unwrap(), TxOutcome::Submitted);
+                ntcp_test_loopback();
+            }
+            assert_eq!(ntcp_test_available(), 1023 - 12);
+            assert_eq!(io.receive(&mut out).unwrap(), Some(64));
+            assert_eq!(&out[..64], &[0; 64]);
+            assert!(
+                ntcp_test_rx_count() < 11,
+                "RX must prefetch a vector-compatible burst"
+            );
+            assert_eq!(ntcp_test_available(), 1023 - 11);
+            // A new arrival must follow the already prefetched packets.
+            assert_eq!(io.transmit(&[12; 64]).unwrap(), TxOutcome::Submitted);
+            ntcp_test_loopback();
+            for sequence in 1..=12u8 {
+                assert_eq!(io.receive(&mut out).unwrap(), Some(64));
+                assert_eq!(&out[..64], &[sequence; 64]);
+            }
+            assert_eq!(io.receive(&mut out).unwrap(), None);
+            assert_eq!(ntcp_test_available(), 1023);
+
+            let clock = ClockDescriptor {
+                domain: ClockDomain::Device(17),
+                unit: TimestampUnit::RawTicks { identity: 23 },
+            };
+            io.enable_rx_timestamps(clock).unwrap();
+            for (value, valid) in [(11, 1), (22, 0), (33, 1)] {
+                ntcp_test_timestamp(value, valid, 0);
+            }
+            for (value, valid) in [(11, true), (22, false), (33, true)] {
+                let packet = io.receive_with_metadata(&mut out).unwrap().unwrap();
+                assert_eq!(packet.len, 64);
+                assert_eq!(&out[..64], &[0x42; 64]);
+                assert_eq!(
+                    packet.timestamps.hardware,
+                    valid.then_some(PacketTimestamp {
+                        value,
+                        source: TimestampSource::Hardware,
+                        point: TimestampPoint::DeviceReceive,
+                        clock,
+                    })
+                );
+            }
+            assert_eq!(ntcp_test_available(), 1023);
+
+            assert_eq!(io.transmit(&[0x11; 64]).unwrap(), TxOutcome::Submitted);
+            ntcp_test_loopback();
+            ntcp_test_transformed(0);
+            ntcp_test_corrupt();
+            for (value, length) in [(0x22, 64), (0x44, 129), (0x33, 64)] {
+                assert_eq!(
+                    io.transmit(&vec![value; length]).unwrap(),
+                    TxOutcome::Submitted
+                );
+                ntcp_test_loopback();
+            }
+            assert_eq!(io.receive(&mut out).unwrap(), Some(64));
+            assert_eq!(&out[..64], &[0x11; 64]);
+            assert_eq!(ntcp_test_rx_count(), 0);
+            out.fill(0xa5);
+            assert_eq!(
+                io.receive(&mut out).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
+            assert_eq!(out, [0xa5; 256]);
+            assert!(io.receive(&mut out).is_err());
+            assert_eq!(out, [0xa5; 256]);
+            assert_eq!(io.receive(&mut out).unwrap(), Some(64));
+            assert_eq!(&out[..64], &[0x22; 64]);
+            let mut short = [0xa5; 128];
+            assert!(io.receive(&mut short).is_err());
+            assert_eq!(short, [0xa5; 128]);
+            assert_eq!(io.receive(&mut out).unwrap(), Some(64));
+            assert_eq!(&out[..64], &[0x33; 64]);
+            assert_eq!(io.receive(&mut out).unwrap(), None);
+            assert_eq!(ntcp_test_available(), 1023);
+        }
+
+        // Drop releases unread chains, including every segment, before the
+        // host destroys the borrowed port and pool.
+        {
+            let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
+            for value in 0..3u8 {
+                assert_eq!(io.transmit(&[value; 129]).unwrap(), TxOutcome::Submitted);
+                assert_eq!(ntcp_test_loopback(), 2);
+            }
+            assert_eq!(io.receive(&mut out).unwrap(), Some(129));
+            assert_eq!(ntcp_test_rx_count(), 0);
+            assert_eq!(ntcp_test_available(), 1023 - 4);
+        }
+        assert_eq!(ntcp_test_available(), 1023);
+
+        // Destruction frees only prefetched packets, leaving the rest of the
+        // borrowed queue available to the next adapter.
+        let queued;
+        {
+            let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
+            for sequence in 0..16u8 {
+                assert_eq!(io.transmit(&[sequence; 64]).unwrap(), TxOutcome::Submitted);
+                ntcp_test_loopback();
+            }
+            assert_eq!(io.receive(&mut out).unwrap(), Some(64));
+            assert_eq!(&out[..64], &[0; 64]);
+            queued = ntcp_test_rx_count();
+            assert!(queued > 0 && queued < 15);
+        }
+        assert_eq!(ntcp_test_rx_count(), queued);
+        assert_eq!(ntcp_test_available(), 1023 - queued);
+        let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
+        for sequence in (16 - queued) as u8..16 {
+            assert_eq!(io.receive(&mut out).unwrap(), Some(64));
+            assert_eq!(&out[..64], &[sequence; 64]);
+        }
+        assert_eq!(io.receive(&mut out).unwrap(), None);
+        assert_eq!(ntcp_test_available(), 1023);
     }
 }

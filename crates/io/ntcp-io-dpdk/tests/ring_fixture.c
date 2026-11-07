@@ -33,7 +33,7 @@ int ntcp_test_init(void) {
                     getenv("NTCP_DPDK_TEST_MEMPOOL_PMD")};
     int argc = args[9] ? 10 : 8;
     if (rte_eal_init(argc, args) < 0) return -2;
-    rx = rte_ring_create("ntcp_rx", 8, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
+    rx = rte_ring_create("ntcp_rx", 32, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
     tx = rte_ring_create("ntcp_tx", 8, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
     pool = rte_pktmbuf_pool_create("ntcp_pool", 1023, 0, 0, 256, SOCKET_ID_ANY);
     if (!rx || !tx || !pool) {
@@ -45,7 +45,7 @@ int ntcp_test_init(void) {
     port = (uint16_t)id;
     struct rte_eth_conf conf = {0};
     if (rte_eth_dev_configure(port, 1, 1, &conf) ||
-        rte_eth_rx_queue_setup(port, 0, 8, SOCKET_ID_ANY, NULL, pool) ||
+        rte_eth_rx_queue_setup(port, 0, 32, SOCKET_ID_ANY, NULL, pool) ||
         rte_eth_tx_queue_setup(port, 0, 8, SOCKET_ID_ANY, NULL) ||
         rte_eth_dev_start(port)) return -5;
     return port;
@@ -85,6 +85,7 @@ void ntcp_test_timestamp(uint64_t value, int valid, int corrupt) {
     assert(rte_ring_enqueue(rx, m) == 0);
 }
 unsigned ntcp_test_tx_count(void) { return rte_ring_count(tx); }
+unsigned ntcp_test_rx_count(void) { return rte_ring_count(rx); }
 void ntcp_test_transformed(unsigned kind) {
     struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
     assert(m);
