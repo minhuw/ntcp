@@ -162,6 +162,17 @@ fn read_all(station: &mut Station, connection: ConnId) -> Vec<u8> {
     data
 }
 
+//= https://www.rfc-editor.org/rfc/rfc826#name-abstract
+//= type=test
+//# It then causes
+//# this packet to be broadcast to all stations on the Ethernet cable
+//# originally determined by the routing mechanism.
+//= https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.2
+//= type=test
+//# The link layer SHOULD save (rather than discard) at least
+//# one (the latest) packet of each set of packets destined to
+//# the same unresolved IP address, and transmit the saved
+//# packet when the address has been resolved.
 #[test]
 fn stations_resolve_each_other_and_exchange_data_both_ways() {
     let mut a = Station::new(config(IP_A, MAC_A, None));
@@ -450,6 +461,15 @@ fn static_neighbors_need_no_arp_and_bad_configurations_are_refused() {
     assert!(!refused(point));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc826#name-abstract
+//= type=test
+//# ?Is the opcode ares_op$REQUEST?  (NOW look at the opcode!!)
+//# Yes:
+//# Swap hardware and protocol fields, putting the local
+//# hardware and protocol addresses in the sender fields.
+//# Set the ar$op field to ares_op$REPLY
+//# Send the packet to the (new) target hardware address on
+//# the same hardware on which the request was received.
 #[test]
 fn only_requests_for_the_local_address_are_answered() {
     let mut a = Station::new(config(IP_A, MAC_A, None));
@@ -495,6 +515,14 @@ fn only_requests_for_the_local_address_are_answered() {
     assert_eq!(a.network.counters().discarded, discarded + 2);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc826#name-abstract
+//= type=test
+//# After a suitable time, the daemon considers removing an entry.
+//# It first sends (with a small number of retransmissions if needed)
+//# an address resolution packet with opcode REQUEST directly to the
+//# Ethernet address in the table.  If a REPLY is not seen in a short
+//# amount of time, the entry is deleted.  The request is sent
+//# directly so as not to bother every station on the Ethernet.
 #[test]
 fn idle_entries_are_validated_by_probe_unless_tcp_confirms_them() {
     let mut a = Station::new(config(IP_A, MAC_A, None));
@@ -531,7 +559,7 @@ fn idle_entries_are_validated_by_probe_unless_tcp_confirms_them() {
         .try_write(client, b"lost", WriteOptions::default())
         .unwrap();
     let mut probes = Vec::new();
-    for _ in 0..80 {
+    for _ in 0..100 {
         now += 100_000;
         a.drive(now);
         let sent = a.sent();
@@ -540,13 +568,20 @@ fn idle_entries_are_validated_by_probe_unless_tcp_confirms_them() {
         b.drive(now);
         b.sent();
     }
-    let (at, (destination, probe)) = probes[0];
-    assert_eq!(destination, MAC_B);
-    assert_eq!(probe, request((MAC_A, IP_A), IP_B));
+    let (at, _) = probes[0];
     assert!(
         at >= start + 5 * SECOND && at <= start + 5 * SECOND + 200_000,
         "{at} {start}"
     );
+    // Three unicast requests one second apart, unanswered; a second after
+    // the last the entry is deleted.
+    assert_eq!(probes.len(), 3);
+    for (index, &(sent, (destination, probe))) in probes.iter().enumerate() {
+        assert_eq!(destination, MAC_B);
+        assert_eq!(probe, request((MAC_A, IP_A), IP_B));
+        assert_eq!(sent, at + index as u64 * SECOND);
+    }
+    assert_eq!(a.network.counters().resolution_failures, 1);
 }
 
 // Frames given up while their next hop resolves leave their held records

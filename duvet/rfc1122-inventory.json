@@ -2,7 +2,7 @@
   "rfc": 1122,
   "document_status": "Internet Standard",
   "scope_kind": "scoped-operative",
-  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and the I/O-free ntcp-arp cache's ARP cache validation and per-destination request rate limit (section 2.3.2.1); the section 2.3.2.2 packet queue stays TODO until the embedding integration. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy, ARP transmission on the wire and general host/socket APIs are outside this inventory.",
+  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and ARP (section 2.3.2): the ntcp-arp cache's validation and per-destination request rate limit (2.3.2.1), and the 2.3.2.2 packet queue of ntcp-native Ethernet ports that resolve IPv4 next hops by ARP, which keep each owner's latest frame while its next hop resolves and send it once resolved (ntcp-socket's IPv4 ports still use static neighbours). RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy, other ARP embeddings and general host/socket APIs are outside this inventory.",
   "text_sha256": "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
   "paragraphs": [
     {
@@ -33,12 +33,12 @@
       "id": "1122-arp-queue",
       "section": "2.3.2.2",
       "quote": "The link layer SHOULD save (rather than discard) at least one (the latest) packet of each set of packets destined to the same unresolved IP address, and transmit the saved packet when the address has been resolved.",
-      "status": "TODO",
-      "reason": "ntcp-arp records one held tag per owner while its next hop is unresolved and reports Wake::Retry once resolved (Wake::Unreachable on failure); the embedding keeps the owner's latest frame in its one transmit slot and retransmits it on Retry. Keeping and resending the frame belongs to the ntcp-host/ntcp-native integration, which is pending.",
+      "status": "covered",
+      "reason": "On an ntcp-native Ethernet port that resolves IPv4 next hops by ARP, a frame whose next hop Host::resolve_neighbor holds stays in its owner's one transmit slot (the owner's latest output) without a submission ticket; ntcp-arp records one held tag per owner, and Host::neighbor_wake's Retry resends that frame through egress once the reply arrives, while Unreachable withdraws it unsubmitted with the soft Address Unreachable advice. The native test asserts that the first SYN waits while only the broadcast request leaves and is sent to the replying station's MAC once the reply arrives; the kernel-interop test (tests/linux_arp.py) completes TCP with Linux with no static neighbour. ntcp-socket's IPv4 ports still use static neighbours.",
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.2",
       "evidence": [
-        "crates/stacks/ntcp-arp/src/cache.rs::pub fn next_wake(",
-        "crates/stacks/ntcp-arp/tests/cache.rs::fn held_owners_are_told_to_retry_once_resolved()"
+        "crates/adapters/ntcp-native/src/driver.rs::Ok(NeighborHop::Held)",
+        "crates/adapters/ntcp-native/tests/arp.rs::fn stations_resolve_each_other_and_exchange_data_both_ways()"
       ]
     },
     {

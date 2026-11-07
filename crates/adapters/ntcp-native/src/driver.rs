@@ -317,6 +317,34 @@ impl<P: PacketIo> Network<P> {
     }
     // Up to `limit` due ARP control frames (replies, requests, probes)
     // through their own slot; returns how many were tried.
+    //= https://www.rfc-editor.org/rfc/rfc826#name-abstract
+    //# ?Is the opcode ares_op$REQUEST?  (NOW look at the opcode!!)
+    //# Yes:
+    //# Swap hardware and protocol fields, putting the local
+    //# hardware and protocol addresses in the sender fields.
+    //# Set the ar$op field to ares_op$REPLY
+    //# Send the packet to the (new) target hardware address on
+    //# the same hardware on which the request was received.
+    //
+    // A reply leaves through this port, the one its request arrived on, to
+    // the requester's hardware address.
+    //= https://www.rfc-editor.org/rfc/rfc826#name-abstract
+    //# It then causes
+    //# this packet to be broadcast to all stations on the Ethernet cable
+    //# originally determined by the routing mechanism.
+    //
+    // A request for a next hop this port resolves leaves through it to the
+    // broadcast address.
+    //= https://www.rfc-editor.org/rfc/rfc826#name-abstract
+    //# After a suitable time, the daemon considers removing an entry.
+    //# It first sends (with a small number of retransmissions if needed)
+    //# an address resolution packet with opcode REQUEST directly to the
+    //# Ethernet address in the table.  If a REPLY is not seen in a short
+    //# amount of time, the entry is deleted.  The request is sent
+    //# directly so as not to bother every station on the Ethernet.
+    //
+    // The Host's unicast probes of an unconfirmed entry leave through this
+    // port; the entry is deleted when none is answered.
     fn control_output(
         &mut self,
         now: Instant,
@@ -654,6 +682,13 @@ impl<P: PacketIo> Network<P> {
             let owner = pending.owner.map_or(Owner::Stateless, Owner::Tcp);
             match self.host.resolve_neighbor(context, owner, self.now) {
                 Ok(NeighborHop::Resolved(mac)) => slot.bytes[..6].copy_from_slice(&mac),
+                // The frame stays in its owner's slot, the latest of that
+                // owner's output, and is sent once its wake retries it.
+                //= https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.2
+                //# The link layer SHOULD save (rather than discard) at least
+                //# one (the latest) packet of each set of packets destined to
+                //# the same unresolved IP address, and transmit the saved
+                //# packet when the address has been resolved.
                 Ok(NeighborHop::Held) => {
                     pending.held = true;
                     return Ok(false);

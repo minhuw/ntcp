@@ -202,7 +202,7 @@ inventory = "duvet/rfc791-inventory.json"
 id = 1122
 document_status = "Internet Standard"
 scope_kind = "scoped-operative"
-scope = "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and the I/O-free ntcp-arp cache's ARP cache validation and per-destination request rate limit (section 2.3.2.1); the section 2.3.2.2 packet queue stays TODO until the embedding integration. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy, ARP transmission on the wire and general host/socket APIs are outside this inventory."
+scope = "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and ARP (section 2.3.2): the ntcp-arp cache's validation and per-destination request rate limit (2.3.2.1), and the 2.3.2.2 packet queue of ntcp-native Ethernet ports that resolve IPv4 next hops by ARP, which keep each owner's latest frame while its next hop resolves and send it once resolved (ntcp-socket's IPv4 ports still use static neighbours). RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy, other ARP embeddings and general host/socket APIs are outside this inventory."
 extraction = "manual"
 inventory = "duvet/rfc1122-inventory.json"
 
@@ -218,7 +218,7 @@ inventory = "duvet/rfc6864-inventory.json"
 id = 826
 document_status = "Internet Standard"
 scope_kind = "selected-requirements"
-scope = "SELECTED: Ethernet/IPv4 packet format codec, the reception checks and merge rule, request field generation, and the reply and unicast-probe decisions of the I/O-free ntcp-arp cache; putting requests, replies and probes on the wire awaits the embedding integration (TODO). Other hardware and protocol address spaces and the memo's monitoring and timeout discussion are outside this inventory."
+scope = "SELECTED: Ethernet/IPv4 packet format codec, the reception checks and merge rule, request field generation, and the reply and unicast-probe decisions of the I/O-free ntcp-arp cache, put on the wire by ntcp-host's neighbor calls and ntcp-native Ethernet ports that resolve IPv4 next hops by ARP (ntcp-socket's IPv4 ports still use static neighbours, with no ARP on the wire). Other hardware and protocol address spaces and the memo's monitoring and timeout discussion are outside this inventory."
 extraction = "manual"
 inventory = "duvet/rfc826-additions.toml"
 

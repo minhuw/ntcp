@@ -8,9 +8,9 @@ from rfc_scopes import PREFIX, ROOT, check_registration
 
 
 TARGET = PREFIX + "826#name-abstract"
-# The selected clause set is a review contract: 13 clauses, of which 3 wait
-# for the embedding to transmit and 2 are Linux-default departures.
-CLAUSES = (13, 3, 2, "cba1a185a1ffbb626712f462c3c09f112e8ca1ee1c073044a2ca0e3f8d82558d")
+# The selected clause set is a review contract: 13 clauses, of which 2 are
+# Linux-default departures.
+CLAUSES = (13, 0, 2, "cba1a185a1ffbb626712f462c3c09f112e8ca1ee1c073044a2ca0e3f8d82558d")
 
 
 def entries(name):
@@ -30,7 +30,8 @@ class ArpInventory(unittest.TestCase):
         self.assertEqual(scope["document_status"], "Internet Standard")
         self.assertEqual(scope["inventory"], "duvet/rfc826-additions.toml")
         self.assertTrue(scope["scope"].startswith("SELECTED:"))
-        self.assertIn("awaits the embedding integration (TODO)", scope["scope"])
+        self.assertIn("put on the wire by ntcp-host's neighbor calls and ntcp-native", scope["scope"])
+        self.assertIn("ntcp-socket's IPv4 ports still use static neighbours", scope["scope"])
 
     def test_exact_selected_clauses_and_dispositions(self):
         total, todos, exceptions, digest = CLAUSES
@@ -38,7 +39,8 @@ class ArpInventory(unittest.TestCase):
         dispositions = entries("todos")
         self.assertEqual(len(specs), total)
         self.assertTrue(all(kind == "SPEC" and row["target"] == TARGET for kind, row in specs))
-        self.assertEqual(Counter(kind for kind, _ in dispositions), Counter(TODO=todos, EXCEPTION=exceptions))
+        self.assertEqual(Counter(kind for kind, _ in dispositions),
+                         +Counter(TODO=todos, EXCEPTION=exceptions))
         spec_keys = {audit.clause_key(row) for _, row in specs}
         self.assertTrue({audit.clause_key(row) for _, row in dispositions} <= spec_keys)
         self.assertEqual(clauses_hash(), digest)
@@ -60,6 +62,27 @@ class ArpInventory(unittest.TestCase):
         expected = {audit.clause_key(row) for _, row in entries("additions")} - excepted
         self.assertEqual(set(kinds), expected)
         self.assertTrue(all(found == {"CITATION", "TEST"} for found in kinds.values()))
+
+    def test_wire_clauses_are_cited_and_asserted_by_the_native_port(self):
+        # Putting replies, requests and probes on the wire is ntcp-native's:
+        # each such clause has a citation in its driver and an asserting test.
+        wire = {"Send the packet to the (new) target hardware address on the same hardware",
+                "this packet to be broadcast to all stations on the Ethernet cable",
+                "It first sends (with a small number of retransmissions if needed)"}
+        clauses = {audit.clause_key(row) for _, row in entries("additions")
+                   if any(audit.norm(text) in audit.norm(row["quote"]) for text in wire)}
+        self.assertEqual(len(clauses), 3)
+        native = ROOT / "crates/adapters/ntcp-native"
+        for directory, kind in (("src", "CITATION"), ("tests", "TEST")):
+            found = set()
+            for path in (native / directory).rglob("*.rs"):
+                for annotation in audit.source_annotations(path.read_text()):
+                    if annotation["target"] == TARGET and annotation["kind"] == kind:
+                        self.assertEqual(annotation["reason"], "")
+                        if kind == "TEST":
+                            self.assertIn("assert", annotation["attached"])
+                        found.add(audit.clause_key(annotation))
+            self.assertEqual(found, clauses, directory)
 
 
 class EarlyMemo(unittest.TestCase):

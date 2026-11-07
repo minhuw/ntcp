@@ -18,7 +18,7 @@ from test_annotation_inventory import report_fixture, report_scopes
 CONTRACT = {
     791: (19, 19, 0, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
           "823132a1638cd0fc39160740de5ecd34c696a65f03fbb863122ffffaaf961e8d"),
-    1122: (19, 18, 1, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
+    1122: (19, 19, 0, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
            "d244277d38341742b2aaa1bd1ee9f365e16999e8822a4f28fd25b9b608b02c02"),
     6864: (4, 4, 0, "e00ff443857166e5b26deecfdc77a0a1c5ff17fc87a6a8c50b020ce7f4d516d9",
            "586eabdc924e7104e828cf54cbeddfcdd85f11c2e2ac5e1cc48e5379eba9e772"),

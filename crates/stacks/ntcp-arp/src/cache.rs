@@ -649,7 +649,6 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     /// removed from the held set. The embedding keeps the attempt itself
     /// (one transmit slot per owner) and retries it on `Wake::Retry`.
     //= https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.2
-    //= reason=ntcp-arp records one held tag per owner while its next hop is unresolved and reports Wake::Retry once resolved (Wake::Unreachable on failure); the embedding keeps the owner's latest frame in its one transmit slot and retransmits it on Retry. Keeping and resending the frame belongs to the ntcp-host/ntcp-native integration, which is pending.
     //# The link layer SHOULD save (rather than discard) at least
     //# one (the latest) packet of each set of packets destined to
     //# the same unresolved IP address, and transmit the saved
@@ -824,7 +823,6 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
 
     // Queue the reply to `request`, claiming its target address for `mac`.
     //= https://www.rfc-editor.org/rfc/rfc826#name-abstract
-    //= reason=ntcp-arp builds the reply (fields swapped, local hardware and protocol addresses as sender, ar$op REPLY) and next_control yields it for the receiving link, unicast to the requester's sender hardware address; transmitting it on that link is the embedding's, pending the ntcp-host/ntcp-native integration.
     //# ?Is the opcode ares_op$REQUEST?  (NOW look at the opcode!!)
     //# Yes:
     //# Swap hardware and protocol fields, putting the local
@@ -892,7 +890,6 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             };
             let (limit, destination) = match (e.state, e.mac) {
                 //= https://www.rfc-editor.org/rfc/rfc826#name-abstract
-                //= reason=ntcp-arp addresses each resolution request to the Ethernet broadcast address and yields it for the link the next hop was resolved on; putting it on that link is the embedding's, pending the ntcp-host/ntcp-native integration.
                 //# It then causes
                 //# this packet to be broadcast to all stations on the Ethernet cable
                 //# originally determined by the routing mechanism.
@@ -1035,7 +1032,6 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc826#name-abstract
-    //= reason=ntcp-arp implements the poll: after DELAY_FIRST_PROBE an unconfirmed entry sends up to ucast_solicit unicast requests to the cached Ethernet address, one RetransTimer apart, and is deleted one RetransTimer after the last without a reply; transmitting the polled requests is the embedding's, pending the ntcp-host/ntcp-native integration.
     //# After a suitable time, the daemon considers removing an entry.
     //# It first sends (with a small number of retransmissions if needed)
     //# an address resolution packet with opcode REQUEST directly to the

@@ -235,11 +235,13 @@ dependencies = [
 name = "ntcp-native"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "ntcp",
  "ntcp-arp",
  "ntcp-ethernet",
  "ntcp-host",
  "ntcp-io",
+ "ntcp-io-af-packet",
  "ntcp-io-tun",
  "ntcp-ip",
  "ntcp-ip6",

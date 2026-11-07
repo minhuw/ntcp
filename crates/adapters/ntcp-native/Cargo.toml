@@ -19,3 +19,6 @@ ntcp-ethernet = { path = "../../stacks/ntcp-ethernet", version = "0.0.1" }
 ntcp-io-tun = { path = "../../io/ntcp-io-tun", version = "0.0.1" }
 ntcp-arp = { path = "../../stacks/ntcp-arp", version = "0.0.1" }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ntcp-io-af-packet = { path = "../../io/ntcp-io-af-packet", version = "0.0.1" }
+libc = "0.2"
