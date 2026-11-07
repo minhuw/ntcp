@@ -5,6 +5,11 @@ pub use ntcp_ip_common::Error;
 pub const ETHERNET_HEADER: usize = 14;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 pub const ETHERTYPE_IPV6: u16 = 0x86dd;
+/// The Address Resolution Protocol (RFC 826). The IP parsers above refuse
+/// it; `parse_ethernet_arp` and `encode_ethernet_arp` carry its frames.
+pub const ETHERTYPE_ARP: u16 = 0x0806;
+/// The broadcast Ethernet address, to which ARP requests are sent.
+pub const BROADCAST: [u8; 6] = [0xff; 6];
 #[derive(Clone, Copy, Debug)]
 pub struct Ethernet<'a> {
     pub source: [u8; 6],
@@ -80,6 +85,53 @@ pub fn encode_ethernet(
     if ethernet_payload(ether_type, payload)? != payload.len() {
         return Err(Error::Length);
     }
+    write_frame(out, source, destination, ether_type, payload)
+}
+
+/// An untagged ARP frame: its addresses and everything after the header.
+/// The payload keeps any minimum-frame padding, which the ARP body's own
+/// fixed layout delimits; this layer knows no ARP hardware or protocol
+/// lengths. A VLAN tag is unsupported here as on the IP path.
+pub fn parse_ethernet_arp(bytes: &[u8]) -> Result<Ethernet<'_>, Error> {
+    if bytes.len() < ETHERNET_HEADER {
+        return Err(Error::Truncated);
+    }
+    let ether_type = u16::from_be_bytes([bytes[12], bytes[13]]);
+    match ether_type {
+        ETHERTYPE_ARP => {}
+        0x8100 | 0x88a8 | 0x9100 => return Err(Error::VlanUnsupported),
+        _ => return Err(Error::EtherTypeUnsupported),
+    }
+    let mut source = [0; 6];
+    let mut destination = [0; 6];
+    source.copy_from_slice(&bytes[6..12]);
+    destination.copy_from_slice(&bytes[..6]);
+    Ok(Ethernet {
+        source,
+        destination,
+        ether_type,
+        payload: &bytes[ETHERNET_HEADER..],
+    })
+}
+
+/// An ARP frame carrying the encoded ARP body `payload`, padded to the
+/// 60-octet minimum as `encode_ethernet` pads.
+pub fn encode_ethernet_arp(
+    out: &mut [u8],
+    source: [u8; 6],
+    destination: [u8; 6],
+    payload: &[u8],
+) -> Result<usize, Error> {
+    write_frame(out, source, destination, ETHERTYPE_ARP, payload)
+}
+
+fn write_frame(
+    out: &mut [u8],
+    source: [u8; 6],
+    destination: [u8; 6],
+    ether_type: u16,
+    payload: &[u8],
+) -> Result<usize, Error> {
     let ip_end = payload
         .len()
         .checked_add(ETHERNET_HEADER)

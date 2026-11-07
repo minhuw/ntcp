@@ -396,3 +396,75 @@ fn ipv6_multicast_groups_and_their_ethernet_mapping() {
     // A unicast destination has no multicast mapping.
     assert_eq!(ipv6_multicast_mac(address), None);
 }
+
+// A broadcast ARP request in the form Linux emits (target MAC zero), before
+// zero padding to the 60-octet minimum frame.
+const ARP_REQUEST: [u8; 42] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 0x01, 0x08, 0x06, // Ethernet
+    0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01, // htype, ptype, hlen, plen, op
+    0x02, 0, 0, 0, 0, 0x01, 192, 0, 2, 1, // sender
+    0, 0, 0, 0, 0, 0, 192, 0, 2, 2, // target
+];
+
+#[test]
+fn arp_frames_parse_and_encode_with_padding() {
+    let body = &ARP_REQUEST[ETHERNET_HEADER..];
+    let mut out = [0xaa; 64];
+    let len = encode_ethernet_arp(&mut out, [2, 0, 0, 0, 0, 1], BROADCAST, body).unwrap();
+    assert_eq!(len, 60);
+    assert_eq!(&out[..42], &ARP_REQUEST);
+    assert!(out[42..60].iter().all(|b| *b == 0));
+    assert_eq!(
+        encode_ethernet_arp(&mut out[..59], [2, 0, 0, 0, 0, 1], BROADCAST, body),
+        Err(Error::Truncated)
+    );
+    // Padded and unpadded frames both carry the whole remainder.
+    for frame in [&out[..60], &ARP_REQUEST[..]] {
+        let eth = parse_ethernet_arp(frame).unwrap();
+        assert_eq!(eth.ether_type, ETHERTYPE_ARP);
+        assert_eq!(eth.destination, BROADCAST);
+        assert_eq!(eth.source, [2, 0, 0, 0, 0, 1]);
+        assert_eq!(&eth.payload[..28], body);
+        assert_eq!(eth.payload.len(), frame.len() - ETHERNET_HEADER);
+    }
+    assert_eq!(
+        parse_ethernet_arp(&ARP_REQUEST[..13]).err(),
+        Some(Error::Truncated)
+    );
+}
+
+#[test]
+fn ip_parsers_refuse_arp_and_arp_parser_refuses_others() {
+    let mut frame = [0; 60];
+    frame[..42].copy_from_slice(&ARP_REQUEST);
+    assert_eq!(
+        parse_ethernet(&frame).err(),
+        Some(Error::EtherTypeUnsupported)
+    );
+    assert_eq!(
+        parse_ethernet_fragment(&frame).err(),
+        Some(Error::EtherTypeUnsupported)
+    );
+    assert_eq!(
+        encode_ethernet(
+            &mut [0; 60],
+            [0; 6],
+            BROADCAST,
+            ETHERTYPE_ARP,
+            &frame[14..42]
+        ),
+        Err(Error::EtherTypeUnsupported)
+    );
+    // VLAN-tagged ARP stays unsupported; IP frames are not ARP.
+    for (tag, error) in [
+        (0x8100u16, Error::VlanUnsupported),
+        (0x88a8, Error::VlanUnsupported),
+        (0x9100, Error::VlanUnsupported),
+        (ETHERTYPE_IPV4, Error::EtherTypeUnsupported),
+        (ETHERTYPE_IPV6, Error::EtherTypeUnsupported),
+    ] {
+        let mut tagged = frame;
+        tagged[12..14].copy_from_slice(&tag.to_be_bytes());
+        assert_eq!(parse_ethernet_arp(&tagged).err(), Some(error));
+    }
+}
