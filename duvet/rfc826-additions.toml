@@ -1,0 +1,81 @@
+# Selected RFC 826 clauses implemented by crates/stacks/ntcp-arp. The memo has no
+# numbered sections: Duvet sections its prepared text under its only named
+# heading, so every clause targets name-abstract.
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+ares_op$REQUEST (= 1, high byte transmitted first) and ares_op$REPLY (= 2), and ares_hrd$Ethernet (= 1).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+Ethernet packet data: 16.bit: (ar$hrd) Hardware address space (e.g., Ethernet, Packet Radio Net.) 16.bit: (ar$pro) Protocol address space. For Ethernet hardware, this is from the set of type fields ether_typ$<protocol>. 8.bit: (ar$hln) byte length of each hardware address 8.bit: (ar$pln) byte length of each protocol address 16.bit: (ar$op) opcode (ares_op$REQUEST | ares_op$REPLY) nbytes: (ar$sha) Hardware address of sender of this packet, n from the ar$hln field. mbytes: (ar$spa) Protocol address of sender of this packet, m from the ar$pln field. nbytes: (ar$tha) Hardware address of target of this packet (if known). mbytes: (ar$tpa) Protocol address of target.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+?Do I have the hardware type in ar$hrd? Yes: (almost definitely) [optionally check the hardware length ar$hln] ?Do I speak the protocol in ar$pro? Yes: [optionally check the protocol length ar$pln]
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+There are no padding bytes between addresses. The packet data should be viewed as a byte stream in which only 3 byte pairs are defined to be words (ar$hrd, ar$pro and ar$op) which are sent most significant byte first (Ethernet/PDP-10 byte style).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+Merge_flag := false If the pair <protocol type, sender protocol address> is already in my translation table, update the sender hardware address field of the entry with the new information in the packet and set Merge_flag to true.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+?Am I the target protocol address? Yes: If Merge_flag is false, add the triplet <protocol type, sender protocol address, sender hardware address> to the translation table.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+Notice that the <protocol type, sender protocol address, sender hardware address> triplet is merged into the table before the opcode is looked at.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+Notice also that if an entry already exists for the <protocol type, sender protocol address> pair, then the new hardware address supersedes the old one.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+?Is the opcode ares_op$REQUEST? (NOW look at the opcode!!) Yes: Swap hardware and protocol fields, putting the local hardware and protocol addresses in the sender fields. Set the ar$op field to ares_op$REPLY Send the packet to the (new) target hardware address on the same hardware on which the request was received.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+It then causes this packet to be broadcast to all stations on the Ethernet cable originally determined by the routing mechanism.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+The Address Resolution module then sets the ar$hrd field to ares_hrd$Ethernet, ar$pro to the protocol type that is being resolved, ar$hln to 6 (the number of bytes in a 48.bit Ethernet address), ar$pln to the length of an address in that protocol, ar$op to ares_op$REQUEST, ar$sha with the 48.bit ethernet address of itself, ar$spa with the protocol address of itself, and ar$tpa with the protocol address of the machine that is trying to be accessed.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+It does not set ar$tha to anything in particular, because it is this value that it is trying to determine.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc826#name-abstract"
+quote = '''
+After a suitable time, the daemon considers removing an entry. It first sends (with a small number of retransmissions if needed) an address resolution packet with opcode REQUEST directly to the Ethernet address in the table. If a REPLY is not seen in a short amount of time, the entry is deleted. The request is sent directly so as not to bother every station on the Ethernet.
+'''

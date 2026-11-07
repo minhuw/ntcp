@@ -202,7 +202,7 @@ inventory = "duvet/rfc791-inventory.json"
 id = 1122
 document_status = "Internet Standard"
 scope_kind = "scoped-operative"
-scope = "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy and general host/socket APIs are outside this inventory."
+scope = "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and the I/O-free ntcp-arp cache's ARP cache validation and per-destination request rate limit (section 2.3.2.1); the section 2.3.2.2 packet queue stays TODO until the embedding integration. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy, ARP transmission on the wire and general host/socket APIs are outside this inventory."
 extraction = "manual"
 inventory = "duvet/rfc1122-inventory.json"
 
@@ -213,6 +213,14 @@ scope_kind = "scoped-operative"
 scope = "SCOPED: atomic IPv4 datagram definition, arbitrary sender Identification and receiver ignoring Identification in the unfragmented IPv4 codec/quoted-header decoder. Updates RFC791 and RFC1122 Identification semantics. No full-document or full IPv4 host conformance: non-atomic datagrams, fragmentation/reassembly, non-atomic ID allocation/rate limits, forwarding, NAT and tunnel behavior are outside this inventory."
 extraction = "manual"
 inventory = "duvet/rfc6864-inventory.json"
+
+[[rfc]]
+id = 826
+document_status = "Internet Standard"
+scope_kind = "selected-requirements"
+scope = "SELECTED: Ethernet/IPv4 packet format codec, the reception checks and merge rule, request field generation, and the reply and unicast-probe decisions of the I/O-free ntcp-arp cache; putting requests, replies and probes on the wire awaits the embedding integration (TODO). Other hardware and protocol address spaces and the memo's monitoring and timeout discussion are outside this inventory."
+extraction = "manual"
+inventory = "duvet/rfc826-additions.toml"
 
 [[rfc]]
 id = 8200

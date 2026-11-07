@@ -111,6 +111,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntcp-arp"
+version = "0.0.1"
+dependencies = [
+ "ntcp-ethernet",
+]
+
+[[package]]
 name = "ntcp-buffer"
 version = "0.0.1"
 

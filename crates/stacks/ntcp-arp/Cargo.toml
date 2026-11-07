@@ -1,0 +1,10 @@
+[package]
+name = "ntcp-arp"
+version = "0.0.1"
+edition = "2024"
+rust-version.workspace = true
+license = "MIT"
+repository = "https://github.com/minhuw/ntcp"
+
+[dependencies]
+ntcp-ethernet = { version = "0.0.1", path = "../ntcp-ethernet", default-features = false }

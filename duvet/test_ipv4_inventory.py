@@ -18,8 +18,8 @@ from test_annotation_inventory import report_fixture, report_scopes
 CONTRACT = {
     791: (19, 19, 0, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
           "823132a1638cd0fc39160740de5ecd34c696a65f03fbb863122ffffaaf961e8d"),
-    1122: (16, 16, 0, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
-           "140d6afa98dde87d39941c1863076d8fa41864673c357689e1d81f343880960d"),
+    1122: (19, 18, 1, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
+           "d244277d38341742b2aaa1bd1ee9f365e16999e8822a4f28fd25b9b608b02c02"),
     6864: (4, 4, 0, "e00ff443857166e5b26deecfdc77a0a1c5ff17fc87a6a8c50b020ce7f4d516d9",
            "586eabdc924e7104e828cf54cbeddfcdd85f11c2e2ac5e1cc48e5379eba9e772"),
 }
@@ -50,7 +50,7 @@ def ledger(n):
 class Ipv4Inventory(unittest.TestCase):
     def test_registration_scoped_status_and_exact_clause_contract(self):
         scopes = check_registration()
-        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200})
+        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200, 826})
         for n, (total, covered, todos, text_hash, clauses_hash) in CONTRACT.items():
             with self.subTest(rfc=n):
                 document, scope = ledger(n), scopes[n]

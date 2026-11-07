@@ -1,4 +1,16 @@
 [[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.1"
+quote = "An implementation of the Address Resolution Protocol (ARP) [LINK:2] MUST provide a mechanism to flush out-of-date cache entries. If this mechanism involves a timeout, it SHOULD be possible to configure the timeout value."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.1"
+quote = "A mechanism to prevent ARP flooding (repeatedly sending an ARP Request for the same IP address, at a high rate) MUST be included. The recommended maximum rate is 1 per second per destination."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.2"
+quote = "The link layer SHOULD save (rather than discard) at least one (the latest) packet of each set of packets destined to the same unresolved IP address, and transmit the saved packet when the address has been resolved."
+
+[[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.1"
 quote = "A datagram whose version number is not 4 MUST be silently discarded."
 

@@ -1,0 +1,6 @@
+# The packet queue waits for the ntcp-host/ntcp-native integration.
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.2"
+reason = "ntcp-arp records one held tag per owner while its next hop is unresolved and reports Wake::Retry once resolved (Wake::Unreachable on failure); the embedding keeps the owner's latest frame in its one transmit slot and retransmits it on Retry. Keeping and resending the frame belongs to the ntcp-host/ntcp-native integration, which is pending."
+quote = "The link layer SHOULD save (rather than discard) at least one (the latest) packet of each set of packets destined to the same unresolved IP address, and transmit the saved packet when the address has been resolved."

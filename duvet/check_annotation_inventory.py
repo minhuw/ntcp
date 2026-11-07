@@ -44,7 +44,7 @@ from urllib.request import Request, urlopen
 
 from check_rfc_coverage import check
 from rfc_scopes import PREFIX, ROOT, check_registration
-from historical_rfc import identity, legacy_layout, prepare
+from historical_rfc import early_memo, identity, legacy_layout, prepare
 
 ARTIFACTS = Path("workbench/rfc-annotation-gap")
 REPORT = Path("workbench/duvet/report.json")
@@ -84,8 +84,12 @@ def official_lines(raw):
 def official_sections(raw):
     sections = defaultdict(list)
     current = "preamble"
+    # An early memo has no numbered sections; Duvet's first section must be
+    # 1, so body lines beginning with a number ("100 useless entries") are
+    # never headings there.
+    numbered = not early_memo(raw)
     for line in official_lines(raw):
-        heading = re.match(r"^(?:((?:Appendix|APPENDIX) )([A-Z](?:\.[0-9]+)*)[.:]?|([0-9]+(?:\.[0-9]+)*\.?|[A-Z](?:\.[0-9]+)*\.))\s+\S.*$", line)
+        heading = numbered and re.match(r"^(?:((?:Appendix|APPENDIX) )([A-Z](?:\.[0-9]+)*)[.:]?|([0-9]+(?:\.[0-9]+)*\.?|[A-Z](?:\.[0-9]+)*\.))\s+\S.*$", line)
         if heading and "..." not in line:
             number = (heading[2] or heading[3]).rstrip(".")
             current = ("appendix-" if heading[1] or number[0].isalpha() else "section-") + number

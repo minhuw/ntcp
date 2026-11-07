@@ -46,7 +46,7 @@ def ledger(n):
 class TimeWaitPersistInventories(unittest.TestCase):
     def test_registration_status_and_manual_full_operative_scope(self):
         scopes = check_registration()
-        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200})
+        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200, 826})
         for n, status, sha in (
             (6191, "Best Current Practice", "974f45f076be09e8be66ef8b12e9b5a99ba95b43251502b08539fc53d9347211"),
             (6429, "Informational", "f2d371ecfeb49168b72a86e863a88fb3593fa90a2548b07fa2ead6cff68b6fcf"),

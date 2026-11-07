@@ -2,9 +2,45 @@
   "rfc": 1122,
   "document_status": "Internet Standard",
   "scope_kind": "scoped-operative",
-  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy and general host/socket APIs are outside this inventory.",
+  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and the I/O-free ntcp-arp cache's ARP cache validation and per-destination request rate limit (section 2.3.2.1); the section 2.3.2.2 packet queue stays TODO until the embedding integration. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy, ARP transmission on the wire and general host/socket APIs are outside this inventory.",
   "text_sha256": "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
   "paragraphs": [
+    {
+      "id": "1122-arp-flush",
+      "section": "2.3.2.1",
+      "quote": "An implementation of the Address Resolution Protocol (ARP) [LINK:2] MUST provide a mechanism to flush out-of-date cache entries. If this mechanism involves a timeout, it SHOULD be possible to configure the timeout value.",
+      "status": "covered",
+      "reason": "ArpCache ages REACHABLE entries to STALE after a ReachableTime drawn from [0.5, 1.5) times base_reachable, revalidates a used STALE entry through DELAY and unicast PROBE, and deletes it one RetransTimer after the last unanswered probe; incomplete resolutions fail likewise. Every timer is an ArpTimers field in milliseconds, converted to caller units.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.1",
+      "evidence": [
+        "crates/stacks/ntcp-arp/src/cache.rs::pub fn service(",
+        "crates/stacks/ntcp-arp/tests/cache.rs::fn reachable_ages_to_stale_then_delay_probe_and_reachable_again()"
+      ]
+    },
+    {
+      "id": "1122-arp-flood",
+      "section": "2.3.2.1",
+      "quote": "A mechanism to prevent ARP flooding (repeatedly sending an ARP Request for the same IP address, at a high rate) MUST be included. The recommended maximum rate is 1 per second per destination.",
+      "status": "covered",
+      "reason": "Only ArpCache::next_control originates requests, and each request to a destination reported possibly or definitely submitted defers that destination's next one by RetransTimer (1 s default); blocked or failed attempts consume nothing. Re-resolving never sends sooner, and a failed destination is retried only one RetransTimer after its last request.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.1",
+      "evidence": [
+        "crates/stacks/ntcp-arp/src/cache.rs::pub fn complete(",
+        "crates/stacks/ntcp-arp/tests/cache.rs::fn requests_are_spaced_one_second_apart_then_resolution_fails()"
+      ]
+    },
+    {
+      "id": "1122-arp-queue",
+      "section": "2.3.2.2",
+      "quote": "The link layer SHOULD save (rather than discard) at least one (the latest) packet of each set of packets destined to the same unresolved IP address, and transmit the saved packet when the address has been resolved.",
+      "status": "TODO",
+      "reason": "ntcp-arp records one held tag per owner while its next hop is unresolved and reports Wake::Retry once resolved (Wake::Unreachable on failure); the embedding keeps the owner's latest frame in its one transmit slot and retransmits it on Retry. Keeping and resending the frame belongs to the ntcp-host/ntcp-native integration, which is pending.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-2.3.2.2",
+      "evidence": [
+        "crates/stacks/ntcp-arp/src/cache.rs::pub fn next_wake(",
+        "crates/stacks/ntcp-arp/tests/cache.rs::fn held_owners_are_told_to_retry_once_resolved()"
+      ]
+    },
     {
       "id": "1122-version",
       "section": "3.2.1.1",
