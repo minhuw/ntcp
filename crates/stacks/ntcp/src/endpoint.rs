@@ -58,12 +58,12 @@ impl ActiveOpenOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ConnectionId {
     slot: usize,
     generation: u64,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ListenerId {
     slot: usize,
     generation: u64,
@@ -3795,7 +3795,9 @@ impl Endpoint {
     }
 
     pub fn cancel_tx_timestamps(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        // Observation cancellation changes neither selected bytes nor their
+        // departure accounting. It must remain available while a reservation
+        // is quarantined after an uncertain backend submission.
         self.slot_mut(id)?.connection.tx_timestamps.cancel_from(0);
         Ok(())
     }

@@ -224,6 +224,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntcp-native"
+version = "0.0.1"
+dependencies = [
+ "ntcp",
+ "ntcp-clock",
+ "ntcp-ethernet",
+ "ntcp-host",
+ "ntcp-io",
+ "ntcp-io-tun",
+ "ntcp-ip",
+ "ntcp-ip6",
+]
+
+[[package]]
 name = "ntcp-packetdrill"
 version = "0.0.1"
 dependencies = [
