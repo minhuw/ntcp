@@ -836,3 +836,40 @@ fn write_readiness_is_rearmed_after_send_buffer_backpressure() {
     );
     assert!(!drain(&mut pair.a).contains(&Event::Writable(pair.client)));
 }
+
+#[test]
+fn one_drive_reaches_data_queued_behind_idle_connections() {
+    let mut pair = Pair::new(false, false);
+    let peer = pair.a.connection_info(pair.client).unwrap().peer;
+    let mut connections = vec![pair.client];
+    for _ in 0..3 {
+        let id = pair.a.connect(peer).unwrap();
+        for _ in 0..100 {
+            pair.step();
+            while pair.b.accept(pair.listener).is_ok() {}
+            if pair.a.connection_info(id).unwrap().state == State::Established {
+                break;
+            }
+        }
+        assert_eq!(
+            pair.a.connection_info(id).unwrap().state,
+            State::Established
+        );
+        connections.push(id);
+    }
+    for _ in 0..10 {
+        pair.step();
+    }
+    drain(&mut pair.a);
+    // Setting an option refreshes a connection without giving it output, so
+    // each idle connection is queued ahead of the one with data.
+    let (busy, idle) = connections.split_last().unwrap();
+    for &id in idle {
+        pair.a.set_nodelay(id, true).unwrap();
+    }
+    pair.a
+        .try_write(*busy, b"hello", WriteOptions::default())
+        .unwrap();
+    let report = pair.a.drive(pair.now + 1, BUDGET).unwrap();
+    assert_eq!(report.transmitted, 1, "{report:?}");
+}

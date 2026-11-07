@@ -178,7 +178,13 @@ impl<P: PacketIo> Network<P> {
         if !self.retained.is_empty() {
             report.more_work = true;
         }
+        // Once the endpoint offers nothing and no slot holds a frame to retry,
+        // further polls at this instant cannot transmit anything.
+        let mut exhausted = false;
         for _ in 0..budget.transmit {
+            if exhausted && self.tx_pending == 0 {
+                break;
+            }
             let index = self.tx_cursor;
             self.tx_cursor = (index + 1) % self.tx.len();
             let mut slot = std::mem::replace(
@@ -188,9 +194,18 @@ impl<P: PacketIo> Network<P> {
                     pending: None,
                 },
             );
+            let was_pending = slot.pending.is_some();
             let result = self.transmit_slot(&mut slot, report);
+            let still_pending = slot.pending.is_some();
             self.tx[index] = slot;
-            result?;
+            match (was_pending, still_pending) {
+                (false, true) => self.tx_pending += 1,
+                (true, false) => self.tx_pending -= 1,
+                _ => {}
+            }
+            // A settled retry may release output, so poll again after it.
+            let idle = result?;
+            exhausted = idle || exhausted && was_pending && still_pending;
         }
         if budget.reclaim != 0 {
             report.reclaimed = self
@@ -207,7 +222,11 @@ impl<P: PacketIo> Network<P> {
             .into_iter()
             .chain(self.host.next_reassembly_deadline())
             .min();
-        report.tx_blocked |= self.tx.iter().any(|s| s.pending.is_some());
+        debug_assert_eq!(
+            self.tx_pending,
+            self.tx.iter().filter(|s| s.pending.is_some()).count()
+        );
+        report.tx_blocked |= self.tx_pending != 0;
         if self.endpoint.has_pending_output() {
             report.more_work = true;
         }
@@ -349,7 +368,10 @@ impl<P: PacketIo> Network<P> {
         });
         Ok(())
     }
-    fn transmit_slot(&mut self, slot: &mut TxSlot, report: &mut DriveReport) -> Result<()> {
+    // Ok(true): the endpoint was polled and has nothing left to offer at this
+    // instant. A poll that skipped an idle ready-queue entry still reports
+    // more work, and the next connection may have a packet.
+    fn transmit_slot(&mut self, slot: &mut TxSlot, report: &mut DriveReport) -> Result<bool> {
         let offset = self.config.link.offset();
         if slot.pending.is_none() {
             let header = if self.config.local_address.is_ipv4() {
@@ -365,13 +387,13 @@ impl<P: PacketIo> Network<P> {
                 Ok(result) => result,
                 Err(EndpointError::OutputReserved) => {
                     report.tx_blocked = true;
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(e) => return Err(e.into()),
             };
             report.more_work |= poll.more_work;
             let Some(packet) = poll.packet else {
-                return Ok(());
+                return Ok(!poll.more_work);
             };
             let attempt = attempt.ok_or(Error::InvalidHandle)?;
             let ip_len = if packet.ip.source.is_ipv4() {
@@ -421,13 +443,13 @@ impl<P: PacketIo> Network<P> {
                 }
                 Err(ntcp_host::Error::Capacity | ntcp_host::Error::Allocation) => {
                     report.tx_blocked = true;
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(ntcp_host::Error::Obsolete) => {
                     self.endpoint.reject_unsubmitted(pending.attempt)?;
                     slot.pending = None;
                     report.more_work = true;
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => return Err(error.into()),
             },
@@ -486,7 +508,7 @@ impl<P: PacketIo> Network<P> {
                 return Err(refused.error.into());
             }
         }
-        Ok(())
+        Ok(false)
     }
     fn maintain_connections(&mut self) -> Result<()> {
         for index in 0..self.listeners.len() {
@@ -519,16 +541,19 @@ impl<P: PacketIo> Network<P> {
                 continue;
             }
             if abort {
-                for slot in &mut self.tx {
-                    if slot.pending.as_ref().is_some_and(|p| p.owner == Some(core)) {
-                        let pending = slot.pending.take().unwrap();
-                        if let Some(ticket) = pending.ticket {
-                            self.host.cancel_submission(ticket);
+                if self.tx_pending != 0 {
+                    for slot in &mut self.tx {
+                        if slot.pending.as_ref().is_some_and(|p| p.owner == Some(core)) {
+                            let pending = slot.pending.take().unwrap();
+                            self.tx_pending -= 1;
+                            if let Some(ticket) = pending.ticket {
+                                self.host.cancel_submission(ticket);
+                            }
+                            // Every retained frame is certified unsubmitted. The
+                            // explicit abort below supersedes its restored work.
+                            self.endpoint
+                                .discard_unsubmitted(self.now, pending.attempt, None)?;
                         }
-                        // Every retained frame is certified unsubmitted. The
-                        // explicit abort below supersedes its restored work.
-                        self.endpoint
-                            .discard_unsubmitted(self.now, pending.attempt, None)?;
                     }
                 }
                 if !self.endpoint.is_output_reserved(core) {

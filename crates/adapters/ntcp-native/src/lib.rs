@@ -68,6 +68,8 @@ pub struct Network<P: PacketIo> {
     staged_timestamp: Option<TimestampEvent>,
     backend_clocks: Vec<(u64, ntcp_io::ClockDescriptor)>,
     tx: Vec<driver::TxSlot>,
+    // Slots in `tx` holding a pending frame.
+    tx_pending: usize,
     tx_cursor: usize,
     rx: Vec<u8>,
     completed: Vec<u8>,
@@ -254,6 +256,7 @@ impl<P: PacketIo> Network<P> {
             staged_timestamp: None,
             backend_clocks,
             tx,
+            tx_pending: 0,
             tx_cursor: 0,
             // Capture an oversized physical frame safely before the Host rejects it.
             rx: bytes(65575 + 14)?,
