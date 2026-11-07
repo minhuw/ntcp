@@ -1352,6 +1352,12 @@ impl Ledger {
     /// datagram signatures, and released owners' tombstones.
     pub fn expire(&mut self, now: Instant) {
         for owner in 0..self.owners.len() {
+            // Only `seal` fills history, for an owner a reservation pins, and
+            // `release_owner` empties it before freeing the record.
+            if self.owners[owner].is_none() {
+                debug_assert!((0..self.slots(owner)).all(|s| self.slot(owner, s).is_none()));
+                continue;
+            }
             for slot in 0..self.slots(owner) {
                 if let Some(entry) = self.slot(owner, slot)
                     && !entry.retirable()
