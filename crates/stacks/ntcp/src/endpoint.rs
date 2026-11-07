@@ -417,6 +417,14 @@ pub struct Endpoint {
     fast_open_hmac_error: Option<Error>,
     fast_open: Option<crate::fast_open::FastOpen>,
     reservations: Vec<crate::output_reservation::OutputReservation>,
+    // Reservation bookkeeping, kept in step with every change of a slot's
+    // `current` or its `attempt` (`check_reservation_index`): the slot held
+    // by each connection slot index and by the stateless lane, the number of
+    // free slots, and the number of held slots without a current attempt.
+    reservation_owners: Vec<Option<usize>>,
+    stateless_reservation: Option<usize>,
+    free_reservations: usize,
+    unattempted_reservations: usize,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
@@ -562,6 +570,10 @@ impl Endpoint {
             fast_open_hmac_key: secret,
             fast_open_hmac_error: None,
             reservations: Vec::new(),
+            reservation_owners: Vec::new(),
+            stateless_reservation: None,
+            free_reservations: 0,
+            unattempted_reservations: 0,
             address_policy: Box::new(address_policy),
             passive_errors,
             tuples: TupleTable::new(count)?,
@@ -4469,11 +4481,17 @@ impl Endpoint {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
+        // Only a held slot without a current attempt can wait for pacing.
+        let waiting: &[_] = if self.unattempted_reservations == 0 {
+            &[]
+        } else {
+            &self.reservations
+        };
         self.deadlines
             .first()
             .map(|(time, _)| time)
             .into_iter()
-            .chain(self.reservations.iter().filter_map(|slot| {
+            .chain(waiting.iter().filter_map(|slot| {
                 let r = slot.current.as_ref()?;
                 if r.attempt.is_some() {
                     return None;
@@ -4486,7 +4504,7 @@ impl Endpoint {
             .min()
     }
     pub fn has_pending_output(&self) -> bool {
-        self.reservations.iter().any(|slot| slot.current.is_some())
+        self.free_reservations != self.reservations.len()
             || !self.output.is_empty()
             || !self.control.is_empty()
             || !self.cleanup.is_empty()
@@ -4659,6 +4677,8 @@ impl Endpoint {
         if charge > self.buffer_room() {
             return Err(Error::NoMemory.into());
         }
+        let mut owners = reserved_vec(self.slots.len())?;
+        owners.resize(self.slots.len(), None);
         let mut slots = reserved_vec(count)?;
         for index in 0..count {
             let mut slot = crate::output_reservation::OutputReservation::new();
@@ -4671,6 +4691,10 @@ impl Endpoint {
             slots.push(slot);
         }
         self.reservations = slots;
+        self.reservation_owners = owners;
+        self.stateless_reservation = None;
+        self.free_reservations = count;
+        self.unattempted_reservations = 0;
         self.buffer_bytes += charge;
         Ok(())
     }
@@ -4689,13 +4713,93 @@ impl Endpoint {
             .flatten()
     }
 
-    // ponytail: bounded linear pool lookup; add a slot index if measured flow counts warrant it.
     pub fn is_output_reserved(&self, id: ConnectionId) -> bool {
-        self.reservations.iter().any(|slot| {
-            slot.current
-                .as_ref()
-                .is_some_and(|r| r.packet.connection == Some(id))
-        })
+        let reserved = self.reservation_of(Some(id)).is_some();
+        debug_assert_eq!(
+            reserved,
+            self.reservations.iter().any(|slot| {
+                slot.current
+                    .as_ref()
+                    .is_some_and(|r| r.packet.connection == Some(id))
+            })
+        );
+        reserved
+    }
+
+    // The slot holding `owner`'s output; None is the stateless lane.
+    fn reservation_of(&self, owner: Option<ConnectionId>) -> Option<usize> {
+        let index = match owner {
+            Some(id) => *self.reservation_owners.get(id.slot)?,
+            None => self.stateless_reservation,
+        }?;
+        // Indexed by slot index alone; the held packet confirms the generation.
+        self.reservations[index]
+            .current
+            .as_ref()
+            .is_some_and(|r| r.packet.connection == owner)
+            .then_some(index)
+    }
+
+    fn reservation_owner_mut(&mut self, owner: Option<ConnectionId>) -> &mut Option<usize> {
+        match owner {
+            Some(id) => &mut self.reservation_owners[id.slot],
+            None => &mut self.stateless_reservation,
+        }
+    }
+
+    // Call right after slot `index` captured output with a current attempt.
+    fn reservation_held(&mut self, index: usize) {
+        let owner = self.reservations[index].current.as_ref().unwrap();
+        debug_assert!(owner.attempt.is_some());
+        let owner = owner.packet.connection;
+        *self.reservation_owner_mut(owner) = Some(index);
+        self.free_reservations -= 1;
+        self.check_reservation_index();
+    }
+
+    fn clear_reservation(&mut self, index: usize) {
+        if let Some(r) = &self.reservations[index].current {
+            let (owner, unattempted) = (r.packet.connection, r.attempt.is_none());
+            *self.reservation_owner_mut(owner) = None;
+            self.free_reservations += 1;
+            self.unattempted_reservations -= usize::from(unattempted);
+        }
+        self.reservations[index].clear();
+        self.check_reservation_index();
+    }
+
+    fn set_reservation_attempt(&mut self, index: usize, attempt: Option<crate::TransmitAttempt>) {
+        let r = self.reservations[index].current.as_mut().unwrap();
+        match (r.attempt.is_some(), attempt.is_some()) {
+            (true, false) => self.unattempted_reservations += 1,
+            (false, true) => self.unattempted_reservations -= 1,
+            _ => {}
+        }
+        r.attempt = attempt;
+        self.check_reservation_index();
+    }
+
+    // Full-scan form of the reservation bookkeeping, for debug builds.
+    fn check_reservation_index(&self) {
+        if cfg!(debug_assertions) {
+            let held = self.reservations.iter().filter_map(|s| s.current.as_ref());
+            assert_eq!(
+                self.free_reservations,
+                self.reservations.len() - held.clone().count()
+            );
+            assert_eq!(
+                self.unattempted_reservations,
+                held.clone().filter(|r| r.attempt.is_none()).count()
+            );
+            for (index, slot) in self.reservations.iter().enumerate() {
+                if let Some(r) = &slot.current {
+                    assert_eq!(self.reservation_of(r.packet.connection), Some(index));
+                }
+            }
+            let indexed = self.reservation_owners.iter().flatten().count()
+                + usize::from(self.stateless_reservation.is_some());
+            assert_eq!(indexed, self.reservations.len() - self.free_reservations);
+        }
     }
 
     fn reject_if_output_reserved(&self, id: ConnectionId) -> Result<(), EndpointError> {
@@ -4710,14 +4814,12 @@ impl Endpoint {
             .iter()
             .map(|index| self.id(index))
             .filter(|&id| {
-                self.reservations
-                    .iter()
-                    .find_map(|slot| {
-                        slot.current
-                            .as_ref()
-                            .filter(|r| r.packet.connection == Some(id))
-                    })
-                    .is_none_or(|r| r.attempt.is_none())
+                self.reservation_of(Some(id)).is_none_or(|index| {
+                    self.reservations[index]
+                        .current
+                        .as_ref()
+                        .is_some_and(|r| r.attempt.is_none())
+                })
             })
     }
 
@@ -4760,13 +4862,8 @@ impl Endpoint {
         if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
         }
-        let free = self.reservations.iter().any(|slot| slot.current.is_none());
-        if !free
-            && !self
-                .reservations
-                .iter()
-                .any(|slot| slot.current.as_ref().is_some_and(|r| r.attempt.is_none()))
-        {
+        let free = self.free_reservations != 0;
+        if !free && self.unattempted_reservations == 0 {
             return Err(EndpointError::OutputReserved);
         }
         self.clock(now)?;
@@ -4774,13 +4871,7 @@ impl Endpoint {
             let next = self
                 .ready_connections()
                 .find(|&id| free || self.is_output_reserved(id));
-            let control = free
-                && !self.control.is_empty()
-                && !self.reservations.iter().any(|slot| {
-                    slot.current
-                        .as_ref()
-                        .is_some_and(|r| r.packet.connection.is_none())
-                });
+            let control = free && !self.control.is_empty() && self.reservation_of(None).is_none();
             let owner = if control && (self.control_turn || next.is_none()) {
                 None
             } else {
@@ -4825,16 +4916,16 @@ impl Endpoint {
         if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
         }
-        let existing = self.reservations.iter().position(|slot| {
-            slot.current
-                .as_ref()
-                .is_some_and(|r| r.packet.connection == selected)
-        });
-        let index = existing
+        let index = self
+            .reservation_of(selected)
             .or_else(|| {
-                self.reservations
-                    .iter()
-                    .position(|slot| slot.current.is_none())
+                (self.free_reservations != 0)
+                    .then(|| {
+                        self.reservations
+                            .iter()
+                            .position(|slot| slot.current.is_none())
+                    })
+                    .flatten()
             })
             .ok_or(EndpointError::OutputReserved)?;
         if self.reservations[index]
@@ -4888,9 +4979,12 @@ impl Endpoint {
                 ));
             }
             let attempt = self.reservations[index].token()?;
-            let r = self.reservations[index].current.as_mut().unwrap();
-            r.attempt = Some(attempt);
-            r.abandon_attempt = attempt;
+            self.set_reservation_attempt(index, Some(attempt));
+            self.reservations[index]
+                .current
+                .as_mut()
+                .unwrap()
+                .abandon_attempt = attempt;
             if let Some(id) = connection {
                 self.output.remove(id.slot);
                 self.output.push(id.slot);
@@ -4935,6 +5029,7 @@ impl Endpoint {
             } else {
                 self.reservations[index].capture(packet, out, attempt);
             }
+            self.reservation_held(index);
             if let Some(id) = packet.connection {
                 zone = self.retained_slot(id)?.connection.scoped_tuple().zone();
             }
@@ -5040,12 +5135,12 @@ impl Endpoint {
         let r = self.reservations[index].current.as_mut().unwrap();
         let connection = r.packet.connection;
         if finished {
-            self.reservations[index].clear();
+            self.clear_reservation(index);
         } else {
             r.departure = departure;
             r.offset += r.emitted_bytes;
             r.sacks += r.emitted_sacks;
-            r.attempt = None;
+            self.set_reservation_attempt(index, None);
         }
         if let Some(id) = connection {
             self.refresh(id.slot);
@@ -5086,7 +5181,7 @@ impl Endpoint {
             return Ok(false);
         }
         let Some(connection) = r.packet.connection else {
-            self.reservations[index].clear();
+            self.clear_reservation(index);
             return Ok(true);
         };
         let timestamp = r.packet.tx_timestamp;
@@ -5101,9 +5196,8 @@ impl Endpoint {
                 }
             }
         }
-        let r = self.reservations[index].current.as_mut().unwrap();
-        r.attempt = None;
-        r.repaired = true;
+        self.set_reservation_attempt(index, None);
+        self.reservations[index].current.as_mut().unwrap().repaired = true;
         Ok(true)
     }
 
@@ -5162,7 +5256,7 @@ impl Endpoint {
             return Ok(false);
         }
         let Some(id) = r.packet.connection else {
-            self.reservations[index].clear();
+            self.clear_reservation(index);
             return Ok(true);
         };
         let flags = self.reservations[index].bytes[13];
@@ -5184,7 +5278,7 @@ impl Endpoint {
                     .cancel_transmit(token.stream_range(), source);
             }
         }
-        self.reservations[index].clear();
+        self.clear_reservation(index);
         if let Some(error) = error
             && self
                 .retained_slot_mut(id)?
@@ -5242,7 +5336,7 @@ impl Endpoint {
                     .cancel_transmit(token.stream_range(), source);
             }
         }
-        self.reservations[index].clear();
+        self.clear_reservation(index);
         self.refresh(id.slot);
         Ok(true)
     }
@@ -5291,7 +5385,7 @@ impl Endpoint {
         {
             return Ok(false);
         }
-        self.reservations[attempt.reservation].clear();
+        self.clear_reservation(attempt.reservation);
         self.refresh(id.slot);
         self.rearm_pending_accept(id);
         Ok(true)
@@ -5321,11 +5415,11 @@ impl Endpoint {
             slot.connection.abandon_reserved_output();
             slot.reset_deadline = None;
             slot.closed_output_drained = true;
-            self.reservations[index].clear();
+            self.clear_reservation(index);
             self.refresh(id.slot);
             self.rearm_pending_accept(id);
         } else {
-            self.reservations[index].clear();
+            self.clear_reservation(index);
         }
         Ok(true)
     }
@@ -5358,11 +5452,7 @@ impl Endpoint {
             if !self.cleanup.is_empty() {
                 self.cleanup_one();
             }
-            let stateless_held = self.reservations.iter().any(|slot| {
-                slot.current
-                    .as_ref()
-                    .is_some_and(|r| r.packet.connection.is_none())
-            });
+            let stateless_held = self.reservation_of(None).is_some();
             let next = self.output.iter().find(|&index| {
                 let id = self.id(index);
                 !self.is_output_reserved(id) && selected.is_none_or(|owner| owner == Some(id))

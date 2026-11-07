@@ -264,6 +264,7 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
     };
     let token = a.reservations[0].token().unwrap();
     a.reservations[0].capture(packet, &bytes, token);
+    a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
     let mut blocks = std::vec::Vec::new();
@@ -354,6 +355,7 @@ fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
     };
     let token = a.reservations[0].token().unwrap();
     a.reservations[0].capture(packet, &bytes, token);
+    a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
     // Too little space for the pair must not silently change its meaning.
@@ -414,6 +416,7 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
         &bytes,
         token,
     );
+    a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
     let mut total = 0;

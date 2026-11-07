@@ -711,12 +711,13 @@ impl Endpoint {
         slot.dscp = dscp;
         // Only future suffix selection uses this metadata. Already returned
         // attempt bytes retain their old metadata and fail the host barrier.
-        for reservation in &mut self.reservations {
-            if let Some(r) = &mut reservation.current
-                && r.packet.connection == Some(id)
-            {
-                r.packet.dscp = dscp;
-            }
+        if let Some(index) = self.reservation_of(Some(id)) {
+            self.reservations[index]
+                .current
+                .as_mut()
+                .unwrap()
+                .packet
+                .dscp = dscp;
         }
         self.refresh(id.slot);
         Ok(())
