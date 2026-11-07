@@ -111,7 +111,7 @@ impl<P: PacketIo> Network<P> {
             ));
         }
         let instance = NEXT_INSTANCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Capacity)?;
         let local = config.local_address;
         let (path_limits, limits) = ntcp_host::managed_limits(&config.tcp, 1, 1, 1, 1, 0)?;

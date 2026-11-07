@@ -2,6 +2,7 @@
 name = "ntcp-buffer"
 version = "0.0.1"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
 description = "Immutable shared payload ownership for network transmission"
 repository = "https://github.com/minhuw/ntcp"

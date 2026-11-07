@@ -46,7 +46,7 @@ static INSTANCES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn next_instance() -> Result<u64, Error> {
     INSTANCES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .map(|n| n + 1)
         .map_err(|_| Error::Capacity)
 }

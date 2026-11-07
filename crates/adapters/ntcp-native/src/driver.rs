@@ -250,9 +250,8 @@ impl<P: PacketIo> Network<P> {
                         return None;
                     }
                     let Ok(id) =
-                        NEXT_INSTANCE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                            n.checked_add(1)
-                        })
+                        NEXT_INSTANCE
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                     else {
                         self.counters.timestamp_metadata_lost += 1;
                         return None;

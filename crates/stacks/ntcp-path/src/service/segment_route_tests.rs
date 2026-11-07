@@ -1,5 +1,5 @@
 use crate::*;
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::net::Ipv6Addr;
 
 fn address(value: &str) -> ScopedAddress {

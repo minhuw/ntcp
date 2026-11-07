@@ -1,3 +1,6 @@
 [workspace]
 members = ["crates/stacks/*", "crates/io/*", "crates/adapters/*", "integration/packetdrill", "integration/rfc_host", "crates/net/ntcp-egress", "crates/net/ntcp-buffer"]
 resolver = "3"
+
+[workspace.package]
+rust-version = "1.99"

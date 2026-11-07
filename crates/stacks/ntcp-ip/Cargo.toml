@@ -2,6 +2,7 @@
 name = "ntcp-ip"
 version = "0.0.1"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
 description = "Bounded, caller-buffer IPv4 codec for ntcp"
 repository = "https://github.com/minhuw/ntcp"
