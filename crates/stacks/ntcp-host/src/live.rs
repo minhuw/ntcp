@@ -33,6 +33,9 @@ impl Live {
     pub fn next(&self, from: usize) -> Option<usize> {
         self.0.get(self.0.partition_point(|&s| s < from)).copied()
     }
+    pub fn contains(&self, slot: usize) -> bool {
+        self.0.binary_search(&slot).is_ok()
+    }
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.0.iter().copied()
     }

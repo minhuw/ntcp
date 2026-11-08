@@ -684,7 +684,7 @@ impl Host {
         };
         match reserve(self) {
             Err(Error::Capacity) => {
-                self.maintain_ledger(endpoint);
+                self.maintain_ledger(endpoint, true);
                 reserve(self)
             }
             result => result,

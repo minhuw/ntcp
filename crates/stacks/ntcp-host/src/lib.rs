@@ -582,6 +582,17 @@ pub struct Host {
     // Occupied `bindings` records: what service and collection passes and
     // owner lookups visit.
     live_bindings: Live,
+    // Per endpoint connection slot (`ConnectionId::index`), the binding its
+    // owner generation committed, if any; sized when attached.
+    owner_bindings: Vec<Option<usize>>,
+    // Committed bindings yet to adopt the owner search aging, and those
+    // whose owners hold results to publish.
+    unaged: Live,
+    unpublished: Live,
+    // The endpoint's reclaim count and the PathService's dirtied count
+    // when the last pass that depends on them completed.
+    reclaimed: u64,
+    dirtied: u64,
     leases: Vec<Option<Lease>>,
     ledger: Ledger,
     udp: Udp,
@@ -659,6 +670,11 @@ impl Host {
             ports: table(path_limits.links, None)?,
             bindings: table(limits.bindings, None)?,
             live_bindings: Live::new(limits.bindings)?,
+            owner_bindings: Vec::new(),
+            unaged: Live::new(limits.bindings)?,
+            unpublished: Live::new(limits.bindings)?,
+            reclaimed: 0,
+            dirtied: 0,
             leases: table(limits.output_leases, None)?,
             ledger: Ledger::new(limits.ledger)?,
             udp: Udp::new(limits.udp)?,
@@ -943,7 +959,13 @@ impl Host {
         if self.attached || self.timebase != endpoint.caller_timebase() {
             return Err(Error::InvalidContext);
         }
+        let connections = endpoint.max_connections();
+        self.owner_bindings
+            .try_reserve_exact(connections)
+            .map_err(|_| Error::Allocation)?;
+        self.ledger.index_connections(connections)?;
         endpoint.enable_managed_paths(self.paths.context())?;
+        self.owner_bindings.resize(connections, None);
         self.attached = true;
         Ok(())
     }
@@ -1000,11 +1022,19 @@ impl Host {
     // The record of `owner`'s binding.
     fn binding_index(&self, owner: ConnectionId) -> Option<usize> {
         debug_assert!(self.live_bindings.matches(&self.bindings));
-        self.live_bindings.iter().find(|&index| {
+        let owned = |index: usize| {
             self.bindings[index]
                 .as_ref()
                 .is_some_and(|b| b.owner == Some(owner))
-        })
+        };
+        // The index names the newest generation committed in a slot; an
+        // older one not yet collected is found by the scan.
+        if let Some(Some(index)) = self.owner_bindings.get(owner.index()).copied()
+            && owned(index)
+        {
+            return Some(index);
+        }
+        self.live_bindings.iter().find(|&index| owned(index))
     }
     // The record of a prepared binding no connection has committed yet.
     fn provisional(&self, prepared: PreparedPath) -> Option<usize> {
@@ -1238,43 +1268,58 @@ impl Host {
         self.expire_reassembly(now);
         self.service_adjunct(now);
         let mut report = ServiceReport::default();
+        // Connections created after an owner aging change adopt it here,
+        // before their first output selection.
         let mut next = 0;
-        while let Some(index) = self.live_bindings.next(next) {
+        while let Some(index) = self.unaged.next(next) {
             next = index + 1;
-            let Some(owner) = self.bindings[index].as_ref().and_then(|b| b.owner) else {
-                continue;
-            };
-            // Connections created after an owner aging change adopt it here,
-            // before their first output selection.
-            if let Err(error) = self.apply_search_aging(endpoint, now, owner) {
-                report.fail(error);
-            }
-            if let Err(error) = self.publish_results(endpoint, now, owner, &mut report) {
-                report.fail(error);
-            }
-        }
-        let mut next = 0;
-        while let Some(index) = self.live_bindings.next(next) {
-            next = index + 1;
-            let Some((owner, client)) = self.bindings[index]
-                .as_ref()
-                .and_then(|b| Some((b.owner?, b.prepared.client)))
-            else {
-                continue;
-            };
-            if !self.paths.is_dirty(client)? {
-                continue;
-            }
-            match self.refresh(endpoint, owner) {
-                Ok(_) => report.applied += 1,
+            let owner = self.bindings[index].as_ref().and_then(|b| b.owner).unwrap();
+            match self.apply_search_aging(endpoint, now, owner) {
+                Ok(()) => self.unaged.remove(index),
                 Err(error) => report.fail(error),
             }
         }
-        for slot in 0..self.udp.limits.flows {
-            match self.udp_service(slot) {
-                Ok(true) => report.applied += 1,
-                Ok(false) => {}
+        self.take_progress(endpoint);
+        let mut next = 0;
+        while let Some(index) = self.unpublished.next(next) {
+            next = index + 1;
+            let owner = self.bindings[index].as_ref().and_then(|b| b.owner).unwrap();
+            match self.publish_results(endpoint, now, owner, &mut report) {
+                Ok(()) => self.unpublished.remove(index),
                 Err(error) => report.fail(error),
+            }
+        }
+        // Clients become dirty only by what advances `dirtied`. A pass that
+        // left one dirty by a failure is made again.
+        let dirtied = self.paths.dirtied();
+        if dirtied != self.dirtied {
+            let failed = report.failed;
+            let mut next = 0;
+            while let Some(index) = self.live_bindings.next(next) {
+                next = index + 1;
+                let Some((owner, client)) = self.bindings[index]
+                    .as_ref()
+                    .and_then(|b| Some((b.owner?, b.prepared.client)))
+                else {
+                    continue;
+                };
+                if !self.paths.is_dirty(client)? {
+                    continue;
+                }
+                match self.refresh(endpoint, owner) {
+                    Ok(_) => report.applied += 1,
+                    Err(error) => report.fail(error),
+                }
+            }
+            for slot in 0..self.udp.limits.flows {
+                match self.udp_service(slot) {
+                    Ok(true) => report.applied += 1,
+                    Ok(false) => {}
+                    Err(error) => report.fail(error),
+                }
+            }
+            if report.failed == failed {
+                self.dirtied = dirtied;
             }
         }
         Ok(report)
@@ -1396,16 +1441,30 @@ impl Host {
 
     pub fn collect(&mut self, endpoint: &Endpoint) -> Result<(), Error> {
         self.check_endpoint(endpoint)?;
+        // A committed binding and its ledger owner outlive their connection
+        // until the endpoint reclaims it: while the reclaim count stands
+        // still, there are none to collect.
+        let reclaimed = endpoint.reclaimed();
+        let gone = reclaimed != self.reclaimed;
         let mut next = 0;
-        while let Some(index) = self.live_bindings.next(next) {
+        while gone && let Some(index) = self.live_bindings.next(next) {
             next = index + 1;
-            if self.bindings[index].as_ref().is_some_and(|b| {
-                b.owner.is_some_and(|id| {
-                    !endpoint.connection_exists(id) && !endpoint.is_output_reserved(id)
-                })
-            }) {
+            if let Some(id) = self.bindings[index].as_ref().and_then(|b| b.owner)
+                && !endpoint.connection_exists(id)
+                && !endpoint.is_output_reserved(id)
+            {
                 let binding = self.bindings[index].take().unwrap();
                 self.live_bindings.remove(index);
+                for set in [&mut self.unaged, &mut self.unpublished] {
+                    if set.contains(index) {
+                        set.remove(index);
+                    }
+                }
+                if let Some(entry) = self.owner_bindings.get_mut(id.index())
+                    && *entry == Some(index)
+                {
+                    *entry = None;
+                }
                 self.paths.release(binding.prepared.client)?;
             }
         }
@@ -1417,7 +1476,9 @@ impl Host {
                 self.paths.release(lease.take().unwrap().prepared.client)?;
             }
         }
-        self.maintain_ledger(endpoint);
+        if self.maintain_ledger(endpoint, gone) {
+            self.reclaimed = reclaimed;
+        }
         Ok(())
     }
 
@@ -1430,10 +1491,13 @@ impl Host {
         self.ledger.expire(self.now);
     }
 
-    // Retire delivered TCP data, reclaim reservations no call can use, and
-    // release owner records of generations that no longer exist (their
-    // history becomes tombstones until the feedback horizon).
-    fn maintain_ledger(&mut self, endpoint: &Endpoint) {
+    // Reclaim reservations no call can use and, with `sweep`, visit every
+    // owner record: retire delivered TCP data and release the records of
+    // generations that no longer exist (their history becomes tombstones
+    // until the feedback horizon). Whether no such record is left.
+    // Otherwise delivered data is retired as the endpoint reports progress
+    // (`service_changes`), and dead generations wait for a sweep.
+    fn maintain_ledger(&mut self, endpoint: &Endpoint, sweep: bool) -> bool {
         let mut next = 0;
         while let Some(index) = self.ledger.next_pending(next) {
             next = index + 1;
@@ -1450,8 +1514,9 @@ impl Host {
                 self.ledger.drop_pending(index);
             }
         }
+        let mut released = true;
         let mut next = 0;
-        while let Some(index) = self.ledger.next_owner(next) {
+        while sweep && let Some(index) = self.ledger.next_owner(next) {
             next = index + 1;
             match self.ledger.owner(index) {
                 Some(Owner::Tcp(id)) if endpoint.connection_exists(id) => {
@@ -1459,13 +1524,15 @@ impl Host {
                         self.retire_record(index, id, progress.unacknowledged_sequence);
                     }
                 }
+                // A pinned record is released by a later sweep.
                 Some(Owner::Tcp(id)) if !endpoint.is_output_reserved(id) => {
-                    self.ledger.release_owner(index, self.now);
+                    released &= self.ledger.release_owner(index, self.now);
                 }
                 _ => {}
             }
         }
         self.ledger.expire(self.now);
+        released
     }
 
     // Retire delivered TCP data. Each definitely submitted segment a new
@@ -1478,6 +1545,20 @@ impl Host {
             self.retire_record(record, id, unacknowledged);
         }
     }
+    // What the endpoint reports of its connections since last asked: data
+    // acknowledged is retired at once, as Linux confirms a route's neighbor
+    // in tcp_ack, and results wait for the next service pass.
+    fn take_progress(&mut self, endpoint: &mut Endpoint) {
+        while let Some((owner, unacknowledged)) = endpoint.next_progress() {
+            self.retire_tcp(owner, unacknowledged);
+            if let Some(index) = self.binding_index(owner)
+                && !self.unpublished.contains(index)
+                && endpoint.has_unpublished_results(owner) == Ok(true)
+            {
+                self.unpublished.insert(index);
+            }
+        }
+    }
     // `retire_tcp` of the generation `id` owning ledger record `index`.
     fn retire_record(&mut self, index: usize, id: ConnectionId, unacknowledged: u32) {
         let Self {
@@ -1485,7 +1566,7 @@ impl Host {
             neighbors,
             ipv4_neighbors,
             bindings,
-            live_bindings,
+            owner_bindings,
             entropy,
             now,
             ..
@@ -1494,10 +1575,12 @@ impl Host {
         let mut binding = None;
         ledger.retire_record(index, unacknowledged, |record| {
             let current = *binding.get_or_insert_with(|| {
-                live_bindings
-                    .iter()
-                    .filter_map(|index| bindings[index].as_ref())
-                    .find(|b| b.owner == Some(id))
+                owner_bindings
+                    .get(id.index())
+                    .copied()
+                    .flatten()
+                    .and_then(|index| bindings[index].as_ref())
+                    .filter(|b| b.owner == Some(id))
                     .map(|b| b.prepared.snapshot)
             });
             let Some(snapshot) = current else {
@@ -1546,7 +1629,7 @@ impl Host {
         let index = match self.ledger.admit(owner) {
             Ok(index) => index,
             Err(Error::Capacity) => {
-                self.maintain_ledger(endpoint);
+                self.maintain_ledger(endpoint, true);
                 self.ledger.admit(owner)?
             }
             Err(error) => return Err(error),
@@ -1559,7 +1642,7 @@ impl Host {
         let stale = |a| endpoint.transmit_attempt_packet(a).is_none();
         match self.ledger.reserve(index, attempt, stale) {
             Err(Error::Capacity) => {
-                self.maintain_ledger(endpoint);
+                self.maintain_ledger(endpoint, true);
                 self.ledger.reserve(index, attempt, stale)
             }
             result => result,
@@ -1747,7 +1830,7 @@ impl Host {
             if self.live_bindings.len() == self.bindings.len() {
                 self.collect(endpoint)?;
             }
-            Ok(endpoint.input_with_path_provider(
+            let disposition = endpoint.input_with_path_provider(
                 now,
                 context.link,
                 packet.ip,
@@ -1757,7 +1840,9 @@ impl Host {
                 metadata,
                 outgoing_dscp,
                 self,
-            )?)
+            )?;
+            self.take_progress(endpoint);
+            Ok(disposition)
         } else {
             Err(Error::Unsupported)
         }
@@ -3050,6 +3135,12 @@ impl PathProvider for Host {
             .provisional(prepared)
             .expect("prepared binding preflight");
         self.bindings[index].as_mut().unwrap().owner = Some(connection);
+        if let Some(entry) = self.owner_bindings.get_mut(connection.index()) {
+            *entry = Some(index);
+        }
+        if self.search_aging.is_some() {
+            self.unaged.insert(index);
+        }
     }
     fn cancel(&mut self, prepared: PreparedPath) {
         let index = self

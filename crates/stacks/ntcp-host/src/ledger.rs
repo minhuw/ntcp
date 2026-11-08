@@ -858,6 +858,9 @@ fn evidence_matches(e: &Evidence, quote: &QuoteKey) -> bool {
 pub(crate) struct Ledger {
     limits: LedgerLimits,
     owners: Vec<Option<Owner>>,
+    // Per endpoint connection slot (`ConnectionId::index`), the record of
+    // its TCP owner generation, if any; empty until `index_connections`.
+    tcp_owners: Vec<Option<usize>>,
     // Occupied owner records, unsealed reservations and summaries: what
     // the passes made on every collection visit (`check_live`).
     live_owners: Live,
@@ -924,6 +927,7 @@ impl Ledger {
         Ok(Self {
             limits,
             owners: crate::table(limits.owners, None)?,
+            tcp_owners: Vec::new(),
             live_owners: Live::new(limits.owners)?,
             live_pending: Live::new(limits.concurrent_attempts)?,
             live_tombstones: Live::new(summaries)?,
@@ -1032,7 +1036,29 @@ impl Ledger {
             extra.resize(wanted, None);
         }
     }
+    /// Index TCP owners by their connections' slots, of an endpoint with
+    /// `connections` slots.
+    pub fn index_connections(&mut self, connections: usize) -> Result<(), Error> {
+        self.tcp_owners
+            .try_reserve_exact(connections)
+            .map_err(|_| Error::Allocation)?;
+        self.tcp_owners.resize(connections, None);
+        for index in self.live_owners.iter() {
+            if let Some(Owner::Tcp(id)) = self.owners[index] {
+                self.tcp_owners[id.index()] = Some(index);
+            }
+        }
+        Ok(())
+    }
     pub fn owner_index(&self, owner: Owner) -> Option<usize> {
+        // The index names the newest generation admitted in a slot; an
+        // older one still holding history is found by the scan.
+        if let Owner::Tcp(id) = owner
+            && let Some(Some(index)) = self.tcp_owners.get(id.index()).copied()
+            && self.owners[index] == Some(owner)
+        {
+            return Some(index);
+        }
         self.live_owners
             .iter()
             .find(|&index| self.owners[index] == Some(owner))
@@ -1053,6 +1079,11 @@ impl Ledger {
             .ok_or(Error::Capacity)?;
         self.owners[index] = Some(owner);
         self.live_owners.insert(index);
+        if let Owner::Tcp(id) = owner
+            && let Some(entry) = self.tcp_owners.get_mut(id.index())
+        {
+            *entry = Some(index);
+        }
         self.keys[index] = None;
         self.blind[index] = 0;
         self.own[index] = None;
@@ -1082,6 +1113,12 @@ impl Ledger {
             self.fold(own, now);
         }
         self.extra[index] = Vec::new();
+        if let Some(Owner::Tcp(id)) = self.owners[index]
+            && let Some(entry) = self.tcp_owners.get_mut(id.index())
+            && *entry == Some(index)
+        {
+            *entry = None;
+        }
         self.owners[index] = None;
         self.live_owners.remove(index);
         self.keys[index] = None;
