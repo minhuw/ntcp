@@ -132,6 +132,9 @@ fn network(
 ) -> Network<Wire> {
     let mut config = NetworkConfig::new(IpAddr::V4(local), 1500);
     config.tcp.max_connections = args.connections;
+    // The endpoint's buffer budget is not under test; the default admits
+    // about 55 connections.
+    config.tcp.max_buffer_bytes = usize::MAX;
     config.tcp.connection.timebase = CallerTimebase {
         units_per_second: 1_000_000_000,
         ..CallerTimebase::default()

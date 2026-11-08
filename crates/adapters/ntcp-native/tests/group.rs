@@ -925,3 +925,91 @@ fn connection_info_is_current_without_events_and_close_still_completes() {
         Err(Error::InvalidHandle)
     ));
 }
+
+// Readable is a level: a read that leaves bytes behind is followed by
+// another Readable, and one that takes the rest by none.
+#[test]
+fn a_partial_read_raises_readable_again() {
+    let mut pair = Pair::new(false, false);
+    drain(&mut pair.a);
+    pair.b
+        .try_write(pair.server, &[7; 100], WriteOptions::default())
+        .unwrap();
+    pair.step();
+    pair.step();
+    let client = pair.client;
+    let readable = |events: &[Event]| events.contains(&Event::Readable(client));
+    assert!(readable(&drain(&mut pair.a)));
+    assert!(!readable(&drain(&mut pair.a)));
+    let mut buffer = [0; 64];
+    assert!(matches!(
+        pair.a.try_read(pair.client, &mut buffer[..10]),
+        Ok(ReadOutcome::Data { len: 10, .. })
+    ));
+    assert!(readable(&drain(&mut pair.a)));
+    assert!(matches!(
+        pair.a.try_read(pair.client, &mut buffer),
+        Ok(ReadOutcome::Data { len: 64, .. })
+    ));
+    assert!(matches!(
+        pair.a.try_read(pair.client, &mut buffer),
+        Ok(ReadOutcome::Data { len: 26, .. })
+    ));
+    assert!(!readable(&drain(&mut pair.a)));
+}
+
+// A listener with a connection left to accept after an accept is
+// acceptable again, though the endpoint raises nothing for it.
+#[test]
+fn a_listener_is_acceptable_again_while_connections_wait() {
+    let mut pair = Pair::new(false, false);
+    let peer = pair.a.connection_info(pair.client).unwrap().peer;
+    drain(&mut pair.b);
+    let listener = pair.listener;
+    let acceptable = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| **e == Event::Acceptable(listener))
+            .count()
+    };
+    for _ in 0..2 {
+        pair.a.connect(peer).unwrap();
+    }
+    for _ in 0..10 {
+        pair.step();
+    }
+    assert_eq!(acceptable(&drain(&mut pair.b)), 1);
+    pair.b.accept(pair.listener).unwrap();
+    assert_eq!(acceptable(&drain(&mut pair.b)), 1);
+    pair.b.accept(pair.listener).unwrap();
+    assert_eq!(acceptable(&drain(&mut pair.b)), 0);
+    assert!(pair.b.accept(pair.listener).unwrap_err().is_would_block());
+}
+
+// Connections that nothing happened to give no events, and a change gives
+// events for its connection alone.
+#[test]
+fn idle_connections_give_no_events() {
+    let mut pair = Pair::new(false, false);
+    let peer = pair.a.connection_info(pair.client).unwrap().peer;
+    for _ in 0..4 {
+        pair.a.connect(peer).unwrap();
+    }
+    for _ in 0..10 {
+        pair.step();
+        while pair.b.accept(pair.listener).is_ok() {}
+    }
+    drain(&mut pair.a);
+    drain(&mut pair.b);
+    for _ in 0..3 {
+        pair.step();
+    }
+    assert_eq!(drain(&mut pair.a), []);
+    assert!(!pair.a.drain_events(&mut []).more);
+    pair.b
+        .try_write(pair.server, b"hello", WriteOptions::default())
+        .unwrap();
+    pair.step();
+    pair.step();
+    assert_eq!(drain(&mut pair.a), [Event::Readable(pair.client)]);
+}

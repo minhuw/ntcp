@@ -34,7 +34,7 @@ impl<P: PacketIo> Network<P> {
     fn stop_with_error(&mut self, error: io::Error) -> Error {
         self.stopped = true;
         self.stopped_event = true;
-        for slot in &mut self.connections {
+        for (index, slot) in self.connections.iter_mut().enumerate() {
             if let Some(c) = &mut slot.value {
                 // Observation cancellation does not certify non-submission.
                 let _ = self.endpoint.cancel_tx_timestamps(c.core);
@@ -43,6 +43,8 @@ impl<P: PacketIo> Network<P> {
                 c.readable_event = false;
                 c.read_waiting = false;
                 c.write_waiting = None;
+                self.ready.push(index);
+                self.stamped.push(index);
             }
         }
         let returned = io::Error::new(error.kind(), error.to_string());
@@ -217,13 +219,17 @@ impl<P: PacketIo> Network<P> {
             let slot = &mut tx[index];
             let was_pending = slot.pending.is_some();
             let was_held = slot.pending.as_ref().is_some_and(|p| p.held);
+            let owner = slot.pending.as_ref().and_then(|p| p.owner);
             let result = self.transmit_slot(slot, report);
             let still_pending = slot.pending.is_some();
             let still_held = slot.pending.as_ref().is_some_and(|p| p.held);
             self.tx = tx;
             match (was_pending, still_pending) {
                 (false, true) => occupy(&mut self.tx_frames, index),
-                (true, false) => vacate(&mut self.tx_frames, index),
+                (true, false) => {
+                    vacate(&mut self.tx_frames, index);
+                    self.reservation_released(owner);
+                }
                 _ => {}
             }
             // Only frames to retry count as pending.
@@ -506,8 +512,9 @@ impl<P: PacketIo> Network<P> {
                     self.tx_pending += 1;
                 }
                 Some(advice) => {
-                    slot.pending = None;
+                    let owner = slot.pending.take().unwrap().owner;
                     vacate(&mut self.tx_frames, index);
+                    self.reservation_released(owner);
                     let error = match advice {
                         Advice::NetworkError(error) => Some(error),
                         Advice::PacketTooBig { .. } => None,
@@ -842,12 +849,26 @@ impl<P: PacketIo> Network<P> {
         }
         Ok(false)
     }
+    // A frame of `owner` left its transmit slot, ending the reservation that
+    // kept the connection's events, and its close, from being acted on.
+    fn reservation_released(&mut self, owner: Option<ntcp::ConnectionId>) {
+        if let Some(slot) = owner.and_then(|core| self.connection_map.get(&core).copied()) {
+            self.touch(slot);
+        }
+    }
+    // Carries on the closes and aborts some change may have advanced, then
+    // frees the slots of released connections the endpoint has reclaimed.
     fn maintain_connections(&mut self) -> Result<()> {
-        let mut next = 0;
-        while let Some(index) = next_live(&self.live_listeners, next) {
-            next = index + 1;
-            let listener = self.listeners[index].value.as_ref().unwrap();
-            if listener.closing {
+        let connections = self.connections.len();
+        // A close blocked by a reservation is queued again, for the next
+        // pass: reservations end within a few drives.
+        for _ in 0..self.maintain.len() {
+            let index = self.maintain.pop().unwrap();
+            if index >= connections {
+                let index = index - connections;
+                let Some(listener) = self.listeners[index].value.as_ref() else {
+                    continue;
+                };
                 let core = listener.core;
                 match self.endpoint.close_listener(core) {
                     Ok(()) => {
@@ -855,24 +876,20 @@ impl<P: PacketIo> Network<P> {
                         self.listeners[index].value = None;
                         vacate(&mut self.live_listeners, index);
                     }
-                    Err(EndpointError::OutputReserved) => {}
+                    Err(EndpointError::OutputReserved) => self.maintain.push(connections + index),
                     Err(e) => return Err(e.into()),
                 }
-            }
-        }
-        let mut next = 0;
-        while let Some(index) = next_live(&self.live_connections, next) {
-            next = index + 1;
-            let c = self.connections[index].value.as_ref().unwrap();
-            let (core, abort, close, released) =
-                (c.core, c.abort_requested, c.close_requested, c.released);
-            if released {
-                if !self.endpoint.connection_exists(core) {
-                    self.connection_map.remove(&core);
-                    self.connections[index].value = None;
-                    vacate(&mut self.live_connections, index);
-                }
                 continue;
+            }
+            let Some(c) = self.connections[index].value.as_ref() else {
+                continue;
+            };
+            let (core, abort, close) = (c.core, c.abort_requested, c.close_requested);
+            if c.released || !(abort || close) {
+                continue;
+            }
+            if self.endpoint.is_output_reserved(core) {
+                self.maintain.push(index);
             }
             if abort {
                 if self.tx_pending != 0 || self.tx_held != 0 {
@@ -913,10 +930,9 @@ impl<P: PacketIo> Network<P> {
             }
             // Release reads the state its Closed event was derived from:
             // every change to Closed or TIME-WAIT raises an event, whose
-            // collection (and every drain) refreshes the connection.
+            // drain refreshes the connection and queues it here again.
             let c = self.connections[index].value.as_mut().unwrap();
-            if (close || abort)
-                && matches!(c.state, State::Closed | State::TimeWait)
+            if matches!(c.state, State::Closed | State::TimeWait)
                 && !c.connected_event
                 && !c.closed_event
                 && c.trace_count == 0
@@ -924,6 +940,24 @@ impl<P: PacketIo> Network<P> {
             {
                 self.endpoint.release(core)?;
                 c.released = true;
+                self.releasing.push(index);
+            }
+        }
+        let reclaimed = self.endpoint.reclaimed();
+        if reclaimed != self.reclaimed {
+            self.reclaimed = reclaimed;
+            let mut k = 0;
+            while k < self.releasing.len() {
+                let index = self.releasing[k];
+                let core = self.connections[index].value.as_ref().unwrap().core;
+                if self.endpoint.connection_exists(core) {
+                    k += 1;
+                    continue;
+                }
+                self.releasing.swap_remove(k);
+                self.connection_map.remove(&core);
+                self.connections[index].value = None;
+                vacate(&mut self.live_connections, index);
             }
         }
         Ok(())

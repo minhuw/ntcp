@@ -1,8 +1,10 @@
-// Caller-side cost of one Network as max_connections grows while the number
-// of live connections stays at four: an idle drive() plus drain_events(), and
-// a 16-byte request/response round trip. Two Networks run back to back over
-// in-memory queues. With --check, exits nonzero unless both costs at 1024
-// stay within their bounds of the cost at 16.
+// Caller-side cost of one Network: an idle drive() plus drain_events(), and a
+// 16-byte request/response round trip on one connection. Two Networks run
+// back to back over in-memory queues. Two series: max_connections grows while
+// four connections are live, and then the live connections, all idle but
+// the one measured, grow at a fixed max_connections. With --check, exits
+// nonzero unless both costs at the largest size of each series stay within
+// their bounds of the cost at its smallest.
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use ntcp_native::{
     ConnId, Event, Link, Network, NetworkConfig, ReadOutcome, WorkBudget, WriteOptions,
@@ -41,12 +43,18 @@ impl PacketIo for Wire {
 const BUDGET: WorkBudget = WorkBudget::new(64, 64, 64, 64);
 const CONNECTIONS: usize = 4;
 const SIZES: [usize; 4] = [16, 64, 256, 1024];
+// Live connections, at max_connections of the largest.
+const LIVE: [usize; 3] = [CONNECTIONS, 32, 128];
 const IDLE_ITERATIONS: u32 = 20_000;
 const ROUNDS: u32 = 2_000;
 const REPETITIONS: usize = 5;
 // --check bounds: the cost at 1024 over the cost at 16.
 const IDLE_RATIO: f64 = 2.5;
 const ROUND_TRIP_RATIO: f64 = 1.5;
+// --check bound: the cost at 32 and 128 live connections over the cost at
+// four. A drive does work for connections that have some, not for each live
+// one.
+const LIVE_RATIO: f64 = 1.25;
 
 struct Pair {
     a: Network<Wire>,
@@ -63,7 +71,7 @@ fn drain(network: &mut Network<Wire>, events: &mut [Event]) {
     while network.drain_events(events).more {}
 }
 
-fn pair(max_connections: usize, start: Instant) -> Pair {
+fn pair(max_connections: usize, live: usize, start: Instant) -> Pair {
     let (x, y) = (Queue::default(), Queue::default());
     let (ip_a, ip_b): (IpAddr, IpAddr) =
         ("10.73.0.1".parse().unwrap(), "10.73.0.2".parse().unwrap());
@@ -71,6 +79,9 @@ fn pair(max_connections: usize, start: Instant) -> Pair {
         let mut config = NetworkConfig::new(address, 1500);
         config.link = Link::Ip;
         config.tcp.max_connections = max_connections;
+        // The endpoint's buffer budget is not under test; the default admits
+        // fewer than the largest series' connections.
+        config.tcp.max_buffer_bytes = usize::MAX;
         config
     };
     let wire = |incoming: &Queue, outgoing: &Queue| Wire {
@@ -79,13 +90,13 @@ fn pair(max_connections: usize, start: Instant) -> Pair {
     };
     let mut a = Network::new(config(ip_a), wire(&x, &y), [1; 32], now(start)).unwrap();
     let mut b = Network::new(config(ip_b), wire(&y, &x), [2; 32], now(start)).unwrap();
-    let listener = b.listen(9000, CONNECTIONS).unwrap();
-    let clients: Vec<_> = (0..CONNECTIONS)
+    let listener = b.listen(9000, live).unwrap();
+    let clients: Vec<_> = (0..live)
         .map(|_| a.connect(SocketAddr::new(ip_b, 9000)).unwrap())
         .collect();
     let mut servers = Vec::new();
     let mut events = [Event::NetworkStopped; 64];
-    while servers.len() < CONNECTIONS {
+    while servers.len() < live {
         a.drive(now(start), BUDGET).unwrap();
         b.drive(now(start), BUDGET).unwrap();
         drain(&mut a, &mut events);
@@ -197,34 +208,68 @@ fn main() -> ExitCode {
         }
     };
     let start = Instant::now();
-    let mut pairs: Vec<_> = SIZES.iter().map(|&max| pair(max, start)).collect();
+    let max = *LIVE.last().unwrap();
+    let series: Vec<_> = SIZES
+        .iter()
+        .map(|&size| (format!("{size}"), size, CONNECTIONS))
+        .chain(LIVE.iter().map(|&live| (format!("live{live}"), max, live)))
+        .collect();
+    let mut pairs: Vec<_> = series
+        .iter()
+        .map(|&(_, max, live)| pair(max, live, start))
+        .collect();
     // Repetitions alternate between the sizes so that drift in machine load
     // or clock frequency reaches all of them alike; each keeps its minimum.
-    let mut idle_us = [f64::INFINITY; SIZES.len()];
-    let mut round_trip_us = [f64::INFINITY; SIZES.len()];
+    let mut idle_us = vec![f64::INFINITY; series.len()];
+    let mut round_trip_us = vec![f64::INFINITY; series.len()];
     for _ in 0..REPETITIONS {
         for (index, pair) in pairs.iter_mut().enumerate() {
             idle_us[index] = idle_us[index].min(idle(pair, start));
             round_trip_us[index] = round_trip_us[index].min(round_trip(pair, start));
         }
     }
-    for (index, max) in SIZES.iter().enumerate() {
-        println!("METRIC idle_drive_drain_us_{max}={:.3}", idle_us[index]);
-        println!("METRIC round_trip_us_{max}={:.3}", round_trip_us[index]);
+    for (index, (name, ..)) in series.iter().enumerate() {
+        println!("METRIC idle_drive_drain_us_{name}={:.3}", idle_us[index]);
+        println!("METRIC round_trip_us_{name}={:.3}", round_trip_us[index]);
     }
+    let mut failed = false;
+    let mut compare = |what: &str, costs: &[f64], names: (&str, &str), bound: f64| {
+        let ratio = costs[1] / costs[0];
+        println!("{what} {}/{}: {ratio:.3} (bound {bound})", names.1, names.0);
+        failed |= ratio > bound;
+    };
     let last = SIZES.len() - 1;
-    let idle_ratio = idle_us[last] / idle_us[0];
-    let round_trip_ratio = round_trip_us[last] / round_trip_us[0];
-    println!(
-        "idle drive+drain {}/{}: {idle_ratio:.3} (bound {IDLE_RATIO})",
-        SIZES[last], SIZES[0]
+    let names = (series[0].0.as_str(), series[last].0.as_str());
+    compare(
+        "idle drive+drain",
+        &[idle_us[0], idle_us[last]],
+        names,
+        IDLE_RATIO,
     );
-    println!(
-        "round trip {}/{}: {round_trip_ratio:.3} (bound {ROUND_TRIP_RATIO})",
-        SIZES[last], SIZES[0]
+    compare(
+        "round trip",
+        &[round_trip_us[0], round_trip_us[last]],
+        names,
+        ROUND_TRIP_RATIO,
     );
-    if check && (idle_ratio > IDLE_RATIO || round_trip_ratio > ROUND_TRIP_RATIO) {
-        eprintln!("drive cost grows with configured capacity");
+    let first = SIZES.len();
+    for index in first + 1..series.len() {
+        let names = (series[first].0.as_str(), series[index].0.as_str());
+        compare(
+            "idle drive+drain",
+            &[idle_us[first], idle_us[index]],
+            names,
+            LIVE_RATIO,
+        );
+        compare(
+            "round trip",
+            &[round_trip_us[first], round_trip_us[index]],
+            names,
+            LIVE_RATIO,
+        );
+    }
+    if check && failed {
+        eprintln!("drive cost grows with configured capacity or idle connections");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
