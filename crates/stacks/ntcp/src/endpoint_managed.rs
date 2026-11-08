@@ -693,12 +693,14 @@ impl Endpoint {
     pub fn managed_route(&self, id: ConnectionId) -> Result<ManagedRoute, EndpointError> {
         let slot = self.retained_slot(id)?;
         let connection = &slot.connection;
+        let binding = connection
+            .managed_path
+            .as_ref()
+            .ok_or(Error::InvalidState)?;
         Ok(ManagedRoute {
-            client: connection
-                .managed_path
-                .as_ref()
-                .ok_or(Error::InvalidState)?
-                .client,
+            client: binding.client,
+            stamp: binding.snapshot.stamp(),
+            dscp: slot.dscp,
             zone: connection.scoped_tuple().zone(),
             forwarding_destination: slot
                 .ipv4_options

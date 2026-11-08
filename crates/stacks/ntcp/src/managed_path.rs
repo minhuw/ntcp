@@ -161,6 +161,11 @@ pub struct ManagedPathInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManagedRoute {
     pub client: ntcp_path::ClientId,
+    /// The observation of the bound snapshot (`PreparedPath::snapshot`): a
+    /// stamp names one snapshot, so equal stamps mean an equal binding.
+    pub stamp: ntcp_path::ChangeStamp,
+    /// The traffic class of the connection's packets.
+    pub dscp: u8,
     /// See `ManagedPathInfo::zone`.
     pub zone: Option<ntcp_path::LinkId>,
     /// See `ManagedPathInfo::forwarding_destination`.

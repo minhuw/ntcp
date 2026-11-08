@@ -1106,6 +1106,25 @@ impl Host {
             return Err(Error::InvalidContext);
         }
         let via = scoped(current.forwarding_destination, current.zone)?;
+        // The Host stored, and the Endpoint applied under the path's class,
+        // the client's current observation (a stamp names one snapshot) on
+        // the outgoing selection the connection still uses: nothing to
+        // rebind or apply, only the checks of any use.
+        let stamp = self.paths.stamp(client)?;
+        let stored = &self.bindings[index].as_ref().unwrap().prepared;
+        if stored.snapshot.stamp() == stamp
+            && current.stamp == stamp
+            && current.dscp == stored.snapshot.key().dscp().value()
+            && stored.snapshot.status() == PathStatus::Valid
+            && self.forwards_via(stored.snapshot.key(), via)
+        {
+            let prepared = *stored;
+            debug_assert_eq!(self.paths.snapshot(client), Ok(prepared.snapshot));
+            self.forwarding(&prepared.snapshot)?;
+            endpoint.validate_path_budget(owner, &prepared)?;
+            self.paths.acknowledge(client, stamp)?;
+            return Ok(prepared);
+        }
         let mut snapshot = self.paths.snapshot(client)?;
         // A validated peer return-route update need not invalidate the old
         // routing entry, so compare the actual outgoing selection as well.

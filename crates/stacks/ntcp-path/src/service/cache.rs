@@ -673,6 +673,10 @@ impl PathService {
     pub fn path_snapshot(&self, path: PathId) -> Result<PathSnapshot, Error> {
         Ok(self.paths.get_ref(self.context, path.0)?.snapshot)
     }
+    /// The observation `snapshot(client)` would return.
+    pub fn stamp(&self, client: ClientId) -> Result<ChangeStamp, Error> {
+        Ok(self.client_snapshot(client)?.stamp())
+    }
     fn client_snapshot(&self, client: ClientId) -> Result<&PathSnapshot, Error> {
         let path = self.clients.get_ref(self.context, client.0)?.path;
         Ok(&self.paths.get_ref(self.context, path.0)?.snapshot)
