@@ -1131,7 +1131,7 @@ impl Host {
         // The connection's complete headers (an SR route's Segment Routing
         // Header included) must still fit the path: a header that no longer
         // does fails admission rather than being cut.
-        endpoint.validate_path_budget(owner, prepared)?;
+        endpoint.validate_path_budget(owner, &prepared)?;
         endpoint.apply_path_budget(owner, prepared)?;
         self.bindings[index].as_mut().unwrap().prepared = prepared;
         self.paths.acknowledge(prepared.client, snapshot.stamp())?;

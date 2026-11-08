@@ -715,7 +715,7 @@ impl Endpoint {
     /// (binding authority and a budget that carries the connection's
     /// complete headers and one payload octet). Changes nothing, so a
     /// provider can validate every client before committing a change.
-    pub fn validate_path_budget(&self, id: ConnectionId, path: PreparedPath) -> Result<(), EndpointError> {
+    pub fn validate_path_budget(&self, id: ConnectionId, path: &PreparedPath) -> Result<(), EndpointError> {
         let connection = &self.retained_slot(id)?.connection;
         connection.check_managed_budget(path)?;
         if !connection.represents_budget(path) {

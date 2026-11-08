@@ -3169,14 +3169,14 @@ impl Connection {
                         .saturating_sub(u32::from(self.ip_header_len)) as usize,
                 )
             });
-        local.min(self.managed_path.map_or(usize::MAX, |path| {
+        local.min(self.managed_path.as_ref().map_or(usize::MAX, |path| {
             self.managed_ip_budget(path)
                 .saturating_sub(u32::from(self.ip_header_len)) as usize
         }))
     }
 
     fn managed_payload_mss(&self) -> usize {
-        self.managed_path.map_or(usize::MAX, |path| {
+        self.managed_path.as_ref().map_or(usize::MAX, |path| {
             self.managed_ip_budget(path)
                 .saturating_sub(u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 })
                 .max(1) as usize
@@ -3187,7 +3187,7 @@ impl Connection {
     // IPv6 connection keeps every complete packet within the IPv6 minimum
     // link MTU, whose payload ceiling `send_ip_payload_limit` states only
     // for the base header: an SR route's Segment Routing Header counts too.
-    fn managed_ip_budget(&self, path: crate::PreparedPath) -> u32 {
+    fn managed_ip_budget(&self, path: &crate::PreparedPath) -> u32 {
         let budget = path.snapshot.ip_packet_budget().unwrap_or(0);
         if self.pmtud.is_none() && !self.tuple.local.is_ipv4() {
             budget.min(min_mtu(false))
@@ -3199,7 +3199,7 @@ impl Connection {
     // The complete IP header this connection's packets carry on `path`: its
     // IPv4 header with options, or the path's IPv6 header (the base header
     // and an SR route's Segment Routing Header).
-    fn path_ip_header_len(&self, path: crate::PreparedPath) -> u16 {
+    fn path_ip_header_len(&self, path: &crate::PreparedPath) -> u16 {
         if self.tuple.local.is_ipv4() {
             self.ip_header_len
         } else {
@@ -3210,7 +3210,7 @@ impl Connection {
     /// Whether the packet budget of `path` still carries this connection's
     /// complete IP header on it (options and extension headers included),
     /// its TCP header with every option it sends and one payload octet.
-    pub(crate) fn represents_budget(&self, path: crate::PreparedPath) -> bool {
+    pub(crate) fn represents_budget(&self, path: &crate::PreparedPath) -> bool {
         path.snapshot.ip_packet_budget().is_ok_and(|budget| {
             budget
                 >= u32::from(self.path_ip_header_len(path)) + 20 + if self.timestamps { 12 } else { 0 } + 1
@@ -3218,9 +3218,9 @@ impl Connection {
     }
 
     /// Read-only check that `apply_managed_budget(path)` succeeds (the same
-    /// binding authority). Returns the current binding.
-    pub(crate) fn check_managed_budget(&self, path: crate::PreparedPath) -> Result<crate::PreparedPath, Error> {
-        let old = self.managed_path.ok_or(Error::InvalidState)?;
+    /// binding authority).
+    pub(crate) fn check_managed_budget(&self, path: &crate::PreparedPath) -> Result<(), Error> {
+        let old = self.managed_path.as_ref().ok_or(Error::InvalidState)?;
         if path.snapshot.status() != ntcp_path::PathStatus::Valid
             || old.snapshot.key().context() != path.snapshot.key().context()
             || old.snapshot.key().source_address() != path.snapshot.key().source_address()
@@ -3229,7 +3229,7 @@ impl Connection {
         {
             return Err(Error::InvalidArgument);
         }
-        Ok(old)
+        Ok(())
     }
 
     /// Network authority changes packetization, never loss/retry classification.
@@ -3240,18 +3240,21 @@ impl Connection {
         &mut self,
         path: crate::PreparedPath,
     ) -> Result<bool, Error> {
-        let old = self.check_managed_budget(path)?;
-        if old == path {
+        self.check_managed_budget(&path)?;
+        let old = self.managed_path.as_ref().unwrap();
+        if *old == path {
             return Ok(false);
         }
         let replaced = old.snapshot.path() != path.snapshot.path();
+        let rebound = old.client != path.client;
+        let negative = old.snapshot.negative_revision() != path.snapshot.negative_revision();
         let bound = self.path_bound(path.snapshot.first_hop_mtu());
         if let Some(p) = &mut self.pmtud {
             p.set_plateaus(self.config.pmtud.unwrap().policy.ipv4_plateaus.for_path(Some(path)));
             p.network_link_bound(path.snapshot.first_hop_mtu(), bound);
             if replaced {
                 p.replace_network_authority();
-            } else if old.snapshot.negative_revision() != path.snapshot.negative_revision() {
+            } else if negative {
                 p.invalidate_probe_size_result();
             }
             // Owner policy delivered with the snapshot: stale-policy size
@@ -3267,10 +3270,10 @@ impl Connection {
                 p.lower_baseline(budget);
             }
         }
-        if replaced || old.client != path.client {
+        if replaced || rebound {
             // Results and provenance describe only the binding they arose on.
             self.managed_results = crate::endpoint::ManagedResults::default();
-        } else if old.snapshot.negative_revision() != path.snapshot.negative_revision() {
+        } else if negative {
             // Newer negative evidence makes earlier delivery proof stale. An
             // applied decrease stays: the Host discards it once subsumed.
             self.managed_results.receipt = None;
@@ -3279,7 +3282,7 @@ impl Connection {
         self.managed_path = Some(path);
         // A replacement route may add, change or drop a Segment Routing
         // Header: every later packet is sized for the new path's header.
-        self.ip_header_len = self.path_ip_header_len(path);
+        self.ip_header_len = self.path_ip_header_len(&path);
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
         let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
         let local = self.pmtud.as_ref().map_or(usize::MAX, |p| {
@@ -9031,7 +9034,7 @@ impl Connection {
             let admin_target = self.pmtud.as_ref().and_then(|p| p.administrative_target());
             let mut admin_deferral = None;
             let candidate = self.pmtud.as_ref().and_then(|p| {
-                let target = if let Some(path) = self.managed_path {
+                let target = if let Some(path) = &self.managed_path {
                     if p.discovery_disabled() {
                         admin_deferral = Some(crate::pmtud::AdministrativeDeferral::DiscoveryDisabled);
                         return None;
@@ -9049,7 +9052,9 @@ impl Connection {
                 }
                 target
             }).filter(|&size| {
-                self.managed_path.is_none_or(|path| size <= path.snapshot.first_hop_mtu())
+                self.managed_path
+                    .as_ref()
+                    .is_none_or(|path| size <= path.snapshot.first_hop_mtu())
             }).filter(|_| {
                 let recovering = self.congestion.in_recovery()
                     || self.sack_recovery.is_some()

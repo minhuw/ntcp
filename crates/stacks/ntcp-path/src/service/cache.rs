@@ -668,11 +668,14 @@ impl PathService {
     /// them. Acknowledging invalidation clears dirty only, never restores output
     /// authority. A new binding is required before output may resume.
     pub fn snapshot(&self, client: ClientId) -> Result<PathSnapshot, Error> {
-        let client = self.clients.get(self.context, client.0)?;
-        self.path_snapshot(client.path)
+        self.client_snapshot(client).copied()
     }
     pub fn path_snapshot(&self, path: PathId) -> Result<PathSnapshot, Error> {
-        Ok(self.paths.get(self.context, path.0)?.snapshot)
+        Ok(self.paths.get_ref(self.context, path.0)?.snapshot)
+    }
+    fn client_snapshot(&self, client: ClientId) -> Result<&PathSnapshot, Error> {
+        let path = self.clients.get_ref(self.context, client.0)?.path;
+        Ok(&self.paths.get_ref(self.context, path.0)?.snapshot)
     }
     /// `validate_selection` of an observed path's key, without selecting a
     /// route again while that path is still valid: every revision re-resolves
@@ -700,10 +703,10 @@ impl PathService {
         self.validate_selection(snapshot.key).map(|_| ())
     }
     pub fn path_pins(&self, path: PathId) -> Result<usize, Error> {
-        Ok(self.paths.get(self.context, path.0)?.pins)
+        Ok(self.paths.get_ref(self.context, path.0)?.pins)
     }
     pub fn is_dirty(&self, client: ClientId) -> Result<bool, Error> {
-        Ok(self.clients.get(self.context, client.0)?.dirty)
+        Ok(self.clients.get_ref(self.context, client.0)?.dirty)
     }
 
     /// Callback-free, allocation-free bounded scan. Reading does not consume.
@@ -724,11 +727,11 @@ impl PathService {
     }
 
     pub fn acknowledge(&mut self, client: ClientId, stamp: ChangeStamp) -> Result<(), Error> {
-        let current = self.snapshot(client)?;
-        if stamp.path != current.path() || stamp.version > current.version() {
+        let current = self.client_snapshot(client)?.stamp();
+        if stamp.path != current.path || stamp.version > current.version {
             return Err(Error::InvalidArgument);
         }
-        if stamp.version == current.version() {
+        if stamp.version == current.version {
             self.clients.slots[client.0.slot]
                 .value
                 .as_mut()

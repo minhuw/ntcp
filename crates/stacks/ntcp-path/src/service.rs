@@ -426,13 +426,17 @@ impl<T: Copy> Table<T> {
             .ok_or(Error::Capacity)
     }
     fn get(&self, context: ContextId, handle: Handle) -> Result<T, Error> {
+        self.get_ref(context, handle).copied()
+    }
+    // Readers of one field of a large record (a cached path) borrow it.
+    fn get_ref(&self, context: ContextId, handle: Handle) -> Result<&T, Error> {
         if handle.context != context {
             return Err(Error::ForeignContext);
         }
         self.slots
             .get(handle.slot)
             .filter(|s| s.generation == handle.generation)
-            .and_then(|s| s.value)
+            .and_then(|s| s.value.as_ref())
             .ok_or(Error::StaleHandle)
     }
     fn insert(&mut self, context: ContextId, slot: usize, generation: u64, value: T) -> Handle {

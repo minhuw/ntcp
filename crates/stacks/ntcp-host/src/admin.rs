@@ -512,7 +512,7 @@ impl Host {
             }
             endpoint.validate_path_budget(
                 owner,
-                PreparedPath {
+                &PreparedPath {
                     client: binding.prepared.client,
                     snapshot: next,
                 },
