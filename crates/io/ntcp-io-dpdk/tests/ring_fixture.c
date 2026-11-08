@@ -3,7 +3,6 @@
 #include <errno.h>
 #include <sched.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <rte_errno.h>
 #include <unistd.h>
@@ -26,13 +25,12 @@ int ntcp_test_init(void) {
     if (sched_getaffinity(0, sizeof(cpus), &cpus)) return -1;
     int cpu;
     for (cpu = 0; cpu < CPU_SETSIZE && !CPU_ISSET(cpu, &cpus); ++cpu) {}
-    char mapping[64];
+    char mapping[64], prefix[64];
     snprintf(mapping, sizeof(mapping), "--lcores=0@%d", cpu);
-    char *args[] = {"ntcp-test", mapping, "--no-huge", "--no-pci",
-                    "--no-shconf", "--no-telemetry", "-m", "64", "-d",
-                    getenv("NTCP_DPDK_TEST_MEMPOOL_PMD")};
-    int argc = args[9] ? 10 : 8;
-    if (rte_eal_init(argc, args) < 0) return -2;
+    snprintf(prefix, sizeof(prefix), "--file-prefix=ntcp-ring-%d", (int)getpid());
+    char *args[] = {"ntcp-test", mapping, "--no-huge", "--no-pci", "--in-memory",
+                    prefix, "--no-telemetry", "-m", "64"};
+    if (rte_eal_init(RTE_DIM(args), args) < 0) return -2;
     rx = rte_ring_create("ntcp_rx", 32, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
     tx = rte_ring_create("ntcp_tx", 8, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
     pool = rte_pktmbuf_pool_create("ntcp_pool", 1023, 0, 0, 256, SOCKET_ID_ANY);

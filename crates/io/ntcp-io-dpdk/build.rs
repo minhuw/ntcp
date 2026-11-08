@@ -37,8 +37,10 @@ fn native() {
     #[cfg(feature = "test-pmd")]
     {
         println!("cargo:rerun-if-changed=tests/ring_fixture.c");
+        println!("cargo:rerun-if-changed=tests/host_fixture.c");
         cc::Build::new()
             .file("tests/ring_fixture.c")
+            .file("tests/host_fixture.c")
             .flags(&flags)
             .flag_if_supported("-std=gnu11")
             .compile("ntcp_dpdk_test_fixture");

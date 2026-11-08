@@ -26,3 +26,7 @@ shlex = { version = "2", optional = true }
 [[test]]
 name = "ring_pmd"
 required-features = ["test-pmd"]
+
+[[test]]
+name = "host_pmd"
+required-features = ["test-pmd"]

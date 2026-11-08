@@ -1,6 +1,7 @@
-#define ALLOW_EXPERIMENTAL_API // DPDK 23.11 read-only rte_eth_dev_conf_get.
+#define ALLOW_EXPERIMENTAL_API // rte_eth_dev_conf_get, rte_eth_read_clock.
 #include "shim.h"
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
@@ -400,4 +401,223 @@ done:
     rte_pktmbuf_free(head);
     for (; consumed < count; ++consumed) release(segments[consumed].lease);
     return result;
+}
+
+// Host setup. Unlike everything above, these functions own EAL, ports, pools
+// and flows; Rust (host.rs) sequences them and guarantees teardown order.
+#include <rte_bus.h>
+#include <rte_dev.h>
+#include <rte_eal.h>
+#include <rte_flow.h>
+#include <rte_lcore.h>
+#include <rte_mempool.h>
+
+int ntcp_dpdk_eal_init(int argc, char **argv) {
+    // Pins the calling thread to the main lcore. Never retried by the caller.
+    int result = rte_eal_init(argc, argv);
+    return result < 0 ? -rte_errno : result;
+}
+unsigned ntcp_dpdk_main_lcore(void) { return rte_get_main_lcore(); }
+// UINT32_MAX (LCORE_ID_ANY) means the calling thread is not an EAL thread.
+unsigned ntcp_dpdk_lcore_id(void) { return rte_lcore_id(); }
+int ntcp_dpdk_thread_register(void) {
+    return rte_thread_register() < 0 ? -rte_errno : 0;
+}
+void ntcp_dpdk_thread_unregister(void) { rte_thread_unregister(); }
+
+static int find_port(const char *devargs, uint16_t *port, unsigned *count) {
+    struct rte_dev_iterator iterator;
+    uint16_t id;
+    *count = 0;
+    RTE_ETH_FOREACH_MATCHING_DEV(id, devargs, &iterator) {
+        *port = id;
+        ++*count;
+    }
+    return 0;
+}
+
+// Find (probing if needed) exactly one ethdev port for devargs and take
+// exclusive ethdev ownership of it, so no other owner can configure it.
+int ntcp_dpdk_port_claim(const char *devargs, uint64_t *owner, uint16_t *port) {
+    unsigned count;
+    find_port(devargs, port, &count);
+    if (!count) {
+        int result = rte_dev_probe(devargs);
+        // Already probed but without a matching port is reported below.
+        if (result < 0 && result != -EEXIST) return result;
+        find_port(devargs, port, &count);
+    }
+    if (!count) return -ENODEV;
+    if (count > 1) return -EINVAL; // Ambiguous: name one port's devargs.
+    int result = rte_eth_dev_owner_new(owner);
+    if (result < 0) return result;
+    struct rte_eth_dev_owner claim = { .id = *owner };
+    snprintf(claim.name, sizeof(claim.name), "ntcp");
+    result = rte_eth_dev_owner_set(*port, &claim);
+    if (result < 0) {
+        rte_eth_dev_owner_delete(*owner);
+        *owner = 0;
+    }
+    // rte_eth_dev_owner_set fails with EPERM for one reason only: the port
+    // already has another owner. That is contention, not missing privilege, so
+    // report EBUSY (ResourceBusy) rather than send callers to check privileges.
+    return result == -EPERM ? -EBUSY : result;
+}
+
+static void flow_message(const struct rte_flow_error *error, char *message, size_t capacity) {
+    snprintf(message, capacity, "%s", error->message ? error->message : "");
+}
+
+// Bifurcated PMDs (mlx5) must enter isolated mode before configuration.
+int ntcp_dpdk_port_isolate(uint16_t port, char *message, size_t capacity) {
+    struct rte_flow_error error = {0};
+    int result = rte_flow_isolate(port, 1, &error);
+    if (result < 0) flow_message(&error, message, capacity);
+    return result;
+}
+
+int ntcp_dpdk_port_socket(uint16_t port) { return rte_eth_dev_socket_id(port); }
+
+void *ntcp_dpdk_pool_create(const char *name, uint32_t count, uint16_t data_size,
+                            int socket, int *error) {
+    if ((uint32_t)data_size + RTE_PKTMBUF_HEADROOM > UINT16_MAX) {
+        *error = -EINVAL;
+        return NULL;
+    }
+    // A queue's pool is used by one worker lcore. The cache only amortises
+    // ring access (testpmd uses 250); flush thresholds require 1.5x <= count.
+    unsigned cache = RTE_MIN(256u, count / 2);
+    struct rte_mempool *pool = rte_pktmbuf_pool_create(name, count, cache, 0,
+        (uint16_t)(data_size + RTE_PKTMBUF_HEADROOM), socket);
+    *error = pool ? 0 : -rte_errno;
+    return pool;
+}
+
+// Freeing a pool with outstanding mbufs would leave live references to freed
+// memory. Retain (leak) it instead; returns 1 if freed, 0 if retained.
+int ntcp_dpdk_pool_free(void *pool) {
+    if (!rte_mempool_full(pool)) return 0;
+    rte_mempool_free(pool);
+    return 1;
+}
+
+enum {
+    NTCP_STAGE_INFO = 1, NTCP_STAGE_QUEUES, NTCP_STAGE_TIMESTAMP, NTCP_STAGE_SCATTER,
+    NTCP_STAGE_MULTI_SEGS, NTCP_STAGE_CONFIGURE, NTCP_STAGE_DESCRIPTORS,
+};
+
+// Configure queue pairs for the borrowed adapter's RX contract: complete,
+// untransformed frames. Only TIMESTAMP (requested) and SCATTER (needed for
+// frames larger than one mbuf) are enabled on RX; nothing strips or merges.
+int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *config,
+                             uint16_t *rx_desc, uint16_t *tx_desc, int *stage) {
+    struct rte_eth_dev_info info;
+    *stage = NTCP_STAGE_INFO;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    *stage = NTCP_STAGE_QUEUES;
+    if (!config->queues || config->queues > info.max_rx_queues ||
+        config->queues > info.max_tx_queues) return -EINVAL;
+    uint64_t rx = 0, tx = 0;
+    if (config->rx_timestamps) {
+        *stage = NTCP_STAGE_TIMESTAMP;
+        if (!(info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TIMESTAMP)) return -ENOTSUP;
+        rx |= RTE_ETH_RX_OFFLOAD_TIMESTAMP;
+    }
+    // Same L2 overhead rule as ethdev's MTU validation.
+    uint32_t overhead = info.max_mtu != UINT16_MAX && info.max_rx_pktlen > info.max_mtu ?
+        info.max_rx_pktlen - info.max_mtu : RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN;
+    int large = (uint32_t)config->mtu + overhead > config->mbuf_data_size;
+    if (large) {
+        *stage = NTCP_STAGE_SCATTER;
+        if (!(info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER)) return -ENOTSUP;
+        rx |= RTE_ETH_RX_OFFLOAD_SCATTER;
+    }
+    // The adapter chains any frame longer than one mbuf, and explicit zero-copy
+    // needs chains: enable multi-segment TX whenever supported, require it
+    // when MTU-sized frames cannot fit one mbuf.
+    if (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) {
+        tx |= RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+    } else if (large) {
+        *stage = NTCP_STAGE_MULTI_SEGS;
+        return -ENOTSUP;
+    }
+    // No RSS: a queue receives only what flows steer to it (or queue 0's
+    // default traffic), so each worker sees exactly its own connections.
+    struct rte_eth_conf conf = {0};
+    conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+    conf.rxmode.mtu = config->mtu;
+    conf.rxmode.offloads = rx;
+    conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
+    conf.txmode.offloads = tx;
+    *stage = NTCP_STAGE_CONFIGURE;
+    result = rte_eth_dev_configure(port, config->queues, config->queues, &conf);
+    if (result < 0) return result;
+    *stage = NTCP_STAGE_DESCRIPTORS;
+    *rx_desc = config->rx_desc;
+    *tx_desc = config->tx_desc;
+    return rte_eth_dev_adjust_nb_rx_tx_desc(port, rx_desc, tx_desc);
+}
+
+// Queue offloads stay zero: port-level offloads already apply to every queue.
+int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
+                               uint16_t tx_desc, int socket, void *pool) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    struct rte_eth_rxconf rxconf = info.default_rxconf;
+    rxconf.offloads = 0;
+    result = rte_eth_rx_queue_setup(port, queue, rx_desc, socket, &rxconf, pool);
+    if (result < 0) return result;
+    struct rte_eth_txconf txconf = info.default_txconf;
+    txconf.offloads = 0;
+    return rte_eth_tx_queue_setup(port, queue, tx_desc, socket, &txconf);
+}
+
+int ntcp_dpdk_port_start(uint16_t port) { return rte_eth_dev_start(port); }
+
+// Teardown after every queue user and flow is gone: stop, close (releases the
+// port), drop ownership, and detach the device once it has no ethdev port
+// left, so a later claim can probe it again. Best effort; nothing to report.
+void ntcp_dpdk_port_release(uint16_t port, uint64_t owner, int started) {
+    struct rte_eth_dev_info info;
+    struct rte_device *device = rte_eth_dev_info_get(port, &info) == 0 ? info.device : NULL;
+    if (started) rte_eth_dev_stop(port);
+    rte_eth_dev_close(port);
+    rte_eth_dev_owner_delete(owner);
+    if (device && rte_eth_find_next_of(0, device) == RTE_MAX_ETHPORTS)
+        rte_dev_remove(device);
+}
+
+int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock) {
+    return rte_eth_read_clock(port, clock);
+}
+
+// ETH / IPV4 (exact destination) -> QUEUE. dst is in network byte order.
+void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
+                          char *message, size_t capacity) {
+    struct rte_flow_attr attr = { .ingress = 1 };
+    struct rte_flow_item_ipv4 spec = {0}, mask = {0};
+    spec.hdr.dst_addr = dst;
+    mask.hdr.dst_addr = UINT32_MAX;
+    struct rte_flow_item pattern[] = {
+        { .type = RTE_FLOW_ITEM_TYPE_ETH },
+        { .type = RTE_FLOW_ITEM_TYPE_IPV4, .spec = &spec, .mask = &mask },
+        { .type = RTE_FLOW_ITEM_TYPE_END },
+    };
+    struct rte_flow_action_queue target = { .index = queue };
+    struct rte_flow_action actions[] = {
+        { .type = RTE_FLOW_ACTION_TYPE_QUEUE, .conf = &target },
+        { .type = RTE_FLOW_ACTION_TYPE_END },
+    };
+    struct rte_flow_error flow_error = {0};
+    struct rte_flow *flow = rte_flow_create(port, &attr, pattern, actions, &flow_error);
+    *error = flow ? 0 : -rte_errno;
+    if (!flow) flow_message(&flow_error, message, capacity);
+    return flow;
+}
+
+int ntcp_dpdk_flow_destroy(uint16_t port, void *flow) {
+    struct rte_flow_error error;
+    return rte_flow_destroy(port, flow, &error);
 }

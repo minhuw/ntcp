@@ -1,3 +1,9 @@
+mod calibration;
+pub use calibration::{CalibrationError, ClockCalibration, ClockFit, MAX_CALIBRATION_WINDOW};
+#[cfg(feature = "native")]
+mod host;
+#[cfg(feature = "native")]
+pub use host::{Eal, Flow, HostedQueue, Port, PortConfig, QueueHandle};
 #[cfg(feature = "native")]
 mod native;
 #[cfg(feature = "native")]

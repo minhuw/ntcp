@@ -43,4 +43,31 @@ int ntcp_dpdk_shared_transmit(uint16_t port, uint16_t queue, void *pool,
     const struct ntcp_shared_segment *segments, uint16_t count,
     ntcp_release_fn release);
 
+// Host setup: owns EAL, ports, pools and flows (see host.rs for ordering).
+int ntcp_dpdk_eal_init(int argc, char **argv);
+unsigned ntcp_dpdk_main_lcore(void);
+unsigned ntcp_dpdk_lcore_id(void);
+int ntcp_dpdk_thread_register(void);
+void ntcp_dpdk_thread_unregister(void);
+int ntcp_dpdk_port_claim(const char *devargs, uint64_t *owner, uint16_t *port);
+int ntcp_dpdk_port_isolate(uint16_t port, char *message, size_t capacity);
+int ntcp_dpdk_port_socket(uint16_t port);
+void *ntcp_dpdk_pool_create(const char *name, uint32_t count, uint16_t data_size,
+                            int socket, int *error);
+int ntcp_dpdk_pool_free(void *pool);
+struct ntcp_port_config {
+    uint16_t queues, rx_desc, tx_desc, mtu, mbuf_data_size;
+    uint8_t rx_timestamps;
+};
+int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *config,
+                             uint16_t *rx_desc, uint16_t *tx_desc, int *stage);
+int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
+                               uint16_t tx_desc, int socket, void *pool);
+int ntcp_dpdk_port_start(uint16_t port);
+void ntcp_dpdk_port_release(uint16_t port, uint64_t owner, int started);
+int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock);
+void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
+                          char *message, size_t capacity);
+int ntcp_dpdk_flow_destroy(uint16_t port, void *flow);
+
 #endif
