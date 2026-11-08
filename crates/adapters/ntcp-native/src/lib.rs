@@ -1310,7 +1310,59 @@ impl<P: PacketIo> Network<P> {
             }
         }
         let more = !self.events.is_empty() || self.stopped_event || !self.ready.is_empty();
+        if !more {
+            self.check_ready();
+        }
         DrainReport { written, more }
+    }
+    // The full-scan form of the ready queue, for debug builds: when a drain
+    // leaves nothing queued, no live connection or listener has an event a
+    // refresh would raise.
+    fn check_ready(&self) {
+        if !cfg!(debug_assertions) || self.stopped {
+            return;
+        }
+        for &slot in &self.live_connections {
+            debug_assert!(
+                !self.unqueued_event(slot),
+                "connection slot {slot} has an event but is not queued"
+            );
+        }
+        for &slot in &self.live_listeners {
+            let l = self.listeners[slot].value.as_ref().unwrap();
+            debug_assert!(
+                !(l.acceptable && !l.closing),
+                "listener slot {slot} is acceptable but not queued"
+            );
+        }
+    }
+    // Whether refreshing connection `slot` and asking it for an event would
+    // give one, without doing either.
+    fn unqueued_event(&self, slot: usize) -> bool {
+        let c = self.connections[slot].value.as_ref().unwrap();
+        if c.released {
+            return false;
+        }
+        let Ok(state) = self.endpoint.state(c.core) else {
+            return false;
+        };
+        let connected = matches!(state, State::Established | State::CloseWait)
+            && matches!(c.state, State::SynSent | State::SynReceived);
+        let closed = matches!(state, State::Closed | State::TimeWait)
+            && !matches!(c.state, State::Closed | State::TimeWait);
+        let readable = c.read_waiting
+            && !self.endpoint.is_output_reserved(c.core)
+            && (self.endpoint.readable_bytes(c.core).unwrap_or(0) != 0
+                || self.endpoint.terminal_readable_bytes(c.core).unwrap_or(0) != 0
+                || matches!(
+                    state,
+                    State::CloseWait
+                        | State::Closing
+                        | State::LastAck
+                        | State::TimeWait
+                        | State::Closed
+                ));
+        connected || closed || readable || self.connection_has_event(slot)
     }
     // Whether next_connection_event would give an event, without taking it.
     fn connection_has_event(&self, slot: usize) -> bool {

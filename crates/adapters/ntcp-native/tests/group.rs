@@ -1031,3 +1031,99 @@ fn the_buffer_budget_admits_exactly_its_connections() {
     assert_eq!(admitted(budget), 3);
     assert_eq!(admitted(budget - 1), 2);
 }
+
+// Applications that read, write and accept only when an event says so
+// complete every exchange while transmits are refused at random and reads
+// take random amounts: no event is lost. Debug builds also check after
+// every drain that no connection has an event left unqueued.
+#[test]
+fn event_driven_exchanges_complete_under_backpressure_and_partial_reads() {
+    const EXCHANGES: usize = 100;
+    const SIZE: usize = 48;
+    let mut pair = Pair::new(false, false);
+    let peer = pair.a.connection_info(pair.client).unwrap().peer;
+    let mut clients = vec![pair.client];
+    for _ in 0..3 {
+        clients.push(pair.a.connect(peer).unwrap());
+    }
+    let mut servers = vec![pair.server];
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut random = move |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % bound as u64) as usize
+    };
+    // Per client: exchanges done, octets of the current response still to
+    // come, and whether its request still has to be written.
+    let mut done = vec![0; clients.len()];
+    let mut awaited = vec![0; clients.len()];
+    let mut unwritten = vec![true; clients.len()];
+    // Per server: octets read and not yet echoed.
+    let mut echo: Vec<usize> = Vec::new();
+    let mut buffer = [0; SIZE];
+    for _ in 0..20_000 {
+        if done.iter().all(|&n| n == EXCHANGES) {
+            return;
+        }
+        pair.a.backend().blocked.set(random(3) == 0);
+        pair.b.backend().blocked.set(random(3) == 0);
+        pair.step();
+        for event in drain(&mut pair.b) {
+            match event {
+                Event::Acceptable(_) => {
+                    while let Ok(server) = pair.b.accept(pair.listener) {
+                        servers.push(server);
+                    }
+                }
+                Event::Readable(id) | Event::Writable(id) => {
+                    let index = servers.iter().position(|&s| s == id).unwrap();
+                    echo.resize(servers.len(), 0);
+                    if let Event::Readable(_) = event
+                        && let Ok(ReadOutcome::Data { len, .. }) =
+                            pair.b.try_read(id, &mut buffer[..1 + random(SIZE)])
+                    {
+                        echo[index] += len;
+                    }
+                    if echo[index] != 0 {
+                        match pair
+                            .b
+                            .try_write(id, &buffer[..echo[index]], WriteOptions::default())
+                        {
+                            Ok(receipt) => echo[index] -= receipt.accepted,
+                            Err(error) => assert!(error.is_would_block(), "{error:?}"),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for event in drain(&mut pair.a) {
+            let (Event::Connected(id) | Event::Readable(id) | Event::Writable(id)) = event else {
+                continue;
+            };
+            let index = clients.iter().position(|&c| c == id).unwrap();
+            if let Event::Readable(_) = event
+                && let Ok(ReadOutcome::Data { len, .. }) =
+                    pair.a.try_read(id, &mut buffer[..1 + random(SIZE)])
+            {
+                awaited[index] -= len;
+                if awaited[index] == 0 {
+                    done[index] += 1;
+                    unwritten[index] = done[index] < EXCHANGES;
+                }
+            }
+            if unwritten[index] && awaited[index] == 0 {
+                match pair.a.try_write(id, &[7; SIZE], WriteOptions::default()) {
+                    Ok(receipt) => {
+                        assert_eq!(receipt.accepted, SIZE);
+                        unwritten[index] = false;
+                        awaited[index] = SIZE;
+                    }
+                    Err(error) => assert!(error.is_would_block(), "{error:?}"),
+                }
+            }
+        }
+    }
+    panic!("exchanges stalled: {done:?}, awaiting {awaited:?}, unwritten {unwritten:?}");
+}
