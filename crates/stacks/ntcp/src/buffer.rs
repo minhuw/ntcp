@@ -1050,6 +1050,65 @@ impl ReceiveBuffer {
         }
     }
 
+    // The slots of `len` bytes from `offset`, as at most two index ranges
+    // (the second one after the ring wraps).
+    fn ranges(&self, offset: usize, len: usize) -> [core::ops::Range<usize>; 2] {
+        let start = self.index(offset);
+        let first = len.min(self.data.len() - start);
+        [start..start + first, 0..len - first]
+    }
+
+    // `set_present` for every slot of `range`, four slots per metadata byte.
+    fn set_present_range(&mut self, range: core::ops::Range<usize>, present: bool) {
+        let mut index = range.start;
+        while index < range.end && !index.is_multiple_of(4) {
+            self.set_present(index, present);
+            index += 1;
+        }
+        let fill = if present { 0x55 } else { 0 };
+        while index + 4 <= range.end {
+            self.metadata[index / 4] = fill;
+            index += 4;
+        }
+        for index in index..range.end {
+            self.set_present(index, present);
+        }
+    }
+
+    // Whether every slot of `range` holds a byte.
+    fn all_present(&self, range: core::ops::Range<usize>) -> bool {
+        let mut index = range.start;
+        while index < range.end && !index.is_multiple_of(4) {
+            if !self.is_present(index) {
+                return false;
+            }
+            index += 1;
+        }
+        while index + 4 <= range.end {
+            if self.metadata[index / 4] & 0x55 != 0x55 {
+                return false;
+            }
+            index += 4;
+        }
+        (index..range.end).all(|index| self.is_present(index))
+    }
+
+    // Clears the reporting anchors of every slot of `range`.
+    fn clear_pending_range(&mut self, range: core::ops::Range<usize>) {
+        let mut index = range.start;
+        while index < range.end && !index.is_multiple_of(8) {
+            self.report_pending[index / 8] &= !(1 << (index % 8));
+            index += 1;
+        }
+        while index + 8 <= range.end {
+            self.report_pending[index / 8] = 0;
+            index += 8;
+        }
+        for index in index..range.end {
+            self.report_pending[index / 8] &= !(1 << (index % 8));
+        }
+    }
+
     pub(crate) fn peek(&self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.contiguous_len);
         for (offset, dst) in out[..count].iter_mut().enumerate() {
@@ -1063,15 +1122,24 @@ impl ReceiveBuffer {
 
     pub(crate) fn read(&mut self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.contiguous_len);
-        for (offset, dst) in out[..count].iter_mut().enumerate() {
-            let index = self.index(offset);
-            assert!(self.is_present(index));
-            // Presence guarantees an initialized payload byte.
-            *dst = unsafe { self.data[index].assume_init() };
-            self.set_present(index, false);
-            self.occupied -= 1;
-            self.report_pending[index / 8] &= !(1 << (index % 8));
+        let mut copied = 0;
+        for range in self.ranges(0, count) {
+            assert!(self.all_present(range.clone()));
+            let len = range.len();
+            // SAFETY: presence guarantees initialized payload bytes; `out`
+            // holds `count` bytes and the ranges cover `count` slots.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.data[range.clone()].as_ptr().cast::<u8>(),
+                    out[copied..].as_mut_ptr(),
+                    len,
+                );
+            }
+            copied += len;
+            self.set_present_range(range.clone(), false);
+            self.clear_pending_range(range);
         }
+        self.occupied -= count;
         self.head = self.index(count);
         self.read_base = self.read_base.wrapping_add(count as u32);
         self.contiguous_len -= count;
@@ -1130,6 +1198,40 @@ impl ReceiveBuffer {
         let data_limit = self
             .fin_sequence
             .map_or(capacity, |end| end.distance_from(self.read_base) as usize);
+        // In-order text that fits, with no byte retained beyond the contiguous
+        // prefix: every byte is new and extends the prefix, so the per-byte
+        // path below reduces to copying the run and marking it present, with
+        // no reporting anchor and PUSH taken at once.
+        let start = self.contiguous_len;
+        if !fin && !outcome.out_of_order && !had_holes && start + payload.len() <= data_limit {
+            let mut copied = 0;
+            for range in self.ranges(start, payload.len()) {
+                let len = range.len();
+                // SAFETY: the ranges cover `payload.len()` slots of the ring.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        payload[copied..].as_ptr(),
+                        self.data[range.clone()].as_mut_ptr().cast::<u8>(),
+                        len,
+                    );
+                }
+                copied += len;
+                self.set_present_range(range, true);
+            }
+            let end = start + payload.len();
+            accepted(start, end);
+            outcome.new_bytes = payload.len();
+            self.occupied += payload.len();
+            self.contiguous_len = end;
+            self.pushed |= push;
+            if self.fin_sequence == Some(self.next()) {
+                self.eof = true;
+                outcome.fin = true;
+            }
+            outcome.advanced = true;
+            self.latest = None;
+            return outcome;
+        }
         let mut new_anchor = None;
         let mut run = None;
         for (offset, &byte) in payload.iter().enumerate() {
@@ -1777,6 +1879,52 @@ mod tests {
             ),
             storage
         );
+    }
+
+    // In-order arrivals beyond no retained byte take the copying path, the
+    // rest the per-byte one. Mixed at random across ring wraps, with partial
+    // reads, they count every new byte once and deliver the stream exactly.
+    #[test]
+    fn copying_and_per_byte_insertion_deliver_the_same_stream() {
+        for capacity in [61, 64, 256] {
+            let start = Seq(u32::MAX - 40);
+            let mut recv = ReceiveBuffer::new(start, capacity).unwrap();
+            let stream: Vec<u8> = (0..20_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+            let mut received = alloc::vec![false; stream.len()];
+            let mut random = 7u32;
+            let mut draw = |bound: u32| {
+                random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((random >> 8) % bound) as usize
+            };
+            let mut delivered = Vec::new();
+            let mut out = alloc::vec![0; capacity];
+            while delivered.len() < stream.len() {
+                let base = delivered.len();
+                let frontier = base + recv.readable();
+                let (from, len) = if draw(3) == 0 {
+                    (frontier + 1 + draw(12), 1 + draw(8))
+                } else {
+                    (frontier, 1 + draw(24))
+                };
+                let end = (from + len).min(base + capacity).min(stream.len());
+                if from < end {
+                    let fresh = (from..end).filter(|&i| !received[i]).count();
+                    let outcome = recv.insert_with_push(
+                        start.wrapping_add(from as u32),
+                        &stream[from..end],
+                        false,
+                        draw(2) == 0,
+                    );
+                    assert_eq!(outcome.new_bytes, fresh, "{from}..{end}");
+                    received[from..end].fill(true);
+                }
+                let want = draw(capacity as u32 + 1);
+                let count = recv.read(&mut out[..want]);
+                delivered.extend_from_slice(&out[..count]);
+            }
+            assert_eq!(delivered, stream);
+            assert_eq!(recv.readable(), 0);
+        }
     }
 
     #[test]

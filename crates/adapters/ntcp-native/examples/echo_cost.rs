@@ -281,8 +281,14 @@ fn main() -> ExitCode {
     };
     let clock = Clock(Instant::now());
     let mut bench = Bench::new(&args, &clock);
-    // Warm the connections' windows, buffers and caches.
-    bench.run(&clock, args.requests / 10 + 1);
+    // Warm the connections' windows, buffers and caches. Idle drives need
+    // established connections only, and a profile of them no traffic.
+    let warm = if args.idle_only {
+        1000
+    } else {
+        args.requests / 10 + 1
+    };
+    bench.run(&clock, warm);
     // Let the last responses' acknowledgments settle before idling.
     for _ in 0..100 {
         bench.drive(&clock);
