@@ -210,19 +210,17 @@ impl<P: PacketIo> Network<P> {
             data += 1;
             let index = self.tx_cursor;
             self.tx_cursor = (index + 1) % self.tx.len();
-            let mut slot = std::mem::replace(
-                &mut self.tx[index],
-                TxSlot {
-                    bytes: Vec::new(),
-                    pending: None,
-                },
-            );
+            // The table is set aside while one slot is served in place: a
+            // slot carries its frame's egress context, too large to move out
+            // and back for every frame.
+            let mut tx = std::mem::take(&mut self.tx);
+            let slot = &mut tx[index];
             let was_pending = slot.pending.is_some();
             let was_held = slot.pending.as_ref().is_some_and(|p| p.held);
-            let result = self.transmit_slot(&mut slot, report);
+            let result = self.transmit_slot(slot, report);
             let still_pending = slot.pending.is_some();
             let still_held = slot.pending.as_ref().is_some_and(|p| p.held);
-            self.tx[index] = slot;
+            self.tx = tx;
             match (was_pending, still_pending) {
                 (false, true) => occupy(&mut self.tx_frames, index),
                 (true, false) => vacate(&mut self.tx_frames, index),
