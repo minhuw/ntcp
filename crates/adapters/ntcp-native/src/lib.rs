@@ -985,6 +985,19 @@ impl<P: PacketIo> Network<P> {
         })
     }
     pub fn try_read(&mut self, id: ConnId, out: &mut [u8]) -> Result<ReadOutcome> {
+        let result = self.read_once(id, out);
+        // What the read left to read, or the end of the stream, is queued
+        // now, in the order it became ready again. A read that left nothing
+        // is queued by the change that next gives it something.
+        if self.conn(id).is_ok() {
+            self.refresh_connection(id.slot);
+            if self.connection_has_event(id.slot) {
+                self.ready.push(id.slot);
+            }
+        }
+        result
+    }
+    fn read_once(&mut self, id: ConnId, out: &mut [u8]) -> Result<ReadOutcome> {
         self.running()?;
         let c = self.conn(id)?;
         if c.close_requested || c.abort_requested || c.released {
@@ -1001,8 +1014,6 @@ impl<P: PacketIo> Network<P> {
         let start = c.read_cursor;
         self.conn_mut(id)?.readable_event = false;
         self.conn_mut(id)?.read_waiting = true;
-        // Whatever this read leaves is raised again by the next drain.
-        self.touch(id.slot);
         let terminal = state == State::Closed;
         let available = if terminal {
             self.endpoint.terminal_readable_bytes(core)?
@@ -1041,7 +1052,6 @@ impl<P: PacketIo> Network<P> {
             return Ok(ReadOutcome::Eof);
         }
         self.conn_mut(id)?.read_cursor += len as u64;
-        self.refresh_connection(id.slot);
         Ok(ReadOutcome::Data {
             len,
             range: TxStreamRange {
