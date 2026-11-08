@@ -42,13 +42,16 @@
 //   and one unit, and the RTTs subtract instants taken on any thread.
 // - Hardware RTT: the RX stamp of a response's last octet is in device
 //   ticks; each worker fits its own ClockCalibration from (now, read_clock)
-//   pairs taken every 100 ms and converts the stamp to caller time. The
+//   pairs taken every 100 ms, each the most tightly bracketed of three reads
+//   (`bracketed_reading`), and converts the stamp to caller time. The
 //   request's start is its Scheduled stamp: the caller time of the drive
 //   that handed its octets to the queue. With `rte_eth_read_clock`
 //   unsupported, or no stamps, no hardware RTT is reported.
 
 use ntcp_io::ClockDescriptor;
-use ntcp_io_dpdk::{ClockCalibration, ClockFit, Eal, HostedQueue, Port, PortConfig, QueueHandle};
+use ntcp_io_dpdk::{
+    ClockCalibration, ClockFit, Eal, HostedQueue, Port, PortConfig, QueueHandle, bracketed_reading,
+};
 use ntcp_native::{
     CallerTimebase, ConnId, Error as NetError, EthernetNextHop, Event, Link, Network,
     NetworkConfig, ReadOutcome, SharedNeighborLimits, SharedNeighbors, TimestampClock,
@@ -71,6 +74,8 @@ const DRAIN: Duration = Duration::from_secs(1);
 const LINGER: Duration = Duration::from_secs(1);
 const CALIBRATION_PERIOD: u64 = NANOS / 10;
 const CALIBRATION_WINDOW: usize = 32;
+// Device clock reads per paired reading; the most tightly bracketed is kept.
+const CALIBRATION_READS: usize = 3;
 const REQUEST_LEN: usize = 16;
 
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
@@ -564,15 +569,10 @@ fn exchange(
             && now >= next_calibration
         {
             next_calibration = now + CALIBRATION_PERIOD;
-            let before = now_ns();
-            let device = network.backend().read_clock();
-            let after = now_ns();
-            match device {
-                Ok(ticks) => {
-                    if calibration
-                        .push(before + (after - before) / 2, ticks)
-                        .is_err()
-                    {
+            let queue = network.backend();
+            match bracketed_reading(CALIBRATION_READS, now_ns, || queue.read_clock()) {
+                Ok((caller, ticks)) => {
+                    if calibration.push(caller, ticks).is_err() {
                         report.calibration_rejected += 1;
                     }
                 }

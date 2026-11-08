@@ -1,5 +1,7 @@
 mod calibration;
-pub use calibration::{CalibrationError, ClockCalibration, ClockFit, MAX_CALIBRATION_WINDOW};
+pub use calibration::{
+    CalibrationError, ClockCalibration, ClockFit, MAX_CALIBRATION_WINDOW, bracketed_reading,
+};
 #[cfg(feature = "native")]
 mod host;
 #[cfg(feature = "native")]

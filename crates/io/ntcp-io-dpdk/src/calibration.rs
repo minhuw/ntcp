@@ -9,9 +9,38 @@ use std::{collections::VecDeque, fmt};
 /// (Theil-Sen is quadratic), so this bounds the per-sample cost.
 pub const MAX_CALIBRATION_WINDOW: usize = 128;
 
-// Two points always fit exactly: they give no residual and cannot expose an
-// outlier, so a fit needs a third.
+// Two points always fit exactly and give no residual, so a fit needs a third.
 const MIN_FIT_SAMPLES: usize = 3;
+
+// Three samples cannot expose an outlier: the robust line runs through two of
+// them (the median of three slopes is one pair's, and the median intercept is
+// that pair's), so their median deviation is zero and any noise on the third
+// would reject it, leaving too few to fit. From four samples on, only samples
+// above the median deviation can be rejected, which leaves at least three.
+const MIN_ROBUST_SAMPLES: usize = 4;
+
+/// One paired reading for `ClockCalibration::push`: `reads` device clock
+/// reads (at least one), each between two caller clock reads, keeping the
+/// most tightly bracketed and the midpoint of its bracket as caller time. An
+/// interrupt or preemption between the reads widens a bracket and moves its
+/// midpoint, so the narrowest bracket best dates the device read.
+pub fn bracketed_reading<E>(
+    reads: usize,
+    mut caller: impl FnMut() -> u64,
+    mut device: impl FnMut() -> Result<u64, E>,
+) -> Result<(u64, u64), E> {
+    let mut best: Option<(u64, u64, u64)> = None;
+    for _ in 0..reads.max(1) {
+        let before = caller();
+        let ticks = device()?;
+        let width = caller().saturating_sub(before);
+        if best.is_none_or(|(narrowest, _, _)| width < narrowest) {
+            best = Some((width, before.saturating_add(width / 2), ticks));
+        }
+    }
+    let (_, caller, device) = best.unwrap();
+    Ok((caller, device))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CalibrationError {
@@ -201,7 +230,11 @@ fn fit(samples: &VecDeque<(u64, u64)>) -> Option<ClockFit> {
         .collect();
     // 1.4826 * MAD estimates a normal standard deviation. Integer caller ticks
     // make anything below one tick quantization, not evidence of an outlier.
-    let threshold = (3.0 * 1.4826 * median(&mut deviations.clone())).max(1.0);
+    let threshold = if points.len() < MIN_ROBUST_SAMPLES {
+        f64::INFINITY
+    } else {
+        (3.0 * 1.4826 * median(&mut deviations.clone())).max(1.0)
+    };
     let inliers: Vec<(f64, f64)> = points
         .iter()
         .zip(&deviations)
@@ -312,6 +345,59 @@ mod tests {
         assert_eq!(fit.residual_rms(), 0.0);
         assert_eq!(calibration.to_caller(20), Some(1_030));
         assert_eq!(calibration.to_caller(10), Some(1_000));
+    }
+
+    #[test]
+    fn the_narrowest_bracket_dates_the_reading() {
+        // Caller reads 0,10 | 20,90 (preempted) | 100,104 | 110,130.
+        let mut times = [0, 10, 20, 90, 100, 104, 110, 130].into_iter();
+        let mut ticks = 0..;
+        let reading =
+            bracketed_reading::<()>(4, || times.next().unwrap(), || Ok(ticks.next().unwrap()));
+        assert_eq!(reading, Ok((102, 2)));
+        assert_eq!(
+            bracketed_reading(3, || 0, || Err::<u64, _>("unreadable")),
+            Err("unreadable")
+        );
+        let mut calls = 0;
+        assert_eq!(
+            bracketed_reading::<()>(
+                0,
+                || 5,
+                || {
+                    calls += 1;
+                    Ok(9)
+                }
+            ),
+            Ok((5, 9))
+        );
+        assert_eq!(calls, 1);
+    }
+
+    // Too few samples to tell an outlier from noise: every sample is fitted.
+    #[test]
+    fn three_noisy_samples_fit_without_rejection() {
+        let mut calibration = ClockCalibration::new(3).unwrap();
+        // 12.8 ns per tick, caller readings off the line by tens of ns.
+        for (caller, device) in [(0, 0), (100_000_020, 7_812_500), (199_999_970, 15_625_000)] {
+            calibration.push(caller, device).unwrap();
+        }
+        let fit = calibration.fit().unwrap();
+        assert_eq!((fit.inliers(), fit.outliers()), (3, 0));
+        assert!((fit.rate() - 12.8).abs() < 1e-5, "{}", fit.rate());
+        assert!(fit.max_residual() > 1.0 && fit.max_residual() < 50.0);
+        // From four samples on the filter applies, and always leaves a fit.
+        calibration = ClockCalibration::new(4).unwrap();
+        for (caller, device) in [
+            (0, 0),
+            (100_000_020, 7_812_500),
+            (199_999_970, 15_625_000),
+            (300_400_000, 23_437_500),
+        ] {
+            calibration.push(caller, device).unwrap();
+        }
+        let fit = calibration.fit().unwrap();
+        assert!(fit.inliers() >= 3, "{}", fit.inliers());
     }
 
     #[test]
