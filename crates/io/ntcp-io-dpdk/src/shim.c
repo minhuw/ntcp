@@ -593,6 +593,16 @@ int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock) {
     return rte_eth_read_clock(port, clock);
 }
 
+// The default (index 0) address, as the device reports it now. Copied out
+// as bytes: Rust does not mirror struct rte_ether_addr.
+int ntcp_dpdk_port_mac(uint16_t port, uint8_t mac[6]) {
+    struct rte_ether_addr address;
+    int result = rte_eth_macaddr_get(port, &address);
+    if (result < 0) return result;
+    memcpy(mac, address.addr_bytes, RTE_ETHER_ADDR_LEN);
+    return 0;
+}
+
 // ETH / IPV4 (exact destination) -> QUEUE. dst is in network byte order.
 void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
                           char *message, size_t capacity) {

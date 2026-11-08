@@ -70,6 +70,7 @@ unsafe extern "C" {
     fn ntcp_dpdk_port_start(port: u16) -> i32;
     fn ntcp_dpdk_port_release(port: u16, owner: u64, started: i32);
     fn ntcp_dpdk_read_clock(port: u16, clock: *mut u64) -> i32;
+    fn ntcp_dpdk_port_mac(port: u16, mac: *mut u8) -> i32;
     fn ntcp_dpdk_flow_ipv4(
         port: u16,
         dst: u32,
@@ -406,6 +407,14 @@ impl Port {
         read_clock(self.inner.port)
     }
 
+    /// The port's default MAC address (rte_eth_macaddr_get), as the device
+    /// reports it at the time of the call: the source address of its frames
+    /// and the hardware address ARP answers with. Reported as is; a virtual
+    /// device without an address (the ring PMD) reports all zeros.
+    pub fn mac_address(&self) -> io::Result<[u8; 6]> {
+        mac_address(self.inner.port)
+    }
+
     /// Steer IPv4 packets with destination `dst` to `queue` (ETH / IPV4 dst →
     /// QUEUE). The rule is destroyed when the `Flow` drops, always before
     /// the port stops.
@@ -466,6 +475,16 @@ fn read_clock(port: u16) -> io::Result<u64> {
         return Err(dpdk_error("rte_eth_read_clock", result));
     }
     Ok(clock)
+}
+
+fn mac_address(port: u16) -> io::Result<[u8; 6]> {
+    let mut mac = [0; 6];
+    // SAFETY: the caller holds the port alive; the shim writes six octets.
+    let result = unsafe { ntcp_dpdk_port_mac(port, mac.as_mut_ptr()) };
+    if result < 0 {
+        return Err(dpdk_error("rte_eth_macaddr_get", result));
+    }
+    Ok(mac)
 }
 
 /// An rte_flow rule; keeps its port alive and is destroyed on drop.
@@ -619,6 +638,11 @@ impl HostedQueue {
     /// See `Port::read_clock`.
     pub fn read_clock(&self) -> io::Result<u64> {
         read_clock(self.port.port)
+    }
+
+    /// See `Port::mac_address`.
+    pub fn mac_address(&self) -> io::Result<[u8; 6]> {
+        mac_address(self.port.port)
     }
 
     pub fn dpdk(&self) -> &Dpdk {

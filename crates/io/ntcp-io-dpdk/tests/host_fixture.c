@@ -39,6 +39,20 @@ int ntcp_host_test_port_named(const char *name) {
     return rte_eth_dev_get_port_by_name(name, &port) == 0 ? port : -1;
 }
 
+// Reads and sets the default MAC through ethdev's own calls, beside the
+// host module's shim.
+int ntcp_host_test_mac(uint16_t port, uint8_t mac[6]) {
+    struct rte_ether_addr address;
+    int result = rte_eth_macaddr_get(port, &address);
+    if (result == 0) memcpy(mac, address.addr_bytes, RTE_ETHER_ADDR_LEN);
+    return result;
+}
+int ntcp_host_test_set_mac(uint16_t port, const uint8_t mac[6]) {
+    struct rte_ether_addr address;
+    memcpy(address.addr_bytes, mac, RTE_ETHER_ADDR_LEN);
+    return rte_eth_dev_default_mac_addr_set(port, &address);
+}
+
 // Keeps the ring PMD, and with it the net_ring vdev driver, linked even
 // under --as-needed when no other object references it.
 void *ntcp_host_test_ring_driver(void) { return (void *)rte_eth_from_rings; }

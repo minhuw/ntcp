@@ -66,6 +66,7 @@ int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
 int ntcp_dpdk_port_start(uint16_t port);
 void ntcp_dpdk_port_release(uint16_t port, uint64_t owner, int started);
 int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock);
+int ntcp_dpdk_port_mac(uint16_t port, uint8_t mac[6]);
 void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
                           char *message, size_t capacity);
 int ntcp_dpdk_flow_destroy(uint16_t port, void *flow);

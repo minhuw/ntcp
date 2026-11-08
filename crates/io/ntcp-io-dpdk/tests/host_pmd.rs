@@ -12,6 +12,8 @@ unsafe extern "C" {
     fn ntcp_host_test_lcore() -> u32;
     fn ntcp_host_test_port_named(name: *const c_char) -> i32;
     fn ntcp_host_test_ring_driver() -> *mut c_void;
+    fn ntcp_host_test_mac(port: u16, mac: *mut u8) -> i32;
+    fn ntcp_host_test_set_mac(port: u16, mac: *const u8) -> i32;
 }
 
 const NO_LCORE: u32 = u32::MAX;
@@ -78,6 +80,7 @@ fn hosted_ring_ports() {
 
     port_lifecycle(eal);
     rejected_configurations(eal);
+    mac_addresses(eal);
     outstanding_mbufs_retain_pool(eal);
 }
 
@@ -96,6 +99,8 @@ fn port_lifecycle(eal: &'static Eal) {
         port.read_clock().unwrap_err().kind(),
         ErrorKind::Unsupported
     );
+    // The ring PMD has no address of its own; none is made up.
+    assert_eq!(port.mac_address().unwrap(), [0; 6]);
     // ethdev ownership: a second host cannot configure the same port.
     assert_eq!(
         Port::start(eal, config).err().unwrap().kind(),
@@ -247,6 +252,40 @@ fn rejected_configurations(eal: &'static Eal) {
         .err()
         .unwrap();
     assert!(error.to_string().contains("claim net_bogus0"), "{error}");
+    assert_eq!(pools(), (0, 0));
+}
+
+fn device_mac(port: u16) -> [u8; 6] {
+    let mut mac = [0; 6];
+    // SAFETY: EAL is initialized; the fixture writes six octets.
+    assert_eq!(unsafe { ntcp_host_test_mac(port, mac.as_mut_ptr()) }, 0);
+    mac
+}
+
+// The null PMD draws a random locally administered unicast address at probe
+// and accepts a new default address, so the reported MAC can be checked
+// against ethdev's own view twice, the second time octet by octet against
+// an address of the test's choosing.
+fn mac_addresses(eal: &'static Eal) {
+    let port = Port::start(eal, PortConfig::new("net_null0")).unwrap();
+    let drawn = port.mac_address().unwrap();
+    assert_eq!(drawn, device_mac(port.port_id()));
+    assert_eq!(drawn[0] & 0b11, 0b10, "{drawn:02x?}");
+    assert_eq!(port.mac_address().unwrap(), drawn);
+
+    let queue = port.take_queue(0).unwrap().attach().unwrap();
+    assert_eq!(queue.mac_address().unwrap(), drawn);
+    let chosen = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    // SAFETY: EAL is initialized; the address has six octets.
+    assert_eq!(
+        unsafe { ntcp_host_test_set_mac(port.port_id(), chosen.as_ptr()) },
+        0
+    );
+    assert_eq!(port.mac_address().unwrap(), chosen);
+    assert_eq!(queue.mac_address().unwrap(), chosen);
+    drop(port);
+    drop(queue);
+    assert_eq!(port_named("net_null0"), None);
     assert_eq!(pools(), (0, 0));
 }
 
