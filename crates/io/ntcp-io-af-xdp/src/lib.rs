@@ -38,7 +38,7 @@ impl Config {
             || self.frame_count < 2
             || !self.ring_size.is_power_of_two()
             || self.ring_size > self.frame_count / 2
-            || self.ring_size > (1 << 30)
+            || self.ring_size > (1 << 29)
             || self.mtu < 68
             || self
                 .headroom
@@ -329,9 +329,17 @@ impl AfXdp {
                 metadata_len: 0,
             },
         )?;
-        for option in [2, 3, 5, 6] {
+        // The fill ring holds twice the RX frames (ring_size). The kernel
+        // publishes its fill consumer late: after the RX descriptors of a
+        // batch (xsk_flush), and only when it refreshes a cached batch, so a
+        // received frame's fill entry may still count as unconsumed. A frame
+        // has at most one such lagging entry besides its current one, so a
+        // received frame can always be refilled.
+        let fill_size = config.ring_size * 2;
+        for option in [2, 3, 6] {
             set_option(raw, option, &config.ring_size)?;
         }
+        set_option(raw, 5, &fill_size)?;
         let mut offsets = Offsets::default();
         let mut size = size_of::<Offsets>() as libc::socklen_t;
         // SAFETY: output buffer has the supplied length.
@@ -352,7 +360,7 @@ impl AfXdp {
         }
         let rx = Ring::new(raw, 0, offsets.rx, config.ring_size)?;
         let tx = Ring::new(raw, 0x80000000, offsets.tx, config.ring_size)?;
-        let fill = Ring::new(raw, 0x100000000, offsets.fill, config.ring_size)?;
+        let fill = Ring::new(raw, 0x100000000, offsets.fill, fill_size)?;
         let completion = Ring::new(raw, 0x180000000, offsets.completion, config.ring_size)?;
         let address = SockAddr {
             family: libc::AF_XDP as u16,
@@ -683,7 +691,7 @@ mod tests {
             fd: unsafe { OwnedFd::from_raw_fd(raw) },
             rx: ring(config.ring_size),
             tx: ring(config.ring_size),
-            fill: ring(config.ring_size),
+            fill: ring(2 * config.ring_size),
             completion: ring(config.ring_size),
             umem,
             config,
@@ -990,8 +998,9 @@ mod tests {
     fn corrupt_rx_and_fill_indices_fail_before_copy() {
         let mut a = adapter();
         inject(&mut a, 0, &[42; 64]);
-        for i in 0..4 {
-            a.fill.push(i * 4096).unwrap();
+        // More fill entries than twice the RX frames: impossible from the kernel.
+        for i in 0..8 {
+            a.fill.push(i % 4 * 4096).unwrap();
         }
         let mut out = [17; 64];
         assert_eq!(
@@ -1011,6 +1020,22 @@ mod tests {
             .store(100, Ordering::Relaxed);
         assert!(a.receive_one(&mut out).is_err());
         assert_eq!(out, [17; 64]);
+    }
+
+    #[test]
+    fn received_frame_refills_before_kernel_publishes_fill_consumption() {
+        let mut a = adapter();
+        // Every RX frame is in the fill ring; the kernel took frame 0 for a
+        // packet and published the descriptor, not yet its fill consumption.
+        for i in 0..4 {
+            a.fill.push(i * 4096).unwrap();
+        }
+        inject(&mut a, 0, &[42; 64]);
+        let mut out = [0; 64];
+        assert_eq!(a.receive_one(&mut out).unwrap(), Some(64));
+        assert_eq!(out, [42; 64]);
+        assert_eq!(a.fill.indices().unwrap(), (5, 0));
+        assert!(!a.poisoned);
     }
 
     #[test]
