@@ -877,6 +877,13 @@ pub(crate) struct Ledger {
     // and then extra[i] (see `provision`).
     history: Vec<Option<Entry>>,
     extra: Vec<Vec<Option<Entry>>>,
+    // Per owner record: its occupied history slots, and how many of them are
+    // retirable (outstanding TCP data). Passes over a record's history stop
+    // once they have seen every occupied slot, and delivery retirement skips
+    // a record with nothing retirable: an idle connection's history is
+    // mostly empty slots and pure ACKs.
+    occupied: Vec<usize>,
+    retirable: Vec<usize>,
     // A live TCP generation's own evicted history. It is kept apart from the
     // shared summaries so delivery can shrink it (`retire_tcp`): otherwise a
     // long transfer's evictions would widen one cover until it matched every
@@ -920,6 +927,8 @@ impl Ledger {
             blind: crate::table(limits.owners, 0)?,
             history: crate::table(entries, None)?,
             extra: crate::table(limits.owners, Vec::new())?,
+            occupied: crate::table(limits.owners, 0)?,
+            retirable: crate::table(limits.owners, 0)?,
             own: crate::table(limits.owners, None)?,
             pending: crate::table(limits.concurrent_attempts, None)?,
             datagrams: crate::table(limits.datagram_evidence, None)?,
@@ -950,21 +959,53 @@ impl Ledger {
     fn slots(&self, owner: usize) -> usize {
         self.limits.history_per_owner + self.extra[owner].len()
     }
-    fn slot(&self, owner: usize, i: usize) -> Option<Entry> {
+    fn slot(&self, owner: usize, i: usize) -> Option<&Entry> {
         let h = self.limits.history_per_owner;
         if i < h {
-            self.history[owner * h + i]
+            self.history[owner * h + i].as_ref()
         } else {
-            self.extra[owner][i - h]
+            self.extra[owner][i - h].as_ref()
         }
     }
-    fn slot_mut(&mut self, owner: usize, i: usize) -> &mut Option<Entry> {
+    // The only writer of history slots: keeps the occupancy counts.
+    fn set_slot(&mut self, owner: usize, i: usize, value: Option<Entry>) -> Option<Entry> {
         let h = self.limits.history_per_owner;
-        if i < h {
+        let slot = if i < h {
             &mut self.history[owner * h + i]
         } else {
             &mut self.extra[owner][i - h]
+        };
+        let old = core::mem::replace(slot, value);
+        for (entry, added) in [(&old, false), (&value, true)] {
+            let Some(entry) = entry else {
+                continue;
+            };
+            let retirable = usize::from(entry.retirable());
+            if added {
+                self.occupied[owner] += 1;
+                self.retirable[owner] += retirable;
+            } else {
+                self.occupied[owner] -= 1;
+                self.retirable[owner] -= retirable;
+            }
         }
+        old
+    }
+    // A record's occupied history slots in order; it stops at the last one.
+    // Callers do not change the record's history while iterating.
+    fn occupied_slots(&self, owner: usize) -> impl Iterator<Item = usize> + '_ {
+        let (mut slot, mut remaining) = (0, self.occupied[owner]);
+        core::iter::from_fn(move || {
+            while remaining != 0 && slot < self.slots(owner) {
+                let current = slot;
+                slot += 1;
+                if self.slot(owner, current).is_some() {
+                    remaining -= 1;
+                    return Some(current);
+                }
+            }
+            None
+        })
     }
     /// Before a physical call: extend an owner's history to one entry per
     /// segment of `send_capacity` plus one control segment, the derivation
@@ -1022,7 +1063,10 @@ impl Ledger {
             return false;
         }
         for i in 0..self.slots(index) {
-            if let Some(entry) = self.slot_mut(index, i).take() {
+            if self.occupied[index] == 0 {
+                break;
+            }
+            if let Some(entry) = self.set_slot(index, i, None) {
                 self.bury(entry.record, now);
             }
         }
@@ -1174,7 +1218,7 @@ impl Ledger {
                 continue;
             };
             let slot = self.victim(p.owner, now);
-            if let Some(old) = self.slot_mut(p.owner, slot).take() {
+            if let Some(old) = self.set_slot(p.owner, slot, None) {
                 self.evict(p.owner, old.record, now);
             }
             // A discarded summary of this key may hide an older identical
@@ -1199,10 +1243,14 @@ impl Ledger {
             if !retirable(&record) {
                 self.next_expiry = self.next_expiry.min(self.expiry(&record));
             }
-            *self.slot_mut(p.owner, slot) = Some(Entry {
-                record,
-                order: self.order,
-            });
+            self.set_slot(
+                p.owner,
+                slot,
+                Some(Entry {
+                    record,
+                    order: self.order,
+                }),
+            );
             sealed += 1;
         }
         sealed
@@ -1216,7 +1264,7 @@ impl Ledger {
             self.slot(owner, s)
                 .is_none_or(|e| !e.retirable() && self.expired(&e.record, now))
         }) {
-            *self.slot_mut(owner, slot) = None;
+            self.set_slot(owner, slot, None);
             return slot;
         }
         let oldest = |retirable: bool| {
@@ -1369,17 +1417,24 @@ impl Ledger {
     ) {
         debug_assert!(matches!(self.owners[index], Some(Owner::Tcp(_))));
         let mut floor = unacknowledged;
-        for slot in 0..self.slots(index) {
-            if let Some(entry) = self.slot(index, slot)
-                && entry.retirable()
-                && let Selector::Tcp { start, end, .. } = entry.record.evidence.transport
-            {
-                if serial_le(end, unacknowledged) {
-                    delivered(&entry.record);
-                    *self.slot_mut(index, slot) = None;
-                } else if serial_lt(start, floor) {
-                    floor = start;
-                }
+        // Stop once every retirable entry was seen (`seen` counts those kept).
+        let (mut slot, mut seen) = (0, 0);
+        while seen < self.retirable[index] && slot < self.slots(index) {
+            let current = slot;
+            slot += 1;
+            let Some(entry) = self.slot(index, current).filter(|e| e.retirable()) else {
+                continue;
+            };
+            seen += 1;
+            let Selector::Tcp { start, end, .. } = entry.record.evidence.transport else {
+                continue;
+            };
+            if serial_le(end, unacknowledged) {
+                let entry = self.set_slot(index, current, None).unwrap();
+                seen -= 1;
+                delivered(&entry.record);
+            } else if serial_lt(start, floor) {
+                floor = start;
             }
         }
         let Some(own) = &mut self.own[index] else {
@@ -1416,15 +1471,23 @@ impl Ledger {
         let mut from = 0;
         while let Some(owner) = self.live_owners.next(from) {
             from = owner + 1;
-            for slot in 0..self.slots(owner) {
-                if let Some(entry) = self.slot(owner, slot)
-                    && !entry.retirable()
-                {
-                    if self.expired(&entry.record, now) {
-                        *self.slot_mut(owner, slot) = None;
-                    } else {
-                        next = next.min(self.expiry(&entry.record));
-                    }
+            // Stop once every occupied slot was seen (`seen` counts those kept).
+            let (mut slot, mut seen) = (0, 0);
+            while seen < self.occupied[owner] && slot < self.slots(owner) {
+                let current = slot;
+                slot += 1;
+                let Some(entry) = self.slot(owner, current) else {
+                    continue;
+                };
+                seen += 1;
+                if entry.retirable() {
+                    continue;
+                }
+                if self.expired(&entry.record, now) {
+                    self.set_slot(owner, current, None);
+                    seen -= 1;
+                } else {
+                    next = next.min(self.expiry(&entry.record));
                 }
             }
         }
@@ -1461,13 +1524,20 @@ impl Ledger {
         assert!(self.live_pending.matches(&self.pending));
         assert!(self.live_tombstones.matches(&self.tombstones));
         for owner in 0..self.owners.len() {
+            let (mut occupied, mut retirable) = (0, 0);
             for slot in 0..self.slots(owner) {
                 let Some(entry) = self.slot(owner, slot) else {
                     continue;
                 };
+                occupied += 1;
+                retirable += usize::from(entry.retirable());
                 assert!(self.owners[owner].is_some());
                 assert!(entry.retirable() || self.expiry(&entry.record) >= self.next_expiry);
             }
+            assert_eq!(
+                (occupied, retirable),
+                (self.occupied[owner], self.retirable[owner])
+            );
         }
         let datagrams = self.datagrams.iter().flatten().map(|(_, until)| *until);
         let tombstones = self.tombstones.iter().flatten().map(|t| t.until);
@@ -1489,8 +1559,8 @@ impl Ledger {
         // Free records hold no history (`check_live`).
         self.live_owners
             .iter()
-            .flat_map(move |record| (0..self.slots(record)).map(move |slot| (record, slot)))
-            .filter_map(move |(record, slot)| Some((record, self.slot(record, slot)?)))
+            .flat_map(move |record| self.occupied_slots(record).map(move |slot| (record, slot)))
+            .filter_map(move |(record, slot)| Some((record, *self.slot(record, slot)?)))
             .filter(move |(_, entry)| {
                 (entry.retirable() || !self.expired(&entry.record, now))
                     && entry.matches(&quote)
