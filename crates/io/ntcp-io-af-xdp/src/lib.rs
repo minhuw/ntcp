@@ -32,7 +32,8 @@ pub struct Config {
     pub ring_size: u32,
     pub headroom: u32,
     // Configured IP-sized copy budget, NOT the live interface MTU.
-    // The adapter frame cap adds 14 bytes; validation includes UMEM headroom.
+    // The adapter frame cap adds 14 bytes. A frame also holds the UMEM and
+    // kernel headroom, so mtu is at most frame_size - headroom - 270.
     pub mtu: u32,
 }
 
@@ -47,14 +48,22 @@ impl Config {
             || self.ring_size > self.frame_count / 2
             || self.ring_size > (1 << 29)
             || self.mtu < 68
-            || self
-                .headroom
-                .checked_add(KERNEL_HEADROOM)
-                .and_then(|n| n.checked_add(self.mtu))
-                .and_then(|n| n.checked_add(14))
-                .is_none_or(|n| n > self.frame_size)
         {
             return Err(invalid("invalid AF_XDP configuration"));
+        }
+        // The frame size is valid here, so it exceeds the kernel headroom and
+        // the Ethernet header.
+        let max_mtu = (self.frame_size - KERNEL_HEADROOM - 14).saturating_sub(self.headroom);
+        if self.mtu > max_mtu {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "AF_XDP mtu {} exceeds {max_mtu}: a {}-octet frame holds {} octets of \
+                     headroom, {KERNEL_HEADROOM} of kernel headroom and a 14-octet Ethernet \
+                     header besides the IP packet",
+                    self.mtu, self.frame_size, self.headroom
+                ),
+            ));
         }
         let bytes = (self.frame_size as usize)
             .checked_mul(self.frame_count as usize)
@@ -813,6 +822,23 @@ mod tests {
         ] {
             assert!(bad.validate().is_err());
         }
+        // The largest IP packet a 4096-octet frame without headroom holds.
+        let fits = Config {
+            headroom: 0,
+            mtu: 3826,
+            ..config()
+        };
+        assert!(fits.validate().is_ok());
+        let error = Config { mtu: 3827, ..fits }.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("exceeds 3826"), "{error}");
+        let error = Config {
+            mtu: 3827,
+            ..config()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds 3794"), "{error}");
         for offsets in [
             RingOffset {
                 producer: 1,
