@@ -68,36 +68,36 @@ pub struct PathSnapshot {
 }
 
 impl PathSnapshot {
-    pub const fn path(self) -> PathId {
+    pub const fn path(&self) -> PathId {
         self.stamp.path
     }
-    pub const fn stamp(self) -> ChangeStamp {
+    pub const fn stamp(&self) -> ChangeStamp {
         self.stamp
     }
-    pub const fn version(self) -> u64 {
+    pub const fn version(&self) -> u64 {
         self.stamp.version
     }
-    pub const fn key(self) -> PathKey {
+    pub const fn key(&self) -> PathKey {
         self.key
     }
-    pub const fn status(self) -> PathStatus {
+    pub const fn status(&self) -> PathStatus {
         self.status
     }
-    pub const fn first_hop_mtu(self) -> u32 {
+    pub const fn first_hop_mtu(&self) -> u32 {
         self.first_hop_mtu
     }
-    pub const fn link_version(self) -> u64 {
+    pub const fn link_version(&self) -> u64 {
         self.link_version
     }
-    pub const fn learned_mtu(self) -> Option<u32> {
+    pub const fn learned_mtu(&self) -> Option<u32> {
         self.learned_mtu
     }
     /// Revision of the last actual learned decrease, independent of harmless
     /// link/policy updates. The deadline uses the producer's caller timebase.
-    pub const fn negative_revision(self) -> u64 {
+    pub const fn negative_revision(&self) -> u64 {
         self.negative_revision
     }
-    pub const fn retry_not_before(self) -> u64 {
+    pub const fn retry_not_before(&self) -> u64 {
         self.retry_not_before
     }
     pub const fn ipv4_plateaus(self) -> Option<Ipv4Plateaus> {
@@ -109,24 +109,24 @@ impl PathSnapshot {
     /// never delivery proof and is not learned network state. Upward sets
     /// and clears keep it, so they never restore a larger accepted value;
     /// only confirmed delivery on this incarnation relaxes it.
-    pub const fn administrative_restriction(self) -> Option<u32> {
+    pub const fn administrative_restriction(&self) -> Option<u32> {
         self.restriction
     }
     /// The effective owner administrative estimate of the path (route and
     /// exact-path policy intersected): a cap on size search, distinct from
     /// the accepted network estimate and from delivery proof.
-    pub const fn administrative_estimate(self) -> Option<u32> {
+    pub const fn administrative_estimate(&self) -> Option<u32> {
         self.admin_estimate
     }
     /// The effective owner discovery-disable flag of the path.
-    pub const fn discovery_disabled(self) -> bool {
+    pub const fn discovery_disabled(&self) -> bool {
         self.discovery_disabled
     }
     /// Advances (to the policy generation of the change) every time the
     /// effective discovery policy of this incarnation changes, so size
     /// evidence selected under an older policy is recognizably stale even
     /// after a disable followed by a re-enable.
-    pub const fn discovery_revision(self) -> u64 {
+    pub const fn discovery_revision(&self) -> u64 {
         self.discovery_revision
     }
     /// The complete IP header length H of output on this path before any
@@ -134,7 +134,7 @@ impl PathSnapshot {
     /// route of n segments, the Segment Routing Header listing them and the
     /// final destination (8 + 16(n + 1) octets). Fixed for the path, whose
     /// key names the route generation.
-    pub const fn ip_header_len(self) -> u32 {
+    pub const fn ip_header_len(&self) -> u32 {
         self.ip_header_len
     }
 
@@ -156,7 +156,7 @@ impl PathSnapshot {
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
     //= reason=The owner's discovery-disable flag on a path, or on the route it resolves through, set through Host::administration and by the ntcp-pathctl utility (8201-080), caps that path's IPv6 packet budget at the IPv6 minimum link MTU of 1280 octets (PathSnapshot::ip_packet_budget), counting every IP header and any Fragment header; the uncapped network estimate is still the one compared with administrative values, and an administrative value above 1280 stays cached. Every packet the Host sends on the path obeys it: Host::admin_apply applies the budget to existing TCP connections in the same transaction (reservation-safe budget application keeps submitted prefixes) and future connections are created under it, the submission barrier refuses a larger packet, each physical software-GSO segment is cut to it, UDP Refuse admits only datagrams that fit whole, Fragment mode and Echo replies cut packets to at most 1280 octets, and Host::udp_send's payload limit follows the same budget. Connections created with PMTUD disabled enforce the same ceiling on their own (8201-004); the path flag is the separate administrative control. Tests: ntcp-host src/tests/admin.rs (existing and future TCP output and retransmissions, SYN, SYN-ACK, FIN and RST control segments and stateless resets, and every physical GSO segment of an aggregate held across the disable and of new aggregates, at most 1280 octets), emitter.rs discovery_disable_caps_ipv6_flows_at_1280_and_refuses_probes and ingress.rs echo_replies_on_a_discovery_disabled_ipv6_route_are_at_most_1280; the integration/rfc_host admin and native-admin cases capture every IPv6 packet of tun_echo and the native runtime (existing and new TCP connections, control segments and UDP source fragments) at most 1280 octets after ntcp-pathctl disables discovery on a path or route, with stream and datagram hashes intact, while a neighbor destination keeps 1500-octet packets.
     //# The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.
-    pub fn ip_packet_budget(self) -> Result<u32, Error> {
+    pub fn ip_packet_budget(&self) -> Result<u32, Error> {
         let budget = self.pmtu_estimate()?;
         if !self.discovery_disabled {
             return Ok(budget);
@@ -174,7 +174,7 @@ impl PathSnapshot {
     /// Whether the destination is on a connected network: the resolved next
     /// hop is the forwarding destination itself rather than a gateway or a
     /// forwarder.
-    fn next_hop_on_link(self) -> bool {
+    fn next_hop_on_link(&self) -> bool {
         self.key.next_hop == ResolvedNextHop::Address(self.key.forwarding_destination)
     }
 
@@ -184,7 +184,7 @@ impl PathSnapshot {
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
     //= reason=The suggested route flag is set through Host::administration and by the ntcp-pathctl utility. Outside flagged routes IPv4 packets carry DF (the atomic encoder and every source fragment) except the application-requested IP_PMTUDISC_DONT TCP output, each with an Identification leased from the Host allocator. T13 supplies the mechanisms those controls build on: the Host IdentifierAllocator (every non-atomic IPv4 datagram the Host originates, fragmented or DF-clear, carries a leased Identification), the fragmenting datagram emitter and Host UDP Probe mode; it adds no administrative control. The administrative model exists: PathService stores owner policy (discovery disable and an administrative PMTU estimate) per forwarding route and per exact resolved path under compare-and-set generations and keeps a route's administrative restriction (the lowest value its estimate imposed on a path) across idle path eviction and upward sets until the route's estimate is cleared, and its outstanding administrative hold across clears as well, and installs later paths of the route under them, so reacquisition never promotes a deferred upward value; Host::administration issues a Host-instance-bound capability for query (the administrative estimate, the accepted network estimate with its provenance, each client's usable size, TCP transport ceilings, and the TCP and Echo adjunct search diagnostic), read-only candidate validation and apply. Each estimate operation compares with the path's accepted network estimate: a downward value lowers it at once with a fresh negative revision and a hold of max(old, now + 600 seconds), notifies every client of the path in the same administration transaction and caps the search and confirmed growth while set; an equal value is a no-op; an upward value changes no accepted estimate, hold, search lower bound, current size or confirmed bound and defines a search transition: it caps TCP PLPMTUD and the Host Echo adjunct search, and once per value the first probe the existing hold, cooldown, loss-recovery, data/window and adjunct-demand rules allow targets it (clipped by the first-hop, transport and negative-evidence bounds; the deferral or clip is reported), so the accepted estimate grows only through an acknowledged or echoed unfragmented probe and PathService::confirm_delivery, and a failed targeted probe is not reopened by later revisions; clearing removes the cap for live and later paths and keeps every hold, while a live path incarnation keeps the accepted estimate a restriction lowered (no older larger value is restored), which relaxes only through confirmed delivery there. Size proof follows the final submitted bytes: a TCP record raises max_acked or search_low or reaches confirm_delivery only when its submitted packet was unfragmentable (IPv4 DF set, certified from Host::submit's physical receipt for managed output), so DF-clear IP_PMTUDISC_DONT output proves no size. Every change is one serialized Host::admin_apply transaction: it validates read-only every TCP binding on each affected path (complete option-bearing headers plus one payload octet), failing with nothing changed, then stores the policy and applies each binding's new snapshot, each UDP flow's change notification and the Echo adjunct state at once; best-effort output never blocks a change: a held stateless output lease is revalidated by the submission barrier and a queued ICMP message is sized at emission, exactly as after a trusted PTB decrease (one that no longer fits is refused or counted unsent), so a remote peer cannot hold the owner's restriction off; the IPv4 plateau table and RFC 4821 search aging (existing TCP connections at once, future ones before their first output) are administered through the same capability. The discovery-disable flag is enforced on existing and future users: no TCP PLPMTUD probe, Echo adjunct probe or UDP Probe-mode datagram (refused with DiscoveryDisabled) leaves a flagged path and the submission barrier refuses any packet above its ordinary budget; TCP stops size-search changes (probe success, implicit growth, isolated-loss narrowing, verification and black-hole fallback) while loss recovery continues; each change invalidates outstanding TCP and adjunct size results selected under the previous policy; and on IPv6 the path's packet budget is at most 1280 octets, which every physical packet of existing and newly created users obeys (Host tests: TCP output and retransmissions, SYN, SYN-ACK, FIN and RST control segments and stateless resets, each physical software-GSO segment of an aggregate held across the disable and of new aggregates, UDP Refuse and Fragment, and Echo replies). On IPv4 the flag leaves DF clear on the packets of the route or path whatever the upper layer requests (RFC 1191 section 6.6, the user's recorded decision B): TCP segments including control segments and connections created with PLPMTUD, whole UDP datagrams of Host::udp_send and Host::udp_send_datagram and Host source fragments of UDP Fragment mode and Echo replies (MF, offsets and the datagram's one Identification kept, every rewritten header checksum recomputed), each DF-clear datagram carrying an Identification leased from the Host allocator (the RFC 6864 ceiling holds output instead of reusing a value); its sending limit is the RFC 1122 section 3.3.3 EMTU_S: the owner's administrative value when set (never above the accepted estimate), otherwise at most 576 octets through a gateway or forwarder and the accepted estimate within the link MTU on-link, the packet budget existing and future TCP, UDP Refuse and Fragment, Echo replies and udp_datagram_limits use. The TCP submission barrier (Host::submit) refuses a DF-set IPv4 packet on such a path; Host::clears_dont_fragment and Host::lease_df_clear apply the rewrite at each physical submission in the native runtime (a route disable dominates the socket's IP_MTU_DISCOVER) and tun_echo, and DF-clear deliveries prove no size (Host tests in ntcp-host src/tests/ipv4_policy.rs, PathService tests of the on-link, gateway and forwarder limits). A DF-clear datagram is non-atomic, so such a route needs exactly these leased Identifications (RFC 6864). T12 stage 6 adds the system utility: the ntcp-path-control crate's opt-in local control socket (an absolute pathname Unix stream socket of mode 0600 in a private 0700 directory owned by the owner; every request, queries included, authorized on the accepted descriptor by its kernel SO_PEERCRED uid against an allow-list defaulting to the owner's effective uid, without a root bypass and failing closed; a versioned length-prefixed binary protocol with fixed-width fields, frame and page bounds derived from the largest encoded messages, bounded peer slots, per-pass work, frame-completion, reply-drain and idle deadlines, and explicit statuses for malformed, oversized, unknown-version, unknown-opcode, unauthorized and stale requests, which change nothing), served from the owner loop of the native runtime (control.socket, control.allow_uids, separate from route.*; native descriptors and direct system calls on the owner thread, before the held-output early continue) and of tun_echo (NTCP_CONTROL_SOCKET), through the Host-bound administration capability, and the ntcp-pathctl utility: paginated route and path queries carrying a listing revision (generations, policy, the cached administrative estimate, the accepted estimate with provenance, the shared packet budget, holds and revisions, and per client the usable size, transport ceilings and deferred growth with its reason), discovery disable and enable and administrative estimate set and clear on a route or an exact path under compare-and-set generations, the IPv4 plateau table and search aging (real utility process round trips in ntcp-path-control tests/control.rs, the native runtime and tun_echo tests). Namespace evidence (integration/rfc_host admin and native-admin cases): after ntcp-pathctl disables discovery on an IPv4 route or path of tun_echo or the native runtime, every captured packet, TCP control segments and UDP source fragments included, has DF clear and its own nonzero leased Identification, at most 576 octets through a Forwarder route or at most the administrative value when one is set, while another destination through the same route keeps DF on its packets and fragments. Host::udp_send, the T9 whole-datagram API that tun_echo's Refuse-mode UDP echo replies use, leaves its IPv4 datagrams on such a route DF clear with a leased Identification as well, holding a datagram on identifier backpressure (UdpSendError::Backpressure) and refusing one above the sending limit with its payload limit (ntcp-host test disabled_ipv4_route_clears_df_on_whole_udp_send_datagrams); the integration/rfc_host admin refuse case captures tun_echo's Refuse-mode replies after ntcp-pathctl disables discovery on its IPv4 path: DF clear, distinct nonzero Identifications and at most 576 octets, a larger reply refused locally with the 548-octet payload limit, while the neighbor destination keeps DF and re-enabling restores it. Route isolation of the IPv4 policy is shown in-process: ntcp-host test disabling_one_ipv4_route_leaves_a_neighbor_route_keeping_df_on_fragments disables one of two routes sharing a link and next hop, whose fragments leave DF clear while the other route keeps DF on its fragments; on the wire, the integration/rfc_host icmp route-isolation case gives the datagram_drive Host a second route (the same link and Forwarder next hop, selected by DSCP): after the owner disables discovery on its default route, that route's source fragments leave DF clear with one nonzero leased Identification per datagram and at most 576 octets, while the neighboring enabled route keeps DF on its fragments and the peer reassembles both.
     //# The former can be accomplished by associating a flag with the routing entry; when a packet is sent via a route with this flag set, the IP layer leaves the DF bit clear no matter what the upper layer requests.
-    pub fn clears_dont_fragment(self) -> bool {
+    pub fn clears_dont_fragment(&self) -> bool {
         self.discovery_disabled && self.key.destination.address.is_ipv4()
     }
 
@@ -199,7 +199,7 @@ impl PathSnapshot {
     /// so a validated PTB for an earlier submission learns the same network
     /// value whether or not the owner disabled discovery. It is NOT a
     /// sending limit: packets are sized with `ip_packet_budget`.
-    pub fn pmtu_estimate(self) -> Result<u32, Error> {
+    pub fn pmtu_estimate(&self) -> Result<u32, Error> {
         if self.status != PathStatus::Valid {
             return Err(Error::Invalidated);
         }
@@ -210,7 +210,7 @@ impl PathSnapshot {
     /// invalidation freezes it, so it stays readable after the path's
     /// route, source or link is gone. A report of what the path learned,
     /// never output authority or a sending budget.
-    pub fn last_pmtu_estimate(self) -> u32 {
+    pub fn last_pmtu_estimate(&self) -> u32 {
         let ceiling = if self.key.destination.address.is_ipv4() {
             65535
         } else {
@@ -227,13 +227,13 @@ impl PathSnapshot {
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.1
     //= reason=T7 PathService exposes minimum-header MMS_S, complete-header budgets and versioned notifications with exact acknowledgements. T8 Host applies snapshots to actual native/TUN TCP owners and gates every reserved physical submission. Independent-reader/coalescing tests preserve readN/update/ackN; validated cross-protocol publication remains T9/T10.
     //# A way to learn of changes in the value of MMS_S, the "maximum send transport-message size", which is derived from the Path MTU by subtracting the minimum IP header size.
-    pub fn mms_s(self) -> Result<u32, Error> {
+    pub fn mms_s(&self) -> Result<u32, Error> {
         self.ip_packet_budget()?
             .checked_sub(self.minimum_header())
             .ok_or(Error::InvalidArgument)
     }
 
-    fn minimum_header(self) -> u32 {
+    fn minimum_header(&self) -> u32 {
         if self.key.destination.address.is_ipv4() {
             20
         } else {

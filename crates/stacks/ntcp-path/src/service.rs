@@ -337,36 +337,36 @@ pub struct PathKey {
 }
 
 impl PathKey {
-    pub const fn context(self) -> ContextId {
+    pub const fn context(&self) -> ContextId {
         self.context
     }
-    pub const fn source(self) -> SourceId {
+    pub const fn source(&self) -> SourceId {
         self.source
     }
-    pub const fn source_address(self) -> ScopedAddress {
+    pub const fn source_address(&self) -> ScopedAddress {
         self.source_address
     }
-    pub const fn destination(self) -> ScopedAddress {
+    pub const fn destination(&self) -> ScopedAddress {
         self.destination
     }
     /// Actual destination used for forwarding (the first source-route hop
     /// when explicitly supplied), distinct from the transport destination.
-    pub const fn forwarding_destination(self) -> ScopedAddress {
+    pub const fn forwarding_destination(&self) -> ScopedAddress {
         self.forwarding_destination
     }
-    pub const fn dscp(self) -> Dscp {
+    pub const fn dscp(&self) -> Dscp {
         self.dscp
     }
-    pub const fn link(self) -> LinkId {
+    pub const fn link(&self) -> LinkId {
         self.link
     }
-    pub const fn next_hop(self) -> ResolvedNextHop {
+    pub const fn next_hop(&self) -> ResolvedNextHop {
         self.next_hop
     }
-    pub const fn route(self) -> RouteId {
+    pub const fn route(&self) -> RouteId {
         self.route
     }
-    pub const fn request(self) -> PathRequest {
+    pub const fn request(&self) -> PathRequest {
         PathRequest {
             source: self.source,
             destination: self.destination,
@@ -383,13 +383,13 @@ pub struct ResolvedPath {
 }
 
 impl ResolvedPath {
-    pub const fn key(self) -> PathKey {
+    pub const fn key(&self) -> PathKey {
         self.key
     }
-    pub const fn first_hop_mtu(self) -> u32 {
+    pub const fn first_hop_mtu(&self) -> u32 {
         self.first_hop_mtu
     }
-    pub const fn link_version(self) -> u64 {
+    pub const fn link_version(&self) -> u64 {
         self.link_version
     }
 }

@@ -10530,9 +10530,10 @@ impl Connection {
             self.application_deadline(),
             self.local_resource.and_then(|r| r.retry_at),
         ]
-        .into_iter()
+        .iter()
         .flatten()
         .min()
+        .copied()
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
