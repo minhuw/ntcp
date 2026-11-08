@@ -412,7 +412,7 @@ impl Host {
         }
         self.search_aging = Some(aging);
         for index in 0..self.bindings.len() {
-            if let Some(owner) = self.bindings[index].and_then(|b| b.owner) {
+            if let Some(owner) = self.bindings[index].as_ref().and_then(|b| b.owner) {
                 // Validated above.
                 let _ = self.apply_search_aging(endpoint, now, owner);
             }

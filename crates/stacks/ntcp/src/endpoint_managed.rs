@@ -187,6 +187,14 @@ impl Endpoint {
             .take())
     }
 
+    /// Whether a live owner generation holds a result to take
+    /// (`take_pending_pmtu_applied` or `take_confirmed_probe`): a provider
+    /// polls every owner on each service pass, and nearly always none has one.
+    pub fn has_unpublished_results(&self, id: ConnectionId) -> Result<bool, EndpointError> {
+        let results = &self.slot(id)?.connection.managed_results;
+        Ok(results.applied.is_some() || results.confirmed.is_some())
+    }
+
     /// Take the unpublished confirmed-probe result of a live owner generation.
     pub fn take_confirmed_probe(
         &mut self,

@@ -994,20 +994,24 @@ impl Host {
     }
     pub fn binding(&self, owner: ConnectionId) -> Result<PreparedPath, Error> {
         self.binding_index(owner)
-            .map(|index| self.bindings[index].unwrap().prepared)
+            .map(|index| self.bindings[index].as_ref().unwrap().prepared)
             .ok_or(Error::InvalidContext)
     }
     // The record of `owner`'s binding.
     fn binding_index(&self, owner: ConnectionId) -> Option<usize> {
         debug_assert!(self.live_bindings.matches(&self.bindings));
-        self.live_bindings
-            .iter()
-            .find(|&index| self.bindings[index].is_some_and(|b| b.owner == Some(owner)))
+        self.live_bindings.iter().find(|&index| {
+            self.bindings[index]
+                .as_ref()
+                .is_some_and(|b| b.owner == Some(owner))
+        })
     }
     // The record of a prepared binding no connection has committed yet.
     fn provisional(&self, prepared: PreparedPath) -> Option<usize> {
         self.live_bindings.iter().find(|&index| {
-            self.bindings[index].is_some_and(|b| b.owner.is_none() && b.prepared == prepared)
+            self.bindings[index]
+                .as_ref()
+                .is_some_and(|b| b.owner.is_none() && b.prepared == prepared)
         })
     }
 
@@ -1176,7 +1180,7 @@ impl Host {
         self.collect(endpoint)?;
         let mut first = None;
         for index in 0..self.bindings.len() {
-            if let Some(owner) = self.bindings[index].and_then(|b| b.owner)
+            if let Some(owner) = self.bindings[index].as_ref().and_then(|b| b.owner)
                 && let Err(error) = self.refresh(endpoint, owner)
             {
                 first.get_or_insert(error);
@@ -1218,7 +1222,7 @@ impl Host {
         let mut next = 0;
         while let Some(index) = self.live_bindings.next(next) {
             next = index + 1;
-            let Some(owner) = self.bindings[index].and_then(|b| b.owner) else {
+            let Some(owner) = self.bindings[index].as_ref().and_then(|b| b.owner) else {
                 continue;
             };
             // Connections created after an owner aging change adopt it here,
@@ -1233,13 +1237,13 @@ impl Host {
         let mut next = 0;
         while let Some(index) = self.live_bindings.next(next) {
             next = index + 1;
-            let Some(binding) = self.bindings[index] else {
+            let Some((owner, client)) = self.bindings[index]
+                .as_ref()
+                .and_then(|b| Some((b.owner?, b.prepared.client)))
+            else {
                 continue;
             };
-            let Some(owner) = binding.owner else {
-                continue;
-            };
-            if !self.paths.is_dirty(binding.prepared.client)? {
+            if !self.paths.is_dirty(client)? {
                 continue;
             }
             match self.refresh(endpoint, owner) {
@@ -1268,6 +1272,9 @@ impl Host {
         owner: ConnectionId,
         report: &mut ServiceReport,
     ) -> Result<(), Error> {
+        if live(endpoint.has_unpublished_results(owner))? != Some(true) {
+            return Ok(());
+        }
         if let Some(Some(result)) = live(endpoint.take_pending_pmtu_applied(owner))?
             && self.publish_applied(now, owner, result)? == Some(path::EstimateChange::Decreased)
         {
@@ -1373,7 +1380,7 @@ impl Host {
         let mut next = 0;
         while let Some(index) = self.live_bindings.next(next) {
             next = index + 1;
-            if self.bindings[index].is_some_and(|b| {
+            if self.bindings[index].as_ref().is_some_and(|b| {
                 b.owner.is_some_and(|id| {
                     !endpoint.connection_exists(id) && !endpoint.is_output_reserved(id)
                 })
@@ -1384,7 +1391,10 @@ impl Host {
             }
         }
         for lease in &mut self.leases {
-            if lease.is_some_and(|l| endpoint.transmit_attempt_packet(l.attempt).is_none()) {
+            if lease
+                .as_ref()
+                .is_some_and(|l| endpoint.transmit_attempt_packet(l.attempt).is_none())
+            {
                 self.paths.release(lease.take().unwrap().prepared.client)?;
             }
         }
@@ -1467,7 +1477,7 @@ impl Host {
             let current = *binding.get_or_insert_with(|| {
                 live_bindings
                     .iter()
-                    .filter_map(|index| bindings[index])
+                    .filter_map(|index| bindings[index].as_ref())
                     .find(|b| b.owner == Some(id))
                     .map(|b| b.prepared.snapshot)
             });
@@ -2224,7 +2234,7 @@ impl Host {
         } else if let Some(index) = self
             .leases
             .iter()
-            .position(|l| l.is_some_and(|l| l.attempt == attempt))
+            .position(|l| l.as_ref().is_some_and(|l| l.attempt == attempt))
         {
             let lease = self.leases[index].unwrap();
             let mut snapshot = self.paths.snapshot(lease.prepared.client)?;
@@ -2324,7 +2334,7 @@ impl Host {
     }
     fn registration(&self, owner: ConnectionId) -> Option<Registration> {
         self.binding_index(owner)
-            .and_then(|index| self.bindings[index].unwrap().registration)
+            .and_then(|index| self.bindings[index].as_ref().unwrap().registration)
     }
     fn planned(&self, owner: ConnectionId) -> Result<(usize, Binding, Registration), Error> {
         self.live_bindings
