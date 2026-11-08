@@ -426,6 +426,7 @@ impl PathService {
     //= reason=PathService marks every client of a path dirty on each trusted decrease and on link MTU, route, source, link or plateau changes. Host::service_changes, run on every native service_egress and MTU-refresh pass and every tun_echo transmit pass, brings each dirty TCP binding (reserved owners included, budget only, no repair) and each Host UDP flow (a coalesced per-flow change slot carrying MMS_S and the payload limit) to the newest snapshot and acknowledges exactly that version; a failing client stays dirty without stopping the others, and stateless leases and every physical submission revalidate against the current version. Dual-family Host tests (two TCP flows plus a UDP flow, held scalar, zero-copy and partial software GSO reservations, a randomized multi-client model), native reservation-race tests and the isolated namespace shared-fanout case, in which a real router PTB quotes only TCP flow A, verify it.
     //# The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
     fn mark_dirty(&mut self, path: PathId) {
+        self.dirtied += 1;
         for slot in &mut self.clients.slots {
             if let Some(client) = &mut slot.value {
                 if client.path == path {
@@ -602,6 +603,7 @@ impl PathService {
             generation,
             Client { path, dirty: true },
         ));
+        self.dirtied += 1;
         self.generation = generation;
         self.revision = revision;
         Ok((client, self.snapshot(client)?))
@@ -652,6 +654,7 @@ impl PathService {
             generation,
             Client { path, dirty: true },
         ));
+        self.dirtied += 1;
         self.generation = generation;
         self.revision = revision;
         Ok((client, self.snapshot(client)?))
@@ -711,6 +714,14 @@ impl PathService {
     }
     pub fn is_dirty(&self, client: ClientId) -> Result<bool, Error> {
         Ok(self.clients.get_ref(self.context, client.0)?.dirty)
+    }
+
+    /// Advances whenever a client may have become dirty (a new or rebound
+    /// client, or a change to a path with clients): while it stands still,
+    /// no client is newly dirty and a caller that served every dirty client
+    /// has none to look for.
+    pub fn dirtied(&self) -> u64 {
+        self.dirtied
     }
 
     /// Callback-free, allocation-free bounded scan. Reading does not consume.

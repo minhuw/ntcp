@@ -63,6 +63,14 @@ pub struct ConnectionId {
     slot: usize,
     generation: u64,
 }
+impl ConnectionId {
+    /// The connection's slot, below the endpoint's `max_connections` and
+    /// shared by the slot's successive generations: an index for tables an
+    /// embedding keeps per connection.
+    pub fn index(self) -> usize {
+        self.slot
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ListenerId {
     slot: usize,
@@ -446,6 +454,10 @@ pub struct Endpoint {
     events: ReadyQueue,
     advice: ReadyQueue,
     cleanup: ReadyQueue,
+    // Managed connections whose SND.UNA moved from `progress_una`, or that
+    // hold results to publish, since `next_progress` last gave them.
+    progress: ReadyQueue,
+    progress_una: Vec<u32>,
     deadlines: Deadlines,
     reclaimed: u64,
     // Stateless replies: addresses, header, IPv4 options, timestamp echo and,
@@ -616,6 +628,12 @@ impl Endpoint {
             advice: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             events: ReadyQueue::new(event_capacity).map_err(|_| Error::NoMemory)?,
             cleanup: ReadyQueue::new(listeners_count).map_err(|_| Error::NoMemory)?,
+            progress: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
+            progress_una: {
+                let mut una = reserved_vec(count)?;
+                una.resize(count, 0);
+                una
+            },
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
             reclaimed: 0,
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
@@ -2666,6 +2684,7 @@ impl Endpoint {
         self.output.remove(index);
         self.events.remove(index);
         self.advice.remove(index);
+        self.progress.remove(index);
         self.deadlines.set(index, None);
         self.recycle_connection(slot.connection);
         self.reclaimed += 1;
@@ -2738,6 +2757,15 @@ impl Endpoint {
             if slot.connection.handshake_complete() || slot.connection.state() == State::Closed {
                 slot.fast_open_owner = None;
             }
+        }
+        // Reserved connections too: the provider's evidence and results do
+        // not wait for the reservation.
+        if self.managed_context.is_some()
+            && let Some(slot) = &self.slots[index]
+            && (slot.connection.unacknowledged() != self.progress_una[index]
+                || slot.connection.managed_results.unpublished())
+        {
+            self.progress.push(index);
         }
         if self.is_output_reserved(self.id(index)) {
             self.deadlines.set(index, None);

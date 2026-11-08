@@ -491,6 +491,8 @@ pub struct PathService {
     generation: u64,
     revision: u64,
     admin_revision: u64,
+    // Counts the changes that may have made a client dirty (`dirtied`).
+    dirtied: u64,
     plateaus: Ipv4Plateaus,
 }
 
@@ -559,6 +561,7 @@ impl PathService {
             generation: 0,
             revision: 0,
             admin_revision: 0,
+            dirtied: 0,
             plateaus: Ipv4Plateaus::CONTEMPORARY,
         })
     }

@@ -106,6 +106,11 @@ pub(crate) struct ManagedResults {
     pub(crate) receipt: Option<((Seq, Seq, u32), crate::DiscoveryIntent, PhysicalReceipt)>,
     pub(crate) confirmed: Option<ConfirmedProbe>,
 }
+impl ManagedResults {
+    pub(crate) fn unpublished(&self) -> bool {
+        self.applied.is_some() || self.confirmed.is_some()
+    }
+}
 
 impl Endpoint {
     /// Host-correlated Packet Too Big for an exact connection generation.
@@ -188,11 +193,26 @@ impl Endpoint {
     }
 
     /// Whether a live owner generation holds a result to take
-    /// (`take_pending_pmtu_applied` or `take_confirmed_probe`): a provider
-    /// polls every owner on each service pass, and nearly always none has one.
+    /// (`take_pending_pmtu_applied` or `take_confirmed_probe`); a connection
+    /// that comes to hold one is reported by `next_progress`.
     pub fn has_unpublished_results(&self, id: ConnectionId) -> Result<bool, EndpointError> {
-        let results = &self.slot(id)?.connection.managed_results;
-        Ok(results.applied.is_some() || results.confirmed.is_some())
+        Ok(self.slot(id)?.connection.managed_results.unpublished())
+    }
+
+    /// The next live connection whose SND.UNA moved, or that came to hold
+    /// a result to take, since this last gave it, with its SND.UNA: what a
+    /// provider learns from acknowledgments and results without polling
+    /// every owner. A connection is given once per change, however many
+    /// came before the call.
+    pub fn next_progress(&mut self) -> Option<(ConnectionId, u32)> {
+        let index = self.progress.pop()?;
+        let una = self.slots[index]
+            .as_ref()
+            .unwrap()
+            .connection
+            .unacknowledged();
+        self.progress_una[index] = una;
+        Some((self.id(index), una))
     }
 
     /// Take the unpublished confirmed-probe result of a live owner generation.
@@ -296,6 +316,10 @@ impl Endpoint {
 
     pub fn caller_timebase(&self) -> crate::CallerTimebase {
         self.config.connection.timebase
+    }
+
+    pub fn max_connections(&self) -> usize {
+        self.config.max_connections
     }
 
     pub fn managed_context(&self) -> Option<ntcp_path::ContextId> {

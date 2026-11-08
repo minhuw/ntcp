@@ -2471,6 +2471,9 @@ impl Connection {
     pub(crate) fn close_reason(&self) -> Option<CloseReason> {
         self.reason
     }
+    pub(crate) fn unacknowledged(&self) -> u32 {
+        self.snd_una.0
+    }
     pub(crate) fn events_pending(&self) -> bool {
         !self.events.is_empty() || self.tx_timestamps.signalled()
     }
