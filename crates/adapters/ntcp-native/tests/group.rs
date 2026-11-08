@@ -1013,3 +1013,21 @@ fn idle_connections_give_no_events() {
     pair.step();
     assert_eq!(drain(&mut pair.a), [Event::Readable(pair.client)]);
 }
+
+// The budget for n connections admits n connections, their timestamp
+// capacities included, and one octet less admits one fewer.
+#[test]
+fn the_buffer_budget_admits_exactly_its_connections() {
+    let address = "10.73.0.1".parse().unwrap();
+    let peer = SocketAddr::new("10.73.0.2".parse().unwrap(), 9000);
+    let budget = config(address, false, 1).buffer_budget(3).unwrap();
+    let admitted = |budget: usize| {
+        let mut config = config(address, false, 1);
+        config.tcp.max_buffer_bytes = budget;
+        let (wire, _) = wires(PacketLayer::Ip);
+        let mut network = Network::new(config, wire, [1; 32], 0).unwrap();
+        (0..8).take_while(|_| network.connect(peer).is_ok()).count()
+    };
+    assert_eq!(admitted(budget), 3);
+    assert_eq!(admitted(budget - 1), 2);
+}

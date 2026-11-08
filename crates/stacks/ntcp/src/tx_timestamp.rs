@@ -118,6 +118,10 @@ impl TxTimestamps {
         self.records.capacity() * core::mem::size_of::<Record>()
     }
 
+    pub(crate) fn allocation_bytes(limit: usize) -> Option<usize> {
+        limit.checked_mul(core::mem::size_of::<Record>())
+    }
+
     pub(crate) fn resize(&mut self, limit: usize, spare_bytes: usize) -> Result<(), Error> {
         if limit < self.records.len() {
             return Err(Error::WouldBlock);
@@ -125,9 +129,7 @@ impl TxTimestamps {
         if limit == self.limit {
             return Ok(());
         }
-        let bytes = limit
-            .checked_mul(core::mem::size_of::<Record>())
-            .ok_or(Error::NoMemory)?;
+        let bytes = Self::allocation_bytes(limit).ok_or(Error::NoMemory)?;
         if bytes > spare_bytes {
             return Err(Error::NoMemory);
         }

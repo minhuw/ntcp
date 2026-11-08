@@ -50,6 +50,17 @@ pub struct NetworkConfig {
     pub static_neighbors: Vec<(Ipv4Addr, [u8; 6])>,
 }
 impl NetworkConfig {
+    /// The `tcp.max_buffer_bytes` a Network with this configuration needs
+    /// to hold `connections` connections at once: its output reservations,
+    /// one per connection slot and one for stateless replies, and each
+    /// connection's buffers and timestamp records. None if it overflows.
+    pub fn buffer_budget(&self, connections: usize) -> Option<usize> {
+        let reservations = self.tcp.max_connections.checked_add(1)?;
+        self.tcp
+            .connection_charge(self.tx_timestamp_phases, self.rx_timestamp_ranges)?
+            .checked_mul(connections)?
+            .checked_add(self.tcp.output_reservations_charge(reservations, None)?)
+    }
     pub fn new(local_address: IpAddr, mtu: u32) -> Self {
         Self {
             local_address,

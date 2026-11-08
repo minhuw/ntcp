@@ -149,6 +149,44 @@ impl EndpointConfig {
         Ok(())
     }
 
+    /// The share of `max_buffer_bytes` one connection is charged with the
+    /// configured buffers and MSS, once its TX timestamp phases and RX
+    /// timestamp ranges are set to these capacities: what a budget for a
+    /// number of such connections must allow each. None if it overflows.
+    pub fn connection_charge(
+        &self,
+        tx_timestamp_phases: usize,
+        rx_timestamp_ranges: usize,
+    ) -> Option<usize> {
+        Connection::allocation_bytes(
+            self.connection.send_capacity,
+            self.connection.receive_capacity,
+            usize::from(self.connection.mss),
+        )?
+        .checked_add(crate::tx_timestamp::TxTimestamps::allocation_bytes(
+            tx_timestamp_phases,
+        )?)?
+        .checked_add(crate::rx_timestamp::RxTimestamps::allocation_bytes(
+            rx_timestamp_ranges,
+        )?)
+    }
+
+    /// The share of `max_buffer_bytes` taken by `count` output reservations
+    /// (`enable_output_reservations_with_capacity`, or `_with_gso` with
+    /// `gso`). None if it overflows.
+    pub fn output_reservations_charge(
+        &self,
+        count: usize,
+        gso: Option<crate::GsoLimits>,
+    ) -> Option<usize> {
+        (self.connection.send_ip_payload_limit as usize)
+            .checked_add(gso.map_or(0, |limits| limits.max_bytes))?
+            .checked_add(core::mem::size_of::<
+                crate::output_reservation::OutputReservation,
+            >())?
+            .checked_mul(count)
+    }
+
     fn preallocation_bytes(&self) -> Result<(usize, usize), EndpointError> {
         // The existing conservative 3*receive charge covers payload, the
         // 2-bit presence/PUSH map and the new 1-bit pending-report map.
@@ -4747,13 +4785,9 @@ impl Endpoint {
         }
         let size = self.config.connection.send_ip_payload_limit as usize;
         let payload_size = gso.map_or(0, |limits| limits.max_bytes);
-        let charge = size
-            .checked_add(payload_size)
-            .ok_or(Error::NoMemory)?
-            .checked_add(core::mem::size_of::<
-                crate::output_reservation::OutputReservation,
-            >())
-            .and_then(|size| size.checked_mul(count))
+        let charge = self
+            .config
+            .output_reservations_charge(count, gso)
             .ok_or(Error::NoMemory)?;
         if charge > self.buffer_room() {
             return Err(Error::NoMemory.into());
