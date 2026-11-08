@@ -646,6 +646,8 @@ pub struct ConnectionEvents {
     pub network_error: Option<NetworkError>,
     // One notification per connection, coalesced in the existing bounded event queue.
     pub invalid_window_scale: Option<u8>,
+    // A TX timestamp observation became ready to take with next_tx_timestamp.
+    pub tx_timestamps: bool,
 }
 
 impl ConnectionEvents {
@@ -2470,10 +2472,12 @@ impl Connection {
         self.reason
     }
     pub(crate) fn events_pending(&self) -> bool {
-        !self.events.is_empty()
+        !self.events.is_empty() || self.tx_timestamps.signalled()
     }
     pub(crate) fn take_events(&mut self) -> ConnectionEvents {
-        core::mem::take(&mut self.events)
+        let mut events = core::mem::take(&mut self.events);
+        events.tx_timestamps = self.tx_timestamps.take_signal();
+        events
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5

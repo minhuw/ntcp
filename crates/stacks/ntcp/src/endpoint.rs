@@ -447,6 +447,7 @@ pub struct Endpoint {
     advice: ReadyQueue,
     cleanup: ReadyQueue,
     deadlines: Deadlines,
+    reclaimed: u64,
     // Stateless replies: addresses, header, IPv4 options, timestamp echo and,
     // when a managed provider stated it at queueing, the complete IP header
     // length (extensions included) of the IPv6 path the reply leaves on (a
@@ -616,6 +617,7 @@ impl Endpoint {
             events: ReadyQueue::new(event_capacity).map_err(|_| Error::NoMemory)?,
             cleanup: ReadyQueue::new(listeners_count).map_err(|_| Error::NoMemory)?,
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
+            reclaimed: 0,
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
             config,
             routes: Vec::new(),
@@ -2666,6 +2668,7 @@ impl Endpoint {
         self.advice.remove(index);
         self.deadlines.set(index, None);
         self.recycle_connection(slot.connection);
+        self.reclaimed += 1;
         if let Some(generation) = self.generations[index].checked_add(1) {
             self.generations[index] = generation;
             self.free.push(index);
@@ -3726,6 +3729,7 @@ impl Endpoint {
                 value,
                 clock,
             );
+        self.refresh(token.connection().slot);
         Ok(())
     }
 
@@ -3742,6 +3746,7 @@ impl Endpoint {
             .connection
             .tx_timestamps
             .cancel_transmit(token.stream_range(), source);
+        self.refresh(token.connection().slot);
         Ok(())
     }
 
@@ -3813,6 +3818,7 @@ impl Endpoint {
         // departure accounting. It must remain available while a reservation
         // is quarantined after an uncertain backend submission.
         self.slot_mut(id)?.connection.tx_timestamps.cancel_from(0);
+        self.refresh(id.slot);
         Ok(())
     }
 
@@ -4381,6 +4387,13 @@ impl Endpoint {
         self.tuples
             .find(self.hash(tuple), tuple)
             .map(|index| self.id(index))
+    }
+
+    // Connections reclaimed so far. State kept per connection outside the
+    // endpoint need be checked for reclaimed generations only when this has
+    // changed.
+    pub fn reclaimed(&self) -> u64 {
+        self.reclaimed
     }
 
     // Includes released records retained for final output or TIME-WAIT.

@@ -92,6 +92,8 @@ struct Record {
 pub(crate) struct TxTimestamps {
     records: Vec<Record>,
     limit: usize,
+    // A record became ready since the connection last reported it.
+    signal: bool,
 }
 
 impl TxTimestampRequest {
@@ -187,6 +189,7 @@ impl TxTimestamps {
             {
                 record.event.outcome = TxTimestampOutcome::Recorded { value, clock };
                 record.ready = true;
+                self.signal = true;
             }
         }
     }
@@ -200,6 +203,7 @@ impl TxTimestamps {
             {
                 record.event.outcome = TxTimestampOutcome::Cancelled;
                 record.ready = true;
+                self.signal = true;
             }
         }
     }
@@ -209,12 +213,23 @@ impl TxTimestamps {
             if !record.ready && record.event.target >= start {
                 record.event.outcome = TxTimestampOutcome::Cancelled;
                 record.ready = true;
+                self.signal = true;
             }
         }
     }
 
     pub(crate) fn discard_request(&mut self, cookie: u64) {
         self.records.retain(|record| record.event.cookie != cookie);
+    }
+
+    // Whether a record became ready since the last take: the connection's
+    // event that it has observations to drain.
+    pub(crate) fn signalled(&self) -> bool {
+        self.signal
+    }
+
+    pub(crate) fn take_signal(&mut self) -> bool {
+        core::mem::take(&mut self.signal)
     }
 
     pub(crate) fn next(&mut self) -> Option<TxTimestampEvent> {
