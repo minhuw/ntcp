@@ -884,6 +884,11 @@ pub(crate) struct Ledger {
     // mostly empty slots and pure ACKs.
     occupied: Vec<usize>,
     retirable: Vec<usize>,
+    // Per owner record: the SND.UNA its delivery retirement last ran at,
+    // while neither its history nor its own summary changed since.
+    // Retirement is idempotent, so another pass at that SND.UNA, which every
+    // collection makes for every live connection, has nothing to do.
+    retired: Vec<Option<u32>>,
     // A live TCP generation's own evicted history. It is kept apart from the
     // shared summaries so delivery can shrink it (`retire_tcp`): otherwise a
     // long transfer's evictions would widen one cover until it matched every
@@ -929,6 +934,7 @@ impl Ledger {
             extra: crate::table(limits.owners, Vec::new())?,
             occupied: crate::table(limits.owners, 0)?,
             retirable: crate::table(limits.owners, 0)?,
+            retired: crate::table(limits.owners, None)?,
             own: crate::table(limits.owners, None)?,
             pending: crate::table(limits.concurrent_attempts, None)?,
             datagrams: crate::table(limits.datagram_evidence, None)?,
@@ -976,6 +982,7 @@ impl Ledger {
             &mut self.extra[owner][i - h]
         };
         let old = core::mem::replace(slot, value);
+        self.retired[owner] = None;
         for (entry, added) in [(&old, false), (&value, true)] {
             let Some(entry) = entry else {
                 continue;
@@ -1049,6 +1056,7 @@ impl Ledger {
         self.keys[index] = None;
         self.blind[index] = 0;
         self.own[index] = None;
+        self.retired[index] = None;
         Ok(index)
     }
     pub fn owner_pinned(&self, index: usize) -> bool {
@@ -1078,6 +1086,7 @@ impl Ledger {
         self.live_owners.remove(index);
         self.keys[index] = None;
         self.blind[index] = 0;
+        self.retired[index] = None;
         true
     }
 
@@ -1299,6 +1308,7 @@ impl Ledger {
             return self.bury(record, now);
         }
         let summary = Tombstone::of(&record.evidence, until);
+        self.retired[owner] = None;
         match &mut self.own[owner] {
             Some(own) => own.absorb(&summary),
             own => *own = Some(summary),
@@ -1416,6 +1426,16 @@ impl Ledger {
         mut delivered: impl FnMut(&Record),
     ) {
         debug_assert!(matches!(self.owners[index], Some(Owner::Tcp(_))));
+        if self.retired[index] == Some(unacknowledged) {
+            debug_assert!((0..self.slots(index)).all(|slot| {
+                self.slot(index, slot).is_none_or(|e| {
+                    !e.retirable()
+                        || !matches!(e.record.evidence.transport,
+                            Selector::Tcp { end, .. } if serial_le(end, unacknowledged))
+                })
+            }));
+            return;
+        }
         let mut floor = unacknowledged;
         // Stop once every retirable entry was seen (`seen` counts those kept).
         let (mut slot, mut seen) = (0, 0);
@@ -1437,6 +1457,7 @@ impl Ledger {
                 floor = start;
             }
         }
+        self.retired[index] = Some(unacknowledged);
         let Some(own) = &mut self.own[index] else {
             return;
         };
