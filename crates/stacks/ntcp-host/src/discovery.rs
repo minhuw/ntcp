@@ -14,9 +14,11 @@ use crate::neighbor::{
     AddressState, Control, ControlOutcome, ControlToken, Destination, NdEvent, NdPort, Resolution,
 };
 use crate::{
-    Advice, BackendOutcome, EgressContext, Error, Forwarding, Host, IngressContext, Ipv4Receive,
-    Ipv6Receive, Owner, ReceiveCapabilities, Received, ResolvedNextHop,
+    Advice, BackendOutcome, EgressContext, Error, Forwarding, Host, IngressContext,
+    Ipv4NeighborTable, Ipv4Receive, Ipv6Receive, NeighborHold, Owner, ReceiveCapabilities,
+    Received, ResolvedNextHop,
 };
+use alloc::boxed::Box;
 use ntcp::TransmitAttempt;
 #[cfg(any(test, feature = "test-support"))]
 use ntcp_arp::ArpState;
@@ -52,7 +54,7 @@ pub struct NeighborTicket {
 #[derive(Debug, Eq, PartialEq)]
 enum Token {
     Nd(ControlToken),
-    Arp(crate::arp::ControlToken),
+    Arp(ntcp_arp::ControlToken),
 }
 
 /// One caller-time Neighbor Discovery pass (`Host::service_neighbors`).
@@ -153,9 +155,11 @@ impl Host {
             Ok(())
         };
         if arp && added.is_ok() {
-            added = self
-                .ipv4_neighbors
-                .add_link(context.link, port.mac, self.entropy.as_mut());
+            added = self.ipv4_neighbors.table_mut().add_link(
+                context.link,
+                port.mac,
+                self.entropy.as_mut(),
+            );
         }
         if let Err(error) = added {
             self.remove_link(context)?;
@@ -200,13 +204,14 @@ impl Host {
         link: LinkId,
         address: Ipv4Addr,
     ) -> Result<AddressState, Error> {
-        if !self.ipv4_neighbors.has_link(link) {
+        let table = self.ipv4_neighbors.table_mut();
+        if !table.has_link(link) {
             return Err(Error::InvalidContext);
         }
         let scoped = ScopedAddress::new(IpAddr::V4(address), None)?;
-        self.ipv4_neighbors.add_local(link, address)?;
+        table.add_local(link, address)?;
         if let Err(error) = self.paths.register_source(scoped, link) {
-            self.ipv4_neighbors.remove_local(link, address);
+            self.ipv4_neighbors.table_mut().remove_local(link, address);
             return Err(error.into());
         }
         Ok(AddressState::Assigned)
@@ -227,10 +232,33 @@ impl Host {
         let IpAddr::V4(address) = address else {
             return Err(Error::Unsupported);
         };
-        if !self.ipv4_neighbors.has_link(link) {
+        let table = self.ipv4_neighbors.table_mut();
+        if !table.has_link(link) {
             return Err(Error::Unsupported);
         }
-        self.ipv4_neighbors.add_permanent(link, address, mac, now)
+        table.add_permanent(link, address, mac, now)
+    }
+
+    /// Resolve the IPv4 next hops of neighbor ports through `table` instead
+    /// of this Host's own cache (`Limits::ipv4_neighbors`, then unused):
+    /// for example one Ethernet port's table, shared by the Hosts of its
+    /// queues. Every port registered afterwards that receives IPv4 resolves
+    /// it there. Refused (`InvalidContext`) once a link is registered.
+    pub fn set_ipv4_neighbor_table(
+        &mut self,
+        table: Box<dyn Ipv4NeighborTable>,
+    ) -> Result<(), Error> {
+        if self.ports.iter().any(Option::is_some) {
+            return Err(Error::InvalidContext);
+        }
+        self.ipv4_neighbors.install(table);
+        Ok(())
+    }
+
+    /// The table `set_ipv4_neighbor_table` installed: its embedding drives
+    /// what the Host's calls do not (a shared table's housekeeping).
+    pub fn ipv4_neighbor_table_mut(&mut self) -> Option<&mut (dyn Ipv4NeighborTable + 'static)> {
+        self.ipv4_neighbors.installed()
     }
 
     /// The embedding has joined all-nodes and `address`'s solicited-node
@@ -270,7 +298,7 @@ impl Host {
         link: LinkId,
         address: Ipv4Addr,
     ) -> Option<(ArpState, Option<[u8; 6]>)> {
-        self.ipv4_neighbors.entry(link, address)
+        self.ipv4_neighbors.table().entry(link, address)
     }
 
     /// Apply every Neighbor Discovery and ARP timer due at `now`
@@ -287,16 +315,18 @@ impl Host {
             ..
         } = self;
         neighbors.service(now, &mut |event| apply(paths, event, &mut report));
-        ipv4_neighbors.service(now, &mut |link, address| {
-            lost(
-                paths,
-                link,
-                IpAddr::V4(address),
-                None,
-                ntcp_path::NeighborLoss::Unreachable,
-                &mut report,
-            )
-        });
+        ipv4_neighbors
+            .table_mut()
+            .service(now, &mut |link, address| {
+                lost(
+                    paths,
+                    link,
+                    IpAddr::V4(address),
+                    None,
+                    ntcp_path::NeighborLoss::Unreachable,
+                    &mut report,
+                )
+            });
         self.settle_held_icmp(now);
         report
     }
@@ -340,11 +370,12 @@ impl Host {
         now: Instant,
         held: HeldOutput,
     ) -> Result<NeighborHop, Error> {
-        if !self.ipv4_neighbors.has_link(link) {
+        let table = self.ipv4_neighbors.table_mut();
+        if !table.has_link(link) {
             return Err(Error::Unsupported);
         }
         Ok(
-            match self.ipv4_neighbors.resolve(link, next_hop, now, held)? {
+            match table.resolve(link, next_hop, now, NeighborHold(held))? {
                 Some(mac) => NeighborHop::Resolved(mac),
                 None => NeighborHop::Held,
             },
@@ -382,7 +413,13 @@ impl Host {
                 self.neighbors.release(slot);
                 (held, mac.is_some())
             }
-            None => self.ipv4_neighbors.next_wake(transport)?,
+            None => {
+                let (held, resolved) = self
+                    .ipv4_neighbors
+                    .table_mut()
+                    .next_wake(&|held| transport(&held.0))?;
+                (held.0, resolved)
+            }
         };
         let HeldOutput::Transport { owner, attempt } = held else {
             return None;
@@ -412,7 +449,7 @@ impl Host {
     ) -> Result<Option<NeighborHop>, Error> {
         if let ResolvedNextHop::Address(next_hop) = key.next_hop()
             && let IpAddr::V4(next_hop) = next_hop.address()
-            && self.ipv4_neighbors.has_link(key.link())
+            && self.ipv4_neighbors.table().has_link(key.link())
         {
             return Ok(Some(self.ipv4_hop(key.link(), next_hop, now, held)?));
         }
@@ -449,9 +486,9 @@ impl Host {
         }
         // ARP yields only ended records; one whose message or probe is gone
         // stays until its resolution ends.
-        let host_output = |held: &HeldOutput| !matches!(held, HeldOutput::Transport { .. });
-        while let Some((held, resolved)) = self.ipv4_neighbors.next_wake(host_output) {
-            match held {
+        let host_output = |held: &NeighborHold| !matches!(held.0, HeldOutput::Transport { .. });
+        while let Some((held, resolved)) = self.ipv4_neighbors.table_mut().next_wake(&host_output) {
+            match held.0 {
                 HeldOutput::Transport { .. } => {}
                 HeldOutput::Icmp(arrival) => {
                     self.icmp_output_settle(arrival, Some(resolved));
@@ -466,7 +503,7 @@ impl Host {
     /// The earliest caller time at which `service_neighbors` or
     /// `neighbor_output` has work.
     pub fn next_neighbor_deadline(&self) -> Option<Instant> {
-        let ipv4 = self.ipv4_neighbors.next_deadline();
+        let ipv4 = self.ipv4_neighbors.table().next_deadline();
         match self.neighbors.next_deadline() {
             Some(ipv6) => Some(ipv4.map_or(ipv6, |ipv4| ipv4.min(ipv6))),
             None => ipv4,
@@ -488,22 +525,25 @@ impl Host {
         body: &[u8],
     ) -> Result<(), Error> {
         self.port(context.link)?;
-        if !self.ipv4_neighbors.has_link(context.link) {
+        if !self.ipv4_neighbors.table().has_link(context.link) {
             return Err(Error::Unsupported);
         }
+        let arp = ntcp_arp::parse(body)?;
         let Self {
             ipv4_neighbors,
             entropy,
             ..
         } = self;
-        ipv4_neighbors.receive(context.link, body, now, entropy.as_mut())?;
+        ipv4_neighbors
+            .table_mut()
+            .receive(context.link, &arp, now, entropy.as_mut())?;
         self.settle_held_icmp(now);
         Ok(())
     }
 
     /// Cumulative ARP counters of every port (zero without ARP storage).
     pub fn arp_counters(&self) -> crate::ArpCounters {
-        self.ipv4_neighbors.counters()
+        self.ipv4_neighbors.table().counters()
     }
 
     // ND ingress on an ND-capable port, before ordinary destination
@@ -601,7 +641,8 @@ impl Host {
         out: &mut [u8],
     ) -> Result<Option<NeighborTransmit>, Error> {
         let Some((control, token)) = self.neighbors.next_control(link, now) else {
-            let Some((destination, len, token)) = self.ipv4_neighbors.output(link, now, out)?
+            let Some((destination, len, token)) =
+                self.ipv4_neighbors.table_mut().output(link, now, out)?
             else {
                 return Ok(None);
             };
@@ -733,7 +774,9 @@ impl Host {
                     BackendOutcome::WouldBlock | BackendOutcome::Rejected => Arp::Blocked,
                     BackendOutcome::NotSubmitted => Arp::Failed,
                 };
-                self.ipv4_neighbors.complete(token, outcome, now);
+                self.ipv4_neighbors
+                    .table_mut()
+                    .complete(token, outcome, now);
             }
         }
         Ok(())

@@ -8,7 +8,7 @@ mod cache;
 
 pub use cache::{
     AddressKind, ArpCache, ArpCounters, ArpLimits, ArpState, ArpTimers, Control, ControlOutcome,
-    ControlToken, Event, Resolution, Wake,
+    ControlToken, Event, Mapping, Resolution, Wake,
 };
 
 use core::net::Ipv4Addr;

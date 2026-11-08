@@ -63,6 +63,7 @@ pub use neighbor::NeighborState;
 mod redirect;
 pub use redirect::{RedirectOutcome, RedirectRejection};
 mod arp;
+pub use arp::{Ipv4NeighborTable, NeighborHold};
 mod discovery;
 pub use discovery::{NeighborHop, NeighborReport, NeighborTicket, NeighborTransmit, NeighborWake};
 mod udp;
@@ -223,7 +224,9 @@ pub struct Limits {
     /// Neighbor Discovery for ND-capable ports; none by default.
     pub neighbors: NeighborLimits,
     /// ARP for the IPv4 next hops of neighbor ports, the same quantities
-    /// for that family (the answers are ARP replies); none by default.
+    /// for that family (the answers are ARP replies); none by default, and
+    /// none needed with a table of the embedding's
+    /// (`Host::set_ipv4_neighbor_table`).
     pub ipv4_neighbors: NeighborLimits,
 }
 
@@ -592,7 +595,7 @@ pub struct Host {
     identifiers: Allocator,
     adjunct: Adjunct,
     neighbors: Neighbors<discovery::HeldOutput>,
-    ipv4_neighbors: arp::Ipv4Neighbors,
+    ipv4_neighbors: arp::Ipv4Backend,
     // Addresses ND ingress found duplicate since the last
     // `service_neighbors` report, which carries them to the owner.
     unreported_duplicates: usize,
@@ -678,7 +681,7 @@ impl Host {
                 path_limits.links,
                 timebase.units_per_second,
             )?,
-            ipv4_neighbors: arp::Ipv4Neighbors::new(
+            ipv4_neighbors: arp::Ipv4Backend::new(
                 limits.ipv4_neighbors,
                 path_limits.links,
                 timebase.units_per_second,
@@ -705,7 +708,7 @@ impl Host {
             return Err(Error::Unsupported);
         }
         // Likewise its IPv4 addresses, which ARP must also answer for.
-        if address.address().is_ipv4() && self.ipv4_neighbors.has_link(link) {
+        if address.address().is_ipv4() && self.ipv4_neighbors.table().has_link(link) {
             return Err(Error::Unsupported);
         }
         Ok(self.paths.register_source(address, link)?)
@@ -927,7 +930,7 @@ impl Host {
         self.port(context.link)?;
         self.paths.remove_link(context.link)?;
         self.neighbors.remove_port(context.link);
-        self.ipv4_neighbors.remove_link(context.link);
+        self.ipv4_neighbors.table_mut().remove_link(context.link);
         let slot = self
             .ports
             .iter()
@@ -1497,7 +1500,7 @@ impl Host {
                     *now,
                     entropy.as_mut(),
                 ),
-                IpAddr::V4(next_hop) => ipv4_neighbors.confirm(
+                IpAddr::V4(next_hop) => ipv4_neighbors.table_mut().confirm(
                     evidence.link,
                     next_hop,
                     record.committed_at,

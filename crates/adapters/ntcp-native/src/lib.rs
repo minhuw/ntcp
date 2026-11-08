@@ -2,8 +2,10 @@
 
 mod config;
 mod driver;
+mod shared;
 mod types;
 pub use config::{EthernetNextHop, Link, NetworkConfig};
+pub use shared::{SharedNeighborLimits, SharedNeighbors};
 pub use types::*;
 
 use ntcp::{AddressValidation, Endpoint, EndpointError, Tuple};
@@ -82,6 +84,9 @@ pub struct Network<P: PacketIo> {
     // An ARP packet was taken in since held output was last released: a
     // resolution may have ended.
     arp_input: bool,
+    // IPv4 next hops resolve through a port's shared table
+    // (`with_shared_neighbors`), not the Host's own.
+    shared_neighbors: bool,
     tx_cursor: usize,
     // The one transmit slot of ARP control frames (empty without ARP).
     control: Vec<u8>,
@@ -146,7 +151,7 @@ fn bytes(capacity: usize) -> Result<Vec<u8>> {
 // step. The draws are a keyed SipHash of a counter under std's per-process
 // random keys: unpredictable without a system call per draw, of which TCP
 // progress makes one per confirmation.
-fn entropy() -> ntcp_host::Entropy {
+pub(crate) fn entropy() -> ntcp_host::Entropy {
     use std::hash::BuildHasher;
     let keys = std::collections::hash_map::RandomState::new();
     let mut counter = 0u64;
@@ -165,6 +170,32 @@ impl<P: PacketIo> Network<P> {
     // monotonic caller ticks in config.tcp.connection.timebase. Device/queue
     // ownership and any borrowed EAL/pool lifetime remain backend contracts.
     pub fn new(config: NetworkConfig, io: P, secret: [u8; 32], now: Instant) -> Result<Self> {
+        Self::build(config, io, secret, now, None)
+    }
+    /// A Network on one queue of an Ethernet port whose IPv4 next hops
+    /// `neighbors` resolves for every Network on the port: the link must be
+    /// `EthernetNextHop::Arp` with the table's MAC, and caller time must
+    /// come from the clock, units and origin every member uses
+    /// (`SharedNeighbors`). The Network answers ARP for its address and
+    /// takes ARP input for every member; `neighbor_entries` sizes the front
+    /// cache of mappings it resolves without the table's lock, and its
+    /// static neighbors become the port's. Dropping it leaves the table.
+    pub fn with_shared_neighbors(
+        config: NetworkConfig,
+        io: P,
+        secret: [u8; 32],
+        now: Instant,
+        neighbors: &SharedNeighbors,
+    ) -> Result<Self> {
+        Self::build(config, io, secret, now, Some(neighbors))
+    }
+    fn build(
+        config: NetworkConfig,
+        io: P,
+        secret: [u8; 32],
+        now: Instant,
+        neighbors: Option<&SharedNeighbors>,
+    ) -> Result<Self> {
         config.validate(&io)?;
         if config.tcp.ipv4_options_enabled {
             return Err(Error::Unsupported(
@@ -186,7 +217,28 @@ impl<P: PacketIo> Network<P> {
             .max_connections
             .checked_add(1)
             .ok_or(Error::Capacity)?;
-        if arp.is_some() {
+        let member = match (neighbors, arp, config.link) {
+            (None, _, _) => None,
+            (Some(neighbors), Some(_), Link::Ethernet { local_mac, .. }) => {
+                if local_mac != neighbors.local_mac() {
+                    return Err(Error::InvalidConfig(
+                        "a shared neighbor table serves the one MAC of its port",
+                    ));
+                }
+                if config.tcp.connection.timebase.units_per_second != neighbors.units_per_second() {
+                    return Err(Error::InvalidConfig(
+                        "members of a shared neighbor table use its time units",
+                    ));
+                }
+                Some(neighbors.join(owners, config.neighbor_entries)?)
+            }
+            _ => {
+                return Err(Error::InvalidConfig(
+                    "a shared neighbor table resolves IPv4 next hops by ARP",
+                ));
+            }
+        };
+        if arp.is_some() && member.is_none() {
             // One held attempt per output lane; a reply per requester, each
             // of which the request also adds as an entry.
             limits.ipv4_neighbors = ntcp_host::NeighborLimits {
@@ -205,6 +257,10 @@ impl<P: PacketIo> Network<P> {
             limits,
             config.tcp.connection.timebase,
         )?;
+        let shared_neighbors = member.is_some();
+        if let Some(member) = member {
+            host.set_ipv4_neighbor_table(Box::new(member))?;
+        }
         let receive = ntcp_host::ReceiveCapabilities {
             max_ip_packet: config.mtu as usize,
             ipv4: if local.is_ipv4() {
@@ -362,6 +418,7 @@ impl<P: PacketIo> Network<P> {
             tx_held: 0,
             tx_frames,
             arp_input: false,
+            shared_neighbors,
             tx_cursor: 0,
             control,
             // Capture an oversized physical frame safely before the Host rejects it.
@@ -432,6 +489,22 @@ impl<P: PacketIo> Network<P> {
     }
     pub fn failure(&self) -> Option<&io::Error> {
         self.failure.as_ref()
+    }
+    /// For a member of a shared neighbor table: an eventfd to signal (one
+    /// 8-octet write adding 1) when another member ends a resolution that
+    /// holds this Network's output or reports a neighbor lost, so that a
+    /// blocking embedding's poll set wakes for the drive that releases it.
+    /// The embedding creates the descriptor and resets it as it polls; a
+    /// write that would block is not retried, the descriptor then being
+    /// readable already. A busy-polling embedding needs none: each drive
+    /// takes its wakes.
+    #[cfg(unix)]
+    pub fn set_neighbor_wake_fd(&mut self, fd: std::os::fd::OwnedFd) -> Result<()> {
+        let member = shared::member(&mut self.host).ok_or(Error::Unsupported(
+            "a wake descriptor needs a shared neighbor table",
+        ))?;
+        member.set_wake(std::fs::File::from(fd));
+        Ok(())
     }
     pub fn is_stopped(&self) -> bool {
         self.stopped

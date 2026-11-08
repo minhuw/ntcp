@@ -359,3 +359,131 @@ fn ipv4_resolution_needs_its_own_storage() {
     );
     assert_eq!(host.next_neighbor_deadline(), None);
 }
+
+// A table installed by the embedding in place of the Host's own cache.
+#[derive(Default)]
+struct Installed {
+    link: Option<LinkId>,
+    locals: Vec<Ipv4Addr>,
+    received: Vec<Arp>,
+}
+impl Ipv4NeighborTable for Installed {
+    fn has_link(&self, link: LinkId) -> bool {
+        self.link == Some(link)
+    }
+    fn add_link(
+        &mut self,
+        link: LinkId,
+        mac: [u8; 6],
+        _: Option<&mut Entropy>,
+    ) -> Result<(), Error> {
+        assert_eq!(mac, OWN);
+        self.link = Some(link);
+        Ok(())
+    }
+    fn remove_link(&mut self, _: LinkId) {
+        self.link = None;
+    }
+    fn add_local(&mut self, _: LinkId, address: Ipv4Addr) -> Result<(), Error> {
+        self.locals.push(address);
+        Ok(())
+    }
+    fn remove_local(&mut self, _: LinkId, address: Ipv4Addr) {
+        self.locals.retain(|a| *a != address);
+    }
+    fn add_permanent(&mut self, _: LinkId, _: Ipv4Addr, _: [u8; 6], _: u64) -> Result<(), Error> {
+        Err(Error::Capacity)
+    }
+    fn resolve(
+        &mut self,
+        _: LinkId,
+        _: Ipv4Addr,
+        _: u64,
+        _: NeighborHold,
+    ) -> Result<Option<[u8; 6]>, Error> {
+        Ok(Some(GATEWAY_MAC))
+    }
+    fn next_wake(&mut self, _: &dyn Fn(&NeighborHold) -> bool) -> Option<(NeighborHold, bool)> {
+        None
+    }
+    fn receive(
+        &mut self,
+        _: LinkId,
+        arp: &Arp,
+        _: u64,
+        _: Option<&mut Entropy>,
+    ) -> Result<(), Error> {
+        self.received.push(*arp);
+        Ok(())
+    }
+    fn output(
+        &mut self,
+        _: LinkId,
+        _: u64,
+        _: &mut [u8],
+    ) -> Result<Option<([u8; 6], usize, ntcp_arp::ControlToken)>, Error> {
+        Ok(None)
+    }
+    fn complete(&mut self, _: ntcp_arp::ControlToken, _: ntcp_arp::ControlOutcome, _: u64) {}
+    fn service(&mut self, _: u64, _: &mut dyn FnMut(LinkId, Ipv4Addr)) {}
+    fn next_deadline(&self) -> Option<u64> {
+        Some(7)
+    }
+    fn confirm(
+        &mut self,
+        _: LinkId,
+        _: Ipv4Addr,
+        _: u64,
+        _: u64,
+        _: Option<&mut Entropy>,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+    fn counters(&self) -> ArpCounters {
+        ArpCounters {
+            requests_sent: 3,
+            ..ArpCounters::default()
+        }
+    }
+}
+
+// The Host's IPv4 neighbor calls reach an installed table, which needs no
+// storage of the Host's own and is installed before any port.
+#[test]
+fn an_installed_table_serves_the_ipv4_neighbor_calls() {
+    let cfg = config(1);
+    let mut host = arp_host(&cfg, NeighborLimits::default());
+    host.set_ipv4_neighbor_table(Box::new(Installed::default()))
+        .unwrap();
+    let context = host
+        .register_neighbor_port(InterfaceKey(1), 1500, receive(), NdPort::new(OWN))
+        .unwrap();
+    let link = context.link();
+    assert_eq!(
+        host.add_neighbor_address(link, LOCAL),
+        Ok(AddressState::Assigned)
+    );
+    assert_eq!(
+        host.register_source(ScopedAddress::new(IpAddr::V4(LOCAL), None).unwrap(), link),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(
+        host.add_static_neighbor(link, IpAddr::V4(GATEWAY), GATEWAY_MAC, 0),
+        Err(Error::Capacity)
+    );
+    let request = request_for(Ipv4Addr::new(192, 0, 2, 9));
+    host.receive_arp(context, 0, &body(request)).unwrap();
+    assert_eq!(host.next_neighbor_deadline(), Some(7));
+    assert_eq!(host.arp_counters().requests_sent, 3);
+    assert!(output(&mut host, link, 0).is_none());
+    let table: &mut dyn core::any::Any = host.ipv4_neighbor_table_mut().unwrap();
+    let table = table.downcast_mut::<Installed>().unwrap();
+    assert_eq!(table.locals, [LOCAL]);
+    assert_eq!(table.received, [request]);
+    assert_eq!(
+        host.set_ipv4_neighbor_table(Box::new(Installed::default())),
+        Err(Error::InvalidContext)
+    );
+    // A Host without one has no table to reach.
+    assert!(side().0.ipv4_neighbor_table_mut().is_none());
+}

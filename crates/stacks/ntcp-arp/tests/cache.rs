@@ -954,3 +954,119 @@ fn a_publishing_only_link_fails_validation_instead_of_stalling() {
     assert_eq!(proxy.next_deadline(), None);
     assert!(proxy.next_control(1, 6 * S).is_none());
 }
+
+// What resolution returns and until when, and the epoch that changes only
+// when a returned mapping may change: an embedding keeping mappings outside
+// the cache reuses them while both hold.
+#[test]
+fn mappings_stay_valid_until_their_deadline_or_an_epoch_change() {
+    let mut cache = cache();
+    assert_eq!(cache.resolve(0, PEER_IP, 0, 1), Ok(Resolution::Held));
+    assert_eq!(cache.mapping(0, PEER_IP, 0), None);
+    let epoch = cache.mapping_epoch();
+    submit(&mut cache, 0).unwrap();
+    // Resolving an unresolved entry changes no mapping anybody used.
+    receive(&mut cache, reply_from(PEER, PEER_IP), 0);
+    assert_eq!(cache.mapping_epoch(), epoch);
+    let reachable = Mapping {
+        mac: PEER,
+        state: ArpState::Reachable,
+        until: 30 * S,
+    };
+    assert_eq!(cache.mapping(0, PEER_IP, 0), Some(reachable));
+    // Aging changes the epoch never; each deadline bounds its state.
+    service(&mut cache, 30 * S);
+    assert_eq!(
+        cache
+            .mapping(0, PEER_IP, 31 * S)
+            .map(|m| (m.state, m.until)),
+        Some((ArpState::Stale, 31 * S))
+    );
+    assert_eq!(
+        cache.resolve(0, PEER_IP, 31 * S, 1),
+        Ok(Resolution::Ready(PEER))
+    );
+    assert_eq!(
+        cache
+            .mapping(0, PEER_IP, 31 * S)
+            .map(|m| (m.state, m.until)),
+        Some((ArpState::Delay, 36 * S))
+    );
+    service(&mut cache, 36 * S);
+    assert_eq!(
+        cache
+            .mapping(0, PEER_IP, 36 * S)
+            .map(|m| (m.state, m.until)),
+        Some((ArpState::Probe, 36 * S))
+    );
+    submit(&mut cache, 36 * S).unwrap();
+    assert_eq!(
+        cache.mapping(0, PEER_IP, 36 * S).map(|m| m.until),
+        Some(37 * S)
+    );
+    assert_eq!(cache.mapping_epoch(), epoch);
+    // A changed MAC, a configured mapping, removal and failure change it.
+    let changes = |cache: &mut Cache, change: &dyn Fn(&mut Cache)| {
+        let before = cache.mapping_epoch();
+        change(cache);
+        assert_ne!(cache.mapping_epoch(), before);
+    };
+    changes(&mut cache, &|c| {
+        receive(c, request_from(OTHER, PEER_IP, LOCAL), 37 * S)
+    });
+    assert_eq!(
+        cache.mapping(0, PEER_IP, 37 * S).map(|m| m.mac),
+        Some(OTHER)
+    );
+    // (The request's answer.)
+    assert_eq!(
+        submit(&mut cache, 37 * S).unwrap().arp.operation,
+        Operation::Reply
+    );
+    changes(&mut cache, &|c| {
+        c.add_permanent(0, OTHER_IP, OTHER, 37 * S).unwrap()
+    });
+    assert_eq!(
+        cache
+            .mapping(0, OTHER_IP, 37 * S)
+            .map(|m| (m.state, m.until)),
+        Some((ArpState::Permanent, u64::MAX))
+    );
+    changes(&mut cache, &|c| assert!(c.remove_entry(0, OTHER_IP)));
+    assert_eq!(
+        cache.resolve(0, PEER_IP, 37 * S, 1),
+        Ok(Resolution::Ready(OTHER))
+    );
+    changes(&mut cache, &|c| {
+        for at in [42, 43, 44] {
+            service(c, at * S);
+            submit(c, at * S);
+        }
+        assert_eq!(service(c, 45 * S).len(), 1);
+    });
+    assert_eq!(cache.mapping(0, PEER_IP, 45 * S), None);
+}
+
+#[test]
+fn ended_holds_are_visited_without_removal_and_released_by_owner() {
+    let mut cache = cache();
+    for tag in [1, 2, 3] {
+        assert_eq!(cache.resolve(0, PEER_IP, 0, tag), Ok(Resolution::Held));
+    }
+    assert_eq!(cache.resolve(0, OTHER_IP, 0, 4), Ok(Resolution::Held));
+    let ended = |cache: &Cache| {
+        let mut tags = Vec::new();
+        cache.ended(|tag| tags.push(*tag));
+        tags
+    };
+    assert_eq!(ended(&cache), []);
+    submit(&mut cache, 0).unwrap();
+    receive(&mut cache, reply_from(PEER, PEER_IP), 0);
+    assert_eq!(ended(&cache), [1, 2, 3]);
+    assert_eq!(ended(&cache), [1, 2, 3]);
+    // Released records are neither visited nor woken; the others are.
+    assert_eq!(cache.release_matching(|tag| *tag >= 3), 2);
+    assert_eq!(ended(&cache), [1, 2]);
+    assert_eq!(wakes(&mut cache), [Wake::Retry(1), Wake::Retry(2)]);
+    assert_eq!(ended(&cache), []);
+}

@@ -90,6 +90,21 @@ pub enum Resolution {
     Held,
 }
 
+/// A usable mapping and how long resolution returns it unchanged
+/// (`ArpCache::mapping`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mapping {
+    pub mac: [u8; 6],
+    pub state: ArpState,
+    /// Until this time (exclusive) no timer changes the entry and resolving
+    /// it changes nothing but its use: the REACHABLE expiry or the DELAY or
+    /// PROBE deadline; the given time for STALE, whose next resolution
+    /// starts DELAY; never (`u64::MAX`) for a permanent entry. Received
+    /// packets, confirmations and configuration are not foreseen; those
+    /// that alter or remove a mapping change `ArpCache::mapping_epoch`.
+    pub until: u64,
+}
+
 /// A held output attempt whose resolution ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Wake<T> {
@@ -228,6 +243,9 @@ pub struct ArpCache<L, T> {
     retrans: u64,
     delay_first_probe: u64,
     next_id: u64,
+    // Advanced whenever a mapping `resolve` returned may change or stop
+    // being returned (`mapping_epoch`).
+    epoch: u64,
     counters: ArpCounters,
     interfaces: Vec<Option<Interface<L>>>,
     entries: Vec<Option<Entry<L>>>,
@@ -284,6 +302,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             retrans: units(timers.retrans_ms),
             delay_first_probe: units(timers.delay_first_probe_ms),
             next_id: 0,
+            epoch: 0,
             counters: ArpCounters::default(),
             interfaces: table(limits.links, None)?,
             entries: table(limits.entries, None)?,
@@ -311,6 +330,27 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// A counter that changes whenever a mapping `resolve` returned may
+    /// change or stop being returned: a learned MAC replacing another, an
+    /// entry failed, removed or reclaimed, a permanent entry configured, an
+    /// address becoming answered by this cache, a link removed. Timers that
+    /// only age an entry (REACHABLE to STALE, DELAY to PROBE) leave it
+    /// alone; `Mapping::until` bounds those. An embedding that keeps
+    /// mappings outside the cache uses them while the epoch is unchanged.
+    pub fn mapping_epoch(&self) -> u64 {
+        self.epoch
+    }
+    fn remapped(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+    // Store `entry` in `slot`; a mapping it reclaims is gone.
+    fn occupy(&mut self, slot: usize, entry: Entry<L>) {
+        if self.entries[slot].is_some_and(|e| e.mac.is_some()) {
+            self.remapped();
+        }
+        self.entries[slot] = Some(entry);
     }
     fn interface(&self, link: L) -> Option<&Interface<L>> {
         self.interfaces.iter().flatten().find(|i| i.link == link)
@@ -352,6 +392,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     /// Forget a link with its entries, addresses and queued replies; its
     /// held output fails.
     pub fn remove_link(&mut self, link: L) {
+        self.remapped();
         for interface in &mut self.interfaces {
             if interface.is_some_and(|i| i.link == link) {
                 *interface = None;
@@ -401,6 +442,8 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             address,
             kind,
         });
+        // An answered address is no longer resolved.
+        self.remapped();
         Ok(())
     }
 
@@ -465,6 +508,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             Some(slot) => (slot, self.entries[slot].unwrap().id),
             None => (self.vacancy().ok_or(Error::Capacity)?, self.id()),
         };
+        self.remapped();
         self.entries[slot] = Some(Entry {
             id,
             link,
@@ -495,6 +539,24 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     pub fn entry(&self, link: L, address: Ipv4Addr) -> Option<(ArpState, Option<[u8; 6]>)> {
         let e = self.entries[self.find(link, address)?]?;
         Some((e.state, e.mac))
+    }
+
+    /// The mapping `resolve` would return at `now` for `address` on `link`,
+    /// and until when it returns it without changing the entry; None while
+    /// it is unresolved.
+    pub fn mapping(&self, link: L, address: Ipv4Addr, now: u64) -> Option<Mapping> {
+        let e = self.entries[self.find(link, address)?]?;
+        let until = match e.state {
+            ArpState::Incomplete => return None,
+            ArpState::Stale => now,
+            ArpState::Permanent => u64::MAX,
+            ArpState::Reachable | ArpState::Delay | ArpState::Probe => e.deadline,
+        };
+        Some(Mapping {
+            mac: e.mac?,
+            state: e.state,
+            until,
+        })
     }
 
     fn find(&self, link: L, address: Ipv4Addr) -> Option<usize> {
@@ -529,7 +591,11 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
 
     // The entry is removed and its held output fails.
     fn fail(&mut self, slot: usize) {
-        let id = self.entries[slot].unwrap().id;
+        let e = self.entries[slot].unwrap();
+        if e.mac.is_some() {
+            self.remapped();
+        }
+        let id = e.id;
         self.entries[slot] = None;
         for &held in &self.holding {
             if let Some(p) = &mut self.pending[held]
@@ -661,17 +727,20 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 self.source(link).ok_or(Error::NoSource)?;
                 let slot = self.vacancy().ok_or(Error::Capacity)?;
                 let id = self.id();
-                self.entries[slot] = Some(Entry {
-                    id,
-                    link,
-                    address,
-                    state: ArpState::Incomplete,
-                    mac: None,
-                    mapped_at: now,
-                    used_at: now,
-                    deadline: now,
-                    sent: 0,
-                });
+                self.occupy(
+                    slot,
+                    Entry {
+                        id,
+                        link,
+                        address,
+                        state: ArpState::Incomplete,
+                        mac: None,
+                        mapped_at: now,
+                        used_at: now,
+                        deadline: now,
+                        sent: 0,
+                    },
+                );
                 id
             }
         };
@@ -700,12 +769,8 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             let Some(p) = self.pending[slot].filter(|p| filter(&p.tag)) else {
                 continue;
             };
-            let entry = self.entries.iter().flatten().find(|e| e.id == p.entry);
-            let wake = match entry {
-                _ if p.failed => Wake::Unreachable(p.tag),
-                None => Wake::Unreachable(p.tag),
-                Some(e) if e.state != ArpState::Incomplete => Wake::Retry(p.tag),
-                Some(_) => continue,
+            let Some(wake) = self.ended_wake(p) else {
+                continue;
             };
             self.unhold(slot);
             return Some(wake);
@@ -713,15 +778,43 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
         None
     }
 
+    /// Visit the tag of every held attempt whose resolution ended, in the
+    /// order `next_wake` yields them, without removing any: an embedding
+    /// whose owners take their wakes elsewhere learns whom to notify.
+    pub fn ended(&self, mut visit: impl FnMut(&T)) {
+        for &slot in &self.holding {
+            let p = self.pending[slot].unwrap();
+            if self.ended_wake(p).is_some() {
+                visit(&p.tag);
+            }
+        }
+    }
+
+    fn ended_wake(&self, p: Pending<T>) -> Option<Wake<T>> {
+        let entry = self.entries.iter().flatten().find(|e| e.id == p.entry);
+        match entry {
+            _ if p.failed => Some(Wake::Unreachable(p.tag)),
+            None => Some(Wake::Unreachable(p.tag)),
+            Some(e) if e.state != ArpState::Incomplete => Some(Wake::Retry(p.tag)),
+            Some(_) => None,
+        }
+    }
+
     /// Forget every held record of `tag` (its owner gave the attempt up).
     pub fn release(&mut self, tag: T) -> bool {
-        let mut found = false;
+        self.release_matching(|held| *held == tag) != 0
+    }
+
+    /// Forget every held record whose tag `filter` accepts (their owner
+    /// went away), returning how many.
+    pub fn release_matching(&mut self, filter: impl Fn(&T) -> bool) -> usize {
+        let mut found = 0;
         let mut k = 0;
         while k < self.holding.len() {
             let slot = self.holding[k];
-            if self.pending[slot].is_some_and(|p| p.tag == tag) {
+            if self.pending[slot].is_some_and(|p| filter(&p.tag)) {
                 self.unhold(slot);
-                found = true;
+                found += 1;
             } else {
                 k += 1;
             }
@@ -816,6 +909,9 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             if e.state != ArpState::Permanent {
                 let changed = e.mac != Some(arp.sender_mac);
                 if changed {
+                    if e.mac.is_some() {
+                        self.remapped();
+                    }
                     e.mac = Some(arp.sender_mac);
                     e.mapped_at = now;
                 }
@@ -847,17 +943,20 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             && let Some(slot) = self.vacancy()
         {
             let id = self.id();
-            self.entries[slot] = Some(Entry {
-                id,
-                link,
-                address: sender,
-                state: ArpState::Stale,
-                mac: Some(arp.sender_mac),
-                mapped_at: now,
-                used_at: now,
-                deadline: now,
-                sent: 0,
-            });
+            self.occupy(
+                slot,
+                Entry {
+                    id,
+                    link,
+                    address: sender,
+                    state: ArpState::Stale,
+                    mac: Some(arp.sender_mac),
+                    mapped_at: now,
+                    used_at: now,
+                    deadline: now,
+                    sent: 0,
+                },
+            );
         }
         let claim = match kind {
             AddressKind::Local => interface.mac,

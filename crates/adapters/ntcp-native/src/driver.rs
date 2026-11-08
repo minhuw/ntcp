@@ -87,6 +87,9 @@ impl<P: PacketIo> Network<P> {
         completed: &mut [u8],
         report: &mut DriveReport,
     ) -> Result<()> {
+        if let Some(member) = super::shared::member(&mut self.host) {
+            member.begin();
+        }
         self.maintain_connections()?;
         report.more_work |= self.endpoint.on_timeout(now, budget.timers)?;
         let changes = self.host.service_changes(&mut self.endpoint, now)?;
@@ -188,7 +191,10 @@ impl<P: PacketIo> Network<P> {
         // Control frames due now take at most half the transmit budget,
         // rounded up, before data, so data cannot starve them nor they data.
         let mut control = 0;
-        if !self.control.is_empty() {
+        if self.shared_neighbors {
+            control = self.shared_output(now, budget.transmit.div_ceil(2), true, report)?;
+            self.settle_member(now)?;
+        } else if !self.control.is_empty() {
             self.service_neighbors(now)?;
             control = self.control_output(now, budget.transmit.div_ceil(2), report)?;
         }
@@ -233,7 +239,9 @@ impl<P: PacketIo> Network<P> {
         }
         // Requests for next hops data output just began resolving, within
         // what is left.
-        if !self.control.is_empty() {
+        if self.shared_neighbors {
+            self.shared_output(now, budget.transmit - control - data, false, report)?;
+        } else if !self.control.is_empty() {
             self.control_output(now, budget.transmit - control - data, report)?;
         }
         if budget.reclaim != 0 {
@@ -320,6 +328,74 @@ impl<P: PacketIo> Network<P> {
         }
         self.arp_input = false;
         self.release_resolved()
+    }
+    // A member's share of its port's housekeeping: when the shared table has
+    // work due and no other member holds it, the port's timers (`timers`)
+    // and up to `limit` due ARP frames, sent on this queue through the
+    // control slot as `control_output` sends them; returns how many were
+    // tried. A member that finds the table held skips it: the holder is
+    // doing the work, or the next drive of any member will.
+    fn shared_output(
+        &mut self,
+        now: Instant,
+        limit: usize,
+        timers: bool,
+        report: &mut DriveReport,
+    ) -> Result<usize> {
+        let Self {
+            host,
+            io,
+            control,
+            counters,
+            ..
+        } = self;
+        let Some(member) = super::shared::member(host) else {
+            return Ok(0);
+        };
+        let (mut sent, mut blocked, mut failure) = (0, false, None);
+        let used = member.housekeep(now, limit, timers, |frame| {
+            use ntcp_arp::ControlOutcome;
+            if frame.encode(control).is_err() {
+                return ControlOutcome::Failed;
+            }
+            match io.transmit(control) {
+                Ok(TxOutcome::Submitted) => {
+                    sent += 1;
+                    ControlOutcome::Submitted
+                }
+                Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
+                    blocked = true;
+                    ControlOutcome::Blocked
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    ControlOutcome::Uncertain
+                }
+            }
+        });
+        report.transmitted += sent;
+        counters.arp_sent += sent as u64;
+        if blocked {
+            report.tx_blocked = true;
+            counters.backend_backpressure += 1;
+        }
+        if let Some(error) = failure {
+            return Err(Error::Backend(error));
+        }
+        Ok(used.unwrap_or(0))
+    }
+    // A member's wakes: the neighbors the port lost are reported to its
+    // Host, and its held frames whose resolution ended are released.
+    fn settle_member(&mut self, now: Instant) -> Result<()> {
+        if !super::shared::member(&mut self.host).is_some_and(|m| m.woken()) {
+            return Ok(());
+        }
+        self.host.service_neighbors(now);
+        self.release_resolved()?;
+        if let Some(member) = super::shared::member(&mut self.host) {
+            member.settled();
+        }
+        Ok(())
     }
     // Up to `limit` due ARP control frames (replies, requests, probes)
     // through their own slot; returns how many were tried.
