@@ -1,3 +1,6 @@
 /target
+# nix build output links
+/result
+/result-*
 /workbench/
 __pycache__/
