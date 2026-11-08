@@ -1,5 +1,12 @@
 #![cfg(target_os = "linux")]
 
+#[cfg(feature = "host")]
+mod host;
+#[cfg(feature = "host")]
+pub use host::{Address, HostedQueue, Port, PortConfig, QueueHandle, Rule, XdpMode};
+#[cfg(feature = "host")]
+mod ethtool;
+
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use std::{
     io,

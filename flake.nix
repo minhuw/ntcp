@@ -78,8 +78,11 @@
           '';
 
       # nixpkgs' C toolchain compiles the shim and links Rust binaries, so DPDK, rdma-core and
-      # every binary built here share nix's glibc.
+      # every binary built here share nix's glibc. ntcp-io-af-xdp's host feature compiles its
+      # XDP program with clang-unwrapped: cc-wrapper's host-target flags do not apply to BPF.
       devShells.${system}.default = pkgs.mkShell {
+        NTCP_BPF_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+        NTCP_BPF_CFLAGS = "-isystem ${pkgs.linuxHeaders}/include";
         packages = [
           pkgs.pkg-config
           pkgs.rustc
@@ -90,6 +93,7 @@
         buildInputs = [
           dpdk-mlx5
           pkgs.rdma-core
+          pkgs.libbpf
         ]
         ++ dpdkStaticDeps;
       };

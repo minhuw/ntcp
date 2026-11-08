@@ -7,6 +7,22 @@ license = "MIT"
 repository = "https://github.com/minhuw/ntcp"
 description = "Copy-mode AF_XDP packet I/O adapter"
 
+[features]
+default = []
+# The AF_XDP host: an XDP program that hands ntcp's addresses to AF_XDP
+# sockets, ntuple steering and hosted queues. Needs libbpf and a BPF clang.
+host = ["dep:pkg-config"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 ntcp-io = { version = "0.0.1", path = "../ntcp-io" }
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ntcp-native = { path = "../../adapters/ntcp-native", version = "0.0.1" }
+
+[build-dependencies]
+pkg-config = { version = "0.3", optional = true }
+
+[[example]]
+name = "xdp_echo"
+required-features = ["host"]
