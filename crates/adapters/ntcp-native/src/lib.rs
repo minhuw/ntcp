@@ -809,11 +809,20 @@ impl<P: PacketIo> Network<P> {
     }
     pub fn connection_info(&self, id: ConnId) -> Result<ConnectionInfo> {
         let c = self.conn(id)?;
+        // The endpoint's own state, not the one events were derived from: a
+        // FIN sent or acknowledged, or TIME-WAIT ending, raises no event. A
+        // released connection, or one of a stopped network, keeps its last.
+        let (state, reason) = match self.endpoint.state(c.core) {
+            Ok(state) if !c.released && !self.stopped => {
+                (state, self.endpoint.close_reason(c.core).ok().flatten())
+            }
+            _ => (c.state, c.reason),
+        };
         Ok(ConnectionInfo {
             local: c.local,
             peer: c.peer,
-            state: c.state,
-            reason: c.reason,
+            state,
+            reason,
             application_closed: c.close_requested || c.abort_requested,
             network_stopped: self.stopped,
         })

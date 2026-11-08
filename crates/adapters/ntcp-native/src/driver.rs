@@ -913,7 +913,9 @@ impl<P: PacketIo> Network<P> {
                     Err(e) => return Err(e.into()),
                 }
             }
-            self.refresh_connection(index);
+            // Release reads the state its Closed event was derived from:
+            // every change to Closed or TIME-WAIT raises an event, whose
+            // collection (and every drain) refreshes the connection.
             let c = self.connections[index].value.as_mut().unwrap();
             if (close || abort)
                 && matches!(c.state, State::Closed | State::TimeWait)

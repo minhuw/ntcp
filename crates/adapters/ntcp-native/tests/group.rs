@@ -873,3 +873,55 @@ fn one_drive_reaches_data_queued_behind_idle_connections() {
     let report = pair.a.drive(pair.now + 1, BUDGET).unwrap();
     assert_eq!(report.transmitted, 1, "{report:?}");
 }
+
+// Sending a FIN and having it acknowledged change a connection's state
+// without an event: its information is the endpoint's state, current
+// without draining events. The Closed event still arrives, and the handle
+// is released only after the application drained it.
+#[test]
+fn connection_info_is_current_without_events_and_close_still_completes() {
+    let mut pair = Pair::new(false, false);
+    drain(&mut pair.a);
+    drain(&mut pair.b);
+    pair.a.close(pair.client).unwrap();
+    pair.now += 10_000;
+    pair.a.drive(pair.now, BUDGET).unwrap();
+    let state = |pair: &Pair| pair.a.connection_info(pair.client).unwrap().state;
+    assert_eq!(state(&pair), State::FinWait1);
+    // The peer acknowledges the FIN; the next drive of `a` takes the ACK.
+    pair.step();
+    pair.step();
+    assert_eq!(state(&pair), State::FinWait2);
+    assert!(matches!(
+        pair.b.try_read(pair.server, &mut [0; 8]),
+        Ok(ReadOutcome::Eof)
+    ));
+    pair.b.close(pair.server).unwrap();
+    pair.step();
+    pair.step();
+    assert_eq!(state(&pair), State::TimeWait);
+    // Not released while its Closed event is undelivered.
+    for _ in 0..3 {
+        pair.step();
+        assert!(pair.a.connection_info(pair.client).is_ok());
+    }
+    let events = drain(&mut pair.a);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Closed { connection, .. } if *connection == pair.client)),
+        "{events:?}"
+    );
+    pair.now += pair.a.config().tcp.connection.time_wait_us;
+    for _ in 0..10 {
+        pair.step();
+        drain(&mut pair.a);
+        if pair.a.connection_info(pair.client).is_err() {
+            break;
+        }
+    }
+    assert!(matches!(
+        pair.a.connection_info(pair.client),
+        Err(Error::InvalidHandle)
+    ));
+}
