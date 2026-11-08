@@ -18,6 +18,10 @@ test-pmd = ["native"]
 [dependencies]
 ntcp-io = { version = "0.0.1", path = "../ntcp-io" }
 
+[dev-dependencies]
+libc = "0.2"
+ntcp-native = { path = "../../adapters/ntcp-native", version = "0.0.1" }
+
 [build-dependencies]
 cc = { version = "1", optional = true }
 pkg-config = { version = "0.3", optional = true }
@@ -30,3 +34,7 @@ required-features = ["test-pmd"]
 [[test]]
 name = "host_pmd"
 required-features = ["test-pmd"]
+
+[[example]]
+name = "dpdk_echo"
+required-features = ["native"]
