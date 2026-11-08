@@ -234,6 +234,9 @@ pub struct ArpCache<L, T> {
     addresses: Vec<Option<Address<L>>>,
     replies: Vec<Option<Reply<L>>>,
     pending: Vec<Option<Pending<T>>>,
+    // Slots of `pending` holding a record, ascending: what the wake and
+    // release passes, run while output is held, visit (`check_holding`).
+    holding: Vec<usize>,
 }
 
 fn table<V: Clone>(count: usize, value: V) -> Result<Vec<V>, Error> {
@@ -287,6 +290,13 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             addresses: table(limits.addresses, None)?,
             replies: table(limits.replies, None)?,
             pending: table(limits.held, None)?,
+            holding: {
+                let mut slots = Vec::new();
+                slots
+                    .try_reserve_exact(limits.held)
+                    .map_err(|_| Error::Allocation)?;
+                slots
+            },
         })
     }
     pub fn units_per_second(&self) -> u64 {
@@ -503,7 +513,11 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
         if let Some(slot) = self.entries.iter().position(Option::is_none) {
             return Some(slot);
         }
-        let held = |id| self.pending.iter().flatten().any(|p| p.entry == id);
+        let held = |id| {
+            self.holding
+                .iter()
+                .any(|&s| self.pending[s].is_some_and(|p| p.entry == id))
+        };
         self.entries
             .iter()
             .enumerate()
@@ -517,11 +531,36 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     fn fail(&mut self, slot: usize) {
         let id = self.entries[slot].unwrap().id;
         self.entries[slot] = None;
-        for p in self.pending.iter_mut().flatten() {
-            if p.entry == id {
+        for &held in &self.holding {
+            if let Some(p) = &mut self.pending[held]
+                && p.entry == id
+            {
                 p.failed = true;
             }
         }
+    }
+
+    fn hold(&mut self, slot: usize, record: Pending<T>) {
+        self.pending[slot] = Some(record);
+        let at = self.holding.partition_point(|&s| s < slot);
+        debug_assert!(self.holding.len() < self.holding.capacity());
+        self.holding.insert(at, slot);
+        self.check_holding();
+    }
+    fn unhold(&mut self, slot: usize) {
+        self.pending[slot] = None;
+        let at = self.holding.partition_point(|&s| s < slot);
+        self.holding.remove(at);
+        self.check_holding();
+    }
+    // The full scan `holding` replaces, for debug builds.
+    fn check_holding(&self) {
+        debug_assert!(
+            self.holding
+                .iter()
+                .copied()
+                .eq((0..self.pending.len()).filter(|&s| self.pending[s].is_some()))
+        );
     }
 
     // Reachability is confirmed on `link`: a fresh ReachableTime is drawn
@@ -605,10 +644,9 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             }
         }
         if self
-            .pending
+            .holding
             .iter()
-            .flatten()
-            .any(|p| p.tag == tag && !p.failed)
+            .any(|&s| self.pending[s].is_some_and(|p| p.tag == tag && !p.failed))
         {
             return Ok(Resolution::Held);
         }
@@ -637,11 +675,14 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 id
             }
         };
-        self.pending[held] = Some(Pending {
-            entry,
-            failed: false,
-            tag,
-        });
+        self.hold(
+            held,
+            Pending {
+                entry,
+                failed: false,
+                tag,
+            },
+        );
         Ok(Resolution::Held)
     }
 
@@ -654,7 +695,8 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     //# the same unresolved IP address, and transmit the saved
     //# packet when the address has been resolved.
     pub fn next_wake(&mut self, filter: impl Fn(&T) -> bool) -> Option<Wake<T>> {
-        for slot in 0..self.pending.len() {
+        for k in 0..self.holding.len() {
+            let slot = self.holding[k];
             let Some(p) = self.pending[slot].filter(|p| filter(&p.tag)) else {
                 continue;
             };
@@ -665,7 +707,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 Some(e) if e.state != ArpState::Incomplete => Wake::Retry(p.tag),
                 Some(_) => continue,
             };
-            self.pending[slot] = None;
+            self.unhold(slot);
             return Some(wake);
         }
         None
@@ -674,10 +716,14 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     /// Forget every held record of `tag` (its owner gave the attempt up).
     pub fn release(&mut self, tag: T) -> bool {
         let mut found = false;
-        for p in &mut self.pending {
-            if p.is_some_and(|p| p.tag == tag) {
-                *p = None;
+        let mut k = 0;
+        while k < self.holding.len() {
+            let slot = self.holding[k];
+            if self.pending[slot].is_some_and(|p| p.tag == tag) {
+                self.unhold(slot);
                 found = true;
+            } else {
+                k += 1;
             }
         }
         found

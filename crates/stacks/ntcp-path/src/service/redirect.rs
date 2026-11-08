@@ -64,7 +64,11 @@ impl PathService {
         dscp: Dscp,
     ) -> Option<Redirect> {
         let mut found = None;
-        for r in self.redirects.iter().flatten() {
+        for r in self
+            .installed
+            .iter()
+            .filter_map(|&slot| self.redirects[slot].as_ref())
+        {
             if r.route != route || r.destination != destination {
                 continue;
             }
@@ -75,6 +79,26 @@ impl PathService {
             }
         }
         found
+    }
+
+    // Every change of a slot of `redirects` goes through here, keeping
+    // `installed` its occupied slots; debug builds check it by a full scan.
+    fn set_redirect(&mut self, slot: usize, redirect: Option<Redirect>) {
+        let at = self.installed.partition_point(|&s| s < slot);
+        match (self.installed.get(at) == Some(&slot), redirect.is_some()) {
+            (false, true) => self.installed.insert(at, slot),
+            (true, false) => {
+                self.installed.remove(at);
+            }
+            _ => {}
+        }
+        self.redirects[slot] = redirect;
+        debug_assert!(
+            self.installed
+                .iter()
+                .copied()
+                .eq((0..self.redirects.len()).filter(|&s| self.redirects[s].is_some()))
+        );
     }
 
     /// Install a Redirect for the forwarding destination of `key` received
@@ -178,15 +202,18 @@ impl PathService {
                 continue;
             };
             let generation = self.next_generation()?;
-            self.redirects[i] = Some(Redirect {
-                route: key.route,
-                link: key.link,
-                destination,
-                dscp,
-                sender,
-                target,
-                generation,
-            });
+            self.set_redirect(
+                i,
+                Some(Redirect {
+                    route: key.route,
+                    link: key.link,
+                    destination,
+                    dscp,
+                    sender,
+                    target,
+                    generation,
+                }),
+            );
             self.generation = generation;
         }
         self.commit_revision(revision);
@@ -219,9 +246,9 @@ impl PathService {
             return Ok(0);
         }
         let revision = self.next_revision()?;
-        for slot in &mut self.redirects {
-            if slot.is_some_and(|r| affected(&r)) {
-                *slot = None;
+        for slot in 0..self.redirects.len() {
+            if self.redirects[slot].is_some_and(|r| affected(&r)) {
+                self.set_redirect(slot, None);
             }
         }
         self.commit_revision(revision);
@@ -258,7 +285,7 @@ impl PathService {
             if !self.route(r.route).is_ok_and(|route| route.link == r.link)
                 || self.link(r.link).is_err()
             {
-                self.redirects[slot] = None;
+                self.set_redirect(slot, None);
             }
         }
     }

@@ -420,11 +420,11 @@ pub struct Endpoint {
     // Reservation bookkeeping, kept in step with every change of a slot's
     // `current` or its `attempt` (`check_reservation_index`): the slot held
     // by each connection slot index and by the stateless lane, the number of
-    // free slots, and the number of held slots without a current attempt.
+    // free slots, and the held slots without a current attempt.
     reservation_owners: Vec<Option<usize>>,
     stateless_reservation: Option<usize>,
     free_reservations: usize,
-    unattempted_reservations: usize,
+    unattempted_reservations: ReadyQueue,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
@@ -435,6 +435,8 @@ pub struct Endpoint {
     isn_clock: u32,
     last_isn_time: Instant,
     slots: Vec<Option<Slot>>,
+    // The occupied `slots`, for counts over live connections.
+    occupied: ReadyQueue,
     generations: Vec<u64>,
     free: Vec<usize>,
     listeners: Vec<Option<Listener>>,
@@ -604,10 +606,11 @@ impl Endpoint {
             reservation_owners: Vec::new(),
             stateless_reservation: None,
             free_reservations: 0,
-            unattempted_reservations: 0,
+            unattempted_reservations: ReadyQueue::new(0).map_err(|_| Error::NoMemory)?,
             address_policy: Box::new(address_policy),
             passive_errors,
             tuples: TupleTable::new(count)?,
+            occupied: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             output: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             advice: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             events: ReadyQueue::new(event_capacity).map_err(|_| Error::NoMemory)?,
@@ -972,16 +975,19 @@ impl Endpoint {
             .fast_open_cookie_policy
             .as_ref()
             .unwrap_or(&self.fast_open_cookie_policy);
+        let early = |slot: &&Slot| {
+            slot.fast_open_owner == Some(listener)
+                && !slot.connection.handshake_complete()
+                && slot.connection.state() != State::Closed
+        };
         let pending = self
-            .slots
+            .occupied
             .iter()
-            .flatten()
-            .filter(|slot| {
-                slot.fast_open_owner == Some(listener)
-                    && !slot.connection.handshake_complete()
-                    && slot.connection.state() != State::Closed
-            })
+            .filter_map(|index| self.slots[index].as_ref())
+            .filter(early)
             .count();
+        // The full scan `occupied` replaces, for debug builds.
+        debug_assert_eq!(pending, self.slots.iter().flatten().filter(early).count());
         let valid = !protected
             && syn.options.fast_open.is_some_and(|cookie| {
                 policy.valid_in(
@@ -1602,6 +1608,7 @@ impl Endpoint {
             self.output.remove(old.slot);
         }
         self.free.pop();
+        self.occupied.push(index);
         let fast_open_owner = if connection.fast_open_early {
             listener
         } else {
@@ -2646,6 +2653,7 @@ impl Endpoint {
     fn reclaim(&mut self, index: usize) {
         let id = self.id(index);
         let slot = self.slots[index].take().unwrap();
+        self.occupied.remove(index);
         let tuple = slot.connection.scoped_tuple();
         if slot.mapped {
             self.tuples.remove(self.hash(tuple), tuple, index);
@@ -4505,20 +4513,12 @@ impl Endpoint {
 
     pub fn next_deadline(&self) -> Option<Instant> {
         // Only a held slot without a current attempt can wait for pacing.
-        let waiting: &[_] = if self.unattempted_reservations == 0 {
-            &[]
-        } else {
-            &self.reservations
-        };
         self.deadlines
             .first()
             .map(|(time, _)| time)
             .into_iter()
-            .chain(waiting.iter().filter_map(|slot| {
-                let r = slot.current.as_ref()?;
-                if r.attempt.is_some() {
-                    return None;
-                }
+            .chain(self.unattempted_reservations.iter().filter_map(|index| {
+                let r = self.reservations[index].current.as_ref()?;
                 self.retained_slot(r.packet.connection?)
                     .ok()?
                     .connection
@@ -4719,6 +4719,7 @@ impl Endpoint {
         }
         let mut owners = reserved_vec(self.slots.len())?;
         owners.resize(self.slots.len(), None);
+        let unattempted = ReadyQueue::new(count).map_err(|_| Error::NoMemory)?;
         let mut slots = reserved_vec(count)?;
         for index in 0..count {
             let mut slot = crate::output_reservation::OutputReservation::new();
@@ -4734,7 +4735,7 @@ impl Endpoint {
         self.reservation_owners = owners;
         self.stateless_reservation = None;
         self.free_reservations = count;
-        self.unattempted_reservations = 0;
+        self.unattempted_reservations = unattempted;
         self.buffer_bytes += charge;
         Ok(())
     }
@@ -4799,10 +4800,10 @@ impl Endpoint {
 
     fn clear_reservation(&mut self, index: usize) {
         if let Some(r) = &self.reservations[index].current {
-            let (owner, unattempted) = (r.packet.connection, r.attempt.is_none());
+            let owner = r.packet.connection;
             *self.reservation_owner_mut(owner) = None;
             self.free_reservations += 1;
-            self.unattempted_reservations -= usize::from(unattempted);
+            self.unattempted_reservations.remove(index);
         }
         self.reservations[index].clear();
         self.check_reservation_index();
@@ -4811,8 +4812,8 @@ impl Endpoint {
     fn set_reservation_attempt(&mut self, index: usize, attempt: Option<crate::TransmitAttempt>) {
         let r = self.reservations[index].current.as_mut().unwrap();
         match (r.attempt.is_some(), attempt.is_some()) {
-            (true, false) => self.unattempted_reservations += 1,
-            (false, true) => self.unattempted_reservations -= 1,
+            (true, false) => self.unattempted_reservations.push(index),
+            (false, true) => self.unattempted_reservations.remove(index),
             _ => {}
         }
         r.attempt = attempt;
@@ -4827,8 +4828,16 @@ impl Endpoint {
                 self.free_reservations,
                 self.reservations.len() - held.clone().count()
             );
+            // A queue holds each slot at most once: the same set.
+            let unattempted = |index: usize| {
+                self.reservations[index]
+                    .current
+                    .as_ref()
+                    .is_some_and(|r| r.attempt.is_none())
+            };
+            assert!(self.unattempted_reservations.iter().all(unattempted));
             assert_eq!(
-                self.unattempted_reservations,
+                self.unattempted_reservations.iter().count(),
                 held.clone().filter(|r| r.attempt.is_none()).count()
             );
             for (index, slot) in self.reservations.iter().enumerate() {
@@ -4903,7 +4912,7 @@ impl Endpoint {
             return Err(Error::InvalidArgument.into());
         }
         let free = self.free_reservations != 0;
-        if !free && self.unattempted_reservations == 0 {
+        if !free && self.unattempted_reservations.is_empty() {
             return Err(EndpointError::OutputReserved);
         }
         self.clock(now)?;

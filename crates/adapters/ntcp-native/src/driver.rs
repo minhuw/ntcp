@@ -217,6 +217,11 @@ impl<P: PacketIo> Network<P> {
             let still_pending = slot.pending.is_some();
             let still_held = slot.pending.as_ref().is_some_and(|p| p.held);
             self.tx[index] = slot;
+            match (was_pending, still_pending) {
+                (false, true) => occupy(&mut self.tx_frames, index),
+                (true, false) => vacate(&mut self.tx_frames, index),
+                _ => {}
+            }
             // Only frames to retry count as pending.
             self.tx_pending += usize::from(still_pending && !still_held);
             self.tx_pending -= usize::from(was_pending && !was_held);
@@ -251,6 +256,7 @@ impl<P: PacketIo> Network<P> {
         {
             report.next_deadline = Some(report.next_deadline.map_or(at, |d| d.min(at)));
         }
+        self.check_live();
         debug_assert_eq!(
             self.tx_pending,
             self.tx
@@ -410,8 +416,9 @@ impl<P: PacketIo> Network<P> {
                 } => (attempt, Some(advice)),
             };
             // A frame given up meanwhile (its connection aborted) is gone.
-            let Some(index) = self.tx.iter().position(|s| {
-                s.pending
+            let Some(index) = self.tx_frames.iter().copied().find(|&i| {
+                self.tx[i]
+                    .pending
                     .as_ref()
                     .is_some_and(|p| p.held && p.attempt == attempt)
             }) else {
@@ -426,6 +433,7 @@ impl<P: PacketIo> Network<P> {
                 }
                 Some(advice) => {
                     slot.pending = None;
+                    vacate(&mut self.tx_frames, index);
                     let error = match advice {
                         Advice::NetworkError(error) => Some(error),
                         Advice::PacketTooBig { .. } => None,
@@ -761,40 +769,46 @@ impl<P: PacketIo> Network<P> {
         Ok(false)
     }
     fn maintain_connections(&mut self) -> Result<()> {
-        for index in 0..self.listeners.len() {
-            let Some(listener) = &self.listeners[index].value else {
-                continue;
-            };
+        let mut next = 0;
+        while let Some(index) = next_live(&self.live_listeners, next) {
+            next = index + 1;
+            let listener = self.listeners[index].value.as_ref().unwrap();
             if listener.closing {
                 let core = listener.core;
                 match self.endpoint.close_listener(core) {
                     Ok(()) => {
                         self.listener_map.remove(&core);
                         self.listeners[index].value = None;
+                        vacate(&mut self.live_listeners, index);
                     }
                     Err(EndpointError::OutputReserved) => {}
                     Err(e) => return Err(e.into()),
                 }
             }
         }
-        for index in 0..self.connections.len() {
-            let Some(c) = &self.connections[index].value else {
-                continue;
-            };
+        let mut next = 0;
+        while let Some(index) = next_live(&self.live_connections, next) {
+            next = index + 1;
+            let c = self.connections[index].value.as_ref().unwrap();
             let (core, abort, close, released) =
                 (c.core, c.abort_requested, c.close_requested, c.released);
             if released {
                 if !self.endpoint.connection_exists(core) {
                     self.connection_map.remove(&core);
                     self.connections[index].value = None;
+                    vacate(&mut self.live_connections, index);
                 }
                 continue;
             }
             if abort {
                 if self.tx_pending != 0 || self.tx_held != 0 {
-                    for slot in &mut self.tx {
+                    let mut next = 0;
+                    while let Some(frame) = next_live(&self.tx_frames, next) {
+                        next = frame + 1;
+                        let slot = &mut self.tx[frame];
                         if slot.pending.as_ref().is_some_and(|p| p.owner == Some(core)) {
                             let pending = slot.pending.take().unwrap();
+                            vacate(&mut self.tx_frames, frame);
                             if pending.held {
                                 self.tx_held -= 1;
                             } else {

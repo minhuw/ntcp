@@ -480,6 +480,9 @@ pub struct PathService {
     // Redirect overrides, one slot per cached path: the population of
     // destinations whose first hop a Redirect can change.
     redirects: Vec<Option<redirect::Redirect>>,
+    // Slots of `redirects` holding an override, ascending: what every
+    // selection consults (`set_redirect`).
+    installed: Vec<usize>,
     // A shared nonwrapping generation domain prevents reuse after deletion.
     generation: u64,
     revision: u64,
@@ -502,6 +505,7 @@ impl PathService {
             (limits.routes, size_of::<RouteAdmin>()),
             (limits.routes, size_of::<Box<[Ipv6Addr]>>()),
             (limits.paths, size_of::<Option<redirect::Redirect>>()),
+            (limits.paths, size_of::<usize>()),
         ] {
             bytes = bytes
                 .checked_add(count.checked_mul(size).ok_or(Error::Capacity)?)
@@ -540,6 +544,13 @@ impl PathService {
                     .map_err(|_| Error::Allocation)?;
                 records.resize(limits.paths, None);
                 records
+            },
+            installed: {
+                let mut slots = Vec::new();
+                slots
+                    .try_reserve_exact(limits.paths)
+                    .map_err(|_| Error::Allocation)?;
+                slots
             },
             generation: 0,
             revision: 0,

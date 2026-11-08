@@ -61,6 +61,11 @@ pub struct Network<P: PacketIo> {
     connection_map: HashMap<ntcp::ConnectionId, usize>,
     listeners: Vec<Slot<Listener>>,
     listener_map: HashMap<ntcp::ListenerId, usize>,
+    // Occupied slots of `connections` and `listeners`, ascending. The passes
+    // of every drive and event drain visit these, not every configured slot:
+    // a free slot holds no state, event or work.
+    live_connections: Vec<usize>,
+    live_listeners: Vec<usize>,
     events: VecDeque<Event>,
     event_capacity: usize,
     event_cursor: usize,
@@ -72,6 +77,8 @@ pub struct Network<P: PacketIo> {
     tx_pending: usize,
     // Slots in `tx` holding a frame whose next hop ARP is resolving.
     tx_held: usize,
+    // Slots in `tx` holding a frame, held or not, ascending.
+    tx_frames: Vec<usize>,
     // An ARP packet was taken in since held output was last released: a
     // resolution may have ended.
     arp_input: bool,
@@ -98,6 +105,33 @@ fn table<T>(capacity: usize) -> Result<Vec<Slot<T>>> {
         value: None,
     });
     Ok(result)
+}
+// An empty sorted set of slot indices (`live_connections` and the like)
+// with room for every slot, so that `occupy` never allocates.
+fn indices(capacity: usize) -> Result<Vec<usize>> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::Capacity)?;
+    Ok(result)
+}
+fn occupy(live: &mut Vec<usize>, slot: usize) {
+    let at = live.partition_point(|&s| s < slot);
+    debug_assert!(live.get(at) != Some(&slot) && live.len() < live.capacity());
+    live.insert(at, slot);
+}
+fn vacate(live: &mut Vec<usize>, slot: usize) {
+    let at = live.partition_point(|&s| s < slot);
+    debug_assert_eq!(live.get(at), Some(&slot));
+    live.remove(at);
+}
+// The first occupied slot at or after `from`. A pass that steps with it
+// visits what a pass over every slot in order would find occupied.
+fn next_live(live: &[usize], from: usize) -> Option<usize> {
+    live.get(live.partition_point(|&s| s < from)).copied()
+}
+fn occupied<T>(slots: &[Slot<T>]) -> impl Iterator<Item = usize> + '_ {
+    (0..slots.len()).filter(|&i| slots[i].value.is_some())
 }
 fn bytes(capacity: usize) -> Result<Vec<u8>> {
     let mut result = Vec::new();
@@ -298,6 +332,9 @@ impl<P: PacketIo> Network<P> {
             .map_err(|_| Error::Capacity)?;
         let connections = table(config.tcp.max_connections)?;
         let listeners = table(config.tcp.max_listeners)?;
+        let live_connections = indices(config.tcp.max_connections)?;
+        let live_listeners = indices(config.tcp.max_listeners)?;
+        let tx_frames = indices(owners)?;
         let next_port = *config.ephemeral_ports.start();
         Ok(Self {
             config,
@@ -312,6 +349,8 @@ impl<P: PacketIo> Network<P> {
             connection_map,
             listeners,
             listener_map,
+            live_connections,
+            live_listeners,
             events,
             event_capacity,
             event_cursor: 0,
@@ -321,6 +360,7 @@ impl<P: PacketIo> Network<P> {
             tx,
             tx_pending: 0,
             tx_held: 0,
+            tx_frames,
             arp_input: false,
             tx_cursor: 0,
             control,
@@ -441,6 +481,27 @@ impl<P: PacketIo> Network<P> {
             Ok(())
         }
     }
+    // The full-scan form of the occupied-slot indexes, for debug builds.
+    fn check_live(&self) {
+        debug_assert!(
+            self.live_connections
+                .iter()
+                .copied()
+                .eq(occupied(&self.connections))
+        );
+        debug_assert!(
+            self.live_listeners
+                .iter()
+                .copied()
+                .eq(occupied(&self.listeners))
+        );
+        debug_assert!(
+            self.tx_frames
+                .iter()
+                .copied()
+                .eq((0..self.tx.len()).filter(|&i| self.tx[i].pending.is_some()))
+        );
+    }
     fn conn(&self, id: ConnId) -> Result<&Connection> {
         if id.instance != self.instance {
             return Err(Error::InvalidHandle);
@@ -505,7 +566,9 @@ impl<P: PacketIo> Network<P> {
             read_waiting: true,
             write_waiting: None,
         });
+        occupy(&mut self.live_connections, slot);
         self.connection_map.insert(core, slot);
+        self.check_live();
         Ok(self.conn_id(slot))
     }
     fn port_in_use(&self, port: u16) -> bool {
@@ -620,7 +683,9 @@ impl<P: PacketIo> Network<P> {
             closing: false,
             acceptable: false,
         });
+        occupy(&mut self.live_listeners, slot);
         self.listener_map.insert(core, slot);
+        self.check_live();
         Ok(ListenerId {
             instance: self.instance,
             slot,
@@ -1030,10 +1095,34 @@ impl<P: PacketIo> Network<P> {
             written += 1;
             self.stopped_event = false;
         }
-        let total = self.connections.len() + self.listeners.len();
+        self.check_live();
+        // Round robin over connection slots, then listener slots, from the
+        // cursor. Free slots have no events and are skipped; a pass that
+        // visits every occupied slot leaves the cursor where it began, as a
+        // pass over every slot does.
+        let connections = self.connections.len();
+        let total = connections + self.listeners.len();
+        let (live_connections, live) = (
+            self.live_connections.len(),
+            self.live_connections.len() + self.live_listeners.len(),
+        );
+        let start = self.event_cursor;
+        let first = if start < connections {
+            self.live_connections.partition_point(|&s| s < start)
+        } else {
+            live_connections
+                + self
+                    .live_listeners
+                    .partition_point(|&s| s < start - connections)
+        };
         let mut scanned = 0;
-        while written < out.len() && scanned < total {
-            let slot = self.event_cursor;
+        while written < out.len() && scanned < live {
+            let k = (first + scanned) % live;
+            let slot = if k < live_connections {
+                self.live_connections[k]
+            } else {
+                connections + self.live_listeners[k - live_connections]
+            };
             self.event_cursor = (slot + 1) % total;
             scanned += 1;
             let event = if slot < self.connections.len() {
@@ -1059,45 +1148,53 @@ impl<P: PacketIo> Network<P> {
                 written += 1;
             }
         }
+        if written < out.len() {
+            self.event_cursor = start;
+        }
         let more = !self.events.is_empty()
             || self.stopped_event
-            || self.connections.iter().any(|s| {
-                s.value.as_ref().is_some_and(|c| {
-                    c.connected_event
-                        || c.closed_event
-                        || c.readable_event
-                        || c.write_waiting.is_some_and(|request| {
-                            !self.stopped
-                                && usize::from(request.scheduled)
-                                    + usize::from(request.acknowledged)
-                                    <= self
-                                        .config
-                                        .tx_timestamp_phases
-                                        .saturating_sub(c.trace_count)
-                                && self
-                                    .endpoint
-                                    .check_write_admission(c.core, None, request)
-                                    .is_ok_and(|n| n != 0)
-                        })
-                })
+            || self.live_connections.iter().any(|&slot| {
+                let c = self.connections[slot].value.as_ref().unwrap();
+                c.connected_event
+                    || c.closed_event
+                    || c.readable_event
+                    || c.write_waiting.is_some_and(|request| {
+                        !self.stopped
+                            && usize::from(request.scheduled) + usize::from(request.acknowledged)
+                                <= self
+                                    .config
+                                    .tx_timestamp_phases
+                                    .saturating_sub(c.trace_count)
+                            && self
+                                .endpoint
+                                .check_write_admission(c.core, None, request)
+                                .is_ok_and(|n| n != 0)
+                    })
             })
-            || self
-                .listeners
-                .iter()
-                .any(|s| s.value.as_ref().is_some_and(|l| l.acceptable && !l.closing));
+            || self.live_listeners.iter().any(|&slot| {
+                let l = self.listeners[slot].value.as_ref().unwrap();
+                l.acceptable && !l.closing
+            });
         DrainReport { written, more }
     }
     fn stage_timestamp(&mut self) -> bool {
         if self.staged_timestamp.is_some() {
             return true;
         }
-        for _ in 0..self.connections.len() {
-            let slot = self.timestamp_cursor;
-            self.timestamp_cursor = (slot + 1) % self.connections.len();
-            if let Some(c) = &self.connections[slot].value
-                && !c.released
+        // Round robin over the occupied slots from the cursor; a pass that
+        // finds nothing leaves the cursor where it began, as a pass over
+        // every slot does.
+        let live = self.live_connections.len();
+        let first = self
+            .live_connections
+            .partition_point(|&s| s < self.timestamp_cursor);
+        for k in 0..live {
+            let slot = self.live_connections[(first + k) % live];
+            let c = self.connections[slot].value.as_ref().unwrap();
+            if !c.released
                 && let Ok(Some(observation)) = self.endpoint.next_tx_timestamp(c.core)
             {
+                self.timestamp_cursor = (slot + 1) % self.connections.len();
                 self.staged_timestamp = Some(TimestampEvent {
                     connection: self.conn_id(slot),
                     observation,

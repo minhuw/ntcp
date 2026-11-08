@@ -8,6 +8,7 @@
 //! against an attacker who has observed the exact packet.
 
 use crate::Error;
+use crate::live::Live;
 use alloc::vec::Vec;
 use core::net::IpAddr;
 use ntcp::{ConnectionId, Instant, TransmitAttempt};
@@ -857,6 +858,16 @@ fn evidence_matches(e: &Evidence, quote: &QuoteKey) -> bool {
 pub(crate) struct Ledger {
     limits: LedgerLimits,
     owners: Vec<Option<Owner>>,
+    // Occupied owner records, unsealed reservations and summaries: what
+    // the passes made on every collection visit (`check_live`).
+    live_owners: Live,
+    live_pending: Live,
+    live_tombstones: Live,
+    // No history entry without delivery retirement, evicted datagram
+    // signature or summary expires before this, so `expire` has nothing
+    // to remove until then. A lower bound: whatever leaves earlier by
+    // another route leaves it in place.
+    next_expiry: Instant,
     // Per owner record: the key its submissions use, and the time until
     // which it gets no owner-level attribution because a summary its quotes
     // could match was discarded (see `fold` and `seal`).
@@ -901,6 +912,10 @@ impl Ledger {
         Ok(Self {
             limits,
             owners: crate::table(limits.owners, None)?,
+            live_owners: Live::new(limits.owners)?,
+            live_pending: Live::new(limits.concurrent_attempts)?,
+            live_tombstones: Live::new(summaries)?,
+            next_expiry: Instant::MAX,
             keys: crate::table(limits.owners, None)?,
             blind: crate::table(limits.owners, 0)?,
             history: crate::table(entries, None)?,
@@ -926,6 +941,7 @@ impl Ledger {
             discards: 0,
         })
     }
+    #[cfg(test)]
     pub fn limits(&self) -> LedgerLimits {
         self.limits
     }
@@ -969,7 +985,13 @@ impl Ledger {
         }
     }
     pub fn owner_index(&self, owner: Owner) -> Option<usize> {
-        self.owners.iter().position(|o| *o == Some(owner))
+        self.live_owners
+            .iter()
+            .find(|&index| self.owners[index] == Some(owner))
+    }
+    /// The first occupied owner record at or after `from`.
+    pub fn next_owner(&self, from: usize) -> Option<usize> {
+        self.live_owners.next(from)
     }
     /// Existing record, or a free one. Callers release dead owners first.
     pub fn admit(&mut self, owner: Owner) -> Result<usize, Error> {
@@ -982,13 +1004,16 @@ impl Ledger {
             .position(Option::is_none)
             .ok_or(Error::Capacity)?;
         self.owners[index] = Some(owner);
+        self.live_owners.insert(index);
         self.keys[index] = None;
         self.blind[index] = 0;
         self.own[index] = None;
         Ok(index)
     }
     pub fn owner_pinned(&self, index: usize) -> bool {
-        self.pending.iter().flatten().any(|p| p.owner == index)
+        self.live_pending
+            .iter()
+            .any(|p| self.pending[p].is_some_and(|p| p.owner == index))
     }
     /// Fold remaining history into tombstones and free the record. Pinned
     /// owners (unsealed reservations) are never released.
@@ -1006,6 +1031,7 @@ impl Ledger {
         }
         self.extra[index] = Vec::new();
         self.owners[index] = None;
+        self.live_owners.remove(index);
         self.keys[index] = None;
         self.blind[index] = 0;
         true
@@ -1021,9 +1047,9 @@ impl Ledger {
         stale: impl Fn(TransmitAttempt) -> bool,
     ) -> Result<usize, Error> {
         if let Some(index) = self
-            .pending
+            .live_pending
             .iter()
-            .position(|p| p.is_some_and(|p| p.attempt == Some(attempt)))
+            .find(|&i| self.pending[i].is_some_and(|p| p.attempt == Some(attempt)))
         {
             return if self.pending[index].unwrap().owner == owner {
                 Ok(index)
@@ -1031,8 +1057,9 @@ impl Ledger {
                 Err(Error::Obsolete)
             };
         }
-        if let Some(index) = self.pending.iter().position(|p| {
-            p.is_some_and(|p| p.owner == owner && p.issued && p.attempt.is_none_or(&stale))
+        if let Some(index) = self.live_pending.iter().find(|&i| {
+            self.pending[i]
+                .is_some_and(|p| p.owner == owner && p.issued && p.attempt.is_none_or(&stale))
         }) {
             let p = self.pending[index].as_mut().unwrap();
             p.attempt = Some(attempt);
@@ -1059,15 +1086,14 @@ impl Ledger {
             issued: false,
             evidence: None,
         });
+        self.live_pending.insert(index);
         Ok(index)
     }
     /// Pre-reserve every segment one aggregated physical call may emit; the
     /// whole group shares one ticket and seals or cancels together. A single
     /// datagram is a group of one whose evidence is complete before the call.
     pub fn reserve_group(&mut self, owner: usize, evidence: &[Evidence]) -> Result<u64, Error> {
-        if evidence.is_empty()
-            || self.pending.iter().filter(|p| p.is_none()).count() < evidence.len()
-        {
+        if evidence.is_empty() || self.pending.len() - self.live_pending.len() < evidence.len() {
             return Err(Error::Capacity);
         }
         let first = self.reserve_slot(owner, None)?;
@@ -1082,6 +1108,7 @@ impl Ledger {
                 issued: false,
                 evidence: Some(*e),
             });
+            self.live_pending.insert(index);
         }
         Ok(ticket)
     }
@@ -1101,28 +1128,33 @@ impl Ledger {
         Ok(p.ticket)
     }
     pub fn find_ticket(&self, ticket: u64) -> Option<usize> {
-        self.pending
+        self.live_pending
             .iter()
-            .position(|p| p.is_some_and(|p| p.ticket == ticket))
+            .find(|&i| self.pending[i].is_some_and(|p| p.ticket == ticket))
     }
     pub fn pending(&self, index: usize) -> Option<Pending> {
         self.pending[index]
     }
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
+    /// The first unsealed reservation at or after `from`.
+    pub fn next_pending(&self, from: usize) -> Option<usize> {
+        self.live_pending.next(from)
     }
     /// Reclaim an unsealed reservation no physical call can still use.
     pub fn drop_pending(&mut self, index: usize) {
-        self.pending[index] = None;
+        if self.pending[index].take().is_some() {
+            self.live_pending.remove(index);
+        }
     }
     pub fn owner(&self, index: usize) -> Option<Owner> {
         self.owners[index]
     }
     /// Certified non-submission: drop the reservation(s), record nothing.
     pub fn cancel(&mut self, ticket: u64) {
-        for p in &mut self.pending {
-            if p.is_some_and(|p| p.ticket == ticket) {
-                *p = None;
+        let mut next = 0;
+        while let Some(index) = self.live_pending.next(next) {
+            next = index + 1;
+            if self.pending[index].is_some_and(|p| p.ticket == ticket) {
+                self.drop_pending(index);
             }
         }
     }
@@ -1130,11 +1162,13 @@ impl Ledger {
     /// Reservation guaranteed the owner record and the evidence.
     pub fn seal(&mut self, ticket: u64, now: Instant, possibly_submitted: bool) -> usize {
         let mut sealed = 0;
-        for index in 0..self.pending.len() {
+        let mut next = 0;
+        while let Some(index) = self.live_pending.next(next) {
+            next = index + 1;
             let Some(p) = self.pending[index].filter(|p| p.ticket == ticket) else {
                 continue;
             };
-            self.pending[index] = None;
+            self.drop_pending(index);
             let Some(evidence) = p.evidence else {
                 debug_assert!(false, "sealed reservation without validated evidence");
                 continue;
@@ -1157,12 +1191,16 @@ impl Ledger {
                 self.keys[p.owner] = Some(key);
             }
             self.order += 1;
+            let record = Record {
+                evidence,
+                committed_at: now,
+                possibly_submitted,
+            };
+            if !retirable(&record) {
+                self.next_expiry = self.next_expiry.min(self.expiry(&record));
+            }
             *self.slot_mut(p.owner, slot) = Some(Entry {
-                record: Record {
-                    evidence,
-                    committed_at: now,
-                    possibly_submitted,
-                },
+                record,
                 order: self.order,
             });
             sealed += 1;
@@ -1189,10 +1227,12 @@ impl Ledger {
         oldest(false).or_else(|| oldest(true)).unwrap()
     }
     fn expired(&self, record: &Record, now: Instant) -> bool {
+        self.expiry(record) <= now
+    }
+    fn expiry(&self, record: &Record) -> Instant {
         record
             .committed_at
             .saturating_add(self.limits.feedback_horizon)
-            <= now
     }
     // Same-owner eviction. A TCP generation's evicted history becomes its
     // own summary, which delivery shrinks; anything else is buried at once.
@@ -1236,6 +1276,7 @@ impl Ledger {
                         .min_by_key(|&s| self.datagrams[s].unwrap().1)
                         .unwrap()
                 });
+            self.next_expiry = self.next_expiry.min(until);
             if let Some((old, old_until)) = self.datagrams[slot].replace((e, until))
                 && old_until > now
             {
@@ -1248,13 +1289,13 @@ impl Ledger {
     fn fold(&mut self, summary: Tombstone, now: Instant) {
         let key = summary.key;
         let live = |t: &Option<Tombstone>| t.filter(|t| t.until > now);
-        if let Some(t) = self
-            .tombstones
-            .iter_mut()
-            .filter_map(|t| t.as_mut().filter(|t| t.until > now))
-            .find(|t| t.key == key)
+        if let Some(index) = self
+            .live_tombstones
+            .iter()
+            .find(|&i| live(&self.tombstones[i]).is_some_and(|t| t.key == key))
         {
-            t.absorb(&summary);
+            // A later horizon only: `next_expiry` stays a lower bound.
+            self.tombstones[index].as_mut().unwrap().absorb(&summary);
             return;
         }
         let slot = match (0..self.tombstones.len()).find(|&s| live(&self.tombstones[s]).is_none()) {
@@ -1290,6 +1331,10 @@ impl Ledger {
                 slot
             }
         };
+        if self.tombstones[slot].is_none() {
+            self.live_tombstones.insert(slot);
+        }
+        self.next_expiry = self.next_expiry.min(summary.until);
         self.tombstones[slot] = Some(summary);
     }
 
@@ -1304,15 +1349,25 @@ impl Ledger {
     /// size no candidate MTU can be below, never a path change.
     /// `delivered` sees each record retired: data a new cumulative
     /// acknowledgment covers.
+    #[cfg(test)]
     pub fn retire_tcp(
         &mut self,
         owner: ConnectionId,
         unacknowledged: u32,
+        delivered: impl FnMut(&Record),
+    ) {
+        if let Some(index) = self.owner_index(Owner::Tcp(owner)) {
+            self.retire_record(index, unacknowledged, delivered);
+        }
+    }
+    /// `retire_tcp` of the TCP generation owning record `index`.
+    pub fn retire_record(
+        &mut self,
+        index: usize,
+        unacknowledged: u32,
         mut delivered: impl FnMut(&Record),
     ) {
-        let Some(index) = self.owner_index(Owner::Tcp(owner)) else {
-            return;
-        };
+        debug_assert!(matches!(self.owners[index], Some(Owner::Tcp(_))));
         let mut floor = unacknowledged;
         for slot in 0..self.slots(index) {
             if let Some(entry) = self.slot(index, slot)
@@ -1351,32 +1406,76 @@ impl Ledger {
     /// Time expiry for entries without delivery retirement, evicted
     /// datagram signatures, and released owners' tombstones.
     pub fn expire(&mut self, now: Instant) {
-        for owner in 0..self.owners.len() {
-            // Only `seal` fills history, for an owner a reservation pins, and
-            // `release_owner` empties it before freeing the record.
-            if self.owners[owner].is_none() {
-                debug_assert!((0..self.slots(owner)).all(|s| self.slot(owner, s).is_none()));
-                continue;
-            }
+        self.check_live();
+        if now < self.next_expiry {
+            return;
+        }
+        let mut next = Instant::MAX;
+        // Only `seal` fills history, for an owner a reservation pins, and
+        // `release_owner` empties it before freeing the record.
+        let mut from = 0;
+        while let Some(owner) = self.live_owners.next(from) {
+            from = owner + 1;
             for slot in 0..self.slots(owner) {
                 if let Some(entry) = self.slot(owner, slot)
                     && !entry.retirable()
-                    && self.expired(&entry.record, now)
                 {
-                    *self.slot_mut(owner, slot) = None;
+                    if self.expired(&entry.record, now) {
+                        *self.slot_mut(owner, slot) = None;
+                    } else {
+                        next = next.min(self.expiry(&entry.record));
+                    }
                 }
             }
         }
         for d in &mut self.datagrams {
-            if d.is_some_and(|(_, until)| until <= now) {
-                *d = None;
+            match *d {
+                Some((_, until)) if until <= now => *d = None,
+                Some((_, until)) => next = next.min(until),
+                None => {}
             }
         }
-        for t in &mut self.tombstones {
-            if t.is_some_and(|t| t.until <= now) {
-                *t = None;
+        let mut from = 0;
+        while let Some(index) = self.live_tombstones.next(from) {
+            from = index + 1;
+            let until = self.tombstones[index].unwrap().until;
+            if until <= now {
+                self.tombstones[index] = None;
+                self.live_tombstones.remove(index);
+            } else {
+                next = next.min(until);
             }
         }
+        self.next_expiry = next;
+        self.check_live();
+    }
+
+    // The full scans the indexes and the expiry bound replace, for debug
+    // builds: the occupied records, reservations and summaries, nothing
+    // expirable before `next_expiry`, and no history in a free record.
+    fn check_live(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        assert!(self.live_owners.matches(&self.owners));
+        assert!(self.live_pending.matches(&self.pending));
+        assert!(self.live_tombstones.matches(&self.tombstones));
+        for owner in 0..self.owners.len() {
+            for slot in 0..self.slots(owner) {
+                let Some(entry) = self.slot(owner, slot) else {
+                    continue;
+                };
+                assert!(self.owners[owner].is_some());
+                assert!(entry.retirable() || self.expiry(&entry.record) >= self.next_expiry);
+            }
+        }
+        let datagrams = self.datagrams.iter().flatten().map(|(_, until)| *until);
+        let tombstones = self.tombstones.iter().flatten().map(|t| t.until);
+        assert!(
+            datagrams
+                .chain(tombstones)
+                .all(|until| until >= self.next_expiry)
+        );
     }
 
     // Unexpired live entries (and their owner records) exactly matching a quote.
@@ -1387,7 +1486,9 @@ impl Ledger {
         zone: Option<LinkId>,
     ) -> impl Iterator<Item = (usize, Entry)> + '_ {
         let quote = *quote;
-        (0..self.owners.len())
+        // Free records hold no history (`check_live`).
+        self.live_owners
+            .iter()
             .flat_map(move |record| (0..self.slots(record)).map(move |slot| (record, slot)))
             .filter_map(move |(record, slot)| Some((record, self.slot(record, slot)?)))
             .filter(move |(_, entry)| {
