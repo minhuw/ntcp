@@ -1187,14 +1187,13 @@ fn plateau_and_search_aging_operations_reach_existing_and_future_users() {
 // leaves a stateless reset held (selected, authorized, ticketed) while the
 // owner restricts the route that carries it and the live connection. The
 // change applies at once and updates the connection in the same call; the
-// reset is revalidated at its submission exactly as after a trusted PTB
-// decrease. On IPv4 the reset answers a source-routed SYN, so its reversed
-// route makes it larger than the restricted estimate and the barrier
-// refuses it (released as certified unsent). On IPv6 every stateless reply
-// fits the 1280-octet minimum, so after a disable and a downward set the
-// held reset still leaves.
+// held reset, authorized under the path as it was, is refused at its
+// submission exactly as after a trusted PTB decrease, released as certified
+// unsent, and nothing of it stays in the ledger. (On IPv4 the reset answers
+// a source-routed SYN, so its reversed route also makes it larger than the
+// restricted estimate.)
 #[test]
-fn held_stateless_lease_never_blocks_a_restriction_and_is_revalidated_at_submission() {
+fn held_stateless_lease_never_blocks_a_restriction_and_is_refused_at_submission() {
     for v6 in [false, true] {
         let mut cfg = config(3);
         cfg.ipv4_options_enabled = true;
@@ -1269,18 +1268,12 @@ fn held_stateless_lease_never_blocks_a_restriction_and_is_revalidated_at_submiss
             assert!(a.1.managed_path(tcp).unwrap().ordinary_ip_budget <= budget);
         }
         let result = a.0.submit(&mut a.1, now + 4, ticket, context, &frame, 0, |_| {
-            assert!(v6, "the oversized IPv4 reset reached the backend");
-            BackendOutcome::Submitted
+            panic!("a reset authorized under the old path reached the backend")
         });
-        if v6 {
-            assert!(result.unwrap() == Submission::Submitted);
-            assert!(frame.len() <= 1280);
-        } else {
-            let refused = result.err().unwrap();
-            assert_eq!(refused.error, Error::Obsolete);
-            assert!(a.1.reject_unsubmitted(attempt).unwrap());
-            a.0.cancel_submission(refused.ticket);
-        }
+        let refused = result.err().unwrap();
+        assert_eq!(refused.error, Error::Obsolete);
+        assert!(a.1.reject_unsubmitted(attempt).unwrap());
+        a.0.cancel_submission(refused.ticket);
         a.0.collect(&a.1).unwrap();
         assert_eq!(a.0.ledger.pending_count(), 0);
         // The connection keeps working within the restricted budget.

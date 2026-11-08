@@ -298,8 +298,13 @@ fn managed_scheduled_successive_decreases_with_refused_retries_then_increase() {
     }
 }
 
+// A held RTO retransmission was authorized under its path as it was. A
+// plateau replacement changes the path's stamp without changing what the
+// bytes may be, yet the held attempt is refused at its next submission and
+// selected again: this costs a repacketization, never phantom loss,
+// retransmission or RTO work.
 #[test]
-fn managed_scheduled_harmless_stamp_preserves_held_attempt_and_real_rto_work() {
+fn managed_scheduled_path_change_refuses_held_attempt_without_phantom_rto_work() {
     let (mut a, mut b, client, server, wa, wb) = pair_output(false, false, false);
     let cid = connection(&a, client);
     a.execute(client, Op::Write(vec![9; 300])).unwrap();
@@ -315,17 +320,22 @@ fn managed_scheduled_harmless_stamp_preserves_held_attempt_and_real_rto_work() {
     let state = a.endpoint.transport_info(cid).unwrap();
     let timer = a.endpoint.next_deadline();
     let context = a.egress.as_ref().unwrap().context(cid).unwrap();
-    // Plateau replacement changes the stamp without invalidating these bytes.
     a.host
         .as_mut()
         .unwrap()
         .set_ipv4_plateaus(path::Ipv4Plateaus::RFC1191)
         .unwrap();
+    let mut replacement = None;
     for _ in 0..3 {
         tick(&mut a);
         a.service_egress().unwrap();
-        assert_eq!(a.egress.as_ref().unwrap().attempt(cid), attempt);
-        assert_eq!(wa.lock().unwrap().offered.last(), Some(&held));
+        let current = a.egress.as_ref().unwrap().attempt(cid);
+        assert_ne!(current, attempt);
+        assert_eq!(*replacement.get_or_insert(current), current);
+        assert_eq!(
+            ip_size(wa.lock().unwrap().offered.last().unwrap()),
+            ip_size(&held)
+        );
         let mut live = a.endpoint.transport_info(cid).unwrap();
         // These observations intentionally measure elapsed caller time.
         live.last_data_recv_ms = state.last_data_recv_ms;
@@ -353,11 +363,16 @@ fn managed_scheduled_harmless_stamp_preserves_held_attempt_and_real_rto_work() {
     assert_eq!(ip_size(&original), ip_size(&held));
 }
 
+// A held probe was authorized under its path as it was, so any change of
+// that path refuses it, and the connection selects ordinary output in its
+// place. Harmless: only a link increase changes the path version; the hold
+// is not restarted, so the search probes again during the transfer and
+// confirms a larger ceiling. Unchanged: a fresh equal report keeps the
+// estimate but restarts the hold. Lower: a new negative revision. In both
+// stale cases the refused probe proves nothing and the restarted hold
+// outlasts the transfer.
 #[test]
-fn managed_scheduled_genuine_probe_submits_but_new_negative_revision_rejects_held_intent() {
-    // Harmless: only a link increase changes the path version. Unchanged: a
-    // fresh equal report keeps the estimate but restarts the hold. Lower: a
-    // new negative revision. Only the harmless change may submit the probe.
+fn managed_scheduled_held_probe_is_refused_by_any_path_change() {
     for v6 in [false, true] {
         for (stale, unchanged) in [(false, false), (true, true), (true, false)] {
             let (mut a, mut b, client, server, wa, wb) = pair_output(v6, false, false);
@@ -422,35 +437,30 @@ fn managed_scheduled_genuine_probe_submits_but_new_negative_revision_rejects_hel
                     .set_link_mtu(prior.link, 1600)
                     .unwrap();
                 tick(&mut a);
-                a.service_egress().unwrap(); // Still WouldBlock, same real probe.
-                assert_eq!(a.egress.as_ref().unwrap().attempt(cid), attempt);
-                assert_eq!(
-                    a.endpoint
-                        .transmit_discovery_intent(attempt)
-                        .unwrap()
-                        .ip_packet_len(),
-                    intent.ip_packet_len()
-                );
+                a.service_egress().unwrap(); // Still WouldBlock: refused, selected again.
+                let replacement = a.egress.as_ref().unwrap().attempt(cid);
+                assert_ne!(replacement, attempt);
+                assert!(a.endpoint.transmit_discovery_intent(attempt).is_none());
+                assert!(a.endpoint.transmit_discovery_intent(replacement).is_none());
                 assert_eq!(a.endpoint.next_deadline(), deadline);
                 let current = a.host.as_ref().unwrap().binding(cid).unwrap().snapshot;
                 assert_eq!(current.learned_mtu(), Some(mtu));
                 assert_eq!(current.retry_not_before(), hold);
-                assert_eq!(wa.lock().unwrap().offered.last(), Some(&selected));
+                assert!(ip_size(wa.lock().unwrap().offered.last().unwrap()) <= mtu as usize);
                 mtu
             };
             let offers = wa.lock().unwrap().offered.len();
             wa.lock().unwrap().block = false;
             tick(&mut a);
             a.service_egress().unwrap();
+            assert!(a.endpoint.transmit_discovery_intent(attempt).is_none());
+            assert_ne!(wa.lock().unwrap().sent.front(), Some(&selected));
             if stale {
-                assert!(a.endpoint.transmit_discovery_intent(attempt).is_none());
                 assert!(
                     wa.lock().unwrap().offered[offers..]
                         .iter()
                         .all(|p| ip_size(p) <= limit as usize)
                 );
-            } else {
-                assert_eq!(wa.lock().unwrap().sent.front(), Some(&selected));
             }
             transfer(&wa, &mut b, &wb);
             b.service_egress().unwrap();
@@ -460,10 +470,9 @@ fn managed_scheduled_genuine_probe_submits_but_new_negative_revision_rejects_hel
                 b.execute(server, Op::Read(BYTES)).unwrap().bytes,
                 vec![7; 20000]
             );
-            // The runtime's change service publishes the delivered probe,
+            // The runtime's change service publishes a delivered probe,
             // selected after the hold and definitely submitted, as the new
-            // shared ceiling; a probe the stale cases rejected proves nothing, and
-            // their restarted hold outlasts the transfer.
+            // shared ceiling: in the harmless case a later one of the transfer.
             let ordinary = a.endpoint.managed_path(cid).unwrap().ordinary_ip_budget;
             let learned = a
                 .host
@@ -477,9 +486,8 @@ fn managed_scheduled_genuine_probe_submits_but_new_negative_revision_rejects_hel
                 assert!(ordinary <= limit);
                 assert_eq!(learned, Some(limit));
             } else {
-                // Later probes of the same transfer may confirm more.
                 let learned = learned.unwrap();
-                assert!(learned >= ip_size(&selected) as u32);
+                assert!(learned > limit);
                 assert!(ordinary > limit && ordinary <= learned);
             }
             eprintln!(
@@ -585,8 +593,13 @@ fn managed_scheduled_no_route_preserves_sibling_progress_and_budget_update_adds_
     assert_eq!(live.retransmitted, 0);
 }
 
+// A reset held by a blocked backend across a change of its path (here a link
+// MTU decrease that it still fits) is refused at its next submission. A
+// stateless reset is dropped, as the peer's next segment draws another; a
+// released connection's final reset is selected again and leaves. Either
+// way its lease or binding ends with it.
 #[test]
-fn managed_scheduled_stateless_and_released_final_reset_leases_end_after_real_submission() {
+fn managed_scheduled_held_reset_across_a_path_change_ends_its_lease() {
     for released in [false, true] {
         let (mut a, wa) = native(false, 2, 2);
         let (mut b, wb) = native(false, 3, 2);
@@ -634,8 +647,15 @@ fn managed_scheduled_stateless_and_released_final_reset_leases_end_after_real_su
         wire.lock().unwrap().block = false;
         tick(sender);
         sender.service_egress().unwrap();
-        assert_eq!(wire.lock().unwrap().sent.len(), 1);
-        assert_eq!(wire.lock().unwrap().sent.front(), Some(&held));
+        if released {
+            assert_eq!(wire.lock().unwrap().sent.len(), 1);
+            assert_eq!(
+                ip_size(wire.lock().unwrap().sent.front().unwrap()),
+                ip_size(&held)
+            );
+        } else {
+            assert!(wire.lock().unwrap().sent.is_empty());
+        }
         assert_eq!(sender.host.as_ref().unwrap().lease_count(), 0);
         if released {
             sender.test_now = Some(sender.now() + sender.defaults.connection.time_wait_us + 1);

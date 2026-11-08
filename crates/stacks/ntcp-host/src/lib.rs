@@ -2219,7 +2219,8 @@ impl Host {
     }
 
     /// Obtain authority for a selected reservation. Keep this context with a
-    /// blocked frame; validate_egress must run again at EVERY physical retry.
+    /// blocked frame: `submit` checks the frame against it at every physical
+    /// attempt and refuses it once the context's path has changed.
     pub fn egress_context(
         &mut self,
         endpoint: &mut Endpoint,
@@ -2534,21 +2535,23 @@ impl Host {
         frame: &[u8],
         shared_payload_len: usize,
     ) -> Result<EgressContext, Error> {
-        let live = self.egress_context(endpoint, context.attempt)?;
+        self.check_endpoint(endpoint)?;
         let packet = endpoint
             .transmit_attempt_packet(context.attempt)
             .ok_or(Error::Obsolete)?;
-        // Stateless bytes carry no local delivery/probe proof to transfer.
-        // Revalidate them under the replacement lease rather than stranding
-        // the independent control lane after route/source replacement.
-        if packet.connection.is_some()
-            && (live.binding.client != context.binding.client
-                || live.binding.snapshot.path() != context.binding.snapshot.path()
-                || live.link != context.link
-                || live.next_hop != context.next_hop)
-        {
+        // `egress_context` granted the authority; it holds while the path
+        // is unchanged. Every change of a path's selection, budget or
+        // validity gives it a new stamp, and a rebind or release retires the
+        // client, so a frame held across one is refused. A connection's
+        // binding is brought up to date first, so that it packetizes its
+        // output again for the current path; a stateless reply is dropped.
+        if self.paths.stamp(context.binding.client) != Ok(context.binding.snapshot.stamp()) {
+            if let Some(owner) = packet.connection {
+                self.authorized_refresh(endpoint, owner, &packet)?;
+            }
             return Err(Error::Obsolete);
         }
+        let live = context;
         let (ip, header, total, protocol) = if packet.ip.source.is_ipv4() {
             ntcp_ip::quote_header(frame)?
         } else {

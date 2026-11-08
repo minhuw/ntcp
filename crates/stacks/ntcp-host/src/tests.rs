@@ -709,85 +709,53 @@ fn exact_probe_attempt_and_negative_revision_gate_actual_submission() {
     }
 }
 
+// A stateless reply's lease grants authority under its path as it is. A
+// reply held across a change of that path (a route replacement, or a link
+// MTU change that leaves the reply fitting) is refused without reaching the
+// backend and without rebinding its lease; rejecting it as unsent releases
+// the lease and its pin.
 #[test]
-fn stateless_rebind_capacity_failure_preserves_lease_pins_then_submits_once() {
-    let cfg = config(2);
-    let (local, remote) = addresses(false);
-    let mut a = managed(local, 63, cfg.clone());
-    let mut b = managed_configured(remote, 64, cfg.clone(), false, Some(2));
-    a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0).unwrap();
-    let syn = emit(&mut a.0, &mut a.1, 1).unwrap();
-    input(&mut b.0, &mut b.1, b.2, 2, &syn, 0);
-    let (attempt, packet, frame) = selected(&mut b.1, 3).unwrap();
-    assert!(packet.connection.is_none());
-    let held = b.0.egress_context(&mut b.1, attempt).unwrap();
-    let old = held.binding;
-    let mut request = old.snapshot.key().request();
-    request.destination = ScopedAddress::new("192.0.2.3".parse().unwrap(), None).unwrap();
-    let (blocker, _) = b.0.paths.acquire(request).unwrap();
-    let route = b.0.paths().route(old.snapshot.key().route()).unwrap();
-    b.0.replace_route(old.snapshot.key().route(), route).unwrap();
-    let usage = b.0.paths().usage();
-    let mut submissions = 0;
-    let ticket = b.0.submission_ticket(&mut b.1, held).unwrap();
-    let refused = b.0.submit(&mut b.1, 4, ticket, held, &frame, 0, |_| {
-        submissions += 1;
-        BackendOutcome::Submitted
-    }).unwrap_err();
-    assert_eq!(refused.error, Error::Path(path::Error::Capacity));
-    assert_eq!(submissions, 0);
-    assert_eq!(b.0.paths().usage(), usage);
-    assert_eq!(b.0.leases[0].unwrap().prepared, old);
-    assert_eq!(b.0.paths().path_pins(old.snapshot.path()).unwrap(), 1);
-    assert!(b.0.paths().is_dirty(old.client).unwrap());
-    assert_eq!(b.1.transmit_attempt_packet(attempt), Some(packet));
-    b.0.paths.release(blocker).unwrap();
-    let mut live = None;
-    let submitted = b.0.submit(&mut b.1, 4, refused.ticket, held, &frame, 0, |current| {
-        submissions += 1;
-        live = Some(current);
-        BackendOutcome::Submitted
-    }).unwrap();
-    assert!(submitted == Submission::Submitted);
-    let live = live.unwrap();
-    assert_eq!(submissions, 1);
-    assert_ne!(live.binding.client, old.client);
-    assert_ne!(live.binding.snapshot.path(), old.snapshot.path());
-    assert_eq!(b.0.paths().path_pins(old.snapshot.path()).unwrap(), 0);
-    assert!(!b.0.paths().is_dirty(live.binding.client).unwrap());
-    assert!(!b.1.accept_transmit(4, attempt).unwrap());
-    b.0.collect(&b.1).unwrap();
-    assert_eq!(b.0.lease_count(), 0);
-    assert_eq!(b.0.paths().usage().clients, 0);
-}
-
-#[test]
-fn stateless_reset_lease_and_harmless_stamp_refresh_have_bounded_authority() {
-    let cfg = config(2);
-    let (local, remote) = addresses(false);
-    let mut a = managed(local, 61, cfg.clone());
-    let mut b = managed(remote, 62, cfg.clone());
-    a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
-        .unwrap();
-    let syn = emit(&mut a.0, &mut a.1, 1).unwrap();
-    input(&mut b.0, &mut b.1, b.2, 2, &syn, 0);
-    let (attempt, packet, frame) = selected(&mut b.1, 3).unwrap();
-    assert!(packet.connection.is_none());
-    assert_eq!(b.0.binding_count(), 0);
-    let context = b.0.egress_context(&mut b.1, attempt).unwrap();
-    assert_eq!(b.0.lease_count(), 1);
-    b.0.set_link_mtu(b.2.link(), 1600).unwrap();
-    let refreshed = b.0.validate_egress(&mut b.1, context, &frame, 0).unwrap();
-    assert_ne!(
-        refreshed.binding.snapshot.stamp(),
-        context.binding.snapshot.stamp()
-    );
-    b.0.remove_link(b.2).unwrap();
-    assert!(b.0.validate_egress(&mut b.1, refreshed, &frame, 0).is_err());
-    b.1.reject_unsubmitted(attempt).unwrap();
-    b.0.collect(&b.1).unwrap();
-    assert_eq!(b.0.lease_count(), 0);
-    assert_eq!(b.0.paths().usage().clients, 0);
+fn stateless_reply_held_across_a_path_change_is_refused() {
+    for replace_route in [true, false] {
+        let cfg = config(2);
+        let (local, remote) = addresses(false);
+        let mut a = managed(local, 61, cfg.clone());
+        let mut b = managed(remote, 62, cfg.clone());
+        a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+            .unwrap();
+        let syn = emit(&mut a.0, &mut a.1, 1).unwrap();
+        input(&mut b.0, &mut b.1, b.2, 2, &syn, 0);
+        let (attempt, packet, frame) = selected(&mut b.1, 3).unwrap();
+        assert!(packet.connection.is_none());
+        assert_eq!(b.0.binding_count(), 0);
+        let held = b.0.egress_context(&mut b.1, attempt).unwrap();
+        let old = held.binding;
+        assert_eq!(b.0.lease_count(), 1);
+        let ticket = b.0.submission_ticket(&mut b.1, held).unwrap();
+        if replace_route {
+            let route = b.0.paths().route(old.snapshot.key().route()).unwrap();
+            b.0.replace_route(old.snapshot.key().route(), route).unwrap();
+        } else {
+            b.0.set_link_mtu(b.2.link(), 1600).unwrap();
+        }
+        let usage = b.0.paths().usage();
+        let refused = b
+            .0
+            .submit(&mut b.1, 4, ticket, held, &frame, 0, |_| {
+                panic!("a reply authorized under the old path reached the backend")
+            })
+            .unwrap_err();
+        assert_eq!(refused.error, Error::Obsolete);
+        assert_eq!(b.0.paths().usage(), usage);
+        assert_eq!(b.0.leases[0].unwrap().prepared, old);
+        assert_eq!(b.0.paths().path_pins(old.snapshot.path()).unwrap(), 1);
+        assert!(b.1.reject_unsubmitted(attempt).unwrap());
+        b.0.cancel_submission(refused.ticket);
+        b.0.collect(&b.1).unwrap();
+        assert_eq!(b.0.lease_count(), 0);
+        assert_eq!(b.0.paths().usage().clients, 0);
+        assert_eq!(b.0.ledger.pending_count(), 0);
+    }
 }
 
 #[test]

@@ -787,8 +787,9 @@ impl Owner {
                         false,
                     ),
                     // The Owner is serialized through the Host transaction:
-                    // exact revalidation at every retry, evidence reservation
-                    // and acceptance preflight, then the one synchronous
+                    // the frame checked against its context at every retry
+                    // (refused once the context's path changed), evidence
+                    // reservation and acceptance preflight, then the one synchronous
                     // physical call (including timestamp fallback), then its
                     // finalization. Every software-GSO segment is its own
                     // attempt with its own ticket.
@@ -842,7 +843,6 @@ impl Owner {
                                     link.ports[port]
                                         .frame_header(&mut slot.shared.header, destination);
                                 }
-                                let mut live = None;
                                 let mut physical = None;
                                 let submission = host.submit(
                                     &mut self.endpoint,
@@ -851,16 +851,7 @@ impl Owner {
                                     context,
                                     &slot.bytes[offset..offset + entry.ip_len],
                                     shared_len,
-                                    |current| {
-                                        live = Some(current);
-                                        // A path now leaving another way
-                                        // (another port or next hop)
-                                        // retries with that frame.
-                                        if link.attached(current.link, current.next_hop) != Ok(port)
-                                            || current.next_hop != context.next_hop
-                                        {
-                                            return ntcp_host::BackendOutcome::WouldBlock;
-                                        }
+                                    |_| {
                                         let result = link.transmit(
                                             port,
                                             &slot.bytes,
@@ -873,8 +864,8 @@ impl Owner {
                                         outcome
                                     },
                                 );
-                                if let Some(live) = live {
-                                    entry.context = Some(live);
+                                if physical.is_some() {
+                                    entry.context = Some(context);
                                     entry.blocked = None;
                                 }
                                 match submission {
