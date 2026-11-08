@@ -953,8 +953,8 @@ impl Host {
         }
         Ok(())
     }
-    fn forwarding(&self, snapshot: PathSnapshot) -> Result<Port, Error> {
-        self.paths.validate_selection(snapshot.key())?;
+    fn forwarding(&self, snapshot: &PathSnapshot) -> Result<Port, Error> {
+        self.paths.validate_snapshot(snapshot)?;
         if snapshot.key().destination().address().is_ipv6() && snapshot.first_hop_mtu() < 1280 {
             return Err(Error::Unsupported);
         }
@@ -1096,13 +1096,13 @@ impl Host {
     ) -> Result<PreparedPath, Error> {
         self.check_endpoint(endpoint)?;
         let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
-        let current = endpoint.managed_path(owner)?;
-        let mut binding = self.bindings[index].unwrap();
-        if current.binding.client != binding.prepared.client {
+        let current = endpoint.managed_route(owner)?;
+        let mut client = self.bindings[index].as_ref().unwrap().prepared.client;
+        if current.client != client {
             return Err(Error::InvalidContext);
         }
         let via = scoped(current.forwarding_destination, current.zone)?;
-        let mut snapshot = self.paths.snapshot(binding.prepared.client)?;
+        let mut snapshot = self.paths.snapshot(client)?;
         // A validated peer return-route update need not invalidate the old
         // routing entry, so compare the actual outgoing selection as well.
         if snapshot.status() != PathStatus::Valid || !self.forwards_via(snapshot.key(), via) {
@@ -1114,21 +1114,16 @@ impl Host {
             )?;
             let resolved = self.paths.resolve_via(request, via)?;
             self.forwarding_resolved(resolved.key())?;
-            let (client, rebound) = self
-                .paths
-                .rebind_via(binding.prepared.client, request, via)?;
-            binding.prepared = PreparedPath {
+            let (rebound_client, rebound) = self.paths.rebind_via(client, request, via)?;
+            client = rebound_client;
+            self.bindings[index].as_mut().unwrap().prepared = PreparedPath {
                 client,
                 snapshot: rebound,
             };
-            self.bindings[index] = Some(binding);
             snapshot = rebound;
         }
-        self.forwarding(snapshot)?;
-        let prepared = PreparedPath {
-            client: binding.prepared.client,
-            snapshot,
-        };
+        self.forwarding(&snapshot)?;
+        let prepared = PreparedPath { client, snapshot };
         // The connection's complete headers (an SR route's Segment Routing
         // Header included) must still fit the path: a header that no longer
         // does fails admission rather than being cut.
@@ -2209,7 +2204,7 @@ impl Host {
         // to a link-local peer carries the arrival link of the input that
         // caused it. Either leaves only on that link.
         let zone = match packet.connection {
-            Some(owner) => endpoint.managed_path(owner)?.zone,
+            Some(owner) => endpoint.managed_route(owner)?.zone,
             None => endpoint
                 .transmit_attempt_zone(attempt)
                 .ok_or(Error::Obsolete)?,
@@ -2254,7 +2249,7 @@ impl Host {
                 snapshot = rebound;
                 PreparedPath { client, snapshot }
             } else {
-                self.forwarding(snapshot)?;
+                self.forwarding(&snapshot)?;
                 PreparedPath {
                     client: lease.prepared.client,
                     snapshot,
@@ -2284,7 +2279,7 @@ impl Host {
             self.leases[index] = Some(Lease { attempt, prepared });
             prepared
         };
-        self.forwarding(binding.snapshot)?;
+        self.forwarding(&binding.snapshot)?;
         if packet.dscp != binding.snapshot.key().dscp().value()
             || packet.ip.source != binding.snapshot.key().source_address().address()
             || packet.ip.destination != binding.snapshot.key().destination().address()
@@ -2583,7 +2578,7 @@ impl Host {
         }
         let ordinary = if let Some(owner) = packet.connection {
             endpoint
-                .managed_path(owner)?
+                .managed_route(owner)?
                 .ordinary_ip_budget
                 .min(live.binding.snapshot.ip_packet_budget()?)
         } else {

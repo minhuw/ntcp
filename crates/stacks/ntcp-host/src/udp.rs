@@ -782,7 +782,7 @@ impl Host {
         };
         let prepared = match current {
             Some(prepared) => {
-                self.forwarding(prepared.snapshot)?;
+                self.forwarding(&prepared.snapshot)?;
                 prepared
             }
             None => {

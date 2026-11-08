@@ -674,6 +674,31 @@ impl PathService {
     pub fn path_snapshot(&self, path: PathId) -> Result<PathSnapshot, Error> {
         Ok(self.paths.get(self.context, path.0)?.snapshot)
     }
+    /// `validate_selection` of an observed path's key, without selecting a
+    /// route again while that path is still valid: every revision re-resolves
+    /// every valid path and invalidates, for good, each whose selection
+    /// changed (`commit_revision`), and nothing else changes selection, so a
+    /// path still valid is still its key's selection. An invalidated or
+    /// released path, or one of another incarnation, is checked in full.
+    pub fn validate_snapshot(&self, snapshot: &PathSnapshot) -> Result<(), Error> {
+        let path = snapshot.path().0;
+        if path.context == self.context
+            && let Some(Slot {
+                generation,
+                value: Some(current),
+            }) = self.paths.slots.get(path.slot)
+            && *generation == path.generation
+            && current.snapshot.status == PathStatus::Valid
+            && current.snapshot.key == snapshot.key
+        {
+            debug_assert!(
+                self.validate_selection(snapshot.key)
+                    .is_ok_and(|resolved| resolved.key == snapshot.key)
+            );
+            return Ok(());
+        }
+        self.validate_selection(snapshot.key).map(|_| ())
+    }
     pub fn path_pins(&self, path: PathId) -> Result<usize, Error> {
         Ok(self.paths.get(self.context, path.0)?.pins)
     }

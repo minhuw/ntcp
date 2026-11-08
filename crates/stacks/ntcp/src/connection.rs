@@ -3235,10 +3235,14 @@ impl Connection {
     /// Network authority changes packetization, never loss/retry classification.
     /// Safe while a reservation is held: its immutable bytes are checked again
     /// by the serialized submission barrier and split only after nonsubmission.
-    pub(crate) fn apply_managed_budget(&mut self, path: crate::PreparedPath) -> Result<(), Error> {
+    /// Returns whether anything changed: false for the binding already applied.
+    pub(crate) fn apply_managed_budget(
+        &mut self,
+        path: crate::PreparedPath,
+    ) -> Result<bool, Error> {
         let old = self.check_managed_budget(path)?;
         if old == path {
-            return Ok(());
+            return Ok(false);
         }
         let replaced = old.snapshot.path() != path.snapshot.path();
         let bound = self.path_bound(path.snapshot.first_hop_mtu());
@@ -3288,7 +3292,7 @@ impl Connection {
             .min(self.config.send_ip_payload_limit as usize - 20 - if self.timestamps { 12 } else { 0 })
             .min(local).min(self.managed_payload_mss());
         self.set_path_mss_budget(effective);
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn ip_header_len(&self) -> u16 { self.ip_header_len }

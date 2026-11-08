@@ -476,7 +476,7 @@ impl Host {
                         && crate::scoped(current.forwarding_destination, current.zone)
                             .is_ok_and(|via| self.forwards_via(snapshot.key(), via))
                 })
-                || self.forwarding(snapshot).is_err()
+                || self.forwarding(&snapshot).is_err()
             {
                 continue;
             }
@@ -517,7 +517,7 @@ impl Host {
                     snapshot: next,
                 },
             )?;
-            self.forwarding(next)?;
+            self.forwarding(&next)?;
         }
         Ok(())
     }

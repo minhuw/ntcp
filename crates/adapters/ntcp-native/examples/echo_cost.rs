@@ -290,10 +290,14 @@ fn main() -> ExitCode {
     let mut best_ns = f64::INFINITY;
     let mut best_drives = f64::INFINITY;
     let mut best_idle = f64::INFINITY;
+    let mut packets = 0.0;
     for _ in 0..args.repetitions {
         if !args.idle_only {
             let drives = bench.drives;
+            let sent = bench.client.counters().transmitted + bench.server.counters().transmitted;
             let elapsed = bench.run(&clock, args.requests);
+            let total = bench.client.counters().transmitted + bench.server.counters().transmitted;
+            packets = (total - sent) as f64 / args.requests as f64;
             best_ns = best_ns.min(elapsed as f64 / args.requests as f64);
             best_drives = best_drives.min((bench.drives - drives) as f64 / args.requests as f64);
         }
@@ -304,6 +308,7 @@ fn main() -> ExitCode {
     if !args.idle_only {
         println!("METRIC ns_per_request={best_ns:.1}");
         println!("METRIC drives_per_request={best_drives:.2}");
+        println!("METRIC packets_per_request={packets:.2}");
         println!("METRIC requests_per_second={:.0}", 1e9 / best_ns);
     }
     println!("METRIC idle_drive_ns={best_idle:.1}");

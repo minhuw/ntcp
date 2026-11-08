@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    FactoryRole, ManagedError, ManagedOpenOptions, ManagedPathInfo, PathFactoryRequest,
-    PathProvider, PreparedPath,
+    FactoryRole, ManagedError, ManagedOpenOptions, ManagedPathInfo, ManagedRoute,
+    PathFactoryRequest, PathProvider, PreparedPath,
 };
 
 /// What a managed Host proved about one physically submitted TCP segment of
@@ -669,9 +669,28 @@ impl Endpoint {
     pub fn managed_path(&self, id: ConnectionId) -> Result<ManagedPathInfo, EndpointError> {
         let slot = self.retained_slot(id)?;
         let connection = &slot.connection;
+        let route = self.managed_route(id)?;
         Ok(ManagedPathInfo {
             binding: connection.managed_path.ok_or(Error::InvalidState)?,
             tuple: connection.tuple(),
+            zone: route.zone,
+            forwarding_destination: route.forwarding_destination,
+            ip_header_len: connection.ip_header_len(),
+            ordinary_ip_budget: route.ordinary_ip_budget,
+        })
+    }
+
+    /// The route-selecting part of `managed_path`, for providers that check
+    /// it on every packet.
+    pub fn managed_route(&self, id: ConnectionId) -> Result<ManagedRoute, EndpointError> {
+        let slot = self.retained_slot(id)?;
+        let connection = &slot.connection;
+        Ok(ManagedRoute {
+            client: connection
+                .managed_path
+                .as_ref()
+                .ok_or(Error::InvalidState)?
+                .client,
             zone: connection.scoped_tuple().zone(),
             forwarding_destination: slot
                 .ipv4_options
@@ -679,7 +698,6 @@ impl Endpoint {
                 .and_then(|route| route.hops().first().copied())
                 .map(IpAddr::V4)
                 .unwrap_or(connection.tuple().remote.ip()),
-            ip_header_len: connection.ip_header_len(),
             ordinary_ip_budget: connection.path_payload_limit() as u32
                 + u32::from(connection.ip_header_len()),
         })
@@ -707,7 +725,12 @@ impl Endpoint {
     ) -> Result<(), EndpointError> {
         let dscp = path.snapshot.key().dscp().value();
         let slot = self.retained_slot_mut(id)?;
-        slot.connection.apply_managed_budget(path)?;
+        // The binding already applied, under the same class: nothing changes,
+        // so nothing needs rescheduling. Path providers apply the current
+        // binding again on every packet they authorize.
+        if !slot.connection.apply_managed_budget(path)? && slot.dscp == dscp {
+            return Ok(());
+        }
         slot.dscp = dscp;
         // Only future suffix selection uses this metadata. Already returned
         // attempt bytes retain their old metadata and fail the host barrier.

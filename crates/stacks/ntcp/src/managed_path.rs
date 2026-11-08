@@ -155,6 +155,20 @@ pub struct ManagedPathInfo {
     pub ordinary_ip_budget: u32,
 }
 
+/// What a path provider reads of a connection's managed path on every
+/// packet (`Endpoint::managed_route`): the parts of `ManagedPathInfo` that
+/// select its route, without a copy of the bound path's snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagedRoute {
+    pub client: ntcp_path::ClientId,
+    /// See `ManagedPathInfo::zone`.
+    pub zone: Option<ntcp_path::LinkId>,
+    /// See `ManagedPathInfo::forwarding_destination`.
+    pub forwarding_destination: core::net::IpAddr,
+    /// See `ManagedPathInfo::ordinary_ip_budget`.
+    pub ordinary_ip_budget: u32,
+}
+
 /// Transport-local limits of one connection, reported beside (never inside)
 /// the shared IP-layer path estimate: none of them is network evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
