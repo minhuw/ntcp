@@ -13,7 +13,7 @@ type Side = (Host, Endpoint, IngressContext);
 
 const MDL: u64 = 120_000_000;
 
-fn side(local: SocketAddr, identity: u128, signatures: usize) -> Side {
+fn side(local: SocketAddr, identity: u64, signatures: usize) -> Side {
     let cfg = config(2);
     let mut side = managed_limited(local, identity, cfg, false, None, None, |p, mut l| {
         l.datagrams = DatagramLimits {
@@ -221,7 +221,7 @@ fn data_at(packet: &[u8]) -> usize {
 fn first_and_later_fragment_ptbs_advise_their_owner_with_the_fragment_length() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 9100 + u128::from(v6), 1);
+        let mut a = side(local, 9100 + u64::from(v6), 1);
         let flow = open(&mut a, 5000, remote);
         let (owner, sent) = send(&mut a, 1, flow, &payload());
         // A PTB for the first fragment: its UDP selector correlates.
@@ -295,7 +295,7 @@ fn first_and_later_fragment_ptbs_advise_their_owner_with_the_fragment_length() {
 fn aliased_later_fragments_allow_only_a_path_level_decrease() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 9200 + u128::from(v6), 1);
+        let mut a = side(local, 9200 + u64::from(v6), 1);
         let first = open(&mut a, 5000, remote);
         let second = open(&mut a, 5001, remote);
         let (first_owner, one) = send(&mut a, 1, first, &payload());
@@ -329,7 +329,7 @@ fn stale_and_evicted_fragment_history_keeps_its_ambiguity() {
         let (local, remote) = addresses(v6);
         // An exact evicted signature per flow: a closed flow's fragments stay
         // exact evidence without an owner.
-        let mut a = side(local, 9300 + u128::from(v6), 1);
+        let mut a = side(local, 9300 + u64::from(v6), 1);
         let closed = open(&mut a, 5000, remote);
         let (_, sent) = send(&mut a, 1, closed, &payload());
         // Keep the path alive for path-level action.
@@ -348,7 +348,7 @@ fn stale_and_evicted_fragment_history_keeps_its_ambiguity() {
 
         // No exact signatures: a closed flow's later fragments fold into
         // the portless summary of their addresses, shared across flows.
-        let mut b = side(local, 9400 + u128::from(v6), 0);
+        let mut b = side(local, 9400 + u64::from(v6), 0);
         let closed = open(&mut b, 5000, remote);
         let (_, old) = send(&mut b, 1, closed, &payload());
         let live = open(&mut b, 5001, remote);
@@ -393,8 +393,8 @@ fn fragment_quotes_never_reach_tcp() {
     for v6 in [false, true] {
         let cfg = config(2);
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 9500 + u128::from(v6), 1);
-        let mut b = managed(remote, 9600 + u128::from(v6), cfg.clone());
+        let mut a = side(local, 9500 + u64::from(v6), 1);
+        let mut b = managed(remote, 9600 + u64::from(v6), cfg.clone());
         b.1.listen(remote, 1).unwrap();
         let id =
             a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)

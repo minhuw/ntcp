@@ -30,7 +30,7 @@ impl Ipv4TimestampProvider for Clock {
     }
 }
 
-fn side(local: SocketAddr, identity: u128, cfg: &EndpointConfig) -> Side {
+fn side(local: SocketAddr, identity: u64, cfg: &EndpointConfig) -> Side {
     managed_limited(local, identity, cfg.clone(), false, None, None, |p, l| {
         let output = IcmpOutputLimits {
             messages: 2,

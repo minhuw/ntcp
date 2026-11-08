@@ -499,7 +499,7 @@ mod linux {
             .map_err(host_error)?;
             limits.reassembly = reassembly;
             let mut host = Host::new(
-                path::ContextId::new(u128::from_ne_bytes(identity[..16].try_into().unwrap())),
+                path::ContextId::new(u64::from_ne_bytes(identity[..8].try_into().unwrap())),
                 paths,
                 limits,
                 endpoint.caller_timebase(),

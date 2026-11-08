@@ -234,7 +234,7 @@ impl Network {
         time: ntcp_clock::TransportClock,
     ) -> io::Result<Self> {
         let ipv4 = local.is_ipv4();
-        let mut identity = [0u8; 16];
+        let mut identity = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut identity)?;
         let (paths, mut limits) =
             ntcp_host::managed_limits(config, 1, 1, 1, 2, 1).map_err(host_error)?;
@@ -303,7 +303,7 @@ impl Network {
             ipv4_timeout_seconds: 60,
         };
         let mut host = Host::new(
-            path::ContextId::new(u128::from_ne_bytes(identity)),
+            path::ContextId::new(u64::from_ne_bytes(identity)),
             paths,
             limits,
             endpoint.caller_timebase(),

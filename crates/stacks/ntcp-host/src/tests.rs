@@ -66,7 +66,7 @@ fn addresses(v6: bool) -> (SocketAddr, SocketAddr) {
 }
 fn managed(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: EndpointConfig,
 ) -> (Host, Endpoint, IngressContext) {
     managed_configured(local, identity, cfg, false, None)
@@ -76,7 +76,7 @@ fn managed(
 // lease Identifications.
 fn managed_identified(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: EndpointConfig,
 ) -> (Host, Endpoint, IngressContext) {
     let mut side = managed_limited(local, identity, cfg, false, None, None, |p, mut l| {
@@ -96,7 +96,7 @@ fn managed_identified(
 }
 fn managed_configured(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: EndpointConfig,
     gso: bool,
     path_capacity: Option<usize>,
@@ -106,7 +106,7 @@ fn managed_configured(
 // `denied_hop` is an embedding route policy the Endpoint must enforce.
 fn managed_route_policy(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: EndpointConfig,
     gso: bool,
     path_capacity: Option<usize>,
@@ -116,7 +116,7 @@ fn managed_route_policy(
 }
 fn managed_with(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: EndpointConfig,
     gso: bool,
     path_capacity: Option<usize>,
@@ -140,7 +140,7 @@ fn managed_with(
 // Like `managed_with`, but adjusts every Host limit (e.g. adds UDP flows).
 fn managed_limited(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: EndpointConfig,
     gso: bool,
     path_capacity: Option<usize>,

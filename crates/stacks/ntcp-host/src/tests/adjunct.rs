@@ -32,11 +32,11 @@ fn limits(paths: usize) -> DatagramLimits {
     }
 }
 
-fn side(local: SocketAddr, identity: u128, paths: usize) -> Side {
+fn side(local: SocketAddr, identity: u64, paths: usize) -> Side {
     side_with(local, identity, limits(paths))
 }
 
-fn side_with(local: SocketAddr, identity: u128, datagrams: DatagramLimits) -> Side {
+fn side_with(local: SocketAddr, identity: u64, datagrams: DatagramLimits) -> Side {
     let mut side = managed_limited(local, identity, config(2), false, None, None, |p, mut l| {
         l.datagrams = datagrams;
         let (p, l) = managed_udp_limits(
@@ -771,7 +771,7 @@ fn seeded_model_of_adjunct_events() {
     for v6 in [false, true] {
         for seed in 1..=12u64 {
             let (local, remote) = addresses(v6);
-            let mut a = side(local, 500 + seed as u128, 1);
+            let mut a = side(local, 500 + seed as u64, 1);
             let flow = open(&mut a, local, Some(remote));
             let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
             let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -871,7 +871,7 @@ fn adjunct_report(a: &Side, capability: &Administration, path: path::PathId) -> 
 
 // A flow with fragmentation demand on a path whose learned ceiling is
 // LEARNED, held until the returned instant.
-fn learned_side(v6: bool, identity: u128) -> (Side, UdpFlowId, path::PathId, u64) {
+fn learned_side(v6: bool, identity: u64) -> (Side, UdpFlowId, path::PathId, u64) {
     let (local, remote) = addresses(v6);
     let mut a = side(local, identity, 1);
     let flow = open(&mut a, local, Some(remote));
@@ -892,7 +892,7 @@ fn learned_side(v6: bool, identity: u128) -> (Side, UdpFlowId, path::PathId, u64
 fn upward_set_waits_for_the_hold_then_one_adjunct_probe_targets_the_value() {
     use ntcp::{AdministrativeDeferral, AdministrativeSearch};
     for v6 in [false, true] {
-        let (mut a, flow, path, hold) = learned_side(v6, 430 + u128::from(v6));
+        let (mut a, flow, path, hold) = learned_side(v6, 430 + u64::from(v6));
         let capability = a.0.administration();
         let e0 = effective(&mut a, flow);
         assert_eq!(e0, initial(v6));
@@ -981,7 +981,7 @@ fn failed_targeted_adjunct_probe_does_not_reopen_the_search() {
     use ntcp::{AdministrativeClip, AdministrativeDeferral, AdministrativeSearch};
     const PMTU: u32 = 1400;
     for v6 in [false, true] {
-        let (mut a, flow, path, hold) = learned_side(v6, 440 + u128::from(v6));
+        let (mut a, flow, path, hold) = learned_side(v6, 440 + u64::from(v6));
         let capability = a.0.administration();
         let e0 = effective(&mut a, flow);
         super::admin::set_estimate(&mut a, &capability, MDL + 1, path, Some(UP)).unwrap();
@@ -1084,7 +1084,7 @@ fn failed_targeted_adjunct_probe_does_not_reopen_the_search() {
 fn reply_across_a_discovery_policy_revision_proves_no_size() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 450 + u128::from(v6), 1);
+        let mut a = side(local, 450 + u64::from(v6), 1);
         let flow = open(&mut a, local, Some(remote));
         let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
         let capability = a.0.administration();
@@ -1142,7 +1142,7 @@ fn reply_across_a_discovery_policy_revision_proves_no_size() {
 fn ptb_for_a_probe_sent_before_a_disable_still_lowers_the_shared_estimate() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 455 + u128::from(v6), 1);
+        let mut a = side(local, 455 + u64::from(v6), 1);
         let flow = open(&mut a, local, Some(remote));
         let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
         let capability = a.0.administration();
@@ -1196,7 +1196,7 @@ fn ptb_for_a_probe_sent_before_a_disable_still_lowers_the_shared_estimate() {
 fn discovery_disable_stops_the_adjunct() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 470 + u128::from(v6), 1);
+        let mut a = side(local, 470 + u64::from(v6), 1);
         let flow = open(&mut a, local, Some(remote));
         let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
         let capability = a.0.administration();

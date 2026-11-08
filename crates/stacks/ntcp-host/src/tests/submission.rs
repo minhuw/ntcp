@@ -58,7 +58,7 @@ fn send(side: &mut Side, now: u64) -> Option<Vec<u8>> {
 fn connected(
     v6: bool,
     cfg: &EndpointConfig,
-    identity: u128,
+    identity: u64,
 ) -> (Side, Side, ConnectionId, ConnectionId) {
     let (local, remote) = addresses(v6);
     let mut a = managed(local, identity, cfg.clone());

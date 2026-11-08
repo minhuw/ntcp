@@ -1698,6 +1698,23 @@ impl Ledger {
     pub fn discards(&self) -> usize {
         self.discards
     }
+    /// The class a discarded summary of a TCP flow from `local` to `remote`
+    /// in `zone` shadows: a hash, so distinct flows may share one.
+    #[cfg(test)]
+    pub fn discard_class(
+        &self,
+        local: core::net::SocketAddr,
+        remote: core::net::SocketAddr,
+        zone: Option<LinkId>,
+    ) -> usize {
+        self.discarded.class(Key::Flow {
+            source: local.ip(),
+            destination: remote.ip(),
+            protocol: 6,
+            ports: Some((local.port(), remote.port())),
+            zone,
+        })
+    }
     /// Which evicted evidence `correlate` consulted for a quote: exact
     /// signature hits, and whether a discarded summary shadowed it.
     #[cfg(test)]

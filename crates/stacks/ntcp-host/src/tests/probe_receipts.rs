@@ -22,7 +22,7 @@ const UDP: UdpLimits = UdpLimits {
     probe_receipts: 2,
 };
 
-fn side(local: SocketAddr, identity: u128) -> Side {
+fn side(local: SocketAddr, identity: u64) -> Side {
     let mut side = managed_limited(local, identity, config(2), false, None, None, |p, mut l| {
         l.datagrams = DatagramLimits {
             max_fragments: 8,
@@ -159,7 +159,7 @@ fn set_discovery(a: &mut Side, now: u64, path: path::PathId, disabled: bool) {
 fn receipts_are_reserved_issued_once_expire_and_are_reclaimed() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 9700 + u128::from(v6));
+        let mut a = side(local, 9700 + u64::from(v6));
         let flow = a.0.udp_open(&a.1, local, Some(remote), options()).unwrap();
         let t = 10 * SECOND;
         // An uncertain submission yields no receipt and holds no capacity;
@@ -275,7 +275,7 @@ fn receipts_are_reserved_issued_once_expire_and_are_reclaimed() {
             report(&mut a, later, other, fourth, UdpProbeOutcome::Success).err(),
             Some(ProbeReportError::Foreign)
         );
-        let mut b = side(local, 9800 + u128::from(v6));
+        let mut b = side(local, 9800 + u64::from(v6));
         let flow_b = b.0.udp_open(&b.1, local, Some(remote), options()).unwrap();
         assert_eq!(flow_b, flow, "same slot and generation in another Host");
         assert_eq!(
@@ -303,7 +303,7 @@ fn receipts_are_reserved_issued_once_expire_and_are_reclaimed() {
 fn stale_receipts_after_rebind_decrease_or_discovery_change_are_rejected() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 9710 + u128::from(v6));
+        let mut a = side(local, 9710 + u64::from(v6));
         let flow = a.0.udp_open(&a.1, local, Some(remote), options()).unwrap();
         let path = a.0.udp_path_limits(&a.1, flow, None).unwrap().path;
         let t = 10 * SECOND;
@@ -356,7 +356,7 @@ fn stale_receipts_after_rebind_decrease_or_discovery_change_are_rejected() {
 fn each_outcome_changes_only_the_reporting_flows_bounds_and_sizing() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 9720 + u128::from(v6));
+        let mut a = side(local, 9720 + u64::from(v6));
         let flow = a.0.udp_open(&a.1, local, Some(remote), options()).unwrap();
         let neighbor_local = SocketAddr::new(local.ip(), local.port() + 1);
         let neighbor =
@@ -509,7 +509,7 @@ fn each_outcome_changes_only_the_reporting_flows_bounds_and_sizing() {
 fn owner_granted_writer_offers_success_to_the_shared_estimate_separately() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
-        let mut a = side(local, 9730 + u128::from(v6));
+        let mut a = side(local, 9730 + u64::from(v6));
         let flow = a.0.udp_open(&a.1, local, Some(remote), options()).unwrap();
         let neighbor_local = SocketAddr::new(local.ip(), local.port() + 1);
         let neighbor =
@@ -523,7 +523,7 @@ fn owner_granted_writer_offers_success_to_the_shared_estimate_separately() {
         a.0.service_changes(&mut a.1, t).unwrap();
         let open = t + HOLD;
         // Only the owner's capability grants a writer, per flow generation.
-        let foreign = side(local, 9740 + u128::from(v6)).0.administration();
+        let foreign = side(local, 9740 + u64::from(v6)).0.administration();
         assert_eq!(
             a.0.udp_grant_shared_writer(&foreign, flow).err(),
             Some(Error::Unauthorized)

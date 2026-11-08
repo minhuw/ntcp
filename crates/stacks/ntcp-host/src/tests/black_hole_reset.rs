@@ -54,7 +54,7 @@ fn family(v6: bool) -> (u32, u32, u32) {
 }
 
 impl Net {
-    fn new(v6: bool, identity: u128) -> Self {
+    fn new(v6: bool, identity: u64) -> Self {
         let mut cfg = config(2);
         cfg.connection.pmtud = Some(PmtudConfig {
             initial_search_low: v6.then_some(1400),
@@ -334,7 +334,7 @@ fn managed_reset_is_bounded_by_the_shared_estimate_which_loss_never_changes() {
     for v6 in [false, true] {
         for decrease in [false, true] {
             let (initial, halved, hole) = family(v6);
-            let mut t = Net::new(v6, 7700 + u128::from(v6) * 2 + u128::from(decrease));
+            let mut t = Net::new(v6, 7700 + u64::from(v6) * 2 + u64::from(decrease));
             let bound = if v6 { 1350 } else { 900 };
             let shared = decrease.then_some(bound);
             if decrease {
@@ -384,7 +384,7 @@ fn managed_reset_is_bounded_by_the_shared_estimate_which_loss_never_changes() {
 fn managed_reset_is_bounded_by_an_administrative_estimate() {
     for v6 in [false, true] {
         let (initial, halved, hole) = family(v6);
-        let mut t = Net::new(v6, 7720 + u128::from(v6));
+        let mut t = Net::new(v6, 7720 + u64::from(v6));
         let run = t.stop(hole, 12_000);
         t.check(&run, None);
         assert_eq!(shape(&run)[2..], [(3, initial, initial), (4, halved, halved)]);
@@ -423,7 +423,7 @@ fn managed_reset_is_bounded_by_an_administrative_estimate() {
 fn managed_disabled_discovery_takes_no_fallback_until_re_enabled_in_the_run() {
     for v6 in [false, true] {
         let (initial, halved, _) = family(v6);
-        let mut t = Net::new(v6, 7730 + u128::from(v6));
+        let mut t = Net::new(v6, 7730 + u64::from(v6));
         // Below every packet the path will carry.
         t.hole = if v6 { 1200 } else { 500 };
         t.write(12_000);
@@ -463,7 +463,7 @@ fn managed_disabled_discovery_takes_no_fallback_until_re_enabled_in_the_run() {
 fn managed_ptb_authority_outlives_its_hold_and_path_replacement_releases_it() {
     for v6 in [false, true] {
         let (initial, halved, hole) = family(v6);
-        let mut t = Net::new(v6, 7740 + u128::from(v6));
+        let mut t = Net::new(v6, 7740 + u64::from(v6));
         let reported = if v6 { 1350 } else { 900 };
         t.hole = reported;
         t.ptb = true;

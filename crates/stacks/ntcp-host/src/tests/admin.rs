@@ -9,7 +9,7 @@ use path::{
 
 type Side = (Host, Endpoint, IngressContext);
 
-fn udp_side(local: SocketAddr, identity: u128, cfg: &EndpointConfig) -> Side {
+fn udp_side(local: SocketAddr, identity: u64, cfg: &EndpointConfig) -> Side {
     managed_limited(local, identity, cfg.clone(), false, None, None, |p, l| {
         let (p, l) = managed_udp_limits(
             p,
@@ -91,8 +91,8 @@ fn query_reports_three_values_and_clients_and_policy_alone_changes_no_estimate()
     for v6 in [false, true] {
         let cfg = config(2);
         let (local, remote) = addresses(v6);
-        let mut a = udp_side(local, 9200 + u128::from(v6), &cfg);
-        let mut b = managed(remote, 9300 + u128::from(v6), cfg.clone());
+        let mut a = udp_side(local, 9200 + u64::from(v6), &cfg);
+        let mut b = managed(remote, 9300 + u64::from(v6), cfg.clone());
         let listener = b.1.listen(remote, 2).unwrap();
         let tcp = a
             .1
@@ -271,8 +271,8 @@ fn administrative_estimate_operations_compare_with_the_accepted_estimate() {
     for v6 in [false, true] {
         let cfg = config(2);
         let (local, remote) = addresses(v6);
-        let mut a = managed(local, 9400 + u128::from(v6), cfg.clone());
-        let mut b = managed(remote, 9500 + u128::from(v6), cfg.clone());
+        let mut a = managed(local, 9400 + u64::from(v6), cfg.clone());
+        let mut b = managed(remote, 9500 + u64::from(v6), cfg.clone());
         let listener = b.1.listen(remote, 2).unwrap();
         let tcp = a
             .1
@@ -455,7 +455,7 @@ fn pump_within(a: &mut Side, b: &mut Side, now: &mut u64, limit: usize) {
 
 // A connected pair whose shared path a router's validated PTB lowered to
 // `low` (with its 600-second hold); the repair is delivered at that size.
-fn lowered_by_ptb(v6: bool, identity: u128) -> (Side, Side, ConnectionId, u64) {
+fn lowered_by_ptb(v6: bool, identity: u64) -> (Side, Side, ConnectionId, u64) {
     let cfg = config(2);
     let (local, remote) = addresses(v6);
     let mut a = managed(local, identity, cfg.clone());
@@ -559,7 +559,7 @@ fn upward_set_inside_hold_defers_then_the_targeted_probe_grows_only_to_the_value
     use ntcp::{AdministrativeClip, AdministrativeDeferral, AdministrativeSearch};
     for v6 in [false, true] {
         for clip in [false, true] {
-            let identity = 9700 + 4 * u128::from(v6) + 2 * u128::from(clip);
+            let identity = 9700 + 4 * u64::from(v6) + 2 * u64::from(clip);
             let (mut a, mut b, tcp, mut now) = lowered_by_ptb(v6, identity);
             let low = low(v6);
             let capability = a.0.administration();
@@ -654,7 +654,7 @@ fn upward_set_inside_hold_defers_then_the_targeted_probe_grows_only_to_the_value
 #[test]
 fn failed_targeted_probe_is_not_reopened_by_new_administrative_revisions() {
     for v6 in [false, true] {
-        let (mut a, mut b, tcp, mut now) = lowered_by_ptb(v6, 9720 + u128::from(v6) * 2);
+        let (mut a, mut b, tcp, mut now) = lowered_by_ptb(v6, 9720 + u64::from(v6) * 2);
         let capability = a.0.administration();
         let path = a.0.binding(tcp).unwrap().snapshot.path();
         set_estimate(&mut a, &capability, now, path, Some(UP)).unwrap();
@@ -698,7 +698,7 @@ fn failed_targeted_probe_is_not_reopened_by_new_administrative_revisions() {
 #[test]
 fn downward_set_during_an_active_search_invalidates_the_probe_result() {
     for v6 in [false, true] {
-        let (mut a, mut b, tcp, mut now) = lowered_by_ptb(v6, 9730 + u128::from(v6) * 2);
+        let (mut a, mut b, tcp, mut now) = lowered_by_ptb(v6, 9730 + u64::from(v6) * 2);
         let capability = a.0.administration();
         let path = a.0.binding(tcp).unwrap().snapshot.path();
         let down = if v6 { 1300 } else { 1100 };
@@ -747,7 +747,7 @@ fn downward_set_below_a_working_size_caps_every_later_packet_after_hold_and_agin
     for v6 in [false, true] {
         let cfg = config(2);
         let (local, remote) = addresses(v6);
-        let identity = 9760 + u128::from(v6) * 2;
+        let identity = 9760 + u64::from(v6) * 2;
         let mut a = managed(local, identity, cfg.clone());
         let mut b = managed(remote, identity + 1, cfg.clone());
         let listener = b.1.listen(remote, 2).unwrap();
@@ -843,7 +843,7 @@ fn policy_revision_invalidates_outstanding_ordinary_and_probe_results() {
         for (probe, while_disabled) in [(false, false), (true, false), (false, true)] {
             let cfg = config(2);
             let (local, remote) = addresses(v6);
-            let identity = 9740 + 8 * u128::from(v6) + 4 * u128::from(probe) + 2 * u128::from(while_disabled);
+            let identity = 9740 + 8 * u64::from(v6) + 4 * u64::from(probe) + 2 * u64::from(while_disabled);
             // Its IPv4 output on the disabled route needs Identifications.
             let mut a = managed_identified(local, identity, cfg.clone());
             let mut b = managed(remote, identity + 1, cfg.clone());
@@ -1198,7 +1198,7 @@ fn held_stateless_lease_never_blocks_a_restriction_and_is_refused_at_submission(
         let mut cfg = config(3);
         cfg.ipv4_options_enabled = true;
         let (local, remote) = addresses(v6);
-        let identity = 9990 + 2 * u128::from(v6);
+        let identity = 9990 + 2 * u64::from(v6);
         let mut a = if v6 {
             managed(local, identity, cfg.clone())
         } else {
@@ -1296,7 +1296,7 @@ fn held_stateless_lease_never_blocks_a_restriction_and_is_refused_at_submission(
 #[test]
 fn probe_submitted_before_a_disable_and_acknowledged_after_it_publishes_nothing() {
     for v6 in [false, true] {
-        let (mut a, mut b, tcp, mut now) = lowered_by_ptb(v6, 9760 + 2 * u128::from(v6));
+        let (mut a, mut b, tcp, mut now) = lowered_by_ptb(v6, 9760 + 2 * u64::from(v6));
         let capability = a.0.administration();
         let path = a.0.binding(tcp).unwrap().snapshot.path();
         let route = a.0.binding(tcp).unwrap().snapshot.key().route();

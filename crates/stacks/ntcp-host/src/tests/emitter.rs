@@ -46,7 +46,7 @@ fn counter_entropy(state: Arc<Mutex<u32>>) -> Entropy {
     })
 }
 
-fn side(local: SocketAddr, identity: u128, limits: DatagramLimits) -> Side {
+fn side(local: SocketAddr, identity: u64, limits: DatagramLimits) -> Side {
     let cfg = config(2);
     let mut side = managed_limited(local, identity, cfg, false, None, None, |p, mut l| {
         l.datagrams = limits;
@@ -771,7 +771,7 @@ fn discovery_disable_caps_ipv6_flows_at_1280_and_refuses_probes() {
     for v6 in [false, true] {
         let (local, remote) = addresses(v6);
         let remote = SocketAddr::new(remote.ip(), 7);
-        let mut a = side(local, 9900 + u128::from(v6), datagrams(576));
+        let mut a = side(local, 9900 + u64::from(v6), datagrams(576));
         let flow = a.0.udp_open(&a.1, local, Some(remote), options()).unwrap();
         let before = a.0.udp_path_limits(&a.1, flow, None).unwrap();
         let path = before.path;

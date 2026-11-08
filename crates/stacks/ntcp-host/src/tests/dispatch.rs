@@ -17,7 +17,7 @@ fn send(side: &mut Side, now: u64) -> Option<Vec<u8>> {
     assert!(result == Submission::Submitted);
     Some(frame)
 }
-fn connected(v6: bool, cfg: &EndpointConfig, identity: u128) -> (Side, Side, ConnectionId) {
+fn connected(v6: bool, cfg: &EndpointConfig, identity: u64) -> (Side, Side, ConnectionId) {
     let (local, remote) = addresses(v6);
     let mut a = managed(local, identity, cfg.clone());
     let mut b = managed(remote, identity + 1, cfg.clone());
@@ -600,7 +600,7 @@ fn replay_never_applies_a_deferred_report_to_another_live_generation() {
 
 // One Host context with two links; the local address is registered (and
 // routed) on link 1 only.
-fn two_links(v6: bool, identity: u128, cfg: &EndpointConfig) -> (Side, IngressContext) {
+fn two_links(v6: bool, identity: u64, cfg: &EndpointConfig) -> (Side, IngressContext) {
     let (local, _) = addresses(v6);
     let (mut paths, limits) = managed_limits(cfg, 2, 2, 2, 4, 1).unwrap();
     paths.paths += 1;

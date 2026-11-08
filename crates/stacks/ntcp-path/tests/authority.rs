@@ -6,7 +6,7 @@ fn address(text: &str) -> ScopedAddress {
 fn prefix(text: &str, length: u8) -> IpPrefix {
     IpPrefix::new(text.parse().unwrap(), length).unwrap()
 }
-fn service(context: u128) -> PathService {
+fn service(context: u64) -> PathService {
     PathService::new(
         ContextId::new(context),
         Limits {

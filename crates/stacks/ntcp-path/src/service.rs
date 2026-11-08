@@ -12,13 +12,13 @@ use crate::{Error, Ipv4Plateaus};
 /// Embeddings must allocate distinct values for independent network contexts;
 /// addresses and interface indices do not establish context identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct ContextId(u128);
+pub struct ContextId(u64);
 
 impl ContextId {
-    pub const fn new(value: u128) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
-    pub const fn value(self) -> u128 {
+    pub const fn value(self) -> u64 {
         self.0
     }
 }
@@ -48,11 +48,11 @@ impl LinkId {
     /// The complete identity (context, slot, generation) as fixed-width
     /// big-endian octets: keyed digests of scoped identities include it, so
     /// a recycled slot never names the same zone.
-    pub fn to_bytes(self) -> [u8; 32] {
-        let mut bytes = [0; 32];
-        bytes[..16].copy_from_slice(&self.0.context.0.to_be_bytes());
-        bytes[16..24].copy_from_slice(&(self.0.slot as u64).to_be_bytes());
-        bytes[24..].copy_from_slice(&self.0.generation.to_be_bytes());
+    pub fn to_bytes(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.0.context.0.to_be_bytes());
+        bytes[8..16].copy_from_slice(&(self.0.slot as u64).to_be_bytes());
+        bytes[16..].copy_from_slice(&self.0.generation.to_be_bytes());
         bytes
     }
 }

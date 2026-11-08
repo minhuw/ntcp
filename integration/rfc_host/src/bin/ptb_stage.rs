@@ -110,12 +110,12 @@ impl Network {
         tun: Tun,
         time: ntcp_clock::TransportClock,
     ) -> io::Result<Self> {
-        let mut identity = [0u8; 16];
+        let mut identity = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut identity)?;
         let (paths, limits) =
             ntcp_host::managed_limits(config, 1, 1, 1, 1, 1).map_err(host_error)?;
         let mut host = Host::new(
-            path::ContextId::new(u128::from_ne_bytes(identity)),
+            path::ContextId::new(u64::from_ne_bytes(identity)),
             paths,
             limits,
             endpoint.caller_timebase(),

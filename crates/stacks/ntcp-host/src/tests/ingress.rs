@@ -30,7 +30,7 @@ fn reassembly() -> ReassemblyLimits {
     }
 }
 
-fn side(local: SocketAddr, identity: u128, cfg: &EndpointConfig, output: IcmpOutputLimits) -> Side {
+fn side(local: SocketAddr, identity: u64, cfg: &EndpointConfig, output: IcmpOutputLimits) -> Side {
     managed_limited(local, identity, cfg.clone(), false, None, None, |p, l| {
         let (p, l) = managed_udp_limits(p, l, UDP).unwrap();
         let (p, mut l) = managed_icmp_output_limits(p, l, output).unwrap();
@@ -850,7 +850,7 @@ fn reconstruct(frames: &[Vec<u8>]) -> (IpMetadata, Vec<u8>, Vec<(usize, bool, Op
     (outer.unwrap(), data, shape)
 }
 
-fn fragmenting_side(local: SocketAddr, identity: u128, capacity: bool) -> Side {
+fn fragmenting_side(local: SocketAddr, identity: u64, capacity: bool) -> Side {
     let mut side = unstarted_fragmenting_side(local, identity, capacity);
     side.0.start_identifiers(Continuity::Fresh).unwrap();
     side
@@ -858,7 +858,7 @@ fn fragmenting_side(local: SocketAddr, identity: u128, capacity: bool) -> Side {
 
 // `fragmenting_side` whose identifier allocator is not started: no
 // identifier can be issued.
-fn unstarted_fragmenting_side(local: SocketAddr, identity: u128, capacity: bool) -> Side {
+fn unstarted_fragmenting_side(local: SocketAddr, identity: u64, capacity: bool) -> Side {
     let cfg = config(2);
     let mut side = managed_limited(local, identity, cfg, false, None, None, |p, mut l| {
         l.datagrams = DatagramLimits {
@@ -1053,7 +1053,7 @@ fn queued_oversized_echo_reply_never_blocks_a_restriction_and_is_counted_unsent(
                 continue;
             }
             let (local, remote) = addresses(v6);
-            let identity = 9994 + 4 * u128::from(v6) + 2 * u128::from(disable);
+            let identity = 9994 + 4 * u64::from(v6) + 2 * u64::from(disable);
             let mut a = fragmenting_side(local, identity, false);
             let cfg = config(2);
             let mut b = managed(remote, identity + 1, cfg.clone());
@@ -1205,7 +1205,7 @@ fn df_clear_echo_replies_are_held_while_no_identifier_can_be_issued() {
     const MDL: u64 = 120_000_000;
     let (local, remote) = addresses(false);
     for size in [100usize, 1420] {
-        let mut a = fragmenting_side(local, 9993 + size as u128, true);
+        let mut a = fragmenting_side(local, 9993 + size as u64, true);
         withhold_identifiers(&mut a, remote.ip());
         let capability = a.0.administration();
         let prefix = path::IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap();
@@ -1338,7 +1338,7 @@ fn an_identifier_blocked_reply_does_not_hold_other_destinations_output() {
 // withheld until one MDL, discovery disabled on the exact path to it (DF clear): the
 // queued replies to it are held by an icmp_output attempt. Returns the
 // side, the neighbor on an enabled path and the disabled path.
-fn held_replies_side(identity: u128) -> (Side, IpAddr, path::PathId) {
+fn held_replies_side(identity: u64) -> (Side, IpAddr, path::PathId) {
     let (local, remote) = addresses(false);
     let neighbor: IpAddr = "198.51.100.7".parse().unwrap();
     let mut a = fragmenting_side(local, identity, true);
@@ -1513,7 +1513,7 @@ fn a_reassembly_error_displaces_a_held_reply_from_a_full_queue() {
 fn a_full_queue_without_held_messages_drops_new_messages() {
     let (local, remote) = addresses(false);
     for attempted in [false, true] {
-        let (mut a, neighbor, disabled) = held_replies_side(9998 + u128::from(attempted));
+        let (mut a, neighbor, disabled) = held_replies_side(9998 + u64::from(attempted));
         let (source, path) = if attempted {
             (neighbor, None)
         } else {
@@ -2086,7 +2086,7 @@ fn maximal_echo_option_areas_are_answered_within_forty_octets() {
     cases.push((received, 2, HOP_B));
     for (n, (options, reversed, first_hop)) in cases.into_iter().enumerate() {
         assert_eq!(options.len().div_ceil(4) * 4, 40);
-        let mut a = fragmenting_side(local, 10_200 + n as u128, true);
+        let mut a = fragmenting_side(local, 10_200 + n as u64, true);
         receive_profile(&mut a, true, true);
         let frame = with_ipv4_options(&echo(to_us, 1, n as u16, &[n as u8; 32]), &options);
         let mut clock = Samples::default();

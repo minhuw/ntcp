@@ -129,8 +129,8 @@ fn host_ptb_repairs_exact_quoted_range_of_the_quoted_connection_only() {
     for v6 in [false, true] {
         let cfg = cfg();
         let (local, remote) = addresses(v6);
-        let mut a = managed(local, 7000 + u128::from(v6), cfg.clone());
-        let mut b = managed(remote, 7100 + u128::from(v6), cfg.clone());
+        let mut a = managed(local, 7000 + u64::from(v6), cfg.clone());
+        let mut b = managed(remote, 7100 + u64::from(v6), cfg.clone());
         b.1.listen(remote, 4).unwrap();
         let flow_a = connect(&mut a, &cfg, 1000, 0);
         let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -236,7 +236,7 @@ fn deferred_report_survives_ledger_eviction_and_path_replacement() {
         for replace in [false, true] {
             let cfg = cfg();
             let (local, remote) = addresses(v6);
-            let identity = 7200 + u128::from(v6) * 2 + u128::from(replace);
+            let identity = 7200 + u64::from(v6) * 2 + u64::from(replace);
             let send_capacity = cfg.connection.send_capacity;
             let mut a = managed_with(local, identity, cfg.clone(), false, None, None, |l| {
                 l.segment_bytes = send_capacity;
@@ -333,8 +333,8 @@ fn deferred_report_about_data_acknowledged_meanwhile_is_rejected_on_replay() {
     for v6 in [false, true] {
         let cfg = cfg();
         let (local, remote) = addresses(v6);
-        let mut a = managed(local, 7300 + u128::from(v6), cfg.clone());
-        let mut b = managed(remote, 7350 + u128::from(v6), cfg.clone());
+        let mut a = managed(local, 7300 + u64::from(v6), cfg.clone());
+        let mut b = managed(remote, 7350 + u64::from(v6), cfg.clone());
         b.1.listen(remote, 4).unwrap();
         let id = connect(&mut a, &cfg, 1000, 0);
         let mut now = 0;
@@ -380,7 +380,7 @@ fn host_reserved_ptb_repair_raced_by_decrease_is_one_physical_packet_in_restart(
         for mode in [Scalar, ZeroCopy, PartialGso] {
             let cfg = cfg();
             let (local, remote) = addresses(v6);
-            let identity = 7400 + u128::from(v6) * 4 + mode as u128;
+            let identity = 7400 + u64::from(v6) * 4 + mode as u64;
             let mut a = managed_configured(local, identity, cfg.clone(), mode == PartialGso, None);
             let mut b = managed(remote, identity + 100, cfg.clone());
             b.1.listen(remote, 4).unwrap();
@@ -836,7 +836,7 @@ fn randomized_host_tcp_drop_repair_never_acts_beyond_the_model() {
             let mut rng = Rng((seed + 50 * u64::from(v6)).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let cfg = cfg();
             let (local, remote) = addresses(v6);
-            let identity = 7600 + u128::from(seed) * 2 + u128::from(v6);
+            let identity = 7600 + u64::from(seed) * 2 + u64::from(v6);
             let mut a = managed(local, identity, cfg.clone());
             // The peer outlives every generation the driver opens.
             let peer_cfg = EndpointConfig {

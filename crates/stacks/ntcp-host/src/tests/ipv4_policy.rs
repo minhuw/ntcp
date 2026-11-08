@@ -84,7 +84,7 @@ fn disabled_ipv4_route_clears_df_and_applies_the_sending_limit_to_tcp() {
     for (estimate, limit) in [(None, 576), (Some(1400), 1400)] {
         let cfg = config(4);
         let (local, remote) = addresses(false);
-        let identity = 9900 + u128::from(limit);
+        let identity = 9900 + u64::from(limit);
         let mut a = managed_identified(local, identity, cfg.clone());
         let mut b = managed(remote, identity + 1, cfg.clone());
         let listener = b.1.listen(remote, 4).unwrap();
@@ -306,7 +306,7 @@ const UDP: UdpLimits = UdpLimits {
     probe_receipts: 2,
 };
 
-fn udp_side(identity: u128) -> Side {
+fn udp_side(identity: u64) -> Side {
     let (local, _) = addresses(false);
     let mut side = managed_limited(local, identity, config(2), false, None, None, |p, mut l| {
         l.datagrams = DatagramLimits {

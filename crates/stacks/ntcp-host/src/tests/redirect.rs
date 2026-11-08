@@ -32,7 +32,7 @@ fn unscoped(address: IpAddr) -> ScopedAddress {
 fn next_hop(side: &Side, id: ConnectionId) -> ResolvedNextHop {
     side.0.binding(id).unwrap().snapshot.key().next_hop()
 }
-fn endpoint(cfg: &EndpointConfig, identity: u128, owned: IpAddr) -> Endpoint {
+fn endpoint(cfg: &EndpointConfig, identity: u64, owned: IpAddr) -> Endpoint {
     Endpoint::new(cfg.clone(), [identity as u8; 32], 0, move |request| match request {
         ntcp::AddressValidation::Bind { local } | ntcp::AddressValidation::Open { local, .. } => {
             local == owned
@@ -46,7 +46,7 @@ fn endpoint(cfg: &EndpointConfig, identity: u128, owned: IpAddr) -> Endpoint {
 // IPv4: 192.0.2.1 on a link whose embedding resolves IP next hops, with a
 // default route through gateway 192.0.2.254 and the connected
 // 192.0.2.0/24.
-fn gateway_side(identity: u128, cfg: &EndpointConfig, gso: bool) -> Side {
+fn gateway_side(identity: u64, cfg: &EndpointConfig, gso: bool) -> Side {
     let local = v4("192.0.2.1");
     let (paths, limits) = managed_limits(cfg, 1, 1, 1, 4, 1).unwrap();
     let (paths, limits) = managed_udp_limits(paths, limits, UDP).unwrap();
@@ -117,7 +117,7 @@ fn remote4() -> SocketAddr {
 
 // An established connection from the gateway side, with one full data
 // segment submitted and lost (outstanding, so the ledger still holds it).
-fn ipv4_connection(identity: u128, cfg: &EndpointConfig, dscp: u8) -> (Side, Side, ConnectionId, Vec<u8>) {
+fn ipv4_connection(identity: u64, cfg: &EndpointConfig, dscp: u8) -> (Side, Side, ConnectionId, Vec<u8>) {
     let mut a = gateway_side(identity, cfg, false);
     let mut b = managed(remote4(), identity + 1, cfg.clone());
     let listener = b.1.listen(remote4(), 2).unwrap();
@@ -166,7 +166,7 @@ fn dispatch(side: &mut Side, now: u64, report: &[u8]) -> RedirectOutcome {
 fn ipv4_redirects_move_the_destination_and_notify_tcp_and_udp() {
     for code in [1, 0] {
         let cfg = config(2);
-        let (mut a, _b, id, data) = ipv4_connection(600 + u128::from(code) * 2, &cfg, 0);
+        let (mut a, _b, id, data) = ipv4_connection(600 + u64::from(code) * 2, &cfg, 0);
         let flow = a
             .0
             .udp_open(
@@ -535,10 +535,10 @@ fn nd_receive() -> ReceiveCapabilities {
     }
 }
 
-fn nd_side(identity: u128, cfg: &EndpointConfig) -> Side {
+fn nd_side(identity: u64, cfg: &EndpointConfig) -> Side {
     nd_side_with(identity, cfg, IcmpOutputLimits::default())
 }
-fn nd_side_with(identity: u128, cfg: &EndpointConfig, output: IcmpOutputLimits) -> Side {
+fn nd_side_with(identity: u64, cfg: &EndpointConfig, output: IcmpOutputLimits) -> Side {
     let (paths, mut limits) = managed_limits(cfg, 2, 2, 2, 2, 0).unwrap();
     limits.neighbors = NeighborLimits {
         entries: 4,
@@ -696,7 +696,7 @@ fn scoped(side: &Side, address: &str) -> ResolvedNextHop {
 }
 
 // A connection through fe80::1 whose SYN was submitted to its mapping.
-fn ipv6_connection(identity: u128) -> (Side, ConnectionId, Vec<u8>) {
+fn ipv6_connection(identity: u64) -> (Side, ConnectionId, Vec<u8>) {
     let cfg = config(2);
     let mut a = nd_side(identity, &cfg);
     learn_router(&mut a, v6("fe80::1"), R1, 0);
@@ -995,7 +995,7 @@ fn ipv6_redirect_rejections_change_nothing() {
 // each with one full data segment submitted and lost; returns their
 // identifiers and those segments.
 fn ipv4_dscp_pair(
-    identity: u128,
+    identity: u64,
     cfg: &EndpointConfig,
     dscp: u8,
 ) -> (Side, Side, [(ConnectionId, Vec<u8>); 2]) {
@@ -1053,7 +1053,7 @@ fn ipv4_redirect_sequences_follow_each_dscp_first_hop() {
     for (specific, general) in [(2, 1), (3, 0)] {
         let cfg = config(2);
         let (mut a, _b, [(plain, data0), (marked, data24)]) =
-            ipv4_dscp_pair(660 + u128::from(specific) * 2, &cfg, 24);
+            ipv4_dscp_pair(660 + u64::from(specific) * 2, &cfg, 24);
         let gateway = ResolvedNextHop::Address(unscoped(v4("192.0.2.254")));
         let hop = |address| ResolvedNextHop::Address(unscoped(v4(address)));
         let other = |a: &Side| {
@@ -1126,7 +1126,7 @@ fn ipv4_general_redirect_rebinds_connections_of_every_dscp() {
     for code in [0, 1] {
         let cfg = config(2);
         let (mut a, _b, [(plain, data0), (marked, _)]) =
-            ipv4_dscp_pair(680 + u128::from(code) * 2, &cfg, 46);
+            ipv4_dscp_pair(680 + u64::from(code) * 2, &cfg, 46);
         assert_eq!(
             dispatch(&mut a, SECOND, &redirect4(&data0, code, "192.0.2.253")),
             RedirectOutcome::Installed

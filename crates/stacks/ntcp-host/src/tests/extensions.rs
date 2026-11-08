@@ -29,13 +29,13 @@ const REASSEMBLY: ReassemblyLimits = ReassemblyLimits {
     ipv4_timeout_seconds: 60,
 };
 
-fn side(local: SocketAddr, identity: u128, cfg: &EndpointConfig) -> Side {
+fn side(local: SocketAddr, identity: u64, cfg: &EndpointConfig) -> Side {
     side_with(local, identity, cfg, REASSEMBLY)
 }
 
 fn side_with(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: &EndpointConfig,
     reassembly: ReassemblyLimits,
 ) -> Side {

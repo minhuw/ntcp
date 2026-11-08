@@ -36,7 +36,7 @@ fn reassembly(datagram: usize) -> ReassemblyLimits {
 // further link only exists (and may be the largest).
 fn side(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     cfg: &EndpointConfig,
     links: &[Link],
     reassembly: Option<ReassemblyLimits>,

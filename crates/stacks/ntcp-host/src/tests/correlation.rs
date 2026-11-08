@@ -967,7 +967,7 @@ fn randomized_host_dispatch_never_acts_beyond_the_reference_model() {
             };
             let mut side = managed_limited(
                 local,
-                3000 + u128::from(seed) + 100 * u128::from(v6),
+                3000 + u64::from(seed) + 100 * u64::from(v6),
                 cfg.clone(),
                 false,
                 None,

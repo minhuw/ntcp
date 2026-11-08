@@ -14,7 +14,7 @@ const UDP: UdpLimits = UdpLimits {
     probe_receipts: 2,
 };
 
-fn udp_side(local: SocketAddr, identity: u128, cfg: &EndpointConfig) -> Side {
+fn udp_side(local: SocketAddr, identity: u64, cfg: &EndpointConfig) -> Side {
     managed_limited(local, identity, cfg.clone(), false, None, None, |p, l| {
         let (p, l) = managed_udp_limits(p, l, UDP).unwrap();
         (p, l, 1)
@@ -81,7 +81,7 @@ fn link_remote(v6: bool) -> IpAddr {
 // reached by its own host route (a path whose link differs; a route selects
 // links by destination, source and DSCP only, so it is a distinct
 // destination's route).
-fn isolating_side(local: SocketAddr, identity: u128, cfg: &EndpointConfig) -> Side {
+fn isolating_side(local: SocketAddr, identity: u64, cfg: &EndpointConfig) -> Side {
     let v6 = local.is_ipv6();
     let source = second_source(v6);
     let (paths, limits) = managed_limits(cfg, 2, 2, 2, 4, 1).unwrap();
@@ -218,8 +218,8 @@ fn quoted_flow_decrease_reaches_every_subscriber_and_isolated_paths_stay_unchang
     for v6 in [false, true] {
         let cfg = config(4);
         let (local, remote) = addresses(v6);
-        let mut a = isolating_side(local, 4100 + u128::from(v6), &cfg);
-        let mut b = managed(remote, 4200 + u128::from(v6), cfg.clone());
+        let mut a = isolating_side(local, 4100 + u64::from(v6), &cfg);
+        let mut b = managed(remote, 4200 + u64::from(v6), cfg.clone());
         let listener = b.1.listen(remote, 4).unwrap();
         let flow_a = connect(&mut a, &cfg, 1000, 0);
         let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -362,8 +362,8 @@ fn source_and_link_isolated_paths_survive_every_shared_publication() {
         let cfg = config(4);
         let units = cfg.connection.timebase.units_per_second;
         let (local, remote) = addresses(v6);
-        let mut a = isolating_side(local, 5500 + u128::from(v6), &cfg);
-        let mut b = managed(remote, 5600 + u128::from(v6), cfg.clone());
+        let mut a = isolating_side(local, 5500 + u64::from(v6), &cfg);
+        let mut b = managed(remote, 5600 + u64::from(v6), cfg.clone());
         let listener = b.1.listen(remote, 4).unwrap();
         let flow_a = connect(&mut a, &cfg, 1000, 0);
         let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -487,8 +487,8 @@ fn retired_route_generation_is_never_changed_or_resurrected() {
         let cfg = config(4);
         let units = cfg.connection.timebase.units_per_second;
         let (local, remote) = addresses(v6);
-        let mut a = udp_side(local, 5700 + u128::from(v6), &cfg);
-        let mut b = managed(remote, 5800 + u128::from(v6), cfg.clone());
+        let mut a = udp_side(local, 5700 + u64::from(v6), &cfg);
+        let mut b = managed(remote, 5800 + u64::from(v6), cfg.clone());
         let listener = b.1.listen(remote, 4).unwrap();
         let flow_a = connect(&mut a, &cfg, 1000, 0);
         let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -624,8 +624,8 @@ fn udp_quoted_decrease_notifies_every_tcp_connection_on_the_path() {
     for v6 in [false, true] {
         let cfg = config(4);
         let (local, remote) = addresses(v6);
-        let mut a = udp_side(local, 4150 + u128::from(v6), &cfg);
-        let mut b = managed(remote, 4250 + u128::from(v6), cfg.clone());
+        let mut a = udp_side(local, 4150 + u64::from(v6), &cfg);
+        let mut b = managed(remote, 4250 + u64::from(v6), cfg.clone());
         b.1.listen(remote, 4).unwrap();
         let tcp = [
             connect(&mut a, &cfg, 1000, 0),
@@ -693,7 +693,7 @@ fn fragment_quotes_of_unfragmented_datagrams_do_not_correlate() {
     for v6 in [false, true] {
         let cfg = config(4);
         let (local, remote) = addresses(v6);
-        let mut a = udp_side(local, 4170 + u128::from(v6), &cfg);
+        let mut a = udp_side(local, 4170 + u64::from(v6), &cfg);
         let udp = flow(&mut a, 5000, remote.ip(), 0);
         let path = limits(&mut a, udp).path;
         let mut packet = [0; 1600];
@@ -785,8 +785,8 @@ fn failed_client_stays_dirty_while_others_are_served() {
     for v6 in [false, true] {
         let cfg = config(4);
         let (local, remote) = addresses(v6);
-        let mut a = udp_side(local, 4300 + u128::from(v6), &cfg);
-        let mut b = managed(remote, 4400 + u128::from(v6), cfg.clone());
+        let mut a = udp_side(local, 4300 + u64::from(v6), &cfg);
+        let mut b = managed(remote, 4400 + u64::from(v6), cfg.clone());
         b.1.listen(remote, 4).unwrap();
         let flow_a = connect(&mut a, &cfg, 1000, 0);
         let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -869,7 +869,7 @@ fn change_notifications_coalesce_survive_sends_and_end_with_the_flow() {
     for v6 in [false, true] {
         let cfg = config(2);
         let (local, remote) = addresses(v6);
-        let mut a = udp_side(local, 4500 + u128::from(v6), &cfg);
+        let mut a = udp_side(local, 4500 + u64::from(v6), &cfg);
         let id = flow(&mut a, 5000, remote.ip(), 0);
         let path = limits(&mut a, id).path;
         let sizes: &[u32] = if v6 {
@@ -966,7 +966,7 @@ fn repinned_flow_reports_the_changed_destination_never_the_new_pin() {
             for send_to_y in [false, true] {
                 let cfg = config(2);
                 let (local, remote) = addresses(v6);
-                let mut a = udp_side(local, 4550 + u128::from(v6), &cfg);
+                let mut a = udp_side(local, 4550 + u64::from(v6), &cfg);
                 let options = UdpOptions {
                     dscp: 0,
                     hop_limit: 64,
@@ -1064,8 +1064,8 @@ fn applied_deferred_report_publishes_exactly_once_and_stale_results_never() {
         for case in [Applied, AckCancelled, Released, Rebound, Subsumed] {
             let cfg = config(4);
             let (local, remote) = addresses(v6);
-            let mut a = managed(local, 4600 + u128::from(v6), cfg.clone());
-            let mut b = managed(remote, 4700 + u128::from(v6), cfg.clone());
+            let mut a = managed(local, 4600 + u64::from(v6), cfg.clone());
+            let mut b = managed(remote, 4700 + u64::from(v6), cfg.clone());
             let listener = b.1.listen(remote, 4).unwrap();
             let flow_a = connect(&mut a, &cfg, 1000, 0);
             let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -1204,8 +1204,8 @@ fn delivered_probe_after_hold_raises_shared_ceiling_and_stale_proof_never() {
         ] {
             let cfg = config(4);
             let (local, remote) = addresses(v6);
-            let mut a = managed(local, 4800 + u128::from(v6), cfg.clone());
-            let mut b = managed(remote, 4900 + u128::from(v6), cfg.clone());
+            let mut a = managed(local, 4800 + u64::from(v6), cfg.clone());
+            let mut b = managed(remote, 4900 + u64::from(v6), cfg.clone());
             b.1.listen(remote, 4).unwrap();
             let flow_a = connect(&mut a, &cfg, 1000, 24);
             let flow_b = connect(&mut a, &cfg, 1001, 24);
@@ -1429,8 +1429,8 @@ fn unchanged_tcp_report_still_lowers_shared_record_and_restarts_hold() {
         for duplicate in [true, false] {
             let cfg = config(4);
             let (local, remote) = addresses(v6);
-            let mut a = udp_side(local, 5100 + u128::from(v6), &cfg);
-            let mut b = managed(remote, 5200 + u128::from(v6), cfg.clone());
+            let mut a = udp_side(local, 5100 + u64::from(v6), &cfg);
+            let mut b = managed(remote, 5200 + u64::from(v6), cfg.clone());
             b.1.listen(remote, 4).unwrap();
             let flow_a = connect(&mut a, &cfg, 1000, 0);
             let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -1540,8 +1540,8 @@ fn below_proven_delivery_report_shared_outcome_ignores_loss_inference() {
                         ntcp::Ipv4Plateaus::RFC1191;
                 }
                 let (local, remote) = addresses(v6);
-                let mut a = udp_side(local, 5300 + u128::from(v6), &cfg);
-                let mut b = managed(remote, 5400 + u128::from(v6), cfg.clone());
+                let mut a = udp_side(local, 5300 + u64::from(v6), &cfg);
+                let mut b = managed(remote, 5400 + u64::from(v6), cfg.clone());
                 b.1.listen(remote, 4).unwrap();
                 let flow_a = connect(&mut a, &cfg, 1000, 0);
                 let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -2136,9 +2136,9 @@ fn successive_decreases_during_held_reservation_then_increase_keep_prefix_and_ch
             let mut cfg = config(4);
             cfg.connection.pmtud.as_mut().unwrap().initial_search_low = Some(1500);
             let (local, remote) = addresses(v6);
-            let identity = 5000 + u128::from(v6);
+            let identity = 5000 + u64::from(v6);
             let mut a = managed_configured(local, identity, cfg.clone(), mode == PartialGso, None);
-            let mut b = managed(remote, 5100 + u128::from(v6), cfg.clone());
+            let mut b = managed(remote, 5100 + u64::from(v6), cfg.clone());
             let listener = b.1.listen(remote, 4).unwrap();
             let flow_a = connect(&mut a, &cfg, 1000, 0);
             let flow_b = connect(&mut a, &cfg, 1001, 0);
@@ -2400,8 +2400,8 @@ fn randomized_shared_fanout_converges_and_isolates_paths() {
         let cfg = config(4);
         let second = cfg.connection.timebase.units_per_second;
         let (local, remote) = addresses(v6);
-        let mut a = isolating_side(local, 6000 + u128::from(seed), &cfg);
-        let mut b = managed(remote, 7000 + u128::from(seed), cfg.clone());
+        let mut a = isolating_side(local, 6000 + u64::from(seed), &cfg);
+        let mut b = managed(remote, 7000 + u64::from(seed), cfg.clone());
         let listener = b.1.listen(remote, 4).unwrap();
         let tcp = [
             connect(&mut a, &cfg, 1000, 0),

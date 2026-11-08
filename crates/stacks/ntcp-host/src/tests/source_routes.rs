@@ -8,7 +8,7 @@ const LATER: [u8; 2] = [10, 11];
 fn hop(last: u8) -> Ipv4Addr {
     Ipv4Addr::new(192, 0, 2, last)
 }
-pub(super) fn routed(local: SocketAddr, identity: u128, cfg: EndpointConfig) -> Peer {
+pub(super) fn routed(local: SocketAddr, identity: u64, cfg: EndpointConfig) -> Peer {
     let mut peer = managed(local, identity, cfg);
     peer.0.ports[0].as_mut().unwrap().receive.ipv4 = Ipv4Receive::Enabled {
         interpretation: true,

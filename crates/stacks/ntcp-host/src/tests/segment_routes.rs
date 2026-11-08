@@ -49,7 +49,7 @@ fn segments() -> [Ipv6Addr; 2] {
     ]
 }
 
-fn side(local: SocketAddr, identity: u128, adjunct_paths: usize) -> Side {
+fn side(local: SocketAddr, identity: u64, adjunct_paths: usize) -> Side {
     side_with(
         local,
         identity,
@@ -60,7 +60,7 @@ fn side(local: SocketAddr, identity: u128, adjunct_paths: usize) -> Side {
 
 fn side_with(
     local: SocketAddr,
-    identity: u128,
+    identity: u64,
     adjunct_paths: usize,
     connectionless: ConnectionlessSizing,
 ) -> Side {
@@ -1045,7 +1045,7 @@ fn adjunct_probe_without_room_for_the_header_is_not_sent() {
     assert_eq!((counters.probes, counters.not_sent), (0, 1));
 }
 
-fn tcp_side(local: SocketAddr, identity: u128, cfg: EndpointConfig, gso: bool) -> Side {
+fn tcp_side(local: SocketAddr, identity: u64, cfg: EndpointConfig, gso: bool) -> Side {
     let mut side = managed_limited(local, identity, cfg, gso, None, None, |mut p, l| {
         p.routes += 1;
         (p, l, 1)
@@ -1306,9 +1306,9 @@ fn ptb_quoting_srh_tcp_lowers_only_that_segment_route() {
     for left in [2usize, 1] {
         let cfg = full_size_config();
         let (local, remote) = addresses(true);
-        let mut a = tcp_side(local, 1740 + left as u128, cfg.clone(), false);
+        let mut a = tcp_side(local, 1740 + left as u64, cfg.clone(), false);
         segment_route(&mut a, remote.ip());
-        let mut b = tcp_side(remote, 1750 + left as u128, cfg.clone(), false);
+        let mut b = tcp_side(remote, 1750 + left as u64, cfg.clone(), false);
         let listener = b.1.listen(remote, 4).unwrap();
         let id =
             a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
@@ -1671,7 +1671,7 @@ fn tcp_whose_header_no_longer_fits_fails_admission() {
 }
 
 // A peer's timestamped SYN to `to`, where nothing listens.
-fn closed_port_syn(from: SocketAddr, to: SocketAddr, identity: u128) -> Vec<u8> {
+fn closed_port_syn(from: SocketAddr, to: SocketAddr, identity: u64) -> Vec<u8> {
     let cfg = config(4);
     let mut peer = tcp_side(from, identity, cfg.clone(), false);
     peer.1

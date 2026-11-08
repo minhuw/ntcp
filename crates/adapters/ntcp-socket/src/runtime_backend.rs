@@ -535,7 +535,7 @@ impl Owner {
         let mtu = links.iter().map(|l| l.0).max().ok_or(EINVAL)?;
         let overhead = links.iter().map(|l| l.1).max().ok_or(EINVAL)?;
         let max_ip_packet = links.iter().map(|l| l.2).max().ok_or(EINVAL)?;
-        let mut identity = [0; 16];
+        let mut identity = [0; 8];
         ports::fill(&mut identity)?;
         use ntcp_host::{Forwarding, Ipv4Receive, Ipv6Receive, ReceiveCapabilities, path};
         // Occupied transports + provisional TIME-WAIT generation + stateless
@@ -621,7 +621,7 @@ impl Owner {
         );
         let message_bytes = limits.icmp_output.message_bytes;
         let mut host = ntcp_host::Host::new(
-            path::ContextId::new(u128::from_ne_bytes(identity)),
+            path::ContextId::new(u64::from_ne_bytes(identity)),
             paths,
             limits,
             self.endpoint.caller_timebase(),

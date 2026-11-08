@@ -481,10 +481,10 @@ fn managed_native_live_class_capacity_failure_preserves_socket_core_client_and_d
     let link = previous.paths().link(ingress.link()).unwrap();
     let (mut paths, limits) = ntcp_host::managed_limits(&owner.defaults, 1, 1, 1, 1, 1).unwrap();
     paths.paths = 1;
-    let mut identity = [0; 16];
+    let mut identity = [0; 8];
     ports::fill(&mut identity).unwrap();
     let mut host = ntcp_host::Host::new(
-        path::ContextId::new(u128::from_ne_bytes(identity)),
+        path::ContextId::new(u64::from_ne_bytes(identity)),
         paths,
         limits,
         owner.endpoint.caller_timebase(),

@@ -11,7 +11,7 @@ const REMOTE: &str = "[fe80::2]:8080";
 
 // A Host with `links` links, each owning `address` (scoped to it) and
 // routing fe80::/64 on-link-scope through its own forwarder.
-fn scoped_side(address: &str, links: usize, identity: u128, cfg: &EndpointConfig) -> Peer {
+fn scoped_side(address: &str, links: usize, identity: u64, cfg: &EndpointConfig) -> Peer {
     scoped_side_with(address, links, identity, cfg, 0)
 }
 
@@ -19,7 +19,7 @@ fn scoped_side(address: &str, links: usize, identity: u128, cfg: &EndpointConfig
 fn scoped_side_with(
     address: &str,
     links: usize,
-    identity: u128,
+    identity: u64,
     cfg: &EndpointConfig,
     flows: usize,
 ) -> Peer {
@@ -159,7 +159,7 @@ fn tuple() -> Tuple {
     }
 }
 
-fn peers(cfg: &EndpointConfig, identity: u128) -> Vec<Peer> {
+fn peers(cfg: &EndpointConfig, identity: u64) -> Vec<Peer> {
     (0..2)
         .map(|index| {
             let mut peer = scoped_side(REMOTE, 1, identity + index, cfg);
@@ -173,7 +173,7 @@ fn peers(cfg: &EndpointConfig, identity: u128) -> Vec<Peer> {
 }
 
 // Both links carry the same fe80::1:1000 -> fe80::2:8080 connection.
-fn two_scoped_connections(cfg: &EndpointConfig, identity: u128) -> (Peer, Vec<Peer>, [ConnectionId; 2], u64) {
+fn two_scoped_connections(cfg: &EndpointConfig, identity: u64) -> (Peer, Vec<Peer>, [ConnectionId; 2], u64) {
     let mut a = scoped_side(LOCAL, 2, identity, cfg);
     let mut b = peers(cfg, identity + 10);
     let mut ids = [None; 2];
@@ -296,8 +296,22 @@ fn ptb_lowers_only_the_link_whose_submission_it_quotes() {
 #[test]
 fn discarded_history_of_one_link_leaves_the_other_links_ptb_attributable() {
     let cfg = config(4);
-    let mut a = scoped_side(LOCAL, 2, 7250, &cfg);
-    let mut b = peers(&cfg, 7260);
+    // Discarded summaries shadow hash classes of flow keys. The case needs
+    // the four-tuple's keys on the two links in different classes, so it
+    // takes the first context identity that gives them.
+    let (mut a, identity) = (7250..)
+        .step_by(20)
+        .take(64)
+        .map(|identity| (scoped_side(LOCAL, 2, identity, &cfg), identity))
+        .find(|(a, _)| {
+            let class = |link| {
+                a.0.ledger
+                    .discard_class(tuple().local, tuple().remote, Some(link))
+            };
+            class(a.2[0].link()) != class(a.2[1].link())
+        })
+        .expect("an identity separating the links' classes");
+    let mut b = peers(&cfg, identity + 10);
     let (kept, other) = (a.2[0], a.2[1]);
     let scoped = ScopedTuple::new(tuple(), Some(kept.link())).unwrap();
     let id =
@@ -804,7 +818,7 @@ fn time_wait_reuse_stays_within_its_scoped_identity() {
 }
 
 // A client's first SYN for the shared link-local tuple.
-fn link_local_syn(cfg: &EndpointConfig, identity: u128) -> Vec<u8> {
+fn link_local_syn(cfg: &EndpointConfig, identity: u64) -> Vec<u8> {
     let mut client = scoped_side(LOCAL, 1, identity, cfg);
     let zone = client.2[0].link();
     client
@@ -1015,7 +1029,7 @@ fn udp_out(side: &mut Peer, now: u64, flow: UdpFlowId, payload: &[u8]) -> (LinkI
 
 // One peer per link, each with a fe80::2:8080 flow connected to
 // fe80::1:1000 on its only link.
-fn udp_peers(cfg: &EndpointConfig, identity: u128) -> Vec<(Peer, UdpFlowId)> {
+fn udp_peers(cfg: &EndpointConfig, identity: u64) -> Vec<(Peer, UdpFlowId)> {
     (0..2)
         .map(|index| {
             let mut peer = scoped_side_with(REMOTE, 1, identity + index, cfg, 1);

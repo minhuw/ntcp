@@ -252,7 +252,7 @@ impl<P: PacketIo> Network<P> {
             };
         }
         let mut host = Host::new(
-            path::ContextId::new(u128::from(instance)),
+            path::ContextId::new(instance),
             path_limits,
             limits,
             config.tcp.connection.timebase,
