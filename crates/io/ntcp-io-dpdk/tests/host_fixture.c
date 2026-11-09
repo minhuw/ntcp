@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#define ALLOW_EXPERIMENTAL_API // rte_eth_dev_conf_get.
 #include <sched.h>
 #include <string.h>
 #include <rte_eal.h>
@@ -51,6 +52,44 @@ int ntcp_host_test_set_mac(uint16_t port, const uint8_t mac[6]) {
     struct rte_ether_addr address;
     memcpy(address.addr_bytes, mac, RTE_ETHER_ADDR_LEN);
     return rte_eth_dev_default_mac_addr_set(port, &address);
+}
+
+// The RSS part of the configuration ethdev holds for the port, as the host
+// module passed it: whether mq_mode is RSS, the hash types, and the key
+// (key_len 0 if the PMD was left to choose).
+int ntcp_host_test_rss_conf(uint16_t port, int *rss, uint64_t *hf, uint8_t key[255],
+                            uint8_t *key_len) {
+    struct rte_eth_conf conf;
+    int result = rte_eth_dev_conf_get(port, &conf);
+    if (result < 0) return result;
+    *rss = conf.rxmode.mq_mode == RTE_ETH_MQ_RX_RSS;
+    *hf = conf.rx_adv_conf.rss_conf.rss_hf;
+    *key_len = conf.rx_adv_conf.rss_conf.rss_key ? conf.rx_adv_conf.rss_conf.rss_key_len : 0;
+    if (*key_len) memcpy(key, conf.rx_adv_conf.rss_conf.rss_key, *key_len);
+    return 0;
+}
+uint64_t ntcp_host_test_rss_ipv4_hf(void) {
+    return RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_FRAG_IPV4;
+}
+
+// The device's key and redirection table, read with ethdev's own calls.
+int ntcp_host_test_rss_key(uint16_t port, uint8_t key[255], uint8_t *key_len) {
+    struct rte_eth_rss_conf conf = { .rss_key = key, .rss_key_len = 255 };
+    int result = rte_eth_dev_rss_hash_conf_get(port, &conf);
+    struct rte_eth_dev_info info;
+    if (result == 0) result = rte_eth_dev_info_get(port, &info);
+    if (result == 0) *key_len = info.hash_key_size;
+    return result;
+}
+int ntcp_host_test_reta(uint16_t port, uint16_t *reta, uint16_t size) {
+    struct rte_eth_rss_reta_entry64 table[size / RTE_ETH_RETA_GROUP_SIZE + 1];
+    memset(table, 0, sizeof(table));
+    for (uint16_t i = 0; i < size; ++i)
+        table[i / RTE_ETH_RETA_GROUP_SIZE].mask |= UINT64_C(1) << (i % RTE_ETH_RETA_GROUP_SIZE);
+    int result = rte_eth_dev_rss_reta_query(port, table, size);
+    for (uint16_t i = 0; result == 0 && i < size; ++i)
+        reta[i] = table[i / RTE_ETH_RETA_GROUP_SIZE].reta[i % RTE_ETH_RETA_GROUP_SIZE];
+    return result;
 }
 
 // Keeps the ring PMD, and with it the net_ring vdev driver, linked even

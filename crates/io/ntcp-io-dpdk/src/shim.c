@@ -504,13 +504,20 @@ int ntcp_dpdk_pool_free(void *pool) {
 enum {
     NTCP_STAGE_INFO = 1, NTCP_STAGE_QUEUES, NTCP_STAGE_TIMESTAMP, NTCP_STAGE_SCATTER,
     NTCP_STAGE_MULTI_SEGS, NTCP_STAGE_CONFIGURE, NTCP_STAGE_DESCRIPTORS,
+    NTCP_STAGE_RSS, NTCP_STAGE_RSS_KEY,
 };
+
+// The hash types ntcp's flow ownership is defined over: TCP over addresses and
+// ports, fragments (which carry no ports past the first) over addresses.
+static const uint64_t ntcp_rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_IPV4 |
+    RTE_ETH_RSS_FRAG_IPV4;
 
 // Configure queue pairs for the borrowed adapter's RX contract: complete,
 // untransformed frames. Only TIMESTAMP (requested) and SCATTER (needed for
 // frames larger than one mbuf) are enabled on RX; nothing strips or merges.
 int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *config,
-                             uint16_t *rx_desc, uint16_t *tx_desc, int *stage) {
+                             uint16_t *rx_desc, uint16_t *tx_desc, int *stage,
+                             uint8_t *key_size) {
     struct rte_eth_dev_info info;
     *stage = NTCP_STAGE_INFO;
     int result = rte_eth_dev_info_get(port, &info);
@@ -542,10 +549,27 @@ int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *confi
         *stage = NTCP_STAGE_MULTI_SEGS;
         return -ENOTSUP;
     }
-    // No RSS: a queue receives only what flows steer to it (or queue 0's
-    // default traffic), so each worker sees exactly its own connections.
+    // Without RSS a queue receives only what flows steer to it (or queue 0's
+    // default traffic), so each worker sees exactly its own connections. With
+    // RSS, unsteered traffic is spread by the device's hash and redirection
+    // table, which the caller reads back (ntcp_dpdk_rss_query) to know where
+    // each flow lands. The algorithm stays the PMD default (mlx5: Toeplitz).
     struct rte_eth_conf conf = {0};
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+    *key_size = info.hash_key_size;
+    if (config->rss && config->queues > 1) {
+        *stage = NTCP_STAGE_RSS;
+        uint64_t hf = ntcp_rss_hf & info.flow_type_rss_offloads;
+        if (!hf) return -ENOTSUP;
+        *stage = NTCP_STAGE_RSS_KEY;
+        if (config->rss_key && config->rss_key_len != info.hash_key_size) return -EINVAL;
+        conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+        conf.rx_adv_conf.rss_conf.rss_hf = hf;
+        // NULL leaves the key to the PMD. ethdev keeps this pointer in the
+        // device configuration and some PMDs read it again at start.
+        conf.rx_adv_conf.rss_conf.rss_key = (uint8_t *)config->rss_key;
+        conf.rx_adv_conf.rss_conf.rss_key_len = config->rss_key ? config->rss_key_len : 0;
+    }
     conf.rxmode.mtu = config->mtu;
     conf.rxmode.offloads = rx;
     conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
@@ -627,7 +651,113 @@ void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *erro
     return flow;
 }
 
+// ETH / IPV4 (exact destination) / TCP (destination port under mask) ->
+// QUEUE. dst and dst_port are in network byte order, mask in host order.
+// Validated first, so a PMD that cannot match this pattern refuses it before
+// anything is installed (stage 1); stage 2 is the creation itself. The
+// priority equals ntcp_dpdk_flow_ipv4's (0): mlx5 orders rules of one
+// priority by their deepest layer, so this L4 rule matches before an L3 rule
+// for the same address. rte_flow itself leaves such overlaps undefined.
+void *ntcp_dpdk_flow_tcp_port(uint16_t port, uint32_t dst, uint16_t dst_port,
+                              uint16_t mask, uint16_t queue, int *error, int *stage,
+                              char *message, size_t capacity) {
+    struct rte_flow_attr attr = { .ingress = 1 };
+    struct rte_flow_item_ipv4 ip_spec = {0}, ip_mask = {0};
+    ip_spec.hdr.dst_addr = dst;
+    ip_mask.hdr.dst_addr = UINT32_MAX;
+    struct rte_flow_item_tcp tcp_spec = {0}, tcp_mask = {0};
+    tcp_spec.hdr.dst_port = dst_port;
+    tcp_mask.hdr.dst_port = rte_cpu_to_be_16(mask);
+    struct rte_flow_item pattern[] = {
+        { .type = RTE_FLOW_ITEM_TYPE_ETH },
+        { .type = RTE_FLOW_ITEM_TYPE_IPV4, .spec = &ip_spec, .mask = &ip_mask },
+        { .type = RTE_FLOW_ITEM_TYPE_TCP, .spec = &tcp_spec, .mask = &tcp_mask },
+        { .type = RTE_FLOW_ITEM_TYPE_END },
+    };
+    struct rte_flow_action_queue target = { .index = queue };
+    struct rte_flow_action actions[] = {
+        { .type = RTE_FLOW_ACTION_TYPE_QUEUE, .conf = &target },
+        { .type = RTE_FLOW_ACTION_TYPE_END },
+    };
+    struct rte_flow_error flow_error = {0};
+    *stage = 1;
+    int result = rte_flow_validate(port, &attr, pattern, actions, &flow_error);
+    if (result < 0) {
+        *error = result;
+        flow_message(&flow_error, message, capacity);
+        return NULL;
+    }
+    *stage = 2;
+    struct rte_flow *flow = rte_flow_create(port, &attr, pattern, actions, &flow_error);
+    *error = flow ? 0 : -rte_errno;
+    if (!flow) flow_message(&flow_error, message, capacity);
+    return flow;
+}
+
 int ntcp_dpdk_flow_destroy(uint16_t port, void *flow) {
     struct rte_flow_error error;
     return rte_flow_destroy(port, flow, &error);
+}
+
+int ntcp_dpdk_rss_sizes(uint16_t port, uint16_t *key_size, uint16_t *reta_size) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    *key_size = info.hash_key_size;
+    *reta_size = info.reta_size;
+    return 0;
+}
+
+enum { NTCP_RSS_IPV4_TCP = 1, NTCP_RSS_IPV4 = 2, NTCP_RSS_FRAG_IPV4 = 4 };
+
+static struct rte_eth_rss_reta_entry64 *reta_groups(uint16_t length) {
+    size_t groups = (length + RTE_ETH_RETA_GROUP_SIZE - 1) / RTE_ETH_RETA_GROUP_SIZE;
+    struct rte_eth_rss_reta_entry64 *table = calloc(groups, sizeof(*table));
+    if (!table) return NULL;
+    for (uint16_t i = 0; i < length; ++i)
+        table[i / RTE_ETH_RETA_GROUP_SIZE].mask |= UINT64_C(1) << (i % RTE_ETH_RETA_GROUP_SIZE);
+    return table;
+}
+
+// The key, granted hash types and the whole redirection table in effect.
+// Returns -ENOSPC (sizes set) if a buffer is smaller than the device's, and
+// -ENOTSUP if the device reports no key or no table.
+int ntcp_dpdk_rss_query(uint16_t port, uint8_t *key, uint16_t key_capacity,
+                        uint16_t *reta, uint16_t reta_capacity, uint16_t *key_len,
+                        uint16_t *reta_len, uint8_t *hash) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    *key_len = info.hash_key_size;
+    *reta_len = info.reta_size;
+    if (!info.hash_key_size || !info.reta_size) return -ENOTSUP;
+    if (info.hash_key_size > key_capacity || info.reta_size > reta_capacity) return -ENOSPC;
+    struct rte_eth_rss_conf conf = { .rss_key = key, .rss_key_len = info.hash_key_size };
+    result = rte_eth_dev_rss_hash_conf_get(port, &conf);
+    if (result < 0) return result;
+    // Some PMDs report the key length they used, others leave it as passed.
+    if (!conf.rss_key_len || conf.rss_key_len > info.hash_key_size) return -EIO;
+    *key_len = conf.rss_key_len;
+    *hash = (conf.rss_hf & RTE_ETH_RSS_NONFRAG_IPV4_TCP ? NTCP_RSS_IPV4_TCP : 0) |
+        (conf.rss_hf & RTE_ETH_RSS_IPV4 ? NTCP_RSS_IPV4 : 0) |
+        (conf.rss_hf & RTE_ETH_RSS_FRAG_IPV4 ? NTCP_RSS_FRAG_IPV4 : 0);
+    struct rte_eth_rss_reta_entry64 *table = reta_groups(info.reta_size);
+    if (!table) return -ENOMEM;
+    result = rte_eth_dev_rss_reta_query(port, table, info.reta_size);
+    if (result == 0)
+        for (uint16_t i = 0; i < info.reta_size; ++i)
+            reta[i] = table[i / RTE_ETH_RETA_GROUP_SIZE].reta[i % RTE_ETH_RETA_GROUP_SIZE];
+    free(table);
+    return result;
+}
+
+// Replaces every entry; ethdev checks each against the RX queue count.
+int ntcp_dpdk_rss_reta_update(uint16_t port, const uint16_t *reta, uint16_t length) {
+    struct rte_eth_rss_reta_entry64 *table = reta_groups(length);
+    if (!table) return -ENOMEM;
+    for (uint16_t i = 0; i < length; ++i)
+        table[i / RTE_ETH_RETA_GROUP_SIZE].reta[i % RTE_ETH_RETA_GROUP_SIZE] = reta[i];
+    int result = rte_eth_dev_rss_reta_update(port, table, length);
+    free(table);
+    return result;
 }

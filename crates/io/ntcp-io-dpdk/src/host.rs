@@ -33,6 +33,9 @@ struct PortSetup {
     mtu: u16,
     mbuf_data_size: u16,
     rx_timestamps: u8,
+    rss: u8,
+    rss_key_len: u8,
+    rss_key: *const u8,
 }
 
 unsafe extern "C" {
@@ -58,6 +61,7 @@ unsafe extern "C" {
         rx_desc: *mut u16,
         tx_desc: *mut u16,
         stage: *mut i32,
+        key_size: *mut u8,
     ) -> i32;
     fn ntcp_dpdk_port_queue_setup(
         port: u16,
@@ -79,8 +83,36 @@ unsafe extern "C" {
         message: *mut c_char,
         capacity: usize,
     ) -> *mut c_void;
+    fn ntcp_dpdk_flow_tcp_port(
+        port: u16,
+        dst: u32,
+        dst_port: u16,
+        mask: u16,
+        queue: u16,
+        error: *mut i32,
+        stage: *mut i32,
+        message: *mut c_char,
+        capacity: usize,
+    ) -> *mut c_void;
     fn ntcp_dpdk_flow_destroy(port: u16, flow: *mut c_void) -> i32;
+    fn ntcp_dpdk_rss_sizes(port: u16, key_size: *mut u16, reta_size: *mut u16) -> i32;
+    fn ntcp_dpdk_rss_query(
+        port: u16,
+        key: *mut u8,
+        key_capacity: u16,
+        reta: *mut u16,
+        reta_capacity: u16,
+        key_len: *mut u16,
+        reta_len: *mut u16,
+        hash: *mut u8,
+    ) -> i32;
+    fn ntcp_dpdk_rss_reta_update(port: u16, reta: *const u16, length: u16) -> i32;
 }
+
+// Hash type bits of ntcp_dpdk_rss_query.
+const RSS_IPV4_TCP: u8 = 1;
+const RSS_IPV4: u8 = 2;
+const RSS_FRAG_IPV4: u8 = 4;
 
 const LCORE_ID_ANY: u32 = u32::MAX;
 
@@ -212,6 +244,17 @@ pub struct PortConfig {
     /// Enable RTE_ETH_RX_OFFLOAD_TIMESTAMP (required capability) and expose
     /// device-clock RX timestamps on every hosted queue.
     pub rx_timestamps: bool,
+    /// Receive side scaling across all queues (mq_mode RSS) for traffic no
+    /// flow rule steers, over the IPv4 hash types the device grants among
+    /// unfragmented TCP (addresses and ports), other IPv4 and IPv4 fragments
+    /// (addresses). The device must grant at least one. Ignored with a single
+    /// queue. Not allowed with `isolate`: an isolated port receives only
+    /// what flow rules match, so the table would spread nothing. `Port::rss`
+    /// reads the key and redirection table back.
+    pub rss: bool,
+    /// Hash key for `rss`, exactly the device's hash key size (40 octets on
+    /// mlx5). None keeps the PMD's key.
+    pub rss_key: Option<Vec<u8>>,
 }
 
 impl PortConfig {
@@ -228,6 +271,8 @@ impl PortConfig {
             mbuf_data_size: 2048,
             isolate: false,
             rx_timestamps: false,
+            rss: false,
+            rss_key: None,
         }
     }
 }
@@ -244,6 +289,9 @@ struct PortInner {
     pools: Vec<NonNull<c_void>>,
     taken: Box<[AtomicBool]>,
     clock: Option<ClockDescriptor>,
+    rss: bool,
+    // ethdev keeps a pointer to the configured key; it lives with the port.
+    _rss_key: Option<Box<[u8]>>,
 }
 
 // SAFETY: the pool pointers are only passed to thread-agnostic DPDK calls
@@ -271,7 +319,8 @@ impl Drop for PortInner {
 /// one pool per queue pair on the device's NUMA socket. RX keeps complete,
 /// untransformed frames: no VLAN/QinQ stripping, LRO or other byte-changing
 /// offloads; RX scatter and TX multi-segment are enabled only as described on
-/// `PortConfig`. No RSS: queues receive what flows steer to them.
+/// `PortConfig`. Queues receive what flows steer to them; without `rss`,
+/// unmatched traffic goes to queue 0 (or, isolated, to the kernel).
 pub struct Port {
     inner: Arc<PortInner>,
 }
@@ -283,6 +332,18 @@ impl Port {
         if config.queues == 0 || config.rx_desc == 0 || config.tx_desc == 0 {
             return Err(invalid("queues and descriptor counts must be nonzero"));
         }
+        if config.rss && config.isolate {
+            return Err(invalid("rss spreads no traffic on an isolated port"));
+        }
+        if config.rss_key.is_some() && !config.rss {
+            return Err(invalid("rss_key requires rss"));
+        }
+        let rss = config.rss && config.queues > 1;
+        let rss_key = config.rss_key.filter(|_| rss).map(Vec::into_boxed_slice);
+        let rss_key_len = match &rss_key {
+            Some(key) => u8::try_from(key.len()).map_err(|_| invalid("rss key too long"))?,
+            None => 0,
+        };
         let devargs =
             CString::new(config.device.as_str()).map_err(|_| invalid("device contains NUL"))?;
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -306,6 +367,8 @@ impl Port {
                     identity: generation,
                 },
             }),
+            rss,
+            _rss_key: rss_key,
         };
         if config.isolate {
             let mut message = [0; 128];
@@ -323,13 +386,32 @@ impl Port {
             mtu: config.mtu,
             mbuf_data_size: config.mbuf_data_size,
             rx_timestamps: u8::from(config.rx_timestamps),
+            rss: u8::from(rss),
+            rss_key_len,
+            rss_key: inner
+                ._rss_key
+                .as_ref()
+                .map_or(std::ptr::null(), |key| key.as_ptr()),
         };
-        let (mut rx_desc, mut tx_desc, mut stage) = (0, 0, 0);
-        // SAFETY: claimed port; all pointers are valid for the call.
+        let (mut rx_desc, mut tx_desc, mut stage, mut key_size) = (0, 0, 0, 0);
+        // SAFETY: claimed port; all pointers are valid for the call, and the
+        // key for as long as the port (it is owned by `inner`).
         let result = unsafe {
-            ntcp_dpdk_port_configure(port, &setup, &mut rx_desc, &mut tx_desc, &mut stage)
+            ntcp_dpdk_port_configure(
+                port,
+                &setup,
+                &mut rx_desc,
+                &mut tx_desc,
+                &mut stage,
+                &mut key_size,
+            )
         };
         if result < 0 {
+            if stage == 9 {
+                return Err(invalid(&format!(
+                    "rss key has {rss_key_len} octets but the device's hash key has {key_size}"
+                )));
+            }
             let context = match stage {
                 2 => "queue count exceeds device limits",
                 3 => "device lacks RTE_ETH_RX_OFFLOAD_TIMESTAMP",
@@ -337,6 +419,7 @@ impl Port {
                 5 => "frames exceed one mbuf but device lacks TX multi-segment",
                 6 => "rte_eth_dev_configure",
                 7 => "rte_eth_dev_adjust_nb_rx_tx_desc",
+                8 => "device grants none of the ipv4 rss hash types",
                 _ => "rte_eth_dev_info_get",
             };
             return Err(dpdk_error(context, result));
@@ -445,6 +528,163 @@ impl Port {
         })
     }
 
+    /// Steer TCP to IPv4 destination `dst` whose destination port, masked
+    /// with `mask`, equals `port` to `queue` (ETH / IPV4 dst / TCP dst_port
+    /// spec and mask → QUEUE). The rule is validated first: a device that
+    /// cannot match it reports Unsupported and nothing is installed. Like
+    /// `steer_ipv4`, the rule is destroyed when the `Flow` drops, always
+    /// before the port stops. Without `isolate`, packets to `dst` that match no
+    /// rule follow RSS (or go to queue 0); isolated, they go to the kernel
+    /// unless a `steer_ipv4` rule takes them.
+    ///
+    /// Both rules use rte_flow priority 0. mlx5 orders rules of one priority
+    /// by their deepest matched layer, so this rule takes precedence over a
+    /// `steer_ipv4` rule for the same address there. rte_flow leaves
+    /// overlapping rules of one priority undefined, so on other PMDs do not
+    /// combine the two for one address.
+    pub fn steer_tcp_port(
+        &self,
+        dst: Ipv4Addr,
+        port: u16,
+        mask: u16,
+        queue: u16,
+    ) -> io::Result<Flow> {
+        if queue >= self.queues() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flow target queue out of range",
+            ));
+        }
+        if port & !mask != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tcp port has bits outside its mask",
+            ));
+        }
+        let (mut error, mut stage, mut message) = (0, 0, [0; 128]);
+        // SAFETY: started port; buffer capacity is passed.
+        let flow = unsafe {
+            ntcp_dpdk_flow_tcp_port(
+                self.inner.port,
+                u32::from(dst).to_be(),
+                port.to_be(),
+                mask,
+                queue,
+                &mut error,
+                &mut stage,
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        let flow = NonNull::new(flow).ok_or_else(|| {
+            if stage == 1 {
+                let error = flow_error("rte_flow_validate", error, &message);
+                // A refused specification (EINVAL) is as unsupported as a
+                // missing flow API: this rule is well formed by construction.
+                match error.kind() {
+                    io::ErrorKind::InvalidInput => {
+                        io::Error::new(io::ErrorKind::Unsupported, error.to_string())
+                    }
+                    _ => error,
+                }
+            } else {
+                flow_error("rte_flow_create", error, &message)
+            }
+        })?;
+        Ok(Flow {
+            port: self.inner.clone(),
+            flow,
+        })
+    }
+
+    /// RSS in effect: the hash key, the granted hash types and the whole
+    /// redirection table (rte_eth_dev_rss_hash_conf_get and
+    /// rte_eth_dev_rss_reta_query), as the device reports them now. Ok(None)
+    /// when the port spreads no traffic by RSS (`rss` off or a single queue).
+    /// Unsupported when the device grants RSS but cannot report its key or
+    /// table.
+    pub fn rss(&self) -> io::Result<Option<Rss>> {
+        if !self.inner.rss {
+            return Ok(None);
+        }
+        let (mut key_size, mut reta_size) = self.rss_sizes()?;
+        loop {
+            let mut key = vec![0; usize::from(key_size)];
+            let mut reta = vec![0; usize::from(reta_size)];
+            let (mut key_len, mut reta_len, mut hash) = (0, 0, 0);
+            // SAFETY: started port; both buffers hold the capacity passed.
+            let result = unsafe {
+                ntcp_dpdk_rss_query(
+                    self.inner.port,
+                    key.as_mut_ptr(),
+                    key_size,
+                    reta.as_mut_ptr(),
+                    reta_size,
+                    &mut key_len,
+                    &mut reta_len,
+                    &mut hash,
+                )
+            };
+            // ENOSPC: the table grew since the sizes were read; retry.
+            if result == -28 {
+                (key_size, reta_size) = (key_len, reta_len);
+                continue;
+            }
+            if result < 0 {
+                return Err(dpdk_error("rss query", result));
+            }
+            key.truncate(usize::from(key_len));
+            reta.truncate(usize::from(reta_len));
+            return Ok(Some(Rss {
+                key,
+                ipv4_tcp: hash & RSS_IPV4_TCP != 0,
+                ipv4: hash & RSS_IPV4 != 0,
+                ipv4_fragments: hash & RSS_FRAG_IPV4 != 0,
+                reta,
+            }));
+        }
+    }
+
+    /// Replace the whole redirection table (rte_eth_dev_rss_reta_update).
+    /// `reta` must have exactly the device's current table length, as
+    /// `Port::rss` reports it, and name queues of this port. Requires a port
+    /// spreading by RSS (`Port::rss` is Some). mlx5 restarts its flows to
+    /// apply the table, which may drop packets received meanwhile.
+    pub fn set_reta(&self, reta: &[u16]) -> io::Result<()> {
+        let invalid =
+            |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+        if !self.inner.rss {
+            return Err(invalid("rss is not enabled on this port"));
+        }
+        let (_, size) = self.rss_sizes()?;
+        if reta.len() != usize::from(size) {
+            return Err(invalid(&format!(
+                "reta has {} entries but the device's table has {size}",
+                reta.len()
+            )));
+        }
+        if reta.iter().any(|&queue| queue >= self.queues()) {
+            return Err(invalid("reta entry names a queue out of range"));
+        }
+        // SAFETY: started port; `reta` holds `size` entries.
+        let result = unsafe { ntcp_dpdk_rss_reta_update(self.inner.port, reta.as_ptr(), size) };
+        if result < 0 {
+            return Err(dpdk_error("rte_eth_dev_rss_reta_update", result));
+        }
+        Ok(())
+    }
+
+    // (hash key size, redirection table size) from dev_info, now.
+    fn rss_sizes(&self) -> io::Result<(u16, u16)> {
+        let (mut key, mut reta) = (0, 0);
+        // SAFETY: started port; outputs are writable.
+        let result = unsafe { ntcp_dpdk_rss_sizes(self.inner.port, &mut key, &mut reta) };
+        if result < 0 {
+            return Err(dpdk_error("rte_eth_dev_info_get", result));
+        }
+        Ok((key, reta))
+    }
+
     /// Hand out queue pair `index` unless a handle or an attached queue holds
     /// it. A handle dropped unattached, or consumed by a failed `attach`,
     /// returns the index; once attached, the queue stays taken for the port's
@@ -485,6 +725,26 @@ fn mac_address(port: u16) -> io::Result<[u8; 6]> {
         return Err(dpdk_error("rte_eth_macaddr_get", result));
     }
     Ok(mac)
+}
+
+/// RSS state of a port, as `Port::rss` reads it from the device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Rss {
+    /// Hash key; the algorithm is the PMD's default (Toeplitz on mlx5).
+    pub key: Vec<u8>,
+    /// RTE_ETH_RSS_NONFRAG_IPV4_TCP: unfragmented IPv4 TCP hashes over
+    /// source and destination addresses and ports.
+    pub ipv4_tcp: bool,
+    /// RTE_ETH_RSS_IPV4: other IPv4 hashes over source and destination
+    /// addresses.
+    pub ipv4: bool,
+    /// RTE_ETH_RSS_FRAG_IPV4: IPv4 fragments hash over source and destination
+    /// addresses.
+    pub ipv4_fragments: bool,
+    /// Redirection table: the RX queue of each entry, indexed by the hash's
+    /// low-order bits. Its length is the device's: on mlx5 the queue count
+    /// when that is a power of two, else the device's largest table.
+    pub reta: Vec<u16>,
 }
 
 /// An rte_flow rule; keeps its port alive and is destroyed on drop.

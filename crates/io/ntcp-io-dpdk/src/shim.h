@@ -57,10 +57,13 @@ void *ntcp_dpdk_pool_create(const char *name, uint32_t count, uint16_t data_size
 int ntcp_dpdk_pool_free(void *pool);
 struct ntcp_port_config {
     uint16_t queues, rx_desc, tx_desc, mtu, mbuf_data_size;
-    uint8_t rx_timestamps;
+    uint8_t rx_timestamps, rss, rss_key_len;
+    // Must stay valid until the port is closed: ethdev keeps the pointer.
+    const uint8_t *rss_key;
 };
 int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *config,
-                             uint16_t *rx_desc, uint16_t *tx_desc, int *stage);
+                             uint16_t *rx_desc, uint16_t *tx_desc, int *stage,
+                             uint8_t *key_size);
 int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
                                uint16_t tx_desc, int socket, void *pool);
 int ntcp_dpdk_port_start(uint16_t port);
@@ -69,6 +72,14 @@ int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock);
 int ntcp_dpdk_port_mac(uint16_t port, uint8_t mac[6]);
 void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
                           char *message, size_t capacity);
+void *ntcp_dpdk_flow_tcp_port(uint16_t port, uint32_t dst, uint16_t dst_port,
+                              uint16_t mask, uint16_t queue, int *error, int *stage,
+                              char *message, size_t capacity);
 int ntcp_dpdk_flow_destroy(uint16_t port, void *flow);
+int ntcp_dpdk_rss_sizes(uint16_t port, uint16_t *key_size, uint16_t *reta_size);
+int ntcp_dpdk_rss_query(uint16_t port, uint8_t *key, uint16_t key_capacity,
+                        uint16_t *reta, uint16_t reta_capacity, uint16_t *key_len,
+                        uint16_t *reta_len, uint8_t *hash);
+int ntcp_dpdk_rss_reta_update(uint16_t port, const uint16_t *reta, uint16_t length);
 
 #endif

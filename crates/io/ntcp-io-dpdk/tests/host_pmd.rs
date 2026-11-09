@@ -1,5 +1,5 @@
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
-use ntcp_io_dpdk::{Eal, Port, PortConfig};
+use ntcp_io_dpdk::{Eal, Port, PortConfig, Rss};
 use std::{
     ffi::{CString, c_char, c_void},
     io::ErrorKind,
@@ -14,6 +14,16 @@ unsafe extern "C" {
     fn ntcp_host_test_ring_driver() -> *mut c_void;
     fn ntcp_host_test_mac(port: u16, mac: *mut u8) -> i32;
     fn ntcp_host_test_set_mac(port: u16, mac: *const u8) -> i32;
+    fn ntcp_host_test_rss_conf(
+        port: u16,
+        rss: *mut i32,
+        hf: *mut u64,
+        key: *mut u8,
+        key_len: *mut u8,
+    ) -> i32;
+    fn ntcp_host_test_rss_ipv4_hf() -> u64;
+    fn ntcp_host_test_rss_key(port: u16, key: *mut u8, key_len: *mut u8) -> i32;
+    fn ntcp_host_test_reta(port: u16, reta: *mut u16, size: u16) -> i32;
 }
 
 const NO_LCORE: u32 = u32::MAX;
@@ -81,6 +91,7 @@ fn hosted_ring_ports() {
     port_lifecycle(eal);
     rejected_configurations(eal);
     mac_addresses(eal);
+    rss_ports(eal);
     outstanding_mbufs_retain_pool(eal);
 }
 
@@ -120,6 +131,24 @@ fn port_lifecycle(eal: &'static Eal) {
             .err()
             .unwrap()
             .kind(),
+        ErrorKind::InvalidInput
+    );
+    // Nor can it validate a masked TCP port rule, so none is created.
+    let address = Ipv4Addr::new(10, 0, 0, 1);
+    let error = port
+        .steer_tcp_port(address, 0x0003, 0x0003, 3)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("rte_flow_validate"), "{error}");
+    for (value, mask, queue) in [(0x0003, 0x0003, 4), (0x0004, 0x0003, 1)] {
+        let error = port.steer_tcp_port(address, value, mask, queue).err();
+        assert_eq!(error.unwrap().kind(), ErrorKind::InvalidInput);
+    }
+    // RSS is off by default: nothing to report or set.
+    assert_eq!(port.rss().unwrap(), None);
+    assert_eq!(
+        port.set_reta(&[0; 4]).unwrap_err().kind(),
         ErrorKind::InvalidInput
     );
 
@@ -241,6 +270,15 @@ fn rejected_configurations(eal: &'static Eal) {
     assert!(error.to_string().contains("mbufs_per_queue"), "{error}");
     assert_eq!(port_named("net_ring4"), None);
 
+    // The ring PMD has no RSS hash types to grant.
+    let mut rss = PortConfig::new("net_ring6");
+    rss.queues = 2;
+    rss.rss = true;
+    let error = Port::start(eal, rss).err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+    assert!(error.to_string().contains("rss hash types"), "{error}");
+    assert_eq!(port_named("net_ring6"), None);
+
     let mut none = PortConfig::new("net_ring5");
     none.queues = 0;
     assert_eq!(
@@ -286,6 +324,128 @@ fn mac_addresses(eal: &'static Eal) {
     drop(port);
     drop(queue);
     assert_eq!(port_named("net_null0"), None);
+    assert_eq!(pools(), (0, 0));
+}
+
+fn rss_conf(port: u16) -> (bool, u64, Vec<u8>) {
+    let (mut rss, mut hf, mut key, mut len) = (0, 0, [0; 255], 0);
+    // SAFETY: EAL is initialized; the key buffer holds 255 octets.
+    let result =
+        unsafe { ntcp_host_test_rss_conf(port, &mut rss, &mut hf, key.as_mut_ptr(), &mut len) };
+    assert_eq!(result, 0);
+    (rss != 0, hf, key[..usize::from(len)].to_vec())
+}
+
+fn device_rss(port: u16, reta_size: u16) -> (Vec<u8>, Vec<u16>) {
+    let (mut key, mut len) = ([0; 255], 0);
+    // SAFETY: EAL is initialized; the key buffer holds 255 octets.
+    assert_eq!(
+        unsafe { ntcp_host_test_rss_key(port, key.as_mut_ptr(), &mut len) },
+        0
+    );
+    let mut reta = vec![0; usize::from(reta_size)];
+    // SAFETY: EAL is initialized; reta holds reta_size entries.
+    assert_eq!(
+        unsafe { ntcp_host_test_reta(port, reta.as_mut_ptr(), reta_size) },
+        0
+    );
+    (key[..usize::from(len)].to_vec(), reta)
+}
+
+// The null PMD implements RSS in software: a 40-octet key, a 128-entry
+// table and every hash type. It stores the configured hash types and the
+// table but keeps its own key, so the key passed is checked against ethdev's
+// copy of the configuration, and the key reported against the device's.
+fn rss_ports(eal: &'static Eal) {
+    // SAFETY: returns a constant.
+    let ipv4 = unsafe { ntcp_host_test_rss_ipv4_hf() };
+    let key: Vec<u8> = (1..=40).collect();
+    let mut config = PortConfig::new("net_null1");
+    config.queues = 4;
+    config.rss = true;
+    config.rss_key = Some(key.clone());
+    let port = Port::start(eal, config).unwrap();
+    let id = port.port_id();
+    assert_eq!(rss_conf(id), (true, ipv4, key.clone()));
+    let rss = port.rss().unwrap().unwrap();
+    let (device_key, device_reta) = device_rss(id, 128);
+    assert_eq!(
+        rss,
+        Rss {
+            key: device_key,
+            ipv4_tcp: true,
+            ipv4: true,
+            ipv4_fragments: true,
+            reta: device_reta,
+        }
+    );
+    assert_eq!(rss.key.len(), 40);
+    assert_ne!(rss.key, key);
+
+    let reta: Vec<u16> = (0..128).map(|i| (i * 7 % 4) as u16).collect();
+    port.set_reta(&reta).unwrap();
+    assert_eq!(device_rss(id, 128).1, reta);
+    assert_eq!(port.rss().unwrap().unwrap().reta, reta);
+    let error = port.set_reta(&reta[..64]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("128"), "{error}");
+    let mut wrong = reta.clone();
+    wrong[5] = 4;
+    let error = port.set_reta(&wrong).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert_eq!(port.rss().unwrap().unwrap().reta, reta);
+    drop(port);
+    assert_eq!(port_named("net_null1"), None);
+
+    // Without a key the PMD keeps its own; the device grants the same types.
+    let mut config = PortConfig::new("net_null2");
+    config.queues = 2;
+    config.rss = true;
+    let port = Port::start(eal, config).unwrap();
+    assert_eq!(rss_conf(port.port_id()), (true, ipv4, Vec::new()));
+    let rss = port.rss().unwrap().unwrap();
+    assert_eq!(rss.key, device_rss(port.port_id(), 128).0);
+    assert!(rss.ipv4_tcp && rss.ipv4 && rss.ipv4_fragments);
+    drop(port);
+
+    // One queue has nothing to spread: RSS stays off.
+    let mut single = PortConfig::new("net_null3");
+    single.rss = true;
+    single.rss_key = Some(vec![0; 39]);
+    let port = Port::start(eal, single).unwrap();
+    assert_eq!(rss_conf(port.port_id()), (false, 0, Vec::new()));
+    assert_eq!(port.rss().unwrap(), None);
+    assert_eq!(
+        port.set_reta(&[0; 128]).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    drop(port);
+
+    let mut short = PortConfig::new("net_null4");
+    short.queues = 2;
+    short.rss = true;
+    short.rss_key = Some(vec![0; 39]);
+    let error = Port::start(eal, short).err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("39 octets"), "{error}");
+    assert!(error.to_string().contains("has 40"), "{error}");
+    assert_eq!(port_named("net_null4"), None); // Released on failure.
+
+    // Rejected before probing.
+    let mut isolated = PortConfig::new("net_null5");
+    isolated.queues = 2;
+    isolated.rss = true;
+    isolated.isolate = true;
+    let error = Port::start(eal, isolated).err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("isolated"), "{error}");
+    let mut keyed = PortConfig::new("net_null5");
+    keyed.rss_key = Some(key);
+    assert_eq!(
+        Port::start(eal, keyed).err().unwrap().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(port_named("net_null5"), None);
     assert_eq!(pools(), (0, 0));
 }
 
