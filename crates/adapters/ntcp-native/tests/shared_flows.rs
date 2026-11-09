@@ -13,7 +13,11 @@ use std::{
     collections::VecDeque,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -1084,7 +1088,8 @@ fn a_member_that_leaves_has_its_handoffs_dropped_and_spares_the_others() {
 
 // Members on their own threads, one shared clock: the port has one queue,
 // member 0's, so every other member's packets cross threads through its
-// inbox.
+// inbox. A member that has its echo keeps driving until every member has
+// its own: the port's queue has no other reader.
 #[test]
 fn members_on_separate_threads_take_handoffs_from_another_thread() {
     for n in [2, 4] {
@@ -1097,11 +1102,13 @@ fn members_on_separate_threads_take_handoffs_from_another_thread() {
         let incoming: Vec<Frames> = (0..n).map(|_| Frames::default()).collect();
         let len = 16 * 1024;
         let (ready, ready_rx) = mpsc::channel();
+        let finished = Arc::new(AtomicUsize::new(0));
         let workers: Vec<_> = (0..n)
             .map(|k| {
                 let (flows, table, ready) = (flows.clone(), table.clone(), ready.clone());
+                let finished = finished.clone();
                 let port = Station::port(&incoming[k], &peer.incoming);
-                thread::spawn(move || -> Option<(Vec<u8>, Counters, SocketAddr)> {
+                thread::spawn(move || -> Option<(Vec<u8>, Counters, Option<usize>)> {
                     let config = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
                     let built = Network::with_shared_flows(
                         config,
@@ -1128,7 +1135,14 @@ fn members_on_separate_threads_take_handoffs_from_another_thread() {
                         .unwrap();
                     let (mut sent, mut echoed) = (0, Vec::new());
                     let mut out = [0; 4096];
-                    while echoed.len() < data.len() && start.elapsed() < Duration::from_secs(30) {
+                    let mut counted = false;
+                    while finished.load(Ordering::Acquire) < n
+                        && start.elapsed() < Duration::from_secs(30)
+                    {
+                        if !counted && echoed.len() == data.len() {
+                            finished.fetch_add(1, Ordering::AcqRel);
+                            counted = true;
+                        }
                         network.drive(clock(), BUDGET).unwrap();
                         if sent < data.len()
                             && let Ok(receipt) =
@@ -1143,8 +1157,11 @@ fn members_on_separate_threads_take_handoffs_from_another_thread() {
                         }
                         thread::sleep(Duration::from_micros(100));
                     }
+                    // While the member is still in the flows: once every
+                    // member has left, no member serves the address.
                     let local = network.connection_info(client).unwrap().local;
-                    Some((echoed, network.counters(), local))
+                    let owner = flows.owner(v4(local), SocketAddrV4::new(PEER, LISTEN));
+                    Some((echoed, network.counters(), owner))
                 })
             })
             .collect();
@@ -1188,10 +1205,9 @@ fn members_on_separate_threads_take_handoffs_from_another_thread() {
         }
         let mut handed_off = 0;
         for (k, worker) in workers.into_iter().enumerate() {
-            let (echoed, counters, local) = worker.join().unwrap().unwrap();
+            let (echoed, counters, owner) = worker.join().unwrap().unwrap();
             assert!(echoed == payload(k, len), "member {k} of {n}");
-            let remote = SocketAddrV4::new(PEER, LISTEN);
-            assert_eq!(flows.owner(v4(local), remote), Some(k));
+            assert_eq!(owner, Some(k));
             if k > 0 {
                 assert!(counters.handoffs_received > 0, "member {k} of {n}");
             }
