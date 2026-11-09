@@ -255,13 +255,24 @@ impl<P: PacketIo> Network<P> {
     ///
     /// `member` is a free member number of `flows`, and the local address
     /// is IPv4: under `FlowOwnership::ByAddress` no other member's, under
-    /// `FlowOwnership::Hash` every member's. `neighbors`, when given, is
+    /// `FlowOwnership::Hash` and `FlowOwnership::TaggedPorts` every
+    /// member's. `neighbors`, when given, is
     /// joined as by `with_shared_neighbors`. Ephemeral ports avoid every
     /// member's listening ports, and `connect_from` refuses a local port
     /// whose flow to the peer another member owns (`Error::InvalidConfig`),
     /// opening nothing: `SharedFlows::owner` names the member to open it
     /// on. A blocking embedding learns of handoffs through the descriptor
     /// of `set_neighbor_wake_fd`.
+    ///
+    /// Under `FlowOwnership::TaggedPorts` ephemeral ports are the member's
+    /// own tagged ports within `ephemeral_ports`, which must hold one
+    /// (`Error::InvalidConfig`). A tagged port's connections are its
+    /// member's whatever the remote, so that member alone listens on it: a
+    /// listening port of its own, whose connections its port rule steers
+    /// straight to its queue. Another member's listener there would never
+    /// see a SYN, which the port's member would answer with a reset, so
+    /// `listen` refuses it (`Error::InvalidConfig`). A service every member
+    /// accepts listens on a port outside the tags.
     pub fn with_shared_flows(
         config: NetworkConfig,
         io: P,
@@ -271,6 +282,14 @@ impl<P: PacketIo> Network<P> {
         flows: &SharedFlows,
         member: usize,
     ) -> Result<Self> {
+        if flows
+            .tagged(member)
+            .is_some_and(|tagged| tagged.first_in(config.ephemeral_ports.clone()).is_none())
+        {
+            return Err(Error::InvalidConfig(
+                "the ephemeral ports of a member of tagged flows hold one of its tagged ports",
+            ));
+        }
         Self::build(config, io, secret, now, neighbors, Some((flows, member)))
     }
     fn build(
@@ -786,6 +805,9 @@ impl<P: PacketIo> Network<P> {
             .expect("single-port tuple scope")
     }
     fn allocate_port(&mut self, peer: SocketAddr) -> Result<u16> {
+        if let Some(tagged) = self.flows.as_ref().and_then(|f| f.tagged()) {
+            return self.allocate_tagged(tagged);
+        }
         let start = self.next_port;
         loop {
             let candidate = self.next_port;
@@ -808,6 +830,33 @@ impl<P: PacketIo> Network<P> {
             if self.next_port == start {
                 return Err(Error::Capacity);
             }
+        }
+    }
+    // A member of tagged flows takes its own tagged ports only, each a port
+    // whose flows it owns, stepping from one to the next by their bits: it
+    // tries no other port of the range. No other member listens on them
+    // (`listen` refuses), so the ports in use here, its own listeners
+    // included, are the only ones it skips.
+    fn allocate_tagged(&mut self, tagged: flows::PortRule) -> Result<u16> {
+        let last = *self.config.ephemeral_ports.end();
+        let first = tagged
+            .first_in(self.config.ephemeral_ports.clone())
+            .ok_or(Error::Capacity)?;
+        let start = tagged.first_in(self.next_port..=last).unwrap_or(first);
+        let mut candidate = start;
+        loop {
+            let next = candidate
+                .checked_add(1)
+                .and_then(|p| tagged.first_in(p..=last))
+                .unwrap_or(first);
+            if !self.port_in_use(candidate) {
+                self.next_port = next;
+                return Ok(candidate);
+            }
+            if next == start {
+                return Err(Error::Capacity);
+            }
+            candidate = next;
         }
     }
     pub fn connect(&mut self, peer: SocketAddr) -> Result<ConnId> {
@@ -867,6 +916,11 @@ impl<P: PacketIo> Network<P> {
     }
     pub fn listen(&mut self, port: u16, backlog: usize) -> Result<ListenerId> {
         self.running()?;
+        if self.flows.as_ref().is_some_and(|f| !f.may_listen(port)) {
+            return Err(Error::InvalidConfig(
+                "another member of the shared flows owns this tagged port",
+            ));
+        }
         let slot = self
             .listeners
             .iter()

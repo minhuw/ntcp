@@ -20,6 +20,7 @@ use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU16,
+    ops::RangeInclusive,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -45,6 +46,25 @@ pub enum FlowOwnership {
     /// NIC hashes with this key, `table` maps its indirection table's
     /// queues to their members, and packets arrive at their owners.
     Hash { key: Vec<u8>, table: Vec<usize> },
+    /// Every member serves one IPv4 address, as under `Hash { key, table }`,
+    /// except for the flows of a tagged local port: a port `p` with
+    /// `p & prefix_mask == prefix` and `p & low` below the member count,
+    /// `low` being the least `2^b - 1` not below the highest member number.
+    /// Its flows belong to member `p & low` whatever the remote, and a
+    /// member's active opens take only its own tagged ports. A NIC rule on
+    /// the TCP destination port (`SharedFlows::port_rule`) then steers the
+    /// replies to a member's active opens to its queue, where under Hash
+    /// the member would search ports for one the NIC's hash puts there,
+    /// and RSS with `key` and `table` steers the rest. Only its member
+    /// listens on a tagged port (`Network::with_shared_flows`).
+    /// `prefix_mask` is nonzero and spares the bits of `low`, and `prefix`
+    /// lies within it.
+    TaggedPorts {
+        key: Vec<u8>,
+        table: Vec<usize>,
+        prefix: u16,
+        prefix_mask: u16,
+    },
 }
 
 /// Storage of a `SharedFlows`, allocated by `SharedFlows::new`.
@@ -77,7 +97,104 @@ struct Shared {
 
 enum Ownership {
     ByAddress,
-    Hash { hash: Toeplitz, table: Box<[usize]> },
+    Hash {
+        hash: Toeplitz,
+        table: Box<[usize]>,
+    },
+    TaggedPorts {
+        hash: Toeplitz,
+        table: Box<[usize]>,
+        tags: Tags,
+    },
+}
+
+// The local ports of `FlowOwnership::TaggedPorts` that are tagged with a
+// member.
+struct Tags {
+    prefix: u16,
+    mask: u16,
+    // The bits that number the member.
+    low: u16,
+    members: usize,
+}
+
+impl Tags {
+    fn new(prefix: u16, mask: u16, members: usize) -> Result<Self> {
+        let low = members
+            .checked_next_power_of_two()
+            .and_then(|n| u16::try_from(n - 1).ok());
+        match low {
+            Some(low) if mask != 0 && mask & low == 0 && prefix & !mask == 0 => Ok(Self {
+                prefix,
+                mask,
+                low,
+                members,
+            }),
+            _ => Err(Error::InvalidConfig(
+                "a port tag is a prefix within a nonzero mask that spares the member bits",
+            )),
+        }
+    }
+    // The member local port `port` is tagged with.
+    fn member(&self, port: u16) -> Option<usize> {
+        let member = usize::from(port & self.low);
+        (port & self.mask == self.prefix && member < self.members).then_some(member)
+    }
+    fn rule(&self, member: usize) -> Option<PortRule> {
+        if member >= self.members {
+            return None;
+        }
+        // A member number is within `low`, a u16.
+        let tag = u16::try_from(member).ok()?;
+        Some(PortRule {
+            value: self.prefix | tag,
+            mask: self.mask | self.low,
+        })
+    }
+}
+
+/// The local ports whose bits under `mask` are `value`: the tagged ports of
+/// one member of `FlowOwnership::TaggedPorts`, which a rule on the TCP
+/// destination port steers to its queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortRule {
+    value: u16,
+    mask: u16,
+}
+
+impl PortRule {
+    /// The least port in `ports` that the rule takes, found from the bits
+    /// of its bounds without visiting the ports between.
+    pub(crate) fn first_in(self, ports: RangeInclusive<u16>) -> Option<u16> {
+        let (start, end) = ports.into_inner();
+        let near = start & !self.mask | self.value;
+        // The highest bit where `start` differs from the rule's value.
+        let first = match (near ^ start).checked_ilog2() {
+            None => start,
+            // The value sets it: `start`'s free bits above it, none below.
+            Some(top) if near > start => near & !(!self.mask & ((1 << top) - 1)),
+            // `start` sets it: its free bits above it advance by one, and
+            // none below are set.
+            Some(top) => {
+                let carried = (start | self.mask | u16::MAX >> (15 - top)).checked_add(1)?;
+                carried & !self.mask | self.value
+            }
+        };
+        (first <= end).then_some(first)
+    }
+}
+
+// The key and table of hashed flows.
+fn hashing(key: &[u8], table: Vec<usize>, members: usize) -> Result<(Toeplitz, Box<[usize]>)> {
+    if !table.len().is_power_of_two() || table.iter().any(|&m| m >= members) {
+        return Err(Error::InvalidConfig(
+            "a flow table has a power-of-two length and names members",
+        ));
+    }
+    let hash = Toeplitz::new(key).ok_or(Error::InvalidConfig(
+        "a flow key covers IPv4 addresses and ports",
+    ))?;
+    Ok((hash, table.into_boxed_slice()))
 }
 
 // One member's place in the flows.
@@ -133,18 +250,18 @@ impl SharedFlows {
         let ownership = match ownership {
             FlowOwnership::ByAddress => Ownership::ByAddress,
             FlowOwnership::Hash { key, table } => {
-                if !table.len().is_power_of_two() || table.iter().any(|&m| m >= limits.members) {
-                    return Err(Error::InvalidConfig(
-                        "a flow table has a power-of-two length and names members",
-                    ));
-                }
-                let hash = Toeplitz::new(&key).ok_or(Error::InvalidConfig(
-                    "a flow key covers IPv4 addresses and ports",
-                ))?;
-                Ownership::Hash {
-                    hash,
-                    table: table.into_boxed_slice(),
-                }
+                let (hash, table) = hashing(&key, table, limits.members)?;
+                Ownership::Hash { hash, table }
+            }
+            FlowOwnership::TaggedPorts {
+                key,
+                table,
+                prefix,
+                prefix_mask,
+            } => {
+                let (hash, table) = hashing(&key, table, limits.members)?;
+                let tags = Tags::new(prefix, prefix_mask, limits.members)?;
+                Ownership::TaggedPorts { hash, table, tags }
             }
         };
         let mut slots = Vec::new();
@@ -179,19 +296,35 @@ impl SharedFlows {
 
     /// The member that owns the TCP flow between `local` and `remote`. Under
     /// `FlowOwnership::ByAddress`, None unless a member serves `local`'s
-    /// address; under `FlowOwnership::Hash`, None unless the members'
-    /// address is `local`'s.
+    /// address; under `FlowOwnership::Hash` and `FlowOwnership::TaggedPorts`,
+    /// None unless the members' address is `local`'s.
     pub fn owner(&self, local: SocketAddrV4, remote: SocketAddrV4) -> Option<usize> {
-        self.shared.route(*local.ip(), None, |hash| {
-            hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
-        })
+        self.shared
+            .route(*local.ip(), None, Some(local.port()), |hash| {
+                hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
+            })
     }
 
     /// The member that reassembles a fragment from `source` to
     /// `destination`, under the same conditions as `owner`.
     pub fn reassembler(&self, source: Ipv4Addr, destination: Ipv4Addr) -> Option<usize> {
-        self.shared
-            .route(destination, None, |hash| hash.ipv4(source, destination))
+        self.shared.route(destination, None, None, |hash| {
+            hash.ipv4(source, destination)
+        })
+    }
+
+    /// Under `FlowOwnership::TaggedPorts`, the rule on the TCP destination
+    /// port that steers member `member`'s tagged ports to its queue: the
+    /// value the port has under the mask, `(prefix | member, prefix_mask |
+    /// low)`, as the DPDK and AF_XDP backends' `steer_tcp_port` take them.
+    /// None under other ownership, or for no member.
+    pub fn port_rule(&self, member: usize) -> Option<(u16, u16)> {
+        self.tagged(member).map(|rule| (rule.value, rule.mask))
+    }
+
+    /// Member `member`'s tagged ports, under `FlowOwnership::TaggedPorts`.
+    pub(crate) fn tagged(&self, member: usize) -> Option<PortRule> {
+        self.shared.tagged(member)
     }
 
     // Member `index`, serving `address`, with room to register `listeners`
@@ -222,7 +355,7 @@ impl SharedFlows {
                     "members of shared flows by address have distinct addresses",
                 ));
             }
-            Ownership::Hash { .. } if joined.any(|a| a != word) => {
+            Ownership::Hash { .. } | Ownership::TaggedPorts { .. } if joined.any(|a| a != word) => {
                 return Err(Error::InvalidConfig(
                     "members of hashed shared flows serve one address",
                 ));
@@ -260,13 +393,15 @@ impl SharedFlows {
 
 impl Shared {
     // The member that owns what `hash` selects among the flows of local
-    // address `address`. `me`, a member and its own address, answers for
-    // that address without reading the slots: under Hash every member's
-    // address is the group's.
+    // address `address`, or the flows of tagged local port `port`. `me`, a
+    // member and its own address, answers for that address without reading
+    // the slots: under Hash and TaggedPorts every member's address is the
+    // group's.
     fn route(
         &self,
         address: Ipv4Addr,
         me: Option<(usize, Ipv4Addr)>,
+        port: Option<u16>,
         hash: impl FnOnce(&Toeplitz) -> u32,
     ) -> Option<usize> {
         match &self.ownership {
@@ -277,13 +412,30 @@ impl Shared {
             Ownership::Hash {
                 hash: toeplitz,
                 table,
-            } => {
-                let served = match me {
-                    Some((_, own)) => own == address,
-                    None => self.serving(address).is_some(),
-                };
-                served.then(|| table[hash(toeplitz) as usize & (table.len() - 1)])
-            }
+            } => self
+                .serves(address, me)
+                .then(|| table[hash(toeplitz) as usize & (table.len() - 1)]),
+            Ownership::TaggedPorts {
+                hash: toeplitz,
+                table,
+                tags,
+            } => self.serves(address, me).then(|| {
+                port.and_then(|p| tags.member(p))
+                    .unwrap_or_else(|| table[hash(toeplitz) as usize & (table.len() - 1)])
+            }),
+        }
+    }
+    // Whether the members of hashed flows serve `address`.
+    fn serves(&self, address: Ipv4Addr, me: Option<(usize, Ipv4Addr)>) -> bool {
+        match me {
+            Some((_, own)) => own == address,
+            None => self.serving(address).is_some(),
+        }
+    }
+    fn tagged(&self, member: usize) -> Option<PortRule> {
+        match &self.ownership {
+            Ownership::TaggedPorts { tags, .. } => tags.rule(member),
+            _ => None,
         }
     }
     // The member that serves `address`, the first of them under Hash.
@@ -455,9 +607,10 @@ impl Member {
         Some((self.index, self.address))
     }
     fn flow(&self, local: SocketAddrV4, remote: SocketAddrV4) -> Option<usize> {
-        self.shared.route(*local.ip(), self.me(), |hash| {
-            hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
-        })
+        self.shared
+            .route(*local.ip(), self.me(), Some(local.port()), |hash| {
+                hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
+            })
     }
     /// The other member that takes in a packet of `key`. None for this
     /// member's own, and for one of an address no member serves, which this
@@ -468,7 +621,7 @@ impl Member {
             Key::Fragment {
                 source,
                 destination,
-            } => self.shared.route(destination, self.me(), |hash| {
+            } => self.shared.route(destination, self.me(), None, |hash| {
                 hash.ipv4(source, destination)
             }),
             Key::Flow { local, remote } => self.flow(local, remote),
@@ -483,6 +636,21 @@ impl Member {
         };
         self.flow(SocketAddrV4::new(self.address, port), peer)
             .is_none_or(|m| m == self.index)
+    }
+    /// Under `FlowOwnership::TaggedPorts`, this member's tagged ports: the
+    /// only ports its active opens take.
+    pub(crate) fn tagged(&self) -> Option<PortRule> {
+        self.shared.tagged(self.index)
+    }
+    /// Whether this member may listen on local `port`: not on a port tagged
+    /// with another member, which owns every connection to it.
+    pub(crate) fn may_listen(&self, port: u16) -> bool {
+        match &self.shared.ownership {
+            Ownership::TaggedPorts { tags, .. } => {
+                tags.member(port).is_none_or(|m| m == self.index)
+            }
+            _ => true,
+        }
     }
     /// Copies `packet` into member `to`'s inbox and wakes it; false, keeping
     /// nothing, when `to` is no member or its inbox is full.
@@ -918,5 +1086,210 @@ mod tests {
         assert!(!a.listened(8080) && a.listened(443));
         a.unlisten(443);
         assert!(!a.listened(443));
+    }
+
+    fn tagged(members: usize, table: Vec<usize>, prefix: u16, mask: u16) -> Result<SharedFlows> {
+        let ownership = FlowOwnership::TaggedPorts {
+            key: DEFAULT_FLOW_KEY.to_vec(),
+            table,
+            prefix,
+            prefix_mask: mask,
+        };
+        SharedFlows::new(ownership, limits(members))
+    }
+
+    #[test]
+    fn tagged_ports_are_their_members_and_other_flows_hash() {
+        let toeplitz = Toeplitz::new(&DEFAULT_FLOW_KEY).unwrap();
+        let remotes = [
+            SocketAddrV4::new(REMOTE, 80),
+            SocketAddrV4::new(ROUTER, 40000),
+        ];
+        // The member bits of 1, 2, 3, 4 and 8 members. Of 3, ports whose
+        // member bits are 3 are tagged with no member, and hash.
+        for (n, low) in [(1, 0), (2, 1), (3, 3), (4, 3), (8, 7)] {
+            let table: Vec<usize> = (0..8).map(|i| i % n).collect();
+            let flows = tagged(n, table.clone(), 0xc000, 0xc000).unwrap();
+            let members: Vec<_> = (0..n)
+                .map(|k| flows.join(k, LOCAL.into(), 0).unwrap())
+                .collect();
+            for k in 0..n {
+                let rule = (0xc000 | k as u16, 0xc000 | low);
+                assert_eq!(flows.port_rule(k), Some(rule), "{n} members");
+            }
+            assert_eq!(flows.port_rule(n), None);
+            for port in 0..=u16::MAX {
+                let tag =
+                    Some(usize::from(port & low)).filter(|&m| port & 0xc000 == 0xc000 && m < n);
+                let ruled = (0..n).filter(|&k| {
+                    let (value, mask) = flows.port_rule(k).unwrap();
+                    port & mask == value
+                });
+                assert!(ruled.eq(tag), "{n} members, port {port}");
+                for member in &members {
+                    assert_eq!(
+                        member.may_listen(port),
+                        tag.is_none_or(|m| m == member.index)
+                    );
+                }
+                // Every 61st port's flows, and every tagged one's of the
+                // highest prefix.
+                if port % 61 != 0 && port < 0xfff0 {
+                    continue;
+                }
+                let local = SocketAddrV4::new(LOCAL, port);
+                for remote in remotes {
+                    let hash = toeplitz.ipv4_ports(*remote.ip(), LOCAL, remote.port(), port);
+                    let owner = tag.unwrap_or(table[hash as usize & 7]);
+                    assert_eq!(flows.owner(local, remote), Some(owner), "{local} {remote}");
+                    for member in &members {
+                        let elsewhere = (owner != member.index).then_some(owner);
+                        let segment = {
+                            let mut segment = ipv4(20, 40, 0, TCP, *remote.ip(), LOCAL);
+                            segment.extend_from_slice(&tcp(remote.port(), port, 20));
+                            segment
+                        };
+                        assert_eq!(member.elsewhere(key(&segment)), elsewhere);
+                        assert_eq!(member.owns(port, remote.into()), owner == member.index);
+                    }
+                }
+            }
+            // Fragments hash; another address is no member's.
+            let reassembler = table[toeplitz.ipv4(REMOTE, LOCAL) as usize & 7];
+            assert_eq!(flows.reassembler(REMOTE, LOCAL), Some(reassembler));
+            let other = SocketAddrV4::new(ROUTER, 0xc000);
+            assert_eq!(flows.owner(other, remotes[0]), None);
+            if n > 1 {
+                assert!(matches!(
+                    flows.join(n - 1, REMOTE.into(), 0),
+                    Err(Error::InvalidConfig(_))
+                ));
+            }
+            for member in &members {
+                let rule = flows.port_rule(member.index).unwrap();
+                assert_eq!(member.tagged().map(|r| (r.value, r.mask)), Some(rule));
+            }
+        }
+        // Other ownership tags no port.
+        let flows = hashed(2, vec![0, 1]);
+        let member = flows.join(0, LOCAL.into(), 0).unwrap();
+        assert_eq!(flows.port_rule(0), None);
+        assert!(member.tagged().is_none() && member.may_listen(0xc001));
+        let flows = SharedFlows::new(FlowOwnership::ByAddress, limits(2)).unwrap();
+        assert_eq!(flows.port_rule(0), None);
+    }
+
+    #[test]
+    fn a_port_tag_lies_under_a_nonzero_mask_that_spares_the_member_bits() {
+        for (n, prefix, mask) in [
+            (1, 0x0001, 0x0001),
+            (2, 0x0000, 0x8000),
+            (4, 0x8000, 0xfffc),
+            (5, 0xc000, 0xfff8),
+        ] {
+            assert!(tagged(n, vec![0], prefix, mask).is_ok(), "{n} {prefix:#x}");
+        }
+        for (n, prefix, mask) in [
+            // No mask, and a prefix beyond it.
+            (2, 0x0000, 0x0000),
+            (2, 0xc000, 0x8000),
+            // A mask that takes a member bit.
+            (2, 0xc001, 0xc001),
+            (3, 0xc000, 0xc002),
+            (4, 0xc000, 0xc002),
+            (8, 0xc004, 0xc004),
+            // More members than the bits that spare a mask can number.
+            (1 << 16, 0x0000, 0x8000),
+            ((1 << 16) + 1, 0x0000, 0x8000),
+        ] {
+            assert!(
+                matches!(
+                    tagged(n, vec![0], prefix, mask),
+                    Err(Error::InvalidConfig(_))
+                ),
+                "{n} {prefix:#x} {mask:#x}"
+            );
+        }
+        // The key and table are those of Hash.
+        for table in [vec![0, 1, 0], vec![0, 2]] {
+            assert!(matches!(
+                tagged(2, table, 0xc000, 0xc000),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+        let ownership = FlowOwnership::TaggedPorts {
+            key: vec![0; 15],
+            table: vec![0],
+            prefix: 0xc000,
+            prefix_mask: 0xc000,
+        };
+        assert!(matches!(
+            SharedFlows::new(ownership, limits(1)),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn the_first_tagged_port_of_a_range_follows_from_its_bounds() {
+        let rules = [
+            (0xc000, 0xc000),
+            (0xc002, 0xc003),
+            (0xc005, 0xc007),
+            (0x0005, 0x000f),
+            (0x8001, 0x8001),
+            (0x0000, 0x0001),
+            (0x1040, 0x5a5a),
+            (0x0000, 0xffff),
+            (0xffff, 0xffff),
+        ];
+        for (value, mask) in rules {
+            let rule = PortRule { value, mask };
+            // The least port the rule takes from each port on, swept down.
+            let mut least = None;
+            for start in (0..=u16::MAX).rev() {
+                if start & mask == value {
+                    least = Some(start);
+                }
+                assert_eq!(
+                    rule.first_in(start..=u16::MAX),
+                    least,
+                    "{value:#x}/{mask:#x} from {start}"
+                );
+                if let Some(port) = least {
+                    assert_eq!(rule.first_in(start..=port), Some(port));
+                    if port > start {
+                        assert_eq!(rule.first_in(start..=port - 1), None);
+                    }
+                }
+            }
+        }
+        let empty = RangeInclusive::new(5, 4);
+        assert_eq!(PortRule { value: 0, mask: 1 }.first_in(empty), None);
+    }
+
+    #[test]
+    fn an_icmp_error_about_a_tagged_port_is_its_members() {
+        let flows = tagged(4, vec![0, 1, 2, 3], 0xc000, 0xc000).unwrap();
+        let members: Vec<_> = (0..4)
+            .map(|k| flows.join(k, LOCAL.into(), 0).unwrap())
+            .collect();
+        for tag in 0..4 {
+            // A segment member `tag` sent from one of its tagged ports, and
+            // the errors about it, whatever their source.
+            let port = 0xd000 | tag as u16;
+            let mut quote = ipv4(20, 1500, 0x4000, TCP, LOCAL, REMOTE);
+            quote.extend_from_slice(&tcp(port, 80, 8));
+            for kind in [3, 4, 5, 11, 12] {
+                let error = icmp(kind, &quote);
+                assert_eq!(key(&error), flow((LOCAL, port), (REMOTE, 80)));
+                for member in &members {
+                    let elsewhere = (member.index != tag).then_some(tag);
+                    assert_eq!(member.elsewhere(key(&error)), elsewhere, "type {kind}");
+                }
+            }
+            let local = SocketAddrV4::new(LOCAL, port);
+            let remote = SocketAddrV4::new(REMOTE, 80);
+            assert_eq!(flows.owner(local, remote), Some(tag));
+        }
     }
 }
