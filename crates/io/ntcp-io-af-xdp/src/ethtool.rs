@@ -208,10 +208,26 @@ fn spec(rule: Match, queue: u32, location: u32) -> FlowSpec {
     spec
 }
 
-// Without driver-chosen locations, take the last free one, as ethtool does
-// for `loc` unspecified: the end of the table has the lowest priority.
-fn free_location(size: u32, used: &[u32]) -> Option<u32> {
-    (0..size).rev().find(|location| !used.contains(location))
+/// Where a new rule goes in a table whose locations the caller chooses. The
+/// UAPI ranks lower locations first (RX_CLS_LOC_FIRST is "maximum
+/// priority"), and ethtool takes the last free location for `loc`
+/// unspecified, the lowest priority. Drivers that choose locations
+/// themselves (RX_CLS_LOC_SPECIAL; sfc and bnxt accept RX_CLS_LOC_ANY only)
+/// get RX_CLS_LOC_ANY and order rules their own way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Placement {
+    /// The first free location: ahead of every rule placed `Last`.
+    First,
+    /// The last free location.
+    Last,
+}
+
+fn free_location(size: u32, used: &[u32], placement: Placement) -> Option<u32> {
+    let free = |location: &u32| !used.contains(location);
+    match placement {
+        Placement::First => (0..size).find(free),
+        Placement::Last => (0..size).rev().find(free),
+    }
 }
 
 fn ioctl(socket: &OwnedFd, ifindex: u32, data: *mut c_void) -> io::Result<()> {
@@ -331,12 +347,18 @@ pub(crate) fn rss_tcp4_fields(socket: &OwnedFd, ifindex: u32) -> io::Result<Opti
     Ok(Some(RssFields(request.data)))
 }
 
-/// Insert a rule steering `rule` to RX queue `queue`; returns its location.
-/// Another writer of the same table between the location query and the
-/// insertion may take the location first; drivers that replace a rule at
-/// an occupied location (mlx5) then replace that writer's rule, as ethtool
-/// itself would.
-pub(crate) fn insert(socket: &OwnedFd, ifindex: u32, rule: Match, queue: u32) -> io::Result<u32> {
+/// Insert a rule steering `rule` to RX queue `queue` at `placement`;
+/// returns its location. Another writer of the same table between the
+/// location query and the insertion may take the location first; drivers
+/// that replace a rule at an occupied location (mlx5) then replace that
+/// writer's rule, as ethtool itself would.
+pub(crate) fn insert(
+    socket: &OwnedFd,
+    ifindex: u32,
+    rule: Match,
+    queue: u32,
+    placement: Placement,
+) -> io::Result<u32> {
     let mut count = Rxnfc::new(ETHTOOL_GRXCLSRLCNT);
     ioctl(socket, ifindex, (&mut count as *mut Rxnfc).cast())
         .map_err(|e| context(e, "ETHTOOL_GRXCLSRLCNT"))?;
@@ -369,7 +391,7 @@ pub(crate) fn insert(socket: &OwnedFd, ifindex: u32, rule: Match, queue: u32) ->
             );
             (size, used)
         };
-        free_location(size, used).ok_or_else(|| {
+        free_location(size, used, placement).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::StorageFull,
                 "no free RX classification rule location",
@@ -580,11 +602,17 @@ mod tests {
     }
 
     #[test]
-    fn last_free_location() {
-        assert_eq!(free_location(4, &[]), Some(3));
-        assert_eq!(free_location(4, &[3, 1]), Some(2));
-        assert_eq!(free_location(4, &[3, 2]), Some(1));
-        assert_eq!(free_location(2, &[0, 1]), None);
-        assert_eq!(free_location(0, &[]), None);
+    fn free_locations() {
+        use Placement::{First, Last};
+        assert_eq!(free_location(4, &[], Last), Some(3));
+        assert_eq!(free_location(4, &[3, 1], Last), Some(2));
+        assert_eq!(free_location(4, &[3, 2], Last), Some(1));
+        assert_eq!(free_location(2, &[0, 1], Last), None);
+        assert_eq!(free_location(0, &[], Last), None);
+        assert_eq!(free_location(4, &[], First), Some(0));
+        assert_eq!(free_location(4, &[0, 2], First), Some(1));
+        assert_eq!(free_location(4, &[1, 0], First), Some(2));
+        assert_eq!(free_location(2, &[1, 0], First), None);
+        assert_eq!(free_location(0, &[], First), None);
     }
 }

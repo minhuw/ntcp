@@ -25,7 +25,10 @@
 //! queue: `steer_ipv4` sends an address to one queue (one Network per
 //! address), `steer_tcp_port` the TCP destination ports of an address that
 //! match a mask, and `steer_arp` sends ARP to one hosted queue. Frames no
-//! rule matches arrive where the device puts them without rules.
+//! rule matches arrive where the device puts them without rules. A frame
+//! that both a port rule and an address rule match should take the port
+//! rule: `steer_tcp_port` places its rule ahead of the others where the
+//! driver lets the port choose (see there).
 //!
 //! The program is attached through a BPF link: it is detached when the last
 //! handle of the port drops, and by the kernel if the process exits. ntuple
@@ -35,7 +38,10 @@
 //! Interfaces, the program and rules are resolved in the network namespace of
 //! the thread that calls `Port::attach`.
 
-use crate::{AfXdp, Config, Rss, RssFields, ethtool};
+use crate::{
+    AfXdp, Config, Rss, RssFields,
+    ethtool::{self, Placement},
+};
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use std::{
     ffi::{CString, c_char, c_int, c_void},
@@ -442,14 +448,16 @@ impl Port {
     /// drivers also need them enabled (`ethtool -K IF ntuple on`), mlx5 does
     /// not.
     pub fn steer_ipv4(&self, address: Ipv4Addr, queue: u32) -> io::Result<Rule> {
-        self.steer(ethtool::Match::Ipv4Destination(address), queue)
+        let rule = ethtool::Match::Ipv4Destination(address);
+        self.steer(rule, queue, Placement::Last)
     }
 
     /// Steer ARP frames to RX queue `queue` (`ethtool -N IF flow-type ether
     /// proto 0x0806 action QUEUE`) until the `Rule` drops. The kernel still
     /// receives the ARP frames that are not for ntcp, on that queue.
     pub fn steer_arp(&self, queue: u32) -> io::Result<Rule> {
-        self.steer(ethtool::Match::EtherType(ETH_P_ARP), queue)
+        let rule = ethtool::Match::EtherType(ETH_P_ARP);
+        self.steer(rule, queue, Placement::Last)
     }
 
     /// Steer TCP/IPv4 frames with destination `address` whose destination
@@ -458,6 +466,15 @@ impl Port {
     /// QUEUE`, with a port mask) until the `Rule` drops. `port` must have no
     /// bits outside `mask`. Unsupported without ntuple filters in the driver;
     /// drivers may refuse partial port masks.
+    ///
+    /// Where it overlaps a `steer_ipv4` rule for the same address, this is
+    /// the more specific rule, so it takes the first free location and the
+    /// others the last: drivers that rank rules by location (lower first,
+    /// as the UAPI describes RX_CLS_LOC_FIRST) then apply it first. mlx5
+    /// ranks rules by the number of fields they match instead (a flow table
+    /// per count, en_fs_ethtool.c), which puts it first as well: address,
+    /// port and TCP against address and IPv4. Drivers that choose locations
+    /// themselves rank rules their own way.
     pub fn steer_tcp_port(
         &self,
         address: Ipv4Addr,
@@ -476,17 +493,23 @@ impl Port {
             port,
             mask,
         };
-        self.steer(rule, queue)
+        self.steer(rule, queue, Placement::First)
     }
 
-    fn steer(&self, rule: ethtool::Match, queue: u32) -> io::Result<Rule> {
+    fn steer(&self, rule: ethtool::Match, queue: u32, placement: Placement) -> io::Result<Rule> {
         if queue >= self.queues() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "steering target queue out of range",
             ));
         }
-        let location = ethtool::insert(&self.inner.control, self.inner.ifindex, rule, queue)?;
+        let location = ethtool::insert(
+            &self.inner.control,
+            self.inner.ifindex,
+            rule,
+            queue,
+            placement,
+        )?;
         Ok(Rule {
             port: self.inner.clone(),
             location,
