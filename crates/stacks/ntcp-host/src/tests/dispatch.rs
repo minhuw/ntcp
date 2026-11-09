@@ -135,6 +135,12 @@ pub(super) fn quote_key(frame: &[u8]) -> QuoteKey {
 const UNCORRELATED: IcmpDispatch =
     IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Uncorrelated));
 
+// RFC 5927 section 4.1, as Linux: a router PTB names the connection of its
+// quoted four-tuple whose sent, unacknowledged sequence space holds the
+// quoted sequence. Forgeries with another address or port, an out-of-window
+// sequence, or a context that never sent the segment change nothing; a
+// forgery that keeps the four-tuple and an in-window sequence is accepted
+// like the router's own report.
 #[test]
 fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
     for v6 in [false, true] {
@@ -149,51 +155,33 @@ fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
         let feedback = ntcp_icmp::decode_icmp(&report).unwrap();
         assert_ne!(feedback.outer.source, remote.ip(), "router, not the peer");
         let before = (current_mtu(&a, id), learned(&a, id));
-        // Wrong address, length, ports and sequence: no submission matches.
+        // Wrong address, ports and sequence: no connection's send window.
         let forgeries = [
             forged(&original, mtu, |f, _| {
                 let at = if v6 { 39 } else { 19 };
                 f[at] ^= 1;
             }),
-            forged(&original, mtu, |f, _| {
-                let at = if v6 { 4 } else { 2 };
-                let len = u16::from_be_bytes([f[at], f[at + 1]]) - 4;
-                f[at..at + 2].copy_from_slice(&len.to_be_bytes());
-            }),
             forged(&original, mtu, |f, h| f[h + 1] ^= 1),
             forged(&original, mtu, |f, h| f[h + 3] ^= 1),
-            forged(&original, mtu, |f, h| f[h + 7] ^= 1),
+            forged(&original, mtu, |f, h| f[h + 4] ^= 0x80),
         ];
         for (n, forgery) in forgeries.iter().enumerate() {
             assert_eq!(dispatch(&mut a, 101, forgery), UNCORRELATED, "forgery {n}");
         }
-        // Wrong header length or protocol, at the correlation boundary.
-        let quote = ntcp_icmp::decode_icmp(&report).unwrap().quoted;
-        let key = QuoteKey {
-            source: quote.ip.source,
-            destination: quote.ip.destination,
-            header_len: u32::from(quote.ip_header_len),
-            packet_len: quote.ip_packet_len,
-            protocol: 6,
-            transport: QuotedSelector::Tcp {
-                source_port: quote.source_port,
-                destination_port: quote.destination_port,
-                sequence: quote.sequence,
-            },
-        };
-        assert!(a.0.correlate(101, &key).owner.is_some());
-        for wrong in [
-            QuoteKey {
-                header_len: key.header_len + 4,
-                ..key
-            },
-            QuoteKey {
-                protocol: 17,
-                ..key
-            },
-        ] {
-            assert_eq!(a.0.correlate(101, &wrong).matches, 0);
-        }
+        // Another protocol never names the connection.
+        let key = quote_key(&original);
+        assert!(a.0.tcp_quote(&a.1, &key, None).is_some());
+        assert!(
+            a.0.tcp_quote(
+                &a.1,
+                &QuoteKey {
+                    protocol: 17,
+                    ..key
+                },
+                None
+            )
+            .is_none()
+        );
         // Wrong context: another Host never submitted this packet.
         let (local, _) = addresses(v6);
         let mut other = managed(local, 2100, cfg.clone());
@@ -208,10 +196,24 @@ fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
         assert_eq!(published, Some(path::EstimateChange::Decreased));
         assert_eq!(current_mtu(&a, id), mtu);
         assert_eq!(learned(&a, id), Some(mtu));
-        let repair = send(&mut a, 103).unwrap();
+        // The four-tuple and an in-window sequence are all a quote must
+        // keep: another length, or a later sequence of the outstanding
+        // segment, is the connection's too.
+        for forgery in [
+            forged(&original, mtu, |f, _| {
+                let at = if v6 { 4 } else { 2 };
+                let len = u16::from_be_bytes([f[at], f[at + 1]]) - 4;
+                f[at..at + 2].copy_from_slice(&len.to_be_bytes());
+            }),
+            forged(&original, mtu, |f, h| f[h + 7] ^= 1),
+        ] {
+            let (report, _) = tcp_report(dispatch(&mut a, 103, &forgery));
+            assert_ne!(report, TcpReport::PacketTooBig(PmtuFeedback::Rejected));
+        }
+        let repair = send(&mut a, 104).unwrap();
         assert!(repair.len() <= mtu as usize);
         std::println!(
-            "v6={v6}: router PTB {} -> TCP {mtu}, shared {mtu}; 5 forged quotes, 2 wrong keys, foreign context discarded; repair {} bytes",
+            "v6={v6}: router PTB {} -> TCP {mtu}, shared {mtu}; 4 forged quotes, another protocol, foreign context discarded; in-window forgeries accepted; repair {} bytes",
             original.len(),
             repair.len()
         );
@@ -242,88 +244,6 @@ fn deferred_tcp_report_is_not_preempted_by_shared_publication() {
         a.0.refresh(&mut a.1, id).unwrap();
         assert_eq!(current_mtu(&a, id), before);
         std::println!("v6={v6}: deferred below proven delivery, shared estimate untouched");
-    }
-}
-
-// Connection churn overflows the summaries of released generations, which
-// discards the oldest. Only owners that could reuse a discarded four-tuple
-// lose owner-level attribution: a later connection on another four-tuple
-// still has its router PTB correlated, while a reuse of the discarded tuple
-// stays ambiguous until that summary's horizon.
-#[test]
-fn discarded_churn_summaries_blind_only_owners_of_their_key() {
-    for v6 in [false, true] {
-        let cfg = config(2);
-        let (local, remote) = addresses(v6);
-        let mut a = managed(local, 2200, cfg.clone());
-        let mut b = managed(remote, 2201, cfg.clone());
-        b.1.listen(remote, 1).unwrap();
-        let slots = 2 * a.0.ledger.limits().owners;
-        let mut now = 0;
-        let mut syns = Vec::new();
-        // One more generation than summaries; the next keeps the last released
-        // generation's record busy until then.
-        for n in 0..slots + 2 {
-            let from = SocketAddr::new(local.ip(), 3000 + n as u16);
-            let id =
-                a.1.connect_with_path_provider(now, from, remote, options(&cfg, 0), &mut a.0)
-                    .unwrap();
-            now += 10;
-            syns.push(send(&mut a, now).unwrap());
-            a.1.abort(id).unwrap();
-            a.1.release(id).unwrap();
-            a.0.collect(&a.1).unwrap();
-            while emit(&mut a.0, &mut a.1, now).is_some() {}
-        }
-        // The first generation's summary was discarded for the last released.
-        assert_eq!(a.0.correlate(now, &quote_key(&syns[0])).matches, 0);
-        let survivor = a.0.correlate(now, &quote_key(&syns[1]));
-        assert_eq!(
-            (survivor.matches, survivor.summarized),
-            (0, true),
-            "other summaries survive, as lossy history only"
-        );
-
-        let fresh = SocketAddr::new(local.ip(), 4000);
-        let id =
-            a.1.connect_with_path_provider(now, fresh, remote, options(&cfg, 0), &mut a.0)
-                .unwrap();
-        pump(&mut a, &mut b, &mut now);
-        a.1.write(id, &[6; 1400]).unwrap();
-        now += 10;
-        let original = send(&mut a, now).unwrap();
-        let (report, published) =
-            tcp_report(dispatch(&mut a, now + 1, &ptb(&original, smaller(v6))));
-        assert!(matches!(
-            report,
-            TcpReport::PacketTooBig(PmtuFeedback::Decreased { .. })
-        ));
-        assert_eq!(published, Some(path::EstimateChange::Decreased));
-
-        // A new generation on the discarded tuple is not attributable: its
-        // packets could be identical to the forgotten generation's.
-        now += 10;
-        pump(&mut a, &mut b, &mut now);
-        let reuse = SocketAddr::new(local.ip(), 3000);
-        let again =
-            a.1.connect_with_path_provider(now, reuse, remote, options(&cfg, 0), &mut a.0)
-                .unwrap();
-        let syn = send(&mut a, now).unwrap();
-        let key = quote_key(&syn);
-        let correlation = a.0.correlate(now, &key);
-        assert_eq!(correlation.matches, 1);
-        assert_eq!(correlation.owner, None, "blinded by the discarded summary");
-        let horizon = a.0.ledger.limits().feedback_horizon;
-        assert_eq!(
-            a.0.correlate(now + horizon, &key)
-                .owner
-                .map(|r| r.evidence.owner),
-            Some(Owner::Tcp(again))
-        );
-        std::println!(
-            "v6={v6}: {} churned generations over {slots} summaries; new tuple PTB Decreased, reused tuple blinded until horizon",
-            slots + 2
-        );
     }
 }
 
@@ -393,8 +313,12 @@ fn unchanged_estimate_drop_advice_is_consumed_without_side_effects() {
     }
 }
 
+// Connections keep no record of the path each segment left on: like Linux,
+// which applies a PTB to the socket's current route, a report quoting a
+// segment sent before the connection moved to another path incarnation
+// lowers the current one, never the old.
 #[test]
-fn stale_path_incarnation_never_changes_an_estimate() {
+fn ptb_after_a_path_change_applies_to_the_current_path() {
     for v6 in [false, true] {
         let cfg = config(2);
         let (mut a, _b, id) = connected(v6, &cfg, 2030);
@@ -403,12 +327,13 @@ fn stale_path_incarnation_never_changes_an_estimate() {
         let old = a.0.binding(id).unwrap().snapshot.path();
         a.0.rebind_dscp(&mut a.1, id, 8).unwrap();
         assert_ne!(a.0.binding(id).unwrap().snapshot.path(), old);
-        let before = current_mtu(&a, id);
         let (report, published) = tcp_report(dispatch(&mut a, 101, &ptb(&original, smaller(v6))));
-        assert_eq!(report, TcpReport::PacketTooBig(PmtuFeedback::Unchanged));
-        assert_eq!(published, None);
-        assert_eq!(current_mtu(&a, id), before);
-        assert_eq!(learned(&a, id), None);
+        assert!(matches!(report, TcpReport::PacketTooBig(_)));
+        assert_ne!(report, TcpReport::PacketTooBig(PmtuFeedback::Rejected));
+        assert_eq!(published, Some(path::EstimateChange::Decreased));
+        assert_eq!(learned(&a, id), Some(smaller(v6)));
+        a.0.refresh(&mut a.1, id).unwrap();
+        assert!(current_mtu(&a, id) <= smaller(v6));
         if let Ok(snapshot) = a.0.paths().path_snapshot(old) {
             assert_eq!(snapshot.learned_mtu(), None);
         }
@@ -424,9 +349,10 @@ fn correlated_errors_and_source_quench() {
         let original = send(&mut a, 100).unwrap();
         drain_events(&mut a.1);
         let unreachable = if v6 { (1, 0) } else { (3, 1) };
+        // A sequence outside the connection's send window.
         let mut wrong = original.clone();
         let h = header(&wrong);
-        wrong[h + 7] ^= 1;
+        wrong[h + 4] ^= 0x80;
         seal_ipv4(&mut wrong);
         assert_eq!(
             dispatch(&mut a, 101, &icmp(&wrong, unreachable, 0)),
@@ -530,12 +456,9 @@ fn reserved_owner_defers_without_effect_and_replay_revalidates_generation() {
             a.0.replay_icmp(&mut a.1, deferred, 105).unwrap(),
             IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Stale))
         );
-        // Fresh input about the released generation is equally stale.
+        // Fresh input about the released generation names no connection.
         a.0.collect(&a.1).unwrap();
-        assert_eq!(
-            dispatch(&mut a, 106, &report),
-            IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Stale))
-        );
+        assert_eq!(dispatch(&mut a, 106, &report), UNCORRELATED);
         std::println!("v6={v6}: deferred while reserved, replay decreased, ended generation stale");
     }
 }

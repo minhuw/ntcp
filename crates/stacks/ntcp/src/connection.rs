@@ -907,6 +907,9 @@ pub(crate) struct Connection {
     // the immutable wire TSval for ordinary RTTM echo validation.
     sample_departure: Option<Instant>,
     rtt_sample_after: Option<Instant>,
+    // When the SYN last left: the departure its acknowledgment delivers,
+    // which RACK, tracking payload only, does not record.
+    syn_sent_at: Option<Instant>,
     syn_timed_out: bool,
     consecutive_timeouts: u32,
     route_advice_pending: bool,
@@ -1258,6 +1261,7 @@ impl Connection {
             sample: None,
             sample_departure: None,
             rtt_sample_after: None,
+            syn_sent_at: None,
             syn_timed_out: false,
             consecutive_timeouts: 0,
             route_advice_pending: false,
@@ -3014,6 +3018,7 @@ impl Connection {
                 self.fast_open_option_sent |= d.fast_open_option;
                 self.fast_open_response_committed |= d.simultaneous_response;
                 self.record_syn_departure(d.syn_timestamp);
+                self.syn_sent_at = Some(now);
             }
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack.record_syn_payload(

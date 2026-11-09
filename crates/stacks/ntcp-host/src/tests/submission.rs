@@ -69,43 +69,55 @@ fn connected(
             .unwrap();
     let mut now = 0;
     pump(&mut a, &mut b, &mut now);
-    for side in [&mut a, &mut b] {
-        settle(side);
+    // `pump` submits through the transaction; connections record nothing.
+    for side in [&a, &b] {
         assert_eq!(side.0.ledger.records().count(), 0);
     }
     let child = b.1.accept(listener).unwrap();
     (a, b, id, child)
 }
-// `pump` submits through the transaction, sealing handshake evidence.
-// Retire delivered data and drop the remaining (never retiring) control
-// evidence, so a test counts only its own submissions.
-fn settle(side: &mut Side) {
-    side.0.collect(&side.1).unwrap();
-    side.0.ledger.expire(u64::MAX);
+// A Host without a listener, holding the stateless reset it owes the SYN it
+// just received, and that SYN, which draws another.
+fn refused(v6: bool, cfg: &EndpointConfig, identity: u64) -> (Side, Vec<u8>) {
+    let (local, remote) = addresses(v6);
+    let mut a = managed(local, identity, cfg.clone());
+    let mut b = managed(remote, identity + 1, cfg.clone());
+    a.1.connect_with_path_provider(0, local, remote, options(cfg, 0), &mut a.0)
+        .unwrap();
+    let syn = send(&mut a, 1).unwrap();
+    input(&mut b.0, &mut b.1, b.2, 2, &syn, 0);
+    (b, syn)
 }
 fn records(host: &Host) -> Vec<Record> {
     host.ledger.records().collect()
 }
+// The connection a quote of `frame` names, with the span it quotes
+// (`Host::tcp_quote`): none once no sent, unacknowledged sequence space holds
+// it.
+fn quoted_span(side: &Side, frame: &[u8]) -> Option<(ConnectionId, u32, u32)> {
+    side.0
+        .tcp_quote(&side.1, &quote(frame), None)
+        .map(|(owner, segment, _)| (owner, segment.start, segment.end))
+}
 
+// A connection's physical attempt reserves and records no ledger evidence
+// (ICMP errors about it are judged against its send window): blocked retries
+// reach the backend until one is accepted, its quote names the connection by
+// its outstanding sequence space, and a path change before a retry is
+// refused before any backend call.
 #[test]
-fn blocked_retry_revalidates_idempotently_and_seals_once() {
+fn connection_retries_block_and_refuse_without_ledger_evidence() {
     for v6 in [false, true] {
         let cfg = config(2);
         let (mut a, mut b, id, child) = connected(v6, &cfg, 1000);
         a.1.write(id, &[5; 1000]).unwrap();
         let (attempt, _, frame) = selected(&mut a.1, 100).unwrap();
         let context = a.0.egress_context(&mut a.1, attempt).unwrap();
-        // Repeated authority and validation reserve exactly one slot.
         for _ in 0..3 {
             a.0.egress_context(&mut a.1, attempt).unwrap();
             a.0.validate_egress(&mut a.1, context, &frame, 0).unwrap();
         }
-        assert_eq!(a.0.ledger.pending_count(), 1);
         let mut ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
-        assert_eq!(
-            a.0.submission_ticket(&mut a.1, context),
-            Err(Error::InvalidContext)
-        );
         let mut calls = 0;
         for retry in 0..3 {
             match a
@@ -119,8 +131,6 @@ fn blocked_retry_revalidates_idempotently_and_seals_once() {
                 Submission::Blocked(t) => ticket = t,
                 other => panic!("{other:?}"),
             }
-            assert_eq!(a.0.ledger.pending_count(), 1);
-            assert!(records(&a.0).is_empty());
             assert!(a.1.transmit_attempt_packet(attempt).is_some());
         }
         let result =
@@ -131,30 +141,15 @@ fn blocked_retry_revalidates_idempotently_and_seals_once() {
             .unwrap();
         assert!(result == Submission::Submitted);
         assert_eq!(calls, 4);
-        assert_eq!(a.0.ledger.pending_count(), 0);
         assert!(a.1.transmit_attempt_packet(attempt).is_none());
-        let sealed = records(&a.0);
-        assert_eq!(sealed.len(), 1);
+        assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
         let start = sequence(&frame);
         assert_eq!(
-            sealed[0].evidence.transport,
-            Selector::Tcp {
-                source_port: 1000,
-                destination_port: 8080,
-                start,
-                end: start.wrapping_add(1000),
-            }
+            quoted_span(&a, &frame),
+            Some((id, start, start.wrapping_add(1000)))
         );
-        assert_eq!(sealed[0].committed_at, 110);
-        assert!(!sealed[0].possibly_submitted);
-        assert_eq!(sealed[0].evidence.owner, Owner::Tcp(id));
-        assert_eq!(sealed[0].evidence.packet_len as usize, frame.len());
-        let correlation = a.0.correlate(111, &quote(&frame));
-        assert_eq!(correlation.unique, Some(sealed[0]));
-        assert_eq!(
-            correlation.path,
-            Some(a.0.binding(id).unwrap().snapshot.path())
-        );
+        let (_, _, path) = a.0.tcp_quote(&a.1, &quote(&frame), None).unwrap();
+        assert_eq!(path, a.0.binding(id).unwrap().snapshot.path());
         input(&mut b.0, &mut b.1, b.2, 112, &frame, 0);
         let mut bytes = [0; 2000];
         assert_eq!(b.1.read(child, &mut bytes).unwrap(), 1000);
@@ -174,48 +169,156 @@ fn blocked_retry_revalidates_idempotently_and_seals_once() {
         assert_eq!(refused.error, Error::Obsolete);
         assert!(a.1.reject_unsubmitted(next).unwrap());
         a.0.cancel_submission(refused.ticket);
-        assert_eq!(a.0.ledger.pending_count(), 0);
-        assert_eq!(records(&a.0).len(), 1);
+        assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
+        std::println!("v6={v6}: 3 WouldBlock retries, refused stale retry, nothing recorded");
+    }
+}
+
+// The stateless lane records every physical submission: repeated authority
+// and validation of one attempt reserve exactly one slot, its single ticket
+// survives blocked retries without a record, and the accepted call seals it
+// once. A path change before a retry is refused, recording nothing.
+#[test]
+fn stateless_blocked_retry_revalidates_idempotently_and_seals_once() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (mut b, syn) = refused(v6, &cfg, 1004);
+        let (attempt, packet, frame) = selected(&mut b.1, 3).unwrap();
+        assert_eq!(packet.connection, None);
+        let context = b.0.egress_context(&mut b.1, attempt).unwrap();
+        // Repeated authority and validation reserve exactly one slot.
+        for _ in 0..3 {
+            b.0.egress_context(&mut b.1, attempt).unwrap();
+            b.0.validate_egress(&mut b.1, context, &frame, 0).unwrap();
+        }
+        assert_eq!(b.0.ledger.pending_count(), 1);
+        let mut ticket = b.0.submission_ticket(&mut b.1, context).unwrap();
+        assert_eq!(
+            b.0.submission_ticket(&mut b.1, context),
+            Err(Error::InvalidContext)
+        );
+        let mut calls = 0;
+        for retry in 0..3 {
+            match b
+                .0
+                .submit(&mut b.1, 4 + retry, ticket, context, &frame, 0, |_| {
+                    calls += 1;
+                    BackendOutcome::WouldBlock
+                })
+                .unwrap()
+            {
+                Submission::Blocked(t) => ticket = t,
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(b.0.ledger.pending_count(), 1);
+            assert!(records(&b.0).is_empty());
+            assert!(b.1.transmit_attempt_packet(attempt).is_some());
+        }
+        let result =
+            b.0.submit(&mut b.1, 10, ticket, context, &frame, 0, |_| {
+                calls += 1;
+                BackendOutcome::Submitted
+            })
+            .unwrap();
+        assert!(result == Submission::Submitted);
+        assert_eq!(calls, 4);
+        assert_eq!(b.0.ledger.pending_count(), 0);
+        assert!(b.1.transmit_attempt_packet(attempt).is_none());
+        let sealed = records(&b.0);
+        assert_eq!(sealed.len(), 1);
+        let start = sequence(&frame);
+        assert_eq!(
+            sealed[0].evidence.transport,
+            Selector::Tcp {
+                source_port: 8080,
+                destination_port: 1000,
+                start,
+                end: start,
+            }
+        );
+        assert_eq!(sealed[0].committed_at, 10);
+        assert!(!sealed[0].possibly_submitted);
+        assert_eq!(sealed[0].evidence.owner, Owner::Stateless);
+        assert_eq!(sealed[0].evidence.packet_len as usize, frame.len());
+        let correlation = b.0.correlate(11, &quote(&frame));
+        assert_eq!(correlation.unique, Some(sealed[0]));
+        assert_eq!(correlation.path, Some(context.binding.snapshot.path()));
+        // A path change before a retry is refused before any backend call.
+        b.0.collect(&b.1).unwrap();
+        input(&mut b.0, &mut b.1, b.2, 20, &syn, 0);
+        let (next, _, frame) = selected(&mut b.1, 21).unwrap();
+        let context = b.0.egress_context(&mut b.1, next).unwrap();
+        let ticket = b.0.submission_ticket(&mut b.1, context).unwrap();
+        let path = context.binding.snapshot.path();
+        b.0.trusted_decrease(22, path, if v6 { 1280 } else { 1100 })
+            .unwrap();
+        let refused =
+            b.0.submit(&mut b.1, 23, ticket, context, &frame, 0, |_| {
+                panic!("obsolete attempt reached the backend")
+            })
+            .unwrap_err();
+        assert_eq!(refused.error, Error::Obsolete);
+        b.1.reject_unsubmitted(next).unwrap();
+        b.0.cancel_submission(refused.ticket);
+        assert_eq!(b.0.ledger.pending_count(), 0);
+        assert_eq!(records(&b.0).len(), 1);
         std::println!(
-            "v6={v6}: 3 WouldBlock retries, 1 seal, refused stale retry recorded nothing"
+            "v6={v6}: stateless 3 WouldBlock retries, 1 seal, refused stale retry recorded nothing"
         );
     }
 }
 
+// An unknown backend outcome is never success and never unsent: the Endpoint
+// keeps the attempt for the caller's quarantine. A connection's records
+// nothing; the stateless lane seals possibly-submitted evidence that still
+// correlates. Either way the quarantine's own new reservation is reclaimed,
+// never sealed.
 #[test]
-fn unknown_outcome_seals_possibly_submitted_and_keeps_quarantine() {
+fn unknown_outcome_keeps_quarantine_and_seals_only_stateless_evidence() {
     let cfg = config(2);
     let (mut a, _b, id, _) = connected(false, &cfg, 1010);
     a.1.write(id, &[1; 500]).unwrap();
-    let (attempt, frame, result) = attempt_with(&mut a, 100, BackendOutcome::Unknown).unwrap();
+    let (attempt, _, result) = attempt_with(&mut a, 100, BackendOutcome::Unknown).unwrap();
     assert_eq!(result, Submission::PossiblySubmitted);
-    let sealed = records(&a.0);
-    assert_eq!(sealed.len(), 1);
-    assert!(sealed[0].possibly_submitted);
-    // Not accepted as success and not cancelled as unsent: the Endpoint still
-    // holds the attempt for the caller's quarantine.
     assert!(a.1.transmit_attempt_packet(attempt).is_some());
     assert!(a.1.is_output_reserved(id));
-    assert_eq!(a.0.ledger.pending_count(), 0);
-    // Its ticket is gone; the evidence can still correlate.
-    assert!(
-        a.0.correlate(101, &quote(&frame))
-            .unique
-            .is_some_and(|r| r.possibly_submitted)
-    );
+    assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
     let context = a.0.egress_context(&mut a.1, attempt).unwrap();
     let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
-    // The quarantine resolves the attempt itself; the new reservation is
-    // reclaimed, never sealed.
     assert!(a.1.abandon_transmit(attempt).unwrap());
     a.0.cancel_submission(ticket);
     a.0.collect(&a.1).unwrap();
-    assert_eq!(records(&a.0).len(), 1);
-    assert_eq!(a.0.ledger.pending_count(), 0);
+    assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
+
+    let (mut b, _) = refused(false, &cfg, 1012);
+    let (attempt, frame, result) = attempt_with(&mut b, 3, BackendOutcome::Unknown).unwrap();
+    assert_eq!(result, Submission::PossiblySubmitted);
+    let sealed = records(&b.0);
+    assert_eq!(sealed.len(), 1);
+    assert!(sealed[0].possibly_submitted);
+    assert!(b.1.transmit_attempt_packet(attempt).is_some());
+    assert_eq!(b.0.ledger.pending_count(), 0);
+    // Its ticket is gone; the evidence can still correlate.
+    assert!(
+        b.0.correlate(4, &quote(&frame))
+            .unique
+            .is_some_and(|r| r.possibly_submitted)
+    );
+    let context = b.0.egress_context(&mut b.1, attempt).unwrap();
+    let ticket = b.0.submission_ticket(&mut b.1, context).unwrap();
+    assert!(b.1.abandon_transmit(attempt).unwrap());
+    b.0.cancel_submission(ticket);
+    b.0.collect(&b.1).unwrap();
+    assert_eq!(records(&b.0).len(), 1);
+    assert_eq!(b.0.ledger.pending_count(), 0);
 }
 
+// A software GSO aggregate leaves one physical segment per call. One that a
+// decrease made obsolete before its call is refused and cancelled, and the
+// aggregate continues at the new size; none of it is ledger evidence, and
+// the receiver reads the stream exactly once.
 #[test]
-fn partial_software_gso_records_each_physical_segment_once() {
+fn partial_software_gso_refusal_repacketizes_without_evidence() {
     for v6 in [false, true] {
         let mut cfg = config(4);
         cfg.connection.pmtud.as_mut().unwrap().initial_search_low = Some(1500);
@@ -228,7 +331,6 @@ fn partial_software_gso_records_each_physical_segment_once() {
                 .unwrap();
         let mut now = 0;
         pump(&mut a, &mut b, &mut now);
-        settle(&mut a);
         let child = b.1.accept(listener).unwrap();
         let payload: Vec<u8> = (0..6000).map(|i| i as u8).collect();
         a.1.write(id, &payload).unwrap();
@@ -239,8 +341,8 @@ fn partial_software_gso_records_each_physical_segment_once() {
             "aggregate continues after one segment"
         );
         input(&mut b.0, &mut b.1, b.2, now + 1, &first, 0);
-        // The second physical segment gets its own ticket; a decrease makes it
-        // obsolete before the call, so only the first segment is evidence.
+        // The second physical segment is authorized on its own; a decrease
+        // makes it obsolete before the call.
         let (held, _, frame) = selected(&mut a.1, now + 2).unwrap();
         let context = a.0.egress_context(&mut a.1, held).unwrap();
         let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
@@ -254,7 +356,6 @@ fn partial_software_gso_records_each_physical_segment_once() {
             .unwrap_err();
         a.1.reject_unsubmitted(held).unwrap();
         a.0.cancel_submission(refused.ticket);
-        assert_eq!(records(&a.0).len(), 1);
         now += 20;
         let mut segments = 1;
         while a.1.is_output_reserved(id) {
@@ -263,59 +364,227 @@ fn partial_software_gso_records_each_physical_segment_once() {
             input(&mut b.0, &mut b.1, b.2, now + 1, &frame, 0);
             segments += 1;
         }
-        let sealed = records(&a.0);
-        assert_eq!(sealed.len(), segments);
-        let mut spans: Vec<(u32, u32)> = sealed
-            .iter()
-            .map(|r| match r.evidence.transport {
-                Selector::Tcp { start, end, .. } => (start, end),
-                _ => unreachable!(),
-            })
-            .collect();
-        spans.sort_by_key(|(s, _)| s.wrapping_sub(sequence(&first)));
-        for pair in spans.windows(2) {
-            assert_eq!(pair[0].1, pair[1].0, "one record per physical segment");
-        }
+        assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
         now += 10;
         pump(&mut a, &mut b, &mut now);
         let mut bytes = vec![0; payload.len()];
         assert_eq!(b.1.read(child, &mut bytes).unwrap(), payload.len());
         assert_eq!(bytes, payload);
-        std::println!("v6={v6}: {segments} physical segments, {segments} sealed records");
+        std::println!("v6={v6}: {segments} physical segments, nothing recorded");
     }
 }
 
+// A backend rejection retains the ticket. A connection's replacement attempt
+// submits under it (it carries no reservation), recording nothing. A
+// withdrawn stateless reply's reservation is reclaimed by `collect`, which
+// also frees the reply's path lease, so its ticket names nothing and the
+// next reply takes its own.
 #[test]
 fn retained_rejection_reuses_its_ticket_for_the_replacement_attempt() {
     let cfg = config(2);
-    let (mut a, mut b, id, child) = connected(false, &cfg, 1030);
+    let (mut b, syn) = refused(false, &cfg, 1030);
+    let (attempt, _, result) = attempt_with(&mut b, 3, BackendOutcome::Rejected).unwrap();
+    let Submission::Rejected(ticket) = result else {
+        panic!("{result:?}")
+    };
+    assert!(records(&b.0).is_empty());
+    assert_eq!(b.0.ledger.pending_count(), 1);
+    b.1.reject_unsubmitted(attempt).unwrap();
+    b.0.collect(&b.1).unwrap();
+    assert_eq!(b.0.ledger.pending_count(), 0, "reclaimed");
+    input(&mut b.0, &mut b.1, b.2, 4, &syn, 0);
+    let (next, _, frame) = selected(&mut b.1, 5).unwrap();
+    assert_ne!(next, attempt);
+    let context = b.0.egress_context(&mut b.1, next).unwrap();
+    let refused =
+        b.0.submit(&mut b.1, 6, ticket, context, &frame, 0, |_| {
+            panic!("a reclaimed ticket reached the backend")
+        })
+        .unwrap_err();
+    assert_eq!(refused.error, Error::Obsolete);
+    b.0.cancel_submission(refused.ticket);
+    let ticket = b.0.submission_ticket(&mut b.1, context).unwrap();
+    let result =
+        b.0.submit(&mut b.1, 6, ticket, context, &frame, 0, |_| {
+            BackendOutcome::Submitted
+        })
+        .unwrap();
+    assert!(result == Submission::Submitted);
+    assert_eq!(records(&b.0).len(), 1);
+    assert_eq!(b.0.ledger.pending_count(), 0);
+
+    let (mut a, mut b, id, child) = connected(false, &cfg, 1032);
     a.1.write(id, &[3; 1200]).unwrap();
     let (attempt, _, result) = attempt_with(&mut a, 100, BackendOutcome::Rejected).unwrap();
     let Submission::Rejected(ticket) = result else {
         panic!("{result:?}")
     };
-    assert!(records(&a.0).is_empty());
     assert!(a.1.reject_unsubmitted(attempt).unwrap());
     let (next, _, frame) = selected(&mut a.1, 101).unwrap();
     assert_ne!(next, attempt);
     let context = a.0.egress_context(&mut a.1, next).unwrap();
-    assert_eq!(a.0.ledger.pending_count(), 1, "re-keyed, not a second slot");
-    assert_eq!(
-        a.0.submission_ticket(&mut a.1, context),
-        Err(Error::InvalidContext)
-    );
     let result =
         a.0.submit(&mut a.1, 102, ticket, context, &frame, 0, |_| {
             BackendOutcome::Submitted
         })
         .unwrap();
     assert!(result == Submission::Submitted);
-    assert_eq!(records(&a.0).len(), 1);
-    assert_eq!(a.0.ledger.pending_count(), 0);
+    assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
     input(&mut b.0, &mut b.1, b.2, 103, &frame, 0);
     let mut now = 110;
     pump(&mut a, &mut b, &mut now);
     assert_eq!(b.1.read(child, &mut [0; 2000]).unwrap(), 1200);
+}
+
+// RFC 5927 section 4.1 with serial arithmetic: a connection's ICMP quote is
+// judged by its own sent sequence space. Each outstanding segment's quote,
+// the one spanning 2^32 included, names the connection until a cumulative
+// acknowledgment covers it; once the generation ends nothing does, and a
+// later generation on the same four-tuple accepts only quotes of its own
+// sequence space. Nothing enters the ledger.
+#[test]
+fn tcp_quotes_follow_the_send_window_across_sequence_wrap_and_generation_reuse() {
+    let cfg = config(1);
+    let (local, remote) = addresses(false);
+    // Learn F() for this tuple/secret, then open when the 4 us clock puts
+    // the first payload byte just below 2^32.
+    let mut probe = managed(local, 1070, cfg.clone());
+    probe
+        .1
+        .connect_with_path_provider(4, local, remote, options(&cfg, 0), &mut probe.0)
+        .unwrap();
+    let base = sequence(&send(&mut probe, 5).unwrap()).wrapping_sub(1);
+    let target = 0u32.wrapping_sub(1500);
+    let open = u64::from(target.wrapping_sub(base)) * 4;
+    let mut a = managed(local, 1070, cfg.clone());
+    let mut b = managed(remote, 1071, cfg.clone());
+    let listener = b.1.listen(remote, 1).unwrap();
+    let id =
+        a.1.connect_with_path_provider(open, local, remote, options(&cfg, 0), &mut a.0)
+            .unwrap();
+    let syn = send(&mut a, open).unwrap();
+    assert_eq!(sequence(&syn), target);
+    assert_eq!(quoted_span(&a, &syn).map(|(owner, ..)| owner), Some(id));
+    input(&mut b.0, &mut b.1, b.2, open + 1, &syn, 0);
+    let mut now = open + 2;
+    pump(&mut a, &mut b, &mut now);
+    let child = b.1.accept(listener).unwrap();
+    assert_eq!(quoted_span(&a, &syn), None, "acknowledged SYN");
+    a.1.write(id, &[2; 4000]).unwrap();
+    let mut frames = Vec::new();
+    while let Some(frame) = send(&mut a, now) {
+        frames.push(frame);
+        now += 1;
+    }
+    let spans: Vec<(u32, u32)> = frames
+        .iter()
+        .map(|frame| {
+            let (owner, start, end) = quoted_span(&a, frame).unwrap();
+            assert_eq!(owner, id);
+            assert_eq!(start, sequence(frame));
+            (start, end)
+        })
+        .collect();
+    assert_eq!(spans.len(), 3);
+    assert!(
+        spans.iter().any(|(s, e)| s > e),
+        "one segment spans the wrap"
+    );
+    // Deliver one segment at a time; each ACK ends exactly the quotes of
+    // what it covers.
+    for (delivered, frame) in frames.iter().enumerate() {
+        input(&mut b.0, &mut b.1, b.2, now, frame, 0);
+        let ack = send(&mut b, now + 1).unwrap();
+        input(&mut a.0, &mut a.1, a.2, now + 2, &ack, 0);
+        for (k, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                quoted_span(&a, frame).is_some(),
+                k > delivered,
+                "segment {k} after delivering {delivered}"
+            );
+        }
+        now += 10;
+    }
+    assert_eq!(b.1.read(child, &mut [0; 5000]).unwrap(), 4000);
+
+    // A generation that ends takes its sequence space with it; the next one
+    // on the four-tuple starts from its own ISS.
+    a.1.write(id, &[7; 500]).unwrap();
+    let lost = send(&mut a, now).unwrap();
+    assert_eq!(quoted_span(&a, &lost).map(|(owner, ..)| owner), Some(id));
+    a.1.abort(id).unwrap();
+    while emit(&mut a.0, &mut a.1, now).is_some() {}
+    a.1.release(id).unwrap();
+    // Bounded reset quarantine retains the old generation until it expires.
+    for _ in 0..1000 {
+        if !a.1.connection_exists(id) {
+            break;
+        }
+        now += 1_000_000;
+        a.1.on_timeout(now, 32).unwrap();
+        while emit(&mut a.0, &mut a.1, now).is_some() {}
+    }
+    assert!(!a.1.connection_exists(id));
+    a.0.collect(&a.1).unwrap();
+    assert_eq!(quoted_span(&a, &lost), None);
+    let replacement =
+        a.1.connect_with_path_provider(now + 10, local, remote, options(&cfg, 0), &mut a.0)
+            .unwrap();
+    assert_ne!(replacement, id);
+    let syn = send(&mut a, now + 11).unwrap();
+    assert_eq!(quoted_span(&a, &lost), None, "the old generation's data");
+    assert_eq!(
+        quoted_span(&a, &syn).map(|(owner, ..)| owner),
+        Some(replacement)
+    );
+    assert!(records(&a.0).is_empty());
+}
+
+// Connections never wait for ledger capacity: with one owner record and one
+// unsealed attempt, two connections' attempts are authorized and submitted
+// together, recording nothing, and the stateless lane still records its
+// reply within the same limits.
+#[test]
+fn connections_need_no_ledger_capacity_and_the_stateless_lane_still_records() {
+    fn one_each(l: &mut LedgerLimits) -> usize {
+        l.owners = 1;
+        l.concurrent_attempts = 1;
+        2
+    }
+    let cfg = config(2);
+    let (local, remote) = addresses(false);
+    let mut a = managed_with(local, 1080, cfg.clone(), false, None, None, one_each);
+    a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+        .unwrap();
+    let second_local = SocketAddr::new(local.ip(), local.port() + 1);
+    let second =
+        a.1.connect_with_path_provider(0, second_local, remote, options(&cfg, 0), &mut a.0)
+            .unwrap();
+    let (one, _, frame_one) = selected(&mut a.1, 1).unwrap();
+    let (two, _, frame_two) = selected(&mut a.1, 1).unwrap();
+    assert_eq!(
+        a.1.transmit_attempt_packet(two).unwrap().connection,
+        Some(second)
+    );
+    let contexts = [one, two].map(|attempt| a.0.egress_context(&mut a.1, attempt).unwrap());
+    for (context, frame) in contexts.into_iter().zip([&frame_one, &frame_two]) {
+        let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
+        let result =
+            a.0.submit(&mut a.1, 2, ticket, context, frame, 0, |_| {
+                BackendOutcome::Submitted
+            })
+            .unwrap();
+        assert!(result == Submission::Submitted);
+    }
+    assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
+    // Without a listener, the peer resets the first SYN.
+    let mut b = managed_with(remote, 1081, cfg.clone(), false, None, None, one_each);
+    input(&mut b.0, &mut b.1, b.2, 3, &frame_one, 0);
+    send(&mut b, 4).unwrap();
+    let sealed = records(&b.0);
+    assert_eq!(sealed.len(), 1);
+    assert_eq!(sealed[0].evidence.owner, Owner::Stateless);
+    assert_eq!(b.0.ledger.pending_count(), 0);
 }
 
 #[test]
@@ -355,357 +624,6 @@ fn certified_nonsubmission_cancels_without_evidence_and_stateless_lane_records()
     assert!(records(&b.0).is_empty());
 }
 
-#[test]
-fn ack_only_entries_expire_while_outstanding_data_waits_for_delivery() {
-    let cfg = config(2);
-    let (mut a, mut b, id, child) = connected(false, &cfg, 1050);
-    b.1.write(child, &[9; 300]).unwrap();
-    let data = send(&mut b, 100).unwrap();
-    input(&mut a.0, &mut a.1, a.2, 101, &data, 0);
-    let ack = send(&mut a, 102).unwrap();
-    a.1.write(id, &[8; 300]).unwrap();
-    let outstanding = send(&mut a, 103).unwrap();
-    let sealed = records(&a.0);
-    assert_eq!(sealed.len(), 2);
-    let horizon = a.0.ledger.limits().feedback_horizon;
-    a.0.expire_submissions(102 + horizon);
-    let left = records(&a.0);
-    assert_eq!(left.len(), 1, "pure ACK expired, unacknowledged data kept");
-    assert_eq!(a.0.correlate(102 + horizon, &quote(&ack)).matches, 0);
-    assert!(
-        a.0.correlate(102 + horizon, &quote(&outstanding))
-            .unique
-            .is_some()
-    );
-    input(&mut b.0, &mut b.1, b.2, 104 + horizon, &outstanding, 0);
-    let ack = send(&mut b, 105 + horizon).unwrap();
-    input(&mut a.0, &mut a.1, a.2, 106 + horizon, &ack, 0);
-    a.0.collect(&a.1).unwrap();
-    assert!(records(&a.0).is_empty(), "delivered data retired");
-}
-
-#[test]
-fn same_owner_eviction_keeps_identical_retransmission_ambiguous() {
-    for v6 in [false, true] {
-        let cfg = config(2);
-        let (local, remote) = addresses(v6);
-        // Two entries, and no extension for this send buffer.
-        let ledger = |l: &mut LedgerLimits| {
-            l.history_per_owner = 2;
-            l.segment_bytes = 65536;
-            1
-        };
-        let mut a = managed_with(local, 1060, cfg.clone(), false, None, None, ledger);
-        let mut b = managed(remote, 1061, cfg.clone());
-        b.1.listen(remote, 1).unwrap();
-        let id =
-            a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
-                .unwrap();
-        let mut now = 0;
-        pump(&mut a, &mut b, &mut now);
-        a.0.collect(&a.1).unwrap();
-        a.1.write(id, &[4; 3000]).unwrap();
-        let first = send(&mut a, now + 10).unwrap();
-        let second = send(&mut a, now + 11).unwrap();
-        assert!(a.0.correlate(now + 12, &quote(&first)).unique.is_some());
-        let third = send(&mut a, now + 12).unwrap();
-        // The owner's own oldest entry made room; it survives as a tombstone.
-        assert_eq!(records(&a.0).len(), 2);
-        let evicted = a.0.correlate(now + 13, &quote(&first));
-        // Lossy history is no positive evidence: no match, path or owner.
-        assert_eq!((evicted.matches, evicted.summarized), (0, true));
-        assert_eq!((evicted.unique, evicted.path), (None, None));
-        assert!(a.0.correlate(now + 13, &quote(&third)).unique.is_some());
-        // Nothing was delivered: the RTO retransmits the identical head.
-        let mut retransmit = None;
-        for step in 1..64 {
-            let at = now + step * 1_000_000;
-            a.1.on_timeout(at, 32).unwrap();
-            if let Some(frame) = send(&mut a, at) {
-                retransmit = Some(frame);
-                break;
-            }
-        }
-        let retransmit = retransmit.expect("RTO retransmission");
-        assert_eq!(quote(&retransmit), quote(&first));
-        let identical = a.0.correlate(now + 64_000_000, &quote(&first));
-        assert_eq!(
-            (identical.matches, identical.summarized),
-            (1, true),
-            "live retransmission plus tombstone"
-        );
-        assert_eq!(identical.path, Some(a.0.binding(id).unwrap().snapshot.path()));
-        assert_eq!(identical.unique, None, "old quote never names the new copy");
-        let _ = second;
-    }
-}
-
-#[test]
-fn tcp_retirement_across_sequence_wrap_and_owner_generation_reuse() {
-    let cfg = config(1);
-    let (local, remote) = addresses(false);
-    // Learn F() for this tuple/secret, then open when the 4 us clock puts
-    // the first payload byte just below 2^32.
-    let mut probe = managed(local, 1070, cfg.clone());
-    probe
-        .1
-        .connect_with_path_provider(4, local, remote, options(&cfg, 0), &mut probe.0)
-        .unwrap();
-    let base = sequence(&send(&mut probe, 5).unwrap()).wrapping_sub(1);
-    let target = 0u32.wrapping_sub(1500);
-    let open = u64::from(target.wrapping_sub(base)) * 4;
-    // Reset quarantine below outlives the default 2 MSL horizon; configure a
-    // longer one so the ended generation's history is still live when its
-    // slot is reused.
-    let horizon = |l: &mut LedgerLimits| {
-        l.feedback_horizon = 3_600_000_000;
-        1
-    };
-    let mut a = managed_with(local, 1070, cfg.clone(), false, None, None, horizon);
-    let mut b = managed(remote, 1071, cfg.clone());
-    let listener = b.1.listen(remote, 1).unwrap();
-    let id =
-        a.1.connect_with_path_provider(open, local, remote, options(&cfg, 0), &mut a.0)
-            .unwrap();
-    let syn = send(&mut a, open).unwrap();
-    assert_eq!(sequence(&syn), target);
-    input(&mut b.0, &mut b.1, b.2, open + 1, &syn, 0);
-    let mut now = open + 2;
-    pump(&mut a, &mut b, &mut now);
-    let child = b.1.accept(listener).unwrap();
-    settle(&mut a);
-    assert!(records(&a.0).is_empty(), "acknowledged SYN retired");
-    a.1.write(id, &[2; 4000]).unwrap();
-    let mut frames = Vec::new();
-    while let Some(frame) = send(&mut a, now) {
-        frames.push(frame);
-        now += 1;
-    }
-    let spans: Vec<(u32, u32)> = records(&a.0)
-        .iter()
-        .map(|r| match r.evidence.transport {
-            Selector::Tcp { start, end, .. } => (start, end),
-            _ => unreachable!(),
-        })
-        .collect();
-    assert_eq!(spans.len(), 3);
-    assert!(
-        spans.iter().any(|(s, e)| s > e),
-        "one segment spans the wrap"
-    );
-    // Deliver one segment at a time; each ACK retires exactly what it covers.
-    for (delivered, frame) in frames.iter().enumerate() {
-        input(&mut b.0, &mut b.1, b.2, now, frame, 0);
-        let ack = send(&mut b, now + 1).unwrap();
-        input(&mut a.0, &mut a.1, a.2, now + 2, &ack, 0);
-        a.0.collect(&a.1).unwrap();
-        assert_eq!(records(&a.0).len(), frames.len() - delivered - 1);
-        now += 10;
-    }
-    assert_eq!(b.1.read(child, &mut [0; 5000]).unwrap(), 4000);
-
-    // Unacknowledged history of a generation that ends becomes a tombstone
-    // when its slot is reused; it never belongs to the new generation.
-    a.1.write(id, &[7; 500]).unwrap();
-    let lost = send(&mut a, now).unwrap();
-    a.1.abort(id).unwrap();
-    while emit(&mut a.0, &mut a.1, now).is_some() {}
-    a.1.release(id).unwrap();
-    // Bounded reset quarantine retains the old generation until it expires.
-    for _ in 0..1000 {
-        if !a.1.connection_exists(id) {
-            break;
-        }
-        now += 1_000_000;
-        a.1.on_timeout(now, 32).unwrap();
-        while emit(&mut a.0, &mut a.1, now).is_some() {}
-    }
-    assert!(!a.1.connection_exists(id));
-    a.0.collect(&a.1).unwrap();
-    assert!(records(&a.0).is_empty());
-    let replacement =
-        a.1.connect_with_path_provider(now + 10, local, remote, options(&cfg, 0), &mut a.0)
-            .unwrap();
-    assert_ne!(replacement, id);
-    send(&mut a, now + 11).unwrap();
-    let sealed = records(&a.0);
-    assert_eq!(sealed.len(), 1);
-    assert_eq!(sealed[0].evidence.owner, Owner::Tcp(replacement));
-    let old = a.0.correlate(now + 12, &quote(&lost));
-    assert_eq!((old.matches, old.summarized, old.unique), (0, true, None));
-    a.0.ledger
-        .retire_tcp(id, sequence(&lost).wrapping_add(1000), |_| {});
-    assert_eq!(records(&a.0).len(), 1, "stale generation retires nothing");
-}
-
-// A long-lived connection evicts continuously when its window exceeds its
-// history. Delivery cuts its evicted summary back at SND.UNA, so after far
-// more than 2^32 bytes of evicted spans the newest live segments are still
-// attributable and only evicted outstanding segments are ambiguous.
-#[test]
-fn delivery_shrinks_evicted_tcp_history_so_live_segments_stay_attributable() {
-    let cfg = config(1);
-    let (local, remote) = addresses(false);
-    let two = |l: &mut LedgerLimits| {
-        l.history_per_owner = 2;
-        1
-    };
-    let (mut host, mut endpoint, ingress) =
-        managed_with(local, 1095, cfg.clone(), false, None, None, two);
-    let id = endpoint
-        .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut host)
-        .unwrap();
-    let snapshot = host.binding(id).unwrap().snapshot;
-    const SPAN: u32 = 60_000;
-    let segment = |k: u32| {
-        let start = k.wrapping_mul(SPAN);
-        Evidence {
-            link: ingress.link(),
-            path: snapshot.path(),
-            owner: Owner::Tcp(id),
-            source: local.ip(),
-            destination: remote.ip(),
-            dscp: 0,
-            header_len: 20,
-            packet_len: 40 + SPAN,
-            protocol: 6,
-            transport: Selector::Tcp {
-                source_port: local.port(),
-                destination_port: remote.port(),
-                start,
-                end: start.wrapping_add(SPAN),
-            },
-        }
-    };
-    let key = |k: u32| QuoteKey {
-        source: local.ip(),
-        destination: remote.ip(),
-        header_len: 20,
-        packet_len: 40 + SPAN,
-        protocol: 6,
-        transport: QuotedSelector::Tcp {
-            source_port: local.port(),
-            destination_port: remote.port(),
-            sequence: k.wrapping_mul(SPAN),
-        },
-    };
-    let ledger = &mut host.ledger;
-    let index = ledger.admit(Owner::Tcp(id)).unwrap();
-    // Four segments outstanding, two in history: every seal evicts one
-    // outstanding segment.
-    let rounds = (1u64 << 32) / u64::from(SPAN) + 100;
-    for k in 0..rounds as u32 {
-        ledger.retire_tcp(id, k.wrapping_sub(3).wrapping_mul(SPAN), |_| {});
-        let ticket = ledger.reserve_group(index, &[segment(k)]).unwrap();
-        assert_eq!(ledger.seal(ticket, 10, false), 1);
-        if k % 4096 == 4095 || k + 1 == rounds as u32 {
-            let newest = ledger.correlate(11, &key(k));
-            assert_eq!(newest.matches, 1, "round {k}");
-            assert_eq!(newest.owner.map(|r| r.evidence.owner), Some(Owner::Tcp(id)));
-            let evicted = ledger.correlate(11, &key(k - 3));
-            assert_eq!(
-                (evicted.matches, evicted.summarized, evicted.owner, evicted.path),
-                (0, true, None, None),
-                "round {k}"
-            );
-            assert_eq!(ledger.correlate(11, &key(k - 4)).matches, 0, "delivered");
-        }
-    }
-    // The released generation's summary covers only its outstanding window.
-    let last = rounds as u32 - 1;
-    assert!(ledger.release_owner(index, 12));
-    assert!(ledger.correlate(13, &key(last)).summarized);
-    assert!(!ledger.correlate(13, &key(last - 4)).summarized);
-}
-
-// The base history is sized from the default send buffer; a connection
-// configured with its own buffer extends its history before its next
-// physical call, so its whole window stays attributable.
-#[test]
-fn connection_send_buffer_provisions_its_own_history() {
-    for v6 in [false, true] {
-        let cfg = config(2);
-        let (local, remote) = addresses(v6);
-        let two = |l: &mut LedgerLimits| {
-            l.history_per_owner = 2;
-            1
-        };
-        let mut a = managed_with(local, 1096, cfg.clone(), false, None, None, two);
-        let mut b = managed(remote, 1097, cfg.clone());
-        b.1.listen(remote, 1).unwrap();
-        let id =
-            a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
-                .unwrap();
-        let mut now = 0;
-        pump(&mut a, &mut b, &mut now);
-        settle(&mut a);
-        a.1.set_buffer_capacities(id, 4 * 1460, 65536).unwrap();
-        a.1.write(id, &[3; 4 * 1460]).unwrap();
-        let frames: Vec<_> = (0..4).map(|i| send(&mut a, now + i).unwrap()).collect();
-        // Room for 4 segments plus one control segment; the base holds 2.
-        assert_eq!(records(&a.0).len(), 4);
-        for frame in &frames {
-            let c = a.0.correlate(now + 5, &quote(frame));
-            assert_eq!(
-                c.owner.map(|r| r.evidence.owner),
-                Some(Owner::Tcp(id)),
-                "{v6}"
-            );
-        }
-    }
-}
-
-#[test]
-fn backpressure_only_at_admission_or_reservation_exhaustion_never_unrecorded() {
-    let cfg = config(2);
-    let (local, remote) = addresses(false);
-    let ledger = |l: &mut LedgerLimits| {
-        l.owners = 1;
-        l.concurrent_attempts = 1;
-        2
-    };
-    let mut a = managed_with(local, 1080, cfg.clone(), false, None, None, ledger);
-    let first =
-        a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
-            .unwrap();
-    let second_local = SocketAddr::new(local.ip(), local.port() + 1);
-    let second =
-        a.1.connect_with_path_provider(0, second_local, remote, options(&cfg, 0), &mut a.0)
-            .unwrap();
-    let (one, _, frame_one) = selected(&mut a.1, 1).unwrap();
-    let (two, _, frame_two) = selected(&mut a.1, 1).unwrap();
-    let context_one = a.0.egress_context(&mut a.1, one).unwrap();
-    let packet_two = a.1.transmit_attempt_packet(two).unwrap();
-    assert_eq!(packet_two.connection, Some(second));
-    // The second owner cannot be admitted: no authority, nothing submitted.
-    assert_eq!(a.0.egress_context(&mut a.1, two), Err(Error::Capacity));
-    assert_eq!(a.1.transmit_attempt_packet(two), Some(packet_two));
-    let ticket = a.0.submission_ticket(&mut a.1, context_one).unwrap();
-    a.0.submit(&mut a.1, 2, ticket, context_one, &frame_one, 0, |_| {
-        BackendOutcome::Submitted
-    })
-    .unwrap();
-    assert_eq!(records(&a.0).len(), 1);
-    // Owner records are guaranteed to live generations: the first one is
-    // still alive, so the second keeps waiting.
-    assert_eq!(a.0.egress_context(&mut a.1, two), Err(Error::Capacity));
-    a.1.abort(first).unwrap();
-    while emit(&mut a.0, &mut a.1, 3).is_some() {}
-    a.1.release(first).unwrap();
-    a.0.collect(&a.1).unwrap();
-    let context_two = a.0.egress_context(&mut a.1, two).unwrap();
-    let ticket = a.0.submission_ticket(&mut a.1, context_two).unwrap();
-    a.0.submit(&mut a.1, 4, ticket, context_two, &frame_two, 0, |_| {
-        BackendOutcome::Submitted
-    })
-    .unwrap();
-    let sealed = records(&a.0);
-    assert_eq!(sealed.len(), 1);
-    assert_eq!(sealed[0].evidence.owner, Owner::Tcp(second));
-    // Every physical call above went through a reservation.
-    assert_eq!(a.0.ledger.pending_count(), 0);
-}
-
 // Non-TCP owners: a datagram flow's aggregated call pre-reserves every
 // segment, and identical datagrams from successive flow generations stay
 // ambiguous until the configured horizon.
@@ -713,7 +631,13 @@ fn backpressure_only_at_admission_or_reservation_exhaustion_never_unrecorded() {
 fn datagram_owner_group_reservation_identical_quotes_and_horizon() {
     let cfg = config(2);
     let (local, remote) = addresses(true);
-    let (mut host, mut endpoint, ingress) = managed(local, 1090, cfg.clone());
+    // Two unsealed attempts: the group's two segments.
+    let two = |l: &mut LedgerLimits| {
+        l.concurrent_attempts = 2;
+        1
+    };
+    let (mut host, mut endpoint, ingress) =
+        managed_with(local, 1090, cfg.clone(), false, None, None, two);
     let id = endpoint
         .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut host)
         .unwrap();
@@ -780,109 +704,124 @@ fn datagram_owner_group_reservation_identical_quotes_and_horizon() {
     assert_eq!(ledger.records().count(), 0);
 }
 
-// Evicted history of different owners never merges: two connections from the
-// same local port to the same peer, and a stateless lane that sent resets to
-// many tuples (one of them byte-identical in every quoted field to a live
-// segment of the second connection), all overflow their history. Each
-// connection's live, unique quote still names it.
+// Evicted history of different owners never merges: two datagram flows from
+// the same address to the same peer, and a stateless lane that sent resets to
+// many tuples (one of them from the second flow's ports), all overflow their
+// one-entry history. Each flow's live, unique quote still names it.
 #[test]
 fn evictions_of_other_owners_never_shadow_a_unique_live_quote() {
     for v6 in [false, true] {
         let cfg = config(2);
         let (local, remote) = addresses(v6);
         let one = |l: &mut LedgerLimits| {
+            l.owners = 3;
             l.history_per_owner = 1;
             1
         };
         let (mut host, mut endpoint, ingress) =
             managed_with(local, 1100, cfg.clone(), false, None, None, one);
-        let second_local = SocketAddr::new(local.ip(), local.port() + 1);
-        let c1 = endpoint
+        let id = endpoint
             .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut host)
             .unwrap();
-        let c2 = endpoint
-            .connect_with_path_provider(0, second_local, remote, options(&cfg, 0), &mut host)
-            .unwrap();
-        let snapshot = host.binding(c1).unwrap().snapshot;
+        let snapshot = host.binding(id).unwrap().snapshot;
         let header: u32 = if v6 { 40 } else { 20 };
-        let segment = |owner, from: SocketAddr, start: u32, end: u32| Evidence {
+        let datagram = |flow: usize, port: u16, length: u16| Evidence {
             link: ingress.link(),
             path: snapshot.path(),
-            owner,
-            source: from.ip(),
+            owner: Owner::Datagram {
+                flow,
+                generation: 1,
+            },
+            source: local.ip(),
             destination: remote.ip(),
             dscp: 0,
             header_len: header,
-            packet_len: header + 20 + end.wrapping_sub(start),
-            protocol: 6,
-            transport: Selector::Tcp {
-                source_port: from.port(),
-                destination_port: remote.port(),
-                start,
-                end,
+            packet_len: header + u32::from(length),
+            protocol: 17,
+            transport: Selector::Udp {
+                source_port: port,
+                destination_port: 7,
+                length,
+                checksum: 0x4242,
             },
         };
-        let key = |e: &Evidence| {
-            let Selector::Tcp {
-                source_port,
-                destination_port,
-                start,
-                ..
-            } = e.transport
-            else {
-                unreachable!()
-            };
-            QuoteKey {
-                source: e.source,
-                destination: e.destination,
-                header_len: e.header_len,
-                packet_len: e.packet_len,
-                protocol: 6,
-                transport: QuotedSelector::Tcp {
+        let reset = |port: u16| Evidence {
+            link: ingress.link(),
+            path: snapshot.path(),
+            owner: Owner::Stateless,
+            source: local.ip(),
+            destination: remote.ip(),
+            dscp: 0,
+            header_len: header,
+            packet_len: header + 20,
+            protocol: 6,
+            transport: Selector::Tcp {
+                source_port: port,
+                destination_port: 7,
+                start: 7,
+                end: 7,
+            },
+        };
+        let key = |e: &Evidence| QuoteKey {
+            source: e.source,
+            destination: e.destination,
+            header_len: e.header_len,
+            packet_len: e.packet_len,
+            protocol: e.protocol,
+            transport: match e.transport {
+                Selector::Udp {
+                    source_port,
+                    destination_port,
+                    length,
+                    checksum,
+                } => QuotedSelector::Udp {
+                    source_port,
+                    destination_port,
+                    length,
+                    checksum,
+                },
+                Selector::Tcp {
+                    source_port,
+                    destination_port,
+                    start,
+                    ..
+                } => QuotedSelector::Tcp {
                     source_port,
                     destination_port,
                     sequence: start,
                 },
-            }
+                _ => unreachable!(),
+            },
         };
         let ledger = &mut host.ledger;
-        let mut commit = |owner, e: Evidence, at| {
-            let index = ledger.admit(owner).unwrap();
+        let mut commit = |e: Evidence, at| {
+            let index = ledger.admit(e.owner).unwrap();
             let ticket = ledger.reserve_group(index, &[e]).unwrap();
             assert_eq!(ledger.seal(ticket, at, false), 1);
         };
-        let old1 = segment(Owner::Tcp(c1), local, 1000, 2000);
-        let live1 = segment(Owner::Tcp(c1), local, 2000, 3000);
-        let old2 = segment(Owner::Tcp(c2), second_local, 5000, 5100);
-        let live2 = segment(Owner::Tcp(c2), second_local, 9000, 9500);
-        commit(Owner::Tcp(c1), old1, 10);
-        commit(Owner::Tcp(c1), live1, 11);
-        commit(Owner::Tcp(c2), old2, 12);
-        commit(Owner::Tcp(c2), live2, 13);
-        // Resets to arbitrary ports, then one mimicking live2's quoted fields.
+        let old1 = datagram(0, 5000, 100);
+        let live1 = datagram(0, 5000, 108);
+        let old2 = datagram(1, 5001, 100);
+        let live2 = datagram(1, 5001, 108);
+        commit(old1, 10);
+        commit(live1, 11);
+        commit(old2, 12);
+        commit(live2, 13);
+        // Resets from arbitrary ports, then one from the second flow's.
         for port in 0..8u16 {
-            let mut reset = segment(
-                Owner::Stateless,
-                SocketAddr::new(local.ip(), 40000 + port),
-                7,
-                7,
-            );
-            reset.packet_len = live2.packet_len;
-            commit(Owner::Stateless, reset, 14);
+            commit(reset(40000 + port), 14);
         }
-        let mut mimic = segment(Owner::Stateless, second_local, 9000, 9000);
-        mimic.packet_len = live2.packet_len;
-        commit(Owner::Stateless, mimic, 15);
-        commit(Owner::Stateless, segment(Owner::Stateless, local, 1, 1), 16);
-        for (live, old, owner) in [(live1, old1, c1), (live2, old2, c2)] {
+        commit(reset(5001), 15);
+        commit(reset(1), 16);
+        for (live, old) in [(live1, old1), (live2, old2)] {
             let correlation = ledger.correlate(20, &key(&live));
-            assert_eq!(correlation.matches, 1, "{owner:?}");
+            assert_eq!(correlation.matches, 1, "{:?}", live.owner);
             assert_eq!(
                 correlation.owner.map(|r| r.evidence.owner),
-                Some(Owner::Tcp(owner))
+                Some(live.owner)
             );
             assert_eq!(correlation.path, Some(snapshot.path()));
-            // The owner's own evicted segment is still remembered, but only
+            // The owner's own evicted datagram is still remembered, but only
             // as ambiguous history.
             let evicted = ledger.correlate(20, &key(&old));
             assert_eq!(
@@ -891,10 +830,11 @@ fn evictions_of_other_owners_never_shadow_a_unique_live_quote() {
             );
         }
         // The stateless lane's own evicted resets stay ambiguous for it.
-        let reset = segment(Owner::Stateless, SocketAddr::new(local.ip(), 40003), 7, 7);
-        let mut quoted = key(&reset);
-        quoted.packet_len = live2.packet_len;
-        assert_eq!(ledger.correlate(20, &quoted).owner, None);
+        let quoted = ledger.correlate(20, &key(&reset(40003)));
+        assert_eq!(
+            (quoted.matches, quoted.summarized, quoted.owner),
+            (0, true, None)
+        );
     }
 }
 
@@ -905,7 +845,13 @@ fn evictions_of_other_owners_never_shadow_a_unique_live_quote() {
 fn discarded_summary_blinds_owners_that_could_reuse_its_key() {
     let cfg = config(2);
     let (local, remote) = addresses(false);
-    let (mut host, mut endpoint, ingress) = managed(local, 1110, cfg.clone());
+    // Two flow records: a new flow is admitted while another is open.
+    let two = |l: &mut LedgerLimits| {
+        l.owners = 2;
+        1
+    };
+    let (mut host, mut endpoint, ingress) =
+        managed_with(local, 1110, cfg.clone(), false, None, None, two);
     let id = endpoint
         .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut host)
         .unwrap();

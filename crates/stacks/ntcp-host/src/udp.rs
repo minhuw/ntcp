@@ -2,7 +2,8 @@
 //!
 //! A flow is a bound local socket address with an optional fixed remote. It
 //! is admitted by the Endpoint's own address policy, sends through the same
-//! path resolution and physical-submission evidence as TCP, and receives
+//! path resolution as TCP, records physical-submission evidence of every
+//! datagram in the ledger, and receives
 //! protocol-17 datagrams that pass the UDP checksum. ICMP errors quoting its
 //! datagrams are correlated by the single Host dispatcher and become bounded,
 //! consumed events. All storage is allocated once by `Host::new`.
@@ -684,7 +685,7 @@ impl Host {
         };
         match reserve(self) {
             Err(Error::Capacity) => {
-                self.maintain_ledger(endpoint, true);
+                self.maintain_ledger(endpoint);
                 reserve(self)
             }
             result => result,

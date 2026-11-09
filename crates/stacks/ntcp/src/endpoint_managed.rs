@@ -200,19 +200,51 @@ impl Endpoint {
     }
 
     /// The next live connection whose SND.UNA moved, or that came to hold
-    /// a result to take, since this last gave it, with its SND.UNA: what a
-    /// provider learns from acknowledgments and results without polling
-    /// every owner. A connection is given once per change, however many
-    /// came before the call.
-    pub fn next_progress(&mut self) -> Option<(ConnectionId, u32)> {
+    /// a result to take, since this last gave it: what a provider learns
+    /// from acknowledgments and results without polling every owner. When
+    /// its SND.UNA moved, with the latest transmission time among the data
+    /// the peer acknowledged (RFC 8985 RACK.xmit_ts), if any qualified: the
+    /// forward progress RFC 4861 section 7.3.1 confirms a neighbor by. A
+    /// connection is given once per change, however many came before the
+    /// call.
+    pub fn next_progress(&mut self) -> Option<(ConnectionId, Option<Instant>)> {
         let index = self.progress.pop()?;
-        let una = self.slots[index]
-            .as_ref()
-            .unwrap()
-            .connection
-            .unacknowledged();
+        let connection = &self.slots[index].as_ref().unwrap().connection;
+        let una = connection.unacknowledged();
+        let delivered = if una != self.progress_una[index] {
+            connection.delivered_sent_at()
+        } else {
+            None
+        };
         self.progress_una[index] = una;
-        Some((self.id(index), una))
+        Some((self.id(index), delivered))
+    }
+
+    /// The live connection an ICMP error quoting `tuple` and `sequence` is
+    /// about, with the segment it quotes, as RFC 5927 section 4.1 and Linux
+    /// accept one: the scoped tuple's connection, whose sent sequence space
+    /// [SND.UNA, SND.NXT] holds the sequence. The segment's span runs from
+    /// the sequence over the payload the quoted lengths leave after this
+    /// connection's data-segment TCP header (`Connection::quoted_span`).
+    pub fn quoted_segment(
+        &self,
+        tuple: ScopedTuple,
+        sequence: u32,
+        ip_packet_len: u32,
+        ip_header_len: u16,
+    ) -> Option<(ConnectionId, CorrelatedSegment)> {
+        let id = self.scoped_connection_id(tuple)?;
+        let payload = ip_packet_len.checked_sub(u32::from(ip_header_len))?;
+        let (start, end) = self.slot(id).ok()?.connection.quoted_span(sequence, payload)?;
+        Some((
+            id,
+            CorrelatedSegment {
+                start,
+                end,
+                ip_packet_len,
+                ip_header_len,
+            },
+        ))
     }
 
     /// Take the unpublished confirmed-probe result of a live owner generation.

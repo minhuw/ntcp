@@ -477,10 +477,10 @@ fn source_and_link_isolated_paths_survive_every_shared_publication() {
     }
 }
 
-// A route change replaces the shared path's generation. Feedback about a
-// pre-change submission, and a decrease and a confirmed raise on the new
-// generation, leave the retired record unchanged and never resurrect it;
-// the stale report does not change the new generation either.
+// A route change replaces the shared path's generation. Feedback quoting a
+// pre-change submission, which like Linux applies to the connection's
+// current path, decreases the new generation, and a confirmed raise follows
+// on it; both leave the retired record unchanged and never resurrect it.
 #[test]
 fn retired_route_generation_is_never_changed_or_resurrected() {
     for v6 in [false, true] {
@@ -519,7 +519,6 @@ fn retired_route_generation_is_never_changed_or_resurrected() {
         a.0.udp_path_change(udp).unwrap();
         let retired = a.0.paths().path_snapshot(old);
         assert!(retired.is_err() || retired.unwrap().status() != path::PathStatus::Valid);
-        let fresh = a.0.paths().path_snapshot(new).unwrap();
         let not_resurrected = |a: &Side| {
             let now = a.0.paths().path_snapshot(old);
             assert_eq!(now, retired, "retired record unchanged");
@@ -529,40 +528,21 @@ fn retired_route_generation_is_never_changed_or_resurrected() {
                 .all(|&id| a.0.binding(id).unwrap().snapshot.path() == new));
         };
 
-        // A PTB correlated to the pre-change submission: drop advice only.
+        // A PTB quoting the pre-change submission is about the connection,
+        // whose current path is the new generation.
         let mtu = if v6 { 1350 } else { 1100 };
         let (report, published) = tcp_report(
             a.0.input_icmp(&mut a.1, a.2, now + 2, &ptb(&stale, mtu), None)
                 .unwrap(),
         );
+        assert!(matches!(report, TcpReport::PacketTooBig(_)));
+        assert_ne!(report, TcpReport::PacketTooBig(PmtuFeedback::Rejected));
+        assert_eq!(published, Some(path::EstimateChange::Decreased));
+        assert_eq!(service(&mut a, now + 3).failed, 0);
         assert_eq!(
-            (report, published),
-            (TcpReport::PacketTooBig(PmtuFeedback::Unchanged), None)
+            a.0.paths().path_snapshot(new).unwrap().learned_mtu(),
+            Some(mtu)
         );
-        assert_eq!(service(&mut a, now + 3), ServiceReport::default());
-        assert_eq!(a.0.paths().path_snapshot(new).unwrap(), fresh);
-        assert_eq!(a.0.udp_path_change(udp).unwrap(), None);
-        not_resurrected(&a);
-
-        // A decrease on the new generation, quoting the UDP flow's datagram
-        // (the rebound TCP flows restarted their own search below it).
-        let mut packet = [0; 1600];
-        let Ok(UdpSent::Submitted(len)) =
-            a.0.udp_send(&a.1, now + 4, udp, None, &[4; 1400], &mut packet, |_, _| {
-                BackendOutcome::Submitted
-            })
-        else {
-            panic!("datagram not submitted");
-        };
-        assert!(matches!(
-            a.0.input_icmp(&mut a.1, a.2, now + 5, &ptb(&packet[..len], mtu), None),
-            Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
-                published: Some(path::EstimateChange::Decreased),
-                ..
-            }))
-        ));
-        assert_eq!(service(&mut a, now + 6).failed, 0);
-        assert_eq!(a.0.paths().path_snapshot(new).unwrap().learned_mtu(), Some(mtu));
         assert_eq!(a.0.udp_path_change(udp).unwrap().unwrap().path, new);
         not_resurrected(&a);
         input(&mut b.0, &mut b.1, b.2, now + 7, &stale, 0);
@@ -601,7 +581,7 @@ fn retired_route_generation_is_never_changed_or_resurrected() {
         );
         not_resurrected(&a);
         std::println!(
-            "ROUTE_GENERATION v6={v6} retired_retained={} stale_ptb=advice_only new: {mtu}->{} retired unchanged",
+            "ROUTE_GENERATION v6={v6} retired_retained={} pre-change ptb on new: {mtu}->{} retired unchanged",
             retired.is_ok(),
             intent.ip_packet_len()
         );
@@ -1655,12 +1635,15 @@ fn below_proven_delivery_report_shared_outcome_ignores_loss_inference() {
 // derived size, deferral and shared publication are the same whether or not
 // black-hole timeouts first lowered A's own estimate (L) or not (C). Every
 // plain submitted packet is smaller than the 1500-octet shared estimate, so
-// its exact and header-inflated quotes derive the same size. After the
-// shared decrease to 1000 every submitted packet is not smaller than the
-// estimate: section 5 then mandates reducing both quotes, and an exact quote
-// of a packet derives what a smaller inflated packet would. An older
-// incarnation has no current shared estimate: its quote is compared with
-// the submitted length, for drop advice only.
+// neither its exact nor its header-inflated quote is reduced: A derives the
+// same size from both, and the Host, which keeps no record of the submitted
+// length, publishes its own estimate below the quoted length when that is
+// larger. After the shared decrease to 1000 every submitted packet is not
+// smaller than the estimate: section 5 then mandates reducing both quotes,
+// and an exact quote of a packet derives what a smaller inflated packet
+// would. A connection keeps no record of the path each segment left on, so,
+// as in Linux, a quote of a segment sent before A moved to another path
+// incarnation is about A's current path.
 // Only A's local label may differ (Decreased versus Unchanged). Scenarios:
 // A's explicit RFC 1191 table with no prior delivery (quoted 1452); the
 // default table after an acknowledged 1480-octet packet (quoted 1495); the
@@ -1668,8 +1651,9 @@ fn below_proven_delivery_report_shared_outcome_ignores_loss_inference() {
 // its timeout. Each with an exact and a header-inflated quote, and each also
 // after a previous shared decrease (a UDP flow's PTB first lowered the Host
 // record to 1000) and about a submission of an older path incarnation (A was
-// rebound to another DSCP after sending it: drop advice only, never
-// publication). Repair follows eligibility, never the label: in C the
+// rebound to another DSCP after sending it: the report lowers the new
+// incarnation, where A has proven no delivery yet). Repair follows
+// eligibility, never the label: in C the
 // quoted range is repaired at once (labelled Decreased or Unchanged); in L the
 // black-hole timeouts already retransmitted the quoted bytes and own their
 // flight, so the same report adds no repair work there.
@@ -1761,13 +1745,12 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                         super::dispatch::seal_ipv4(&mut copy);
                     }
                     // The shared estimate the Host corrects the quote against.
-                    let estimate = (!older).then(|| {
+                    let estimate =
                         a.0.paths()
                             .path_snapshot(path)
                             .unwrap()
                             .pmtu_estimate()
-                            .unwrap()
-                    });
+                            .unwrap();
                     now += 1;
                     let (report, published) =
                         tcp_report(a.0.input_icmp(&mut a.1, a.2, now, &ptb(&copy, 0), None).unwrap());
@@ -1809,8 +1792,8 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                                 quoted_packet_len: quoted.len() as u32
                                     + if inflated { 20 } else { 0 },
                                 candidate_mtu: 0,
-                                current_path: !older,
-                                path_estimate: estimate,
+                                current_path: true,
+                                path_estimate: Some(estimate),
                             },
                         )
                         .unwrap()
@@ -1839,27 +1822,31 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                     // publication carries). The Host publishes the larger of
                     // the derived size and its own estimate (CONTEMPORARY
                     // table, same shared reference), never above an already
-                    // lower shared record. Plain: 1452 and 1010 are below
-                    // 1500, so both quotes give RFC 1191's 1006; 1495 gives
-                    // the default table's 1492, at or above the delivered
-                    // 1480. After the decrease to 1000, and for an older
-                    // incarnation (reference: the submitted length), exact
-                    // quotes are reduced by 20: 1432 -> 1006, 1475 -> 1460
-                    // (below 1480: deferred, timeout publishes max(1460,
-                    // 1460)), 990 -> 508 (timeout publishes max(576, 508));
-                    // inflated quotes recover 1452, 1495 and 1010.
+                    // lower shared record. Plain and older incarnation:
+                    // 1452 and 1010 are below 1500, so both quotes give RFC
+                    // 1191's 1006, and the Host's own estimate below an
+                    // inflated 1472 is 1460; 1495 gives the default table's
+                    // 1492, at or above the delivered 1480. On the new
+                    // incarnation A has proven no delivery, so nothing is
+                    // deferred. After the decrease to 1000, exact quotes are
+                    // reduced by 20: 1432 -> 1006, 1475 -> 1460 (below 1480:
+                    // deferred, timeout publishes max(1460, 1460)), 990 ->
+                    // 508 (timeout publishes max(576, 508)); inflated quotes
+                    // recover 1452, 1495 and 1010.
                     let expected = match (variant, label, inflated) {
-                        (_, "immediate", _) => (1006, false, 1006),
-                        ("plain", "default-table", _) => (1492, false, 1492),
+                        ("shared-decrease", "immediate", _) => (1006, false, 1006),
+                        (_, "immediate", false) => (1006, false, 1006),
+                        (_, "immediate", true) => (1006, false, 1460),
+                        ("shared-decrease", "default-table", false) => (1460, true, 1460),
+                        (_, "default-table", _) => (1492, false, 1492),
                         ("plain", _, _) => (1006, true, 1006),
-                        (_, "default-table", false) => (1460, true, 1460),
-                        (_, "default-table", true) => (1492, false, 1492),
+                        ("older-path", _, _) => (1006, false, 1006),
                         (_, _, false) => (508, true, 576),
                         _ => (1006, true, 1006),
                     };
                     assert_eq!(derived, Some(expected.0), "{label} {variant}");
                     match variant {
-                        "plain" => {
+                        "plain" | "older-path" => {
                             assert_eq!((deferred, eventual), (expected.1, Some(expected.2)));
                             assert_eq!(immediate.is_some(), !deferred);
                             assert_eq!(
@@ -1875,11 +1862,7 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                             );
                             assert_eq!(decreased, usize::from(deferred && expected.2 < SHARED));
                         }
-                        _ => {
-                            // Drop advice only: nothing deferred or published.
-                            assert_eq!(class, PmtuFeedback::Unchanged);
-                            assert_eq!((published, immediate, decreased, eventual), (None, None, 0, None));
-                        }
+                        _ => unreachable!(),
                     }
                     outcomes.push((derived, deferred, published, immediate, decreased, eventual));
                 }
@@ -1889,7 +1872,11 @@ fn legacy_ipv4_report_outcome_is_independent_of_loss_inference() {
                 );
                 by_quote.push(outcomes[0]);
             }
-            if variant == "plain" {
+            // Below the shared estimate an inflated quote is not corrected,
+            // and the Host knows no submitted length to bound it by: in the
+            // immediate scenario its own estimate from the inflated 1472
+            // octets (1460) is published instead of 1006.
+            if variant == "plain" && label != "immediate" {
                 assert_eq!(
                     by_quote[0], by_quote[1],
                     "{label}: exact and inflated quotes differ"

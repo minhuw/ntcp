@@ -134,20 +134,20 @@ fn fast_open_pmtud_profile_exact_quote_fallback_and_bounded_retry() {
             assert_eq!(a.execute(0, Op::Inject(bad_checksum)).unwrap_err(), EINVAL);
             assert_eq!(path_mtu(&a, client), 1500);
             tfo_no_output(&mut a);
-            // Valid checksums alone are insufficient: require exact sent length,
-            // tuple and sequence, plus a bounded decreasing candidate MTU.
+            // Valid checksums alone are insufficient: require the tuple, a
+            // sequence in the sent window (RFC 5927 section 4.1, as Linux),
+            // and a candidate MTU below the quoted length and decreasing.
             for (offset, replacement) in [
                 (30, 40u16),
-                (30, 1040),
                 (50, 8081),
-                (54, 0),
+                (52, 0),
                 (26, 1500),
                 (26, 1600),
                 (26, 1060),
             ] {
                 let mut invalid = feedback.clone();
-                if offset == 54 {
-                    invalid[55] ^= 1; // Definitely wrong sequence, even at ISS wrap.
+                if offset == 52 {
+                    invalid[52] ^= 0x80; // Half the sequence space away.
                 } else {
                     invalid[offset..offset + 2].copy_from_slice(&replacement.to_be_bytes());
                 }

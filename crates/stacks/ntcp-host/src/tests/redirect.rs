@@ -254,7 +254,7 @@ fn ipv4_type_of_service_redirects_use_the_submission_dscp() {
 }
 
 // The run's strict reading of RFC 1122 section 3.2.2.2: a forged sender,
-// a quote of nothing this Host committed, a new gateway not reached
+// a quote naming no connection of this Host, a new gateway not reached
 // directly over the arrival link, a stale route generation and a
 // destination reached directly are all refused, changing nothing.
 #[test]
@@ -266,12 +266,16 @@ fn ipv4_redirect_rejections_change_nothing() {
     let revision = a.0.paths().revision();
     let forged = from(redirect4(&data, 1, "192.0.2.253"), [192, 0, 2, 250]);
     assert_eq!(dispatch(&mut a, SECOND, &forged), RedirectOutcome::Rejected(NotFirstHop));
+    // Another source port: no connection's traffic.
     let unknown = {
         let mut copy = data.clone();
-        copy[24] ^= 0xff;
+        copy[20] ^= 0xff;
         redirect4(&copy, 1, "192.0.2.253")
     };
-    assert_eq!(dispatch(&mut a, SECOND, &unknown), RedirectOutcome::Rejected(Uncorrelated));
+    assert_eq!(
+        dispatch(&mut a, SECOND, &unknown),
+        RedirectOutcome::Rejected(Uncorrelated)
+    );
     for off_link in ["203.0.113.1", "192.0.2.1", "255.255.255.255"] {
         assert_eq!(
             dispatch(&mut a, SECOND, &redirect4(&data, 1, off_link)),
@@ -926,7 +930,7 @@ fn ipv6_redirect_without_a_mapping_and_to_the_destination() {
 
 // Every rejection, with the decoder's result handed to the Host's
 // validator: no Redirected Header (this Host's evidence policy), a quote
-// of nothing it committed, a Destination other than the quoted packet's,
+// naming no connection, a Destination other than the quoted packet's,
 // a sender other than the current router, another arrival link, and a
 // replaced route generation. None changes forwarding or the cache.
 #[test]
@@ -946,8 +950,9 @@ fn ipv6_redirect_rejections_change_nothing() {
             },
         )
         .unwrap();
+    // Another source port: no connection's traffic.
     let mut unknown = syn.clone();
-    unknown[47] ^= 0xff;
+    unknown[40] ^= 0xff;
     let revision = a.0.paths().revision();
     for (router, target, dest, quoted, context, rejection) in [
         ("fe80::1", "fe80::2", destination, None, a.2, NoEvidence),
@@ -1046,8 +1051,10 @@ fn retransmissions(a: &mut Side, now: u64, dscp: u8) -> [Vec<u8>; 2] {
 // segment was submitted with; the forms for every type of service (codes 0
 // and 1) move every DSCP whose first hop is the sender, whether that first
 // hop is the configured gateway or the target of an earlier override.
-// Each Redirect must quote a submission that left through its sender: a
-// quote of a segment sent through the replaced first hop is refused.
+// A Redirect is about the connection its quote names, which keeps no record
+// of the first hop each segment left through: the connection's current
+// first hop may quote a segment sent through the replaced one, while the
+// replaced first hop is refused.
 #[test]
 fn ipv4_redirect_sequences_follow_each_dscp_first_hop() {
     for (specific, general) in [(2, 1), (3, 0)] {
@@ -1073,15 +1080,8 @@ fn ipv4_redirect_sequences_follow_each_dscp_first_hop() {
         );
         a.0.service_changes(&mut a.1, now).unwrap();
         assert_eq!(state(&a), (gateway, hop("192.0.2.253"), gateway));
-        // 192.0.2.253 never forwarded the segment sent through the
-        // gateway.
-        let revision = a.0.paths().revision();
-        let stale = from(redirect4(&data24, general, "192.0.2.252"), [192, 0, 2, 253]);
-        assert!(matches!(
-            dispatch(&mut a, now, &stale),
-            RedirectOutcome::Rejected(_)
-        ));
         // The gateway is no first hop of DSCP 24 any more.
+        let revision = a.0.paths().revision();
         assert!(matches!(
             dispatch(&mut a, now, &redirect4(&data24, general, "192.0.2.252")),
             RedirectOutcome::Rejected(_)
@@ -1089,16 +1089,14 @@ fn ipv4_redirect_sequences_follow_each_dscp_first_hop() {
         assert_eq!(a.0.paths().revision(), revision);
         assert_eq!(state(&a), (gateway, hop("192.0.2.253"), gateway));
 
-        // 192.0.2.253's Redirect for every type of service, quoting the
-        // retransmission it forwarded, moves only DSCP 24: it is the first
-        // hop of nothing else.
+        // 192.0.2.253's Redirect for every type of service moves only
+        // DSCP 24: it is the first hop of nothing else. It quotes the
+        // segment sent through the gateway, which names the connection now
+        // leaving through 192.0.2.253 as well as its retransmission would.
         now += 10 * SECOND;
         let [_, again24] = retransmissions(&mut a, now, 24);
         assert_eq!(again24[1] >> 2, 24);
-        let report = from(
-            redirect4(&again24, general, "192.0.2.252"),
-            [192, 0, 2, 253],
-        );
+        let report = from(redirect4(&data24, general, "192.0.2.252"), [192, 0, 2, 253]);
         assert_eq!(dispatch(&mut a, now, &report), RedirectOutcome::Installed);
         a.0.service_changes(&mut a.1, now).unwrap();
         assert_eq!(state(&a), (gateway, hop("192.0.2.252"), gateway));
@@ -1267,10 +1265,10 @@ fn send_routed(side: &mut Side, now: u64) -> Option<([u8; 6], Vec<u8>)> {
 }
 
 // RFC 4861 section 8.3 over a sequence: the new router may redirect the
-// destination again, quoting a packet it forwarded, while the replaced
-// router, and a quote of a packet sent through it, no longer may. (A
-// retransmission identical in its ledger key to a copy sent through the
-// replaced router is ambiguous evidence and stays refused.)
+// destination again, while the replaced router no longer may. A Redirect is
+// about the connection its quote names, which keeps no record of the
+// router each packet left through, so the new router may quote even a
+// packet sent through the replaced one.
 #[test]
 fn ipv6_redirects_follow_the_current_first_hop() {
     use RedirectRejection::*;
@@ -1306,30 +1304,17 @@ fn ipv6_redirects_follow_the_current_first_hop() {
     assert_eq!(fresh[40..42], 1001u16.to_be_bytes());
     assert_eq!(next_hop(&a, second), scoped(&a, "fe80::2"));
     let revision = a.0.paths().revision();
-    for (router, quoted) in [
-        ("fe80::1", &fresh),
-        ("fe80::1", &again),
-        ("fe80::2", &syn),
-        ("fe80::1", &syn),
-    ] {
+    for (router, quoted) in [("fe80::1", &fresh), ("fe80::1", &again), ("fe80::1", &syn)] {
         let frame = redirect6(v6(router), v6("fe80::3"), destination, None, Some(quoted));
         let outcome = redirected(&mut a, 2 * SECOND + 1, &frame).unwrap();
         assert!(
-            matches!(
-                outcome,
-                RedirectOutcome::Rejected(Stale | NotFirstHop | Uncorrelated)
-            ),
+            matches!(outcome, RedirectOutcome::Rejected(NotFirstHop)),
             "{router}: {outcome:?}"
         );
     }
     assert_eq!(a.0.paths().revision(), revision);
-    let frame = redirect6(
-        v6("fe80::2"),
-        v6("fe80::3"),
-        destination,
-        None,
-        Some(&fresh),
-    );
+    // The SYN left through fe80::1.
+    let frame = redirect6(v6("fe80::2"), v6("fe80::3"), destination, None, Some(&syn));
     assert_eq!(
         redirected(&mut a, 2 * SECOND + 2, &frame),
         Ok(RedirectOutcome::Installed)

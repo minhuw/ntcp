@@ -6,14 +6,13 @@ use path::PathId;
 
 const H: u64 = 400;
 
-// Six owner records: the randomized model's maximum of concurrent owners
-// (the stateless lane, three TCP flows and two datagram flows), so no model
-// submission is refused for capacity.
+// Three owner records: the randomized model's maximum of concurrent owners
+// (the stateless lane and two datagram flows; connections record nothing),
+// so no model submission is refused for capacity.
 fn limits(datagram_evidence: usize) -> LedgerLimits {
     LedgerLimits {
-        owners: 6,
+        owners: 3,
         history_per_owner: 3,
-        segment_bytes: 1460,
         concurrent_attempts: 4,
         datagram_evidence,
         feedback_horizon: H,
@@ -23,11 +22,9 @@ fn limits(datagram_evidence: usize) -> LedgerLimits {
 struct Fixture {
     link: LinkId,
     paths: [PathId; 2],
-    ids: Vec<ConnectionId>,
 }
 
-// Real path incarnations (two DSCP classes) and connection generations
-// minted by an Endpoint, including slot reuse.
+// Real path incarnations (two DSCP classes).
 fn fixture() -> Fixture {
     let cfg = config(2);
     let (local, remote) = addresses(false);
@@ -50,20 +47,9 @@ fn fixture() -> Fixture {
         host.binding(b).unwrap().snapshot,
     );
     assert_ne!(pa.path(), pb.path());
-    let mut ids = vec![a, b];
-    for port in 8082..8106 {
-        let id = *ids.last().unwrap();
-        endpoint.abort(id).unwrap();
-        endpoint.release(id).unwrap();
-        host.collect(&endpoint).unwrap();
-        while emit(&mut host, &mut endpoint, 0).is_some() {}
-        host.collect(&endpoint).unwrap();
-        ids.push(connect(&mut host, &mut endpoint, port, 0));
-    }
     Fixture {
         link: ingress.link(),
         paths: [pa.path(), pb.path()],
-        ids,
     }
 }
 
@@ -185,9 +171,9 @@ fn datagram(f: &Fixture, generation: u64, path: PathId, length: u16, checksum: u
 }
 
 // Lossy history is zoned (RFC 4007 section 6: a link-local address pair is
-// unique only on its link). A released generation on link B folds into a
-// tombstone that denies only quotes arriving on B; the identical
-// link-local four-tuple and sequence range live on link A stays exact,
+// unique only on its link). A released flow generation on link B folds into
+// a tombstone that denies only quotes arriving on B; the identical
+// link-local four-tuple and datagram live on link A stays exact,
 // attributable evidence. Four-tuple keys ignore zones, so the tombstone's
 // own zone check is what separates them.
 #[test]
@@ -207,38 +193,38 @@ fn folded_link_local_history_denies_only_its_own_zone() {
     .unwrap();
     let a = paths.register_link(InterfaceKey(1), 1500).unwrap();
     let b = paths.register_link(InterfaceKey(2), 1500).unwrap();
-    let segment = |link, id| Evidence {
+    let sent = |link, flow| Evidence {
         link,
         path: f.paths[0],
-        owner: Owner::Tcp(id),
+        owner: Owner::Datagram {
+            flow,
+            generation: 1,
+        },
         source: "fe80::1".parse().unwrap(),
         destination: "fe80::2".parse().unwrap(),
         dscp: 0,
         header_len: 40,
-        packet_len: 40 + 20 + 1000,
-        protocol: 6,
-        transport: Selector::Tcp {
+        packet_len: 40 + 8 + 1000,
+        protocol: 17,
+        transport: Selector::Udp {
             source_port: 1000,
             destination_port: 8080,
-            start: 5000,
-            end: 6000,
+            length: 1008,
+            checksum: 0x1234,
         },
     };
     let mut ledger = Ledger::new(limits(0)).unwrap();
-    let released = segment(b, f.ids[1]);
+    let released = sent(b, 1);
     assert!(commit(&mut ledger, released, 1));
     let index = ledger.owner_index(released.owner).unwrap();
     assert!(ledger.release_owner(index, 2));
-    let live = segment(a, f.ids[0]);
+    let live = sent(a, 0);
     assert!(commit(&mut ledger, live, 3));
     let quote = key(&live);
     let on_a = ledger.correlate_in(4, &quote, Some(a));
     assert_eq!((on_a.matches, on_a.summarized), (1, false));
     assert_eq!(on_a.path, Some(f.paths[0]));
-    assert_eq!(
-        on_a.owner.map(|r| r.evidence.owner),
-        Some(Owner::Tcp(f.ids[0]))
-    );
+    assert_eq!(on_a.owner.map(|r| r.evidence.owner), Some(live.owner));
     let on_b = ledger.correlate_in(4, &quote, Some(b));
     assert_eq!(
         (on_b.matches, on_b.summarized, on_b.path, on_b.owner),
@@ -338,42 +324,23 @@ impl Rng {
 struct Sent {
     e: Evidence,
     at: u64,
-    retired: bool,
-}
-
-struct TcpFlow {
-    id: Option<ConnectionId>,
-    port: u16,
-    remote: u8,
-    nxt: u32,
-    // Unretired spans; retransmissions repeat a span exactly. ACKs land on
-    // span boundaries: TCP itself refuses quotes below SND.UNA, so a
-    // partially acknowledged span is never feedback.
-    spans: Vec<(u32, u32)>,
-    path: usize,
 }
 
 struct Model {
     sent: Vec<Sent>,
-    open: Vec<Owner>,
 }
 
 impl Model {
-    // Whether a submission could still be the subject of a quote: outstanding
-    // TCP data until delivery while its generation lives; everything else
-    // (and closed generations' data) until the feedback horizon.
+    // Whether a submission could still be the subject of a quote: until the
+    // feedback horizon.
     fn valid(&self, s: &Sent, now: u64) -> bool {
-        let data = matches!(
-            (s.e.owner, s.e.transport),
-            (Owner::Tcp(_), Selector::Tcp { start, end, .. }) if start != end
-        );
-        !s.retired && (s.at + H > now || data && self.open.contains(&s.e.owner))
+        s.at + H > now
     }
-    // Exact matches no longer valid by time alone (not delivered).
+    // Exact matches no longer valid.
     fn expired(&self, q: &QuoteKey, now: u64) -> bool {
         self.sent
             .iter()
-            .any(|s| !s.retired && !self.valid(s, now) && exact(&s.e, q))
+            .any(|s| !self.valid(s, now) && exact(&s.e, q))
     }
     fn matching(&self, q: &QuoteKey, now: u64) -> Vec<Sent> {
         self.sent
@@ -585,21 +552,7 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         // Two exact signatures: datagram evictions overflow into summaries.
         let mut ledger = Ledger::new(limits(2)).unwrap();
-        let mut model = Model {
-            sent: Vec::new(),
-            open: vec![Owner::Stateless],
-        };
-        let mut tcp: Vec<TcpFlow> = (0..3)
-            .map(|i| TcpFlow {
-                id: None,
-                port: 1000 + i,
-                remote: 2 + (i % 2) as u8,
-                nxt: 0,
-                spans: Vec::new(),
-                path: 0,
-            })
-            .collect();
-        let mut minted = 0;
+        let mut model = Model { sent: Vec::new() };
         let mut udp: [(Option<u64>, usize); 2] = [(None, 0); 2];
         let mut generation = 0;
         let mut now = 1;
@@ -610,99 +563,13 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
                 // Owner records cover the model's concurrency and every
                 // commit seals at once: nothing is refused for capacity.
                 assert!(commit(ledger, e, now), "capacity refused {e:?}");
-                model.sent.push(Sent {
-                    e,
-                    at: now,
-                    retired: false,
-                });
+                model.sent.push(Sent { e, at: now });
             };
-            if op < 30 {
-                let t = &mut tcp[rng.below(3) as usize];
-                let Some(id) = t.id else {
-                    if minted == f.ids.len() {
-                        continue;
-                    }
-                    t.id = Some(f.ids[minted]);
-                    minted += 1;
-                    // Reused generations sometimes reuse an ISS, and one
-                    // starts just below the wrap.
-                    t.nxt = rng.pick(&[0, 1_000_000, u32::MAX - 150]);
-                    t.spans.clear();
-                    t.path = rng.below(2) as usize;
-                    model.open.push(Owner::Tcp(t.id.unwrap()));
-                    continue;
-                };
-                if rng.below(10) == 0 {
-                    t.path ^= 1;
-                }
-                let segment = |start: u32, end: u32| Selector::Tcp {
-                    source_port: t.port,
-                    destination_port: 80,
-                    start,
-                    end,
-                };
-                let path = f.paths[t.path];
-                match rng.below(20) {
-                    0..=9 => {
-                        let len = rng.pick(&[100u32, 120, 200]);
-                        let span = (t.nxt, t.nxt.wrapping_add(len));
-                        let mut e =
-                            evidence(&f, Owner::Tcp(id), path, 40 + len, segment(span.0, span.1));
-                        e.destination = v4(t.remote);
-                        record(&mut ledger, &mut model, e);
-                        t.spans.push(span);
-                        t.nxt = span.1;
-                    }
-                    10..=13 if !t.spans.is_empty() => {
-                        let mut span = t.spans[rng.below(t.spans.len() as u64) as usize];
-                        // Sometimes repacketized after a decrease: a shorter
-                        // segment from the same sequence number, whose
-                        // packet length is the RFC 1191 legacy reading of
-                        // the original's quote.
-                        if rng.below(2) == 0 {
-                            span.1 = span.1.wrapping_sub(20);
-                        }
-                        let len = span.1.wrapping_sub(span.0);
-                        let mut e =
-                            evidence(&f, Owner::Tcp(id), path, 40 + len, segment(span.0, span.1));
-                        e.destination = v4(t.remote);
-                        record(&mut ledger, &mut model, e);
-                    }
-                    14..=16 => {
-                        let mut e = evidence(&f, Owner::Tcp(id), path, 40, segment(t.nxt, t.nxt));
-                        e.destination = v4(t.remote);
-                        record(&mut ledger, &mut model, e);
-                    }
-                    17..=18 if !t.spans.is_empty() => {
-                        let una = t.spans[rng.below(t.spans.len() as u64) as usize].1;
-                        let delivered = |(_, end): (u32, u32)| una.wrapping_sub(end) < 1 << 31;
-                        t.spans.retain(|s| !delivered(*s));
-                        for s in &mut model.sent {
-                            if let (Owner::Tcp(o), Selector::Tcp { start, end, .. }) =
-                                (s.e.owner, s.e.transport)
-                                && o == id
-                                && start != end
-                                && delivered((start, end))
-                            {
-                                s.retired = true;
-                            }
-                        }
-                        ledger.retire_tcp(id, una, |_| {});
-                    }
-                    _ => {
-                        if let Some(index) = ledger.owner_index(Owner::Tcp(id)) {
-                            assert!(ledger.release_owner(index, now));
-                        }
-                        model.open.retain(|o| *o != Owner::Tcp(id));
-                        t.id = None;
-                    }
-                }
-            } else if op < 50 {
+            if op < 50 {
                 let flow = rng.below(2) as usize;
                 let Some(g) = udp[flow].0 else {
                     generation += 1;
                     udp[flow] = (Some(generation), rng.below(2) as usize);
-                    model.open.push(Owner::Datagram { flow, generation });
                     continue;
                 };
                 let owner = Owner::Datagram {
@@ -713,7 +580,6 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
                     if let Some(index) = ledger.owner_index(owner) {
                         assert!(ledger.release_owner(index, now));
                     }
-                    model.open.retain(|o| *o != owner);
                     udp[flow].0 = None;
                     continue;
                 }
@@ -781,10 +647,7 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
                 e.destination = v4(rng.pick(&[2, 3, 4, 5, 6, 7]));
                 record(&mut ledger, &mut model, e);
             } else if op < 58 {
-                // Stateless replies (RST points, cookie SYN-ACKs) on tuples no
-                // connection uses: the ledger treats a byte-identical
-                // stateless/connection segment as an RFC 6528 chance
-                // collision, outside this model.
+                // Stateless replies (RST points, cookie SYN-ACKs).
                 let start = rng.pick(&[7u32, 9]);
                 let (end, len) = if rng.below(2) == 0 {
                     (start, 40)
@@ -910,7 +773,7 @@ fn randomized_correlation_never_acts_beyond_the_reference_model() {
 // The quote key of a quoted frame prefix (IP header plus eight UDP bytes),
 // read the way the ledger compares it: TTL/hop limit, DSCP/ECN and IPv4
 // identification are not part of it.
-fn quoted_key(frame: &[u8]) -> QuoteKey {
+pub(super) fn quoted_key(frame: &[u8]) -> QuoteKey {
     let h = super::dispatch::header(frame);
     let word = |at: usize| u16::from_be_bytes([frame[at], frame[at + 1]]);
     let (source, destination, packet_len, protocol): (IpAddr, IpAddr, u32, u8) = if frame[0] >> 4

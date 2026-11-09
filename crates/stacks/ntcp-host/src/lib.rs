@@ -255,17 +255,19 @@ pub struct ReassemblyCapacity {
 /// retained binding. Every sum is checked; source/link/route capacities are
 /// configured authority.
 ///
-/// Submission ledger: one owner record per binding and per stateless lane, so
-/// every live generation is admitted without waiting. Each owner keeps one
-/// entry per full-sized segment its configured send buffer can hold
-/// outstanding, plus one for the control segment (SYN/FIN/pure ACK) that may
-/// accompany it. A connection configured with a larger send buffer extends
-/// its own history the same way before its next physical call (fallibly,
-/// freed with its record); smaller segments after a decrease, or a failed
-/// extension, overflow into same-owner eviction (which preserves ambiguity
-/// in a summary that delivery shrinks, and never blocks output). Concurrent unsealed attempts equal
-/// the largest Endpoint output pool (max_connections + 1), each holding one
-/// physical attempt. The horizon is twice the configured MSL.
+/// Submission ledger: connections record no evidence (ICMP errors about
+/// them are checked against their own sequence space), so the only owner
+/// provisioned here is the Endpoint's stateless lane, with one record and one
+/// unsealed attempt: the Endpoint holds at most one stateless reservation,
+/// and a retained ticket is re-keyed to its replacement attempt rather than
+/// duplicated. The record exists even without control output, which needs
+/// none, because a ledger has at least one; `managed_udp_limits` adds each
+/// flow's record and attempts. Each record keeps one entry per full-sized
+/// segment the configured send buffer holds, plus one: the TCP-derived size
+/// connections used when they kept evidence, retained for the lane and for
+/// datagram flows. Beyond it a record's oldest entry is evicted into its
+/// key's summary, which never blocks output. The horizon is twice the
+/// configured MSL.
 pub fn managed_limits(
     config: &EndpointConfig,
     links: usize,
@@ -291,10 +293,9 @@ pub fn managed_limits(
         .checked_add(1)
         .ok_or(Error::Capacity)?;
     let ledger = LedgerLimits {
-        owners: bindings.checked_add(output_leases).ok_or(Error::Capacity)?,
+        owners: 1,
         history_per_owner,
-        segment_bytes: mss,
-        concurrent_attempts: bindings,
+        concurrent_attempts: 1,
         datagram_evidence: 0,
         feedback_horizon: feedback_horizon(config.connection.timebase).ok_or(Error::Capacity)?,
     };
@@ -356,10 +357,12 @@ pub struct IngressPacket<'a> {
 /// one pre-reserved aggregate). It cannot be cloned, so an outcome is
 /// finalized at most once: Submitted and Unknown seal it, a certified
 /// non-submission cancels it, WouldBlock and a retained rejection return it.
+/// A connection's attempt reserves no evidence (its ICMP errors are checked
+/// against its sequence space); its Endpoint reservation is finalized once.
 #[must_use = "an unresolved ticket keeps its evidence reservation"]
 #[derive(Debug, Eq, PartialEq)]
 pub struct SubmissionTicket {
-    ticket: u64,
+    ticket: Option<u64>,
 }
 
 /// The backend's own statement about one synchronous physical call.
@@ -468,12 +471,12 @@ pub enum IcmpOutcome {
 
 /// An ICMP error for a TCP owner whose output is reserved. Nothing was
 /// applied or published. The token itself carries the report, normalized
-/// from the validated frame and the exact submission evidence it matched,
-/// bound to this Host context and the owner generation: `Host::replay_icmp`
-/// applies it once the reservation resolves, without the frame and without
-/// the submission ledger, whose bounded history may have evicted the record
-/// meanwhile. The replay revalidates the generation, the quote's overlap with
-/// outstanding data and the current authority of the quoted path.
+/// from the validated frame and the quoted segment the connection's send
+/// window accepted, with the path the connection used on arrival, bound to
+/// this Host context and the owner generation: `Host::replay_icmp` applies
+/// it once the reservation resolves, without the frame. The replay
+/// revalidates the generation, the quote's overlap with outstanding data and
+/// the current authority of that path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeferredIcmp {
     context: IngressContext,
@@ -481,9 +484,9 @@ pub struct DeferredIcmp {
     report: Correlated,
 }
 
-// One validated report correlated with exactly one TCP submission: its
-// sequence span and submitted lengths, the path incarnation every match
-// agreed on, and the family-normalized report.
+// One validated report about one TCP connection: the quoted segment's
+// sequence span and lengths, the connection's path incarnation when the
+// report arrived, and the family-normalized report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Correlated {
     segment: CorrelatedSegment,
@@ -549,6 +552,20 @@ struct Binding {
     owner: Option<ConnectionId>,
     prepared: PreparedPath,
     registration: Option<Registration>,
+    // When the binding last moved to another path incarnation: data its
+    // owner sent until then left on another path.
+    moved: Option<Instant>,
+    // The connection's local and remote ports, which with its path's
+    // addresses name it in a quote (`redirected_path`).
+    ports: (u16, u16),
+}
+impl Binding {
+    fn rebind(&mut self, prepared: PreparedPath, now: Instant) {
+        if prepared.snapshot.path() != self.prepared.snapshot.path() {
+            self.moved = Some(now);
+        }
+        self.prepared = prepared;
+    }
 }
 // A planned open's checked plan, whose options hold the connection's
 // complete immutable source route, and the route authority the owner's
@@ -963,7 +980,6 @@ impl Host {
         self.owner_bindings
             .try_reserve_exact(connections)
             .map_err(|_| Error::Allocation)?;
-        self.ledger.index_connections(connections)?;
         endpoint.enable_managed_paths(self.paths.context())?;
         self.owner_bindings.resize(connections, None);
         self.attached = true;
@@ -1169,10 +1185,14 @@ impl Host {
             self.forwarding_resolved(resolved.key())?;
             let (rebound_client, rebound) = self.paths.rebind_via(client, request, via)?;
             client = rebound_client;
-            self.bindings[index].as_mut().unwrap().prepared = PreparedPath {
-                client,
-                snapshot: rebound,
-            };
+            let now = self.now;
+            self.bindings[index].as_mut().unwrap().rebind(
+                PreparedPath {
+                    client,
+                    snapshot: rebound,
+                },
+                now,
+            );
             snapshot = rebound;
         }
         self.forwarding(&snapshot)?;
@@ -1182,7 +1202,8 @@ impl Host {
         // does fails admission rather than being cut.
         endpoint.validate_path_budget(owner, &prepared)?;
         endpoint.apply_path_budget(owner, prepared)?;
-        self.bindings[index].as_mut().unwrap().prepared = prepared;
+        let now = self.now;
+        self.bindings[index].as_mut().unwrap().rebind(prepared, now);
         self.paths.acknowledge(prepared.client, snapshot.stamp())?;
         Ok(prepared)
     }
@@ -1218,7 +1239,8 @@ impl Host {
             .apply_path_budget(owner, prepared)
             .expect("preflighted path rebind");
         let index = self.binding_index(owner).unwrap();
-        self.bindings[index].as_mut().unwrap().prepared = prepared;
+        let now = self.now;
+        self.bindings[index].as_mut().unwrap().rebind(prepared, now);
         self.paths.acknowledge(client, snapshot.stamp())?;
         Ok(())
     }
@@ -1441,9 +1463,9 @@ impl Host {
 
     pub fn collect(&mut self, endpoint: &Endpoint) -> Result<(), Error> {
         self.check_endpoint(endpoint)?;
-        // A committed binding and its ledger owner outlive their connection
-        // until the endpoint reclaims it: while the reclaim count stands
-        // still, there are none to collect.
+        // A committed binding outlives its connection until the endpoint
+        // reclaims it (and a reclaimed connection holds no reservation):
+        // while the reclaim count stands still, there are none to collect.
         let reclaimed = endpoint.reclaimed();
         let gone = reclaimed != self.reclaimed;
         let mut next = 0;
@@ -1476,9 +1498,8 @@ impl Host {
                 self.paths.release(lease.take().unwrap().prepared.client)?;
             }
         }
-        if self.maintain_ledger(endpoint, gone) {
-            self.reclaimed = reclaimed;
-        }
+        self.reclaimed = reclaimed;
+        self.maintain_ledger(endpoint);
         Ok(())
     }
 
@@ -1491,131 +1512,72 @@ impl Host {
         self.ledger.expire(self.now);
     }
 
-    // Reclaim reservations no call can use and, with `sweep`, visit every
-    // owner record: retire delivered TCP data and release the records of
-    // generations that no longer exist (their history becomes tombstones
-    // until the feedback horizon). Whether no such record is left.
-    // Otherwise delivered data is retired as the endpoint reports progress
-    // (`service_changes`), and dead generations wait for a sweep.
-    fn maintain_ledger(&mut self, endpoint: &Endpoint, sweep: bool) -> bool {
+    // Reclaim reservations no call can use, and drop expired evidence.
+    fn maintain_ledger(&mut self, endpoint: &Endpoint) {
         let mut next = 0;
         while let Some(index) = self.ledger.next_pending(next) {
             next = index + 1;
             let pending = self.ledger.pending(index).unwrap();
-            let Some(attempt) = pending.attempt else {
-                continue;
-            };
-            let retained = pending.issued
-                && match self.ledger.owner(pending.owner) {
-                    Some(Owner::Tcp(id)) => endpoint.is_output_reserved(id),
-                    _ => false,
-                };
-            if endpoint.transmit_attempt_packet(attempt).is_none() && !retained {
+            if pending
+                .attempt
+                .is_some_and(|attempt| endpoint.transmit_attempt_packet(attempt).is_none())
+            {
                 self.ledger.drop_pending(index);
             }
         }
-        let mut released = true;
-        let mut next = 0;
-        while sweep && let Some(index) = self.ledger.next_owner(next) {
-            next = index + 1;
-            match self.ledger.owner(index) {
-                Some(Owner::Tcp(id)) if endpoint.connection_exists(id) => {
-                    if let Ok(progress) = endpoint.send_progress(id) {
-                        self.retire_record(index, id, progress.unacknowledged_sequence);
-                    }
-                }
-                // A pinned record is released by a later sweep.
-                Some(Owner::Tcp(id)) if !endpoint.is_output_reserved(id) => {
-                    released &= self.ledger.release_owner(index, self.now);
-                }
-                _ => {}
-            }
-        }
         self.ledger.expire(self.now);
-        released
     }
 
-    // Retire delivered TCP data. Each definitely submitted segment a new
-    // cumulative acknowledgment covers is forward progress through the
-    // neighbor that carried it (RFC 4861 section 7.3.1), when its path is
-    // still the owner's authoritative one: duplicate acknowledgments retire
-    // nothing, and data sent on an old route confirms nothing.
-    fn retire_tcp(&mut self, id: ConnectionId, unacknowledged: u32) {
-        if let Some(record) = self.ledger.owner_index(Owner::Tcp(id)) {
-            self.retire_record(record, id, unacknowledged);
-        }
-    }
-    // What the endpoint reports of its connections since last asked: data
-    // acknowledged is retired at once, as Linux confirms a route's neighbor
-    // in tcp_ack, and results wait for the next service pass.
+    // What the endpoint reports of its connections since last asked: newly
+    // acknowledged data confirms its neighbor at once, as Linux confirms a
+    // route's neighbor in tcp_ack, and results wait for the next service
+    // pass.
     fn take_progress(&mut self, endpoint: &mut Endpoint) {
-        while let Some((owner, unacknowledged)) = endpoint.next_progress() {
-            self.retire_tcp(owner, unacknowledged);
-            if let Some(index) = self.binding_index(owner)
-                && !self.unpublished.contains(index)
+        while let Some((owner, delivered)) = endpoint.next_progress() {
+            let Some(index) = self.binding_index(owner) else {
+                continue;
+            };
+            if let Some(sent) = delivered {
+                self.confirm_progress(index, sent);
+            }
+            if !self.unpublished.contains(index)
                 && endpoint.has_unpublished_results(owner) == Ok(true)
             {
                 self.unpublished.insert(index);
             }
         }
     }
-    // `retire_tcp` of the generation `id` owning ledger record `index`.
-    fn retire_record(&mut self, index: usize, id: ConnectionId, unacknowledged: u32) {
-        let Self {
-            ledger,
-            neighbors,
-            ipv4_neighbors,
-            bindings,
-            owner_bindings,
-            entropy,
-            now,
-            ..
-        } = self;
-        // The owner's binding is looked up once, at its first delivery.
-        let mut binding = None;
-        ledger.retire_record(index, unacknowledged, |record| {
-            let current = *binding.get_or_insert_with(|| {
-                owner_bindings
-                    .get(id.index())
-                    .copied()
-                    .flatten()
-                    .and_then(|index| bindings[index].as_ref())
-                    .filter(|b| b.owner == Some(id))
-                    .map(|b| b.prepared.snapshot)
-            });
-            let Some(snapshot) = current else {
-                return;
-            };
-            let evidence = record.evidence;
-            if record.possibly_submitted
-                || snapshot.status() != PathStatus::Valid
-                || snapshot.path() != evidence.path
-                || snapshot.key().link() != evidence.link
-            {
-                return;
+    // RFC 4861 section 7.3.1 forward progress: the peer acknowledged data
+    // its owner last sent at `sent`, through the binding's neighbor if the
+    // binding had not moved since. The neighbor table refuses data sent
+    // before its current mapping (`confirm`).
+    fn confirm_progress(&mut self, index: usize, sent: Instant) {
+        let binding = self.bindings[index].as_ref().unwrap();
+        let snapshot = binding.prepared.snapshot;
+        if binding.moved.is_some_and(|moved| sent <= moved)
+            || snapshot.status() != PathStatus::Valid
+        {
+            return;
+        }
+        let ResolvedNextHop::Address(next_hop) = snapshot.key().next_hop() else {
+            return;
+        };
+        let link = snapshot.key().link();
+        // A confirmation without entropy for its ReachableTime is lost, like
+        // an unsent hint; NUD then probes.
+        let _ = match next_hop.address() {
+            IpAddr::V6(next_hop) => {
+                self.neighbors
+                    .confirm(link, next_hop, sent, self.now, self.entropy.as_mut())
             }
-            let ResolvedNextHop::Address(next_hop) = snapshot.key().next_hop() else {
-                return;
-            };
-            // A confirmation without entropy for its ReachableTime is lost,
-            // like an unsent hint; NUD then probes.
-            let _ = match next_hop.address() {
-                IpAddr::V6(next_hop) => neighbors.confirm(
-                    evidence.link,
-                    next_hop,
-                    record.committed_at,
-                    *now,
-                    entropy.as_mut(),
-                ),
-                IpAddr::V4(next_hop) => ipv4_neighbors.table_mut().confirm(
-                    evidence.link,
-                    next_hop,
-                    record.committed_at,
-                    *now,
-                    entropy.as_mut(),
-                ),
-            };
-        });
+            IpAddr::V4(next_hop) => self.ipv4_neighbors.table_mut().confirm(
+                link,
+                next_hop,
+                sent,
+                self.now,
+                self.entropy.as_mut(),
+            ),
+        };
     }
 
     // Idempotent: one reservation per physical attempt. Owner admission is
@@ -1629,21 +1591,15 @@ impl Host {
         let index = match self.ledger.admit(owner) {
             Ok(index) => index,
             Err(Error::Capacity) => {
-                self.maintain_ledger(endpoint, true);
+                self.maintain_ledger(endpoint);
                 self.ledger.admit(owner)?
             }
             Err(error) => return Err(error),
         };
-        if let Owner::Tcp(id) = owner
-            && let Ok(capacity) = endpoint.send_capacity(id)
-        {
-            self.ledger.provision(index, capacity);
-        }
-        let stale = |a| endpoint.transmit_attempt_packet(a).is_none();
-        match self.ledger.reserve(index, attempt, stale) {
+        match self.ledger.reserve(index, attempt) {
             Err(Error::Capacity) => {
-                self.maintain_ledger(endpoint, true);
-                self.ledger.reserve(index, attempt, stale)
+                self.maintain_ledger(endpoint);
+                self.ledger.reserve(index, attempt)
             }
             result => result,
         }
@@ -1850,28 +1806,36 @@ impl Host {
 
     /// The single ICMP classification/dispatch path. The error is admitted on
     /// any registered link of this context when its destination is an
-    /// unscoped registered source, then correlated with the submission ledger
-    /// (context, family, canonical source/final destination, complete header
-    /// and packet lengths, protocol and transport selector; for a quoted
-    /// source fragment, its UDP header at offset zero or else its offset, MF
-    /// and every recorded leading data octet, never ports). Quoted TTL/hop
-    /// limit, ECN, DSCP and IPv4 identification are not compared: routers may
+    /// unscoped registered source. A TCP quote is then about the managed
+    /// connection of its scoped four-tuple when that connection's sent
+    /// sequence space holds the quoted sequence (RFC 5927 section 4.1, as
+    /// Linux checks it), on the connection's current path; connections keep
+    /// no per-segment evidence. Any other quote, and a TCP quote no
+    /// connection accepts, is correlated with the submission ledger, which
+    /// holds the stateless replies and Host datagrams (context, family,
+    /// canonical source/final destination, complete header and packet
+    /// lengths, protocol and transport selector; for a quoted source
+    /// fragment, its UDP header at offset zero or else its offset, MF and
+    /// every recorded leading data octet, never ports). Quoted TTL/hop limit,
+    /// ECN, DSCP and IPv4 identification are not compared: routers may
     /// rewrite the first three, and an atomic datagram's identification
     /// carries no meaning (RFC 6864 section 4.1). Options were validated
     /// structurally by the codec, not compared with historical bytes.
     ///
-    /// Correlation is plausibility against off-path forgery, not
-    /// authentication: an attacker holding the exact quote can still act as
-    /// the router that sent it. Policy: only exact evidence (a live entry or
-    /// exact evicted-datagram signature matching every selector field) is
+    /// Either check is plausibility against off-path forgery, not
+    /// authentication: an attacker holding a connection's four-tuple and an
+    /// in-window sequence, or the exact quote of a datagram, can act as the
+    /// router that sent it. Ledger policy: only exact evidence (a live entry
+    /// or exact evicted-datagram signature matching every selector field) is
     /// positive; lossy history only denies. Path-level effects require an
     /// exact match and every match and lossy hit to agree on one path
     /// incarnation; owner-level effects require one owner generation and one
-    /// submission (TCP: one span), with no lossy hit. A TCP owner's policy runs first and a shared
-    /// estimate is published only for its current-path Decreased or
-    /// Unchanged disposition (never for Deferred). A reserved owner is returned as Deferred, carrying
-    /// the normalized report, before anything is applied. Unmatched quotes are discarded; there is no fallback to the
-    /// connection-local sent ring. `frame` is one unfragmented packet, given
+    /// submission, with no lossy hit. A TCP owner's policy runs first and a
+    /// shared estimate is published only for its current-path Decreased or
+    /// Unchanged disposition (never for Deferred). A reserved owner is
+    /// returned as Deferred, carrying the normalized report, before anything
+    /// is applied. Quotes neither check accepts are discarded. `frame` is one
+    /// unfragmented packet, given
     /// destination processing (`process`) with time from `timestamps`, which
     /// is sampled at most once and only for a Timestamp slot this host may
     /// write; an Echo Request is answered by the Echo service
@@ -1893,8 +1857,8 @@ impl Host {
 
     /// Apply a deferred report to its owner generation, or defer it again
     /// while that owner's output is still reserved. The report was validated
-    /// and correlated on arrival; it needs neither the frame nor the ledger
-    /// record. A generation that no longer exists makes it Stale; TCP rejects
+    /// and correlated on arrival; it needs neither the frame nor any record
+    /// of the quoted segment. A generation that no longer exists makes it Stale; TCP rejects
     /// a quote no longer overlapping outstanding data; a path incarnation that
     /// is no longer the owner's valid binding leaves drop advice only, with
     /// nothing published.
@@ -1944,9 +1908,67 @@ impl Host {
         // The decoder requires the outer destination to be the quoted
         // source: a link-local one is the address of the arrival link, which
         // constrains the candidates. Unscoped quotes search every link, the
-        // outgoing link coming only from ledger evidence.
+        // outgoing link coming only from the connection or ledger evidence.
         let scoped = matches!(quote.ip.source, IpAddr::V6(v) if v.is_unicast_link_local());
         let zone = scoped.then_some(context.link);
+        let ipv4 = quote.ip.source.is_ipv4();
+        // RFC 5927 section 4.1, as Linux: a TCP quote is about the connection
+        // of its scoped tuple whose sent sequence space holds the quoted
+        // sequence, and that connection's policy then judges it. Connections
+        // keep no per-segment evidence; a quote none accepts may still name
+        // a stateless reply in the ledger.
+        if let Some((owner, mut segment, path)) = self.tcp_quote(endpoint, &key, zone) {
+            if !self.quote_authorized(path, packet.payload) {
+                return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
+            }
+            //= https://www.rfc-editor.org/rfc/rfc1191#section-5
+            //# If the Total Length field returned is
+            //# not less than the current PMTU estimate, it must be reduced by
+            //# 4 times the value of the returned Header Length field.
+            if ptb
+                && ipv4
+                && candidate.is_none()
+                && self
+                    .paths
+                    .path_snapshot(path)
+                    .is_ok_and(|s| s.pmtu_estimate().is_ok_and(|e| key.packet_len >= e))
+                && let Some(packet_len) = key
+                    .packet_len
+                    .checked_sub(key.header_len)
+                    .filter(|len| *len >= key.header_len + 20)
+            {
+                segment.ip_packet_len = packet_len;
+            }
+            let kind = if ptb {
+                CorrelatedKind::PacketTooBig {
+                    quoted_packet_len: key.packet_len,
+                    candidate,
+                }
+            } else {
+                let Some(error) = feedback
+                    .ipv4_network_error()
+                    .or_else(|| feedback.ipv6_network_error())
+                else {
+                    return Ok(Completed(Discarded(IcmpDiscard::Implausible)));
+                };
+                CorrelatedKind::NetworkError(error)
+            };
+            let report = Correlated {
+                segment,
+                path: Some(path),
+                ipv4,
+                kind,
+            };
+            return self.tcp_report(
+                endpoint,
+                now,
+                DeferredIcmp {
+                    context,
+                    owner,
+                    report,
+                },
+            );
+        }
         let exact = self.ledger.correlate_in(now, &key, zone);
         // The dropped packet's complete length under each matching reading.
         let mut dropped = (exact.matches != 0).then_some(key.packet_len);
@@ -2010,7 +2032,6 @@ impl Host {
             };
             Some(error)
         };
-        let ipv4 = quote.ip.source.is_ipv4();
         let Some(record) = correlation.owner else {
             // Only a non-TCP PTB can act at the path level alone: a TCP quote
             // needs its connection's policy before anything is published.
@@ -2033,100 +2054,102 @@ impl Host {
             }
             return Ok(Completed(Discarded(IcmpDiscard::Ambiguous)));
         };
+        // Connections record no evidence: the owner is a datagram flow or
+        // the stateless lane, which take advice only.
         let evidence = record.evidence;
-        let Owner::Tcp(id) = evidence.owner else {
-            let advice = match error {
-                Some(error) => Advice::NetworkError(error),
-                None => {
-                    let Some(mtu) = report_mtu(ipv4, evidence.packet_len, candidate) else {
-                        return Ok(Completed(Discarded(IcmpDiscard::Implausible)));
-                    };
-                    Advice::PacketTooBig {
-                        mtu,
-                        dropped_len: evidence.packet_len,
-                    }
+        let advice = match error {
+            Some(error) => Advice::NetworkError(error),
+            None => {
+                let Some(mtu) = report_mtu(ipv4, evidence.packet_len, candidate) else {
+                    return Ok(Completed(Discarded(IcmpDiscard::Implausible)));
+                };
+                Advice::PacketTooBig {
+                    mtu,
+                    dropped_len: evidence.packet_len,
                 }
-            };
-            let published = match (error, correlation.path) {
-                (None, Some(path)) => self.publish(
-                    now,
-                    path,
-                    ipv4,
-                    quoted(&key),
-                    evidence.packet_len,
-                    candidate,
-                    None,
-                )?,
-                _ => None,
-            };
-            // A datagram flow consumes its advice from a bounded queue, after
-            // any shared decrease is in place for its next send. A fragment's
-            // advice names its datagram's remote; `dropped_len` is the
-            // dropped fragment's own length.
-            if let Selector::Udp {
-                destination_port, ..
             }
-            | Selector::UdpFirstFragment {
-                destination_port, ..
-            }
-            | Selector::Fragment {
-                logical_ports: (_, destination_port),
-                ..
-            } = evidence.transport
-            {
-                let remote = core::net::SocketAddr::new(evidence.destination, destination_port);
-                self.udp_advise(
-                    evidence.owner,
-                    match advice {
-                        Advice::PacketTooBig { mtu, dropped_len } => UdpEvent::PacketTooBig {
-                            remote,
-                            mtu,
-                            dropped_len,
-                        },
-                        Advice::NetworkError(error) => UdpEvent::NetworkError { remote, error },
+        };
+        let published = match (error, correlation.path) {
+            (None, Some(path)) => self.publish(
+                now,
+                path,
+                ipv4,
+                quoted(&key),
+                evidence.packet_len,
+                candidate,
+                None,
+            )?,
+            _ => None,
+        };
+        // A datagram flow consumes its advice from a bounded queue, after
+        // any shared decrease is in place for its next send. A fragment's
+        // advice names its datagram's remote; `dropped_len` is the
+        // dropped fragment's own length.
+        if let Selector::Udp {
+            destination_port, ..
+        }
+        | Selector::UdpFirstFragment {
+            destination_port, ..
+        }
+        | Selector::Fragment {
+            logical_ports: (_, destination_port),
+            ..
+        } = evidence.transport
+        {
+            let remote = core::net::SocketAddr::new(evidence.destination, destination_port);
+            self.udp_advise(
+                evidence.owner,
+                match advice {
+                    Advice::PacketTooBig { mtu, dropped_len } => UdpEvent::PacketTooBig {
+                        remote,
+                        mtu,
+                        dropped_len,
                     },
-                );
-            }
-            return Ok(Completed(IcmpOutcome::Advice {
-                owner: Some(evidence.owner),
-                advice,
-                published,
-            }));
-        };
-        let Selector::Tcp { start, end, .. } = evidence.transport else {
-            return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
-        };
-        // A TCP segment's header is far below 65536 octets; a record that
-        // were not is no evidence for its report.
-        let Ok(ip_header_len) = u16::try_from(evidence.header_len) else {
-            return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
-        };
-        let report = Correlated {
-            segment: CorrelatedSegment {
-                start,
-                end,
-                ip_packet_len: evidence.packet_len,
-                ip_header_len,
-            },
-            path: correlation.path,
-            ipv4,
-            kind: match error {
-                Some(error) => CorrelatedKind::NetworkError(error),
-                None => CorrelatedKind::PacketTooBig {
-                    quoted_packet_len: key.packet_len,
-                    candidate,
+                    Advice::NetworkError(error) => UdpEvent::NetworkError { remote, error },
                 },
-            },
+            );
+        }
+        Ok(Completed(IcmpOutcome::Advice {
+            owner: Some(evidence.owner),
+            advice,
+            published,
+        }))
+    }
+
+    // The managed connection a TCP quote is about (`Endpoint::quoted_segment`),
+    // with the segment it quotes and its binding's current path.
+    fn tcp_quote(
+        &self,
+        endpoint: &Endpoint,
+        key: &QuoteKey,
+        zone: Option<LinkId>,
+    ) -> Option<(ConnectionId, CorrelatedSegment, path::PathId)> {
+        let QuotedSelector::Tcp {
+            source_port,
+            destination_port,
+            sequence,
+        } = key.transport
+        else {
+            return None;
         };
-        self.tcp_report(
-            endpoint,
-            now,
-            DeferredIcmp {
-                context,
-                owner: id,
-                report,
+        if key.protocol != ntcp_icmp::PROTOCOL_TCP {
+            return None;
+        }
+        let tuple = ntcp::ScopedTuple::new(
+            ntcp::Tuple {
+                local: core::net::SocketAddr::new(key.source, source_port),
+                remote: core::net::SocketAddr::new(key.destination, destination_port),
             },
-        )
+            zone,
+        )?;
+        let (owner, segment) = endpoint.quoted_segment(
+            tuple,
+            sequence,
+            key.packet_len,
+            u16::try_from(key.header_len).ok()?,
+        )?;
+        let path = self.binding(owner).ok()?.snapshot.path();
+        Some((owner, segment, path))
     }
 
     // TCP policy for one correlated report, at arrival or at replay: deferred
@@ -2168,8 +2191,9 @@ impl Host {
         };
         let quoted = (quoted_packet_len, u32::from(segment.ip_header_len));
         // Only a path incarnation that is still valid and still this
-        // connection's binding may change any estimate. Older submissions
-        // remain drop advice for their outstanding data.
+        // connection's binding may change any estimate. A report replayed
+        // after its connection moved to another incarnation remains drop
+        // advice for its outstanding data.
         let current = report.path.filter(|path| {
             self.binding(id).is_ok_and(|b| b.snapshot.path() == *path)
                 && self
@@ -2402,13 +2426,13 @@ impl Host {
         {
             return Err(Error::Obsolete);
         }
-        // Evidence storage is reserved with the authority, before any bytes
-        // can reach a backend; validate_egress fills it for each retry.
-        self.reserve_attempt(
-            endpoint,
-            packet.connection.map_or(Owner::Stateless, Owner::Tcp),
-            attempt,
-        )?;
+        // A stateless reply's evidence storage is reserved with the
+        // authority, before any bytes can reach a backend; validate_egress
+        // fills it for each retry. A connection keeps none: ICMP errors
+        // about it are checked against its own sequence space.
+        if packet.connection.is_none() {
+            self.reserve_attempt(endpoint, Owner::Stateless, attempt)?;
+        }
         Ok(EgressContext {
             link: binding.snapshot.key().link(),
             next_hop: binding.snapshot.key().next_hop(),
@@ -2701,12 +2725,13 @@ impl Host {
         } else {
             live.binding.snapshot.ip_packet_budget()?
         };
-        let transport = tcp_selector(&frame[header..], total - header)?;
-        let pending = self.reserve_attempt(
-            endpoint,
-            packet.connection.map_or(Owner::Stateless, Owner::Tcp),
-            context.attempt,
-        )?;
+        let evidence = match packet.connection {
+            Some(_) => None,
+            None => Some((
+                tcp_selector(&frame[header..], total - header)?,
+                self.reserve_attempt(endpoint, Owner::Stateless, context.attempt)?,
+            )),
+        };
         if total as u32 > ordinary {
             let intent = endpoint
                 .transmit_discovery_intent(context.attempt)
@@ -2729,21 +2754,23 @@ impl Host {
                 return Err(Error::Obsolete);
             }
         }
-        self.ledger.set_evidence(
-            pending,
-            Evidence {
-                link: live.link,
-                path: live.binding.snapshot.path(),
-                owner: packet.connection.map_or(Owner::Stateless, Owner::Tcp),
-                source: packet.ip.source,
-                destination: packet.ip.destination,
-                dscp: packet.dscp,
-                header_len: header as u32,
-                packet_len: total as u32,
-                protocol,
-                transport,
-            },
-        );
+        if let Some((transport, pending)) = evidence {
+            self.ledger.set_evidence(
+                pending,
+                Evidence {
+                    link: live.link,
+                    path: live.binding.snapshot.path(),
+                    owner: Owner::Stateless,
+                    source: packet.ip.source,
+                    destination: packet.ip.destination,
+                    dscp: packet.dscp,
+                    header_len: header as u32,
+                    packet_len: total as u32,
+                    protocol,
+                    transport,
+                },
+            );
+        }
         Ok(live)
     }
 
@@ -2759,13 +2786,12 @@ impl Host {
         let packet = endpoint
             .transmit_attempt_packet(context.attempt)
             .ok_or(Error::Obsolete)?;
-        let index = self.reserve_attempt(
-            endpoint,
-            packet.connection.map_or(Owner::Stateless, Owner::Tcp),
-            context.attempt,
-        )?;
+        if packet.connection.is_some() {
+            return Ok(SubmissionTicket { ticket: None });
+        }
+        let index = self.reserve_attempt(endpoint, Owner::Stateless, context.attempt)?;
         Ok(SubmissionTicket {
-            ticket: self.ledger.issue(index)?,
+            ticket: Some(self.ledger.issue(index)?),
         })
     }
 
@@ -2779,12 +2805,14 @@ impl Host {
     /// Certified non-submission outside `submit` (for example after a
     /// refused revalidation the caller resolves with the Endpoint).
     pub fn cancel_submission(&mut self, ticket: SubmissionTicket) {
-        self.ledger.cancel(ticket.ticket);
+        if let Some(ticket) = ticket.ticket {
+            self.ledger.cancel(ticket);
+        }
     }
 
     /// The physical-attempt transaction. Every fallible step happens before
     /// `submit` runs: exact revalidation of the bytes and path (at EVERY
-    /// retry), evidence reservation, TCP delivery retirement, and the
+    /// retry), a stateless reply's evidence reservation, and the
     /// Endpoint's acceptance preflight. Afterwards the outcome is finalized
     /// without allocation or fallible lookup. The closure is the one backend
     /// call, including any timestamp fallback it performs; software GSO
@@ -2800,11 +2828,17 @@ impl Host {
         shared_payload_len: usize,
         submit: impl FnOnce(EgressContext) -> BackendOutcome,
     ) -> Result<Submission, Refused> {
-        let pending = self
-            .ledger
-            .find_ticket(ticket.ticket)
-            .and_then(|index| self.ledger.pending(index));
-        if pending.is_none_or(|p| p.attempt != Some(context.attempt)) {
+        let ticketed = match ticket.ticket {
+            Some(ticket) => self
+                .ledger
+                .find_ticket(ticket)
+                .and_then(|index| self.ledger.pending(index))
+                .is_some_and(|p| p.attempt == Some(context.attempt)),
+            None => endpoint
+                .transmit_attempt_packet(context.attempt)
+                .is_some_and(|p| p.connection.is_some()),
+        };
+        if !ticketed {
             return Err(Refused {
                 error: Error::Obsolete,
                 ticket,
@@ -2821,22 +2855,17 @@ impl Host {
             Ok(live) => live,
             Err(error) => return Err(Refused { error, ticket }),
         };
-        debug_assert!(
+        debug_assert!(ticket.ticket.is_none_or(|ticket| {
             self.ledger
-                .find_ticket(ticket.ticket)
+                .find_ticket(ticket)
                 .is_some_and(|index| self.ledger.has_evidence(index))
-        );
+        }));
         self.now = self.now.max(now);
-        if let Some(id) = endpoint
-            .transmit_attempt_packet(context.attempt)
-            .and_then(|p| p.connection)
-            && let Ok(progress) = endpoint.send_progress(id)
-        {
-            self.retire_tcp(id, progress.unacknowledged_sequence);
-        }
         match submit(live) {
             BackendOutcome::Submitted => {
-                self.ledger.seal(ticket.ticket, now, false);
+                if let Some(ticket) = ticket.ticket {
+                    self.ledger.seal(ticket, now, false);
+                }
                 // Only a definite submission certifies the exact bytes the
                 // backend took; validate_egress checked them just above.
                 let receipt = ntcp::PhysicalReceipt {
@@ -2850,11 +2879,13 @@ impl Host {
             BackendOutcome::WouldBlock => Ok(Submission::Blocked(ticket)),
             BackendOutcome::Rejected => Ok(Submission::Rejected(ticket)),
             BackendOutcome::NotSubmitted => {
-                self.ledger.cancel(ticket.ticket);
+                self.cancel_submission(ticket);
                 Ok(Submission::Cancelled)
             }
             BackendOutcome::Unknown => {
-                self.ledger.seal(ticket.ticket, now, true);
+                if let Some(ticket) = ticket.ticket {
+                    self.ledger.seal(ticket, now, true);
+                }
                 Ok(Submission::PossiblySubmitted)
             }
         }
@@ -3103,6 +3134,7 @@ impl PathProvider for Host {
             .unwrap_or(request.tuple.remote.ip());
         let plan = request.registration;
         let zone = request.zone;
+        let ports = (request.tuple.local.port(), request.tuple.remote.port());
         let request = self.request(
             request.tuple.local.ip(),
             request.tuple.remote.ip(),
@@ -3118,6 +3150,8 @@ impl PathProvider for Host {
         // in this serialized preparation.
         self.bindings[index] = Some(Binding {
             owner: None,
+            moved: None,
+            ports,
             prepared,
             registration: plan.map(|plan| Registration {
                 plan,

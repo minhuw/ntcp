@@ -320,6 +320,11 @@ impl Rack {
         Some((end, head.sent))
     }
 
+    // RACK.xmit_ts: the latest transmission time among delivered segments.
+    pub(crate) fn latest_delivered(&self) -> Option<u64> {
+        self.latest.map(|(sent, _)| sent)
+    }
+
     pub(crate) fn valid(&self) -> bool {
         self.fallback.is_none()
     }

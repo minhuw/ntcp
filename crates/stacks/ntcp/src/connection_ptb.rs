@@ -58,6 +58,36 @@ impl Connection {
         Some((low, low.wrapping_add(count)))
     }
 
+    /// RFC 5927 section 4.1's acceptance of a TCP sequence quoted by an ICMP
+    /// error, as Linux's tcp_v4_err and tcp_v6_err make it: within the sent
+    /// sequence space [SND.UNA, SND.NXT], or the start of a quoted segment
+    /// still partly outstanding. The span the quoted segment consumed is
+    /// `ip_payload` octets (after the IP header) less this connection's
+    /// data-segment TCP header. A quote carries only eight TCP octets, so
+    /// options beyond the timestamps (SACK blocks) make the span end a
+    /// little late, and a quoted FIN is not part of it.
+    pub(crate) fn quoted_span(&self, sequence: u32, ip_payload: u32) -> Option<(u32, u32)> {
+        let header = 20 + if self.timestamps { 12 } else { 0 };
+        let (start, end) = (
+            Seq(sequence),
+            Seq(sequence).wrapping_add(ip_payload.saturating_sub(header)),
+        );
+        if start.distance_from(self.snd_una) > self.snd_nxt.distance_from(self.snd_una)
+            && self.quoted_outstanding(start, end).is_none()
+        {
+            return None;
+        }
+        Some((start.0, end.0))
+    }
+
+    /// The latest transmission time among what the peer acknowledged: the
+    /// SYN once delivered, and the payload RACK qualified (RFC 8985
+    /// RACK.xmit_ts).
+    pub(crate) fn delivered_sent_at(&self) -> Option<Instant> {
+        let syn = self.syn_sent_at.filter(|_| self.syn_delivered);
+        self.rack.latest_delivered().max(syn)
+    }
+
     /// The quote overlaps the outstanding window at the still unacknowledged
     /// SYN.
     pub(super) fn quote_covers_syn(&self, start: Seq, end: Seq) -> bool {

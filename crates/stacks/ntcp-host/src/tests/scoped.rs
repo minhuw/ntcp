@@ -290,62 +290,49 @@ fn ptb_lowers_only_the_link_whose_submission_it_quotes() {
 }
 
 // Lossy history is scoped like exact records: the discarded summary of a
-// released generation on link 1 denies attribution only within that zone,
-// so the identical link-local four-tuple on link 0 keeps its PTB
-// attributable.
+// released flow on link 1 denies attribution only within that zone, so the
+// identical link-local four-tuple on link 0 keeps its PTB attributable.
 #[test]
 fn discarded_history_of_one_link_leaves_the_other_links_ptb_attributable() {
     let cfg = config(4);
     // Discarded summaries shadow hash classes of flow keys. The case needs
     // the four-tuple's keys on the two links in different classes, so it
     // takes the first context identity that gives them.
-    let (mut a, identity) = (7250..)
+    let local: SocketAddr = LOCAL.parse().unwrap();
+    let remote: SocketAddr = REMOTE.parse().unwrap();
+    let mut a = (7250..)
         .step_by(20)
         .take(64)
-        .map(|identity| (scoped_side(LOCAL, 2, identity, &cfg), identity))
-        .find(|(a, _)| {
-            let class = |link| {
-                a.0.ledger
-                    .discard_class(tuple().local, tuple().remote, Some(link))
-            };
+        .map(|identity| scoped_side_with(LOCAL, 2, identity, &cfg, 2))
+        .find(|a| {
+            let class = |link| a.0.ledger.discard_class(local, remote, Some(link));
             class(a.2[0].link()) != class(a.2[1].link())
         })
         .expect("an identity separating the links' classes");
-    let mut b = peers(&cfg, identity + 10);
     let (kept, other) = (a.2[0], a.2[1]);
-    let scoped = ScopedTuple::new(tuple(), Some(kept.link())).unwrap();
-    let id =
-        a.1.connect_scoped_with_path_provider(0, scoped, options(&cfg, 0), &mut a.0)
-            .unwrap();
+    let open = |a: &mut Peer, port: u16, zone| {
+        let bind = SocketAddr::new(local.ip(), port);
+        a.0.udp_open_scoped(&a.1, bind, Some(remote), Some(zone), UDP_OPTIONS)
+            .unwrap()
+    };
+    // Closed flows on link 1, each after one datagram: first the same
+    // four-tuple, then others until the summaries overflow and the first,
+    // the oldest, is discarded.
     let mut now = 0;
-    pump_links(&mut a, &mut b, &mut now);
-    assert_eq!(a.1.state(id), Ok(State::Established));
-    // Unanswered generations on link 1, each released after its SYN: first
-    // the same four-tuple, then enough others to overflow the summaries so
-    // that the first, the oldest, is discarded.
-    let slots = 2 * a.0.ledger.limits().owners;
-    let mut syns = Vec::new();
-    for port in core::iter::once(1000).chain(3000..3000 + slots as u16) {
+    let mut sent = Vec::new();
+    for port in core::iter::once(1000).chain(3000..3100) {
+        if a.0.ledger.discards() != 0 {
+            break;
+        }
         now += 10;
-        let tuple = Tuple {
-            local: SocketAddr::new("fe80::1".parse().unwrap(), port),
-            remote: REMOTE.parse().unwrap(),
-        };
-        let scoped = ScopedTuple::new(tuple, Some(other.link())).unwrap();
-        let churn =
-            a.1.connect_scoped_with_path_provider(now, scoped, options(&cfg, 0), &mut a.0)
-                .unwrap();
-        let (link, syn) = emit_on(&mut a, now).unwrap();
+        let flow = open(&mut a, port, other.link());
+        let (link, frame) = udp_out(&mut a, now, flow, &[5; 1400]);
         assert_eq!(link, other.link());
-        syns.push(syn);
-        a.1.abort(churn).unwrap();
-        a.1.release(churn).unwrap();
-        assert!(emit_on(&mut a, now).is_none());
-        // After the poll that found its output drained.
-        a.0.collect(&a.1).unwrap();
+        sent.push(frame);
+        a.0.udp_close(flow).unwrap();
     }
     assert_eq!(a.0.ledger.discards(), 1);
-    let forgotten = super::dispatch::quote_key(&syns[0]);
+    let forgotten = super::correlation::quoted_key(&sent[0]);
     assert_eq!(
         a.0.ledger
             .correlate_in(now, &forgotten, Some(other.link()))
@@ -353,52 +340,50 @@ fn discarded_history_of_one_link_leaves_the_other_links_ptb_attributable() {
         0
     );
     now += 10;
-    a.1.write(id, &[5; 1400]).unwrap();
-    let (link, sent) = emit_on(&mut a, now).unwrap();
+    let flow = open(&mut a, 1000, kept.link());
+    let (link, frame) = udp_out(&mut a, now, flow, &[5; 1400]);
     assert_eq!(link, kept.link());
-    let key = super::dispatch::quote_key(&sent);
+    assert_eq!(frame, sent[0], "identical datagrams on both links");
+    let key = super::correlation::quoted_key(&frame);
     let correlation = a.0.ledger.correlate_in(now, &key, Some(kept.link()));
     assert!(!correlation.summarized);
-    assert_eq!(
-        correlation.owner.map(|r| r.evidence.owner),
-        Some(Owner::Tcp(id))
-    );
-    let (report, published) = tcp_report(
-        a.0.input_icmp(&mut a.1, kept, now + 1, &ptb(&sent, 1280), None)
-            .unwrap(),
-    );
+    let owner = correlation.owner.map(|r| r.evidence.owner);
+    assert!(owner.is_some());
     assert!(matches!(
-        report,
-        TcpReport::PacketTooBig(PmtuFeedback::Decreased { .. })
+        a.0.input_icmp(&mut a.1, kept, now + 1, &ptb(&frame, 1280), None),
+        Ok(IcmpDispatch::Completed(IcmpOutcome::Advice {
+            owner: advised,
+            published: Some(path::EstimateChange::Decreased),
+            ..
+        })) if advised == owner
     ));
-    assert_eq!(published, Some(path::EstimateChange::Decreased));
-    // The discarded history still denies in its own zone: a new generation
-    // of link 1's four-tuple is not attributable until its horizon.
+    assert!(matches!(
+        a.0.udp_event(flow).unwrap(),
+        Some(UdpEvent::PacketTooBig { .. })
+    ));
+    // The discarded history still denies in its own zone: a new flow on
+    // link 1's four-tuple is not attributable until its horizon.
+    a.0.udp_close(flow).unwrap();
     now += 10;
-    let scoped = ScopedTuple::new(tuple(), Some(other.link())).unwrap();
-    let again =
-        a.1.connect_scoped_with_path_provider(now, scoped, options(&cfg, 0), &mut a.0)
-            .unwrap();
-    // Link 0's repair of the dropped segment may leave first.
-    let syn = loop {
-        let (link, frame) = emit_on(&mut a, now).unwrap();
-        if link == other.link() {
-            break frame;
-        }
-    };
-    let key = super::dispatch::quote_key(&syn);
+    let again = open(&mut a, 1000, other.link());
+    let (link, frame) = udp_out(&mut a, now, again, &[5; 1400]);
+    assert_eq!(link, other.link());
+    let key = super::correlation::quoted_key(&frame);
     let correlation = a.0.ledger.correlate_in(now, &key, Some(other.link()));
     assert_eq!(correlation.matches, 1);
     assert_eq!(correlation.owner, None, "blinded by its own zone's discard");
+    // The forgotten datagram left at 10; the new one is still live then.
     let horizon = a.0.ledger.limits().feedback_horizon;
-    assert_eq!(
+    assert!(
         a.0.ledger
-            .correlate_in(now + horizon, &key, Some(other.link()))
+            .correlate_in(10 + horizon, &key, Some(other.link()))
             .owner
-            .map(|r| r.evidence.owner),
-        Some(Owner::Tcp(again))
+            .is_some()
     );
-    std::println!("link 1 summary discarded among {slots}; link 0 PTB still Decreased");
+    std::println!(
+        "link 1 summary discarded after {} closed flows; link 0 PTB still attributable",
+        sent.len()
+    );
 }
 
 #[test]

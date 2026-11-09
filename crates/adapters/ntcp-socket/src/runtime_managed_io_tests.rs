@@ -1217,8 +1217,12 @@ fn router_ptb(frame: &[u8], mtu: u32) -> Vec<u8> {
     frame
 }
 
+// The native transaction calls the backend for exactly the accepted
+// physical segments (blocked calls and a blocked GSO suffix are offered
+// again) and records no ledger evidence for them: ICMP errors about a
+// connection are checked against its own sequence space.
 #[test]
-fn managed_native_transaction_seals_exactly_the_accepted_physical_segments() {
+fn managed_native_transaction_submits_the_accepted_physical_segments_without_evidence() {
     for v6 in [false, true] {
         for (gso, shared) in [(false, false), (true, false), (true, true)] {
             let (mut a, mut b, client, server, wa, wb) = pair_output(v6, gso, shared);
@@ -1236,7 +1240,7 @@ fn managed_native_transaction_seals_exactly_the_accepted_physical_segments() {
             } else {
                 a.execute(client, Op::Write(data.clone())).unwrap();
             }
-            // Three WouldBlock calls of the same attempt record nothing.
+            // Three WouldBlock calls of the same attempt send nothing.
             wa.lock().unwrap().block = true;
             for _ in 0..3 {
                 a.service_egress().unwrap();
@@ -1245,8 +1249,7 @@ fn managed_native_transaction_seals_exactly_the_accepted_physical_segments() {
             let blocked = wa.lock().unwrap().offered.last().unwrap().clone();
             assert!(wa.lock().unwrap().sent.is_empty());
             assert_eq!(correlate(&a, &blocked).matches, 0);
-            // The first physical segment is accepted, the next one blocks:
-            // one sealed record, nothing for the blocked suffix.
+            // The first physical segment is accepted, the next one blocks.
             let port = a.endpoint.tuple(cid).unwrap().local.port();
             {
                 let mut wire = wa.lock().unwrap();
@@ -1265,23 +1268,15 @@ fn managed_native_transaction_seals_exactly_the_accepted_physical_segments() {
             a.service_egress().unwrap();
             let sent: Vec<_> = wa.lock().unwrap().sent.iter().cloned().collect();
             assert!(sent.len() >= 3);
-            // Every frame the backend accepted has exactly one sealed record
-            // of its owner generation and its complete physical size.
+            // None of it is ledger evidence.
             for frame in &sent {
-                let correlation = correlate(&a, frame);
-                assert_eq!(correlation.matches, 1);
-                let record = correlation.owner.unwrap();
-                assert_eq!(correlation.unique, Some(record));
-                assert!(!record.possibly_submitted);
-                assert_eq!(record.evidence.owner, ntcp_host::Owner::Tcp(cid));
-                assert_eq!(record.evidence.packet_len as usize, ip_size(frame));
+                assert_eq!(correlate(&a, frame).matches, 0);
             }
             complete(&mut a, &mut b, &wa, &wb, cid, data.len());
             assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, data);
             eprintln!(
-                "NATIVE_SEALED family={} gso={gso} shared={shared} blocked_calls=3 accepted={} sealed={} acknowledged={}",
+                "NATIVE_SUBMITTED family={} gso={gso} shared={shared} blocked_calls=3 accepted={} acknowledged={}",
                 if v6 { 6 } else { 4 },
-                sent.len(),
                 sent.len(),
                 data.len()
             );
@@ -1290,7 +1285,7 @@ fn managed_native_transaction_seals_exactly_the_accepted_physical_segments() {
 }
 
 #[test]
-fn managed_native_unknown_outcome_seals_possibly_submitted_without_retry() {
+fn managed_native_unknown_outcome_is_quarantined_without_retry() {
     let (mut a, _, client, _, wa, _) = pair_output(false, false, false);
     let cid = connection(&a, client);
     a.execute(client, Op::Write(vec![1; 100])).unwrap();
@@ -1299,12 +1294,10 @@ fn managed_native_unknown_outcome_seals_possibly_submitted_without_retry() {
     let offered = wa.lock().unwrap().offered.clone();
     assert_eq!(offered.len(), 1);
     assert!(wa.lock().unwrap().sent.is_empty());
-    // Never success, never unsent: the reservation stays quarantined while
-    // the evidence remains correlatable.
+    // Never success, never unsent: the reservation stays quarantined, and
+    // a connection's output leaves no ledger evidence.
     assert!(a.endpoint.is_output_reserved(cid));
-    let record = correlate(&a, &offered[0]).owner.unwrap();
-    assert!(record.possibly_submitted);
-    assert_eq!(record.evidence.owner, ntcp_host::Owner::Tcp(cid));
+    assert_eq!(correlate(&a, &offered[0]).matches, 0);
 }
 
 #[test]
@@ -1329,19 +1322,20 @@ fn managed_native_reserved_owner_ptb_is_retained_by_host_dispatch_then_replayed(
             .unwrap()
             .snapshot
             .path();
-        // A forged control quoting a frame that was never sent is discarded
-        // by correlation before any owner is consulted, so it is not retained.
+        // A forged control quoting a sequence outside the connection's send
+        // window names no connection, so it is discarded before any owner
+        // is consulted and not retained.
         let mut forged = first.clone();
         let offset = 14 + crate::ip::header_len(a.local) + 4;
-        forged[offset + 3] ^= 1;
+        forged[offset] ^= 0x80;
         wa.lock()
             .unwrap()
             .incoming
             .push_back(Ok(router_ptb(&forged, mtu)));
         a.receive_batch(&mut [0; 65549]).unwrap();
         assert!(!a.egress.as_ref().unwrap().retained_rx(cid));
-        // The genuine router report is correlated, then deferred unapplied
-        // for this exact reserved generation.
+        // The genuine router report names the connection, then is deferred
+        // unapplied for this exact reserved generation.
         wa.lock()
             .unwrap()
             .incoming
@@ -1714,8 +1708,8 @@ fn managed_native_timestamp_fallback_and_msgsize_rejection_reuse_the_attempt_tic
         wire.enforce_mtu = true;
         wire.mtu = Some(1000);
     }
-    // EMSGSIZE certainly did not submit: nothing is sealed, the Endpoint
-    // retains the reservation and its replacement attempt reuses the ticket.
+    // EMSGSIZE certainly did not submit: the Endpoint retains the
+    // reservation and its replacement attempt reuses the ticket.
     a.service_egress().unwrap();
     let rejected = wa.lock().unwrap().offered.clone();
     assert_eq!(rejected.len(), 1);
@@ -1729,16 +1723,15 @@ fn managed_native_timestamp_fallback_and_msgsize_rejection_reuse_the_attempt_tic
     let sent: Vec<_> = wa.lock().unwrap().sent.iter().cloned().collect();
     assert!(!sent.is_empty());
     assert!(wa.lock().unwrap().requests.is_empty());
+    // Within the refreshed budget, and leaving no ledger evidence.
     for frame in &sent {
         assert!(ip_size(frame) <= 1000);
-        let record = correlate(&a, frame).owner.unwrap();
-        assert!(!record.possibly_submitted);
-        assert_eq!(record.evidence.owner, ntcp_host::Owner::Tcp(cid));
+        assert_eq!(correlate(&a, frame).matches, 0);
     }
     complete(&mut a, &mut b, &wa, &wb, cid, data.len());
     assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, data);
     eprintln!(
-        "NATIVE_FALLBACK_MSGSIZE rejected_ip={} sealed_after_refresh={} acknowledged={}",
+        "NATIVE_FALLBACK_MSGSIZE rejected_ip={} sent_after_refresh={} acknowledged={}",
         ip_size(&rejected[0]),
         sent.len(),
         data.len()

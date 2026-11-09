@@ -1,11 +1,15 @@
-//! Bounded evidence of physical IP submissions made through `Host`.
+//! Bounded evidence of the physical IP submissions made through `Host` that
+//! no connection accounts for: the Endpoint's stateless replies (resets,
+//! cookie SYN-ACKs) and Host datagrams.
 //!
-//! An ICMP error is only plausible feedback if it quotes a packet this host
-//! actually handed to a link. Connection-local TCP rings are written at output
-//! selection and exclude datagrams, so physical evidence lives here: reserved
-//! before the backend call, sealed after it without allocation or fallible
-//! lookup. This is plausibility against off-path forgery, not authentication
-//! against an attacker who has observed the exact packet.
+//! An ICMP error about a connection is checked against that connection's own
+//! sent sequence space (RFC 5927 section 4.1, as Linux does), so connections
+//! record nothing here. An error about anything else is only plausible
+//! feedback if it quotes a packet this host actually handed to a link: that
+//! evidence lives here, reserved before the backend call and sealed after it
+//! without allocation or fallible lookup. This is plausibility against
+//! off-path forgery, not authentication against an attacker who has observed
+//! the exact packet.
 
 use crate::Error;
 use crate::live::Live;
@@ -17,16 +21,12 @@ use ntcp_path::{LinkId, PathId};
 /// Explicit ledger storage, allocated once by `Host::new`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LedgerLimits {
-    /// Concurrent owner records (TCP generations, datagram flows, and the
-    /// stateless lane). Admitting a new owner is the only owner backpressure.
+    /// Concurrent owner records (datagram flows and the stateless lane).
+    /// Admitting a new owner is the only owner backpressure.
     pub owners: usize,
     /// Committed entries guaranteed to every owner; the owner's own oldest
     /// entry is evicted (into a tombstone) beyond this.
     pub history_per_owner: usize,
-    /// Bytes per history entry the base was derived from (the configured
-    /// MSS). A connection configured with a larger send buffer gets a
-    /// fallibly allocated extension sized the same way (see `provision`).
-    pub segment_bytes: usize,
     /// Reserved-but-unsealed physical attempts (each segment counts).
     pub concurrent_attempts: usize,
     /// Evicted datagrams whose exact signature stays correlatable for the
@@ -34,9 +34,8 @@ pub struct LedgerLimits {
     /// Beyond it the oldest signatures fold into their flow's own summary,
     /// which keeps them ambiguous at the cost of that flow's attribution.
     pub datagram_evidence: usize,
-    /// How long an entry without delivery-based retirement (ACK-only/control,
-    /// stateless, datagram) and every tombstone may still correlate, in
-    /// caller time units. See `feedback_horizon`.
+    /// How long an entry and every tombstone may still correlate, in caller
+    /// time units. See `feedback_horizon`.
     pub feedback_horizon: Instant,
 }
 
@@ -54,7 +53,9 @@ pub fn feedback_horizon(timebase: ntcp::CallerTimebase) -> Option<Instant> {
 /// The transport identity that held a physical submission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Owner {
-    /// Exact Endpoint connection generation.
+    /// Exact Endpoint connection generation. Its submissions leave no ledger
+    /// evidence; it names a connection's output where an owner is needed
+    /// (held neighbor resolution).
     Tcp(ConnectionId),
     /// Host datagram flow slot and its generation.
     Datagram { flow: usize, generation: u64 },
@@ -235,8 +236,8 @@ pub struct Correlation {
     pub unique: Option<Record>,
     /// Owner-level identity: every live match belongs to one owner generation
     /// and one submission, no evicted signature or tombstone matches, and the
-    /// owner was not blinded by a discarded summary. Identical TCP segments
-    /// (a retransmission of the same span) are one range; identical datagrams
+    /// owner was not blinded by a discarded summary. Identical TCP replies of
+    /// the stateless lane (the same span) are one range; identical datagrams
     /// stay distinct submissions, so they are never merged here. The latest
     /// such record is reported.
     pub owner: Option<Record>,
@@ -295,7 +296,7 @@ pub(crate) struct Pending {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Key {
     /// Exact addresses, protocol and ports, and the link of a link-local
-    /// source (`zone`). Every generation sending under the same scoped
+    /// source (`zone`). Every flow generation sending under the same scoped
     /// four-tuple shares it, so reuse stays ambiguous; the same link-local
     /// four-tuple on another link is another flow.
     Flow {
@@ -411,7 +412,7 @@ impl Key {
 /// level action is unaffected); an off-path sender that can churn flows to
 /// overflow the summaries could already cause this for its own keys.
 struct Discarded {
-    // Exact keys (TCP generations, connected flows, the stateless lane).
+    // Exact keys (connected flows, the stateless lane).
     keys: Vec<Instant>,
     // Local bindings, which an unconnected datagram flow keeps across remotes.
     bindings: Vec<Instant>,
@@ -440,13 +441,13 @@ impl Discarded {
     }
     // Whether a discarded summary may have held a submission this quote
     // names: one of its own flow key's class (in the quote's zone), or
-    // (unless a connection's match exists, see `correlate`) of the
+    // (unless a datagram flow's match exists, see `correlate`) of the
     // stateless lane.
     fn shadows(
         &self,
         quote: &QuoteKey,
         zone: Option<LinkId>,
-        connection: bool,
+        datagram: bool,
         now: Instant,
     ) -> bool {
         let flow = Key::Flow {
@@ -457,7 +458,7 @@ impl Discarded {
             zone,
         };
         self.keys[self.class(flow)] > now
-            || !connection && self.keys[self.class(Key::Stateless)] > now
+            || !datagram && self.keys[self.class(Key::Stateless)] > now
     }
 }
 
@@ -476,11 +477,11 @@ impl core::hash::Hasher for Fnv {
 
 /// Field-wise merge of one key's evicted history: a `None` field matches
 /// anything, so merging only ever widens what the tombstone may match within
-/// its key. Entries that consume no sequence space (pure ACKs, carrying
-/// SND.NXT) are summarized apart from those that do, and both keep their
-/// complete-length range: otherwise an evicted ACK's sequence point would
-/// widen the cover over live data sent around it, and a quote of that data
-/// (a different packet length) would be falsely ambiguous.
+/// its key. TCP replies that consume no sequence space (bare RSTs, carrying
+/// a sequence point) are summarized apart from those that do (SYN-ACKs), and
+/// both keep their complete-length range: otherwise a point would widen the
+/// cover over the sequence space around it, and a quote of a reply there (a
+/// different packet length) would be falsely ambiguous.
 #[derive(Clone, Copy, Debug)]
 struct Tombstone {
     key: Key,
@@ -596,9 +597,6 @@ fn merge<T: PartialEq>(a: Option<T>, b: Option<T>) -> Option<T> {
 
 fn serial_le(a: u32, b: u32) -> bool {
     b.wrapping_sub(a) < 1 << 31
-}
-fn serial_lt(a: u32, b: u32) -> bool {
-    a != b && serial_le(a, b)
 }
 
 impl Cover {
@@ -759,19 +757,7 @@ fn quoted_ports(selector: QuotedSelector) -> Option<(u16, u16)> {
     }
 }
 
-// Outstanding TCP data: retired by delivery, never by time while its
-// generation lives.
-fn retirable(record: &Record) -> bool {
-    matches!(
-        (record.evidence.owner, record.evidence.transport),
-        (Owner::Tcp(_), Selector::Tcp { start, end, .. }) if start != end
-    )
-}
-
 impl Entry {
-    fn retirable(&self) -> bool {
-        retirable(&self.record)
-    }
     fn matches(&self, quote: &QuoteKey) -> bool {
         evidence_matches(&self.record.evidence, quote)
     }
@@ -858,16 +844,13 @@ fn evidence_matches(e: &Evidence, quote: &QuoteKey) -> bool {
 pub(crate) struct Ledger {
     limits: LedgerLimits,
     owners: Vec<Option<Owner>>,
-    // Per endpoint connection slot (`ConnectionId::index`), the record of
-    // its TCP owner generation, if any; empty until `index_connections`.
-    tcp_owners: Vec<Option<usize>>,
     // Occupied owner records, unsealed reservations and summaries: what
     // the passes made on every collection visit (`check_live`).
     live_owners: Live,
     live_pending: Live,
     live_tombstones: Live,
-    // No history entry without delivery retirement, evicted datagram
-    // signature or summary expires before this, so `expire` has nothing
+    // No history entry, evicted datagram signature or summary expires
+    // before this, so `expire` has nothing
     // to remove until then. A lower bound: whatever leaves earlier by
     // another route leaves it in place.
     next_expiry: Instant,
@@ -876,28 +859,11 @@ pub(crate) struct Ledger {
     // could match was discarded (see `fold` and `seal`).
     keys: Vec<Option<Key>>,
     blind: Vec<Instant>,
-    // Owner record i owns history[i * history_per_owner ..][..history_per_owner]
-    // and then extra[i] (see `provision`).
+    // Owner record i owns history[i * history_per_owner ..][..history_per_owner].
     history: Vec<Option<Entry>>,
-    extra: Vec<Vec<Option<Entry>>>,
-    // Per owner record: its occupied history slots, and how many of them are
-    // retirable (outstanding TCP data). Passes over a record's history stop
-    // once they have seen every occupied slot, and delivery retirement skips
-    // a record with nothing retirable: an idle connection's history is
-    // mostly empty slots and pure ACKs.
+    // Per owner record: its occupied history slots. Passes over a record's
+    // history stop once they have seen every occupied slot.
     occupied: Vec<usize>,
-    retirable: Vec<usize>,
-    // Per owner record: the SND.UNA its delivery retirement last ran at,
-    // while neither its history nor its own summary changed since.
-    // Retirement is idempotent, so another pass at that SND.UNA, which every
-    // collection makes for every live connection, has nothing to do.
-    retired: Vec<Option<u32>>,
-    // A live TCP generation's own evicted history. It is kept apart from the
-    // shared summaries so delivery can shrink it (`retire_tcp`): otherwise a
-    // long transfer's evictions would widen one cover until it matched every
-    // quote of the connection, including its newest live segments. It joins
-    // the shared summary of its four-tuple when the generation is released.
-    own: Vec<Option<Tombstone>>,
     pending: Vec<Option<Pending>>,
     // Exact evicted datagrams, each until its own horizon.
     datagrams: Vec<Option<(Evidence, Instant)>>,
@@ -927,7 +893,6 @@ impl Ledger {
         Ok(Self {
             limits,
             owners: crate::table(limits.owners, None)?,
-            tcp_owners: Vec::new(),
             live_owners: Live::new(limits.owners)?,
             live_pending: Live::new(limits.concurrent_attempts)?,
             live_tombstones: Live::new(summaries)?,
@@ -935,14 +900,10 @@ impl Ledger {
             keys: crate::table(limits.owners, None)?,
             blind: crate::table(limits.owners, 0)?,
             history: crate::table(entries, None)?,
-            extra: crate::table(limits.owners, Vec::new())?,
             occupied: crate::table(limits.owners, 0)?,
-            retirable: crate::table(limits.owners, 0)?,
-            retired: crate::table(limits.owners, None)?,
-            own: crate::table(limits.owners, None)?,
             pending: crate::table(limits.concurrent_attempts, None)?,
             datagrams: crate::table(limits.datagram_evidence, None)?,
-            // A connection or connected datagram flow submits under one key,
+            // A connected datagram flow submits under one key,
             // as does the stateless lane, and each record can retain one
             // released predecessor's key until the horizon. Unconnected flows
             // talking to more remotes than this rely on `fold`'s discard.
@@ -964,42 +925,19 @@ impl Ledger {
     pub fn limits(&self) -> LedgerLimits {
         self.limits
     }
-    // History slots of an owner record: the guaranteed base, then its
-    // extension.
-    fn slots(&self, owner: usize) -> usize {
-        self.limits.history_per_owner + self.extra[owner].len()
+    // The history slots of an owner record.
+    fn slots(&self) -> usize {
+        self.limits.history_per_owner
     }
     fn slot(&self, owner: usize, i: usize) -> Option<&Entry> {
-        let h = self.limits.history_per_owner;
-        if i < h {
-            self.history[owner * h + i].as_ref()
-        } else {
-            self.extra[owner][i - h].as_ref()
-        }
+        self.history[owner * self.limits.history_per_owner + i].as_ref()
     }
     // The only writer of history slots: keeps the occupancy counts.
     fn set_slot(&mut self, owner: usize, i: usize, value: Option<Entry>) -> Option<Entry> {
-        let h = self.limits.history_per_owner;
-        let slot = if i < h {
-            &mut self.history[owner * h + i]
-        } else {
-            &mut self.extra[owner][i - h]
-        };
+        let slot = &mut self.history[owner * self.limits.history_per_owner + i];
         let old = core::mem::replace(slot, value);
-        self.retired[owner] = None;
-        for (entry, added) in [(&old, false), (&value, true)] {
-            let Some(entry) = entry else {
-                continue;
-            };
-            let retirable = usize::from(entry.retirable());
-            if added {
-                self.occupied[owner] += 1;
-                self.retirable[owner] += retirable;
-            } else {
-                self.occupied[owner] -= 1;
-                self.retirable[owner] -= retirable;
-            }
-        }
+        self.occupied[owner] += usize::from(value.is_some());
+        self.occupied[owner] -= usize::from(old.is_some());
         old
     }
     // A record's occupied history slots in order; it stops at the last one.
@@ -1007,7 +945,7 @@ impl Ledger {
     fn occupied_slots(&self, owner: usize) -> impl Iterator<Item = usize> + '_ {
         let (mut slot, mut remaining) = (0, self.occupied[owner]);
         core::iter::from_fn(move || {
-            while remaining != 0 && slot < self.slots(owner) {
+            while remaining != 0 && slot < self.slots() {
                 let current = slot;
                 slot += 1;
                 if self.slot(owner, current).is_some() {
@@ -1018,54 +956,10 @@ impl Ledger {
             None
         })
     }
-    /// Before a physical call: extend an owner's history to one entry per
-    /// segment of `send_capacity` plus one control segment, the derivation
-    /// of the base. Sockets may configure larger send buffers than the
-    /// default the base was sized from (SO_SNDBUF); without room for the
-    /// whole window, feedback for its oldest segments, which a PTB names
-    /// first, would find only ambiguous history. The extension is bounded
-    /// by the Endpoint's buffer budget, allocated fallibly (failure leaves
-    /// same-owner eviction) and freed with the owner record.
-    pub fn provision(&mut self, owner: usize, send_capacity: usize) {
-        let wanted = send_capacity
-            .div_ceil(self.limits.segment_bytes.max(1))
-            .saturating_add(1)
-            .saturating_sub(self.limits.history_per_owner);
-        let extra = &mut self.extra[owner];
-        if wanted > extra.len() && extra.try_reserve_exact(wanted - extra.len()).is_ok() {
-            extra.resize(wanted, None);
-        }
-    }
-    /// Index TCP owners by their connections' slots, of an endpoint with
-    /// `connections` slots.
-    pub fn index_connections(&mut self, connections: usize) -> Result<(), Error> {
-        self.tcp_owners
-            .try_reserve_exact(connections)
-            .map_err(|_| Error::Allocation)?;
-        self.tcp_owners.resize(connections, None);
-        for index in self.live_owners.iter() {
-            if let Some(Owner::Tcp(id)) = self.owners[index] {
-                self.tcp_owners[id.index()] = Some(index);
-            }
-        }
-        Ok(())
-    }
     pub fn owner_index(&self, owner: Owner) -> Option<usize> {
-        // The index names the newest generation admitted in a slot; an
-        // older one still holding history is found by the scan.
-        if let Owner::Tcp(id) = owner
-            && let Some(Some(index)) = self.tcp_owners.get(id.index()).copied()
-            && self.owners[index] == Some(owner)
-        {
-            return Some(index);
-        }
         self.live_owners
             .iter()
             .find(|&index| self.owners[index] == Some(owner))
-    }
-    /// The first occupied owner record at or after `from`.
-    pub fn next_owner(&self, from: usize) -> Option<usize> {
-        self.live_owners.next(from)
     }
     /// Existing record, or a free one. Callers release dead owners first.
     pub fn admit(&mut self, owner: Owner) -> Result<usize, Error> {
@@ -1079,15 +973,8 @@ impl Ledger {
             .ok_or(Error::Capacity)?;
         self.owners[index] = Some(owner);
         self.live_owners.insert(index);
-        if let Owner::Tcp(id) = owner
-            && let Some(entry) = self.tcp_owners.get_mut(id.index())
-        {
-            *entry = Some(index);
-        }
         self.keys[index] = None;
         self.blind[index] = 0;
-        self.own[index] = None;
-        self.retired[index] = None;
         Ok(index)
     }
     pub fn owner_pinned(&self, index: usize) -> bool {
@@ -1101,7 +988,7 @@ impl Ledger {
         if self.owners[index].is_none() || self.owner_pinned(index) {
             return false;
         }
-        for i in 0..self.slots(index) {
+        for i in 0..self.slots() {
             if self.occupied[index] == 0 {
                 break;
             }
@@ -1109,33 +996,16 @@ impl Ledger {
                 self.bury(entry.record, now);
             }
         }
-        if let Some(own) = self.own[index].take().filter(|t| t.until > now) {
-            self.fold(own, now);
-        }
-        self.extra[index] = Vec::new();
-        if let Some(Owner::Tcp(id)) = self.owners[index]
-            && let Some(entry) = self.tcp_owners.get_mut(id.index())
-            && *entry == Some(index)
-        {
-            *entry = None;
-        }
         self.owners[index] = None;
         self.live_owners.remove(index);
         self.keys[index] = None;
         self.blind[index] = 0;
-        self.retired[index] = None;
         true
     }
 
     /// Idempotent per attempt: the same physical attempt always owns one
-    /// reservation. A retained ticket of the same owner whose rejected
-    /// attempt is no longer live (`stale`) is re-keyed to the new attempt.
-    pub fn reserve(
-        &mut self,
-        owner: usize,
-        attempt: TransmitAttempt,
-        stale: impl Fn(TransmitAttempt) -> bool,
-    ) -> Result<usize, Error> {
+    /// reservation.
+    pub fn reserve(&mut self, owner: usize, attempt: TransmitAttempt) -> Result<usize, Error> {
         if let Some(index) = self
             .live_pending
             .iter()
@@ -1146,15 +1016,6 @@ impl Ledger {
             } else {
                 Err(Error::Obsolete)
             };
-        }
-        if let Some(index) = self.live_pending.iter().find(|&i| {
-            self.pending[i]
-                .is_some_and(|p| p.owner == owner && p.issued && p.attempt.is_none_or(&stale))
-        }) {
-            let p = self.pending[index].as_mut().unwrap();
-            p.attempt = Some(attempt);
-            p.evidence = None;
-            return Ok(index);
         }
         self.reserve_slot(owner, Some(attempt))
     }
@@ -1235,9 +1096,6 @@ impl Ledger {
             self.live_pending.remove(index);
         }
     }
-    pub fn owner(&self, index: usize) -> Option<Owner> {
-        self.owners[index]
-    }
     /// Certified non-submission: drop the reservation(s), record nothing.
     pub fn cancel(&mut self, ticket: u64) {
         let mut next = 0;
@@ -1265,7 +1123,7 @@ impl Ledger {
             };
             let slot = self.victim(p.owner, now);
             if let Some(old) = self.set_slot(p.owner, slot, None) {
-                self.evict(p.owner, old.record, now);
+                self.bury(old.record, now);
             }
             // A discarded summary of this key may hide an older identical
             // packet, so the old quote must not name this owner.
@@ -1286,9 +1144,7 @@ impl Ledger {
                 committed_at: now,
                 possibly_submitted,
             };
-            if !retirable(&record) {
-                self.next_expiry = self.next_expiry.min(self.expiry(&record));
-            }
+            self.next_expiry = self.next_expiry.min(self.expiry(&record));
             self.set_slot(
                 p.owner,
                 slot,
@@ -1301,24 +1157,19 @@ impl Ledger {
         }
         sealed
     }
-    // A free or expired slot first; otherwise the owner's oldest entry,
-    // preferring entries that consume no sequence space so a stream of pure
-    // ACKs cannot push outstanding data out of the guaranteed history.
+    // A free or expired slot first; otherwise the owner's oldest entry.
     fn victim(&mut self, owner: usize, now: Instant) -> usize {
-        let n = self.slots(owner);
+        let n = self.slots();
         if let Some(slot) = (0..n).find(|&s| {
             self.slot(owner, s)
-                .is_none_or(|e| !e.retirable() && self.expired(&e.record, now))
+                .is_none_or(|e| self.expired(&e.record, now))
         }) {
             self.set_slot(owner, slot, None);
             return slot;
         }
-        let oldest = |retirable: bool| {
-            (0..n)
-                .filter(|&s| self.slot(owner, s).unwrap().retirable() == retirable)
-                .min_by_key(|&s| self.slot(owner, s).unwrap().order)
-        };
-        oldest(false).or_else(|| oldest(true)).unwrap()
+        (0..n)
+            .min_by_key(|&s| self.slot(owner, s).unwrap().order)
+            .unwrap()
     }
     fn expired(&self, record: &Record, now: Instant) -> bool {
         self.expiry(record) <= now
@@ -1328,29 +1179,8 @@ impl Ledger {
             .committed_at
             .saturating_add(self.limits.feedback_horizon)
     }
-    // Same-owner eviction. A TCP generation's evicted history becomes its
-    // own summary, which delivery shrinks; anything else is buried at once.
-    // Like the live outstanding data it summarizes, the own summary does
-    // not expire while the generation lives (`until` applies once it is
-    // released): otherwise a quote of undelivered evicted data would lose
-    // its ambiguity with a later copy on another path.
-    fn evict(&mut self, owner: usize, record: Record, now: Instant) {
-        let until = record
-            .committed_at
-            .saturating_add(self.limits.feedback_horizon);
-        if until <= now && !retirable(&record) {
-            return;
-        }
-        if !matches!(self.owners[owner], Some(Owner::Tcp(_))) {
-            return self.bury(record, now);
-        }
-        let summary = Tombstone::of(&record.evidence, until);
-        self.retired[owner] = None;
-        match &mut self.own[owner] {
-            Some(own) => own.absorb(&summary),
-            own => *own = Some(summary),
-        }
-    }
+    // Same-owner eviction and released history: an unexpired record joins
+    // its key's summary.
     fn bury(&mut self, record: Record, now: Instant) {
         let until = record
             .committed_at
@@ -1433,91 +1263,8 @@ impl Ledger {
         self.tombstones[slot] = Some(summary);
     }
 
-    /// TCP delivery retirement: entries of this exact generation whose whole
-    /// consumed span precedes SND.UNA (serial arithmetic) can no longer be
-    /// the subject of useful feedback and are removed without a tombstone.
-    /// The generation's own evicted summary is cut back the same way, so
-    /// its cover never spans more than the outstanding window: below the
-    /// first live outstanding segment only sequence space this generation
-    /// already delivered remains. Pure ACKs left there share that floor;
-    /// their quotes name a segment of the same generation and, at a header
-    /// size no candidate MTU can be below, never a path change.
-    /// `delivered` sees each record retired: data a new cumulative
-    /// acknowledgment covers.
-    #[cfg(test)]
-    pub fn retire_tcp(
-        &mut self,
-        owner: ConnectionId,
-        unacknowledged: u32,
-        delivered: impl FnMut(&Record),
-    ) {
-        if let Some(index) = self.owner_index(Owner::Tcp(owner)) {
-            self.retire_record(index, unacknowledged, delivered);
-        }
-    }
-    /// `retire_tcp` of the TCP generation owning record `index`.
-    pub fn retire_record(
-        &mut self,
-        index: usize,
-        unacknowledged: u32,
-        mut delivered: impl FnMut(&Record),
-    ) {
-        debug_assert!(matches!(self.owners[index], Some(Owner::Tcp(_))));
-        if self.retired[index] == Some(unacknowledged) {
-            debug_assert!((0..self.slots(index)).all(|slot| {
-                self.slot(index, slot).is_none_or(|e| {
-                    !e.retirable()
-                        || !matches!(e.record.evidence.transport,
-                            Selector::Tcp { end, .. } if serial_le(end, unacknowledged))
-                })
-            }));
-            return;
-        }
-        let mut floor = unacknowledged;
-        // Stop once every retirable entry was seen (`seen` counts those kept).
-        let (mut slot, mut seen) = (0, 0);
-        while seen < self.retirable[index] && slot < self.slots(index) {
-            let current = slot;
-            slot += 1;
-            let Some(entry) = self.slot(index, current).filter(|e| e.retirable()) else {
-                continue;
-            };
-            seen += 1;
-            let Selector::Tcp { start, end, .. } = entry.record.evidence.transport else {
-                continue;
-            };
-            if serial_le(end, unacknowledged) {
-                let entry = self.set_slot(index, current, None).unwrap();
-                seen -= 1;
-                delivered(&entry.record);
-            } else if serial_lt(start, floor) {
-                floor = start;
-            }
-        }
-        self.retired[index] = Some(unacknowledged);
-        let Some(own) = &mut self.own[index] else {
-            return;
-        };
-        for class in &mut own.classes {
-            let Some(Class {
-                cover: Cover::Sequence { start, end },
-                ..
-            }) = class
-            else {
-                continue;
-            };
-            if serial_le(*end, floor) {
-                *class = None;
-            } else if serial_lt(*start, floor) {
-                *start = floor;
-            }
-        }
-        if own.classes.iter().all(Option::is_none) {
-            self.own[index] = None;
-        }
-    }
-    /// Time expiry for entries without delivery retirement, evicted
-    /// datagram signatures, and released owners' tombstones.
+    /// Time expiry for history entries, evicted datagram signatures, and
+    /// released owners' tombstones.
     pub fn expire(&mut self, now: Instant) {
         self.check_live();
         if now < self.next_expiry {
@@ -1531,16 +1278,13 @@ impl Ledger {
             from = owner + 1;
             // Stop once every occupied slot was seen (`seen` counts those kept).
             let (mut slot, mut seen) = (0, 0);
-            while seen < self.occupied[owner] && slot < self.slots(owner) {
+            while seen < self.occupied[owner] && slot < self.slots() {
                 let current = slot;
                 slot += 1;
                 let Some(entry) = self.slot(owner, current) else {
                     continue;
                 };
                 seen += 1;
-                if entry.retirable() {
-                    continue;
-                }
                 if self.expired(&entry.record, now) {
                     self.set_slot(owner, current, None);
                     seen -= 1;
@@ -1582,20 +1326,16 @@ impl Ledger {
         assert!(self.live_pending.matches(&self.pending));
         assert!(self.live_tombstones.matches(&self.tombstones));
         for owner in 0..self.owners.len() {
-            let (mut occupied, mut retirable) = (0, 0);
-            for slot in 0..self.slots(owner) {
+            let mut occupied = 0;
+            for slot in 0..self.slots() {
                 let Some(entry) = self.slot(owner, slot) else {
                     continue;
                 };
                 occupied += 1;
-                retirable += usize::from(entry.retirable());
                 assert!(self.owners[owner].is_some());
-                assert!(entry.retirable() || self.expiry(&entry.record) >= self.next_expiry);
+                assert!(self.expiry(&entry.record) >= self.next_expiry);
             }
-            assert_eq!(
-                (occupied, retirable),
-                (self.occupied[owner], self.retirable[owner])
-            );
+            assert_eq!(occupied, self.occupied[owner]);
         }
         let datagrams = self.datagrams.iter().flatten().map(|(_, until)| *until);
         let tombstones = self.tombstones.iter().flatten().map(|t| t.until);
@@ -1620,7 +1360,7 @@ impl Ledger {
             .flat_map(move |record| self.occupied_slots(record).map(move |slot| (record, slot)))
             .filter_map(move |(record, slot)| Some((record, *self.slot(record, slot)?)))
             .filter(move |(_, entry)| {
-                (entry.retirable() || !self.expired(&entry.record, now))
+                !self.expired(&entry.record, now)
                     && entry.matches(&quote)
                     && zone.is_none_or(|zone| entry.record.evidence.link == zone)
             })
@@ -1661,7 +1401,7 @@ impl Ledger {
         // The latest entry of the candidate owner and its record.
         let mut owner: Option<(Entry, usize)> = None;
         let mut one_owner = true;
-        let mut connection = false;
+        let mut datagram = false;
         // None: no match yet; Some(None): matches disagree on the path.
         let mut path: Option<Option<PathId>> = None;
         let mut join = |p: Option<PathId>| {
@@ -1678,7 +1418,7 @@ impl Ledger {
             }
             join(Some(entry.record.evidence.path));
             let e = entry.record.evidence;
-            connection |= e.owner != Owner::Stateless;
+            datagram |= e.owner != Owner::Stateless;
             match owner {
                 None => owner = Some((entry, record)),
                 Some((first, _))
@@ -1702,22 +1442,21 @@ impl Ledger {
         }
         // Lossy history from here on: it can only take away.
         let mut summarized = false;
-        // The stateless lane's merged summary does not shadow a connection's
-        // own match: a reply it sent carries the sequence number the peer's
-        // segment asked for (RST) or a cookie ISS (SYN-ACK), and a later
-        // connection on that four-tuple sends from its own RFC 6528 ISS, so a
-        // byte-identical segment is a chance collision, not reuse. Its
-        // replies to arbitrary peers would otherwise make every connection
-        // ambiguous under reset load.
-        let shared = self.tombstones.iter().flatten().filter(|t| t.until > now);
-        for t in shared
-            .chain(self.own.iter().flatten())
-            .filter(|t| !(t.key == Key::Stateless && connection) && t.admits(quote, zone))
+        // The stateless lane's merged summary does not shadow a flow's own
+        // match: the lane sends only TCP replies to arbitrary peers, so it
+        // never sent a flow's datagram, and its replies would otherwise make
+        // every flow ambiguous under reset load.
+        for t in self
+            .tombstones
+            .iter()
+            .flatten()
+            .filter(|t| t.until > now)
+            .filter(|t| !(t.key == Key::Stateless && datagram) && t.admits(quote, zone))
         {
             summarized = true;
             join(t.path);
         }
-        if self.discarded.shadows(quote, zone, connection, now) {
+        if self.discarded.shadows(quote, zone, datagram, now) {
             summarized = true;
             join(None);
         }
@@ -1741,11 +1480,7 @@ impl Ledger {
 
     #[cfg(test)]
     pub fn records(&self) -> impl Iterator<Item = Record> + '_ {
-        self.history
-            .iter()
-            .chain(self.extra.iter().flatten())
-            .flatten()
-            .map(|e| e.record)
+        self.history.iter().flatten().map(|e| e.record)
     }
     #[cfg(test)]
     pub fn pending_count(&self) -> usize {
@@ -1756,7 +1491,7 @@ impl Ledger {
     pub fn discards(&self) -> usize {
         self.discards
     }
-    /// The class a discarded summary of a TCP flow from `local` to `remote`
+    /// The class a discarded summary of a UDP flow from `local` to `remote`
     /// in `zone` shadows: a hash, so distinct flows may share one.
     #[cfg(test)]
     pub fn discard_class(
@@ -1768,7 +1503,7 @@ impl Ledger {
         self.discarded.class(Key::Flow {
             source: local.ip(),
             destination: remote.ip(),
-            protocol: 6,
+            protocol: 17,
             ports: Some((local.port(), remote.port())),
             zone,
         })
@@ -1777,12 +1512,12 @@ impl Ledger {
     /// signature hits, and whether a discarded summary shadowed it.
     #[cfg(test)]
     pub fn evicted_hits(&self, now: Instant, quote: &QuoteKey) -> (usize, bool) {
-        let connection = self
+        let datagram = self
             .live(now, quote, None)
             .any(|(_, e)| e.record.evidence.owner != Owner::Stateless);
         (
             self.signatures(now, quote, None).count(),
-            self.discarded.shadows(quote, None, connection, now),
+            self.discarded.shadows(quote, None, datagram, now),
         )
     }
 }

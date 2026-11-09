@@ -1,6 +1,7 @@
 // Redirect reception for both families (never originated): validation of
-// the message against this Host's own forwarding authority and submission
-// evidence, then a bounded override beneath the administrative route
+// the message against this Host's own forwarding authority and the traffic
+// it quotes (a live connection, or the submission evidence of a stateless
+// reply or datagram), then a bounded override beneath the administrative route
 // (`PathService::redirect`), whose installation invalidates the paths it
 // moves; `Host::service_changes` then brings every TCP binding and UDP flow
 // on them to the new first hop (RFC 1191 section 6.3: the packetization
@@ -12,7 +13,7 @@ use ntcp::Instant;
 use ntcp_icmp::{Ipv6Redirect, Quote};
 use ntcp_path::{PathKey, PathStatus, ResolvedNextHop, ScopedAddress};
 
-use crate::{Error, Host, IngressContext, IngressPacket, path, quote_key};
+use crate::{Error, Host, IngressContext, IngressPacket, ledger::QuotedSelector, path, quote_key};
 
 /// The disposition of a wire-valid Redirect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,21 +30,21 @@ pub enum RedirectRejection {
     /// No usable quote: an ICMPv6 Redirect without a Redirected Header
     /// whose quote names a packet this Host sent. RFC 4861 section 8.1
     /// does not require the option; this Host's policy accepts a Redirect
-    /// only with evidence of an exact committed submission.
+    /// only for traffic it has on the redirected path.
     NoEvidence,
-    /// The quote matches no exact committed submission, or its matches do
-    /// not agree on one path incarnation.
+    /// The quote names no live connection's addresses and ports and matches
+    /// no exact committed submission of a stateless reply or datagram, or
+    /// its matches do not agree on one path incarnation.
     Uncorrelated,
-    /// The quoted submission's path is no longer the authoritative
-    /// selection (a replaced route generation, a changed first hop or
-    /// link).
+    /// The quoted traffic's path is no longer the authoritative selection
+    /// (a replaced route generation, a changed first hop or link).
     Stale,
     /// It arrived on another link than the one the path leaves through.
     WrongLink,
     /// The sender is not the destination's current first-hop router, or
     /// the destination is reached directly.
     NotFirstHop,
-    /// The ICMPv6 Destination is not the quoted submission's forwarding
+    /// The ICMPv6 Destination is not the quoted traffic's forwarding
     /// destination.
     Destination,
     /// The new IPv4 gateway is not reached directly over the arrival link,
@@ -52,9 +53,13 @@ pub enum RedirectRejection {
 }
 
 impl Host {
-    // The current authoritative path of the exact committed submission
-    // `quoted` (as `quoted_message`, whose quoted packet starts at offset
-    // 8), on which a Redirect from `sender` arrived over `context`'s link.
+    // The current authoritative path of the traffic `quoted` (as
+    // `quoted_message`, whose quoted packet starts at offset 8) belongs to,
+    // on which a Redirect from `sender` arrived over `context`'s link: for a
+    // TCP quote, the live connection its addresses and ports name, as Linux
+    // finds the socket (connections keep no per-segment evidence, and the
+    // quoted sequence is not checked against the send window here);
+    // otherwise the exact committed submission it quotes.
     fn redirected_path(
         &self,
         context: IngressContext,
@@ -68,10 +73,28 @@ impl Host {
         // A link-local quoted source belongs to the arrival link.
         let zone = matches!(key.source, IpAddr::V6(v) if v.is_unicast_link_local())
             .then_some(context.link);
-        let path = self
-            .ledger
-            .correlate_in(now, &key, zone)
-            .path
+        let connection = match key.transport {
+            QuotedSelector::Tcp {
+                source_port,
+                destination_port,
+                ..
+            } if key.protocol == ntcp_icmp::PROTOCOL_TCP => self
+                .live_bindings
+                .iter()
+                .filter_map(|index| self.bindings[index].as_ref())
+                .find(|b| {
+                    let path = b.prepared.snapshot.key();
+                    b.owner.is_some()
+                        && b.ports == (source_port, destination_port)
+                        && path.source_address().address() == key.source
+                        && path.destination().address() == key.destination
+                        && zone.is_none_or(|zone| path.link() == zone)
+                })
+                .map(|b| b.prepared.snapshot.path()),
+            _ => None,
+        };
+        let path = connection
+            .or_else(|| self.ledger.correlate_in(now, &key, zone).path)
             .filter(|path| self.quote_authorized(*path, quoted_message))
             .ok_or(Uncorrelated)?;
         let snapshot = self.paths.path_snapshot(path).map_err(|_| Stale)?;
@@ -94,12 +117,12 @@ impl Host {
     // RFC 792 and RFC 1122 section 3.2.2.2, with the run's strict
     // rejection of every case RFC 1122 says SHOULD be discarded: the
     // Redirect must come from the current first-hop gateway of the quoted
-    // datagram's destination over the link that datagram left through, and
-    // the new gateway must be reached directly over that link. Host and
-    // Network Redirects update that one destination, whatever its type of
-    // service, without inventing a network mask; the type-of-service forms
-    // apply to the DSCP the datagram was submitted with, never the quoted
-    // (possibly remarked) bits.
+    // traffic's destination over the link its path leaves through, and the
+    // new gateway must be reached directly over that link. Host and Network
+    // Redirects update that one destination, whatever its type of service,
+    // without inventing a network mask; the type-of-service forms apply to
+    // the DSCP of the quoted traffic's path, never the quoted (possibly
+    // remarked) bits.
     pub(crate) fn redirect_ipv4(
         &mut self,
         context: IngressContext,
@@ -142,7 +165,7 @@ impl Host {
 
     // RFC 4861 sections 8.1 and 8.3, from a link-local `source` on an
     // ND-capable port (the decoder checked the message itself). The sender
-    // must be the current first-hop router of the quoted submission's
+    // must be the current first-hop router of the quoted traffic's
     // forwarding destination over the arrival link, and the ICMPv6
     // Destination must be that destination, so a quote for one destination
     // never authorizes another. The target need not match any on-link

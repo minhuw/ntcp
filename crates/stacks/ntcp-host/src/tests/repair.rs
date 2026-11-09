@@ -1,10 +1,10 @@
 // Exact dropped-range repair driven by Host-dispatched PTBs, through real
 // Host/Endpoint owners and a real peer receiver: only the quoted connection
 // repairs, a partially acknowledged quote stays valid, a reserved owner's
-// deferred report survives ledger eviction and path replacement, and a
-// reserved repair raced by a decrease is one physical Host submission in
-// Restart.
-use super::dispatch::{header, ptb, quote_key, tcp_report};
+// deferred report replays on its path (as advice only after a path
+// replacement), and a reserved repair raced by a decrease is one physical
+// Host submission in Restart.
+use super::dispatch::{header, ptb, tcp_report};
 use super::fanout::{Held, reserve};
 use super::*;
 
@@ -224,25 +224,20 @@ fn host_ptb_repairs_exact_quoted_range_of_the_quoted_connection_only() {
     }
 }
 
-// A report about a reserved owner is deferred with its normalized evidence.
-// Before it is replayed, the owner's bounded two-entry history evicts the
-// quoted submission (a fresh dispatch of the same frame no longer names the
-// owner) and, in one variant, the owner moves to another path incarnation.
-// The token alone still drives exact repair of the quoted range; on the
-// replaced path it is drop advice only, with nothing published or lowered.
+// A report about a reserved owner is deferred with the segment and path it
+// was correlated with at arrival. Before it is replayed the owner sends the
+// rest of its window and, in one variant, moves to another path
+// incarnation. The token alone drives exact repair of the quoted range; on
+// the replaced path, which the report was not about, it is drop advice only,
+// with nothing published or lowered.
 #[test]
-fn deferred_report_survives_ledger_eviction_and_path_replacement() {
+fn deferred_report_replays_on_its_path_or_as_advice_after_replacement() {
     for v6 in [false, true] {
         for replace in [false, true] {
             let cfg = cfg();
             let (local, remote) = addresses(v6);
             let identity = 7200 + u64::from(v6) * 2 + u64::from(replace);
-            let send_capacity = cfg.connection.send_capacity;
-            let mut a = managed_with(local, identity, cfg.clone(), false, None, None, |l| {
-                l.segment_bytes = send_capacity;
-                l.history_per_owner = 2;
-                1
-            });
+            let mut a = managed(local, identity, cfg.clone());
             let mut b = managed(remote, identity + 100, cfg.clone());
             b.1.listen(remote, 4).unwrap();
             let id = connect(&mut a, &cfg, 1000, 0);
@@ -269,12 +264,6 @@ fn deferred_report_survives_ledger_eviction_and_path_replacement() {
                 rest.push(wire);
             }
             assert_eq!(rest.len(), 3);
-            // The quoted record was evicted: the raw frame no longer names A.
-            assert_eq!(a.0.correlate(now + 2, &quote_key(&quoted)).owner, None);
-            assert!(matches!(
-                a.0.input_icmp(&mut a.1, a.2, now + 2, &report, None).unwrap(),
-                IcmpDispatch::Completed(IcmpOutcome::Discarded(_))
-            ));
             let old = a.0.binding(id).unwrap().snapshot.path();
             if replace {
                 a.0.rebind_dscp(&mut a.1, id, 8).unwrap();
@@ -318,7 +307,7 @@ fn deferred_report_survives_ledger_eviction_and_path_replacement() {
             let child = peer(&b, local, 1000);
             assert_eq!(read_all(&mut b, child, data.len()), data);
             std::println!(
-                "DEFERRED v6={v6} replace={replace} evicted=true outcome={outcome:?} published={published:?} repair={first}+{}",
+                "DEFERRED v6={v6} replace={replace} outcome={outcome:?} published={published:?} repair={first}+{}",
                 len - first
             );
         }
