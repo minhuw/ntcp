@@ -613,27 +613,37 @@ impl<P: PacketIo> Network<P> {
             }
             return Ok(());
         }
-        if packet.protocol == 6 {
-            let tcp = ntcp::wire::parse(packet.ip, packet.payload)
-                .map_err(|_| Error::Unsupported("malformed TCP packet"))?;
-            let tuple = Tuple {
-                local: SocketAddr::new(packet.ip.destination, tcp.header.destination_port),
-                remote: SocketAddr::new(packet.ip.source, tcp.header.source_port),
-            };
-            if let Some(owner) = self.endpoint.scoped_connection_id(self.scoped(tuple))
-                && self.endpoint.is_output_reserved(owner)
-            {
-                return self.retain(owner, Some(processed), None, metadata);
-            }
-        }
-        self.host.input_datagram(
+        match self.host.input_datagram(
             &mut self.endpoint,
             self.now,
             processed,
             metadata,
             self.config.tcp.dscp,
-        )?;
-        Ok(())
+        ) {
+            Ok(ntcp::InputDisposition::Processed) => Ok(()),
+            // Not taken in (malformed, or refused by the endpoint): counted
+            // as discarded.
+            Ok(ntcp::InputDisposition::Dropped) => Err(Error::Unsupported("datagram dropped")),
+            // The endpoint refuses a segment for a connection whose output is
+            // reserved before taking anything in. It waits, with its exact
+            // envelope, until the reservation ends.
+            Err(ntcp_host::Error::Endpoint(EndpointError::OutputReserved))
+                if packet.protocol == 6 =>
+            {
+                let tcp = ntcp::wire::parse(packet.ip, packet.payload)
+                    .map_err(|_| Error::Unsupported("malformed TCP packet"))?;
+                let tuple = Tuple {
+                    local: SocketAddr::new(packet.ip.destination, tcp.header.destination_port),
+                    remote: SocketAddr::new(packet.ip.source, tcp.header.source_port),
+                };
+                let owner = self
+                    .endpoint
+                    .scoped_connection_id(self.scoped(tuple))
+                    .ok_or(Error::InvalidHandle)?;
+                self.retain(owner, Some(processed), None, metadata)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
     fn retain(
         &mut self,
