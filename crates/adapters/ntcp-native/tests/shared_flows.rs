@@ -914,7 +914,15 @@ fn an_icmp_error_delivered_to_another_member_reaches_the_flows_owner() {
 fn fragments_spread_over_queues_are_reassembled_and_reach_the_flows_owner() {
     for n in [2, 4] {
         for dispatch in [Dispatch::Scatter(0xd1b5_4a32_d192_ed03), Dispatch::rss(n)] {
-            let mut lan = hash_lan(n, dispatch.clone(), INBOX);
+            // Room for two of the peer's drives of datagrams: the scatter
+            // interleaves the fragments of one drive's datagrams, and some
+            // wait in a queue while the next drive's arrive. A fragment
+            // refused for room leaves the rest of its datagram holding a
+            // slot until the reassembly timeout.
+            let (flows, stations) = hash_members(n, INBOX, |config| {
+                config.reassembly_datagrams = 2 * BUDGET.transmit;
+            });
+            let mut lan = Lan::new(stations, dispatch.clone(), Some(flows));
             lan.router.fragment = Some(576);
             let Passive { lan, .. } = passive(lan, 8, 8 * MSS, 5 * SECOND);
             let (handed_off, _, dropped) = lan.handoffs();
