@@ -1,14 +1,18 @@
 // A closed-loop xylem-echo client on a DPDK port: one ntcp-native Network
 // per local IPv4 address, each on its own queue pair and pinned worker
-// thread, the Networks sharing the port's ARP table. Each connection sends
-// a 16-octet request ([request id: u64 LE][delay us: u64 LE = 0]), waits for
-// the same 16 octets back and sends the next. It prints `METRIC name=value`
-// lines and exits nonzero on any failure or if no request completed.
+// thread, the Networks sharing the port's ARP table. With `--members N` the
+// port instead serves one address with N Networks, one per queue pair and
+// worker, that divide its flows (ntcp-native's SharedFlows) and each open
+// their share of the connections. Each connection sends a 16-octet request
+// ([request id: u64 LE][delay us: u64 LE = 0]), waits for the same 16
+// octets back and sends the next. It prints `METRIC name=value` lines and
+// exits nonzero on any failure or if no request completed.
 //
 //   dpdk_echo --dev DEVARGS [--eal ARG]... --ip A.B.C.D [--ip ...] --prefix LEN
 //             [--gateway A.B.C.D] [--neighbor A.B.C.D=MAC]... --server IP:PORT
 //             [--connections N] [--duration SECS] [--isolate] [--rx-timestamps]
-//             [--cpu N]... [--secret-from-urandom]
+//             [--cpu N]... [--members N [--steering auto|rss|none]]
+//             [--secret-from-urandom]
 //
 // Questions an embedding answers, and this example's answers:
 //
@@ -47,16 +51,50 @@
 //   request's start is its Scheduled stamp: the caller time of the drive
 //   that handed its octets to the queue. With `rte_eth_read_clock`
 //   unsupported, or no stamps, no hardware RTT is reported.
+// - Shared address: which queue gets which frames? Member k drives queue k,
+//   and a member takes in only the flows it owns; any other packet it copies
+//   into the owner's inbox, so the steering mode decides how many packets
+//   are handed off, never whether a connection works. `--steering rss`
+//   spreads the port by RSS over all queues and installs no rule for the
+//   address (a rule would take its traffic away from RSS). The members'
+//   ownership mirrors the key and redirection table read back after start,
+//   each table entry's queue naming its member, so a TCP segment arrives
+//   at its owner; ICMP errors, which hash on the router's address, and
+//   fragments, if the device does not hash them by addresses alone, may
+//   land elsewhere and are handed off. `--steering none` keeps RSS off:
+//   without `--isolate` every frame lands on queue 0, with it a rule steers
+//   the address to queue 0, and member 0 hands each flow it does not own,
+//   about (N-1)/N of them, to its owner. Ownership then hashes with ntcp's
+//   default key over a round-robin table. Non-IP frames go where the port
+//   puts unhashed traffic; the shared ARP table serves every member.
+// - Why is ownership fixed at start? A connection's owner must not change
+//   while it lives: active opens pick local ports whose flows they own, and
+//   members route packets by the function without asking each other. It is
+//   built once, from the RSS state read right after start and before any
+//   member joins. Only then may the example rewrite the table: one that
+//   names some member nowhere (the null PMD's is all queue 0) becomes
+//   round-robin, since that member would own no flows and could open no
+//   connection. A device that later moves its table only costs handoffs.
+// - What does `--steering auto` choose? rss if the device takes RSS at
+//   start and the state read back is usable: the IPv4 TCP hash type
+//   granted, a key of at least 16 octets, and a power-of-two table naming
+//   every member's queue and no other. A device that refuses RSS at start
+//   is started again without it. Otherwise none, as always with
+//   `--isolate` (an isolated port spreads nothing by RSS); a port that took
+//   RSS but whose state is unusable keeps spreading by it, which costs
+//   handoffs but no connection. The choice is printed and reported as
+//   `METRIC steering`. Masked local-port rules (`rules`, tier 1 of the
+//   design) are not offered yet.
 
 use ntcp_io::ClockDescriptor;
 use ntcp_io_dpdk::{
     ClockCalibration, ClockFit, Eal, HostedQueue, Port, PortConfig, QueueHandle, bracketed_reading,
 };
 use ntcp_native::{
-    CallerTimebase, ConnId, Error as NetError, EthernetNextHop, Event, Link, Network,
-    NetworkConfig, ReadOutcome, SharedNeighborLimits, SharedNeighbors, TimestampClock,
-    TimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampStage, WorkBudget,
-    WriteOptions,
+    CallerTimebase, ConnId, DEFAULT_FLOW_KEY, Error as NetError, EthernetNextHop, Event,
+    FlowOwnership, Link, Network, NetworkConfig, ReadOutcome, SharedFlowLimits, SharedFlows,
+    SharedNeighborLimits, SharedNeighbors, TimestampClock, TimestampEvent, TxTimestampOutcome,
+    TxTimestampRequest, TxTimestampStage, WorkBudget, WriteOptions,
 };
 use std::{
     collections::HashMap,
@@ -98,12 +136,32 @@ struct Args {
     isolate: bool,
     rx_timestamps: bool,
     cpus: Vec<usize>,
+    // Shared-address mode: members on the one address.
+    members: Option<usize>,
+    steering: Steering,
+}
+
+// How frames of the shared address reach their members. Masked local-port
+// rules (tier 1) will be a third mode, chosen before rss by `auto`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Steering {
+    Auto,
+    Rss,
+    Off,
 }
 
 const USAGE: &str = "usage: dpdk_echo --dev DEVARGS [--eal ARG]... --ip A.B.C.D [--ip ...] \
 --prefix LEN [--gateway A.B.C.D] [--neighbor A.B.C.D=MAC]... --server IP:PORT \
 [--connections N] [--duration SECS] [--isolate] [--rx-timestamps] [--cpu N]... \
-[--secret-from-urandom]";
+[--members N [--steering auto|rss|none]] [--secret-from-urandom]
+
+Without --members, one Network per --ip, each on its own queue (and --cpu, if given).
+--members N: N Networks share the single --ip, one per queue (and --cpu, if given),
+and open --connections (at least N) between them. --steering (default auto) picks how
+frames reach them, reported as METRIC steering: 1 none (ntcp's own key, software
+handoff; RSS off, so queue 0 receives), 2 rss (the device's RSS key and table
+mirrored); auto takes rss when usable, else none. Code 3 is reserved for masked port
+rules.";
 
 fn parse_mac(text: &str) -> Result<[u8; 6], String> {
     let mut mac = [0; 6];
@@ -132,7 +190,10 @@ fn parse_args() -> Result<Args, String> {
         isolate: false,
         rx_timestamps: false,
         cpus: Vec::new(),
+        members: None,
+        steering: Steering::Auto,
     };
+    let mut steering = false;
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
         let mut value = || iter.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -160,6 +221,18 @@ fn parse_args() -> Result<Args, String> {
             "--isolate" => args.isolate = true,
             "--rx-timestamps" => args.rx_timestamps = true,
             "--cpu" => args.cpus.push(value()?.parse().map_err(|_| bad("CPU"))?),
+            "--members" => args.members = Some(value()?.parse().map_err(|_| bad("count"))?),
+            "--steering" => {
+                args.steering = match value()?.as_str() {
+                    "auto" => Steering::Auto,
+                    "rss" => Steering::Rss,
+                    "none" => Steering::Off,
+                    // Masked local-port rules, tier 1 of shared flows.
+                    "rules" => return Err("--steering rules is not supported yet".into()),
+                    _ => return Err(bad("mode (auto, rss or none)")),
+                };
+                steering = true;
+            }
             // The only source of TCP secrets this example has.
             "--secret-from-urandom" => {}
             "-h" | "--help" => return Err(USAGE.into()),
@@ -168,6 +241,21 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.dev.is_empty() || args.ips.is_empty() || args.prefix == 0 || args.server.port() == 0 {
         return Err(USAGE.into());
+    }
+    if let Some(members) = args.members {
+        if args.ips.len() != 1 || members == 0 || args.connections < members {
+            return Err("--members needs one --ip, and --connections at least --members".into());
+        }
+        if !args.cpus.is_empty() && args.cpus.len() != members {
+            return Err("--cpu given once per member".into());
+        }
+        if members > usize::from(u16::MAX) {
+            return Err("too many members".into());
+        }
+        return Ok(args);
+    }
+    if steering {
+        return Err("--steering requires --members".into());
     }
     if args.connections == 0 || !args.cpus.is_empty() && args.cpus.len() != args.ips.len() {
         return Err("--connections must be positive and --cpu given once per --ip".into());
@@ -238,6 +326,10 @@ struct Report {
     hardware_negative: u64,
     arp_sent: u64,
     arp_received: u64,
+    connections: usize,
+    handed_off: u64,
+    handoffs_received: u64,
+    handoffs_dropped: u64,
     clock: Option<String>,
     fit: Option<ClockFit>,
     calibration_rejected: u64,
@@ -267,6 +359,10 @@ struct Worker {
     handle: QueueHandle,
     cpu: Option<libc::cpu_set_t>,
     neighbors: SharedNeighbors,
+    secret: [u8; 32],
+    connections: usize,
+    // Shared-address mode: the flows and this worker's member index.
+    flows: Option<(SharedFlows, usize)>,
 }
 
 fn main() -> ExitCode {
@@ -302,11 +398,22 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     eprintln!("EAL {}", eal_args.join(" "));
     let eal = Eal::init(eal_args)?;
 
+    let threads = args.members.unwrap_or(args.ips.len());
     let mut config = PortConfig::new(args.dev.clone());
-    config.queues = args.ips.len() as u16;
+    config.queues = threads as u16;
     config.isolate = args.isolate;
     config.rx_timestamps = args.rx_timestamps;
-    let port = Port::start(eal, config)?;
+    // An isolated port spreads nothing by RSS; Port::start refuses both.
+    config.rss = args.members.is_some()
+        && (args.steering == Steering::Rss || args.steering == Steering::Auto && !args.isolate);
+    let port = match Port::start(eal, config.clone()) {
+        Err(error) if config.rss && args.steering == Steering::Auto => {
+            eprintln!("STEERING rss refused at start ({error}); starting without");
+            config.rss = false;
+            Port::start(eal, config.clone())?
+        }
+        port => port?,
+    };
     let mac = port.mac_address()?;
     let mac_text = mac.map(|o| format!("{o:02x}")).join(":");
     eprintln!(
@@ -315,7 +422,18 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         port.queues(),
         port.clock()
     );
-    let threads = args.ips.len();
+    // Before any member joins: ownership is fixed for the port's life.
+    let ownership = match args.members {
+        Some(members) => Some(ownership(&port, &args, members)?),
+        None => None,
+    };
+    // Connections per worker: every address opens them all, members split them.
+    let shares: Vec<usize> = match args.members {
+        Some(members) => (0..members)
+            .map(|k| args.connections / members + usize::from(k < args.connections % members))
+            .collect(),
+        None => vec![args.connections; threads],
+    };
     let neighbors = SharedNeighbors::new(
         mac,
         NANOS,
@@ -323,34 +441,70 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             members: threads,
             entries: 64 + args.neighbors.len(),
             // Each member reserves max_connections + 1 output owners.
-            held: threads * (args.connections + 1),
+            held: shares.iter().map(|share| share + 1).sum(),
             replies: 16,
         },
     )?;
-    let mut flows = Vec::new();
-    for (queue, &ip) in args.ips.iter().enumerate() {
-        match port.steer_ipv4(ip, queue as u16) {
-            Ok(flow) => {
-                eprintln!("FLOW {ip} -> queue {queue}");
-                flows.push(flow);
+    let mut rules = Vec::new();
+    let mut shared = None;
+    if let Some((ownership, steering)) = ownership {
+        let ip = args.ips[0];
+        if steering == Steering::Off && args.isolate {
+            rules.push(
+                port.steer_ipv4(ip, 0)
+                    .map_err(|e| format!("steer {ip} to queue 0: {e}"))?,
+            );
+            eprintln!("FLOW {ip} -> queue 0");
+        }
+        let flows = SharedFlows::new(
+            ownership,
+            SharedFlowLimits {
+                members: threads,
+                // As many packets as an RX ring holds: under `none` queue 0
+                // receives every member's frames and passes them on, so an
+                // inbox stands in for the ring the device would have filled
+                // for its member, and a longer backlog is dropped as an
+                // overflowing ring drops it.
+                inbox_packets: usize::from(config.rx_desc),
+                // The port's largest IP packet.
+                packet_bytes: usize::from(config.mtu),
+            },
+        )?;
+        shared = Some((flows, steering));
+    } else {
+        for (queue, &ip) in args.ips.iter().enumerate() {
+            match port.steer_ipv4(ip, queue as u16) {
+                Ok(flow) => {
+                    eprintln!("FLOW {ip} -> queue {queue}");
+                    rules.push(flow);
+                }
+                // One queue without isolation already receives everything.
+                Err(error) if !args.isolate && threads == 1 => {
+                    eprintln!("FLOW {ip} not installed ({error}); queue 0 receives all traffic");
+                }
+                Err(error) => return Err(format!("steer {ip} to queue {queue}: {error}").into()),
             }
-            // One queue without isolation already receives everything.
-            Err(error) if !args.isolate && threads == 1 => {
-                eprintln!("FLOW {ip} not installed ({error}); queue 0 receives all traffic");
-            }
-            Err(error) => return Err(format!("steer {ip} to queue {queue}: {error}").into()),
         }
     }
 
+    // Members share one secret, as one host has one: each member's ISNs and
+    // SYN cookies must hold for flows another member hands it.
+    let common = shared.as_ref().map(|_| random_secret()).transpose()?;
     let args = std::sync::Arc::new(args);
     let mut workers = Vec::new();
-    for (index, &ip) in args.ips.iter().enumerate() {
+    for (index, &connections) in shares.iter().enumerate() {
         let worker = Worker {
             index,
-            ip,
+            ip: args.ips[if shared.is_some() { 0 } else { index }],
             handle: port.take_queue(index as u16)?,
             cpu: args.cpus.get(index).map(|&c| single_cpu(c)).transpose()?,
             neighbors: neighbors.clone(),
+            secret: match common {
+                Some(secret) => secret,
+                None => random_secret()?,
+            },
+            connections,
+            flows: shared.as_ref().map(|(flows, _)| (flows.clone(), index)),
         };
         let args = args.clone();
         workers.push(
@@ -366,8 +520,116 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             ..Report::default()
         }));
     }
-    drop(flows);
-    Ok(summarize(&reports, &neighbors))
+    drop(rules);
+    let steering = shared.map(|(_, steering)| steering);
+    Ok(summarize(&reports, &neighbors, steering))
+}
+
+fn random_secret() -> Result<[u8; 32], String> {
+    let mut secret = [0; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut secret))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    Ok(secret)
+}
+
+// The shared address's ownership function, fixed for the port's life, and
+// the steering it relies on (never Auto). Member k drives queue k.
+fn ownership(
+    port: &Port,
+    args: &Args,
+    members: usize,
+) -> Result<(FlowOwnership, Steering), String> {
+    let rss = if args.steering == Steering::Off {
+        Err("requested".to_owned())
+    } else {
+        spread(port, members).and_then(|rss| usable(rss, members))
+    };
+    // Masked local-port rules (tier 1) will be tried here first.
+    match rss {
+        Ok(ownership) => {
+            eprintln!("STEERING rss: the device's key and table");
+            Ok((ownership, Steering::Rss))
+        }
+        Err(why) if args.steering == Steering::Rss => Err(format!("--steering rss: {why}")),
+        Err(why) => {
+            eprintln!("STEERING none ({why}): ntcp's key, software handoff");
+            // Entries enough that members not a power of two in number
+            // still own nearly equal shares.
+            let table = (0..members.next_power_of_two().max(128))
+                .map(|entry| entry % members)
+                .collect();
+            let ownership = FlowOwnership::Hash {
+                key: DEFAULT_FLOW_KEY.to_vec(),
+                table,
+            };
+            Ok((ownership, Steering::Off))
+        }
+    }
+}
+
+// The port's RSS state, with a table that names every member: a member the
+// table never names owns no flows, so it could open no connection. Such a
+// table is rewritten round-robin, before any member joins.
+fn spread(port: &Port, members: usize) -> Result<ntcp_io_dpdk::Rss, String> {
+    let read = || match port.rss() {
+        Ok(Some(rss)) => {
+            let mut entries = vec![0; members];
+            for &queue in &rss.reta {
+                if let Some(count) = entries.get_mut(usize::from(queue)) {
+                    *count += 1;
+                }
+            }
+            eprintln!(
+                "RSS key={} octets tcp={} ipv4={} fragments={} reta entries per queue {entries:?}",
+                rss.key.len(),
+                rss.ipv4_tcp,
+                rss.ipv4,
+                rss.ipv4_fragments
+            );
+            Ok(rss)
+        }
+        Ok(None) => Err("the port spreads nothing by rss".to_owned()),
+        Err(error) => Err(format!("rss state unreadable: {error}")),
+    };
+    let rss = read()?;
+    if names_every_member(&rss.reta, members) {
+        return Ok(rss);
+    }
+    let table: Vec<u16> = (0..rss.reta.len()).map(|e| (e % members) as u16).collect();
+    port.set_reta(&table)
+        .map_err(|e| format!("the reta misses a member and cannot be rewritten: {e}"))?;
+    eprintln!("RSS reta rewritten round-robin");
+    read()
+}
+
+fn names_every_member(reta: &[u16], members: usize) -> bool {
+    (0..members).all(|member| reta.iter().any(|&queue| usize::from(queue) == member))
+}
+
+// RSS the members can mirror: TCP hashed over addresses and ports with a
+// key that covers them, and a table whose low hash bits index it and that
+// names every member and nothing else.
+fn usable(rss: ntcp_io_dpdk::Rss, members: usize) -> Result<FlowOwnership, String> {
+    if !rss.ipv4_tcp {
+        return Err("the device does not hash ipv4 tcp ports".into());
+    }
+    if rss.key.len() < 16 {
+        return Err(format!("the rss key has only {} octets", rss.key.len()));
+    }
+    if !rss.reta.len().is_power_of_two() {
+        return Err(format!("the reta has {} entries", rss.reta.len()));
+    }
+    if rss.reta.iter().any(|&queue| usize::from(queue) >= members) {
+        return Err("the reta names a queue no member drives".into());
+    }
+    if !names_every_member(&rss.reta, members) {
+        return Err("the reta misses a member".into());
+    }
+    Ok(FlowOwnership::Hash {
+        key: rss.key,
+        table: rss.reta.into_iter().map(usize::from).collect(),
+    })
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -376,7 +638,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[rank - 1]
 }
 
-fn summarize(reports: &[Report], neighbors: &SharedNeighbors) -> bool {
+fn summarize(reports: &[Report], neighbors: &SharedNeighbors, steering: Option<Steering>) -> bool {
     let requests: u64 = reports.iter().map(|r| r.requests).sum();
     // Workers measure concurrently: the rate of each, summed.
     let rate: f64 = reports
@@ -424,6 +686,28 @@ fn summarize(reports: &[Report], neighbors: &SharedNeighbors) -> bool {
     println!("METRIC arp_resolution_failures={}", arp.resolution_failures);
     println!("METRIC arp_requests_sent={}", arp.requests_sent);
     println!("METRIC arp_replies_sent={}", arp.replies_sent);
+    if let Some(steering) = steering {
+        for (index, report) in reports.iter().enumerate() {
+            eprintln!(
+                "MEMBER {index} connections={} handed_off={} handoffs_received={} \
+                 handoffs_dropped={}",
+                report.connections,
+                report.handed_off,
+                report.handoffs_received,
+                report.handoffs_dropped
+            );
+        }
+        println!("METRIC handed_off={}", sum(|r| r.handed_off));
+        println!("METRIC handoffs_received={}", sum(|r| r.handoffs_received));
+        println!("METRIC handoffs_dropped={}", sum(|r| r.handoffs_dropped));
+        // As USAGE documents the codes.
+        let code = match steering {
+            Steering::Off => 1,
+            Steering::Rss => 2,
+            Steering::Auto => unreachable!("auto resolves at start"),
+        };
+        println!("METRIC steering={code}");
+    }
     for (index, report) in reports.iter().enumerate() {
         println!(
             "METRIC t{index}_calibration_rejected={}",
@@ -472,12 +756,8 @@ fn serve_into(
         report.clock = Some("device clock readable, but RX timestamps are off".into());
     }
 
-    let mut secret = [0; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut secret))
-        .map_err(|e| format!("/dev/urandom: {e}"))?;
     let mut config = NetworkConfig::new(IpAddr::V4(worker.ip), 1500);
-    config.tcp.max_connections = args.connections;
+    config.tcp.max_connections = worker.connections;
     config.tcp.connection.timebase = CallerTimebase {
         units_per_second: NANOS,
         ..CallerTimebase::default()
@@ -496,14 +776,27 @@ fn serve_into(
     // One Scheduled stamp per request, one request in flight per connection;
     // room for a partial write's second stamp and one drain behind.
     config.tx_timestamp_phases = 4;
-    let mut network =
-        Network::with_shared_neighbors(config, queue, secret, now_ns(), &worker.neighbors)
-            .map_err(|e| format!("network: {e}"))?;
+    let neighbors = &worker.neighbors;
+    let mut network = match &worker.flows {
+        Some((flows, member)) => Network::with_shared_flows(
+            config,
+            queue,
+            worker.secret,
+            now_ns(),
+            Some(neighbors),
+            flows,
+            *member,
+        ),
+        None => Network::with_shared_neighbors(config, queue, worker.secret, now_ns(), neighbors),
+    }
+    .map_err(|e| format!("network: {e}"))?;
+    report.connections = worker.connections;
 
     let outcome = exchange(
         &mut network,
         args,
         worker.index,
+        worker.connections,
         clock,
         calibrate.then_some(&mut calibration),
         report,
@@ -512,6 +805,9 @@ fn serve_into(
     let counters = network.counters();
     report.arp_sent = counters.arp_sent;
     report.arp_received = counters.arp_received;
+    report.handed_off = counters.handed_off;
+    report.handoffs_received = counters.handoffs_received;
+    report.handoffs_dropped = counters.handoffs_dropped;
     report.fit = calibration.fit().copied();
     outcome
 }
@@ -521,13 +817,14 @@ fn exchange(
     network: &mut Network<HostedQueue>,
     args: &Args,
     index: usize,
+    count: usize,
     clock: Option<ClockDescriptor>,
     mut calibration: Option<&mut ClockCalibration>,
     report: &mut Report,
 ) -> Result<(), String> {
-    let mut connections = Vec::with_capacity(args.connections);
+    let mut connections = Vec::with_capacity(count);
     let mut slots = HashMap::new();
-    for slot in 0..args.connections {
+    for slot in 0..count {
         let id = network
             .connect(SocketAddr::V4(args.server))
             .map_err(|e| format!("connect: {e}"))?;
