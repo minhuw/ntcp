@@ -2919,7 +2919,9 @@ impl Endpoint {
         if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
             self.events.push(index);
         }
-        if (slot.mapped && state != State::Closed)
+        // An idle connection is not offered output: polling it would find
+        // nothing, and only a change, followed by this refresh, gives it some.
+        if (slot.mapped && state != State::Closed && !slot.connection.output_idle())
             || (state == State::Closed && !slot.closed_output_drained)
         {
             self.output.push(index);

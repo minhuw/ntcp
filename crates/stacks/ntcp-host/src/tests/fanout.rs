@@ -1331,7 +1331,8 @@ fn delivered_probe_after_hold_raises_shared_ceiling_and_stale_proof_never() {
                 // B's hold has expired locally, so it probes with enough data
                 // unless a report about A's probe restarted the shared hold.
                 a.1.write(flow_b, &[8; 6000]).unwrap();
-                let (attempt, _, frame) = selected(&mut a.1, now + 3).unwrap();
+                // B's own first packet: A's unsent remainder is ready first.
+                let (attempt, frame, ..) = reserve(&mut a, flow_b, now + 3, Held::Scalar).unwrap();
                 let grows = a.1.transmit_discovery_intent(attempt).is_some();
                 assert_eq!(grows, case == PossiblySubmitted, "{case:?}");
                 assert_eq!(frame.len() > mtu as usize, grows);

@@ -8117,6 +8117,61 @@ impl Connection {
         now: Instant,
         out: &mut [u8],
         reserve: bool,
+        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        shared: Option<&mut Vec<crate::Payload>>,
+    ) -> Result<Option<usize>, Error> {
+        // A connection is offered output after every change, and most changes
+        // (input, a read, the send that took its last data) leave it nothing
+        // to send. The selection below would find that only after building
+        // its options and planning every kind of output; see it at once, as
+        // Linux tests the send head before tcp_write_xmit.
+        if self.output_idle() {
+            let idle = self.check_time(now).map(|()| None);
+            // The selection finds nothing either, and changes nothing doing
+            // so.
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                self.select_output(now, out, reserve, gso, shared),
+                idle,
+                "an idle connection selected output"
+            );
+            return idle;
+        }
+        self.select_output(now, out, reserve, gso, shared)
+    }
+
+    // Whether this connection certainly has nothing to send: no reset,
+    // acknowledgment, SYN or probe owed, no retransmission or recovery work,
+    // every queued octet and any FIN sent, and no administrative PMTU target
+    // whose deferral a selection would record. Each of these is set by a
+    // change, never by time alone.
+    pub(crate) fn output_idle(&self) -> bool {
+        self.pending_rst.is_none()
+            && !self.challenge_ack_pending
+            && !self.syn_pending
+            && !self.ack_pending
+            && !self.probe_pending
+            && !self.keepalive_pending
+            && !self.tlp_pending
+            && !self.retx_pending
+            && self.fast_open_retry.is_none()
+            && self.sack_recovery.is_none()
+            && self.prr.is_none()
+            && self.sack_post_rto.is_none()
+            && self.ptb_idle()
+            && self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize
+            && !(self.shutdown && self.fin_sequence.is_none())
+            && self
+                .pmtud
+                .as_ref()
+                .is_none_or(|p| p.administrative_target().is_none())
+    }
+
+    fn select_output(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        reserve: bool,
         mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
         mut shared: Option<&mut Vec<crate::Payload>>,
     ) -> Result<Option<usize>, Error> {

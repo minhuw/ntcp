@@ -270,7 +270,7 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
     let mut blocks = std::vec::Vec::new();
     let mut total = 0;
     while a.reservations[0].current.is_some() {
-        let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+        let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 16).unwrap();
         let p = out.packet.unwrap();
         let s = wire::parse(ip, &bytes[..p.len]).unwrap();
         assert!(p.len <= 48);
@@ -364,7 +364,7 @@ fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
         Err(EndpointError::ReservationMtuTooSmall)
     );
     assert_eq!(a.reservations[0].current.as_ref().unwrap().sacks, 0);
-    let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+    let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 16).unwrap();
     let p = out.packet.unwrap();
     assert_eq!(p.len, 48);
     let s = wire::parse(ip, &bytes[..p.len]).unwrap();
@@ -424,7 +424,7 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
     let mut cwr_packets = 0;
     let mut rejected_data = false;
     while a.reservations[0].current.is_some() {
-        let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+        let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 16).unwrap();
         let p = out.packet.unwrap();
         let token = token.unwrap();
         let s = wire::parse(ip, &bytes[..p.len]).unwrap();
