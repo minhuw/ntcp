@@ -415,11 +415,12 @@ fn active_opens_avoid_every_members_listening_ports() {
         table: vec![0, 1],
     };
     let flows = SharedFlows::new(ownership, limits(2)).unwrap();
+    let table = neighbors(2);
     let build = |k: usize, ports: std::ops::RangeInclusive<u16>| {
         Station::new(|port| {
             let mut config = config(SHARED, PORT_MAC);
             config.ephemeral_ports = ports;
-            Network::with_shared_flows(config, port, [7; 32], 0, None, &flows, k).unwrap()
+            Network::with_shared_flows(config, port, [7; 32], 0, Some(&table), &flows, k).unwrap()
         })
     };
     let mut listening = build(1, 49152..=65535);
@@ -448,7 +449,41 @@ fn active_opens_avoid_every_members_listening_ports() {
     };
     let config = config(SHARED, PORT_MAC);
     assert!(matches!(
-        Network::with_shared_flows(config, port, [7; 32], 0, None, &flows, 1),
+        Network::with_shared_flows(config, port, [7; 32], 0, Some(&table), &flows, 1),
         Err(Error::InvalidConfig(_))
     ));
+}
+
+fn port() -> Port {
+    Port {
+        incoming: Queue::default(),
+        outgoing: Queue::default(),
+    }
+}
+
+// ARP for the port reaches the queue the NIC puts it on, so on an ARP link
+// a member shares the port's neighbor table: without it, it is refused and
+// joins nothing. A fixed next hop needs no table.
+#[test]
+fn members_on_an_arp_link_share_its_neighbor_table() {
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: vec![0, 1],
+    };
+    let flows = SharedFlows::new(ownership, limits(2)).unwrap();
+    let local = SocketAddrV4::new(SHARED, SERVICE);
+    let remote = SocketAddrV4::new(PEER, PEER_SERVICE);
+    let config = || config(SHARED, PORT_MAC);
+    let alone = Network::with_shared_flows(config(), port(), [7; 32], 0, None, &flows, 0);
+    assert!(matches!(alone, Err(Error::InvalidConfig(_))));
+    assert_eq!(flows.owner(local, remote), None);
+    let table = neighbors(2);
+    let shared = Network::with_shared_flows(config(), port(), [7; 32], 0, Some(&table), &flows, 0);
+    assert!(shared.is_ok() && flows.owner(local, remote).is_some());
+    let mut fixed = config();
+    fixed.link = Link::Ethernet {
+        local_mac: PORT_MAC,
+        next_hop: EthernetNextHop::Fixed(PEER_MAC),
+    };
+    assert!(Network::with_shared_flows(fixed, port(), [7; 32], 0, None, &flows, 1).is_ok());
 }

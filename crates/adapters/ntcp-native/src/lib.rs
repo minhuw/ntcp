@@ -247,23 +247,28 @@ impl<P: PacketIo> Network<P> {
         Self::build(config, io, secret, now, Some(neighbors), None)
     }
     /// Member `member` of `flows`, a Network on one queue of a port whose
-    /// queues divide the flows of the members' IPv4 addresses (with the
-    /// port's shared neighbor table on an ARP link). It takes in only the
-    /// packets of flows it owns and hands any other it receives to the
-    /// owner; its active opens choose local ports whose flows it owns.
+    /// queues divide the flows of the members' IPv4 addresses. It takes in
+    /// only the packets of flows it owns and hands any other it receives to
+    /// the owner; its active opens choose local ports whose flows it owns.
     /// Every member that should accept a port's connections listens on it.
     /// Dropping it leaves the flows: handoffs to it are then dropped.
     ///
     /// `member` is a free member number of `flows`, and the local address
     /// is IPv4: under `FlowOwnership::ByAddress` no other member's, under
     /// `FlowOwnership::Hash` and `FlowOwnership::TaggedPorts` every
-    /// member's. `neighbors`, when given, is
-    /// joined as by `with_shared_neighbors`. Ephemeral ports avoid every
-    /// member's listening ports, and `connect_from` refuses a local port
-    /// whose flow to the peer another member owns (`Error::InvalidConfig`),
-    /// opening nothing: `SharedFlows::owner` names the member to open it
-    /// on. A blocking embedding learns of handoffs through the descriptor
-    /// of `set_neighbor_wake_fd`.
+    /// member's. On an `EthernetNextHop::Arp` link `neighbors` is the
+    /// port's shared table, joined as by `with_shared_neighbors`: ARP
+    /// arrives on whichever queue the port steers it to, and a member that
+    /// resolved alone would never see the replies that reach the other
+    /// members' queues. An IP link or a fixed next hop needs no table.
+    /// Joining otherwise is `Error::InvalidConfig` and joins nothing.
+    ///
+    /// Ephemeral ports avoid every member's listening ports, and
+    /// `connect_from` refuses a local port whose flow to the peer another
+    /// member owns (`Error::InvalidConfig`), opening nothing:
+    /// `SharedFlows::owner` names the member to open it on. A blocking
+    /// embedding learns of handoffs through the descriptor of
+    /// `set_neighbor_wake_fd`.
     ///
     /// Under `FlowOwnership::TaggedPorts` ephemeral ports are the member's
     /// own tagged ports within `ephemeral_ports`, which must hold one
@@ -296,6 +301,11 @@ impl<P: PacketIo> Network<P> {
         {
             return Err(Error::InvalidConfig(
                 "the ephemeral ports of a member of tagged flows hold one of its tagged ports",
+            ));
+        }
+        if neighbors.is_none() && config.arp().is_some() {
+            return Err(Error::InvalidConfig(
+                "members of shared flows on an ARP link share its neighbor table",
             ));
         }
         Self::build(config, io, secret, now, neighbors, Some((flows, member)))
