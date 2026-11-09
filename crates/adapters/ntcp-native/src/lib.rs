@@ -2,9 +2,13 @@
 
 mod config;
 mod driver;
+mod flows;
+mod inbox;
 mod shared;
+mod toeplitz;
 mod types;
 pub use config::{EthernetNextHop, Link, NetworkConfig};
+pub use flows::{DEFAULT_FLOW_KEY, FlowOwnership, SharedFlowLimits, SharedFlows};
 pub use shared::{SharedNeighborLimits, SharedNeighbors};
 pub use types::*;
 
@@ -98,6 +102,8 @@ pub struct Network<P: PacketIo> {
     // IPv4 next hops resolve through a port's shared table
     // (`with_shared_neighbors`), not the Host's own.
     shared_neighbors: bool,
+    // Membership in a port's shared flows (`with_shared_flows`).
+    flows: Option<flows::Member>,
     tx_cursor: usize,
     // The one transmit slot of ARP control frames (empty without ARP).
     control: Vec<u8>,
@@ -220,7 +226,7 @@ impl<P: PacketIo> Network<P> {
     // monotonic caller ticks in config.tcp.connection.timebase. Device/queue
     // ownership and any borrowed EAL/pool lifetime remain backend contracts.
     pub fn new(config: NetworkConfig, io: P, secret: [u8; 32], now: Instant) -> Result<Self> {
-        Self::build(config, io, secret, now, None)
+        Self::build(config, io, secret, now, None, None)
     }
     /// A Network on one queue of an Ethernet port whose IPv4 next hops
     /// `neighbors` resolves for every Network on the port: the link must be
@@ -237,7 +243,35 @@ impl<P: PacketIo> Network<P> {
         now: Instant,
         neighbors: &SharedNeighbors,
     ) -> Result<Self> {
-        Self::build(config, io, secret, now, Some(neighbors))
+        Self::build(config, io, secret, now, Some(neighbors), None)
+    }
+    /// Member `member` of `flows`, a Network on one queue of a port whose
+    /// queues divide the flows of the members' IPv4 addresses (with the
+    /// port's shared neighbor table on an ARP link). It takes in only the
+    /// packets of flows it owns and hands any other it receives to the
+    /// owner; its active opens choose local ports whose flows it owns.
+    /// Every member that should accept a port's connections listens on it.
+    /// Dropping it leaves the flows: handoffs to it are then dropped.
+    ///
+    /// `member` is a free member number of `flows`, and the local address
+    /// is IPv4: under `FlowOwnership::ByAddress` no other member's, under
+    /// `FlowOwnership::Hash` every member's. `neighbors`, when given, is
+    /// joined as by `with_shared_neighbors`. Ephemeral ports avoid every
+    /// member's listening ports, and `connect_from` refuses a local port
+    /// whose flow to the peer another member owns (`Error::InvalidConfig`),
+    /// opening nothing: `SharedFlows::owner` names the member to open it
+    /// on. A blocking embedding learns of handoffs through the descriptor
+    /// of `set_neighbor_wake_fd`.
+    pub fn with_shared_flows(
+        config: NetworkConfig,
+        io: P,
+        secret: [u8; 32],
+        now: Instant,
+        neighbors: Option<&SharedNeighbors>,
+        flows: &SharedFlows,
+        member: usize,
+    ) -> Result<Self> {
+        Self::build(config, io, secret, now, neighbors, Some((flows, member)))
     }
     fn build(
         config: NetworkConfig,
@@ -245,6 +279,7 @@ impl<P: PacketIo> Network<P> {
         secret: [u8; 32],
         now: Instant,
         neighbors: Option<&SharedNeighbors>,
+        flows: Option<(&SharedFlows, usize)>,
     ) -> Result<Self> {
         config.validate(&io)?;
         if config.tcp.ipv4_options_enabled {
@@ -252,6 +287,12 @@ impl<P: PacketIo> Network<P> {
                 "IPv4 option origination on native fixed-hop ports",
             ));
         }
+        let flows = match flows {
+            Some((flows, member)) => {
+                Some(flows.join(member, config.local_address, config.tcp.max_listeners)?)
+            }
+            None => None,
+        };
         let instance = NEXT_INSTANCE
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Capacity)?;
@@ -476,6 +517,7 @@ impl<P: PacketIo> Network<P> {
             tx_frames,
             arp_input: false,
             shared_neighbors,
+            flows,
             tx_cursor: 0,
             control,
             // Capture an oversized physical frame safely before the Host rejects it.
@@ -547,20 +589,31 @@ impl<P: PacketIo> Network<P> {
     pub fn failure(&self) -> Option<&io::Error> {
         self.failure.as_ref()
     }
-    /// For a member of a shared neighbor table: an eventfd to signal (one
-    /// 8-octet write adding 1) when another member ends a resolution that
-    /// holds this Network's output or reports a neighbor lost, so that a
-    /// blocking embedding's poll set wakes for the drive that releases it.
-    /// The embedding creates the descriptor and resets it as it polls; a
-    /// write that would block is not retried, the descriptor then being
-    /// readable already. A busy-polling embedding needs none: each drive
-    /// takes its wakes.
+    /// For a member of a shared neighbor table or of shared flows: an
+    /// eventfd to signal (one 8-octet write adding 1) when another member
+    /// ends a resolution that holds this Network's output, reports a
+    /// neighbor lost or hands this Network a packet, so that a blocking
+    /// embedding's poll set wakes for the drive that releases or takes it.
+    /// One descriptor serves both memberships, so that one poll set entry
+    /// covers every wake from the port's other queues. The embedding creates
+    /// the descriptor and resets it as it polls; a write that would block
+    /// is not retried, the descriptor then being readable already. A
+    /// busy-polling embedding needs none: each drive takes its wakes.
     #[cfg(unix)]
     pub fn set_neighbor_wake_fd(&mut self, fd: std::os::fd::OwnedFd) -> Result<()> {
-        let member = shared::member(&mut self.host).ok_or(Error::Unsupported(
-            "a wake descriptor needs a shared neighbor table",
-        ))?;
-        member.set_wake(std::fs::File::from(fd));
+        let neighbors = shared::member(&mut self.host);
+        if neighbors.is_none() && self.flows.is_none() {
+            return Err(Error::Unsupported(
+                "a wake descriptor needs a shared neighbor table or shared flows",
+            ));
+        }
+        let file = std::sync::Arc::new(std::fs::File::from(fd));
+        if let Some(member) = neighbors {
+            member.set_wake(file.clone());
+        }
+        if let Some(flows) = &self.flows {
+            flows.set_wake(file);
+        }
         Ok(())
     }
     pub fn is_stopped(&self) -> bool {
@@ -732,7 +785,7 @@ impl<P: PacketIo> Network<P> {
         ntcp::ScopedTuple::new(tuple, link_local.then_some(self.ingress.link()))
             .expect("single-port tuple scope")
     }
-    fn allocate_port(&mut self) -> Result<u16> {
+    fn allocate_port(&mut self, peer: SocketAddr) -> Result<u16> {
         let start = self.next_port;
         loop {
             let candidate = self.next_port;
@@ -741,7 +794,15 @@ impl<P: PacketIo> Network<P> {
             } else {
                 candidate + 1
             };
-            if !self.port_in_use(candidate) {
+            // A member of shared flows takes a port whose flow to the peer
+            // it owns, about one candidate in as many as there are members,
+            // and none another member listens on.
+            if self
+                .flows
+                .as_ref()
+                .is_none_or(|f| f.owns(candidate, peer) && !f.listened(candidate))
+                && !self.port_in_use(candidate)
+            {
                 return Ok(candidate);
             }
             if self.next_port == start {
@@ -762,9 +823,14 @@ impl<P: PacketIo> Network<P> {
         let slot = self.free_connection_slot()?;
         let port = match local_port {
             Some(0) => return Err(Error::InvalidConfig("zero local port")),
+            Some(p) if self.flows.as_ref().is_some_and(|f| !f.owns(p, peer)) => {
+                return Err(Error::InvalidConfig(
+                    "another member of the shared flows owns this local port's flow",
+                ));
+            }
             Some(p) if self.port_in_use(p) => return Err(Error::Tcp(EndpointError::AddressInUse)),
             Some(p) => p,
-            None => self.allocate_port()?,
+            None => self.allocate_port(peer)?,
         };
         let local = SocketAddr::new(self.config.local_address, port);
         let options = ntcp::ManagedOpenOptions {
@@ -828,6 +894,9 @@ impl<P: PacketIo> Network<P> {
         });
         occupy(&mut self.live_listeners, slot);
         self.listener_map.insert(core, slot);
+        if let Some(flows) = &mut self.flows {
+            flows.listen(port);
+        }
         self.check_live();
         Ok(ListenerId {
             instance: self.instance,

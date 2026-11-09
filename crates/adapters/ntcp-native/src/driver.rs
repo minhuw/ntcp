@@ -1,7 +1,7 @@
 use super::*;
 use ntcp_host::{
-    Advice, BackendOutcome, DeferredIcmp, EgressContext, IcmpDispatch, NeighborHop, NeighborWake,
-    Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
+    Advice, BackendOutcome, Datagram, DeferredIcmp, EgressContext, IcmpDispatch, NeighborHop,
+    NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
     ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, TimestampUnit, TxOutcome,
@@ -130,6 +130,25 @@ impl<P: PacketIo> Network<P> {
             }
             self.receive_free.push(item.bytes);
         }
+        // Packets other members of shared flows handed over, before this
+        // queue's own and within the same budget: each may be retained as
+        // a received packet may.
+        if let Some(flows) = &self.flows {
+            flows.begin();
+            let limit = (budget.receive - receive_work).min(self.receive_free.len());
+            if limit != 0 && flows.pending() {
+                let inlet = flows.inlet();
+                let mut discarded = 0;
+                let taken = inlet.drain(limit, |packet, handoff| {
+                    if self.take_handoff(packet, handoff, completed).is_err() {
+                        discarded += 1;
+                    }
+                });
+                receive_work += taken;
+                report.discarded += discarded;
+                self.counters.handoffs_received += taken as u64;
+            }
+        }
         while receive_work < budget.receive && !self.receive_free.is_empty() {
             let packet = match self.io.receive_with_metadata(rx) {
                 Ok(Some(packet)) => packet,
@@ -179,15 +198,28 @@ impl<P: PacketIo> Network<P> {
             } else {
                 &rx[..packet.len]
             };
-            let metadata = self.receive_metadata(packet);
-            if self.input(frame, metadata, completed).is_err() {
+            // A member of shared flows hands a packet of another member's
+            // flow, or a fragment another member reassembles, to it as it
+            // arrived.
+            if let Some(flows) = &self.flows
+                && let Some(owner) = flows.elsewhere(flows::key(frame))
+            {
+                let handoff = flows::Handoff {
+                    timestamps: packet.timestamps,
+                    tcp_segment_size: packet.tcp_segment_size,
+                    reassembled: None,
+                };
+                self.hand_off(owner, frame, handoff);
+                continue;
+            }
+            if self.input(frame, packet, completed).is_err() {
                 report.discarded += 1;
             }
         }
         if receive_work == budget.receive && budget.receive != 0 {
             report.more_work = true;
         }
-        if !self.retained.is_empty() {
+        if !self.retained.is_empty() || self.flows.as_ref().is_some_and(|f| f.pending()) {
             report.more_work = true;
         }
         // Control frames due now take at most half the transmit budget,
@@ -590,18 +622,68 @@ impl<P: PacketIo> Network<P> {
             clock,
         })
     }
-    fn input(
-        &mut self,
-        frame: &[u8],
-        metadata: ntcp::RxPacketMetadata,
-        completed: &mut [u8],
-    ) -> Result<()> {
+    fn input(&mut self, frame: &[u8], packet: ReceivedPacket, completed: &mut [u8]) -> Result<()> {
+        let metadata = self.receive_metadata(packet);
         let received = self
             .host
             .receive(self.ingress, self.now, frame, false, completed)?;
         let Received::Datagram(datagram) = received else {
             return Ok(());
         };
+        // A member of shared flows that completes a datagram on a fragment
+        // hands it to the member that owns its flow. Its fragments were
+        // keyed by their addresses alone; it is keyed once, here.
+        if let Some(flows) = &self.flows
+            && flows::fragment(frame)
+            && let Some(owner) = flows.elsewhere(flows::key(datagram.bytes()))
+        {
+            let handoff = flows::Handoff {
+                timestamps: packet.timestamps,
+                tcp_segment_size: packet.tcp_segment_size,
+                reassembled: Some(datagram.envelope()),
+            };
+            self.hand_off(owner, datagram.bytes(), handoff);
+            return Ok(());
+        }
+        self.dispatch(datagram, metadata)
+    }
+    // A packet another member of shared flows handed over, taken in as one
+    // this queue received: as it arrived, through `input` (a fragment is
+    // reassembled here), or as the datagram the sender reassembled, which
+    // the Host adopts and processes as if it had reassembled it. Only a
+    // datagram completed here is keyed again.
+    fn take_handoff(
+        &mut self,
+        bytes: &[u8],
+        handoff: flows::Handoff,
+        completed: &mut [u8],
+    ) -> Result<()> {
+        let packet = ReceivedPacket {
+            len: bytes.len(),
+            timestamps: handoff.timestamps,
+            tcp_segment_size: handoff.tcp_segment_size,
+        };
+        let Some(envelope) = handoff.reassembled else {
+            return self.input(bytes, packet, completed);
+        };
+        let metadata = self.receive_metadata(packet);
+        let datagram = envelope.datagram(bytes).ok_or(Error::Unsupported(
+            "a handed-over datagram of another length",
+        ))?;
+        let datagram = self.host.adopt_datagram(self.ingress, datagram)?;
+        self.dispatch(datagram, metadata)
+    }
+    // Copies a packet into member `owner`'s inbox, counted either way.
+    fn hand_off(&mut self, owner: usize, packet: &[u8], handoff: flows::Handoff) {
+        let flows = self.flows.as_ref().expect("a member of shared flows");
+        if flows.hand_off(owner, packet, handoff) {
+            self.counters.handed_off += 1;
+        } else {
+            self.counters.handoffs_dropped += 1;
+        }
+    }
+    // Destination processing and dispatch of one complete datagram.
+    fn dispatch(&mut self, datagram: Datagram<'_>, metadata: ntcp::RxPacketMetadata) -> Result<()> {
         let processed = self.host.process(datagram, None)?;
         let packet = self.host.decode_datagram(processed)?;
         if packet.protocol == 1 || packet.protocol == 58 {
@@ -879,12 +961,15 @@ impl<P: PacketIo> Network<P> {
                 let Some(listener) = self.listeners[index].value.as_ref() else {
                     continue;
                 };
-                let core = listener.core;
+                let (core, port) = (listener.core, listener.port);
                 match self.endpoint.close_listener(core) {
                     Ok(()) => {
                         self.listener_map.remove(&core);
                         self.listeners[index].value = None;
                         vacate(&mut self.live_listeners, index);
+                        if let Some(flows) = &mut self.flows {
+                            flows.unlisten(port);
+                        }
                     }
                     Err(EndpointError::OutputReserved) => self.maintain.push(connections + index),
                     Err(e) => return Err(e.into()),

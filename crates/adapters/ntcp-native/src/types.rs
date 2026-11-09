@@ -230,4 +230,10 @@ pub struct Counters {
     pub arp_sent: u64,
     // ARP resolutions and unreachability probes that failed.
     pub resolution_failures: u64,
+    // A member of shared flows: packets it received for another member's
+    // flow and handed to that member, packets other members handed to it,
+    // and handoffs it dropped (the owner's inbox full or the owner absent).
+    pub handed_off: u64,
+    pub handoffs_received: u64,
+    pub handoffs_dropped: u64,
 }

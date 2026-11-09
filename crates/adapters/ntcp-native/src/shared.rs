@@ -101,8 +101,9 @@ struct Record {
     // that still uses such a neighbor resolves it again, and that failure
     // is reported.
     lost: Vec<Ipv4Addr>,
-    // Written when another member wakes this one.
-    wake: Option<File>,
+    // Written when another member wakes this one; the Network's shared
+    // flows may write the same descriptor.
+    wake: Option<Arc<File>>,
 }
 
 impl SharedNeighbors {
@@ -267,7 +268,7 @@ impl Table {
             {
                 // An eventfd's count only grows; a descriptor that would
                 // block is already readable.
-                let _ = (&*file).write(&1u64.to_ne_bytes());
+                let _ = (&**file).write(&1u64.to_ne_bytes());
             }
         };
         self.cache.ended(|tag| wake(tag.member));
@@ -367,7 +368,7 @@ impl Member {
     pub(crate) fn settled(&mut self) {
         self.woken = false;
     }
-    pub(crate) fn set_wake(&mut self, file: File) {
+    pub(crate) fn set_wake(&mut self, file: Arc<File>) {
         let mut table = self.shared.lock();
         if let Some(record) = &mut table.members[self.index] {
             record.wake = Some(file);
