@@ -138,15 +138,21 @@ impl<P: PacketIo> Network<P> {
             }
             self.receive_free.push(item.bytes);
         }
-        // Packets other members of shared flows handed over, before this
-        // queue's own and within the same budget. The inbox is looked at
-        // once, and its drain tells whether more waits: a packet handed
-        // over after it looked is the next drive's, and wakes a member that
-        // blocks (`Wake`).
+        // Packets other members of shared flows handed over, within the
+        // same budget as this queue's own. Other members can keep the inbox
+        // full however fast it drains, and this queue holds packets that
+        // may be theirs, so the inbox takes at most half of what is left,
+        // rounded up, before the queue is polled, as control frames take at
+        // most half of the transmit budget, and after it what the queue
+        // leaves: neither starves the other, and neither's share idles
+        // while the other has packets. The inbox is looked at once, and its
+        // drains tell whether more waits: a packet handed over after they
+        // looked is the next drive's, and wakes a member that blocks
+        // (`Wake`).
         let mut handoffs = false;
         if self.inlet.as_ref().is_some_and(|i| i.pending()) {
-            let (taken, more) =
-                self.take_handoffs(budget.receive - receive_work, completed, report);
+            let share = (budget.receive - receive_work).div_ceil(2);
+            let (taken, more) = self.take_handoffs(share, completed, report);
             receive_work += taken;
             handoffs = more;
         }
@@ -220,6 +226,12 @@ impl<P: PacketIo> Network<P> {
             if self.input(frame, packet, fragment, completed).is_err() {
                 report.discarded += 1;
             }
+        }
+        if handoffs && receive_work < budget.receive {
+            let (taken, more) =
+                self.take_handoffs(budget.receive - receive_work, completed, report);
+            receive_work += taken;
+            handoffs = more;
         }
         if receive_work == budget.receive && budget.receive != 0 {
             report.more_work = true;

@@ -487,3 +487,77 @@ fn members_on_an_arp_link_share_its_neighbor_table() {
     };
     assert!(Network::with_shared_flows(fixed, port(), [7; 32], 0, None, &flows, 1).is_ok());
 }
+
+// A segment from the peer's `port` to SERVICE on the shared address, its
+// TCP checksum left zero: members key it by its flow, and the owner's Host
+// discards it.
+fn segment(port: u16) -> Vec<u8> {
+    let mut frame = [PORT_MAC, PEER_MAC].concat();
+    frame.extend_from_slice(&[8, 0, 0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0]);
+    frame.extend_from_slice(&PEER.octets());
+    frame.extend_from_slice(&SHARED.octets());
+    let mut sum: u32 = frame[14..34]
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    frame[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    frame.extend_from_slice(&port.to_be_bytes());
+    frame.extend_from_slice(&SERVICE.to_be_bytes());
+    frame.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 0x50, 0x10, 0x10, 0, 0, 0, 0, 0]);
+    frame
+}
+
+// One drive of `station` with `receive` packets of budget: the packets it
+// took from its queue and from its inbox.
+fn receive(station: &mut Station, now: u64, receive: usize) -> (usize, usize) {
+    let before = station.network.counters().handoffs_received;
+    let report = station
+        .network
+        .drive(now, WorkBudget::new(receive, 8, 8, 8))
+        .unwrap();
+    let handed = station.network.counters().handoffs_received - before;
+    (report.received, handed as usize)
+}
+
+// Other members can keep an inbox full however fast it drains, so it takes
+// at most half of a drive's receive budget, rounded up, before the member's
+// own queue, and after it what the queue leaves; the queue takes what the
+// inbox leaves.
+#[test]
+fn the_inbox_and_the_queue_share_a_drives_receive_budget() {
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: vec![0, 1],
+    };
+    let flows = SharedFlows::new(ownership, limits(2)).unwrap();
+    let neighbors = neighbors(2);
+    let mut stations = members(&[SHARED; 2], &neighbors, &flows);
+    let local = SocketAddrV4::new(SHARED, SERVICE);
+    let port = (1024..)
+        .find(|&p| flows.owner(local, SocketAddrV4::new(PEER, p)) == Some(1))
+        .unwrap();
+    let queue = |station: &Station, frames: usize| {
+        let mut incoming = station.incoming.lock().unwrap();
+        incoming.extend((0..frames).map(|_| segment(port)));
+    };
+    // 24 frames handed to the second member through the first, and 24 on
+    // its own queue.
+    queue(&stations[0], 24);
+    receive(&mut stations[0], STEP, 64);
+    assert_eq!(stations[0].network.counters().handed_off, 24);
+    queue(&stations[1], 24);
+    let second = &mut stations[1];
+    assert_eq!(receive(second, STEP, 8), (4, 4));
+    assert_eq!(receive(second, STEP, 7), (3, 4));
+    // One frame left on the queue, 16 in the inbox.
+    second.incoming.lock().unwrap().truncate(1);
+    assert_eq!(receive(second, STEP, 8), (1, 7));
+    assert_eq!(receive(second, STEP, 8), (0, 8));
+    // One left in the inbox.
+    queue(second, 20);
+    assert_eq!(receive(second, STEP, 8), (7, 1));
+    assert_eq!(second.network.counters().handoffs_dropped, 0);
+}
