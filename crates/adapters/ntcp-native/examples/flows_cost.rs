@@ -22,10 +22,10 @@
 // and remembers its queue by destination port, as hardware hashes for free,
 // and the cost of moving one frame through the port and dispatcher of each
 // series is measured on its own (transmit, steer, receive) and subtracted:
-// the `stack_` metrics and the derived per-packet costs exclude it. Members
-// join without a shared neighbor table (static neighbors, as the plain
-// Networks have), so these costs are the flows' alone; neighbor_cost
-// measures the table's.
+// the `stack_` metrics and the derived per-packet costs exclude it. Every
+// Network sends to one MAC, its link's fixed next hop: members of shared
+// flows that resolve by ARP share the port's neighbor table, whose cost
+// neighbor_cost measures, so with no ARP these costs are the flows' alone.
 //
 // With --cpus, the series b<n>t and c<n>t run b<n> and c<n> again with every
 // Network on its own pinned thread; the `threaded` module below describes
@@ -308,7 +308,7 @@ impl Clock {
     }
 }
 
-fn config(local: Ipv4Addr, mac: [u8; 6], neighbors: Vec<(Ipv4Addr, [u8; 6])>) -> NetworkConfig {
+fn config(local: Ipv4Addr, mac: [u8; 6], next_hop: [u8; 6]) -> NetworkConfig {
     let mut config = NetworkConfig::new(IpAddr::V4(local), 1500);
     config.tcp.max_connections = CONNECTIONS;
     // The endpoint's buffer budget is not under test.
@@ -319,12 +319,8 @@ fn config(local: Ipv4Addr, mac: [u8; 6], neighbors: Vec<(Ipv4Addr, [u8; 6])>) ->
     };
     config.link = Link::Ethernet {
         local_mac: mac,
-        next_hop: EthernetNextHop::Arp {
-            prefix_len: 24,
-            gateway: None,
-        },
+        next_hop: EthernetNextHop::Fixed(next_hop),
     };
-    config.static_neighbors = neighbors;
     config
 }
 
@@ -358,24 +354,21 @@ impl Bench {
             queues: vec![toward_server.clone()],
             steer: Steer::Queue0,
         };
-        let server_neighbors;
         let clients: Vec<_> = match kind {
             Kind::Plain => {
                 let addresses: Vec<_> = (0..members)
                     .map(|k| Ipv4Addr::from(u32::from(ADDRESS) + k as u32))
                     .collect();
-                server_neighbors = addresses.iter().map(|&a| (a, PORT_MAC)).collect();
                 addresses
                     .iter()
                     .enumerate()
                     .map(|(k, &address)| {
-                        let config = config(address, PORT_MAC, vec![(PEER, PEER_MAC)]);
+                        let config = config(address, PORT_MAC, PEER_MAC);
                         Network::new(config, client_wire(k), SECRET, clock.now()).unwrap()
                     })
                     .collect()
             }
             Kind::Ideal | Kind::Queue0 => {
-                server_neighbors = vec![(ADDRESS, PORT_MAC)];
                 let ownership = FlowOwnership::Hash {
                     key: DEFAULT_FLOW_KEY.to_vec(),
                     table: round_robin(members),
@@ -388,7 +381,7 @@ impl Bench {
                 let flows = SharedFlows::new(ownership, limits).unwrap();
                 (0..members)
                     .map(|k| {
-                        let config = config(ADDRESS, PORT_MAC, vec![(PEER, PEER_MAC)]);
+                        let config = config(ADDRESS, PORT_MAC, PEER_MAC);
                         Network::with_shared_flows(
                             config,
                             client_wire(k),
@@ -409,7 +402,7 @@ impl Bench {
             queues: queues.clone(),
             steer,
         };
-        let config = config(PEER, PEER_MAC, server_neighbors);
+        let config = config(PEER, PEER_MAC, PORT_MAC);
         let server = Network::new(config, server_wire, [9; 32], clock.now()).unwrap();
         let mut bench = Self {
             kind,
@@ -1174,8 +1167,7 @@ mod threaded {
             let setting_up = Arc::new(AtomicBool::new(true));
             let up = setting_up.clone();
             spawner.spawn(cpus[0], move |barrier| {
-                let neighbors = vec![(ADDRESS, PORT_MAC)];
-                let config = config(PEER, PEER_MAC, neighbors);
+                let config = config(PEER, PEER_MAC, PORT_MAC);
                 let mut network = Network::new(config, server_wire, [9; 32], clock.now()).unwrap();
                 let listener = network.listen(PORT, CONNECTIONS).unwrap();
                 barrier.wait();
@@ -1209,7 +1201,7 @@ mod threaded {
             for (k, wire) in member_wires.into_iter().enumerate() {
                 let (flows, setting_up) = (flows.clone(), setting_up.clone());
                 spawner.spawn(cpus[1 + k], move |barrier| {
-                    let config = config(ADDRESS, PORT_MAC, vec![(PEER, PEER_MAC)]);
+                    let config = config(ADDRESS, PORT_MAC, PEER_MAC);
                     let mut network = Network::with_shared_flows(
                         config,
                         wire,
