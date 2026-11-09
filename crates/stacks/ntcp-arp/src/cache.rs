@@ -251,10 +251,45 @@ pub struct ArpCache<L, T> {
     entries: Vec<Option<Entry<L>>>,
     addresses: Vec<Option<Address<L>>>,
     replies: Vec<Option<Reply<L>>>,
+    // Occupied slots of `entries` and `replies`, ascending: what the passes
+    // made on every poll (`next_deadline`, `next_control`) and lookups
+    // visit, rather than the configured capacity.
+    occupied: Slots,
+    queued: Slots,
     pending: Vec<Option<Pending<T>>>,
     // Slots of `pending` holding a record, ascending: what the wake and
     // release passes, run while output is held, visit (`check_holding`).
     holding: Vec<usize>,
+}
+
+// A set of table slots, ascending, with room for every slot allocated once.
+struct Slots(Vec<usize>);
+impl Slots {
+    fn new(capacity: usize) -> Result<Self, Error> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::Allocation)?;
+        Ok(Self(slots))
+    }
+    // Record whether `slot` is occupied.
+    fn set(&mut self, slot: usize, occupied: bool) {
+        match (self.0.binary_search(&slot), occupied) {
+            (Err(at), true) => self.0.insert(at, slot),
+            (Ok(at), false) => {
+                self.0.remove(at);
+            }
+            _ => {}
+        }
+    }
+    // The first slot at or after `from`: stepping with it visits every slot
+    // in order, also when the pass frees the slots it visits.
+    fn next(&self, from: usize) -> Option<usize> {
+        self.0.get(self.0.partition_point(|&s| s < from)).copied()
+    }
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().copied()
+    }
 }
 
 fn table<V: Clone>(count: usize, value: V) -> Result<Vec<V>, Error> {
@@ -308,6 +343,8 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             entries: table(limits.entries, None)?,
             addresses: table(limits.addresses, None)?,
             replies: table(limits.replies, None)?,
+            occupied: Slots::new(limits.entries)?,
+            queued: Slots::new(limits.replies)?,
             pending: table(limits.held, None)?,
             holding: {
                 let mut slots = Vec::new();
@@ -350,7 +387,16 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
         if self.entries[slot].is_some_and(|e| e.mac.is_some()) {
             self.remapped();
         }
-        self.entries[slot] = Some(entry);
+        self.set_entry(slot, Some(entry));
+    }
+    // The only writer of an entry slot's occupancy.
+    fn set_entry(&mut self, slot: usize, entry: Option<Entry<L>>) {
+        self.occupied.set(slot, entry.is_some());
+        self.entries[slot] = entry;
+    }
+    fn set_reply(&mut self, slot: usize, reply: Option<Reply<L>>) {
+        self.queued.set(slot, reply.is_some());
+        self.replies[slot] = reply;
     }
     fn interface(&self, link: L) -> Option<&Interface<L>> {
         self.interfaces.iter().flatten().find(|i| i.link == link)
@@ -398,7 +444,9 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 *interface = None;
             }
         }
-        for slot in 0..self.entries.len() {
+        let mut next = 0;
+        while let Some(slot) = self.occupied.next(next) {
+            next = slot + 1;
             if self.entries[slot].is_some_and(|e| e.link == link) {
                 self.fail(slot);
             }
@@ -408,9 +456,9 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 *address = None;
             }
         }
-        for reply in &mut self.replies {
-            if reply.is_some_and(|r| r.link == link) {
-                *reply = None;
+        for slot in 0..self.replies.len() {
+            if self.replies[slot].is_some_and(|r| r.link == link) {
+                self.set_reply(slot, None);
             }
         }
     }
@@ -509,17 +557,20 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             None => (self.vacancy().ok_or(Error::Capacity)?, self.id()),
         };
         self.remapped();
-        self.entries[slot] = Some(Entry {
-            id,
-            link,
-            address,
-            state: ArpState::Permanent,
-            mac: Some(mac),
-            mapped_at: now,
-            used_at: now,
-            deadline: now,
-            sent: 0,
-        });
+        self.set_entry(
+            slot,
+            Some(Entry {
+                id,
+                link,
+                address,
+                state: ArpState::Permanent,
+                mac: Some(mac),
+                mapped_at: now,
+                used_at: now,
+                deadline: now,
+                sent: 0,
+            }),
+        );
         Ok(())
     }
 
@@ -560,9 +611,9 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     }
 
     fn find(&self, link: L, address: Ipv4Addr) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|e| e.is_some_and(|e| e.link == link && e.address == address))
+        self.occupied.iter().find(|&slot| {
+            self.entries[slot].is_some_and(|e| e.link == link && e.address == address)
+        })
     }
 
     // A slot for a new entry: a free one, else the STALE entry used longest
@@ -596,7 +647,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             self.remapped();
         }
         let id = e.id;
-        self.entries[slot] = None;
+        self.set_entry(slot, None);
         for &held in &self.holding {
             if let Some(p) = &mut self.pending[held]
                 && p.entry == id
@@ -994,16 +1045,17 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             return;
         }
         let id = self.id();
-        match self.replies.iter_mut().find(|r| r.is_none()) {
-            Some(free) => {
-                *free = Some(Reply {
+        match self.replies.iter().position(Option::is_none) {
+            Some(free) => self.set_reply(
+                free,
+                Some(Reply {
                     id,
                     link,
                     destination,
                     arp,
                     queued: now,
-                })
-            }
+                }),
+            ),
             None => self.counters.replies_dropped += 1,
         }
     }
@@ -1017,8 +1069,8 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     /// polled.
     pub fn next_control(&self, link: L, now: u64) -> Option<(Control<L>, ControlToken)> {
         let interface = self.interface(link)?;
-        for (slot, r) in self.replies.iter().enumerate() {
-            if let Some(r) = r.filter(|r| r.link == link) {
+        for slot in self.queued.iter() {
+            if let Some(r) = self.replies[slot].filter(|r| r.link == link) {
                 let control = Control {
                     link,
                     source: interface.mac,
@@ -1029,8 +1081,8 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             }
         }
         let source = self.source(link)?;
-        for (slot, e) in self.entries.iter().enumerate() {
-            let Some(e) = e.filter(|e| e.link == link) else {
+        for slot in self.occupied.iter() {
+            let Some(e) = self.entries[slot].filter(|e| e.link == link) else {
                 continue;
             };
             let (limit, destination) = match (e.state, e.mac) {
@@ -1101,7 +1153,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 {
                     return;
                 }
-                self.replies[slot] = None;
+                self.set_reply(slot, None);
                 if outcome == ControlOutcome::Failed {
                     self.counters.replies_dropped += 1;
                 } else {
@@ -1139,7 +1191,9 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     //# entries.  If this mechanism involves a timeout, it SHOULD be
     //# possible to configure the timeout value.
     pub fn service(&mut self, now: u64, events: &mut impl FnMut(Event<L>)) {
-        for slot in 0..self.entries.len() {
+        let mut next = 0;
+        while let Some(slot) = self.occupied.next(next) {
+            next = slot + 1;
             let Some(mut e) = self.entries[slot] else {
                 continue;
             };
@@ -1195,11 +1249,27 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
 
     /// The earliest time `service` or `next_control` has work.
     pub fn next_deadline(&self) -> Option<u64> {
-        let entries = self.entries.iter().flatten().filter_map(|e| match e.state {
-            ArpState::Stale | ArpState::Permanent => None,
-            _ => Some(e.deadline),
-        });
-        let replies = self.replies.iter().flatten().map(|r| r.queued);
+        debug_assert!(
+            self.occupied
+                .iter()
+                .eq((0..self.entries.len()).filter(|&s| self.entries[s].is_some()))
+        );
+        debug_assert!(
+            self.queued
+                .iter()
+                .eq((0..self.replies.len()).filter(|&s| self.replies[s].is_some()))
+        );
+        let entries = self
+            .occupied
+            .iter()
+            .filter_map(|slot| match self.entries[slot]? {
+                e if matches!(e.state, ArpState::Stale | ArpState::Permanent) => None,
+                e => Some(e.deadline),
+            });
+        let replies = self
+            .queued
+            .iter()
+            .filter_map(|slot| Some(self.replies[slot]?.queued));
         entries.chain(replies).min()
     }
 }
