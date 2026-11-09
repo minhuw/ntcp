@@ -210,6 +210,12 @@ enum Dispatch {
     // destination (`addresses[k]` on queue k), as per-address flow rules
     // steer; ARP to queue 0.
     ByDestination(Vec<Ipv4Addr>),
+    // Masked rules on the TCP destination port, (value, mask), ahead of
+    // other steering, as a NIC matches its flow rules before RSS: an
+    // unfragmented TCP packet whose destination port has the value of rule
+    // k under its mask to queue k, any other frame where the second
+    // steering puts it.
+    Rules(Vec<(u16, u16)>, Box<Dispatch>),
 }
 impl Dispatch {
     // RSS as the members' flows hash.
@@ -238,6 +244,10 @@ impl Dispatch {
             Self::ByDestination(addresses) => l3(frame)
                 .and_then(|ip| addresses.iter().position(|&a| a == destination(ip)))
                 .unwrap_or(0),
+            Self::Rules(rules, rss) => l3(frame)
+                .and_then(port_pair)
+                .and_then(|(_, port)| rules.iter().position(|&(v, mask)| port & mask == v))
+                .unwrap_or_else(|| rss.queue(frame, queues)),
         }
     }
 }
@@ -1344,4 +1354,277 @@ fn control_networks_sharing_an_address_without_flows_reset_each_others_segments(
     assert!(lan.resets[0] > 0, "{:?}", lan.resets);
     assert_eq!(lan.resets[1], 0);
     assert!(server.connections.is_empty());
+}
+
+// 11. Tagged ports (`FlowOwnership::TaggedPorts`): a member's active opens
+// take its own tagged ports, and the port's rule for the member steers the
+// replies to its queue; every other flow is hashed as RSS hashes it.
+
+// The IANA dynamic range, the default ephemeral ports.
+const TAG: u16 = 0xc000;
+
+fn tagged_flows(members: usize) -> SharedFlows {
+    let ownership = FlowOwnership::TaggedPorts {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: round_robin(members, TABLE),
+        prefix: TAG,
+        prefix_mask: TAG,
+    };
+    SharedFlows::new(ownership, limits(members, INBOX)).unwrap()
+}
+// `members` members of new TaggedPorts flows on ADDRESS.
+fn tagged_members(
+    members: usize,
+    adjust: impl Fn(&mut NetworkConfig),
+) -> (SharedFlows, Vec<Station>) {
+    let flows = tagged_flows(members);
+    let table = neighbors(members);
+    let stations = (0..members)
+        .map(|k| {
+            let mut config = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
+            adjust(&mut config);
+            join(&flows, &table, k, config)
+        })
+        .collect();
+    (flows, stations)
+}
+// The port programmed for tagged flows: each member's port rule, ahead of
+// RSS with the flows' key and table.
+fn port_rules(flows: &SharedFlows) -> Dispatch {
+    let members = flows.limits().members;
+    let rules = (0..members).map(|k| flows.port_rule(k).unwrap()).collect();
+    Dispatch::Rules(rules, Box::new(Dispatch::rss(members)))
+}
+fn tagged_lan(members: usize, dispatch: impl FnOnce(&SharedFlows) -> Dispatch) -> Lan {
+    let (flows, stations) = tagged_members(members, |_| {});
+    let dispatch = dispatch(&flows);
+    Lan::new(stations, dispatch, Some(flows))
+}
+// A port of the tag's highest quarter tagged with member `k`.
+fn tagged_port(k: usize) -> u16 {
+    0xd000 | k as u16
+}
+
+#[test]
+fn active_opens_from_tagged_ports_steered_by_port_rules_need_no_handoff() {
+    for n in [2, 3, 4] {
+        let mut lan = tagged_lan(n, port_rules);
+        active(&mut lan, 8, 4 * MSS, 5 * SECOND);
+        assert_eq!(lan.handoffs(), (0, 0, 0), "{n} members");
+    }
+}
+
+#[test]
+fn active_opens_from_tagged_ports_survive_a_port_without_rules() {
+    for n in [2, 3, 4] {
+        for dispatch in [Dispatch::Queue0, Dispatch::Scatter(0x2545_f491_4f6c_dd1d)] {
+            let mut lan = tagged_lan(n, |_| dispatch.clone());
+            active(&mut lan, 8, 4 * MSS, 5 * SECOND);
+            let (handed_off, received, dropped) = lan.handoffs();
+            assert!(handed_off > 0 && received > 0, "{n} members, {dispatch:?}");
+            assert_eq!(dropped, 0);
+        }
+    }
+}
+
+#[test]
+fn passive_opens_on_an_untagged_port_follow_rss_under_tagged_ports() {
+    for n in [2, 3, 4] {
+        let lan = tagged_lan(n, port_rules);
+        let Passive { lan, servers } = passive(lan, 64, 4 * MSS, 5 * SECOND);
+        assert!(servers.iter().all(|s| !s.connections.is_empty()), "{n}");
+        assert_eq!(lan.handoffs(), (0, 0, 0), "{n} members");
+    }
+}
+
+#[test]
+fn an_icmp_error_about_a_tagged_port_delivered_elsewhere_reaches_its_member() {
+    for n in [2, 3, 4] {
+        let (flows, stations) = tagged_members(n, with_pmtud);
+        let dispatch = port_rules(&flows);
+        let mut lan = Lan::new(stations, dispatch, Some(flows.clone()));
+        lan.router.misdeliver_icmp = true;
+        icmp_case(&mut lan);
+        // The rules steer every segment: only the errors are handed off,
+        // each once, to the member tagged in the port they quote.
+        let errors = lan.router.drops.len() as u64;
+        assert_eq!(lan.handoffs(), (errors, errors, 0), "{n} members");
+        for &(_, port) in &lan.router.drops {
+            let rules = (0..n).filter_map(|k| flows.port_rule(k));
+            let tagged = rules.filter(|&(value, mask)| port & mask == value);
+            assert_eq!(tagged.count(), 1, "port {port}");
+        }
+        for k in 0..n {
+            let counters = lan.network(k).counters();
+            assert!(counters.handoffs_received > 0, "member {k} of {n}");
+        }
+    }
+}
+
+#[test]
+fn connect_from_refuses_another_members_tagged_port() {
+    for n in [2, 3, 4] {
+        let mut lan = tagged_lan(n, port_rules);
+        let flows = lan.flows.clone().unwrap();
+        let remote = SocketAddrV4::new(PEER, LISTEN);
+        let owner = |port| flows.owner(SocketAddrV4::new(ADDRESS, port), remote);
+        let mut server = Echo::new(&mut lan.peer.network);
+        let mut clients = Vec::new();
+        for k in 0..n {
+            // Another member's tagged port, then an untagged port whose
+            // flow another member owns by its hash.
+            let foreign = [
+                tagged_port((k + 1) % n),
+                (40_000..).find(|&p| owner(p) != Some(k)).unwrap(),
+            ];
+            for port in foreign {
+                assert!(
+                    matches!(
+                        lan.network(k).connect_from(remote.into(), Some(port)),
+                        Err(Error::InvalidConfig(_))
+                    ),
+                    "member {k}, port {port}"
+                );
+            }
+            // Nothing was opened: the member sends nothing.
+            let now = lan.now;
+            lan.network(k).drive(now, BUDGET).unwrap();
+            assert!(lan.members[k].as_ref().unwrap().sent().is_empty());
+            // Its own tagged port, and an untagged port it owns by hash.
+            let own = [
+                tagged_port(k),
+                (40_000..).find(|&p| owner(p) == Some(k)).unwrap(),
+            ];
+            for port in own {
+                let connection = lan
+                    .network(k)
+                    .connect_from(remote.into(), Some(port))
+                    .unwrap();
+                let info = lan.network(k).connection_info(connection).unwrap();
+                assert_eq!(info.local, SocketAddr::new(ADDRESS.into(), port));
+                let data = payload(clients.len(), 2 * MSS);
+                clients.push((k, Client::new(connection, data)));
+            }
+        }
+        let done = lan.run(5 * SECOND, |lan| {
+            server.serve(&mut lan.peer.network);
+            for (k, client) in &mut clients {
+                client.pump(lan.network(*k));
+            }
+            clients.iter().all(|(_, c)| c.done())
+        });
+        assert!(done, "{n} members");
+        for (_, client) in &clients {
+            assert!(client.received == client.payload);
+        }
+        assert_eq!(lan.handoffs(), (0, 0, 0), "{n} members");
+        lan.assert_no_resets();
+    }
+}
+
+// A tagged port's connections are its member's, so that member alone
+// listens on it, and the port's rule steers them straight to its queue.
+#[test]
+fn a_tagged_port_is_listened_on_by_its_member_alone() {
+    let n = 4;
+    let mut lan = tagged_lan(n, port_rules);
+    let mut servers = Vec::new();
+    for k in 0..n {
+        for other in (0..n).filter(|&m| m != k) {
+            assert!(
+                matches!(
+                    lan.network(other).listen(tagged_port(k), 64),
+                    Err(Error::InvalidConfig(_))
+                ),
+                "member {other} on member {k}'s port"
+            );
+        }
+        let listener = lan.network(k).listen(tagged_port(k), 64).unwrap();
+        servers.push(Echo {
+            listener,
+            connections: Vec::new(),
+        });
+    }
+    let mut clients: Vec<_> = (0..4 * n)
+        .map(|i| {
+            let to = SocketAddr::new(ADDRESS.into(), tagged_port(i % n));
+            let connection = lan.peer.network.connect(to).unwrap();
+            Client::new(connection, payload(i, 3 * MSS))
+        })
+        .collect();
+    let done = lan.run(5 * SECOND, |lan| {
+        for (k, server) in servers.iter_mut().enumerate() {
+            server.serve(lan.network(k));
+        }
+        for client in &mut clients {
+            client.pump(&mut lan.peer.network);
+        }
+        clients.iter().all(Client::done)
+    });
+    assert!(done);
+    assert_echoed(&clients);
+    for (k, server) in servers.iter().enumerate() {
+        assert_eq!(server.connections.len(), 4, "member {k}");
+    }
+    assert_eq!(lan.handoffs(), (0, 0, 0));
+    lan.assert_no_resets();
+}
+
+// A member's ephemeral ports are its tagged ports in its range, without
+// those it listens on, until they run out; a range that holds none of
+// them is refused, and nothing joins.
+#[test]
+fn active_opens_take_their_members_tagged_ports_until_they_run_out() {
+    let n = 4;
+    // Sixteen ephemeral ports, four tagged with each member.
+    let (flows, stations) = tagged_members(n, |c| c.ephemeral_ports = 0xc000..=0xc00f);
+    let mut lan = Lan::new(stations, port_rules(&flows), Some(flows));
+    let mut server = Echo::new(&mut lan.peer.network);
+    let to = SocketAddr::new(PEER.into(), LISTEN);
+    let mut clients = Vec::new();
+    for k in 0..n {
+        let tag = k as u16;
+        lan.network(k).listen(TAG | tag, 4).unwrap();
+        for port in [0xc004, 0xc008, 0xc00c] {
+            let connection = lan.network(k).connect(to).unwrap();
+            let local = lan.network(k).connection_info(connection).unwrap().local;
+            assert_eq!(local, SocketAddr::new(ADDRESS.into(), port | tag));
+            let data = payload(clients.len(), MSS);
+            clients.push((k, Client::new(connection, data)));
+        }
+        assert!(
+            matches!(lan.network(k).connect(to), Err(Error::Capacity)),
+            "member {k}"
+        );
+    }
+    let done = lan.run(5 * SECOND, |lan| {
+        server.serve(&mut lan.peer.network);
+        for (k, client) in &mut clients {
+            client.pump(lan.network(*k));
+        }
+        clients.iter().all(|(_, c)| c.done())
+    });
+    assert!(done);
+    assert_eq!(lan.handoffs(), (0, 0, 0));
+    lan.assert_no_resets();
+
+    let flows = tagged_flows(n);
+    let table = neighbors(n);
+    let member = |k: usize, ports: std::ops::RangeInclusive<u16>| {
+        let mut config = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
+        config.ephemeral_ports = ports;
+        Station::build(|port| {
+            Network::with_shared_flows(config, port, SECRET, 0, Some(&table), &flows, k)
+        })
+    };
+    // Member 3's tagged ports are none of 0xc000 to 0xc002, and no member's
+    // are below the tag.
+    for (k, ports) in [(3, 0xc000..=0xc002), (0, 1024..=0xbfff)] {
+        assert!(
+            matches!(member(k, ports.clone()), Err(Error::InvalidConfig(_))),
+            "member {k}, {ports:?}"
+        );
+    }
+    let joined = [member(2, 0xc000..=0xc002), member(3, 0xbfff..=0xc003)];
+    assert!(joined.iter().all(Result::is_ok));
 }
