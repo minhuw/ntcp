@@ -231,8 +231,13 @@ pub struct Counters {
     // ARP resolutions and unreachability probes that failed.
     pub resolution_failures: u64,
     // A member of shared flows: packets it received for another member's
-    // flow and handed to that member, packets other members handed to it,
-    // and handoffs it dropped (the owner's inbox full or the owner absent).
+    // flow and copied into that member's inbox, packets it took from its
+    // own inbox, and handoffs it dropped (the owner's inbox full, or no
+    // member of the owner's number). A packet copied in as its owner
+    // leaves stays in that inbox: the next member of the number discards
+    // what is there when it joins and takes in what lands after. The
+    // members' handoffs_received fall short of their handed_off by those
+    // packets and by what waits.
     pub handed_off: u64,
     pub handoffs_received: u64,
     pub handoffs_dropped: u64,

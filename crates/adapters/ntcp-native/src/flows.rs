@@ -445,8 +445,13 @@ impl SharedFlows {
             .try_reserve_exact(reserved - len)
             .map_err(|_| Error::Capacity)?;
         registry.reserved = reserved;
-        // Handoffs to an earlier member of the slot are not this one's: its
-        // connections left with it.
+        // What reached the slot after its earlier member left was for
+        // connections that left with it. A handoff that read the earlier
+        // member's address and is still being copied in lands after this,
+        // and is taken in as any: under Hash and TaggedPorts its flow is
+        // this member's, which answers it as a restarted host would, and by
+        // address the Host refuses another address. Either way its producer
+        // counted it handed off (`Counters::handed_off`).
         slot.inbox.drain(shared.limits.inbox_packets, |_, _| {});
         slot.wake.woken.store(false, Ordering::Relaxed);
         slot.address.store(word, Ordering::Release);

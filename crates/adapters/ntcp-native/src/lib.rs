@@ -253,7 +253,6 @@ impl<P: PacketIo> Network<P> {
     /// only the packets of flows it owns and hands any other it receives to
     /// the owner; its active opens choose local ports whose flows it owns.
     /// Every member that should accept a port's connections listens on it.
-    /// Dropping it leaves the flows: handoffs to it are then dropped.
     ///
     /// `member` is a free member number of `flows`, under
     /// `FlowOwnership::Hash` one its table names, and the local address is
@@ -274,6 +273,26 @@ impl<P: PacketIo> Network<P> {
     /// nothing: `SharedFlows::owner` names the member to open it on. A
     /// blocking embedding learns of handoffs through the descriptor of
     /// `set_neighbor_wake_fd`.
+    ///
+    /// Every member should be given the same `secret`, as one host has one.
+    /// A TCP Fast Open cookie authenticates its client's address under it,
+    /// and that client's next connection may be another member's. And a
+    /// member that joins a number another left then derives the initial
+    /// sequence numbers of the same flows (RFC 6528) as the earlier member
+    /// did, which keep old segments of its connections, whose TIME-WAIT
+    /// state left with it, out of new ones.
+    ///
+    /// A member's flows are its own for the life of `flows`: the ownership
+    /// function never changes, and no other member takes them over.
+    /// Dropping the Network leaves the flows, and its connections end with
+    /// it unannounced. Until a member joins its number again the others
+    /// drop what they receive of its flows (`Counters::handoffs_dropped`;
+    /// by address, the receiving member's Host refuses the address no
+    /// member serves), so its peers retransmit until they time out and SYNs
+    /// of its flows go unanswered. A member that joins the number owns the
+    /// same flows (by address, those of its own address) and answers what
+    /// remains of the earlier member's connections with resets, as a
+    /// restarted host does.
     ///
     /// Under `FlowOwnership::TaggedPorts` ephemeral ports are the member's
     /// own tagged ports within `ephemeral_ports`, which must hold one
@@ -662,6 +681,12 @@ impl<P: PacketIo> Network<P> {
     /// the descriptor and resets it as it polls; a write that would block
     /// is not retried, the descriptor then being readable already. A
     /// busy-polling embedding needs none: each drive takes its wakes.
+    ///
+    /// A drive reports the work of its own Network, not what it handed to
+    /// or resolved for other members. An embedding that blocks waits on
+    /// every member's descriptor, also when one thread drives several
+    /// members: a member it drove earlier in a round may be handed packets
+    /// later in the round, after it reported no more work.
     #[cfg(unix)]
     pub fn set_neighbor_wake_fd(&mut self, fd: std::os::fd::OwnedFd) -> Result<()> {
         let neighbors = shared::member(&mut self.host);
