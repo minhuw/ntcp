@@ -5218,12 +5218,27 @@ impl Endpoint {
         now: Instant,
         attempt: crate::TransmitAttempt,
     ) -> Result<bool, EndpointError> {
-        if !self.preflight_accept_transmit(now, attempt)? {
+        // The checks of `preflight_accept_transmit`, but the connection's
+        // validation of the departure, which `accept_reserved_output` makes
+        // first, before it changes anything.
+        let Some(r) = self
+            .reservations
+            .get(attempt.reservation)
+            .and_then(|slot| slot.current.as_ref())
+        else {
+            return Ok(false);
+        };
+        if r.attempt != Some(attempt) {
             return Ok(false);
         }
         let index = attempt.reservation;
-        let r = self.reservations[index].current.as_ref().unwrap();
         let connection = r.packet.connection;
+        if let Some(id) = connection
+            && r.departure.is_none()
+        {
+            self.retained_slot(id)?.connection.check_time(now)?;
+        }
+        self.check_clock(now)?;
         let (mut departure, offset, count, finished) = (
             r.departure,
             r.offset,
@@ -5234,7 +5249,6 @@ impl Endpoint {
             },
             r.finished,
         );
-        self.clock(now)?;
         let mut withdrawn = false;
         if let Some(id) = connection
             && let Some(d) = &mut departure
@@ -5244,6 +5258,8 @@ impl Endpoint {
                 .connection
                 .accept_reserved_output(now, d, offset, count, finished)?;
         }
+        // Checked above.
+        self.clock(now)?;
         // A withdrawn suffix was never submitted: release the reservation so
         // the owner reselects that work under its current admission.
         self.complete_reserved_accept(index, departure, finished || withdrawn);

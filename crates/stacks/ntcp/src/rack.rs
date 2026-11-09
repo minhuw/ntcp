@@ -569,7 +569,21 @@ impl Rack {
         if !self.validate_departure(selection, start, end, now) {
             return false;
         }
-        // Preflight above guarantees these cannot fail or allocate.
+        self.commit_validated_departure(selection, start, end, now);
+        true
+    }
+
+    // `commit_departure` of a departure `validate_departure` accepted, with
+    // the intervals unchanged since.
+    pub(crate) fn commit_validated_departure(
+        &mut self,
+        selection: DepartureSelection,
+        start: Seq,
+        end: Seq,
+        now: u64,
+    ) {
+        debug_assert!(self.validate_departure(selection, start, end, now));
+        // Validation guarantees these cannot fail or allocate.
         let left = self.split(start);
         let right = self.split(end);
         debug_assert!(left && right);
@@ -603,7 +617,6 @@ impl Rack {
                 }
             }
         }
-        true
     }
 
     // Called only after encoding succeeds. Production reserves one interval

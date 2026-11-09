@@ -2955,10 +2955,13 @@ impl Connection {
             && let Some(selection) = self.reserved_ledger
         {
             let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
-            let committed =
-                self.rack
-                    .commit_departure(selection, start, start.wrapping_add(count as u32), now);
-            debug_assert!(committed); // Identical read-only preflight above.
+            // Validated above; nothing since changed the intervals.
+            self.rack.commit_validated_departure(
+                selection,
+                start,
+                start.wrapping_add(count as u32),
+                now,
+            );
         }
         if count != 0
             && (d.segmentation.is_some() || d.deferred_fresh)
