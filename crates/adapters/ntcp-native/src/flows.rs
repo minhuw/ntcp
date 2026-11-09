@@ -44,7 +44,10 @@ pub enum FlowOwnership {
     /// `table[h2 & (table.len() - 1)]`, `h2` hashing source and destination
     /// address only, as RSS hashes an IPv4 packet without ports. When the
     /// NIC hashes with this key, `table` maps its indirection table's
-    /// queues to their members, and packets arrive at their owners.
+    /// queues to their members, and packets arrive at their owners. Only
+    /// a member the table names joins (`Network::with_shared_flows`): any
+    /// other would own no flow, and could neither open nor accept a
+    /// connection.
     Hash { key: Vec<u8>, table: Vec<usize> },
     /// Every member serves one IPv4 address, as under `Hash { key, table }`,
     /// except for the flows of a tagged local port: a port `p` with
@@ -56,7 +59,9 @@ pub enum FlowOwnership {
     /// replies to a member's active opens to its queue, where under Hash
     /// the member would search ports for one the NIC's hash puts there,
     /// and RSS with `key` and `table` steers the rest. Only its member
-    /// listens on a tagged port (`Network::with_shared_flows`).
+    /// listens on a tagged port (`Network::with_shared_flows`). A member
+    /// the table does not name owns the flows of its tagged ports alone,
+    /// which is enough to open connections and to accept them there.
     /// `prefix_mask` is nonzero and spares the bits of `low`, and `prefix`
     /// lies within it.
     TaggedPorts {
@@ -75,8 +80,12 @@ pub struct SharedFlowLimits {
     /// Packets each member's inbox holds. A handoff to a full inbox is
     /// dropped and counted, as a NIC drops when a queue overflows.
     pub inbox_packets: usize,
-    /// Octets preallocated for each inbox packet: the port's largest IP
-    /// packet. A longer (reassembled) datagram allocates.
+    /// Octets preallocated for each inbox packet, so that a handoff copies
+    /// into a buffer it never allocates: at least the largest IP packet a
+    /// member takes in, its MTU or, unless ownership is
+    /// `FlowOwnership::ByAddress`, the larger datagram it reassembles
+    /// (`Network::with_shared_flows` refuses a member otherwise). Only a
+    /// packet beyond that, which the owner's Host refuses, allocates.
     pub packet_bytes: usize,
 }
 
@@ -232,6 +241,9 @@ impl Registry {
     }
 }
 
+const PACKET_BYTES: Error =
+    Error::InvalidConfig("the packets of shared flows hold a member's largest IP packet");
+
 // A slot's word for a member with `address`: never 0.
 fn present(address: Ipv4Addr) -> u64 {
     1 << 32 | u64::from(u32::from(address))
@@ -336,9 +348,15 @@ impl SharedFlows {
         self.shared.tagged(member)
     }
 
-    // Member `index`, serving `address`, with room to register `listeners`
-    // listening ports.
-    pub(crate) fn join(&self, index: usize, address: IpAddr, listeners: usize) -> Result<Member> {
+    // Member `index`, serving `address` with packets of up to `mtu` octets,
+    // with room to register `listeners` listening ports.
+    pub(crate) fn join(
+        &self,
+        index: usize,
+        address: IpAddr,
+        mtu: usize,
+        listeners: usize,
+    ) -> Result<Member> {
         let IpAddr::V4(address) = address else {
             return Err(Error::Unsupported("shared flows of IPv6 addresses"));
         };
@@ -346,6 +364,16 @@ impl SharedFlows {
         let slot = shared.slots.get(index).ok_or(Error::InvalidConfig(
             "members of shared flows are numbered below their count",
         ))?;
+        if let Ownership::Hash { table, .. } = &shared.ownership
+            && !table.contains(&index)
+        {
+            return Err(Error::InvalidConfig(
+                "members of hashed shared flows are named by their table",
+            ));
+        }
+        if mtu > shared.limits.packet_bytes {
+            return Err(PACKET_BYTES);
+        }
         let mut registry = lock(&shared.registry);
         if slot.address.load(Ordering::Relaxed) != 0 {
             return Err(Error::InvalidConfig(
@@ -706,6 +734,10 @@ impl Member {
         if matches!(self.shared.ownership, Ownership::ByAddress) {
             return Ok(());
         }
+        // Another member hands over the datagrams it reassembles.
+        if capacity.is_some_and(|c| c > self.shared.limits.packet_bytes) {
+            return Err(PACKET_BYTES);
+        }
         let mut registry = lock(&self.shared.registry);
         if registry.reassembly.iter().flatten().any(|&c| c != capacity) {
             return Err(Error::InvalidConfig(
@@ -930,11 +962,12 @@ mod tests {
         assert_eq!(key(&icmp(3, &[])), Key::Local);
     }
 
+    const MTU: usize = 64;
     fn limits(members: usize) -> SharedFlowLimits {
         SharedFlowLimits {
             members,
             inbox_packets: 2,
-            packet_bytes: 64,
+            packet_bytes: MTU,
         }
     }
     fn hashed(members: usize, table: Vec<usize>) -> SharedFlows {
@@ -961,8 +994,8 @@ mod tests {
         // No member serves the address yet.
         assert_eq!(flows.owner(local, remote), None);
         assert_eq!(flows.reassembler(REMOTE, LOCAL), None);
-        let a = flows.join(0, LOCAL.into(), 1).unwrap();
-        let b = flows.join(1, LOCAL.into(), 1).unwrap();
+        let a = flows.join(0, LOCAL.into(), MTU, 1).unwrap();
+        let b = flows.join(1, LOCAL.into(), MTU, 1).unwrap();
         let table = [0, 1, 1, 0];
         let owner = table[toeplitz.ipv4_ports(REMOTE, LOCAL, 40000, 80) as usize & 3];
         assert_eq!(flows.owner(local, remote), Some(owner));
@@ -992,9 +1025,9 @@ mod tests {
         );
         // Every member serves the one address.
         let c = hashed(3, vec![0, 1, 2, 0]);
-        let _c0 = c.join(0, LOCAL.into(), 0).unwrap();
+        let _c0 = c.join(0, LOCAL.into(), MTU, 0).unwrap();
         assert!(matches!(
-            c.join(1, REMOTE.into(), 0),
+            c.join(1, REMOTE.into(), MTU, 0),
             Err(Error::InvalidConfig(_))
         ));
     }
@@ -1002,8 +1035,8 @@ mod tests {
     #[test]
     fn flows_by_address_belong_to_the_member_addressed() {
         let flows = SharedFlows::new(FlowOwnership::ByAddress, limits(3)).unwrap();
-        let a = flows.join(0, LOCAL.into(), 1).unwrap();
-        let b = flows.join(2, ROUTER.into(), 1).unwrap();
+        let a = flows.join(0, LOCAL.into(), MTU, 1).unwrap();
+        let b = flows.join(2, ROUTER.into(), MTU, 1).unwrap();
         let remote = SocketAddrV4::new(REMOTE, 1234);
         assert_eq!(flows.owner(SocketAddrV4::new(LOCAL, 80), remote), Some(0));
         assert_eq!(flows.owner(SocketAddrV4::new(ROUTER, 80), remote), Some(2));
@@ -1017,19 +1050,19 @@ mod tests {
         assert!(a.owns(1, remote.into()) && b.owns(1, remote.into()));
         // Distinct addresses; IPv6 is not supported; one member per slot.
         assert!(matches!(
-            flows.join(1, LOCAL.into(), 0),
+            flows.join(1, LOCAL.into(), MTU, 0),
             Err(Error::InvalidConfig(_))
         ));
         assert!(matches!(
-            flows.join(1, "2001:db8::1".parse().unwrap(), 0),
+            flows.join(1, "2001:db8::1".parse().unwrap(), MTU, 0),
             Err(Error::Unsupported(_))
         ));
         assert!(matches!(
-            flows.join(2, REMOTE.into(), 0),
+            flows.join(2, REMOTE.into(), MTU, 0),
             Err(Error::InvalidConfig(_))
         ));
         assert!(matches!(
-            flows.join(3, REMOTE.into(), 0),
+            flows.join(3, REMOTE.into(), MTU, 0),
             Err(Error::InvalidConfig(_))
         ));
         // A member that leaves serves its address no longer.
@@ -1043,14 +1076,14 @@ mod tests {
             }))),
             None
         );
-        let _b = flows.join(2, REMOTE.into(), 0).unwrap();
+        let _b = flows.join(2, REMOTE.into(), MTU, 0).unwrap();
     }
 
     #[test]
     fn handoffs_reach_present_members_until_their_inbox_is_full() {
         let flows = hashed(2, vec![0, 1]);
-        let a = flows.join(0, LOCAL.into(), 0).unwrap();
-        let b = flows.join(1, LOCAL.into(), 0).unwrap();
+        let a = flows.join(0, LOCAL.into(), MTU, 0).unwrap();
+        let b = flows.join(1, LOCAL.into(), MTU, 0).unwrap();
         assert!(!b.pending());
         b.begin();
         assert!(a.hand_off(1, &[1, 2, 3], handoff()));
@@ -1066,7 +1099,7 @@ mod tests {
         assert!(a.hand_off(1, &[6], handoff()));
         drop(b);
         assert!(!a.hand_off(1, &[7], handoff()));
-        let b = flows.join(1, LOCAL.into(), 0).unwrap();
+        let b = flows.join(1, LOCAL.into(), MTU, 0).unwrap();
         assert!(!b.pending());
     }
 
@@ -1075,8 +1108,8 @@ mod tests {
     fn the_first_handoff_after_a_drive_looks_writes_the_wake() {
         use std::io::Read;
         let flows = hashed(2, vec![0, 1]);
-        let a = flows.join(0, LOCAL.into(), 0).unwrap();
-        let b = flows.join(1, LOCAL.into(), 0).unwrap();
+        let a = flows.join(0, LOCAL.into(), MTU, 0).unwrap();
+        let b = flows.join(1, LOCAL.into(), MTU, 0).unwrap();
         let (mut reader, writer) = std::io::pipe().unwrap();
         b.set_wake(Arc::new(File::from(std::os::fd::OwnedFd::from(writer))));
         b.begin();
@@ -1098,8 +1131,8 @@ mod tests {
     #[test]
     fn listening_ports_count_every_member_until_it_leaves() {
         let flows = hashed(2, vec![0, 1]);
-        let mut a = flows.join(0, LOCAL.into(), 2).unwrap();
-        let mut b = flows.join(1, LOCAL.into(), 1).unwrap();
+        let mut a = flows.join(0, LOCAL.into(), MTU, 2).unwrap();
+        let mut b = flows.join(1, LOCAL.into(), MTU, 1).unwrap();
         a.listen(80);
         b.listen(80);
         a.listen(443);
@@ -1114,6 +1147,39 @@ mod tests {
         assert!(!a.listened(8080) && a.listened(443));
         a.unlisten(443);
         assert!(!a.listened(443));
+    }
+
+    #[test]
+    fn a_member_joins_named_by_its_table_with_room_for_its_packets() {
+        // Under Hash a member the table never names would own no flow.
+        let flows = hashed(3, vec![0, 1, 0, 1]);
+        assert!(matches!(
+            flows.join(2, LOCAL.into(), MTU, 0),
+            Err(Error::InvalidConfig(_))
+        ));
+        let _a = flows.join(0, LOCAL.into(), MTU, 0).unwrap();
+        // Under TaggedPorts its tagged ports are its own.
+        let tags = tagged(3, vec![0, 1], 0xc000, 0xc000).unwrap();
+        let _c = tags.join(2, LOCAL.into(), MTU, 0).unwrap();
+        let tagged_port = SocketAddrV4::new(LOCAL, 0xc002);
+        let remote = SocketAddrV4::new(REMOTE, 80);
+        assert_eq!(tags.owner(tagged_port, remote), Some(2));
+        // The inbox's buffers hold a packet of the member's MTU, and unless
+        // by address the datagrams it reassembles, which other members
+        // hand over.
+        assert!(matches!(
+            flows.join(1, LOCAL.into(), MTU + 1, 0),
+            Err(Error::InvalidConfig(_))
+        ));
+        let b = flows.join(1, LOCAL.into(), MTU, 0).unwrap();
+        assert!(matches!(
+            b.reassemble(Some(MTU + 1)),
+            Err(Error::InvalidConfig(_))
+        ));
+        b.reassemble(Some(MTU)).unwrap();
+        let flows = SharedFlows::new(FlowOwnership::ByAddress, limits(1)).unwrap();
+        let member = flows.join(0, LOCAL.into(), MTU, 0).unwrap();
+        member.reassemble(Some(MTU + 1)).unwrap();
     }
 
     fn tagged(members: usize, table: Vec<usize>, prefix: u16, mask: u16) -> Result<SharedFlows> {
@@ -1139,7 +1205,7 @@ mod tests {
             let table: Vec<usize> = (0..8).map(|i| i % n).collect();
             let flows = tagged(n, table.clone(), 0xc000, 0xc000).unwrap();
             let members: Vec<_> = (0..n)
-                .map(|k| flows.join(k, LOCAL.into(), 0).unwrap())
+                .map(|k| flows.join(k, LOCAL.into(), MTU, 0).unwrap())
                 .collect();
             for k in 0..n {
                 let rule = (0xc000 | k as u16, 0xc000 | low);
@@ -1189,7 +1255,7 @@ mod tests {
             assert_eq!(flows.owner(other, remotes[0]), None);
             if n > 1 {
                 assert!(matches!(
-                    flows.join(n - 1, REMOTE.into(), 0),
+                    flows.join(n - 1, REMOTE.into(), MTU, 0),
                     Err(Error::InvalidConfig(_))
                 ));
             }
@@ -1200,7 +1266,7 @@ mod tests {
         }
         // Other ownership tags no port.
         let flows = hashed(2, vec![0, 1]);
-        let member = flows.join(0, LOCAL.into(), 0).unwrap();
+        let member = flows.join(0, LOCAL.into(), MTU, 0).unwrap();
         assert_eq!(flows.port_rule(0), None);
         assert!(member.tagged().is_none() && member.may_listen(0xc001));
         let flows = SharedFlows::new(FlowOwnership::ByAddress, limits(2)).unwrap();
@@ -1299,7 +1365,7 @@ mod tests {
     fn an_icmp_error_about_a_tagged_port_is_its_members() {
         let flows = tagged(4, vec![0, 1, 2, 3], 0xc000, 0xc000).unwrap();
         let members: Vec<_> = (0..4)
-            .map(|k| flows.join(k, LOCAL.into(), 0).unwrap())
+            .map(|k| flows.join(k, LOCAL.into(), MTU, 0).unwrap())
             .collect();
         for tag in 0..4 {
             // A segment member `tag` sent from one of its tagged ports, and

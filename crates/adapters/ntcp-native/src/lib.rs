@@ -253,15 +253,18 @@ impl<P: PacketIo> Network<P> {
     /// Every member that should accept a port's connections listens on it.
     /// Dropping it leaves the flows: handoffs to it are then dropped.
     ///
-    /// `member` is a free member number of `flows`, and the local address
-    /// is IPv4: under `FlowOwnership::ByAddress` no other member's, under
+    /// `member` is a free member number of `flows`, under
+    /// `FlowOwnership::Hash` one its table names, and the local address is
+    /// IPv4: under `FlowOwnership::ByAddress` no other member's, under
     /// `FlowOwnership::Hash` and `FlowOwnership::TaggedPorts` every
-    /// member's. On an `EthernetNextHop::Arp` link `neighbors` is the
-    /// port's shared table, joined as by `with_shared_neighbors`: ARP
-    /// arrives on whichever queue the port steers it to, and a member that
-    /// resolved alone would never see the replies that reach the other
-    /// members' queues. An IP link or a fixed next hop needs no table.
-    /// Joining otherwise is `Error::InvalidConfig` and joins nothing.
+    /// member's. `SharedFlowLimits::packet_bytes` holds the largest IP
+    /// packet the member takes in. On an `EthernetNextHop::Arp` link
+    /// `neighbors` is the port's shared table, joined as by
+    /// `with_shared_neighbors`: ARP arrives on whichever queue the port
+    /// steers it to, and a member that resolved alone would never see the
+    /// replies that reach the other members' queues. An IP link or a fixed
+    /// next hop needs no table. Joining otherwise is `Error::InvalidConfig`
+    /// and joins nothing.
     ///
     /// Ephemeral ports avoid every member's listening ports, and
     /// `connect_from` refuses a local port whose flow to the peer another
@@ -327,7 +330,12 @@ impl<P: PacketIo> Network<P> {
         let reassembly = config.reassembly().ok_or(Error::Capacity)?;
         let flows = match flows {
             Some((flows, member)) => {
-                let member = flows.join(member, config.local_address, config.tcp.max_listeners)?;
+                let member = flows.join(
+                    member,
+                    config.local_address,
+                    config.mtu as usize,
+                    config.tcp.max_listeners,
+                )?;
                 member.reassemble(reassembly.datagram_capacity(false))?;
                 Some(member)
             }
