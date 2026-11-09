@@ -321,17 +321,58 @@ fn ipv4_frame(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, data: &[u8]
     frame.extend(data);
     frame
 }
-// The router's ICMP destination unreachable, fragmentation needed and DF
-// set (RFC 1191 section 4), about `invoking`: its header and first 8 data
-// octets (RFC 792), the least a router quotes.
-fn fragmentation_needed(invoking: &[u8], mtu: usize) -> Vec<u8> {
+// A TCP segment the router puts on the wire to the port, with a valid
+// checksum and no TCP options.
+fn tcp_frame(from: SocketAddrV4, to: SocketAddrV4, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+    let mut tcp = vec![0; 20];
+    tcp[..2].copy_from_slice(&from.port().to_be_bytes());
+    tcp[2..4].copy_from_slice(&to.port().to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = 5 << 4;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&8192u16.to_be_bytes());
+    let mut pseudo = from.ip().octets().to_vec();
+    pseudo.extend(to.ip().octets());
+    pseudo.extend([0, 6, 0, 20]);
+    pseudo.extend(&tcp);
+    let sum = checksum(&pseudo);
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+    ipv4_frame(*from.ip(), *to.ip(), 6, &tcp)
+}
+// `frame` with the IPv4 `options`, whole 32-bit words, after its base
+// header. The TCP checksum stays valid: its pseudo-header counts the TCP
+// length, not the IP header's.
+fn with_options(frame: &[u8], options: &[u8]) -> Vec<u8> {
+    let ip = l3(frame).unwrap();
+    let header = header_len(ip);
+    let mut packet = ip[..header].to_vec();
+    packet.extend(options);
+    packet[0] = 0x40 | (packet.len() / 4) as u8;
+    packet[2..4].copy_from_slice(&((ip.len() + options.len()) as u16).to_be_bytes());
+    packet[10..12].fill(0);
+    let sum = checksum(&packet);
+    packet[10..12].copy_from_slice(&sum.to_be_bytes());
+    let mut out = frame[..14].to_vec();
+    out.extend(packet);
+    out.extend(&ip[header..]);
+    out
+}
+// The router's ICMP destination unreachable of `code` about `invoking`:
+// its header and first 8 data octets (RFC 792), the least a router quotes,
+// and for fragmentation needed the next hop's MTU (RFC 1191 section 4).
+fn unreachable(invoking: &[u8], code: u8, mtu: usize) -> Vec<u8> {
     let quote = &invoking[..(header_len(invoking) + 8).min(invoking.len())];
-    let mut icmp = vec![3, 4, 0, 0, 0, 0];
+    let mut icmp = vec![3, code, 0, 0, 0, 0];
     icmp.extend((mtu as u16).to_be_bytes());
     icmp.extend(quote);
     let sum = checksum(&icmp);
     icmp[2..4].copy_from_slice(&sum.to_be_bytes());
     ipv4_frame(ROUTER, source(invoking), 1, &icmp)
+}
+// Fragmentation needed and DF set.
+fn fragmentation_needed(invoking: &[u8], mtu: usize) -> Vec<u8> {
+    unreachable(invoking, 4, mtu)
 }
 // `frame`'s IPv4 datagram in fragments of at most `limit` octets, with
 // Identification `id`; a datagram that fits, or a fragment, as it is.
@@ -375,8 +416,16 @@ struct Router {
     // Delivers that ICMP error to a queue of a member that does not own the
     // quoted flow, rather than where the dispatcher puts it.
     misdeliver_icmp: bool,
+    // Drops every TCP segment from the port and answers it with destination
+    // unreachable of this code, as a router without a route to the peer
+    // (host unreachable) or the peer itself (port unreachable) would.
+    unreachable: Option<u8>,
     // The drops: the time and the dropping packet's source port.
     drops: Vec<(u64, u16)>,
+    // IPv4 options inserted in every TCP segment of the peer's that still
+    // fits the port's MTU, and how many were.
+    options: Option<Vec<u8>>,
+    optioned: usize,
 }
 
 // The port's members, the peer and the wire between them, on one clock.
@@ -391,12 +440,18 @@ struct Lan {
     // TCP resets each member sent to the peer, and the peer to the port.
     resets: Vec<usize>,
     peer_resets: usize,
+    // TCP segments each member sent toward the peer, and every reset with
+    // its member.
+    segments: Vec<usize>,
+    reset_log: Vec<(usize, Vec<u8>)>,
 }
 impl Lan {
     fn new(members: Vec<Station>, dispatch: Dispatch, flows: Option<SharedFlows>) -> Self {
         Self {
             queues: members.iter().map(|m| m.incoming.clone()).collect(),
             resets: vec![0; members.len()],
+            segments: vec![0; members.len()],
+            reset_log: Vec::new(),
             members: members.into_iter().map(Some).collect(),
             peer: Station::peer(),
             dispatch,
@@ -445,13 +500,19 @@ impl Lan {
         if let Some(ip) = l3(&frame) {
             if is_reset(ip) {
                 self.resets[k] += 1;
+                self.reset_log.push((k, ip.to_vec()));
             }
-            if let Some(mtu) = self.router.mtu
-                && ip.len() > mtu
-            {
+            if ports(ip).is_some() {
+                self.segments[k] += 1;
+            }
+            let error = match (self.router.unreachable, self.router.mtu) {
+                (Some(code), _) if ports(ip).is_some() => Some(unreachable(ip, code, 0)),
+                (_, Some(mtu)) if ip.len() > mtu => Some(fragmentation_needed(ip, mtu)),
+                _ => None,
+            };
+            if let Some(error) = error {
                 let (local, remote) = port_pair(ip).unwrap();
                 self.router.drops.push((self.now, local));
-                let error = fragmentation_needed(ip, mtu);
                 let queue = match &self.flows {
                     Some(flows) if self.router.misdeliver_icmp => {
                         let owner = flows
@@ -473,6 +534,13 @@ impl Lan {
     fn toward_port(&mut self, frame: Vec<u8>) {
         if l3(&frame).is_some_and(is_reset) {
             self.peer_resets += 1;
+        }
+        let mut frame = frame;
+        if let Some(options) = &self.router.options
+            && l3(&frame).is_some_and(|ip| ip[9] == 6 && ip.len() + options.len() <= 1500)
+        {
+            frame = with_options(&frame, options);
+            self.router.optioned += 1;
         }
         let pieces = match self.router.fragment {
             Some(limit) => {
@@ -908,7 +976,10 @@ fn an_icmp_error_delivered_to_another_member_reaches_the_flows_owner() {
 // 5. Fragments: the router fragments the peer's datagrams into pieces of
 // at most 576 octets, which reach the queues scattered (or, under RSS, by
 // their addresses, at the member that reassembles them). The reassembler
-// hands each complete datagram to its owner.
+// hands each complete datagram to its owner. Every member but the
+// reassembler hands its fragments on and completes no datagram, yet the
+// connections it owns receive all their data, every segment of which
+// came in fragments: as the datagrams the reassembler handed to it.
 
 #[test]
 fn fragments_spread_over_queues_are_reassembled_and_reach_the_flows_owner() {
@@ -922,12 +993,39 @@ fn fragments_spread_over_queues_are_reassembled_and_reach_the_flows_owner() {
             let (flows, stations) = hash_members(n, INBOX, |config| {
                 config.reassembly_datagrams = 2 * BUDGET.transmit;
             });
+            let reassembler = flows.reassembler(PEER, ADDRESS).unwrap();
             let mut lan = Lan::new(stations, dispatch.clone(), Some(flows));
             lan.router.fragment = Some(576);
-            let Passive { lan, .. } = passive(lan, 8, 8 * MSS, 5 * SECOND);
+            let Passive { mut lan, servers } = passive(lan, 8, 8 * MSS, 5 * SECOND);
             let (handed_off, _, dropped) = lan.handoffs();
             assert!(handed_off > 0, "{n} members, {dispatch:?}");
             assert_eq!(dropped, 0);
+            let mut owners = 0;
+            for (k, server) in servers.iter().enumerate() {
+                let reassembly = lan.network(k).reassembly_counters();
+                let counters = lan.network(k).counters();
+                if k == reassembler {
+                    assert!(reassembly.completed > 0, "{n} members, {dispatch:?}");
+                    continue;
+                }
+                assert_eq!(
+                    (reassembly.held, reassembly.completed),
+                    (0, 0),
+                    "member {k} of {n}, {dispatch:?}"
+                );
+                if !server.connections.is_empty() {
+                    assert!(counters.handoffs_received > 0);
+                    owners += 1;
+                }
+                // RSS puts every unfragmented segment on its owner's queue
+                // and every fragment on the reassembler's: this member
+                // hands nothing on, and what it receives is the
+                // reassembler's datagrams alone.
+                if let Dispatch::Rss { .. } = dispatch {
+                    assert_eq!(counters.handed_off, 0, "member {k} of {n}");
+                }
+            }
+            assert!(owners > 0, "{n} members, {dispatch:?}");
         }
     }
 }
@@ -1635,4 +1733,440 @@ fn active_opens_take_their_members_tagged_ports_until_they_run_out() {
     }
     let joined = [member(2, 0xc000..=0xc002), member(3, 0xbfff..=0xc003)];
     assert!(joined.iter().all(Result::is_ok));
+}
+
+// 12. Edge cases of the classification, each on a queue of a member that
+// does not own the flow. A lone Network on the same wire is the control:
+// the flow's owner must do what it does, and no other member anything.
+
+// A lone Network on ADDRESS, without flows, in a Lan of its own.
+fn lone() -> Lan {
+    let config = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
+    let station = Station::build(|port| Network::new(config, port, SECRET, 0)).unwrap();
+    Lan::new(vec![station], Dispatch::Queue0, None)
+}
+// A port of the peer's whose flow to `local` member `k` owns.
+fn peer_port_of(flows: &SharedFlows, local: SocketAddrV4, k: usize) -> u16 {
+    (20_000..)
+        .find(|&p| flows.owner(local, SocketAddrV4::new(PEER, p)) == Some(k))
+        .unwrap()
+}
+
+// The router inserts IPv4 options (IHL > 5) in the peer's TCP segments,
+// all on queue 0: the receiving member finds the ports after the options
+// and hands every segment of another member's flow over, whose owner takes
+// it as a lone Network does. A member that read the ports at a fixed
+// offset would hand segments to members that know no such connection and
+// reset them.
+#[test]
+fn segments_with_ipv4_options_reach_the_flows_owner_which_takes_them() {
+    // Record Route with two free slots, a Timestamp with two, a Router
+    // Alert: none a source route, which native Networks refuse (below).
+    let record_route = vec![7, 11, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let timestamp = vec![68, 12, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let alert = vec![148, 4, 0, 0];
+    let mut all = record_route.clone();
+    all.extend(&timestamp);
+    all.extend(&alert);
+    for n in [2, 4] {
+        for options in [&record_route, &timestamp, &alert, &all] {
+            let mut lan = hash_lan(n, Dispatch::Queue0, INBOX);
+            lan.router.options = Some(options.clone());
+            // Every segment fits the MTU with the options: SYN, ACK, data
+            // and more of every connection carry them.
+            let Passive { mut lan, servers } = passive(lan, 16, 1000, 5 * SECOND);
+            assert!(lan.router.optioned >= 3 * 16, "{}", lan.router.optioned);
+            for (k, server) in servers.iter().enumerate().skip(1) {
+                assert!(!server.connections.is_empty(), "member {k} of {n}");
+                assert!(lan.network(k).counters().handoffs_received > 0);
+            }
+            assert_eq!(lan.handoffs().2, 0);
+        }
+    }
+}
+
+// A Loose Source Route the peer's SYNs carry (completed, as a datagram
+// that reached its destination carries it): native Networks refuse source
+// routes. The receiving member hands each SYN to the owner, whose Host
+// refuses it as the lone Network's does: discarded, unanswered, no
+// connection.
+#[test]
+fn a_source_routed_syn_is_refused_by_the_flows_owner_as_by_a_lone_network() {
+    // Through the router, its one hop done, and an end of options.
+    let mut route = vec![131, 7, 8];
+    route.extend(ROUTER.octets());
+    route.push(0);
+    let syns = |lan: &mut Lan, from: u16| {
+        lan.router.options = Some(route.clone());
+        let mut servers: Vec<_> = (0..lan.members.len())
+            .map(|k| Echo::new(lan.network(k)))
+            .collect();
+        let to = SocketAddr::new(ADDRESS.into(), LISTEN);
+        let connection = lan.peer.network.connect_from(to, Some(from)).unwrap();
+        lan.run(3 * SECOND + 500_000, |lan| {
+            for (k, server) in servers.iter_mut().enumerate() {
+                server.serve(lan.network(k));
+            }
+            false
+        });
+        let info = lan.peer.network.connection_info(connection).unwrap();
+        assert_eq!(info.state, State::SynSent);
+        assert!(servers.iter().all(|s| s.connections.is_empty()));
+        assert_eq!(lan.segments, vec![0; lan.members.len()]);
+        lan.assert_no_resets();
+        // The SYN and its retransmissions at 1 and 3 seconds.
+        assert_eq!(lan.router.optioned, 3);
+        lan.router.optioned as u64
+    };
+    let mut control = lone();
+    let refused = syns(&mut control, 20_000);
+    assert_eq!(control.network(0).counters().discarded, refused);
+    for n in [2, 4] {
+        let mut lan = hash_lan(n, Dispatch::Queue0, INBOX);
+        let owner = n - 1;
+        let local = SocketAddrV4::new(ADDRESS, LISTEN);
+        let from = peer_port_of(lan.flows.as_ref().unwrap(), local, owner);
+        let refused = syns(&mut lan, from);
+        for k in 0..n {
+            let counters = lan.network(k).counters();
+            let expected = match k {
+                0 => (refused, 0, 0),
+                k if k == owner => (0, refused, refused),
+                _ => (0, 0, 0),
+            };
+            assert_eq!(
+                (
+                    counters.handed_off,
+                    counters.handoffs_received,
+                    counters.discarded
+                ),
+                expected,
+                "member {k} of {n}"
+            );
+        }
+    }
+}
+
+// The router answers every TCP segment from the port with destination
+// unreachable of `code`; member `k` connects to the peer. The connection
+// after `limit`, and the times of the dropped segments since the first.
+fn connect_unreachable(
+    lan: &mut Lan,
+    k: usize,
+    code: u8,
+    limit: u64,
+) -> (ConnectionInfo, Vec<u64>) {
+    lan.router.unreachable = Some(code);
+    let to = SocketAddr::new(PEER.into(), LISTEN);
+    let connection = lan.network(k).connect(to).unwrap();
+    lan.run(limit, |_| false);
+    let info = lan.network(k).connection_info(connection).unwrap();
+    let first = lan.router.drops[0].0;
+    let drops = lan.router.drops.iter().map(|&(at, _)| at - first).collect();
+    lan.assert_no_resets();
+    (info, drops)
+}
+
+// An ICMP error about a member's own SYN, on queue 0, of another member:
+// port unreachable is a hard error, which closes the connection; host
+// unreachable a soft one, after which the SYN is retransmitted on its own
+// clock. The owner reacts exactly as a lone Network does, under hashed
+// flows and under flows by address, and every error is handed to it.
+#[test]
+fn an_icmp_error_about_a_members_own_syn_reaches_it_as_a_lone_networks_would() {
+    let limit = 3 * SECOND + 500_000;
+    for (code, state, reason) in [
+        (3, State::Closed, Some(CloseReason::NetworkError)),
+        (1, State::SynSent, None),
+    ] {
+        let (info, drops) = connect_unreachable(&mut lone(), 0, code, limit);
+        assert_eq!((info.state, info.reason), (state, reason), "code {code}");
+        let expected = drops;
+        if code == 1 {
+            assert_eq!(expected.len(), 3, "{expected:?}");
+        } else {
+            assert_eq!(expected, vec![0]);
+        }
+        let groups = [
+            ("hashed", 2, hash_lan(2, Dispatch::Queue0, INBOX)),
+            ("hashed", 4, hash_lan(4, Dispatch::Queue0, INBOX)),
+            ("by address", 2, by_address_lan(2)),
+        ];
+        for (ownership, n, mut lan) in groups {
+            let k = n - 1;
+            let (info, drops) = connect_unreachable(&mut lan, k, code, limit);
+            let what = format!("code {code}, member {k} of {n}, {ownership}");
+            assert_eq!((info.state, info.reason), (state, reason), "{what}");
+            assert_eq!(drops, expected, "{what}");
+            let errors = drops.len() as u64;
+            let counters = lan.network(0).counters();
+            assert_eq!(counters.handed_off, errors, "{what}");
+            let counters = lan.network(k).counters();
+            assert_eq!(counters.handoffs_received, errors, "{what}");
+        }
+    }
+}
+// Members with an address each, on queue 0, without traffic yet.
+fn by_address_lan(n: usize) -> Lan {
+    let flows = by_address(n);
+    let table = neighbors(n);
+    let stations = (0..n)
+        .map(|k| {
+            let config = config(member_ip(k), PORT_MAC, MEMBER_CONNECTIONS);
+            join(&flows, &table, k, config)
+        })
+        .collect();
+    Lan::new(stations, Dispatch::Queue0, Some(flows))
+}
+
+// Segments of no connection the router puts on queue 0, for a flow member
+// `owner` owns: an ACK is answered by exactly one reset, the owner's, and a
+// reset by nothing at all, as the lone Network answers them. Both are
+// shorter than Ethernet's minimum frame and arrive padded to it, as a MAC
+// pads them.
+#[test]
+fn a_segment_of_no_connection_is_reset_by_the_flows_owner_alone() {
+    let local = SocketAddrV4::new(ADDRESS, 40_000);
+    let padded = |mut frame: Vec<u8>| {
+        assert!(frame.len() < 60);
+        frame.resize(60, 0);
+        frame
+    };
+    let stray = |lan: &mut Lan, from: u16, owner: usize| {
+        let remote = SocketAddrV4::new(PEER, from);
+        let ack = padded(tcp_frame(remote, local, 1000, 5000, 0x10));
+        lan.queues[0].lock().unwrap().push_back(ack);
+        let until = lan.now + 100_000;
+        lan.run(until, |_| false);
+        let mut expected = vec![0; lan.members.len()];
+        expected[owner] = 1;
+        assert_eq!(lan.resets, expected);
+        assert_eq!(lan.segments, expected);
+        // RFC 9293 section 3.10.7.1: the reset takes its sequence number
+        // from the segment's acknowledgment.
+        let (_, reset) = &lan.reset_log[0];
+        assert_eq!(port_pair(reset), Some((local.port(), from)));
+        let tcp = &reset[header_len(reset)..];
+        assert_eq!(tcp[4..8], 5000u32.to_be_bytes());
+        let reset = padded(tcp_frame(remote, local, 5000, 0, 0x04));
+        lan.queues[0].lock().unwrap().push_back(reset);
+        let until = lan.now + 100_000;
+        lan.run(until, |_| false);
+        assert_eq!(lan.resets, expected);
+        assert_eq!(lan.segments, expected);
+    };
+    stray(&mut lone(), 20_000, 0);
+    for n in [2, 4] {
+        let mut lan = hash_lan(n, Dispatch::Queue0, INBOX);
+        let owner = n - 1;
+        let from = peer_port_of(lan.flows.as_ref().unwrap(), local, owner);
+        stray(&mut lan, from, owner);
+        assert_eq!(lan.network(0).counters().handed_off, 2);
+        assert_eq!(lan.network(owner).counters().handoffs_received, 2);
+        assert_eq!(lan.handoffs(), (2, 2, 0));
+    }
+}
+
+// Tier 1 with everything that is no TCP segment on a wrong queue: port
+// rules steer the segments, while the peer's datagrams arrive fragmented,
+// every fragment one queue past its reassembler, and every
+// fragmentation-needed error at a member that does not own its flow. Each
+// member's transfer completes and learns its path MTU.
+#[test]
+fn tagged_flows_survive_fragments_and_icmp_errors_all_on_other_queues() {
+    for n in [2, 4] {
+        let (flows, stations) = tagged_members(n, |config| {
+            with_pmtud(config);
+            config.reassembly_datagrams = 2 * BUDGET.transmit;
+        });
+        let rules = (0..n).map(|k| flows.port_rule(k).unwrap()).collect();
+        let shifted = Dispatch::Rss {
+            key: DEFAULT_FLOW_KEY.to_vec(),
+            reta: (0..TABLE).map(|i| (i + 1) % n).collect(),
+        };
+        let dispatch = Dispatch::Rules(rules, Box::new(shifted));
+        let reassembler = flows.reassembler(PEER, ADDRESS).unwrap();
+        let mut lan = Lan::new(stations, dispatch, Some(flows));
+        lan.router.misdeliver_icmp = true;
+        lan.router.fragment = Some(576);
+        icmp_case(&mut lan);
+        assert_eq!(lan.handoffs().2, 0);
+        for k in 0..n {
+            let reassembly = lan.network(k).reassembly_counters();
+            if k == reassembler {
+                assert!(reassembly.completed > 0, "{n} members");
+            } else {
+                assert_eq!(reassembly.completed, 0, "member {k} of {n}");
+            }
+            assert!(lan.network(k).counters().handoffs_received > 0);
+        }
+    }
+}
+
+// Members on their own threads that block in poll(2) on the eventfd they
+// gave `set_neighbor_wake_fd`, for as long as their drive's next deadline
+// allows. The port has one queue, member 0's, whose arrivals signal member
+// 0's eventfd as a receive interrupt would. Every other member's next hop
+// resolves, and its SYN/ACK and echo arrive, only on member 0's queue: it
+// makes progress before its SYN's one-second retransmission timeout only
+// if member 0's resolutions and handoffs wake it.
+#[cfg(target_os = "linux")]
+#[test]
+fn blocked_members_are_woken_by_another_members_handoffs() {
+    use std::{
+        fs::File,
+        io::{Read, Write},
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        sync::atomic::AtomicBool,
+        time::Instant,
+    };
+    // Non-blocking, as `set_neighbor_wake_fd` wants it: a write that would
+    // block is not retried.
+    fn eventfd() -> File {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0, "eventfd: {}", io::Error::last_os_error());
+        File::from(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    // Blocks until `file` is readable or `timeout` (ms, -1 without end)
+    // passes; whether it was readable, then reset.
+    fn wait(file: &File, timeout: i32) -> bool {
+        let mut entry = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut entry, 1, timeout) } <= 0 {
+            return false;
+        }
+        let _ = (&*file).read(&mut [0; 8]);
+        true
+    }
+    fn signal(file: &File) {
+        let _ = (&*file).write(&1u64.to_ne_bytes());
+    }
+    // Well inside the SYN's initial retransmission timeout.
+    const DEADLINE: Duration = Duration::from_millis(800);
+    for n in [2, 4] {
+        let flows = hash_flows(n, INBOX);
+        let table = neighbors(n);
+        let start = Instant::now();
+        let clock = move || start.elapsed().as_micros() as u64;
+        let mut peer = Station::peer();
+        let listener = peer.network.listen(LISTEN, 16).unwrap();
+        let incoming: Vec<Frames> = (0..n).map(|_| Frames::default()).collect();
+        let wakes: Vec<File> = (0..n).map(|_| eventfd()).collect();
+        let len = 8 * 1024;
+        let finished = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready, ready_rx) = mpsc::channel();
+        let workers: Vec<_> = (0..n)
+            .map(|k| {
+                let (flows, table, ready) = (flows.clone(), table.clone(), ready.clone());
+                let (finished, stop) = (finished.clone(), stop.clone());
+                let port = Station::port(&incoming[k], &peer.incoming);
+                let wake = wakes[k].try_clone().unwrap();
+                thread::spawn(move || {
+                    let config = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
+                    let mut network = Network::with_shared_flows(
+                        config,
+                        port,
+                        SECRET,
+                        clock(),
+                        Some(&table),
+                        &flows,
+                        k,
+                    )
+                    .unwrap();
+                    let fd = OwnedFd::from(wake.try_clone().unwrap());
+                    network.set_neighbor_wake_fd(fd).unwrap();
+                    ready.send(()).unwrap();
+                    let data = payload(k, len);
+                    let client = network
+                        .connect(SocketAddr::new(PEER.into(), LISTEN))
+                        .unwrap();
+                    let (mut sent, mut echoed) = (0, Vec::new());
+                    let mut out = [0; 4096];
+                    let (mut counted, mut woken) = (false, 0);
+                    while !stop.load(Ordering::Acquire) {
+                        let report = network.drive(clock(), BUDGET).unwrap();
+                        let mut busy = report.more_work;
+                        if sent < data.len()
+                            && let Ok(receipt) =
+                                network.try_write(client, &data[sent..], WriteOptions::default())
+                        {
+                            sent += receipt.accepted;
+                            busy |= receipt.accepted != 0;
+                        }
+                        while let Ok(ReadOutcome::Data { len, .. }) =
+                            network.try_read(client, &mut out)
+                        {
+                            echoed.extend_from_slice(&out[..len]);
+                        }
+                        if !counted && echoed.len() == data.len() {
+                            finished.fetch_add(1, Ordering::AcqRel);
+                            counted = true;
+                        }
+                        if busy {
+                            continue;
+                        }
+                        let timeout = report.next_deadline.map_or(-1, |at| {
+                            let ms = at.saturating_sub(clock()).div_ceil(1000);
+                            ms.min(i32::MAX as u64) as i32
+                        });
+                        woken += usize::from(wait(&wake, timeout));
+                    }
+                    (echoed, network.counters(), woken)
+                })
+            })
+            .collect();
+        drop(ready);
+        for _ in 0..n {
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        let begun = Instant::now();
+        let mut echoes: Vec<(ConnId, VecDeque<u8>)> = Vec::new();
+        let mut out = [0; 4096];
+        while finished.load(Ordering::Acquire) < n && begun.elapsed() < DEADLINE {
+            peer.network.drive(clock(), BUDGET).unwrap();
+            let sent = peer.sent();
+            if !sent.is_empty() {
+                incoming[0].lock().unwrap().extend(sent);
+                signal(&wakes[0]);
+            }
+            while let Ok(server) = peer.network.accept(listener) {
+                echoes.push((server, VecDeque::new()));
+            }
+            for (server, queued) in &mut echoes {
+                while let Ok(ReadOutcome::Data { len, .. }) =
+                    peer.network.try_read(*server, &mut out)
+                {
+                    queued.extend(&out[..len]);
+                }
+                if !queued.is_empty()
+                    && let Ok(receipt) = peer.network.try_write(
+                        *server,
+                        queued.make_contiguous(),
+                        WriteOptions::default(),
+                    )
+                {
+                    queued.drain(..receipt.accepted);
+                }
+            }
+            thread::sleep(Duration::from_micros(100));
+        }
+        let elapsed = begun.elapsed();
+        stop.store(true, Ordering::Release);
+        wakes.iter().for_each(signal);
+        let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let done = finished.load(Ordering::Acquire);
+        assert_eq!(done, n, "{done} of {n} members echoed within {elapsed:?}");
+        for (k, (echoed, counters, woken)) in results.iter().enumerate() {
+            assert!(*echoed == payload(k, len), "member {k} of {n}");
+            assert!(*woken > 0, "member {k} of {n}");
+            assert_eq!(counters.handoffs_dropped, 0);
+            if k > 0 {
+                assert!(counters.handoffs_received > 0, "member {k} of {n}");
+            }
+        }
+    }
 }
