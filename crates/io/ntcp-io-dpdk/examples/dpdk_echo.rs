@@ -11,7 +11,7 @@
 //   dpdk_echo --dev DEVARGS [--eal ARG]... --ip A.B.C.D [--ip ...] --prefix LEN
 //             [--gateway A.B.C.D] [--neighbor A.B.C.D=MAC]... --server IP:PORT
 //             [--connections N] [--duration SECS] [--isolate] [--rx-timestamps]
-//             [--cpu N]... [--members N [--steering auto|rss|none]]
+//             [--cpu N]... [--members N [--steering auto|rules|rss|none]]
 //             [--secret-from-urandom]
 //
 // Questions an embedding answers, and this example's answers:
@@ -67,6 +67,27 @@
 //   about (N-1)/N of them, to its owner. Ownership then hashes with ntcp's
 //   default key over a round-robin table. Non-IP frames go where the port
 //   puts unhashed traffic; the shared ARP table serves every member.
+// - What does `--steering rules` add? Tier 1 of the design, ownership by
+//   `FlowOwnership::TaggedPorts`: a member's active opens take only local
+//   ports tagged with its number, `0xC000 | k` under the mask `0xC000 |
+//   2^b - 1` (b bits number the members), and one TCP destination-port
+//   rule per member (`SharedFlows::port_rule`, `Port::steer_tcp_port`)
+//   steers what arrives for them to its queue, whatever the peer. The
+//   other flows are owned and reach their queues as under rss when the
+//   device's RSS is usable, else as under none. The tagged ports lie in
+//   NetworkConfig's default ephemeral ports, 49152-65535, so every member
+//   opens from its own.
+// - Do the rules overlap? Without `--isolate` they do not: what they leave
+//   follows RSS, or lands on queue 0, with no rule of its own. An isolated
+//   port takes in only what rules match, so the address's other traffic
+//   needs `steer_ipv4` to queue 0, which matches the tagged ports too, at
+//   the port rules' rte_flow priority. rte_flow leaves the order of such
+//   rules undefined; mlx5 matches the deepest layer first, so its port
+//   rules win. The example combines the two only on mlx5
+//   (`Port::driver_name` `mlx5_pci` or `mlx5_auxiliary`) and refuses rules
+//   on any other isolated port: where the address rule won, every frame
+//   would reach queue 0, which still works by handoff but is not the
+//   steering it would report.
 // - Why is ownership fixed at start? A connection's owner must not change
 //   while it lives: active opens pick local ports whose flows they own, and
 //   members route packets by the function without asking each other. It is
@@ -75,25 +96,27 @@
 //   names some member nowhere (the null PMD's is all queue 0) becomes
 //   round-robin, since that member would own no flows and could open no
 //   connection. A device that later moves its table only costs handoffs.
-// - What does `--steering auto` choose? rss if the device takes RSS at
-//   start and the state read back is usable: Toeplitz hashing, the IPv4 TCP
-//   hash type granted, a key of at least 16 octets, and a power-of-two
-//   table naming every member's queue and no other. A copy of the device's
-//   hash predicts its queues only for Toeplitz. A PMD that does not report
-//   its function (mlx5, whose function is Toeplitz) is assumed to use it,
-//   and `METRIC handed_off` near zero confirms the guess; a wrong guess
-//   costs handoffs, never a connection. A device that refuses RSS at start
-//   is started again without it. Otherwise none, as always with
-//   `--isolate` (an isolated port spreads nothing by RSS); a port that took
-//   RSS but whose state is unusable keeps spreading by it, which costs
-//   handoffs but no connection. The choice is printed and reported as
-//   `METRIC steering`. Masked local-port rules (`rules`, tier 1 of the
-//   design) are not offered yet.
+// - What does `--steering auto` choose? rules if every member's rule
+//   validates and installs (isolated, only on mlx5). Otherwise rss if the
+//   device takes RSS at start and the state read back is usable: Toeplitz
+//   hashing, the IPv4 TCP hash type granted, a key of at least 16 octets,
+//   and a power-of-two table naming every member's queue and no other. A
+//   copy of the device's hash predicts its queues only for Toeplitz. A PMD
+//   that does not report its function (mlx5, whose function is Toeplitz)
+//   is assumed to use it, and `METRIC handed_off` near zero confirms the
+//   guess; a wrong guess costs handoffs, never a connection. A device that
+//   refuses RSS at start is started again without it. Otherwise none, as
+//   always on an isolated port without rules (it spreads nothing by RSS);
+//   a port that took RSS but whose state is unusable keeps spreading by
+//   it, which costs handoffs but no connection. The choice, and why the
+//   tiers above it were passed over, are printed, and the choice is
+//   reported as `METRIC steering`. An explicit `--steering rules` or `rss`
+//   fails instead of falling back.
 
 use ntcp_io::ClockDescriptor;
 use ntcp_io_dpdk::{
-    ClockCalibration, ClockFit, Eal, HostedQueue, Port, PortConfig, QueueHandle, RssAlgorithm,
-    bracketed_reading,
+    ClockCalibration, ClockFit, Eal, Flow, HostedQueue, Port, PortConfig, QueueHandle,
+    RssAlgorithm, bracketed_reading,
 };
 use ntcp_native::{
     CallerTimebase, ConnId, DEFAULT_FLOW_KEY, Error as NetError, EthernetNextHop, Event,
@@ -120,6 +143,14 @@ const CALIBRATION_WINDOW: usize = 32;
 // Device clock reads per paired reading; the most tightly bracketed is kept.
 const CALIBRATION_READS: usize = 3;
 const REQUEST_LEN: usize = 16;
+// Tagged local ports of `--steering rules`: the IANA dynamic range
+// 49152-65535, NetworkConfig's default ephemeral ports.
+const TAG_PREFIX: u16 = 0xC000;
+const TAG_MASK: u16 = 0xC000;
+// Drivers that match a TCP port rule before an IPv4 rule for the same
+// address at one rte_flow priority: mlx5 orders such rules by their deepest
+// layer, on PCI functions and subfunctions alike.
+const PORT_RULES_FIRST: [&str; 2] = ["mlx5_pci", "mlx5_auxiliary"];
 
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
 
@@ -146,11 +177,13 @@ struct Args {
     steering: Steering,
 }
 
-// How frames of the shared address reach their members. Masked local-port
-// rules (tier 1) will be a third mode, chosen before rss by `auto`.
+// How frames of the shared address reach their members: tiers 1 (masked
+// local-port rules), 2 (rss) and 3 (none) of the design. `auto` takes the
+// first that works.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Steering {
     Auto,
+    Rules,
     Rss,
     Off,
 }
@@ -158,15 +191,18 @@ enum Steering {
 const USAGE: &str = "usage: dpdk_echo --dev DEVARGS [--eal ARG]... --ip A.B.C.D [--ip ...] \
 --prefix LEN [--gateway A.B.C.D] [--neighbor A.B.C.D=MAC]... --server IP:PORT \
 [--connections N] [--duration SECS] [--isolate] [--rx-timestamps] [--cpu N]... \
-[--members N [--steering auto|rss|none]] [--secret-from-urandom]
+[--members N [--steering auto|rules|rss|none]] [--secret-from-urandom]
 
 Without --members, one Network per --ip, each on its own queue (and --cpu, if given).
 --members N: N Networks share the single --ip, one per queue (and --cpu, if given),
 and open --connections (at least N) between them. --steering (default auto) picks how
 frames reach them, reported as METRIC steering: 1 none (ntcp's own key, software
 handoff; RSS off, so queue 0 receives), 2 rss (the device's RSS key and table
-mirrored); auto takes rss when usable, else none. Code 3 is reserved for masked port
-rules.";
+mirrored), 3 rules (member k opens from local ports 0xC000 | k under the mask
+0xC000 | 2^b - 1, b bits numbering the members, and one TCP port rule per member
+steers them to its queue; other flows as rss when usable, else as none; with
+--isolate only on mlx5, which orders the port rules before the address rule).
+auto takes rules when every member's rule installs, else rss when usable, else none.";
 
 fn parse_mac(text: &str) -> Result<[u8; 6], String> {
     let mut mac = [0; 6];
@@ -230,11 +266,10 @@ fn parse_args() -> Result<Args, String> {
             "--steering" => {
                 args.steering = match value()?.as_str() {
                     "auto" => Steering::Auto,
+                    "rules" => Steering::Rules,
                     "rss" => Steering::Rss,
                     "none" => Steering::Off,
-                    // Masked local-port rules, tier 1 of shared flows.
-                    "rules" => return Err("--steering rules is not supported yet".into()),
-                    _ => return Err(bad("mode (auto, rss or none)")),
+                    _ => return Err(bad("mode (auto, rules, rss or none)")),
                 };
                 steering = true;
             }
@@ -409,10 +444,15 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     config.isolate = args.isolate;
     config.rx_timestamps = args.rx_timestamps;
     // An isolated port spreads nothing by RSS; Port::start refuses both.
+    // Under rules, RSS spreads the flows no rule takes.
     config.rss = args.members.is_some()
-        && (args.steering == Steering::Rss || args.steering == Steering::Auto && !args.isolate);
+        && match args.steering {
+            Steering::Rss => true,
+            Steering::Auto | Steering::Rules => !args.isolate,
+            Steering::Off => false,
+        };
     let port = match Port::start(eal, config.clone()) {
-        Err(error) if config.rss && args.steering == Steering::Auto => {
+        Err(error) if config.rss && args.steering != Steering::Rss => {
             eprintln!("STEERING rss refused at start ({error}); starting without");
             config.rss = false;
             Port::start(eal, config.clone())?
@@ -428,8 +468,21 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         port.clock()
     );
     // Before any member joins: ownership is fixed for the port's life.
-    let ownership = match args.members {
-        Some(members) => Some(ownership(&port, &args, members)?),
+    let steered = match args.members {
+        Some(members) => {
+            let limits = SharedFlowLimits {
+                members,
+                // As many packets as an RX ring holds: under `none` queue 0
+                // receives every member's frames and passes them on, so an
+                // inbox stands in for the ring the device would have filled
+                // for its member, and a longer backlog is dropped as an
+                // overflowing ring drops it.
+                inbox_packets: usize::from(config.rx_desc),
+                // The port's largest IP packet.
+                packet_bytes: usize::from(config.mtu),
+            };
+            Some(steer(&port, &args, limits)?)
+        }
         None => None,
     };
     // Connections per worker: every address opens them all, members split them.
@@ -452,29 +505,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     )?;
     let mut rules = Vec::new();
     let mut shared = None;
-    if let Some((ownership, steering)) = ownership {
-        let ip = args.ips[0];
-        if steering == Steering::Off && args.isolate {
-            rules.push(
-                port.steer_ipv4(ip, 0)
-                    .map_err(|e| format!("steer {ip} to queue 0: {e}"))?,
-            );
-            eprintln!("FLOW {ip} -> queue 0");
-        }
-        let flows = SharedFlows::new(
-            ownership,
-            SharedFlowLimits {
-                members: threads,
-                // As many packets as an RX ring holds: under `none` queue 0
-                // receives every member's frames and passes them on, so an
-                // inbox stands in for the ring the device would have filled
-                // for its member, and a longer backlog is dropped as an
-                // overflowing ring drops it.
-                inbox_packets: usize::from(config.rx_desc),
-                // The port's largest IP packet.
-                packet_bytes: usize::from(config.mtu),
-            },
-        )?;
+    if let Some((flows, steering, installed)) = steered {
+        rules = installed;
         shared = Some((flows, steering));
     } else {
         for (queue, &ip) in args.ips.iter().enumerate() {
@@ -538,39 +570,130 @@ fn random_secret() -> Result<[u8; 32], String> {
     Ok(secret)
 }
 
-// The shared address's ownership function, fixed for the port's life, and
-// the steering it relies on (never Auto). Member k drives queue k.
-fn ownership(
+// The shared address's flows, with their ownership fixed for the port's
+// life, the steering they rely on (never Auto) and the rules it installed.
+// Member k drives queue k.
+fn steer(
     port: &Port,
     args: &Args,
-    members: usize,
-) -> Result<(FlowOwnership, Steering), String> {
-    let rss = if args.steering == Steering::Off {
+    limits: SharedFlowLimits,
+) -> Result<(SharedFlows, Steering, Vec<Flow>), String> {
+    let members = limits.members;
+    let ip = args.ips[0];
+    // Every steering's hash: the device's, when a copy of it predicts the
+    // queues, else ntcp's key over a round-robin table.
+    let mirror = if args.steering == Steering::Off {
         Err("requested".to_owned())
     } else {
         spread(port, members).and_then(|rss| usable(rss, members))
     };
-    // Masked local-port rules (tier 1) will be tried here first.
-    match rss {
-        Ok(ownership) => {
-            eprintln!("STEERING rss: the device's key and table");
-            Ok((ownership, Steering::Rss))
-        }
-        Err(why) if args.steering == Steering::Rss => Err(format!("--steering rss: {why}")),
-        Err(why) => {
-            eprintln!("STEERING none ({why}): ntcp's key, software handoff");
-            // Entries enough that members not a power of two in number
-            // still own nearly equal shares.
-            let table = (0..members.next_power_of_two().max(128))
+    let (key, table) = match &mirror {
+        Ok(hash) => hash.clone(),
+        Err(why) if args.steering == Steering::Rss => return Err(format!("--steering rss: {why}")),
+        // Entries enough that members not a power of two in number
+        // still own nearly equal shares.
+        Err(_) => (
+            DEFAULT_FLOW_KEY.to_vec(),
+            (0..members.next_power_of_two().max(128))
                 .map(|entry| entry % members)
-                .collect();
-            let ownership = FlowOwnership::Hash {
-                key: DEFAULT_FLOW_KEY.to_vec(),
-                table,
-            };
-            Ok((ownership, Steering::Off))
+                .collect(),
+        ),
+    };
+    if matches!(args.steering, Steering::Rules | Steering::Auto) {
+        let ownership = FlowOwnership::TaggedPorts {
+            key: key.clone(),
+            table: table.clone(),
+            prefix: TAG_PREFIX,
+            prefix_mask: TAG_MASK,
+        };
+        let tagged = SharedFlows::new(ownership, limits)
+            .map_err(|e| format!("shared flows: {e}"))
+            .and_then(|flows| Ok((tag_rules(port, &flows, ip, args.isolate)?, flows)));
+        match tagged {
+            Ok((rules, flows)) => {
+                match &mirror {
+                    Ok(_) => eprintln!(
+                        "STEERING rules: tagged ports by rule, other flows by the device's key \
+                         and table"
+                    ),
+                    Err(why) => eprintln!(
+                        "STEERING rules: tagged ports by rule, other flows by ntcp's key and \
+                         software handoff (rss: {why})"
+                    ),
+                }
+                return Ok((flows, Steering::Rules, rules));
+            }
+            Err(why) if args.steering == Steering::Rules => {
+                return Err(format!("--steering rules: {why}"));
+            }
+            Err(why) => eprintln!("STEERING rules refused: {why}"),
         }
     }
+    let flows = SharedFlows::new(FlowOwnership::Hash { key, table }, limits)
+        .map_err(|e| format!("shared flows: {e}"))?;
+    let why = match mirror {
+        Ok(_) => {
+            eprintln!("STEERING rss: the device's key and table");
+            return Ok((flows, Steering::Rss, Vec::new()));
+        }
+        Err(why) => why,
+    };
+    eprintln!("STEERING none ({why}): ntcp's key, software handoff");
+    let mut rules = Vec::new();
+    if args.isolate {
+        rules.push(
+            port.steer_ipv4(ip, 0)
+                .map_err(|e| format!("steer {ip} to queue 0: {e}"))?,
+        );
+        eprintln!("FLOW {ip} -> queue 0");
+    }
+    Ok((flows, Steering::Off, rules))
+}
+
+// Member k's tagged ports to queue k (`SharedFlows::port_rule`) and, on an
+// isolated port, which takes in only what rules match, the address's other
+// traffic to queue 0. All or none: the rules installed before a refusal are
+// destroyed with the error.
+fn tag_rules(
+    port: &Port,
+    flows: &SharedFlows,
+    ip: Ipv4Addr,
+    isolate: bool,
+) -> Result<Vec<Flow>, String> {
+    if isolate {
+        let driver = port.driver_name().map_err(|e| format!("driver: {e}"))?;
+        if !PORT_RULES_FIRST.contains(&driver.as_str()) {
+            return Err(format!(
+                "isolated, {ip} needs an ipv4 rule beside the port rules, and {driver} \
+                 may match it first"
+            ));
+        }
+    }
+    let members = flows.limits().members;
+    let mut rules = Vec::with_capacity(members + 1);
+    let mut lines = Vec::with_capacity(members + 1);
+    for member in 0..members {
+        let (value, mask) = flows.port_rule(member).ok_or("no tagged ports")?;
+        let queue = member as u16;
+        let flow = port
+            .steer_tcp_port(ip, value, mask, queue)
+            .map_err(|e| format!("member {member}'s rule {value:#06x}/{mask:#06x}: {e}"))?;
+        rules.push(flow);
+        lines.push(format!(
+            "FLOW {ip} tcp dst port {value:#06x}/{mask:#06x} -> queue {queue}"
+        ));
+    }
+    if isolate {
+        let flow = port
+            .steer_ipv4(ip, 0)
+            .map_err(|e| format!("steer {ip} to queue 0: {e}"))?;
+        rules.push(flow);
+        lines.push(format!("FLOW {ip} -> queue 0, after the port rules"));
+    }
+    for line in lines {
+        eprintln!("{line}");
+    }
+    Ok(rules)
 }
 
 // The port's RSS state, with a table that names every member: a member the
@@ -614,10 +737,11 @@ fn names_every_member(reta: &[u16], members: usize) -> bool {
     (0..members).all(|member| reta.iter().any(|&queue| usize::from(queue) == member))
 }
 
-// RSS the members can mirror: TCP hashed by Toeplitz over addresses and
-// ports with a key that covers them, and a table whose low hash bits index
-// it and that names every member and nothing else.
-fn usable(rss: ntcp_io_dpdk::Rss, members: usize) -> Result<FlowOwnership, String> {
+// RSS the members can mirror, as the key and table of their ownership: TCP
+// hashed by Toeplitz over addresses and ports with a key that covers them,
+// and a table whose low hash bits index it and that names every member and
+// nothing else.
+fn usable(rss: ntcp_io_dpdk::Rss, members: usize) -> Result<(Vec<u8>, Vec<usize>), String> {
     match rss.algorithm {
         RssAlgorithm::Toeplitz => {}
         // mlx5 does not report its function, Toeplitz. Any PMD that does not
@@ -642,10 +766,7 @@ fn usable(rss: ntcp_io_dpdk::Rss, members: usize) -> Result<FlowOwnership, Strin
     if !names_every_member(&rss.reta, members) {
         return Err("the reta misses a member".into());
     }
-    Ok(FlowOwnership::Hash {
-        key: rss.key,
-        table: rss.reta.into_iter().map(usize::from).collect(),
-    })
+    Ok((rss.key, rss.reta.into_iter().map(usize::from).collect()))
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -720,6 +841,7 @@ fn summarize(reports: &[Report], neighbors: &SharedNeighbors, steering: Option<S
         let code = match steering {
             Steering::Off => 1,
             Steering::Rss => 2,
+            Steering::Rules => 3,
             Steering::Auto => unreachable!("auto resolves at start"),
         };
         println!("METRIC steering={code}");
@@ -772,6 +894,8 @@ fn serve_into(
         report.clock = Some("device clock readable, but RX timestamps are off".into());
     }
 
+    // The default ephemeral ports, 49152-65535, hold every member's tagged
+    // ports under `--steering rules` (TAG_PREFIX and TAG_MASK).
     let mut config = NetworkConfig::new(IpAddr::V4(worker.ip), 1500);
     config.tcp.max_connections = worker.connections;
     config.tcp.connection.timebase = CallerTimebase {

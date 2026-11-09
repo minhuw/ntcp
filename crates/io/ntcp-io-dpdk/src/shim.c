@@ -629,6 +629,16 @@ int ntcp_dpdk_port_mac(uint16_t port, uint8_t mac[6]) {
     return 0;
 }
 
+// The ethdev driver name (dev_info.driver_name), NUL-terminated within
+// capacity.
+int ntcp_dpdk_port_driver(uint16_t port, char *name, size_t capacity) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    snprintf(name, capacity, "%s", info.driver_name ? info.driver_name : "");
+    return 0;
+}
+
 // ETH / IPV4 (exact destination) -> QUEUE. dst is in network byte order.
 void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
                           char *message, size_t capacity) {

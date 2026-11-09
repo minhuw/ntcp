@@ -75,6 +75,7 @@ unsafe extern "C" {
     fn ntcp_dpdk_port_release(port: u16, owner: u64, started: i32);
     fn ntcp_dpdk_read_clock(port: u16, clock: *mut u64) -> i32;
     fn ntcp_dpdk_port_mac(port: u16, mac: *mut u8) -> i32;
+    fn ntcp_dpdk_port_driver(port: u16, name: *mut c_char, capacity: usize) -> i32;
     fn ntcp_dpdk_flow_ipv4(
         port: u16,
         dst: u32,
@@ -503,6 +504,23 @@ impl Port {
         mac_address(self.inner.port)
     }
 
+    /// The ethdev driver serving the port (rte_eth_dev_info driver_name),
+    /// such as `mlx5_pci` for a ConnectX PCI function, `net_null` or
+    /// `net_ring`. Behaviour rte_flow leaves to the PMD, such as the order
+    /// of overlapping rules (`steer_tcp_port`), is known only per driver.
+    pub fn driver_name(&self) -> io::Result<String> {
+        let mut name = [0; 64];
+        // SAFETY: valid port; buffer capacity is passed.
+        let result =
+            unsafe { ntcp_dpdk_port_driver(self.inner.port, name.as_mut_ptr(), name.len()) };
+        if result < 0 {
+            return Err(dpdk_error("rte_eth_dev_info_get", result));
+        }
+        // SAFETY: the shim NUL-terminates within capacity (snprintf).
+        let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+        Ok(name.to_string_lossy().into_owned())
+    }
+
     /// Steer IPv4 packets with destination `dst` to `queue` (ETH / IPV4 dst →
     /// QUEUE). The rule is destroyed when the `Flow` drops, always before
     /// the port stops.
@@ -545,8 +563,8 @@ impl Port {
     /// Both rules use rte_flow priority 0. mlx5 orders rules of one priority
     /// by their deepest matched layer, so this rule takes precedence over a
     /// `steer_ipv4` rule for the same address there. rte_flow leaves
-    /// overlapping rules of one priority undefined, so on other PMDs do not
-    /// combine the two for one address.
+    /// overlapping rules of one priority undefined, so on other PMDs
+    /// (`driver_name`) do not combine the two for one address.
     pub fn steer_tcp_port(
         &self,
         dst: Ipv4Addr,

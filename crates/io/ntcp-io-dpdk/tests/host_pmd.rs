@@ -108,6 +108,7 @@ fn port_lifecycle(eal: &'static Eal) {
     config.mbufs_per_queue = 511;
     let port = Port::start(eal, config.clone()).unwrap();
     assert_eq!(port_named("net_ring0"), Some(port.port_id()));
+    assert_eq!(port.driver_name().unwrap(), "net_ring");
     assert_eq!(port.queues(), 4);
     assert_eq!(pools(), (4, 4));
     assert_eq!(port.clock(), None);
@@ -311,6 +312,7 @@ fn device_mac(port: u16) -> [u8; 6] {
 // an address of the test's choosing.
 fn mac_addresses(eal: &'static Eal) {
     let port = Port::start(eal, PortConfig::new("net_null0")).unwrap();
+    assert_eq!(port.driver_name().unwrap(), "net_null");
     let drawn = port.mac_address().unwrap();
     assert_eq!(drawn, device_mac(port.port_id()));
     assert_eq!(drawn[0] & 0b11, 0b10, "{drawn:02x?}");
@@ -394,6 +396,12 @@ fn rss_ports(eal: &'static Eal) {
     );
     assert_eq!(rss.key.len(), 40);
     assert_ne!(rss.key, key);
+    // The null PMD has no rte_flow either: a tagged port rule is refused.
+    let error = port
+        .steer_tcp_port(Ipv4Addr::new(10, 0, 0, 1), 0xc001, 0xc003, 1)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
 
     let reta: Vec<u16> = (0..128).map(|i| (i * 7 % 4) as u16).collect();
     port.set_reta(&reta).unwrap();

@@ -70,6 +70,7 @@ int ntcp_dpdk_port_start(uint16_t port);
 void ntcp_dpdk_port_release(uint16_t port, uint64_t owner, int started);
 int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock);
 int ntcp_dpdk_port_mac(uint16_t port, uint8_t mac[6]);
+int ntcp_dpdk_port_driver(uint16_t port, char *name, size_t capacity);
 void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
                           char *message, size_t capacity);
 void *ntcp_dpdk_flow_tcp_port(uint16_t port, uint32_t dst, uint16_t dst_port,
