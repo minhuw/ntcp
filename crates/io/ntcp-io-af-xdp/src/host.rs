@@ -1,7 +1,7 @@
 //! Opt-in AF_XDP host: attaches an XDP program to one interface, keeps the
-//! set of IPv4 addresses that belong to ntcp, steers them to RX queues with
-//! ethtool ntuple rules, and hands each queue to one worker thread as a
-//! `HostedQueue` (an `AfXdp` socket registered with the program).
+//! set of IPv4 addresses that belong to ntcp, optionally steers frames to RX
+//! queues with ethtool ntuple rules, and hands each queue to one worker
+//! thread as a `HostedQueue` (an `AfXdp` socket registered with the program).
 //!
 //! The program (src/steer.bpf.c) sends an IPv4 frame whose destination, or an
 //! Ethernet/IPv4 ARP frame whose target address, is one of the port's
@@ -9,12 +9,23 @@
 //! other frames to the kernel: the interface keeps its kernel addresses and
 //! traffic, and the kernel answers no ARP for ntcp's addresses. An ntcp frame
 //! arriving on a queue without a socket is dropped and counted
-//! (`Port::unsteered`). On a device with several enabled RX queues, RSS
-//! spreads traffic over all of them, so each address needs `steer_ipv4` to
-//! its socket's queue, and ARP needs `steer_arp` to one hosted queue (the
-//! Networks of a port share one neighbour table, so any member may handle
-//! it). A device with one enabled RX queue (`Port::enabled_queues`), such as
-//! a default veth, needs no rules.
+//! (`Port::unsteered`). The address set records only which addresses are
+//! ntcp's, not which queue serves them: the queue a frame arrives on alone
+//! chooses its socket, and rules only change which queue that is.
+//!
+//! So an address needs no rule when every RX queue the device delivers its
+//! frames on has a hosted queue, for example when every enabled RX queue
+//! (`Port::enabled_queues`) is hosted, or on a device with one enabled RX
+//! queue such as a default veth. Several Networks then share the address,
+//! one per queue, and each receives what the device puts on its queue: the
+//! embedding hands on frames whose flow another Network owns (ntcp-native's
+//! shared flows do), and the Networks share one neighbour table, as ARP for
+//! the address may arrive on any of them. Rules are needed when some of
+//! those queues are not hosted, or when frames must reach a particular
+//! queue: `steer_ipv4` sends an address to one queue (one Network per
+//! address), `steer_tcp_port` the TCP destination ports of an address that
+//! match a mask, and `steer_arp` sends ARP to one hosted queue. Frames no
+//! rule matches arrive where the device puts them without rules.
 //!
 //! The program is attached through a BPF link: it is detached when the last
 //! handle of the port drops, and by the kernel if the process exits. ntuple
@@ -24,7 +35,7 @@
 //! Interfaces, the program and rules are resolved in the network namespace of
 //! the thread that calls `Port::attach`.
 
-use crate::{AfXdp, Config, ethtool};
+use crate::{AfXdp, Config, Rss, ethtool};
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use std::{
     ffi::{CString, c_char, c_int, c_void},
@@ -374,6 +385,13 @@ impl Port {
         ethtool::rx_channels(&self.inner.control, self.inner.ifindex)
     }
 
+    /// The RSS key, indirection table and hash function of the device's
+    /// default RSS context (`ethtool -x IF`), at the time of the call. None if
+    /// the driver has no RSS, or reports neither a key nor a table.
+    pub fn rss(&self) -> io::Result<Option<Rss>> {
+        ethtool::rss(&self.inner.control, self.inner.ifindex)
+    }
+
     /// The interface's MAC address, as the kernel reports it at the time of
     /// the call.
     pub fn mac_address(&self) -> io::Result<[u8; 6]> {
@@ -424,6 +442,33 @@ impl Port {
     /// receives the ARP frames that are not for ntcp, on that queue.
     pub fn steer_arp(&self, queue: u32) -> io::Result<Rule> {
         self.steer(ethtool::Match::EtherType(ETH_P_ARP), queue)
+    }
+
+    /// Steer TCP/IPv4 frames with destination `address` whose destination
+    /// port equals `port` in the bits set in `mask` to RX queue `queue`
+    /// (`ethtool -N IF flow-type tcp4 dst-ip ADDRESS dst-port PORT action
+    /// QUEUE`, with a port mask) until the `Rule` drops. `port` must have no
+    /// bits outside `mask`. Unsupported without ntuple filters in the driver;
+    /// drivers may refuse partial port masks.
+    pub fn steer_tcp_port(
+        &self,
+        address: Ipv4Addr,
+        port: u16,
+        mask: u16,
+        queue: u32,
+    ) -> io::Result<Rule> {
+        if port & !mask != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TCP port has bits outside its mask",
+            ));
+        }
+        let rule = ethtool::Match::TcpIpv4Destination {
+            address,
+            port,
+            mask,
+        };
+        self.steer(rule, queue)
     }
 
     fn steer(&self, rule: ethtool::Match, queue: u32) -> io::Result<Rule> {

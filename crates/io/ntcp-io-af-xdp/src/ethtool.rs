@@ -1,5 +1,5 @@
-// ethtool channel counts (`ethtool -l`) and RX classification rules
-// (`ethtool -N`), through SIOCETHTOOL.
+// ethtool channel counts (`ethtool -l`), RSS configuration (`ethtool -x`)
+// and RX classification rules (`ethtool -N`), through SIOCETHTOOL.
 
 use std::{
     ffi::c_void,
@@ -14,17 +14,70 @@ const ETHTOOL_GRXCLSRLCNT: u32 = 0x2e;
 const ETHTOOL_GRXCLSRLALL: u32 = 0x30;
 const ETHTOOL_SRXCLSRLDEL: u32 = 0x31;
 const ETHTOOL_SRXCLSRLINS: u32 = 0x32;
+const ETHTOOL_GRSSH: u32 = 0x46;
+const TCP_V4_FLOW: u32 = 0x01;
 const IP_USER_FLOW: u32 = 0x0d;
 const ETHER_FLOW: u32 = 0x12;
 const ETH_RX_NFC_IP4: u8 = 1;
 const RX_CLS_LOC_SPECIAL: u64 = 0x8000_0000;
 const RX_CLS_LOC_ANY: u32 = 0xffff_ffff;
+// ETH_RSS_HASH_* come from the kernel's include/linux/ethtool.h (the UAPI
+// header has no names for hfunc values); RXH_XFRM_* from the UAPI header.
+const ETH_RSS_HASH_TOP: u8 = 1 << 0;
+const ETH_RSS_HASH_XOR: u8 = 1 << 1;
+const ETH_RSS_HASH_CRC32: u8 = 1 << 2;
+const RXH_XFRM_SYM_XOR: u8 = 1 << 0;
+const RXH_XFRM_NO_CHANGE: u8 = 0xff;
 
 /// What a rule matches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Match {
     Ipv4Destination(Ipv4Addr),
     EtherType(u16),
+    /// TCP/IPv4 to `address` whose destination port equals `port` in the
+    /// bits set in `mask`.
+    TcpIpv4Destination {
+        address: Ipv4Addr,
+        port: u16,
+        mask: u16,
+    },
+}
+
+/// The RSS configuration of a device's default RSS context (`ethtool -x
+/// IF`), as its driver reports it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Rss {
+    /// The hash key; empty if the driver reports none.
+    pub key: Vec<u8>,
+    /// The indirection table: the RX queue of each entry. Empty if the driver
+    /// reports none.
+    pub table: Vec<u32>,
+    pub function: RssFunction,
+    /// The driver XORs source and destination fields before hashing
+    /// (RXH_XFRM_SYM_XOR, `ethtool -x` "symmetric-xor"), so the hash input is
+    /// not the received packet's fields in order.
+    pub symmetric_xor: bool,
+}
+
+/// The RSS hash function (ETH_RSS_HASH_*).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RssFunction {
+    Toeplitz,
+    Xor,
+    Crc32,
+    /// Not reported (0) or a value this crate does not know.
+    Other(u8),
+}
+
+impl RssFunction {
+    fn from_hfunc(hfunc: u8) -> Self {
+        match hfunc {
+            ETH_RSS_HASH_TOP => Self::Toeplitz,
+            ETH_RSS_HASH_XOR => Self::Xor,
+            ETH_RSS_HASH_CRC32 => Self::Crc32,
+            other => Self::Other(other),
+        }
+    }
 }
 
 // struct ethtool_rx_flow_spec. The flow unions are byte arrays: the
@@ -50,6 +103,21 @@ struct Rxnfc {
     data: u64,
     fs: FlowSpec,
     rule_cnt: u32,
+}
+
+// struct ethtool_rxfh, without the trailing rss_config array: indir_size
+// u32 queue indices, then key_size key octets.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Rxfh {
+    cmd: u32,
+    rss_context: u32,
+    indir_size: u32,
+    key_size: u32,
+    hfunc: u8,
+    input_xfrm: u8,
+    rsvd8: [u8; 2],
+    rsvd32: u32,
 }
 
 #[repr(C)]
@@ -92,6 +160,19 @@ fn spec(rule: Match, queue: u32, location: u32) -> FlowSpec {
             spec.flow_type = ETHER_FLOW;
             spec.h_u[12..14].copy_from_slice(&ether_type.to_be_bytes());
             spec.m_u[12..14].fill(0xff);
+        }
+        Match::TcpIpv4Destination {
+            address,
+            port,
+            mask,
+        } => {
+            // tcp_ip4_spec: ip4src at 0, ip4dst at 4, psrc at 8, pdst at 10,
+            // tos at 12. Mask bits set are compared, as for usr_ip4_spec.
+            spec.flow_type = TCP_V4_FLOW;
+            spec.h_u[4..8].copy_from_slice(&address.octets());
+            spec.h_u[10..12].copy_from_slice(&port.to_be_bytes());
+            spec.m_u[4..8].fill(0xff);
+            spec.m_u[10..12].copy_from_slice(&mask.to_be_bytes());
         }
     }
     spec
@@ -139,6 +220,61 @@ pub(crate) fn rx_channels(socket: &OwnedFd, ifindex: u32) -> io::Result<u32> {
     ioctl(socket, ifindex, channels.as_mut_ptr().cast())
         .map_err(|e| context(e, "ETHTOOL_GCHANNELS"))?;
     Ok(channels[5].saturating_add(channels[8]))
+}
+
+/// The RSS key, indirection table and hash function of RSS context 0. None
+/// if the driver has no RSS (EOPNOTSUPP) or reports neither a key nor a
+/// table. A table that changes size between the two requests fails with
+/// InvalidInput (EINVAL).
+pub(crate) fn rss(socket: &OwnedFd, ifindex: u32) -> io::Result<Option<Rss>> {
+    // Sizes first: zero sizes ask for the sizes only.
+    let mut sizes = Rxfh {
+        cmd: ETHTOOL_GRSSH,
+        ..Rxfh::default()
+    };
+    match ioctl(socket, ifindex, (&mut sizes as *mut Rxfh).cast()) {
+        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => return Ok(None),
+        result => result.map_err(|e| context(e, "ETHTOOL_GRSSH"))?,
+    }
+    if sizes.indir_size == 0 && sizes.key_size == 0 {
+        return Ok(None);
+    }
+    // rxfh followed by the table and the key, in a u32 buffer for alignment.
+    let header = size_of::<Rxfh>() / 4;
+    let table = sizes.indir_size as usize;
+    let key = sizes.key_size as usize;
+    let mut buffer = vec![0u32; header + table + key.div_ceil(4)];
+    // SAFETY: the buffer is 4-aligned and holds an Rxfh.
+    unsafe {
+        buffer.as_mut_ptr().cast::<Rxfh>().write(Rxfh {
+            cmd: ETHTOOL_GRSSH,
+            indir_size: sizes.indir_size,
+            key_size: sizes.key_size,
+            ..Rxfh::default()
+        });
+    }
+    ioctl(socket, ifindex, buffer.as_mut_ptr().cast()).map_err(|e| context(e, "ETHTOOL_GRSSH"))?;
+    // SAFETY: as above; the kernel wrote the reply header in place.
+    let reply = unsafe { buffer.as_ptr().cast::<Rxfh>().read() };
+    Ok(Some(decode_rss(&reply, &buffer[header..], table, key)))
+}
+
+// The kernel writes the table and key it was asked for, then the key size
+// the driver left, which a reply may lower (to zero for an RSS context
+// without its own key). RXH_XFRM_NO_CHANGE (all bits) reports no transform.
+fn decode_rss(reply: &Rxfh, config: &[u32], table: usize, key: usize) -> Rss {
+    let key = key.min(reply.key_size as usize);
+    Rss {
+        key: config[table..]
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .take(key)
+            .collect(),
+        table: config[..table].to_vec(),
+        function: RssFunction::from_hfunc(reply.hfunc),
+        symmetric_xor: reply.input_xfrm != RXH_XFRM_NO_CHANGE
+            && reply.input_xfrm & RXH_XFRM_SYM_XOR != 0,
+    }
 }
 
 /// Insert a rule steering `rule` to RX queue `queue`; returns its location.
@@ -222,6 +358,93 @@ mod tests {
         assert_eq!(offset_of!(Rxnfc, fs), 16);
         assert_eq!(offset_of!(Rxnfc, rule_cnt), 184);
         assert_eq!(size_of::<Ifreq>(), 40);
+        assert_eq!(size_of::<Rxfh>(), 24);
+        assert_eq!(offset_of!(Rxfh, rss_context), 4);
+        assert_eq!(offset_of!(Rxfh, indir_size), 8);
+        assert_eq!(offset_of!(Rxfh, key_size), 12);
+        assert_eq!(offset_of!(Rxfh, hfunc), 16);
+        assert_eq!(offset_of!(Rxfh, input_xfrm), 17);
+        assert_eq!(offset_of!(Rxfh, rsvd32), 20);
+    }
+
+    #[test]
+    fn tcp_port_spec() {
+        let rule = Match::TcpIpv4Destination {
+            address: Ipv4Addr::new(10, 80, 0, 12),
+            port: 0x1230,
+            mask: 0xfff0,
+        };
+        let tcp = spec(rule, 2, 5);
+        assert_eq!(tcp.flow_type, TCP_V4_FLOW);
+        assert_eq!(
+            tcp.h_u[..13],
+            [0, 0, 0, 0, 10, 80, 0, 12, 0, 0, 0x12, 0x30, 0]
+        );
+        assert_eq!(
+            tcp.m_u[..13],
+            [0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0xff, 0xf0, 0]
+        );
+        assert!(tcp.h_u[13..].iter().chain(&tcp.m_u[13..]).all(|&b| b == 0));
+        assert!(tcp.h_ext.iter().chain(&tcp.m_ext).all(|&b| b == 0));
+        assert_eq!((tcp.ring_cookie, tcp.location), (2, 5));
+    }
+
+    #[test]
+    fn rss_reply() {
+        let reply = Rxfh {
+            cmd: ETHTOOL_GRSSH,
+            indir_size: 4,
+            key_size: 6,
+            hfunc: ETH_RSS_HASH_TOP,
+            ..Rxfh::default()
+        };
+        let key = [0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b];
+        let mut config = vec![0, 1, 0, 1];
+        config.push(u32::from_ne_bytes(key[..4].try_into().unwrap()));
+        config.push(u32::from_ne_bytes([key[4], key[5], 0, 0]));
+        let rss = decode_rss(&reply, &config, 4, 6);
+        assert_eq!(
+            rss,
+            Rss {
+                key: key.to_vec(),
+                table: vec![0, 1, 0, 1],
+                function: RssFunction::Toeplitz,
+                symmetric_xor: false,
+            }
+        );
+        let reply = Rxfh {
+            key_size: 0,
+            hfunc: 0,
+            input_xfrm: RXH_XFRM_SYM_XOR,
+            ..reply
+        };
+        let rss = decode_rss(&reply, &config, 4, 6);
+        assert!(rss.key.is_empty());
+        assert_eq!(rss.function, RssFunction::Other(0));
+        assert!(rss.symmetric_xor);
+        let reply = Rxfh {
+            hfunc: ETH_RSS_HASH_CRC32,
+            input_xfrm: RXH_XFRM_NO_CHANGE,
+            ..reply
+        };
+        let rss = decode_rss(&reply, &config, 4, 6);
+        assert_eq!(rss.function, RssFunction::Crc32);
+        assert!(!rss.symmetric_xor);
+    }
+
+    // ETHTOOL_GRSSH needs no privilege; loopback has no RSS operations.
+    #[test]
+    fn loopback_has_no_rss() {
+        // SAFETY: socket returns a new descriptor, checked before wrapping.
+        let socket =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(socket >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: as above.
+        let socket = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(socket) };
+        // SAFETY: NUL-terminated name.
+        let lo = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert_ne!(lo, 0, "{}", io::Error::last_os_error());
+        assert_eq!(rss(&socket, lo).unwrap(), None);
     }
 
     #[test]

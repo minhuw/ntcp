@@ -6,6 +6,8 @@ mod host;
 pub use host::{Address, HostedQueue, Port, PortConfig, QueueHandle, Rule, XdpMode};
 #[cfg(feature = "host")]
 mod ethtool;
+#[cfg(feature = "host")]
+pub use ethtool::{Rss, RssFunction};
 
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use std::{
