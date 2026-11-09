@@ -57,11 +57,16 @@ impl Host {
     // `quoted_message`, whose quoted packet starts at offset 8) belongs to,
     // on which a Redirect from `sender` arrived over `context`'s link: for a
     // TCP quote, the live connection its addresses and ports name, as Linux
-    // finds the socket (connections keep no per-segment evidence, and the
-    // quoted sequence is not checked against the send window here);
-    // otherwise the exact committed submission it quotes.
+    // finds the socket (connections keep no per-segment evidence); otherwise
+    // the exact committed submission it quotes. With `endpoint`, the quoted
+    // sequence must also lie in that connection's send window, as Linux's
+    // tcp_v4_err checks before following a Redirect: an IPv4 Redirect can
+    // come from off the link. An IPv6 one cannot (Hop Limit 255 from a
+    // link-local source, RFC 4861 section 8.1), and its ND input has no
+    // Endpoint.
     fn redirected_path(
         &self,
+        endpoint: Option<&ntcp::Endpoint>,
         context: IngressContext,
         now: Instant,
         sender: ScopedAddress,
@@ -73,12 +78,16 @@ impl Host {
         // A link-local quoted source belongs to the arrival link.
         let zone = matches!(key.source, IpAddr::V6(v) if v.is_unicast_link_local())
             .then_some(context.link);
-        let connection = match key.transport {
-            QuotedSelector::Tcp {
-                source_port,
-                destination_port,
-                ..
-            } if key.protocol == ntcp_icmp::PROTOCOL_TCP => self
+        let connection = match (endpoint, key.transport) {
+            (Some(endpoint), _) => self.tcp_quote(endpoint, &key, zone).map(|(.., path)| path),
+            (
+                None,
+                QuotedSelector::Tcp {
+                    source_port,
+                    destination_port,
+                    ..
+                },
+            ) if key.protocol == ntcp_icmp::PROTOCOL_TCP => self
                 .live_bindings
                 .iter()
                 .filter_map(|index| self.bindings[index].as_ref())
@@ -125,6 +134,7 @@ impl Host {
     // remarked) bits.
     pub(crate) fn redirect_ipv4(
         &mut self,
+        endpoint: &ntcp::Endpoint,
         context: IngressContext,
         now: Instant,
         packet: &IngressPacket,
@@ -134,8 +144,14 @@ impl Host {
         self.owned_on_link(context, packet.ip.destination)?;
         self.now = self.now.max(now);
         let sender = ScopedAddress::new(packet.ip.source, None)?;
-        let key = match self.redirected_path(context, now, sender, &redirect.quoted, packet.payload)
-        {
+        let key = match self.redirected_path(
+            Some(endpoint),
+            context,
+            now,
+            sender,
+            &redirect.quoted,
+            packet.payload,
+        ) {
             Ok(key) => key,
             Err(rejection) => return Ok(RedirectOutcome::Rejected(rejection)),
         };
@@ -186,7 +202,7 @@ impl Host {
             return Ok(RedirectOutcome::Rejected(NoEvidence));
         };
         let sender = ScopedAddress::new(IpAddr::V6(source), Some(context.link))?;
-        let key = match self.redirected_path(context, now, sender, &quoted, option) {
+        let key = match self.redirected_path(None, context, now, sender, &quoted, option) {
             Ok(key) => key,
             Err(rejection) => return Ok(RedirectOutcome::Rejected(rejection)),
         };

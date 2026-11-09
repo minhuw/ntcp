@@ -2118,7 +2118,7 @@ impl Host {
 
     // The managed connection a TCP quote is about (`Endpoint::quoted_segment`),
     // with the segment it quotes and its binding's current path.
-    fn tcp_quote(
+    pub(crate) fn tcp_quote(
         &self,
         endpoint: &Endpoint,
         key: &QuoteKey,

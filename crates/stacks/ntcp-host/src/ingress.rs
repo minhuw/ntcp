@@ -1054,7 +1054,7 @@ impl Host {
         }
         if packet.ip.source.is_ipv4() && packet.payload.first() == Some(&5) {
             return Ok(IcmpDispatch::Completed(IcmpOutcome::Redirect(
-                self.redirect_ipv4(processed.context(), now, &packet)?,
+                self.redirect_ipv4(endpoint, processed.context(), now, &packet)?,
             )));
         }
         if packet.payload.first() == Some(&request) {
