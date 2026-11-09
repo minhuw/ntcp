@@ -854,6 +854,30 @@ impl Host {
         );
     }
 
+    /// A complete datagram another Host context received (`receive`) on a
+    /// port this context also serves, the contexts dividing the port's
+    /// flows, taken over as one that arrived on `context`: an unfragmented
+    /// packet stays within the link's physical limit, and one the other
+    /// context reassembled within this context's reassembly capacity, as if
+    /// reassembled here. The other context did no destination processing,
+    /// so `process` and dispatch here process and record it once. A
+    /// `Processed` datagram cannot be handed over: its envelope holds the
+    /// processing of its own context, which every other refuses.
+    pub fn adopt_datagram<'a>(
+        &self,
+        context: IngressContext,
+        datagram: Datagram<'a>,
+    ) -> Result<Datagram<'a>, Error> {
+        self.port(context.link)?;
+        Ok(Datagram {
+            envelope: Envelope {
+                context,
+                ..datagram.envelope
+            },
+            bytes: datagram.bytes,
+        })
+    }
+
     /// The processed header and payload of a datagram, with transport
     /// ingress ownership (the destination is a source registered on its
     /// arrival link), as `decode_ingress` checks for an unfragmented frame.

@@ -669,3 +669,100 @@ fn admitted_source_routed_echo_reaches_the_echo_service() {
     profile(&mut a, true, false);
     assert!(a.0.receive(a.2, 2, &frame, false, &mut out).is_err());
 }
+
+// Two contexts serving one address divide its flows: one reassembles a
+// datagram whose flow the other owns, which adopts it and is the only one to
+// process it. The first context's processed form is refused by the second.
+#[test]
+fn a_datagram_reassembled_by_another_context_is_processed_once_by_its_adopter() {
+    let cfg = config(2);
+    let (local, remote) = addresses(false);
+    let mut reassembler = side(local, 1410, &cfg);
+    let mut owner = side(local, 1411, &cfg);
+    let mut b = managed(remote, 1412, cfg.clone());
+    let listener = owner.1.listen(local, 2).unwrap();
+    let id =
+        b.1.connect_with_path_provider(0, remote, local, options(&cfg, 0), &mut b.0)
+            .unwrap();
+    let mut now = 0;
+    pump(&mut b, &mut owner, &mut now);
+    let child = owner.1.accept(listener).unwrap();
+    now += 100;
+    b.1.write(id, &[7; 1000]).unwrap();
+    let segment = emit(&mut b.0, &mut b.1, now).unwrap();
+    let frame = with_options(&segment, &OPTIONS);
+    let mut out = vec![0; 8192];
+    let mut complete = None;
+    for piece in fragments(&frame, 51, 256) {
+        let mut piece_out = vec![0; 8192];
+        match reassembler
+            .0
+            .receive(reassembler.2, now, &piece, false, &mut piece_out)
+            .unwrap()
+        {
+            Received::Held => {}
+            Received::Datagram(datagram) => {
+                let len = datagram.bytes().len();
+                out[..len].copy_from_slice(datagram.bytes());
+                complete = Some((datagram.envelope(), len));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let (envelope, len) = complete.unwrap();
+    assert_eq!(reassembler.0.reassembly_counters().completed, 1);
+    let bytes = &out[..len];
+    // Processed where it was reassembled, it belongs to that context.
+    let datagram = envelope.datagram(bytes).unwrap();
+    let mut clock = Clock::default();
+    let processed = reassembler.0.process(datagram, Some(&mut clock)).unwrap();
+    assert_eq!(
+        owner.0.decode_datagram(processed).unwrap_err(),
+        Error::InvalidContext
+    );
+    assert_eq!(
+        owner
+            .0
+            .input_datagram(&mut owner.1, now, processed, RxPacketMetadata::default(), 0)
+            .unwrap_err(),
+        Error::InvalidContext
+    );
+    // Only a context's own link adopts.
+    assert!(
+        owner
+            .0
+            .adopt_datagram(reassembler.2, envelope.datagram(bytes).unwrap())
+            .is_err()
+    );
+    // Adopted, it is reassembled provenance processed and recorded once.
+    let mut clock = Clock::default();
+    let adopted = owner
+        .0
+        .adopt_datagram(owner.2, envelope.datagram(bytes).unwrap())
+        .unwrap();
+    assert_eq!(adopted.context(), owner.2);
+    let processed = owner.0.process(adopted, Some(&mut clock)).unwrap();
+    assert!(processed.reassembled());
+    assert_eq!(clock.calls, 1);
+    let expected = Ipv4Options::parse(&OPTIONS, false)
+        .unwrap()
+        .record(v4(local.ip()), SAMPLE)
+        .unwrap();
+    assert_eq!(processed.packet().options, expected);
+    assert_eq!(
+        owner
+            .0
+            .input_datagram(&mut owner.1, now, processed, RxPacketMetadata::default(), 0)
+            .unwrap(),
+        ntcp::InputDisposition::Processed
+    );
+    assert_eq!(
+        owner.1.received_ipv4_options(child).unwrap(),
+        Some(expected)
+    );
+    let mut data = [0; 1000];
+    assert_eq!(owner.1.read(child, &mut data).unwrap(), 1000);
+    assert_eq!(data, [7; 1000]);
+    assert_eq!(owner.0.reassembly_counters().completed, 0);
+    pump(&mut b, &mut owner, &mut now);
+}
