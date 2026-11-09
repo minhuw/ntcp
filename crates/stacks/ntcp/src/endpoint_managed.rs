@@ -629,11 +629,13 @@ impl Endpoint {
             self.config.reuse_time_wait
                 && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
         });
-        let listener = self.match_listener(tuple.local, zone);
+        // Only a connection request can open through a listener.
+        let listener = ((target.is_none() || replacement)
+            && segment.header.flags & (SYN | ACK | RST) == SYN)
+            .then(|| self.match_listener(tuple.local, zone))
+            .flatten();
         let queued = self.control.len();
         let result = if let Some(id) = listener
-            && (target.is_none() || replacement)
-            && segment.header.flags & (SYN | ACK | RST) == SYN
             // A full backlog/Endpoint or stale TIME-WAIT reuse is dropped by
             // the ordinary factory below without any path transaction.
             && self.passive_room(now, target.filter(|_| replacement), id, scoped, &segment)
@@ -659,8 +661,19 @@ impl Endpoint {
                 endpoint.input_scoped(now, ip, zone, traffic_class, options, bytes, metadata)
             })
         } else {
-            self.input_scoped(now, ip, zone, traffic_class, options, bytes, metadata)
-                .map_err(ManagedError::Endpoint)
+            // Admitted and looked up above; nothing since changed either.
+            self.input_admitted(
+                now,
+                ip,
+                scoped,
+                target,
+                traffic_class,
+                options,
+                route,
+                &segment,
+                metadata,
+            )
+            .map_err(ManagedError::Endpoint)
         };
         // A stateless IPv6 reply this input queued is sized with the complete
         // header of the path the provider will place it on (on its zone's

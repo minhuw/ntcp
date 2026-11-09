@@ -3195,7 +3195,6 @@ impl Endpoint {
         bytes: &[u8],
         metadata: crate::RxPacketMetadata,
     ) -> Result<InputDisposition, EndpointError> {
-        let timestamps = metadata.timestamps;
         let Some((route, segment)) = self.ingress_admission(ip, zone, options, bytes, metadata)? else {
             return Ok(InputDisposition::Dropped);
         };
@@ -3211,6 +3210,36 @@ impl Endpoint {
         };
         let tuple = ScopedTuple { tuple, zone };
         let target = self.tuples.find(self.hash(tuple), tuple);
+        self.input_admitted(
+            now,
+            ip,
+            tuple,
+            target,
+            traffic_class,
+            options,
+            route,
+            &segment,
+            metadata,
+        )
+    }
+
+    // `input_scoped` of a segment `ingress_admission` admitted, for `tuple`,
+    // whose connection slot (if any) is `target`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn input_admitted(
+        &mut self,
+        now: Instant,
+        ip: IpMetadata,
+        tuple: ScopedTuple,
+        target: Option<usize>,
+        traffic_class: u8,
+        options: Ipv4Options,
+        route: Option<SourceRoute>,
+        segment: &wire::Segment<'_>,
+        metadata: crate::RxPacketMetadata,
+    ) -> Result<InputDisposition, EndpointError> {
+        let timestamps = metadata.timestamps;
+        let zone = tuple.zone;
         if target.is_some_and(|index| self.is_output_reserved(self.id(index))) {
             return Err(EndpointError::OutputReserved);
         }
@@ -3239,7 +3268,7 @@ impl Endpoint {
                     tuple,
                     traffic_class,
                     options,
-                    &segment,
+                    segment,
                     timestamps,
                 );
             }
@@ -3248,20 +3277,20 @@ impl Endpoint {
                     && segment.header.flags & (SYN | ACK | RST) == SYN
             });
             let authorization =
-                authority.map(|id| self.crossing_syn_authorization(id, tuple, &segment));
+                authority.map(|id| self.crossing_syn_authorization(id, tuple, segment));
             let slot = self.slots[index].as_mut().unwrap();
             slot.received_dscp = Some(traffic_class >> 2);
             let admitted = if let Some(authorization) = authorization {
                 slot.connection.input_with_receive_authorization(
                     now,
                     traffic_class,
-                    &segment,
+                    segment,
                     metadata,
                     Some(authorization),
                 )?
             } else {
                 slot.connection
-                    .input_with_metadata(now, traffic_class, &segment, metadata)?;
+                    .input_with_metadata(now, traffic_class, segment, metadata)?;
                 false
             };
             if admitted {
@@ -3284,7 +3313,7 @@ impl Endpoint {
             //# in the LISTEN state.  An acceptable reset segment should be
             //# formed for any arriving ACK-bearing segment.
             if segment.header.flags & ACK != 0 {
-                self.reset_for(ip, zone, &segment, route);
+                self.reset_for(ip, zone, segment, route);
                 return Ok(InputDisposition::Processed);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
@@ -3292,7 +3321,7 @@ impl Endpoint {
             if segment.header.flags & SYN == 0 {
                 return Ok(InputDisposition::Dropped);
             }
-            if !self.passive_room(now, None, listener, tuple, &segment) {
+            if !self.passive_room(now, None, listener, tuple, segment) {
                 return Ok(InputDisposition::Dropped);
             }
             let record = self.listeners[listener.slot].as_ref().unwrap();
@@ -3304,7 +3333,7 @@ impl Endpoint {
             let mut connection = match self.new_connection_with_buffers(
                 tuple.tuple,
                 iss,
-                Some(&segment),
+                Some(segment),
                 buffer_capacities,
                 rx_ranges,
                 timestamps,
@@ -3329,7 +3358,7 @@ impl Endpoint {
                 Err(error) => return Err(error),
             }
         }
-        self.reset_for(ip, zone, &segment, route);
+        self.reset_for(ip, zone, segment, route);
         Ok(InputDisposition::Dropped)
     }
 
