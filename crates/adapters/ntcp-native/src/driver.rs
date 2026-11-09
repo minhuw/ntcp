@@ -60,6 +60,14 @@ impl<P: PacketIo> Network<P> {
         }
     }
     pub fn drive(&mut self, now: Instant, budget: WorkBudget) -> Result<DriveReport> {
+        // The drive's look at the inbox of a member of shared flows begins
+        // before anything that can fail: every handoff from here on wakes
+        // the member again, whatever becomes of this drive, so a drive that
+        // fails early cannot leave the wake taken and later handoffs
+        // silent. What already waits is this drive's to take or report.
+        if let Some(flows) = &self.flows {
+            flows.begin();
+        }
         self.advance_time(now)?;
         let mut report = DriveReport::default();
         // Take reusable scratch out of the owner while processed datagrams
@@ -134,7 +142,6 @@ impl<P: PacketIo> Network<P> {
         // queue's own and within the same budget: each may be retained as
         // a received packet may.
         if let Some(flows) = &self.flows {
-            flows.begin();
             let limit = (budget.receive - receive_work).min(self.receive_free.len());
             if limit != 0 && flows.pending() {
                 let inlet = flows.inlet();
