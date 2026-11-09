@@ -220,7 +220,7 @@ error message, TCP just records this information, and honors it only when the co
 # 5927-100
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
-reason = "Selected policy uses immediate decrease for candidate>=max_acked only after exact recent packet and live-sequence validation. It does not trust all newly sized segments as the historical stage description suggests; no missing requirement to do so is imposed."
+reason = "Selected policy uses immediate decrease for candidate>=max_acked only after live-sequence validation: the Host checks a TCP quote against its connection's sent sequence space (RFC 5927 section 4.1, as Linux does) and keeps no per-segment sent evidence. It does not trust all newly sized segments as the historical stage description suggests; no missing requirement to do so is imposed."
 quote = '''
 The Initial Path-MTU Discovery stage is when TCP tries to send segments that are larger than the ones that have so far been sent and acknowledged for this connection. That is, in the Initial Path-MTU Discovery stage, TCP has no record of these large segments getting to the destination host, and thus these implementations believe the network when it reports that these packets are too large to reach the destination host without being fragmented.
 '''
@@ -228,7 +228,7 @@ The Initial Path-MTU Discovery stage is when TCP tries to send segments that are
 # 5927-103
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
-reason = "Selected Informational policy deviation: Pmtud::new sets max_sent=0, not family minimum; sent() increases it including SYN/FIN sequence-bearing packets. Exact sent evidence additionally limits acceptance. No literal initialization/reset conformance claim. This historical algorithm is deliberately not selected, not an unfinished TCP requirement."
+reason = "Selected Informational policy deviation: Pmtud::new sets max_sent=0, not family minimum; sent() increases it including SYN/FIN sequence-bearing packets. Acceptance is the section 4.1 send-window check, as Linux applies it, with no per-segment sent evidence. No literal initialization/reset conformance claim. This historical algorithm is deliberately not selected, not an unfinished TCP requirement."
 quote = '''
 The maxsizesent variable holds the size (in octets) of the largest packet that has so far been sent for this connection. It is initialized to 68 (the minimum IPv4 MTU) when the underlying Internet Protocol is IPv4, and is initialized to 1280 (the minimum IPv6 MTU) when the underlying Internet Protocol is IPv6. Whenever a packet larger than maxsizesent octets is sent, maxsizesent is set to that value.
 '''
