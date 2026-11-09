@@ -48,6 +48,25 @@ pub struct NetworkConfig {
     pub neighbor_entries: usize,
     // Permanent ARP entries; only valid with EthernetNextHop::Arp.
     pub static_neighbors: Vec<(Ipv4Addr, [u8; 6])>,
+    /// Fragmented datagrams under reassembly at once; 0, the default,
+    /// discards every fragment. RFC 1122 section 3.3.2 makes reassembly a
+    /// host MUST, so a Network that should meet RFC 1122 sets this.
+    ///
+    /// Each datagram may be as large as the larger of the MTU and its
+    /// family's required minimum (576 octets for IPv4, 1500 for IPv6): the
+    /// TCP MSS this Network offers follows the MTU, so a conforming peer
+    /// sends nothing larger, and a smaller limit would lower that offer.
+    /// Each costs about four times the larger of the MTU and 1500 octets
+    /// (the Host backs both families' minimums), allocated with the
+    /// Network: its octets and the descriptors of its worst conforming
+    /// fragmentation (8-octet fragments).
+    ///
+    /// Size it for the datagrams whose fragments can arrive interleaved. A
+    /// fragment refused for room leaves the rest of its datagram holding a
+    /// slot until the timeout, 60 seconds after the datagram's first
+    /// fragment; this Network sends no ICMP, so no Time Exceeded follows.
+    /// `Network::reassembly_counters` reports every completion and discard.
+    pub reassembly_datagrams: usize,
 }
 impl NetworkConfig {
     /// The `tcp.max_buffer_bytes` a Network with this configuration needs
@@ -75,7 +94,41 @@ impl NetworkConfig {
             retained_receive_packets: None,
             neighbor_entries: 16,
             static_neighbors: Vec::new(),
+            reassembly_datagrams: 0,
         }
+    }
+    // The Host's reassembly of `reassembly_datagrams` datagrams, each up to
+    // the larger of the MTU and its family's required minimum, held whole
+    // at once, with
+    // descriptors for 8-octet fragments of the larger family's datagram
+    // (an IPv6 first fragment also stores its Fragment header). The IPv4
+    // timeout is the least of RFC 1122 section 3.3.2's recommended range.
+    // None if the storage exceeds what the Host addresses.
+    pub(crate) fn reassembly(&self) -> Option<ntcp_host::ReassemblyLimits> {
+        let datagrams = self.reassembly_datagrams;
+        if datagrams == 0 {
+            return Some(ntcp_host::ReassemblyLimits::default());
+        }
+        let mtu = self.mtu as usize;
+        let ipv6_datagram = mtu.clamp(1500, 65575);
+        let buffered_bytes = datagrams
+            .checked_mul(ipv6_datagram + 8)
+            .filter(|&n| n <= u32::MAX as usize)?;
+        Some(ntcp_host::ReassemblyLimits {
+            assemblies: datagrams,
+            fragments: ipv6_datagram.div_ceil(8),
+            buffered_bytes,
+            ipv4_datagram: mtu.clamp(576, 65535),
+            ipv6_datagram,
+            ipv4_timeout_seconds: 60,
+        })
+    }
+    // The largest IP datagram this Network takes in: a packet of the MTU,
+    // or a reassembled datagram of the local family.
+    pub(crate) fn datagram_capacity(&self) -> usize {
+        self.reassembly()
+            .and_then(|r| r.datagram_capacity(self.local_address.is_ipv6()))
+            .map_or(self.mtu as usize, |n| n.max(self.mtu as usize))
     }
     // The resolved link's on-link prefix and gateway.
     pub(crate) fn arp(&self) -> Option<(Ipv4Addr, u8, Option<Ipv4Addr>)> {
@@ -117,6 +170,11 @@ impl NetworkConfig {
             || self.retained_receive_packets == Some(0)
         {
             return Err(Error::InvalidConfig("MTU, port range or receive capacity"));
+        }
+        if self.reassembly().is_none() {
+            return Err(Error::InvalidConfig(
+                "reassembly datagrams beyond host storage",
+            ));
         }
         match (self.link, io.layer()) {
             (Link::Ip, PacketLayer::Ip) => {}

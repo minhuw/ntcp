@@ -9,6 +9,7 @@ mod toeplitz;
 mod types;
 pub use config::{EthernetNextHop, Link, NetworkConfig};
 pub use flows::{DEFAULT_FLOW_KEY, FlowOwnership, SharedFlowLimits, SharedFlows};
+pub use ntcp_host::ReassemblyCounters;
 pub use shared::{SharedNeighborLimits, SharedNeighbors};
 pub use types::*;
 
@@ -273,6 +274,13 @@ impl<P: PacketIo> Network<P> {
     /// see a SYN, which the port's member would answer with a reset, so
     /// `listen` refuses it (`Error::InvalidConfig`). A service every member
     /// accepts listens on a port outside the tags.
+    ///
+    /// Unless ownership is `FlowOwnership::ByAddress`, a member reassembles
+    /// the datagrams of every member's flows, which their owner takes in
+    /// only within its own reassembly capacity, so the members reassemble
+    /// alike: none of them, or all with the same capacity, which the MTU
+    /// sets (`NetworkConfig::reassembly_datagrams` itself may differ).
+    /// Joining otherwise is `Error::InvalidConfig`.
     pub fn with_shared_flows(
         config: NetworkConfig,
         io: P,
@@ -306,9 +314,12 @@ impl<P: PacketIo> Network<P> {
                 "IPv4 option origination on native fixed-hop ports",
             ));
         }
+        let reassembly = config.reassembly().ok_or(Error::Capacity)?;
         let flows = match flows {
             Some((flows, member)) => {
-                Some(flows.join(member, config.local_address, config.tcp.max_listeners)?)
+                let member = flows.join(member, config.local_address, config.tcp.max_listeners)?;
+                member.reassemble(reassembly.datagram_capacity(false))?;
+                Some(member)
             }
             None => None,
         };
@@ -322,6 +333,7 @@ impl<P: PacketIo> Network<P> {
             _ => 1,
         };
         let (path_limits, mut limits) = ntcp_host::managed_limits(&config.tcp, 1, 1, 1, routes, 0)?;
+        limits.reassembly = reassembly;
         let owners = config
             .tcp
             .max_connections
@@ -449,6 +461,9 @@ impl<P: PacketIo> Network<P> {
         endpoint.enable_output_reservations_with_capacity(owners)?;
         let retained = config.retained_receive_packets.unwrap_or(owners);
         let ip_capacity = config.mtu as usize;
+        // A reassembled datagram is completed into `completed` and may be
+        // retained, so both hold the largest the Host completes.
+        let datagram_capacity = config.datagram_capacity();
         let mut tx = Vec::new();
         tx.try_reserve_exact(owners).map_err(|_| Error::Capacity)?;
         for _ in 0..owners {
@@ -468,7 +483,7 @@ impl<P: PacketIo> Network<P> {
             .try_reserve_exact(retained)
             .map_err(|_| Error::Capacity)?;
         for _ in 0..retained {
-            receive_free.push(bytes(ip_capacity)?);
+            receive_free.push(bytes(datagram_capacity)?);
         }
         let mut retained_input = VecDeque::new();
         retained_input
@@ -541,7 +556,7 @@ impl<P: PacketIo> Network<P> {
             control,
             // Capture an oversized physical frame safely before the Host rejects it.
             rx: bytes(65575 + 14)?,
-            completed: bytes(ip_capacity)?,
+            completed: bytes(datagram_capacity)?,
             retained: retained_input,
             receive_free,
             counters: Counters::default(),
@@ -604,6 +619,13 @@ impl<P: PacketIo> Network<P> {
             resolution_failures: self.host.arp_counters().resolution_failures,
             ..self.counters
         }
+    }
+    /// Fragments held, datagrams completed and every discard by reason,
+    /// by which to size `NetworkConfig::reassembly_datagrams`. While
+    /// reassembly is disabled a discarded fragment counts in
+    /// `discarded.assemblies`.
+    pub fn reassembly_counters(&self) -> ReassemblyCounters {
+        self.host.reassembly_counters()
     }
     pub fn failure(&self) -> Option<&io::Error> {
         self.failure.as_ref()

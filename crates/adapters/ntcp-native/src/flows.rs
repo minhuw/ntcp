@@ -216,6 +216,9 @@ struct Registry {
     // when it joins.
     listening: Vec<(u16, usize)>,
     reserved: usize,
+    // Per member, once it declared it (`Member::reassemble`), the IPv4
+    // datagram capacity it reassembles up to, None without reassembly.
+    reassembly: Vec<Option<Option<usize>>>,
 }
 
 impl Registry {
@@ -276,9 +279,15 @@ impl SharedFlows {
                 wake: Mutex::new(None),
             });
         }
+        let mut reassembly = Vec::new();
+        reassembly
+            .try_reserve_exact(limits.members)
+            .map_err(|_| Error::Capacity)?;
+        reassembly.resize(limits.members, None);
         let registry = Registry {
             listening: Vec::new(),
             reserved: 0,
+            reassembly,
         };
         Ok(Self {
             shared: Arc::new(Shared {
@@ -688,6 +697,24 @@ impl Member {
             index: self.index,
         }
     }
+    /// This member reassembles IPv4 datagrams up to `capacity` (None: it
+    /// does not reassemble). A fragment is reassembled by the member its
+    /// addresses select and the datagram taken in by its flow's owner,
+    /// within the owner's capacity. Only by address are the two always one
+    /// member; otherwise every member declares the same.
+    pub(crate) fn reassemble(&self, capacity: Option<usize>) -> Result<()> {
+        if matches!(self.shared.ownership, Ownership::ByAddress) {
+            return Ok(());
+        }
+        let mut registry = lock(&self.shared.registry);
+        if registry.reassembly.iter().flatten().any(|&c| c != capacity) {
+            return Err(Error::InvalidConfig(
+                "members of hashed shared flows reassemble alike",
+            ));
+        }
+        registry.reassembly[self.index] = Some(capacity);
+        Ok(())
+    }
     pub(crate) fn set_wake(&self, file: Arc<File>) {
         *lock(&self.shared.slots[self.index].wake) = Some(file);
     }
@@ -727,6 +754,7 @@ impl Drop for Member {
             registry.unlisten(port);
         }
         registry.reserved -= self.listeners;
+        registry.reassembly[self.index] = None;
         slot.address.store(0, Ordering::Release);
         *lock(&slot.wake) = None;
     }
