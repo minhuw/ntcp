@@ -266,11 +266,11 @@ impl<P: PacketIo> Network<P> {
     /// next hop needs no table. Joining otherwise is `Error::InvalidConfig`
     /// and joins nothing.
     ///
-    /// Ephemeral ports avoid every member's listening ports, and
-    /// `connect_from` refuses a local port whose flow to the peer another
-    /// member owns (`Error::InvalidConfig`), opening nothing:
-    /// `SharedFlows::owner` names the member to open it on. A blocking
-    /// embedding learns of handoffs through the descriptor of
+    /// Ephemeral ports avoid the listening ports of every member on the
+    /// local address, and `connect_from` refuses a local port whose flow to
+    /// the peer another member owns (`Error::InvalidConfig`), opening
+    /// nothing: `SharedFlows::owner` names the member to open it on. A
+    /// blocking embedding learns of handoffs through the descriptor of
     /// `set_neighbor_wake_fd`.
     ///
     /// Under `FlowOwnership::TaggedPorts` ephemeral ports are the member's

@@ -374,6 +374,9 @@ impl SharedFlows {
         if mtu > shared.limits.packet_bytes {
             return Err(PACKET_BYTES);
         }
+        // Each member serves its own address by address: no member's
+        // listening port is a port another must not open from.
+        let listeners = if shared.registers() { listeners } else { 0 };
         let mut registry = lock(&shared.registry);
         if slot.address.load(Ordering::Relaxed) != 0 {
             return Err(Error::InvalidConfig(
@@ -474,6 +477,11 @@ impl Shared {
             Ownership::TaggedPorts { tags, .. } => tags.rule(member),
             _ => None,
         }
+    }
+    // Whether the members' listening ports are registered: on one address
+    // they are ports every member's active opens avoid.
+    fn registers(&self) -> bool {
+        !matches!(self.ownership, Ownership::ByAddress)
     }
     // The member that serves `address`, the first of them under Hash.
     fn serving(&self, address: Ipv4Addr) -> Option<usize> {
@@ -750,16 +758,20 @@ impl Member {
     pub(crate) fn set_wake(&self, file: Arc<File>) {
         *lock(&self.shared.slots[self.index].wake) = Some(file);
     }
-    /// Some member listens on local `port`.
+    /// Some member on this member's address listens on local `port`.
     pub(crate) fn listened(&self, port: u16) -> bool {
-        lock(&self.shared.registry)
-            .listening
-            .binary_search_by_key(&port, |&(p, _)| p)
-            .is_ok()
+        self.shared.registers()
+            && lock(&self.shared.registry)
+                .listening
+                .binary_search_by_key(&port, |&(p, _)| p)
+                .is_ok()
     }
     /// This member listens on `port` (once more), within the listeners it
     /// joined with.
     pub(crate) fn listen(&mut self, port: u16) {
+        if !self.shared.registers() {
+            return;
+        }
         debug_assert!(self.listening.len() < self.listeners);
         let mut registry = lock(&self.shared.registry);
         match registry.listening.binary_search_by_key(&port, |&(p, _)| p) {
@@ -1147,6 +1159,14 @@ mod tests {
         assert!(!a.listened(8080) && a.listened(443));
         a.unlisten(443);
         assert!(!a.listened(443));
+        // By address no member's port is another's to avoid: each listens
+        // on its own address.
+        let flows = SharedFlows::new(FlowOwnership::ByAddress, limits(2)).unwrap();
+        let mut a = flows.join(0, LOCAL.into(), MTU, 1).unwrap();
+        let b = flows.join(1, ROUTER.into(), MTU, 1).unwrap();
+        a.listen(80);
+        assert!(!b.listened(80));
+        a.unlisten(80);
     }
 
     #[test]
