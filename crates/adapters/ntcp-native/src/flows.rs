@@ -23,7 +23,7 @@ use std::{
     ops::RangeInclusive,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering, fence},
     },
 };
 
@@ -213,10 +213,36 @@ struct Slot {
     // the members that hand off and by `SharedFlows::owner`.
     address: AtomicU64,
     inbox: Inbox<Handoff>,
-    // A handoff arrived since the member's drive last looked: the first one
-    // after that writes its wake descriptor.
+    wake: Wake,
+}
+
+// How a handoff wakes a member that blocks, on lines of its own: the
+// member's drive clears `woken` and the first handoff after that sets it,
+// while every handoff reads the slot's address and the inbox's bounds. Two
+// lines, because x86 prefetches lines in adjacent pairs.
+//
+// A handoff pushes its packet and then reads `woken`; the member's drive
+// clears `woken` (`Inlet::begin`) and then reads the inbox, through its
+// drains and `Inlet::pending`. A sequentially consistent fence between the
+// write and the read on each side lets no more than one side miss the
+// other's write (the store-buffering pattern): the drive takes or reports
+// the packet, or the handoff reads `woken` clear and swaps it set, and the
+// one swap that finds it clear writes the descriptor. A drive that reads
+// `woken` clear leaves it so and needs no fence: an earlier drive cleared
+// it before its own fence (or the join before the member's address was
+// published), so a handoff this drive misses reads that clear or a later
+// set, and the handoff whose swap set it wrote the descriptor after the
+// embedding last reset it, or this drive, after that reset, would have
+// read it set. A handoff that reads `woken` set
+// writes nothing and takes no read-modify-write, and without a descriptor
+// (`armed` clear) the swap that finds it clear takes no lock.
+#[repr(align(128))]
+struct Wake {
+    // A handoff arrived since the member's drive last cleared this.
     woken: AtomicBool,
-    wake: Mutex<Option<Arc<File>>>,
+    // `file` holds a descriptor.
+    armed: AtomicBool,
+    file: Mutex<Option<Arc<File>>>,
 }
 
 struct Registry {
@@ -287,8 +313,11 @@ impl SharedFlows {
             slots.push(Slot {
                 address: AtomicU64::new(0),
                 inbox: Inbox::new(limits.inbox_packets, limits.packet_bytes)?,
-                woken: AtomicBool::new(false),
-                wake: Mutex::new(None),
+                wake: Wake {
+                    woken: AtomicBool::new(false),
+                    armed: AtomicBool::new(false),
+                    file: Mutex::new(None),
+                },
             });
         }
         let mut reassembly = Vec::new();
@@ -419,7 +448,7 @@ impl SharedFlows {
         // Handoffs to an earlier member of the slot are not this one's: its
         // connections left with it.
         slot.inbox.drain(shared.limits.inbox_packets, |_, _| {});
-        slot.woken.store(false, Ordering::Relaxed);
+        slot.wake.woken.store(false, Ordering::Relaxed);
         slot.address.store(word, Ordering::Release);
         Ok(Member {
             shared: shared.clone(),
@@ -634,14 +663,27 @@ pub(crate) struct Member {
     listening: Vec<u16>,
 }
 
-/// A member's inbox, held apart from its Network while the Network takes in
-/// what it drains.
+/// A member's inbox, held apart from its membership so that its Network
+/// can take in what it drains; made once, when the member joins.
 pub(crate) struct Inlet {
     shared: Arc<Shared>,
     index: usize,
 }
 
 impl Inlet {
+    /// The start of a drive's look at the inbox: a handoff after it wakes
+    /// the member again (`Wake`).
+    pub(crate) fn begin(&self) {
+        let wake = &self.shared.slots[self.index].wake;
+        if wake.woken.load(Ordering::Relaxed) {
+            wake.woken.store(false, Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+        }
+    }
+    /// Handoffs wait in the inbox.
+    pub(crate) fn pending(&self) -> bool {
+        !self.shared.slots[self.index].inbox.is_empty()
+    }
     pub(crate) fn drain(&self, budget: usize, f: impl FnMut(&[u8], Handoff)) -> usize {
         self.shared.slots[self.index].inbox.drain(budget, f)
     }
@@ -704,28 +746,21 @@ impl Member {
         if slot.address.load(Ordering::Acquire) == 0 || !slot.inbox.push(packet, handoff) {
             return false;
         }
-        // The swap orders the push before the owner's `begin`, which reads
-        // it: an owner that took the flag sees the packet, and one that
-        // cleared it first is woken.
-        if !slot.woken.swap(true, Ordering::Release)
-            && let Some(file) = &*lock(&slot.wake)
+        // The fences order the push before the read of `woken` here and the
+        // owner's clear before its reads of the inbox (`Wake`); the swap
+        // only elects the one handoff that writes.
+        fence(Ordering::SeqCst);
+        let wake = &slot.wake;
+        if !wake.woken.load(Ordering::Relaxed)
+            && !wake.woken.swap(true, Ordering::Relaxed)
+            && wake.armed.load(Ordering::Relaxed)
+            && let Some(file) = &*lock(&wake.file)
         {
             // An eventfd's count only grows; a descriptor that would block
             // is already readable.
             let _ = (&**file).write(&1u64.to_ne_bytes());
         }
         true
-    }
-    /// The start of a drive's look at the inbox: a handoff after it wakes
-    /// the member again.
-    pub(crate) fn begin(&self) {
-        self.shared.slots[self.index]
-            .woken
-            .swap(false, Ordering::Acquire);
-    }
-    /// Handoffs wait in the inbox.
-    pub(crate) fn pending(&self) -> bool {
-        !self.shared.slots[self.index].inbox.is_empty()
     }
     pub(crate) fn inlet(&self) -> Inlet {
         Inlet {
@@ -756,7 +791,9 @@ impl Member {
         Ok(())
     }
     pub(crate) fn set_wake(&self, file: Arc<File>) {
-        *lock(&self.shared.slots[self.index].wake) = Some(file);
+        let wake = &self.shared.slots[self.index].wake;
+        *lock(&wake.file) = Some(file);
+        wake.armed.store(true, Ordering::Relaxed);
     }
     /// Some member on this member's address listens on local `port`.
     pub(crate) fn listened(&self, port: u16) -> bool {
@@ -800,7 +837,8 @@ impl Drop for Member {
         registry.reserved -= self.listeners;
         registry.reassembly[self.index] = None;
         slot.address.store(0, Ordering::Release);
-        *lock(&slot.wake) = None;
+        slot.wake.armed.store(false, Ordering::Relaxed);
+        *lock(&slot.wake.file) = None;
     }
 }
 
@@ -1096,23 +1134,24 @@ mod tests {
         let flows = hashed(2, vec![0, 1]);
         let a = flows.join(0, LOCAL.into(), MTU, 0).unwrap();
         let b = flows.join(1, LOCAL.into(), MTU, 0).unwrap();
-        assert!(!b.pending());
-        b.begin();
+        let inlet = b.inlet();
+        assert!(!inlet.pending());
+        inlet.begin();
         assert!(a.hand_off(1, &[1, 2, 3], handoff()));
         assert!(a.hand_off(1, &[4], handoff()));
         // Two packets fill it.
         assert!(!a.hand_off(1, &[5], handoff()));
-        assert!(b.pending());
+        assert!(inlet.pending());
         let mut taken = Vec::new();
-        assert_eq!(b.inlet().drain(8, |bytes, _| taken.push(bytes.to_vec())), 2);
+        assert_eq!(inlet.drain(8, |bytes, _| taken.push(bytes.to_vec())), 2);
         assert_eq!(taken, [vec![1, 2, 3], vec![4]]);
-        assert!(!b.pending());
+        assert!(!inlet.pending());
         // Left: refused, and a new member starts with an empty inbox.
         assert!(a.hand_off(1, &[6], handoff()));
-        drop(b);
+        drop((b, inlet));
         assert!(!a.hand_off(1, &[7], handoff()));
         let b = flows.join(1, LOCAL.into(), MTU, 0).unwrap();
-        assert!(!b.pending());
+        assert!(!b.inlet().pending());
     }
 
     #[cfg(unix)]
@@ -1123,16 +1162,23 @@ mod tests {
         let a = flows.join(0, LOCAL.into(), MTU, 0).unwrap();
         let b = flows.join(1, LOCAL.into(), MTU, 0).unwrap();
         let (mut reader, writer) = std::io::pipe().unwrap();
+        // Without a descriptor a handoff writes nothing.
+        assert!(a.hand_off(1, &[0], handoff()));
         b.set_wake(Arc::new(File::from(std::os::fd::OwnedFd::from(writer))));
-        b.begin();
+        let inlet = b.inlet();
+        inlet.begin();
+        inlet.drain(8, |_, _| {});
         for _ in 0..2 {
             assert!(a.hand_off(1, &[1], handoff()));
         }
-        b.begin();
-        b.inlet().drain(8, |_, _| {});
+        inlet.begin();
+        inlet.drain(8, |_, _| {});
+        // A look that finds no handoff since the last leaves the next one
+        // to write.
+        inlet.begin();
         assert!(a.hand_off(1, &[2], handoff()));
         // One write per look: two of eight octets.
-        drop(b);
+        drop((b, inlet));
         drop(flows);
         drop(a);
         let mut written = Vec::new();

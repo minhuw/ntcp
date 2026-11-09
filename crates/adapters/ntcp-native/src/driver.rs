@@ -65,8 +65,8 @@ impl<P: PacketIo> Network<P> {
         // the member again, whatever becomes of this drive, so a drive that
         // fails early cannot leave the wake taken and later handoffs
         // silent. What already waits is this drive's to take or report.
-        if let Some(flows) = &self.flows {
-            flows.begin();
+        if let Some(inlet) = &self.inlet {
+            inlet.begin();
         }
         self.advance_time(now)?;
         let mut report = DriveReport::default();
@@ -139,22 +139,16 @@ impl<P: PacketIo> Network<P> {
             self.receive_free.push(item.bytes);
         }
         // Packets other members of shared flows handed over, before this
-        // queue's own and within the same budget: each may be retained as
-        // a received packet may.
-        if let Some(flows) = &self.flows {
-            let limit = (budget.receive - receive_work).min(self.receive_free.len());
-            if limit != 0 && flows.pending() {
-                let inlet = flows.inlet();
-                let mut discarded = 0;
-                let taken = inlet.drain(limit, |packet, handoff| {
-                    if self.take_handoff(packet, handoff, completed).is_err() {
-                        discarded += 1;
-                    }
-                });
-                receive_work += taken;
-                report.discarded += discarded;
-                self.counters.handoffs_received += taken as u64;
-            }
+        // queue's own and within the same budget. The inbox is looked at
+        // once, and its drain tells whether more waits: a packet handed
+        // over after it looked is the next drive's, and wakes a member that
+        // blocks (`Wake`).
+        let mut handoffs = false;
+        if self.inlet.as_ref().is_some_and(|i| i.pending()) {
+            let (taken, more) =
+                self.take_handoffs(budget.receive - receive_work, completed, report);
+            receive_work += taken;
+            handoffs = more;
         }
         while receive_work < budget.receive && !self.receive_free.is_empty() {
             let packet = match self.io.receive_with_metadata(rx) {
@@ -226,7 +220,7 @@ impl<P: PacketIo> Network<P> {
         if receive_work == budget.receive && budget.receive != 0 {
             report.more_work = true;
         }
-        if !self.retained.is_empty() || self.flows.as_ref().is_some_and(|f| f.pending()) {
+        if !self.retained.is_empty() || handoffs {
             report.more_work = true;
         }
         // Control frames due now take at most half the transmit budget,
@@ -679,6 +673,33 @@ impl<P: PacketIo> Network<P> {
         ))?;
         let datagram = self.host.adopt_datagram(self.ingress, datagram)?;
         self.dispatch(datagram, metadata)
+    }
+    // Up to `limit` packets from this member's inbox, no more than there are
+    // receive buffers free to retain them; returns how many it took, and
+    // whether that was all it could take (none, without a buffer), so that
+    // more may wait. A drain that stops short found the inbox empty, or
+    // its next packet still being copied in, whose handoff wakes the
+    // member then.
+    fn take_handoffs(
+        &mut self,
+        limit: usize,
+        completed: &mut [u8],
+        report: &mut DriveReport,
+    ) -> (usize, bool) {
+        let Some(inlet) = self.inlet.take() else {
+            return (0, false);
+        };
+        let limit = limit.min(self.receive_free.len());
+        let mut discarded = 0;
+        let taken = inlet.drain(limit, |packet, handoff| {
+            if self.take_handoff(packet, handoff, completed).is_err() {
+                discarded += 1;
+            }
+        });
+        self.inlet = Some(inlet);
+        report.discarded += discarded;
+        self.counters.handoffs_received += taken as u64;
+        (taken, taken == limit)
     }
     // Copies a packet into member `owner`'s inbox, counted either way.
     fn hand_off(&mut self, owner: usize, packet: &[u8], handoff: flows::Handoff) {

@@ -103,8 +103,10 @@ pub struct Network<P: PacketIo> {
     // IPv4 next hops resolve through a port's shared table
     // (`with_shared_neighbors`), not the Host's own.
     shared_neighbors: bool,
-    // Membership in a port's shared flows (`with_shared_flows`).
+    // Membership in a port's shared flows (`with_shared_flows`), and its
+    // inbox.
     flows: Option<flows::Member>,
+    inlet: Option<flows::Inlet>,
     tx_cursor: usize,
     // The one transmit slot of ARP control frames (empty without ARP).
     control: Vec<u8>,
@@ -341,6 +343,7 @@ impl<P: PacketIo> Network<P> {
             }
             None => None,
         };
+        let inlet = flows.as_ref().map(flows::Member::inlet);
         let instance = NEXT_INSTANCE
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Capacity)?;
@@ -570,6 +573,7 @@ impl<P: PacketIo> Network<P> {
             arp_input: false,
             shared_neighbors,
             flows,
+            inlet,
             tx_cursor: 0,
             control,
             // Capture an oversized physical frame safely before the Host rejects it.
