@@ -202,18 +202,22 @@ impl<P: PacketIo> Network<P> {
             // A member of shared flows hands a packet of another member's
             // flow, or a fragment another member reassembles, to it as it
             // arrived.
-            if let Some(flows) = &self.flows
-                && let Some(owner) = flows.elsewhere(flows::key(frame))
-            {
-                let handoff = flows::Handoff {
-                    timestamps: packet.timestamps,
-                    tcp_segment_size: packet.tcp_segment_size,
-                    reassembled: None,
-                };
-                self.hand_off(owner, frame, handoff);
-                continue;
+            let mut fragment = false;
+            if let Some(flows) = &self.flows {
+                let key = flows::key(frame);
+                fragment = matches!(key, flows::Key::Fragment { .. });
+                if let Some(owner) = flows.elsewhere(key) {
+                    let handoff = flows::Handoff {
+                        timestamps: packet.timestamps,
+                        tcp_segment_size: packet.tcp_segment_size,
+                        fragment,
+                        reassembled: None,
+                    };
+                    self.hand_off(owner, frame, handoff);
+                    continue;
+                }
             }
-            if self.input(frame, packet, completed).is_err() {
+            if self.input(frame, packet, fragment, completed).is_err() {
                 report.discarded += 1;
             }
         }
@@ -623,7 +627,14 @@ impl<P: PacketIo> Network<P> {
             clock,
         })
     }
-    fn input(&mut self, frame: &[u8], packet: ReceivedPacket, completed: &mut [u8]) -> Result<()> {
+    // `fragment`: a member of shared flows keyed the packet as a fragment.
+    fn input(
+        &mut self,
+        frame: &[u8],
+        packet: ReceivedPacket,
+        fragment: bool,
+        completed: &mut [u8],
+    ) -> Result<()> {
         let metadata = self.receive_metadata(packet);
         let received = self
             .host
@@ -634,13 +645,14 @@ impl<P: PacketIo> Network<P> {
         // A member of shared flows that completes a datagram on a fragment
         // hands it to the member that owns its flow. Its fragments were
         // keyed by their addresses alone; it is keyed once, here.
-        if let Some(flows) = &self.flows
-            && flows::fragment(frame)
+        if fragment
+            && let Some(flows) = &self.flows
             && let Some(owner) = flows.elsewhere(flows::key(datagram.bytes()))
         {
             let handoff = flows::Handoff {
                 timestamps: packet.timestamps,
                 tcp_segment_size: packet.tcp_segment_size,
+                fragment: false,
                 reassembled: Some(datagram.envelope()),
             };
             self.hand_off(owner, datagram.bytes(), handoff);
@@ -665,7 +677,7 @@ impl<P: PacketIo> Network<P> {
             tcp_segment_size: handoff.tcp_segment_size,
         };
         let Some(envelope) = handoff.reassembled else {
-            return self.input(bytes, packet, completed);
+            return self.input(bytes, packet, handoff.fragment, completed);
         };
         let metadata = self.receive_metadata(packet);
         let datagram = envelope.datagram(bytes).ok_or(Error::Unsupported(

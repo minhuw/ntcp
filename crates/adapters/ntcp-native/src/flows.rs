@@ -634,19 +634,16 @@ fn quoted(message: &[u8]) -> Option<Key> {
     })
 }
 
-/// Whether `packet`, as it arrived, is an IPv4 fragment: a datagram the
-/// Host completes on it is a reassembled one.
-pub(crate) fn fragment(packet: &[u8]) -> bool {
-    header(packet).is_some_and(|h| h.fragment & (MORE | OFFSET) != 0)
-}
-
 /// What a member hands over with a packet: its receive metadata as the
-/// backend reported it, which the owner reads against its own clocks, and
-/// for a datagram the sender reassembled its envelope (`Host::adopt_datagram`).
+/// backend reported it, which the owner reads against its own clocks;
+/// whether it is a fragment, whose datagram the receiver keys once it
+/// completes it; and for a datagram the sender reassembled its envelope
+/// (`Host::adopt_datagram`).
 #[derive(Clone, Copy)]
 pub(crate) struct Handoff {
     pub(crate) timestamps: ntcp_io::PacketTimestamps,
     pub(crate) tcp_segment_size: Option<NonZeroU16>,
+    pub(crate) fragment: bool,
     pub(crate) reassembled: Option<ntcp_host::Envelope>,
 }
 
@@ -917,7 +914,6 @@ mod tests {
         segment.extend_from_slice(&tcp(1, 2, 4));
         segment.resize(46, 0xee);
         assert_eq!(key(&segment), flow((LOCAL, 2), (REMOTE, 1)));
-        assert!(!fragment(&segment));
     }
 
     #[test]
@@ -945,7 +941,6 @@ mod tests {
         let mut six = segment.clone();
         six[0] = 0x60;
         assert_eq!(key(&six), Key::Local);
-        assert!(!fragment(&six));
         // UDP and Echo.
         assert_eq!(key(&packet(0, 17, &tcp(53, 53, 8))), Key::Local);
         assert_eq!(key(&icmp(8, &[0; 8])), Key::Local);
@@ -975,7 +970,6 @@ mod tests {
                 },
                 "{word:#x}"
             );
-            assert!(fragment(&piece));
         }
     }
 
@@ -1031,6 +1025,7 @@ mod tests {
         Handoff {
             timestamps: Default::default(),
             tcp_segment_size: None,
+            fragment: false,
             reassembled: None,
         }
     }
