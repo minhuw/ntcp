@@ -608,6 +608,11 @@ impl OutgoingIpv4Options {
         }
         let mut bytes = [0u8; 40];
         let (destination, route_len, len) = self.initialize(final_destination, &mut bytes)?;
+        // No option: nothing to record or write, the common case on every
+        // segment.
+        if len == 0 {
+            return Ok((destination, 0));
+        }
         let padded = (len + 3) & !3;
         let out = out.get_mut(..padded).ok_or(Ipv4OptionsError::Capacity)?;
         let recorded = record(Ipv4Options::parse(&bytes[route_len..len], false)?)?;
