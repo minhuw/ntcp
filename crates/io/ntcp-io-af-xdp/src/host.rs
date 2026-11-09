@@ -35,7 +35,7 @@
 //! Interfaces, the program and rules are resolved in the network namespace of
 //! the thread that calls `Port::attach`.
 
-use crate::{AfXdp, Config, Rss, ethtool};
+use crate::{AfXdp, Config, Rss, RssFields, ethtool};
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use std::{
     ffi::{CString, c_char, c_int, c_void},
@@ -390,6 +390,14 @@ impl Port {
     /// the driver has no RSS, or reports neither a key nor a table.
     pub fn rss(&self) -> io::Result<Option<Rss>> {
         ethtool::rss(&self.inner.control, self.inner.ifindex)
+    }
+
+    /// The packet fields the device's default RSS context hashes for
+    /// TCP/IPv4 (`ethtool -n IF rx-flow-hash tcp4`), at the time of the
+    /// call. None if the driver does not report them. A query of its own, as
+    /// drivers support it apart from `rss` (ETHTOOL_GRXFH, not GRSSH).
+    pub fn rss_tcp4_fields(&self) -> io::Result<Option<RssFields>> {
+        ethtool::rss_tcp4_fields(&self.inner.control, self.inner.ifindex)
     }
 
     /// The interface's MAC address, as the kernel reports it at the time of

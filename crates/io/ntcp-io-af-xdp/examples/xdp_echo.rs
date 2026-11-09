@@ -44,12 +44,12 @@
 //   queue's member. No rule is installed: RSS spreads the address's frames
 //   over the hosted queues, the program hands each to its arrival queue's
 //   socket, and a flow's frames arrive at its owner. That needs Toeplitz
-//   without symmetric-xor, a key covering addresses and ports, a
-//   power-of-two table that names every member's queue and only hosted
-//   queues (a frame on a queue without a socket is dropped), and a tcp4
-//   hash over addresses and ports (`ethtool -N IF rx-flow-hash tcp4 sdfn`,
-//   mlx5's default), which the port cannot read: another hash costs
-//   handoffs, not correctness. `--steering none` uses ntcp's own key
+//   with no input transform (symmetric-xor or any other), a key covering
+//   addresses and ports, a power-of-two table that names every member's
+//   queue and only hosted queues (a frame on a queue without a socket is
+//   dropped), and a tcp4 hash over exactly both addresses and both ports
+//   (`Port::rss_tcp4_fields`; `ethtool -N IF rx-flow-hash tcp4 sdfn`,
+//   mlx5's default). `--steering none` uses ntcp's own key
 //   (`DEFAULT_FLOW_KEY`) and a round-robin table, and steers the address
 //   and ARP to the first member's queue, which hands every other member's
 //   frames on in software. Without rules, frames arrive where the device
@@ -71,7 +71,9 @@
 // - How does a member learn of handoffs? Each drive drains its inbox first;
 //   busy-polling needs no wake descriptor.
 
-use ntcp_io_af_xdp::{HostedQueue, Port, PortConfig, QueueHandle, Rss, RssFunction, XdpMode};
+use ntcp_io_af_xdp::{
+    HostedQueue, Port, PortConfig, QueueHandle, Rss, RssFields, RssFunction, XdpMode,
+};
 use ntcp_native::{
     CallerTimebase, ConnId, DEFAULT_FLOW_KEY, Error as NetError, EthernetNextHop, Event,
     FlowOwnership, Link, Network, NetworkConfig, ReadOutcome, SharedFlowLimits, SharedFlows,
@@ -404,7 +406,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             // to each member's active opens on its queue.
             let rss = match choice {
                 Steering::Software => None,
-                Steering::Auto | Steering::Rss => Some(mirror_rss(port.rss(), &args.queues)),
+                Steering::Auto | Steering::Rss => {
+                    Some(mirror_rss(port.rss(), port.rss_tcp4_fields(), &args.queues))
+                }
             };
             let ownership = match rss {
                 Some(Ok((key, table))) => {
@@ -530,6 +534,7 @@ fn steer(
 // `queues[i]`), or why it cannot place every flow's frames at its owner.
 fn mirror_rss(
     rss: io::Result<Option<Rss>>,
+    fields: io::Result<Option<RssFields>>,
     queues: &[u32],
 ) -> Result<(Vec<u8>, Vec<usize>), String> {
     let rss = match rss {
@@ -540,8 +545,29 @@ fn mirror_rss(
     if rss.function != RssFunction::Toeplitz {
         return Err(format!("the RSS hash is {:?}, not Toeplitz", rss.function));
     }
-    if rss.symmetric_xor {
-        return Err("RSS hashes a symmetric-xor input".into());
+    if rss.input_transform != 0 {
+        return Err(format!(
+            "RSS transforms its input (RXH_XFRM bits {:#04x}; `ethtool -x` names them)",
+            rss.input_transform
+        ));
+    }
+    // ntcp's flow hash takes addresses and ports; with another input the
+    // device puts flows on queues whose members do not own them.
+    match fields {
+        Ok(Some(fields)) if fields.addresses_and_ports() => {}
+        Ok(Some(fields)) => {
+            return Err(format!(
+                "the tcp4 RSS hash takes fields {:#x}, not exactly both addresses and ports \
+                 ({:#x}, `ethtool -N IF rx-flow-hash tcp4 sdfn`)",
+                fields.0,
+                RssFields::SOURCE_ADDRESS
+                    | RssFields::DESTINATION_ADDRESS
+                    | RssFields::SOURCE_PORT
+                    | RssFields::DESTINATION_PORT
+            ));
+        }
+        Ok(None) => return Err("the device reports no tcp4 RSS hash fields".into()),
+        Err(error) => return Err(format!("the tcp4 RSS hash fields are unreadable ({error})")),
     }
     if rss.key.len() < MIN_FLOW_KEY {
         return Err(format!(

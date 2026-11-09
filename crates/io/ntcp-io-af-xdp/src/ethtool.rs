@@ -1,5 +1,6 @@
-// ethtool channel counts (`ethtool -l`), RSS configuration (`ethtool -x`)
-// and RX classification rules (`ethtool -N`), through SIOCETHTOOL.
+// ethtool channel counts (`ethtool -l`), RSS configuration (`ethtool -x`,
+// `ethtool -n IF rx-flow-hash`) and RX classification rules (`ethtool -N`),
+// through SIOCETHTOOL.
 
 use std::{
     ffi::c_void,
@@ -10,6 +11,7 @@ use std::{
 };
 
 const ETHTOOL_GCHANNELS: u32 = 0x3c;
+const ETHTOOL_GRXFH: u32 = 0x29;
 const ETHTOOL_GRXCLSRLCNT: u32 = 0x2e;
 const ETHTOOL_GRXCLSRLALL: u32 = 0x30;
 const ETHTOOL_SRXCLSRLDEL: u32 = 0x31;
@@ -26,8 +28,11 @@ const RX_CLS_LOC_ANY: u32 = 0xffff_ffff;
 const ETH_RSS_HASH_TOP: u8 = 1 << 0;
 const ETH_RSS_HASH_XOR: u8 = 1 << 1;
 const ETH_RSS_HASH_CRC32: u8 = 1 << 2;
-const RXH_XFRM_SYM_XOR: u8 = 1 << 0;
 const RXH_XFRM_NO_CHANGE: u8 = 0xff;
+const RXH_IP_SRC: u64 = 1 << 4;
+const RXH_IP_DST: u64 = 1 << 5;
+const RXH_L4_B_0_1: u64 = 1 << 6;
+const RXH_L4_B_2_3: u64 = 1 << 7;
 
 /// What a rule matches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,10 +58,35 @@ pub struct Rss {
     /// reports none.
     pub table: Vec<u32>,
     pub function: RssFunction,
-    /// The driver XORs source and destination fields before hashing
-    /// (RXH_XFRM_SYM_XOR, `ethtool -x` "symmetric-xor"), so the hash input is
-    /// not the received packet's fields in order.
-    pub symmetric_xor: bool,
+    /// The transforms the driver applies to the hash input, as RXH_XFRM_*
+    /// bits; 0 for none. RXH_XFRM_SYM_XOR (1, `ethtool -x` "symmetric-xor")
+    /// hashes the XOR of source and destination fields, RXH_XFRM_SYM_OR_XOR
+    /// (2, "symmetric-or-xor", Linux 6.15) their OR and XOR, and kernels may
+    /// define more. With any bit set the hash input is not the received
+    /// packet's fields in order.
+    pub input_transform: u8,
+}
+
+/// The packet fields RSS hashes for one flow type (`ethtool -n IF
+/// rx-flow-hash tcp4`), as the RXH_* bits the driver reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RssFields(pub u64);
+
+impl RssFields {
+    /// RXH_IP_SRC.
+    pub const SOURCE_ADDRESS: u64 = RXH_IP_SRC;
+    /// RXH_IP_DST.
+    pub const DESTINATION_ADDRESS: u64 = RXH_IP_DST;
+    /// RXH_L4_B_0_1: transport octets 0 and 1, the TCP source port.
+    pub const SOURCE_PORT: u64 = RXH_L4_B_0_1;
+    /// RXH_L4_B_2_3: transport octets 2 and 3, the TCP destination port.
+    pub const DESTINATION_PORT: u64 = RXH_L4_B_2_3;
+
+    /// The hash takes both addresses and both ports and nothing else: RSS's
+    /// IPv4 TCP input, which ntcp-native's flow ownership hashes.
+    pub fn addresses_and_ports(self) -> bool {
+        self.0 == RXH_IP_SRC | RXH_IP_DST | RXH_L4_B_0_1 | RXH_L4_B_2_3
+    }
 }
 
 /// The RSS hash function (ETH_RSS_HASH_*).
@@ -261,7 +291,9 @@ pub(crate) fn rss(socket: &OwnedFd, ifindex: u32) -> io::Result<Option<Rss>> {
 
 // The kernel writes the table and key it was asked for, then the key size
 // the driver left, which a reply may lower (to zero for an RSS context
-// without its own key). RXH_XFRM_NO_CHANGE (all bits) reports no transform.
+// without its own key). RXH_XFRM_NO_CHANGE (all bits) is a request value;
+// the kernel also reports it for an RSS context whose transform was never
+// set (ethtool_rxfh_ctx_alloc in net/ethtool/ioctl.c), so it reads as none.
 fn decode_rss(reply: &Rxfh, config: &[u32], table: usize, key: usize) -> Rss {
     let key = key.min(reply.key_size as usize);
     Rss {
@@ -272,9 +304,31 @@ fn decode_rss(reply: &Rxfh, config: &[u32], table: usize, key: usize) -> Rss {
             .collect(),
         table: config[..table].to_vec(),
         function: RssFunction::from_hfunc(reply.hfunc),
-        symmetric_xor: reply.input_xfrm != RXH_XFRM_NO_CHANGE
-            && reply.input_xfrm & RXH_XFRM_SYM_XOR != 0,
+        input_transform: match reply.input_xfrm {
+            RXH_XFRM_NO_CHANGE => 0,
+            bits => bits,
+        },
     }
+}
+
+// ETHTOOL_GRXFH reads and writes only cmd, flow_type and data, the original
+// struct ethtool_rxnfc, unless flow_type has FLOW_RSS (another context).
+fn tcp4_fields_request() -> Rxnfc {
+    Rxnfc {
+        flow_type: TCP_V4_FLOW,
+        ..Rxnfc::new(ETHTOOL_GRXFH)
+    }
+}
+
+/// The fields RSS context 0 hashes for TCP/IPv4. None if the driver does
+/// not report them (EOPNOTSUPP).
+pub(crate) fn rss_tcp4_fields(socket: &OwnedFd, ifindex: u32) -> io::Result<Option<RssFields>> {
+    let mut request = tcp4_fields_request();
+    match ioctl(socket, ifindex, (&mut request as *mut Rxnfc).cast()) {
+        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => return Ok(None),
+        result => result.map_err(|e| context(e, "ETHTOOL_GRXFH"))?,
+    }
+    Ok(Some(RssFields(request.data)))
 }
 
 /// Insert a rule steering `rule` to RX queue `queue`; returns its location.
@@ -344,6 +398,12 @@ mod tests {
     use super::*;
     use std::mem::offset_of;
 
+    const RXH_XFRM_SYM_XOR: u8 = 1 << 0;
+    // Not in Linux 6.12's UAPI header: upstream include/uapi/linux/ethtool.h
+    // since commit ecdff893384c ("ethtool: Symmetric OR-XOR RSS hash", 6.15).
+    const RXH_XFRM_SYM_OR_XOR: u8 = 1 << 1;
+    const RXH_L3_PROTO: u64 = 1 << 3;
+
     #[test]
     fn layout_matches_uapi() {
         assert_eq!(size_of::<FlowSpec>(), 168);
@@ -354,6 +414,7 @@ mod tests {
         assert_eq!(offset_of!(FlowSpec, ring_cookie), 152);
         assert_eq!(offset_of!(FlowSpec, location), 160);
         assert_eq!(size_of::<Rxnfc>(), 192);
+        assert_eq!(offset_of!(Rxnfc, flow_type), 4);
         assert_eq!(offset_of!(Rxnfc, data), 8);
         assert_eq!(offset_of!(Rxnfc, fs), 16);
         assert_eq!(offset_of!(Rxnfc, rule_cnt), 184);
@@ -409,7 +470,7 @@ mod tests {
                 key: key.to_vec(),
                 table: vec![0, 1, 0, 1],
                 function: RssFunction::Toeplitz,
-                symmetric_xor: false,
+                input_transform: 0,
             }
         );
         let reply = Rxfh {
@@ -421,7 +482,7 @@ mod tests {
         let rss = decode_rss(&reply, &config, 4, 6);
         assert!(rss.key.is_empty());
         assert_eq!(rss.function, RssFunction::Other(0));
-        assert!(rss.symmetric_xor);
+        assert_eq!(rss.input_transform, RXH_XFRM_SYM_XOR);
         let reply = Rxfh {
             hfunc: ETH_RSS_HASH_CRC32,
             input_xfrm: RXH_XFRM_NO_CHANGE,
@@ -429,7 +490,50 @@ mod tests {
         };
         let rss = decode_rss(&reply, &config, 4, 6);
         assert_eq!(rss.function, RssFunction::Crc32);
-        assert!(!rss.symmetric_xor);
+        assert_eq!(rss.input_transform, 0);
+        // Transforms this crate has no name for are reported as they are.
+        for input_xfrm in [RXH_XFRM_SYM_OR_XOR, 1 << 5] {
+            let reply = Rxfh {
+                input_xfrm,
+                ..reply
+            };
+            assert_eq!(
+                decode_rss(&reply, &config, 4, 6).input_transform,
+                input_xfrm
+            );
+        }
+    }
+
+    // The request as the kernel reads it for ETHTOOL_GRXFH: cmd, flow_type
+    // and data, 16 octets.
+    #[test]
+    fn tcp4_fields_request_and_reply() {
+        let request = tcp4_fields_request();
+        // SAFETY: Rxnfc is plain integers and byte arrays without padding
+        // before `data`.
+        let bytes: [u8; 16] = unsafe { std::ptr::from_ref(&request).cast::<[u8; 16]>().read() };
+        let mut expected = [0; 16];
+        expected[..4].copy_from_slice(&0x29u32.to_ne_bytes());
+        expected[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        assert_eq!(bytes, expected);
+        // mlx5's default for tcp4, `ethtool -n IF rx-flow-hash tcp4` "sdfn".
+        let reply = Rxnfc {
+            data: 0xf0,
+            ..request
+        };
+        let fields = RssFields(reply.data);
+        assert!(fields.addresses_and_ports());
+        assert_eq!(
+            fields.0,
+            RssFields::SOURCE_ADDRESS
+                | RssFields::DESTINATION_ADDRESS
+                | RssFields::SOURCE_PORT
+                | RssFields::DESTINATION_PORT
+        );
+        // Addresses only ("sd"), or an extra field in the input.
+        assert!(!RssFields(RXH_IP_SRC | RXH_IP_DST).addresses_and_ports());
+        assert!(!RssFields(0xf0 | RXH_L3_PROTO).addresses_and_ports());
+        assert!(!RssFields(0).addresses_and_ports());
     }
 
     // ETHTOOL_GRSSH needs no privilege; loopback has no RSS operations.
@@ -445,6 +549,8 @@ mod tests {
         let lo = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
         assert_ne!(lo, 0, "{}", io::Error::last_os_error());
         assert_eq!(rss(&socket, lo).unwrap(), None);
+        // ETHTOOL_GRXFH needs no privilege either; loopback has no rxnfc.
+        assert_eq!(rss_tcp4_fields(&socket, lo).unwrap(), None);
     }
 
     #[test]
