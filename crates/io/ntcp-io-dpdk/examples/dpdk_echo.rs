@@ -76,9 +76,13 @@
 //   round-robin, since that member would own no flows and could open no
 //   connection. A device that later moves its table only costs handoffs.
 // - What does `--steering auto` choose? rss if the device takes RSS at
-//   start and the state read back is usable: the IPv4 TCP hash type
-//   granted, a key of at least 16 octets, and a power-of-two table naming
-//   every member's queue and no other. A device that refuses RSS at start
+//   start and the state read back is usable: Toeplitz hashing, the IPv4 TCP
+//   hash type granted, a key of at least 16 octets, and a power-of-two
+//   table naming every member's queue and no other. A copy of the device's
+//   hash predicts its queues only for Toeplitz. A PMD that does not report
+//   its function (mlx5, whose function is Toeplitz) is assumed to use it,
+//   and `METRIC handed_off` near zero confirms the guess; a wrong guess
+//   costs handoffs, never a connection. A device that refuses RSS at start
 //   is started again without it. Otherwise none, as always with
 //   `--isolate` (an isolated port spreads nothing by RSS); a port that took
 //   RSS but whose state is unusable keeps spreading by it, which costs
@@ -88,7 +92,8 @@
 
 use ntcp_io::ClockDescriptor;
 use ntcp_io_dpdk::{
-    ClockCalibration, ClockFit, Eal, HostedQueue, Port, PortConfig, QueueHandle, bracketed_reading,
+    ClockCalibration, ClockFit, Eal, HostedQueue, Port, PortConfig, QueueHandle, RssAlgorithm,
+    bracketed_reading,
 };
 use ntcp_native::{
     CallerTimebase, ConnId, DEFAULT_FLOW_KEY, Error as NetError, EthernetNextHop, Event,
@@ -581,8 +586,10 @@ fn spread(port: &Port, members: usize) -> Result<ntcp_io_dpdk::Rss, String> {
                 }
             }
             eprintln!(
-                "RSS key={} octets tcp={} ipv4={} fragments={} reta entries per queue {entries:?}",
+                "RSS key={} octets algorithm={:?} tcp={} ipv4={} fragments={} reta entries per \
+                 queue {entries:?}",
                 rss.key.len(),
+                rss.algorithm,
                 rss.ipv4_tcp,
                 rss.ipv4,
                 rss.ipv4_fragments
@@ -607,10 +614,19 @@ fn names_every_member(reta: &[u16], members: usize) -> bool {
     (0..members).all(|member| reta.iter().any(|&queue| usize::from(queue) == member))
 }
 
-// RSS the members can mirror: TCP hashed over addresses and ports with a
-// key that covers them, and a table whose low hash bits index it and that
-// names every member and nothing else.
+// RSS the members can mirror: TCP hashed by Toeplitz over addresses and
+// ports with a key that covers them, and a table whose low hash bits index
+// it and that names every member and nothing else.
 fn usable(rss: ntcp_io_dpdk::Rss, members: usize) -> Result<FlowOwnership, String> {
+    match rss.algorithm {
+        RssAlgorithm::Toeplitz => {}
+        // mlx5 does not report its function, Toeplitz. Any PMD that does not
+        // is assumed to hash so; the handoff counters show a wrong guess.
+        RssAlgorithm::Default => {
+            eprintln!("RSS algorithm unreported: assuming toeplitz, verified by handed_off");
+        }
+        other => return Err(format!("the device hashes with {other:?}, not toeplitz")),
+    }
     if !rss.ipv4_tcp {
         return Err("the device does not hash ipv4 tcp ports".into());
     }

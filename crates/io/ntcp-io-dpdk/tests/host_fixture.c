@@ -72,13 +72,18 @@ uint64_t ntcp_host_test_rss_ipv4_hf(void) {
     return RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_FRAG_IPV4;
 }
 
-// The device's key and redirection table, read with ethdev's own calls.
-int ntcp_host_test_rss_key(uint16_t port, uint8_t key[255], uint8_t *key_len) {
+// The device's key, hash function and redirection table, read with
+// ethdev's own calls. The function is reported as 1 for Toeplitz, 0 for the
+// PMD's unreported default and 2 for any other.
+int ntcp_host_test_rss_key(uint16_t port, uint8_t key[255], uint8_t *key_len,
+                           int *algorithm) {
     struct rte_eth_rss_conf conf = { .rss_key = key, .rss_key_len = 255 };
     int result = rte_eth_dev_rss_hash_conf_get(port, &conf);
     struct rte_eth_dev_info info;
     if (result == 0) result = rte_eth_dev_info_get(port, &info);
     if (result == 0) *key_len = info.hash_key_size;
+    *algorithm = conf.algorithm == RTE_ETH_HASH_FUNCTION_TOEPLITZ ? 1 :
+        conf.algorithm == RTE_ETH_HASH_FUNCTION_DEFAULT ? 0 : 2;
     return result;
 }
 int ntcp_host_test_reta(uint16_t port, uint16_t *reta, uint16_t size) {

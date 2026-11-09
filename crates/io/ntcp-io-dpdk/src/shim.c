@@ -557,12 +557,14 @@ int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *confi
     struct rte_eth_conf conf = {0};
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
     *key_size = info.hash_key_size;
+    // A key is checked even with one queue, where it goes unused, so that a
+    // wrong one never passes silently.
+    *stage = NTCP_STAGE_RSS_KEY;
+    if (config->rss_key && config->rss_key_len != info.hash_key_size) return -EINVAL;
     if (config->rss && config->queues > 1) {
         *stage = NTCP_STAGE_RSS;
         uint64_t hf = ntcp_rss_hf & info.flow_type_rss_offloads;
         if (!hf) return -ENOTSUP;
-        *stage = NTCP_STAGE_RSS_KEY;
-        if (config->rss_key && config->rss_key_len != info.hash_key_size) return -EINVAL;
         conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
         conf.rx_adv_conf.rss_conf.rss_hf = hf;
         // NULL leaves the key to the PMD. ethdev keeps this pointer in the
@@ -710,6 +712,11 @@ int ntcp_dpdk_rss_sizes(uint16_t port, uint16_t *key_size, uint16_t *reta_size) 
 
 enum { NTCP_RSS_IPV4_TCP = 1, NTCP_RSS_IPV4 = 2, NTCP_RSS_FRAG_IPV4 = 4 };
 
+// The hash function is passed to Rust as DPDK's value; host.rs names these.
+_Static_assert(RTE_ETH_HASH_FUNCTION_DEFAULT == 0 && RTE_ETH_HASH_FUNCTION_TOEPLITZ == 1 &&
+    RTE_ETH_HASH_FUNCTION_SIMPLE_XOR == 2 && RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ == 3 &&
+    RTE_ETH_HASH_FUNCTION_SYMMETRIC_TOEPLITZ_SORT == 4, "hash function values changed");
+
 static struct rte_eth_rss_reta_entry64 *reta_groups(uint16_t length) {
     size_t groups = (length + RTE_ETH_RETA_GROUP_SIZE - 1) / RTE_ETH_RETA_GROUP_SIZE;
     struct rte_eth_rss_reta_entry64 *table = calloc(groups, sizeof(*table));
@@ -719,12 +726,14 @@ static struct rte_eth_rss_reta_entry64 *reta_groups(uint16_t length) {
     return table;
 }
 
-// The key, granted hash types and the whole redirection table in effect.
-// Returns -ENOSPC (sizes set) if a buffer is smaller than the device's, and
-// -ENOTSUP if the device reports no key or no table.
+// The key, granted hash types, hash function and the whole redirection
+// table in effect. Returns -ENOSPC (sizes set) if a buffer is smaller than
+// the device's, and -ENOTSUP if the device reports no key or no table.
+// ethdev presets the function to DEFAULT, which a PMD that does not report
+// it (mlx5) leaves.
 int ntcp_dpdk_rss_query(uint16_t port, uint8_t *key, uint16_t key_capacity,
                         uint16_t *reta, uint16_t reta_capacity, uint16_t *key_len,
-                        uint16_t *reta_len, uint8_t *hash) {
+                        uint16_t *reta_len, uint8_t *hash, uint32_t *algorithm) {
     struct rte_eth_dev_info info;
     int result = rte_eth_dev_info_get(port, &info);
     if (result < 0) return result;
@@ -738,6 +747,7 @@ int ntcp_dpdk_rss_query(uint16_t port, uint8_t *key, uint16_t key_capacity,
     // Some PMDs report the key length they used, others leave it as passed.
     if (!conf.rss_key_len || conf.rss_key_len > info.hash_key_size) return -EIO;
     *key_len = conf.rss_key_len;
+    *algorithm = (uint32_t)conf.algorithm;
     *hash = (conf.rss_hf & RTE_ETH_RSS_NONFRAG_IPV4_TCP ? NTCP_RSS_IPV4_TCP : 0) |
         (conf.rss_hf & RTE_ETH_RSS_IPV4 ? NTCP_RSS_IPV4 : 0) |
         (conf.rss_hf & RTE_ETH_RSS_FRAG_IPV4 ? NTCP_RSS_FRAG_IPV4 : 0);

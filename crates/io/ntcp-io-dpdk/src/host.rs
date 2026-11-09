@@ -105,6 +105,7 @@ unsafe extern "C" {
         key_len: *mut u16,
         reta_len: *mut u16,
         hash: *mut u8,
+        algorithm: *mut u32,
     ) -> i32;
     fn ntcp_dpdk_rss_reta_update(port: u16, reta: *const u16, length: u16) -> i32;
 }
@@ -113,6 +114,9 @@ unsafe extern "C" {
 const RSS_IPV4_TCP: u8 = 1;
 const RSS_IPV4: u8 = 2;
 const RSS_FRAG_IPV4: u8 = 4;
+
+// Rounds of `Port::rss` that may find the device's key or table grown.
+const RSS_QUERY_ATTEMPTS: usize = 3;
 
 const LCORE_ID_ANY: u32 = u32::MAX;
 
@@ -253,7 +257,8 @@ pub struct PortConfig {
     /// reads the key and redirection table back.
     pub rss: bool,
     /// Hash key for `rss`, exactly the device's hash key size (40 octets on
-    /// mlx5). None keeps the PMD's key.
+    /// mlx5). None keeps the PMD's key. Its length is checked whenever it is
+    /// given, also with a single queue, where it goes unused.
     pub rss_key: Option<Vec<u8>>,
 }
 
@@ -339,7 +344,7 @@ impl Port {
             return Err(invalid("rss_key requires rss"));
         }
         let rss = config.rss && config.queues > 1;
-        let rss_key = config.rss_key.filter(|_| rss).map(Vec::into_boxed_slice);
+        let rss_key = config.rss_key.map(Vec::into_boxed_slice);
         let rss_key_len = match &rss_key {
             Some(key) => u8::try_from(key.len()).map_err(|_| invalid("rss key too long"))?,
             None => 0,
@@ -597,21 +602,20 @@ impl Port {
         })
     }
 
-    /// RSS in effect: the hash key, the granted hash types and the whole
-    /// redirection table (rte_eth_dev_rss_hash_conf_get and
-    /// rte_eth_dev_rss_reta_query), as the device reports them now. Ok(None)
-    /// when the port spreads no traffic by RSS (`rss` off or a single queue).
-    /// Unsupported when the device grants RSS but cannot report its key or
-    /// table.
+    /// RSS in effect: the hash key, the granted hash types, the hash
+    /// function and the whole redirection table
+    /// (rte_eth_dev_rss_hash_conf_get and rte_eth_dev_rss_reta_query), as
+    /// the device reports them now. Ok(None) when the port spreads no traffic
+    /// by RSS (`rss` off or a single queue). Unsupported when the device
+    /// grants RSS but cannot report its key or table.
     pub fn rss(&self) -> io::Result<Option<Rss>> {
         if !self.inner.rss {
             return Ok(None);
         }
-        let (mut key_size, mut reta_size) = self.rss_sizes()?;
-        loop {
+        let rss = query_resized(self.rss_sizes()?, |key_size, reta_size| {
             let mut key = vec![0; usize::from(key_size)];
             let mut reta = vec![0; usize::from(reta_size)];
-            let (mut key_len, mut reta_len, mut hash) = (0, 0, 0);
+            let (mut key_len, mut reta_len, mut hash, mut algorithm) = (0, 0, 0, 0);
             // SAFETY: started port; both buffers hold the capacity passed.
             let result = unsafe {
                 ntcp_dpdk_rss_query(
@@ -623,26 +627,24 @@ impl Port {
                     &mut key_len,
                     &mut reta_len,
                     &mut hash,
+                    &mut algorithm,
                 )
             };
-            // ENOSPC: the table grew since the sizes were read; retry.
-            if result == -28 {
-                (key_size, reta_size) = (key_len, reta_len);
-                continue;
-            }
             if result < 0 {
-                return Err(dpdk_error("rss query", result));
+                return Err((result, (key_len, reta_len)));
             }
             key.truncate(usize::from(key_len));
             reta.truncate(usize::from(reta_len));
-            return Ok(Some(Rss {
+            Ok(Rss {
                 key,
+                algorithm: RssAlgorithm::from_dpdk(algorithm),
                 ipv4_tcp: hash & RSS_IPV4_TCP != 0,
                 ipv4: hash & RSS_IPV4 != 0,
                 ipv4_fragments: hash & RSS_FRAG_IPV4 != 0,
                 reta,
-            }));
-        }
+            })
+        })?;
+        Ok(Some(rss))
     }
 
     /// Replace the whole redirection table (rte_eth_dev_rss_reta_update).
@@ -707,6 +709,32 @@ impl Port {
     }
 }
 
+// Runs `query` with buffers of `sizes` (hash key, redirection table), and
+// again with the sizes it reports when it fails with ENOSPC because the
+// device's grew since they were read, at most RSS_QUERY_ATTEMPTS times in
+// all. An ENOSPC without larger sizes came from the PMD itself and is
+// returned like any other error, as is one that persists.
+fn query_resized<T>(
+    mut sizes: (u16, u16),
+    mut query: impl FnMut(u16, u16) -> Result<T, (i32, (u16, u16))>,
+) -> io::Result<T> {
+    let mut attempts = 1;
+    loop {
+        match query(sizes.0, sizes.1) {
+            Err((-28, now)) if now.0 > sizes.0 || now.1 > sizes.1 => {
+                if attempts == RSS_QUERY_ATTEMPTS {
+                    return Err(io::Error::other(
+                        "rss query: the device's key or table keeps growing",
+                    ));
+                }
+                attempts += 1;
+                sizes = now;
+            }
+            result => return result.map_err(|(result, _)| dpdk_error("rss query", result)),
+        }
+    }
+}
+
 fn read_clock(port: u16) -> io::Result<u64> {
     let mut clock = 0;
     // SAFETY: the caller holds the started port alive; output is writable.
@@ -730,8 +758,13 @@ fn mac_address(port: u16) -> io::Result<[u8; 6]> {
 /// RSS state of a port, as `Port::rss` reads it from the device.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rss {
-    /// Hash key; the algorithm is the PMD's default (Toeplitz on mlx5).
+    /// Hash key.
     pub key: Vec<u8>,
+    /// Hash function, as the PMD reports it. A copy of the device's hash
+    /// (key and table) predicts its queues only for Toeplitz: Default means
+    /// the PMD did not say, and holds Toeplitz only by the PMD's
+    /// documentation (mlx5's).
+    pub algorithm: RssAlgorithm,
     /// RTE_ETH_RSS_NONFRAG_IPV4_TCP: unfragmented IPv4 TCP hashes over
     /// source and destination addresses and ports.
     pub ipv4_tcp: bool,
@@ -745,6 +778,38 @@ pub struct Rss {
     /// low-order bits. Its length is the device's: on mlx5 the queue count
     /// when that is a power of two, else the device's largest table.
     pub reta: Vec<u16>,
+}
+
+/// RSS hash function (enum rte_eth_hash_function).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RssAlgorithm {
+    /// RTE_ETH_HASH_FUNCTION_DEFAULT: the PMD's choice, unreported. ethdev
+    /// presets this before asking the PMD, and a PMD that does not report
+    /// its function leaves it: mlx5 does, and hashes with Toeplitz.
+    Default,
+    Toeplitz,
+    SimpleXor,
+    /// Toeplitz over the exclusive or of source and destination.
+    SymmetricToeplitz,
+    /// Toeplitz over source and destination sorted, addresses and ports
+    /// each.
+    SymmetricToeplitzSort,
+    /// A function this crate does not name, by its DPDK value.
+    Other(u32),
+}
+
+impl RssAlgorithm {
+    fn from_dpdk(value: u32) -> Self {
+        // The shim asserts these values.
+        match value {
+            0 => Self::Default,
+            1 => Self::Toeplitz,
+            2 => Self::SimpleXor,
+            3 => Self::SymmetricToeplitz,
+            4 => Self::SymmetricToeplitzSort,
+            other => Self::Other(other),
+        }
+    }
 }
 
 /// An rte_flow rule; keeps its port alive and is destroyed on drop.
@@ -991,5 +1056,54 @@ impl PacketIo for HostedQueue {
     }
     fn poll_tx_timestamp(&mut self) -> io::Result<Option<TxTimestampCompletion>> {
         self.io.poll_tx_timestamp()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ENOSPC: i32 = -28;
+
+    // A query's reply: a value, or an error with the sizes it reports.
+    type Reply = Result<u8, (i32, (u16, u16))>;
+
+    // (result, sizes each call was given)
+    fn run(mut replies: Vec<Reply>) -> (io::Result<u8>, Vec<(u16, u16)>) {
+        let mut calls = Vec::new();
+        replies.reverse();
+        let result = query_resized((40, 64), |key, reta| {
+            calls.push((key, reta));
+            replies.pop().unwrap()
+        });
+        (result, calls)
+    }
+
+    #[test]
+    fn rss_query_follows_grown_sizes() {
+        let (result, calls) = run(vec![Err((ENOSPC, (40, 128))), Ok(7)]);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls, [(40, 64), (40, 128)]);
+    }
+
+    #[test]
+    fn rss_query_retries_a_bounded_number_of_times() {
+        let replies = (1..=RSS_QUERY_ATTEMPTS + 1)
+            .map(|round| Err((ENOSPC, (40, 64 << round))))
+            .collect();
+        let (result, calls) = run(replies);
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("keeps growing"), "{error}");
+        assert_eq!(calls.len(), RSS_QUERY_ATTEMPTS);
+    }
+
+    #[test]
+    fn rss_query_returns_the_pmds_own_enospc() {
+        // The sizes did not grow: the PMD itself refused.
+        let (result, calls) = run(vec![Err((ENOSPC, (40, 64)))]);
+        assert!(result.unwrap_err().to_string().starts_with("rss query"));
+        assert_eq!(calls.len(), 1);
+        let (result, _) = run(vec![Err((-95, (40, 64)))]);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 }

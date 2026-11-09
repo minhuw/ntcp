@@ -1,5 +1,5 @@
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
-use ntcp_io_dpdk::{Eal, Port, PortConfig, Rss};
+use ntcp_io_dpdk::{Eal, Port, PortConfig, Rss, RssAlgorithm};
 use std::{
     ffi::{CString, c_char, c_void},
     io::ErrorKind,
@@ -22,7 +22,12 @@ unsafe extern "C" {
         key_len: *mut u8,
     ) -> i32;
     fn ntcp_host_test_rss_ipv4_hf() -> u64;
-    fn ntcp_host_test_rss_key(port: u16, key: *mut u8, key_len: *mut u8) -> i32;
+    fn ntcp_host_test_rss_key(
+        port: u16,
+        key: *mut u8,
+        key_len: *mut u8,
+        algorithm: *mut i32,
+    ) -> i32;
     fn ntcp_host_test_reta(port: u16, reta: *mut u16, size: u16) -> i32;
 }
 
@@ -336,26 +341,32 @@ fn rss_conf(port: u16) -> (bool, u64, Vec<u8>) {
     (rss != 0, hf, key[..usize::from(len)].to_vec())
 }
 
-fn device_rss(port: u16, reta_size: u16) -> (Vec<u8>, Vec<u16>) {
-    let (mut key, mut len) = ([0; 255], 0);
+fn device_rss(port: u16, reta_size: u16) -> (Vec<u8>, RssAlgorithm, Vec<u16>) {
+    let (mut key, mut len, mut algorithm) = ([0; 255], 0, -1);
     // SAFETY: EAL is initialized; the key buffer holds 255 octets.
     assert_eq!(
-        unsafe { ntcp_host_test_rss_key(port, key.as_mut_ptr(), &mut len) },
+        unsafe { ntcp_host_test_rss_key(port, key.as_mut_ptr(), &mut len, &mut algorithm) },
         0
     );
+    let algorithm = match algorithm {
+        0 => RssAlgorithm::Default,
+        1 => RssAlgorithm::Toeplitz,
+        other => panic!("the null PMD reports hash function class {other}"),
+    };
     let mut reta = vec![0; usize::from(reta_size)];
     // SAFETY: EAL is initialized; reta holds reta_size entries.
     assert_eq!(
         unsafe { ntcp_host_test_reta(port, reta.as_mut_ptr(), reta_size) },
         0
     );
-    (key[..usize::from(len)].to_vec(), reta)
+    (key[..usize::from(len)].to_vec(), algorithm, reta)
 }
 
 // The null PMD implements RSS in software: a 40-octet key, a 128-entry
 // table and every hash type. It stores the configured hash types and the
 // table but keeps its own key, so the key passed is checked against ethdev's
-// copy of the configuration, and the key reported against the device's.
+// copy of the configuration, and the key reported against the device's. It
+// does not report its hash function, which ethdev then gives as the default.
 fn rss_ports(eal: &'static Eal) {
     // SAFETY: returns a constant.
     let ipv4 = unsafe { ntcp_host_test_rss_ipv4_hf() };
@@ -368,11 +379,13 @@ fn rss_ports(eal: &'static Eal) {
     let id = port.port_id();
     assert_eq!(rss_conf(id), (true, ipv4, key.clone()));
     let rss = port.rss().unwrap().unwrap();
-    let (device_key, device_reta) = device_rss(id, 128);
+    let (device_key, device_algorithm, device_reta) = device_rss(id, 128);
+    assert_eq!(device_algorithm, RssAlgorithm::Default);
     assert_eq!(
         rss,
         Rss {
             key: device_key,
+            algorithm: device_algorithm,
             ipv4_tcp: true,
             ipv4: true,
             ipv4_fragments: true,
@@ -384,7 +397,7 @@ fn rss_ports(eal: &'static Eal) {
 
     let reta: Vec<u16> = (0..128).map(|i| (i * 7 % 4) as u16).collect();
     port.set_reta(&reta).unwrap();
-    assert_eq!(device_rss(id, 128).1, reta);
+    assert_eq!(device_rss(id, 128).2, reta);
     assert_eq!(port.rss().unwrap().unwrap().reta, reta);
     let error = port.set_reta(&reta[..64]).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -408,10 +421,17 @@ fn rss_ports(eal: &'static Eal) {
     assert!(rss.ipv4_tcp && rss.ipv4 && rss.ipv4_fragments);
     drop(port);
 
-    // One queue has nothing to spread: RSS stays off.
+    // One queue has nothing to spread: RSS stays off. A key is still
+    // checked, so that a wrong one is not accepted only while it goes unused.
     let mut single = PortConfig::new("net_null3");
     single.rss = true;
     single.rss_key = Some(vec![0; 39]);
+    let error = Port::start(eal, single.clone()).err().unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("39 octets"), "{error}");
+    assert!(error.to_string().contains("has 40"), "{error}");
+    assert_eq!(port_named("net_null3"), None); // Released on failure.
+    single.rss_key = Some(vec![0; 40]);
     let port = Port::start(eal, single).unwrap();
     assert_eq!(rss_conf(port.port_id()), (false, 0, Vec::new()));
     assert_eq!(port.rss().unwrap(), None);

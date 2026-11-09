@@ -5,7 +5,7 @@ pub use calibration::{
 #[cfg(feature = "native")]
 mod host;
 #[cfg(feature = "native")]
-pub use host::{Eal, Flow, HostedQueue, Port, PortConfig, QueueHandle, Rss};
+pub use host::{Eal, Flow, HostedQueue, Port, PortConfig, QueueHandle, Rss, RssAlgorithm};
 #[cfg(feature = "native")]
 mod native;
 #[cfg(feature = "native")]

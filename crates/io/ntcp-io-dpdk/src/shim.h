@@ -79,7 +79,7 @@ int ntcp_dpdk_flow_destroy(uint16_t port, void *flow);
 int ntcp_dpdk_rss_sizes(uint16_t port, uint16_t *key_size, uint16_t *reta_size);
 int ntcp_dpdk_rss_query(uint16_t port, uint8_t *key, uint16_t key_capacity,
                         uint16_t *reta, uint16_t reta_capacity, uint16_t *key_len,
-                        uint16_t *reta_len, uint8_t *hash);
+                        uint16_t *reta_len, uint8_t *hash, uint32_t *algorithm);
 int ntcp_dpdk_rss_reta_update(uint16_t port, const uint16_t *reta, uint16_t length);
 
 #endif
