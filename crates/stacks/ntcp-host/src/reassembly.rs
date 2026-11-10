@@ -409,6 +409,10 @@ pub(crate) struct Reassembly {
     // charge that fits.
     top: usize,
     charged: usize,
+    // Slots that hold an assembly or a rejection marker. Every service pass
+    // and every deadline query looks at the slots; with none occupied, the
+    // common case, they return without walking them.
+    occupied: usize,
     scratch: Vec<u32>,
     output: Vec<u8>,
     counters: ReassemblyCounters,
@@ -449,6 +453,7 @@ impl Reassembly {
             pool: storage(pool, 0)?,
             top: 0,
             charged: 0,
+            occupied: 0,
             scratch: storage(descriptors, 0)?,
             output: storage(capacity[0].max(capacity[1]), 0)?,
             counters: ReassemblyCounters::default(),
@@ -464,7 +469,9 @@ impl Reassembly {
     /// Live assemblies and rejection markers.
     #[cfg(test)]
     pub fn assemblies(&self) -> usize {
-        self.slots.iter().flatten().count()
+        let count = self.slots.iter().flatten().count();
+        assert_eq!(count, self.occupied);
+        count
     }
     #[cfg(test)]
     pub fn buffered(&self) -> usize {
@@ -663,6 +670,7 @@ impl Reassembly {
                 // Lifetime from the first-arriving fragment, never derived
                 // from TTL and never refreshed (RFC 8200 section 4.5, RFC
                 // 1122 section 3.3.2).
+                self.occupied += 1;
                 self.slots[index] = Some(Slot {
                     key,
                     rejected: false,
@@ -687,6 +695,7 @@ impl Reassembly {
             && !slot.rejected
         {
             self.slots[index] = None;
+            self.occupied -= 1;
         }
         outcome
     }
@@ -965,6 +974,7 @@ impl Reassembly {
         }
         if !slot.rejected {
             self.slots[index] = None;
+            self.occupied -= 1;
         }
     }
 
@@ -1006,6 +1016,9 @@ impl Reassembly {
         mut live: impl FnMut(LinkId, SourceId) -> bool,
         mut expired: impl FnMut(Expired<'_>),
     ) {
+        if self.occupied == 0 {
+            return;
+        }
         for index in 0..self.slots.len() {
             let Some(slot) = self.slots[index] else {
                 continue;
@@ -1032,6 +1045,9 @@ impl Reassembly {
     /// The earliest deadline of any assembly or marker, for embeddings that
     /// schedule their next service pass.
     pub fn next_deadline(&self) -> Option<Instant> {
+        if self.occupied == 0 {
+            return None;
+        }
         self.slots.iter().flatten().map(|s| s.deadline).min()
     }
 }
