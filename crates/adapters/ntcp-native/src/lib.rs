@@ -902,6 +902,70 @@ impl<P: PacketIo> Network<P> {
             network_stopped: self.stopped,
         })
     }
+    /// What connection `id` is ready for now, as poll(2) reports a socket,
+    /// for an embedding that offers level-triggered readiness: events tell
+    /// of changes, this of the state. A condition it reports false is armed
+    /// as a refused read or write arms it, so the change that makes it true
+    /// raises Readable or Writable. An embedding that keeps the connections
+    /// it found ready and asks again before it reports them, as Linux's
+    /// level-triggered epoll does, can drop one when it is no longer ready:
+    /// its next change is an event. Asking changes nothing else.
+    pub fn readiness(&mut self, id: ConnId) -> Result<Readiness> {
+        self.running()?;
+        let c = self.conn(id)?;
+        if c.close_requested || c.abort_requested || c.released {
+            return Err(Error::InvalidHandle);
+        }
+        let core = c.core;
+        let state = self.endpoint.state(core)?;
+        let read_closed = matches!(
+            state,
+            State::CloseWait | State::Closing | State::LastAck | State::TimeWait | State::Closed
+        );
+        let closed = matches!(
+            state,
+            State::Closing | State::LastAck | State::TimeWait | State::Closed
+        );
+        // As refresh_connection raises Readable, and next_connection_event
+        // Writable.
+        let readable = !self.endpoint.is_output_reserved(core)
+            && (read_closed
+                || self.endpoint.readable_bytes(core).unwrap_or(0) != 0
+                || self.endpoint.terminal_readable_bytes(core).unwrap_or(0) != 0);
+        let open = matches!(state, State::Established | State::CloseWait);
+        let writable = open
+            && self
+                .endpoint
+                .check_write_admission(core, None, TxTimestampRequest::default())
+                .is_ok_and(|n| n != 0);
+        let c = self.conn_mut(id)?;
+        // Data a reserved output keeps from being read is not readable; the
+        // end of the reservation raises Readable only for an armed read.
+        if !readable {
+            c.read_waiting = true;
+        }
+        // A connection still connecting is told writable by Connected.
+        if open && !writable && c.write_waiting.is_none() {
+            c.write_waiting = Some(TxTimestampRequest::default());
+        }
+        Ok(Readiness {
+            readable,
+            writable,
+            read_closed,
+            closed,
+        })
+    }
+    /// Whether `accept` on `listener` would give a connection now, for an
+    /// embedding that offers level-triggered readiness. Nothing needs
+    /// arming: every connection that joins the queue raises Acceptable.
+    pub fn acceptable(&self, listener: ListenerId) -> Result<bool> {
+        self.running()?;
+        let l = self.listener(listener)?;
+        if l.closing {
+            return Err(Error::InvalidHandle);
+        }
+        Ok(self.endpoint.listener_queue_info(l.core)?.0 != 0)
+    }
     pub fn send_progress(&self, id: ConnId) -> Result<SendProgress> {
         Ok(self.endpoint.send_progress(self.conn(id)?.core)?)
     }

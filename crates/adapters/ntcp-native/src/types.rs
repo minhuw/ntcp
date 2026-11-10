@@ -128,6 +128,22 @@ pub struct ConnectionInfo {
     pub network_stopped: bool,
 }
 
+/// What a connection is ready for now (`Network::readiness`), as poll(2)
+/// reports a socket.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Readiness {
+    /// `try_read` would not block: data, the end of the stream or the end
+    /// of the connection is there to read.
+    pub readable: bool,
+    /// `try_write` would take at least one octet.
+    pub writable: bool,
+    /// The peer has finished sending, or the connection ended (POLLRDHUP).
+    pub read_closed: bool,
+    /// Both directions have finished, or the connection ended (POLLHUP);
+    /// `connection_info` tells why.
+    pub closed: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
     Connected(ConnId),
