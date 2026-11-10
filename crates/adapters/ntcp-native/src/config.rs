@@ -82,11 +82,27 @@ impl NetworkConfig {
             .checked_mul(connections)?
             .checked_add(self.tcp.output_reservations_charge(reservations, None)?)
     }
+    /// A Network's configuration with Linux's TCP loss recovery and ACK
+    /// timing, where `EndpointConfig::default` keeps the RFC baseline that
+    /// conformance profiles build on: SACK, RACK and tail loss probes on
+    /// (Linux's tcp_sack and tcp_recovery defaults), a 200 ms floor under
+    /// the sampled retransmission timeout (TCP_RTO_MIN, below RFC 6298
+    /// section 2.4's 1 s SHOULD), and delayed ACKs that adapt between 40
+    /// and 200 ms to the peer's sending (TCP_ATO_MIN, TCP_DELACK_MAX). Each
+    /// remains a field of `tcp.connection` to change.
     pub fn new(local_address: IpAddr, mtu: u32) -> Self {
+        let mut tcp = EndpointConfig::default();
+        let connection = &mut tcp.connection;
+        connection.sack = true;
+        connection.rack = true;
+        connection.tlp = true;
+        connection.rto_min_us = 200_000;
+        connection.adaptive_ack = true;
+        connection.delayed_ack_us = 200_000;
         Self {
             local_address,
             mtu,
-            tcp: EndpointConfig::default(),
+            tcp,
             link: Link::Ip,
             // IANA's dynamic/private port range; callers partition it per worker.
             ephemeral_ports: 49152..=65535,
