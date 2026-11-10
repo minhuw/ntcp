@@ -1309,30 +1309,30 @@ impl Rack {
 
     fn count_by_original(&self, physical: bool) -> Counts {
         let mut counts = Counts::default();
-        let mut first = 0;
-        while first < self.intervals.len() {
-            let a = self.intervals[first];
-            let mut last = first + 1;
-            while last < self.intervals.len() {
-                let b = self.intervals[last];
+        let mut intervals = self.intervals.iter().peekable();
+        while let Some(first) = intervals.next() {
+            let mut sacked = first.sacked;
+            let mut lost = first.original_lost && !first.sacked;
+            let mut retransmitted = first.retransmitted && !first.sacked && !first.needs_retransmit;
+            while let Some(next) = intervals.peek() {
                 let same = if physical {
-                    a.original_wire_start == b.original_wire_start
-                        && a.original_wire_end == b.original_wire_end
+                    first.original_wire_start == next.original_wire_start
+                        && first.original_wire_end == next.original_wire_end
                 } else {
-                    a.original_end == b.original_end
+                    first.original_end == next.original_end
                 };
                 if !same {
                     break;
                 }
-                last += 1;
+                let next = intervals.next().unwrap();
+                sacked &= next.sacked;
+                lost |= next.original_lost && !next.sacked;
+                retransmitted |= next.retransmitted && !next.sacked && !next.needs_retransmit;
             }
-            let segment = || self.intervals.range(first, last);
             counts.unacked += 1;
-            counts.sacked += u32::from(segment().all(|r| r.sacked));
-            counts.lost += u32::from(segment().any(|r| r.original_lost && !r.sacked));
-            counts.retransmitted +=
-                u32::from(segment().any(|r| r.retransmitted && !r.sacked && !r.needs_retransmit));
-            first = last;
+            counts.sacked += u32::from(sacked);
+            counts.lost += u32::from(lost);
+            counts.retransmitted += u32::from(retransmitted);
         }
         counts
     }

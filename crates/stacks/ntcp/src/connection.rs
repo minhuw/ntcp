@@ -1958,8 +1958,8 @@ impl Connection {
             && self.sack_fallback.is_none()
     }
 
-    fn tlp_arm_eligible(&self) -> bool {
-        self.config.tlp
+    fn tlp_arm_packets(&self) -> Option<u32> {
+        if !(self.config.tlp
             && self.rack_enabled()
             && self.synchronized()
             && self.flight() != 0
@@ -1969,15 +1969,20 @@ impl Connection {
             && self.consecutive_timeouts == 0
             && !self.retx_pending
             && self.ecn_pause.is_none_or(|deadline| self.now >= deadline)
-            && self.rack.packet_counts().sacked == 0
             && self.rack.deadline.is_none()
             // A loss probe must not bypass the PTB Restart allowance or
             // ordinary admission of known-dropped ranges.
-            && self.ptb_idle()
+            && self.ptb_idle())
+        {
+            return None;
+        }
+        // PTO sizing uses the same original-packet count as eligibility.
+        let counts = self.rack.packet_counts();
+        (counts.sacked == 0).then_some(counts.unacked)
     }
 
     fn tlp_eligible(&self) -> bool {
-        self.tlp_arm_eligible()
+        self.tlp_arm_packets().is_some()
     }
 
     // Only this value is armed. The protocol-specific deadlines are candidate
@@ -2042,7 +2047,7 @@ impl Connection {
     //# sender should attempt to wait long enough that the receiver has sent
     //# any delayed ACKs that it is withholding.
     fn schedule_tlp(&mut self) {
-        if self.tlp_arm_eligible() {
+        if let Some(unacked_packets) = self.tlp_arm_packets() {
             // Preserve a short flight's peer ACK budget without imposing that
             // delay on full-sized flights. A separate scheduling margin covers
             // local timing variance for sampled multi-packet flights.
@@ -2054,7 +2059,7 @@ impl Connection {
                             fin.at_or_after(self.snd_una)
                                 && (self.fin_standalone || fin == self.snd_una)
                         }));
-                        let packets = self.rack.packet_counts().unacked + fin_packet;
+                        let packets = unacked_packets + fin_packet;
                         let delay = if packets == 1 {
                             self.config
                                 .timebase
@@ -4645,7 +4650,7 @@ impl Connection {
             self.select_loss_timer();
             return;
         }
-        if !self.tlp_arm_eligible() {
+        if self.tlp_arm_packets().is_none() {
             self.tlp_deadline = None;
             self.tlp_pending = false;
         }
@@ -8484,20 +8489,18 @@ impl Connection {
             let full_available =
                 (40 - option_len).min((self.path_payload_limit()).saturating_sub(20 + option_len));
             let max_blocks = available.saturating_sub(4) / 8;
-            sack_limited = self
-                .receive
-                .sack_blocks(full_available.saturating_sub(4) / 8)
-                .iter()
-                .flatten()
-                .count()
-                > self
-                    .receive
-                    .sack_blocks(max_blocks)
-                    .iter()
-                    .flatten()
-                    .count();
             let blocks = self.receive.sack_blocks(max_blocks);
             let n = blocks.iter().flatten().count();
+            let full_max_blocks = full_available.saturating_sub(4) / 8;
+            // Reuse matching budgets; DSACK can change with the slot count.
+            sack_limited = max_blocks != full_max_blocks
+                && self
+                    .receive
+                    .sack_blocks(full_max_blocks)
+                    .iter()
+                    .flatten()
+                    .count()
+                    > n;
             if n != 0 {
                 sack_first = blocks[0];
                 options[option_len..option_len + 4].copy_from_slice(&[1, 1, 5, (2 + n * 8) as u8]);

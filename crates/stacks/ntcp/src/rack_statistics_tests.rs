@@ -447,11 +447,16 @@ fn physical_packet_counts_keep_logical_admissions_and_retry_units_separate() {
         assert_eq!(rack.reo_window(false, Some(100)), 0);
         // One original packet retried in smaller pieces remains one original
         // packet. A partial cumulative ACK also cannot create a new unit.
+        rack.mark_head_lost();
+        assert_eq!(rack.packet_counts().lost, 1);
         for (start, end) in [(0, 4), (4, 10)] {
             commit(&mut rack, seq(start), seq(end), 20, true);
         }
-        assert_eq!(rack.packet_counts().retransmitted, 1);
-        assert_eq!(rack.packet_counts().unacked, 4);
+        let counts = rack.packet_counts();
+        assert_eq!(counts.retransmitted, 1);
+        assert_eq!(counts.lost, 1);
+        assert_eq!(counts.sacked, 3);
+        assert_eq!(counts.unacked, 4);
         sack(&mut rack, &mut scoreboard, seq(4).0, seq(40).0, 30, &[]);
         assert_eq!(rack.packet_counts().unacked, 4);
         sack(&mut rack, &mut scoreboard, seq(10).0, seq(40).0, 31, &[]);

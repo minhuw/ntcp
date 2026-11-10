@@ -843,6 +843,12 @@ impl Endpoint {
     //# For the purpose of PAWS, the timestamps sent on a connection are
     //# required to be monotonically increasing.
     fn check_clock(&self, now: Instant) -> Result<(), EndpointError> {
+        // One caller sample can service timers, input and output. Once it
+        // equals the endpoint clock, it cannot jump backwards or across the
+        // timestamp half-range, so there is no conversion to repeat.
+        if now == self.now {
+            return Ok(());
+        }
         if now < self.now {
             return Err(Error::TimeWentBackwards.into());
         }
