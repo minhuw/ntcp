@@ -183,6 +183,57 @@ fn readiness_stays_while_data_waits_and_ends_when_it_is_read() {
     assert!(pair.server.readiness(server).unwrap().readable);
 }
 
+fn readable(network: &mut Network<Wire>, id: ConnId) -> usize {
+    drain(network)
+        .iter()
+        .filter(|&&e| e == Event::Readable(id))
+        .count()
+}
+
+// As Linux wakes a socket for every segment it queues, each arrival of data
+// or of the peer's FIN raises Readable, also while earlier data is unread and
+// no read armed it; arrivals between two drains give one event, and segments
+// that bring nothing to read give none.
+#[test]
+fn each_arrival_raises_readable_while_earlier_data_is_unread() {
+    let mut pair = Pair::new();
+    let (client, server) = pair.connected();
+    assert_eq!(write_all(&mut pair.client, client, &[1; 10]), 10);
+    pair.steps(3);
+    assert_eq!(readable(&mut pair.server, server), 1);
+    assert_eq!(write_all(&mut pair.client, client, &[2; 10]), 10);
+    pair.steps(3);
+    assert_eq!(readable(&mut pair.server, server), 1);
+    for byte in [3, 4] {
+        assert_eq!(write_all(&mut pair.client, client, &[byte; 10]), 10);
+        pair.steps(3);
+    }
+    assert_eq!(readable(&mut pair.server, server), 1);
+    // The server's own data, and the client's acknowledgment of it.
+    assert_eq!(write_all(&mut pair.server, server, &[5; 100]), 100);
+    pair.steps(400);
+    assert_eq!(read_all(&mut pair.client, client), 100);
+    pair.steps(400);
+    assert_eq!(pair.server.send_progress(server).unwrap().acknowledged, 100);
+    assert_eq!(readable(&mut pair.server, server), 0);
+    pair.client.shutdown_write(client).unwrap();
+    pair.steps(3);
+    assert_eq!(readable(&mut pair.server, server), 1);
+    assert_eq!(read_all_until_eof(&mut pair.server, server), 40);
+}
+
+fn read_all_until_eof(network: &mut Network<Wire>, id: ConnId) -> usize {
+    let mut out = [0; 512];
+    let mut total = 0;
+    loop {
+        match network.try_read(id, &mut out) {
+            Ok(ReadOutcome::Data { len, .. }) => total += len,
+            Ok(ReadOutcome::Eof) => return total,
+            other => panic!("read: {other:?}"),
+        }
+    }
+}
+
 // A partial write that fills the send buffer arms nothing; a readiness
 // that finds it full arms Writable, as a refused write does.
 #[test]

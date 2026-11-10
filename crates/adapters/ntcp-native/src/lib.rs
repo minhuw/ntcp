@@ -40,6 +40,10 @@ struct Connection {
     closed_event: bool,
     readable_event: bool,
     read_waiting: bool,
+    // Data or the peer's FIN arrived since the connection was last
+    // refreshed: it raises Readable whether or not a read is armed, as
+    // Linux wakes a socket for every segment it queues (sk_data_ready).
+    arrived: bool,
     write_waiting: Option<TxTimestampRequest>,
 }
 struct Slot<T> {
@@ -837,6 +841,7 @@ impl<P: PacketIo> Network<P> {
             closed_event: false,
             readable_event: false,
             read_waiting: true,
+            arrived: false,
             write_waiting: None,
         });
         occupy(&mut self.live_connections, slot);
@@ -1376,6 +1381,7 @@ impl<P: PacketIo> Network<P> {
         c.close_requested = true;
         c.readable_event = false;
         c.read_waiting = false;
+        c.arrived = false;
         c.write_waiting = None;
         self.touch(id.slot);
         Ok(())
@@ -1386,6 +1392,7 @@ impl<P: PacketIo> Network<P> {
         c.abort_requested = true;
         c.readable_event = false;
         c.read_waiting = false;
+        c.arrived = false;
         c.write_waiting = None;
         self.touch(id.slot);
         Ok(())
@@ -1414,7 +1421,8 @@ impl<P: PacketIo> Network<P> {
             }
             c.state = state;
             c.reason = self.endpoint.close_reason(c.core).ok().flatten();
-            if c.read_waiting && !self.endpoint.is_output_reserved(c.core) {
+            if (c.read_waiting || c.arrived) && !self.endpoint.is_output_reserved(c.core) {
+                c.arrived = false;
                 c.readable_event = self.endpoint.readable_bytes(c.core).unwrap_or(0) != 0
                     || self.endpoint.terminal_readable_bytes(c.core).unwrap_or(0) != 0
                     || matches!(
@@ -1433,6 +1441,12 @@ impl<P: PacketIo> Network<P> {
             match self.endpoint.next_event() {
                 Some(ntcp::Event::Connection(core, events)) => {
                     if let Some(&slot) = self.connection_map.get(&core) {
+                        if (events.readable || events.half_closed)
+                            && let Some(c) = self.connections[slot].value.as_mut()
+                            && !(c.close_requested || c.abort_requested || c.released)
+                        {
+                            c.arrived = true;
+                        }
                         self.touch(slot);
                         if events.tx_timestamps {
                             self.stamped.push(slot);
@@ -1618,7 +1632,7 @@ impl<P: PacketIo> Network<P> {
             && matches!(c.state, State::SynSent | State::SynReceived);
         let closed = matches!(state, State::Closed | State::TimeWait)
             && !matches!(c.state, State::Closed | State::TimeWait);
-        let readable = c.read_waiting
+        let readable = (c.read_waiting || c.arrived)
             && !self.endpoint.is_output_reserved(c.core)
             && (self.endpoint.readable_bytes(c.core).unwrap_or(0) != 0
                 || self.endpoint.terminal_readable_bytes(c.core).unwrap_or(0) != 0

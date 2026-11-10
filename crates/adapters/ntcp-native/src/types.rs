@@ -147,6 +147,12 @@ pub struct Readiness {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Event {
     Connected(ConnId),
+    /// Data, the end of the stream or the end of the connection is there to
+    /// read. Raised when a read (`try_read`, or `Network::readiness` finding
+    /// nothing) is followed by something to read, when a read leaves some,
+    /// and on every arrival of data or the peer's FIN, also while earlier
+    /// data is unread, as Linux wakes a socket for each segment it queues:
+    /// at most once per connection per drain.
     Readable(ConnId),
     Writable(ConnId),
     Closed {
