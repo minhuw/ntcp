@@ -220,9 +220,11 @@ struct Lan {
     b: Station,
     now: u64,
     shape: Shape,
-    // Datagrams the router fragmented, and their fragments.
+    // Datagrams the router fragmented, and their fragments; when it first
+    // fragmented one.
     fragmented: usize,
     pieces: usize,
+    fragmented_at: Option<u64>,
     // The MSS the Network under test offered.
     offered: Option<u16>,
 }
@@ -236,6 +238,7 @@ impl Lan {
             shape,
             fragmented: 0,
             pieces: 0,
+            fragmented_at: None,
             offered: None,
         }
     }
@@ -254,6 +257,7 @@ impl Lan {
             }
             let index = self.fragmented;
             self.fragmented += 1;
+            self.fragmented_at = self.fragmented_at.or(Some(self.now));
             let pieces = (self.shape)(index, &ip, 0x1000 + index as u32);
             self.pieces += pieces.len();
             self.a.incoming.borrow_mut().extend(pieces);
@@ -297,9 +301,17 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn by_default_a_network_discards_every_fragment_and_counts_it() {
+fn by_default_a_network_reassembles_and_zero_discards_every_fragment() {
     let (a, _) = addresses(false);
-    assert_eq!(NetworkConfig::new(a, 1500).reassembly_datagrams, 0);
+    let default = NetworkConfig::new(a, 1500).reassembly_datagrams;
+    assert_eq!(default, 64);
+    let mut lan = Lan::new(false, default, in_order);
+    let received = lan.transfer(16384, 2 * SECOND);
+    assert!(received == payload(16384));
+    let counters = lan.a.network.reassembly_counters();
+    assert_eq!(counters.completed as usize, lan.fragmented);
+    assert_eq!(counters.discarded, Default::default());
+    // An explicit 0 opts out: every fragment is discarded and counted.
     let mut lan = Lan::new(false, 0, in_order);
     let received = lan.transfer(16384, 2 * SECOND);
     assert!(received.is_empty());
@@ -352,7 +364,8 @@ fn reordered_duplicate_and_overlapping_fragments_complete_each_datagram_once() {
 
 // Octets that differ where fragments overlap discard the datagram; TCP
 // sends the segment again. The fragment that arrives after the discard
-// starts an assembly that never completes and expires at the timeout.
+// starts an assembly that never completes and expires at the IPv4
+// timeout, 30 seconds after it arrived.
 #[test]
 fn a_conflicting_overlap_discards_its_datagram_and_tcp_recovers_it() {
     let mut lan = Lan::new(false, DATAGRAMS, conflicting);
@@ -362,7 +375,13 @@ fn a_conflicting_overlap_discards_its_datagram_and_tcp_recovers_it() {
     assert_eq!(counters.discarded.conflict, 1);
     assert_eq!(counters.completed as usize, lan.fragmented - 1);
     assert_eq!(counters.expired, 0);
-    lan.now += 61 * SECOND;
+    // The stray fragment arrived after the router first fragmented and
+    // before the transfer ended.
+    let (first, end) = (lan.fragmented_at.unwrap(), lan.now);
+    lan.now = first + 30 * SECOND - TICK;
+    lan.step();
+    assert_eq!(lan.a.network.reassembly_counters().expired, 0);
+    lan.now = end + 30 * SECOND - TICK;
     lan.step();
     assert_eq!(lan.a.network.reassembly_counters().expired, 1);
 }

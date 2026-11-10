@@ -18,8 +18,8 @@ from test_annotation_inventory import report_fixture, report_scopes
 CONTRACT = {
     791: (19, 19, 0, "6cfb387fcecfc1b72f2f69343c5b6951b5d263d708162e2b5c66ab8f394f6265",
           "823132a1638cd0fc39160740de5ecd34c696a65f03fbb863122ffffaaf961e8d"),
-    1122: (19, 19, 0, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
-           "d244277d38341742b2aaa1bd1ee9f365e16999e8822a4f28fd25b9b608b02c02"),
+    1122: (20, 19, 0, "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
+           "955e3ac96bd30aef200e296a5d4feefa51278656ca6a1b151d4124fea2eb28ec"),
     6864: (4, 4, 0, "e00ff443857166e5b26deecfdc77a0a1c5ff17fc87a6a8c50b020ce7f4d516d9",
            "586eabdc924e7104e828cf54cbeddfcdd85f11c2e2ac5e1cc48e5379eba9e772"),
 }
@@ -66,7 +66,9 @@ class Ipv4Inventory(unittest.TestCase):
                 self.assertEqual(document["text_sha256"], text_hash)
                 rows = [r for r in document["paragraphs"] if r["status"] != "context"]
                 self.assertEqual(len(rows), total)
-                self.assertEqual(Counter(r["status"] for r in rows), Counter(covered=covered, TODO=todos))
+                # The rest are exceptions: RFC 1122's reassembly timeout range.
+                self.assertEqual(Counter(r["status"] for r in rows),
+                                 Counter(covered=covered, TODO=todos, exception=total - covered - todos))
                 keys = sorted((r["section"], audit.norm(r["quote"])) for r in rows)
                 self.assertEqual(audit.digest(json.dumps(keys, separators=(",", ":")).encode()), clauses_hash)
                 specs = audit.toml_entries(ROOT / f"duvet/rfc{n}-additions.toml")
@@ -92,6 +94,20 @@ class Ipv4Inventory(unittest.TestCase):
                         self.assertTrue(any(a["reason"] == row["reason"] for a in matches))
                     if index == 1:
                         self.assertTrue(any("assert" in a["attached"] for a in matches))
+
+    def test_reassembly_timeout_range_is_a_recorded_linux_compatible_exception(self):
+        # Native Networks hold IPv4 fragments 30 seconds, Linux's ipfrag_time:
+        # no evidence is claimed and no source or test annotation cites it.
+        row = next(r for r in ledger(1122)["paragraphs"] if r["id"] == "1122-reassembly-timeout-range")
+        self.assertEqual((row["section"], row["status"]), ("3.3.2", "exception"))
+        self.assertIn("between 60 seconds and 120 seconds", row["quote"])
+        self.assertNotIn("evidence", row)
+        for fact in ("Linux-compatible", "30 seconds", "ipfrag_time", "never set from the remaining TTL",
+                     "any nonzero value", "RFC 8200 section 4.5"):
+            self.assertIn(fact, row["reason"])
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                self.assertNotEqual(audit.clause_key(annotation), audit.clause_key(row), str(path))
 
     def test_atomic_id_amendment_and_selected_gaps_are_explicit(self):
         for n in (791, 1122):

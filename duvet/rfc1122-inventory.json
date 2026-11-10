@@ -2,7 +2,7 @@
   "rfc": 1122,
   "document_status": "Internet Standard",
   "scope_kind": "scoped-operative",
-  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and ARP (section 2.3.2): the ntcp-arp cache's validation and per-destination request rate limit (2.3.2.1), and the 2.3.2.2 packet queue of ntcp-native Ethernet ports that resolve IPv4 next hops by ARP, which keep each owner's latest frame while its next hop resolves and send it once resolved (ntcp-socket's IPv4 ports still use static neighbours). RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly, security facilities, address administration, legacy ToS policy, other ARP embeddings and general host/socket APIs are outside this inventory.",
+  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and ARP (section 2.3.2): the ntcp-arp cache's validation and per-destination request rate limit (2.3.2.1), and the 2.3.2.2 packet queue of ntcp-native Ethernet ports that resolve IPv4 next hops by ARP, which keep each owner's latest frame while its next hop resolves and send it once resolved (ntcp-socket's IPv4 ports still use static neighbours). RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly (but for the section 3.3.2 reassembly timeout recommendation, recorded as an exception), security facilities, address administration, legacy ToS policy, other ARP embeddings and general host/socket APIs are outside this inventory.",
   "text_sha256": "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
   "paragraphs": [
     {
@@ -232,6 +232,14 @@
         "crates/adapters/ntcp-clock/src/tests.rs::fn actual_cadence_characterization()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+    },
+    {
+      "id": "1122-reassembly-timeout-range",
+      "section": "3.3.2",
+      "quote": "It is recommended that the value lie between 60 seconds and 120 seconds.",
+      "status": "exception",
+      "reason": "Deliberate Linux-compatible deviation: the IPv4 reassembly timeout of ntcp-native Networks is 30 seconds, Linux's ipfrag_time, below this recommended range. It is a fixed value, never set from the remaining TTL, and the Host's ReassemblyLimits::ipv4_timeout_seconds accepts any nonzero value. The fragments of one datagram leave its sender together, so a shorter hold rarely discards a datagram that would have completed; it frees the slots that lost fragments pin sooner and shortens the time in which a reused 16-bit Identification can join fragments of different datagrams. IPv6 keeps the 60 seconds of RFC 8200 section 4.5.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.3.2"
     },
     {
       "id": "1122-id-amendment",

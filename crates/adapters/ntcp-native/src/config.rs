@@ -48,9 +48,9 @@ pub struct NetworkConfig {
     pub neighbor_entries: usize,
     // Permanent ARP entries; only valid with EthernetNextHop::Arp.
     pub static_neighbors: Vec<(Ipv4Addr, [u8; 6])>,
-    /// Fragmented datagrams under reassembly at once; 0, the default,
-    /// discards every fragment. RFC 1122 section 3.3.2 makes reassembly a
-    /// host MUST, so a Network that should meet RFC 1122 sets this.
+    /// Fragmented datagrams under reassembly at once, 64 by default, as a
+    /// host reassembles (RFC 1122 section 3.3.2 makes it a MUST); 0 opts
+    /// out and discards every fragment.
     ///
     /// Each datagram may be as large as the larger of the MTU and its
     /// family's required minimum (576 octets for IPv4, 1500 for IPv6): the
@@ -59,12 +59,14 @@ pub struct NetworkConfig {
     /// Each costs about four times the larger of the MTU and 1500 octets
     /// (the Host backs both families' minimums), allocated with the
     /// Network: its octets and the descriptors of its worst conforming
-    /// fragmentation (8-octet fragments).
+    /// fragmentation (8-octet fragments). The default costs about 400 KB
+    /// at an MTU of 1500 and grows with the MTU.
     ///
     /// Size it for the datagrams whose fragments can arrive interleaved. A
     /// fragment refused for room leaves the rest of its datagram holding a
-    /// slot until the timeout, 60 seconds after the datagram's first
-    /// fragment; this Network sends no ICMP, so no Time Exceeded follows.
+    /// slot until the timeout, 30 seconds after an IPv4 datagram's first
+    /// fragment and 60 after an IPv6 one's; this Network sends no ICMP, so
+    /// no Time Exceeded follows.
     /// `Network::reassembly_counters` reports every completion and discard.
     pub reassembly_datagrams: usize,
 }
@@ -94,7 +96,7 @@ impl NetworkConfig {
             retained_receive_packets: None,
             neighbor_entries: 16,
             static_neighbors: Vec::new(),
-            reassembly_datagrams: 0,
+            reassembly_datagrams: 64,
         }
     }
     // The Host's reassembly of `reassembly_datagrams` datagrams, each up to
@@ -102,7 +104,11 @@ impl NetworkConfig {
     // at once, with
     // descriptors for 8-octet fragments of the larger family's datagram
     // (an IPv6 first fragment also stores its Fragment header). The IPv4
-    // timeout is the least of RFC 1122 section 3.3.2's recommended range.
+    // timeout is Linux's ipfrag_time, 30 seconds, below RFC 1122 section
+    // 3.3.2's recommended 60 to 120: a datagram's fragments leave its
+    // sender together, so a shorter hold seldom discards one that would
+    // have completed, and it frees the slots that lost fragments pin
+    // sooner. IPv6 keeps RFC 8200's 60 seconds.
     // None if the storage exceeds what the Host addresses.
     pub(crate) fn reassembly(&self) -> Option<ntcp_host::ReassemblyLimits> {
         let datagrams = self.reassembly_datagrams;
@@ -120,7 +126,7 @@ impl NetworkConfig {
             buffered_bytes,
             ipv4_datagram: mtu.clamp(576, 65535),
             ipv6_datagram,
-            ipv4_timeout_seconds: 60,
+            ipv4_timeout_seconds: 30,
         })
     }
     // The largest IP datagram this Network takes in: a packet of the MTU,

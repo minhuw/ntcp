@@ -307,9 +307,11 @@ impl<P: PacketIo> Network<P> {
     /// Unless ownership is `FlowOwnership::ByAddress`, a member reassembles
     /// the datagrams of every member's flows, which their owner takes in
     /// only within its own reassembly capacity, so the members reassemble
-    /// alike: none of them, or all with the same capacity, which the MTU
-    /// sets (`NetworkConfig::reassembly_datagrams` itself may differ).
-    /// Joining otherwise is `Error::InvalidConfig`.
+    /// alike: all with the same capacity, which the MTU sets, as members
+    /// of one MTU do by default (`NetworkConfig::reassembly_datagrams`
+    /// itself may differ), or none, each having set it to 0. Joining
+    /// otherwise, or with a capacity beyond
+    /// `SharedFlowLimits::packet_bytes`, is `Error::InvalidConfig`.
     pub fn with_shared_flows(
         config: NetworkConfig,
         io: P,

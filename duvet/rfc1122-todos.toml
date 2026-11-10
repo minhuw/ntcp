@@ -1,1 +1,5 @@
 # No RFC 1122 clause of this inventory is open.
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.3.2"
+reason = "Deliberate Linux-compatible deviation: the IPv4 reassembly timeout of ntcp-native Networks is 30 seconds, Linux's ipfrag_time, below this recommended range. It is a fixed value, never set from the remaining TTL, and the Host's ReassemblyLimits::ipv4_timeout_seconds accepts any nonzero value. The fragments of one datagram leave its sender together, so a shorter hold rarely discards a datagram that would have completed; it frees the slots that lost fragments pin sooner and shortens the time in which a reused 16-bit Identification can join fragments of different datagrams. IPv6 keeps the 60 seconds of RFC 8200 section 4.5."
+quote = "It is recommended that the value lie between 60 seconds and 120 seconds."
