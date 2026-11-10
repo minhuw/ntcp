@@ -101,7 +101,7 @@ fn setup_bounded(v6: bool, warm: bool, capacity: usize) -> (Owner, Owner, u64, S
             .unwrap()
             .value as u64;
         // A remote reset releases the learning slot without creating a local
-        // reset's intentional 2MSL tuple reservation.
+        // reset's intentional TIME-WAIT tuple reservation.
         let learning = cid(a, client);
         b.endpoint.abort(cid(b, server)).unwrap();
         exchange(a, b);

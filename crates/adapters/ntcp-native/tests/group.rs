@@ -586,8 +586,9 @@ fn abort_retires_a_generation_and_stale_handles_cannot_reach_a_new_connection() 
         }
     }
     assert!(pair.a.connection_info(old).unwrap().application_closed);
-    // TCP retains a locally reset tuple for 2MSL. Releasing the application
-    // handle must not make its port or slot reusable during that interval.
+    // TCP retains a locally reset tuple for its TIME-WAIT duration. Releasing
+    // the application handle must not make its port or slot reusable during
+    // that interval.
     let retention = pair.a.config().tcp.connection.time_wait_us;
     // This fixture's caller clock is in microseconds, matching its durations.
     pair.now += retention;

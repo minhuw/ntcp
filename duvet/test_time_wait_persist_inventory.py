@@ -186,6 +186,25 @@ class TimeWaitPersistInventories(unittest.TestCase):
                     if row["status"] == "TODO":
                         self.assertTrue(any(a["reason"] == row["reason"] for a in matches), row["id"])
 
+    def test_rfc9293_time_wait_duration_is_a_recorded_exception(self):
+        # TIME-WAIT lasts the configured duration, 120 s by default, rather
+        # than 2xMSL: an extracted requirement closed only by its exception,
+        # which no source or test annotation cites.
+        manifest = json.loads((ROOT / "duvet/extracted-requirements.json").read_text())
+        must = [r for r in manifest["rfcs"]["9293"]["requirements"] if "(MUST-13)" in r["quote"]]
+        self.assertEqual(len(must), 1)
+        key = audit.clause_key(must[0])
+        exceptions = [r for kind, r in audit.toml_entries(ROOT / "duvet/rfc9293-todos.toml")
+                      if kind == "EXCEPTION" and audit.clause_key(r) == key]
+        self.assertEqual(len(exceptions), 1)
+        for fact in ("ConnectionConfig::time_wait_us", "120 s by default", "MSL of 60 s",
+                     "for example for benchmarks", "TCP_TIMEWAIT_LEN", "zero is refused",
+                     "RFC 6191 timestamp-based TIME-WAIT reuse is unchanged"):
+            self.assertIn(fact, exceptions[0]["reason"])
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                self.assertNotEqual(audit.clause_key(annotation), key, str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

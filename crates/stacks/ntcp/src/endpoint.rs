@@ -123,8 +123,9 @@ impl EndpointConfig {
             || self.connection.pmtud.is_some_and(|p| p.first_hop_mtu < 68)
             || !self.connection.valid_timestamp_timebase()
             || !self.connection.valid_pacing()
-            || self.connection.time_wait_us < 240_000_000
-            || self.connection.time_wait_us < 2 * self.connection.timebase.max_segment_lifetime_us
+            // As in ConnectionConfig::validate: TIME-WAIT must outlive the
+            // instant it begins so the ACK of the peer's FIN is still sent.
+            || self.connection.time_wait_us == 0
             || self.connection.timestamp_bytes_per_tick == 0
             || self.connection.timestamp_bytes_per_tick >= 1 << 31
             || self.connection.challenge_ack_limit == 0
@@ -5724,7 +5725,7 @@ impl Endpoint {
             match output {
                 Ok(Some(len)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2
-                    //= reason=Terminal local reset reserves the tuple for 2MSL independently of immediate application CLOSED; only successful RST generation starts the timer.
+                    //= reason=Terminal local reset reserves the tuple for the configured TIME-WAIT duration independently of immediate application CLOSED; only successful RST generation starts the timer.
                     //# The side of a connection issuing a reset should enter the TIME-WAIT state, as
                     //# this generally helps to reduce the load on busy servers for reasons described
                     //# in [70].
@@ -5959,9 +5960,12 @@ mod recovery_observation_tests {
                 assert_ne!(reset_child[13] & RST, 0);
                 assert_eq!(
                     passive.slots[child.slot].as_ref().unwrap().reset_deadline,
-                    Some(240_000_000 * scale)
+                    Some(cfg.connection.time_wait_us * scale)
                 );
-                assert_eq!(passive.next_deadline(), Some(240_000_000 * scale));
+                assert_eq!(
+                    passive.next_deadline(),
+                    Some(cfg.connection.time_wait_us * scale)
+                );
                 // Absolute end-of-clock deadlines saturate, rather than wrapping early.
                 let mut end = Endpoint::new(cfg, [1; 32], u64::MAX - 1, |_| true).unwrap();
                 end.connect(u64::MAX - 1, tuple.local, tuple.remote)

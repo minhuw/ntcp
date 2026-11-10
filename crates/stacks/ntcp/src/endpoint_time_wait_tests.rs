@@ -673,6 +673,8 @@ fn data_syn_candidate_timeout_and_allocation_failure_restore_old_owner() {
         let mut cfg = config();
         cfg.connection.timestamps = true;
         cfg.connection.user_timeout_us = 180_000_000;
+        // The old TIME-WAIT must outlive the candidate's handshake timeout.
+        cfg.connection.time_wait_us = 240_000_000;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
         let tuple = Tuple {
             local: addresses().1,

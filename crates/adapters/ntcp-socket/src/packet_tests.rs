@@ -2534,7 +2534,8 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
     assert_eq!(tx.connection, Some(child));
     assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
     check_ip(&bytes, 80, false);
-    // The terminal reset retains its original policy and tuple through 2MSL.
+    // The terminal reset retains its original policy and tuple through the
+    // TIME-WAIT duration.
     owner.execute(&mut incoming).unwrap();
     assert!(poll_frame(&mut owner).is_none());
     assert_eq!(owner.inner.endpoint.connection_id(tuple), Some(child));

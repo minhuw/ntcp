@@ -62,6 +62,8 @@ impl Default for CallerTimebase {
     fn default() -> Self {
         Self {
             units_per_second: 1_000_000,
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
+            //# For this specification the MSL is taken to be 2 minutes.
             max_segment_lifetime_us: 120_000_000,
         }
     }
@@ -236,6 +238,12 @@ pub struct ConnectionConfig {
     pub challenge_ack_limit: u32,
     pub challenge_ack_interval_us: u64,
     pub user_timeout_us: u64,
+    // TIME-WAIT duration after an active close, and the tuple reservation
+    // after a locally generated reset. The 120 s default lingers 2xMSL only
+    // for a 60 s MSL, not RFC 9293's 2 minutes, and Linux fixes 60 s
+    // (TCP_TIMEWAIT_LEN); any positive value may be configured, a shorter
+    // one for example for benchmarks. RFC 6191 timestamp-based reuse applies
+    // within whatever duration is configured.
     pub time_wait_us: u64,
     pub keepalive: Option<KeepaliveConfig>,
 }
@@ -312,10 +320,12 @@ impl ConnectionConfig {
             || self.challenge_ack_limit == 0
             || self.challenge_ack_interval_us == 0
             || self.user_timeout_us == 0
-            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
-            //# For this specification the MSL is taken to be 2 minutes.
-            || self.time_wait_us < 240_000_000
-            || self.time_wait_us < 2 * self.timebase.max_segment_lifetime_us
+            // A zero TIME-WAIT would expire at the instant it begins, where
+            // time_wait_valid already fails, and a timer serviced at that
+            // instant before output would drop the ACK of the peer's FIN.
+            // Any positive duration outlives that instant; a large one
+            // saturates the deadline in ticks_from_us and saturating_add.
+            || self.time_wait_us == 0
             || self
                 .keepalive
                 .is_some_and(|k| k.idle_us == 0 || k.interval_us == 0 || k.probes < 2)
@@ -435,7 +445,7 @@ impl Default for ConnectionConfig {
             //= reason=Default R2; applications may override the per-connection timeout.
             //# The value of R2 SHOULD correspond to at least 100 seconds (SHLD-11).
             user_timeout_us: 300_000_000,
-            time_wait_us: 240_000_000,
+            time_wait_us: 120_000_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
             //# If keep-alives are included, the application MUST be able to turn them
             //# on or off for each TCP connection (MUST-24), and they MUST default to
@@ -4502,10 +4512,9 @@ impl Connection {
         self.keepalive_deadline = None;
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
-    //# When a connection is closed actively, it MUST linger in the TIME-WAIT
-    //# state for a time 2xMSL (Maximum Segment Lifetime) (MUST-13).
-    // Configuration enforces at least twice RFC 9293's 120-second MSL.
+    // Lingers for the configured time_wait_us rather than RFC 9293's 2xMSL
+    // (section 3.6.1 MUST-13, recorded as an exception): 120 s by default,
+    // and any positive duration when configured.
     fn time_wait(&mut self) {
         self.terminal(CloseReason::Normal);
         self.state = State::TimeWait;
@@ -5889,6 +5898,7 @@ impl Connection {
             return Ok(());
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+        //= reason=The restarted timeout is the configured TIME-WAIT duration, not 2xMSL; the section 3.6.1 exception records that deviation.
         //# The only thing that can arrive in this state is a retransmission of the
         //# remote FIN. Acknowledge it, and restart the 2 MSL timeout.
         // A duplicate FIN falls just below RCV.NXT after its first receipt.

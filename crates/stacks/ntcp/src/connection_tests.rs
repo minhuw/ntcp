@@ -1961,7 +1961,7 @@ fn caller_units_wire_rtt_and_timer_equivalence() {
                 a.update_time(at(200_102)).unwrap();
                 assert_eq!(a.update_time(at(200_101)), Err(Error::TimeWentBackwards));
                 a.time_wait();
-                assert_eq!(a.time_wait_deadline, Some(at(240_200_102)));
+                assert_eq!(a.time_wait_deadline, Some(at(120_200_102)));
                 (
                     vec![syn_bytes, synack, ack, first, second, data_ack, keepalive],
                     info,
@@ -10911,8 +10911,8 @@ fn fin_half_close_time_wait_and_duplicate_fin_restart() {
     let deadline = a.next_deadline().unwrap();
     a.input(70, &wire::parse(ip(reverse(tuple())), &fin).unwrap())
         .unwrap();
-    assert_eq!(deadline, 60 + 240_000_000);
-    assert_eq!(a.next_deadline(), Some(70 + 240_000_000));
+    assert_eq!(deadline, 60 + 120_000_000);
+    assert_eq!(a.next_deadline(), Some(70 + 120_000_000));
     deliver(&mut a, &mut b, 80);
     assert_eq!(b.state(), State::Closed);
     assert_eq!(b.close_reason(), Some(CloseReason::Normal));
@@ -13156,30 +13156,76 @@ fn persist_uses_updated_rto_once_per_episode() {
 }
 
 #[test]
-//= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
-//= type=test
-//# When a connection is closed actively, it MUST linger in the TIME-WAIT
-//# state for a time 2xMSL (Maximum Segment Lifetime) (MUST-13).
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
 //= type=test
 //# For this specification the MSL is taken to be 2 minutes.
-fn time_wait_configuration_enforces_two_msl_minimum() {
-    for time_wait_us in [0, 1, 239_999_999, 240_000_000, 240_000_001] {
-        let mut cfg = config(64, 8);
-        cfg.time_wait_us = time_wait_us;
-        let result = Connection::active(tuple(), cfg, 100, 0);
-        if time_wait_us < 240_000_000 {
-            assert!(matches!(result, Err(Error::InvalidArgument)));
-        } else {
-            let mut a = result.unwrap();
+fn time_wait_defaults_to_120_seconds_beside_a_two_minute_msl() {
+    let cfg = ConnectionConfig::default();
+    assert_eq!(cfg.timebase.max_segment_lifetime_us, 120_000_000);
+    assert_eq!(cfg.time_wait_us, 120_000_000);
+    let mut a = Connection::active(tuple(), config(64, 8), 100, 5).unwrap();
+    a.time_wait();
+    assert_eq!(a.time_wait_deadline, Some(5 + 120_000_000));
+}
+
+#[test]
+fn time_wait_accepts_any_positive_duration_and_ends_at_its_deadline() {
+    // Durations below the default (down to one microsecond, which the former
+    // 2xMSL floor refused), above it, and one whose deadline saturates.
+    for units_per_second in [1_000_000, 1_000_000_000] {
+        for time_wait_us in [1, 2, 1_000, 59_999_999, 120_000_000, 240_000_001, u64::MAX] {
+            let mut cfg = config(64, 8);
+            cfg.timebase.units_per_second = units_per_second;
+            cfg.time_wait_us = time_wait_us;
+            let mut a = Connection::active(tuple(), cfg, 100, 5).unwrap();
             a.time_wait();
-            assert_eq!(a.time_wait_deadline, Some(time_wait_us));
-            a.timeout(time_wait_us - 1).unwrap();
+            let deadline =
+                5u64.saturating_add(time_wait_us.saturating_mul(units_per_second / 1_000_000));
+            assert_eq!(a.time_wait_deadline, Some(deadline));
+            assert_eq!(a.next_deadline(), Some(deadline));
+            a.timeout(deadline - 1).unwrap();
             assert_eq!(a.state(), State::TimeWait);
-            a.timeout(time_wait_us).unwrap();
-            assert_eq!(a.state(), State::Closed);
+            assert!(a.time_wait_valid(deadline - 1));
+            assert!(!a.time_wait_valid(deadline));
+            if deadline < u64::MAX {
+                a.timeout(deadline).unwrap();
+                assert_eq!(a.state(), State::Closed);
+                assert_eq!(a.next_deadline(), None);
+            }
         }
     }
+    let mut cfg = config(64, 8);
+    cfg.time_wait_us = 0;
+    assert!(matches!(
+        Connection::active(tuple(), cfg, 100, 0),
+        Err(Error::InvalidArgument)
+    ));
+}
+
+#[test]
+fn shortest_time_wait_still_acknowledges_the_peer_fin() {
+    let mut cfg = config(64, 8);
+    cfg.time_wait_us = 1;
+    let (mut a, mut b) = pair(cfg, 100);
+    a.shutdown().unwrap();
+    deliver(&mut a, &mut b, 40);
+    deliver(&mut b, &mut a, 50);
+    assert_eq!(a.state(), State::FinWait2);
+    b.shutdown().unwrap();
+    deliver(&mut b, &mut a, 60);
+    assert_eq!(a.state(), State::TimeWait);
+    assert_eq!(b.state(), State::LastAck);
+    // Timers serviced at the instant TIME-WAIT begins leave it, and the
+    // acknowledgment it owes, in place.
+    a.timeout(60).unwrap();
+    assert_eq!(a.state(), State::TimeWait);
+    deliver(&mut a, &mut b, 60);
+    assert_eq!(b.state(), State::Closed);
+    assert_eq!(b.close_reason(), Some(CloseReason::Normal));
+    assert_eq!(a.next_deadline(), Some(61));
+    a.timeout(61).unwrap();
+    assert_eq!(a.state(), State::Closed);
+    assert_eq!(a.transmit(61, &mut [0; 64]), Ok(None));
 }
 
 #[test]

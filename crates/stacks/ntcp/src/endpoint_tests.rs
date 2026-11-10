@@ -2885,6 +2885,7 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
     ] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
+        let expiry = 3_000 + cfg.connection.time_wait_us;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
         let baseline = b.buffer_bytes();
         if released {
@@ -2917,20 +2918,55 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
             b.connect(5_000, tuple.local, tuple.remote),
             Err(EndpointError::AddressInUse)
         );
-        b.on_timeout(240_002_999, 64).unwrap();
+        b.on_timeout(expiry - 1, 64).unwrap();
         assert_eq!(
-            b.connect(240_002_999, tuple.local, tuple.remote),
+            b.connect(expiry - 1, tuple.local, tuple.remote),
             Err(EndpointError::AddressInUse)
         );
-        b.on_timeout(240_003_000, 64).unwrap();
-        packets(&mut b, 240_003_000);
+        b.on_timeout(expiry, 64).unwrap();
+        packets(&mut b, expiry);
         if released {
             assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
             assert_eq!(b.buffer_bytes(), 0);
         } else {
             assert_eq!(b.state(old), Ok(State::Closed));
         }
-        assert!(b.connect(240_003_000, tuple.local, tuple.remote).is_ok());
+        assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
+    }
+}
+
+#[test]
+fn short_time_wait_ends_at_its_configured_deadline() {
+    let mut cfg = config();
+    cfg.connection.time_wait_us = 0;
+    assert!(matches!(
+        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    ));
+    let tuple = Tuple {
+        local: addresses().1,
+        remote: addresses().0,
+    };
+    for time_wait_us in [1, 1_000] {
+        for released in [false, true] {
+            cfg.connection.time_wait_us = time_wait_us;
+            let (mut b, _, old, _, _, _) = time_wait_endpoint(cfg.clone());
+            let expiry = 3_000 + time_wait_us;
+            assert_eq!(b.next_deadline(), Some(expiry));
+            if released {
+                b.release(old).unwrap();
+            }
+            b.on_timeout(expiry - 1, 64).unwrap();
+            assert!(b.connection_exists(old));
+            assert_eq!(
+                b.connect(expiry - 1, tuple.local, tuple.remote),
+                Err(EndpointError::AddressInUse)
+            );
+            b.on_timeout(expiry, 64).unwrap();
+            assert!(packets(&mut b, expiry).is_empty());
+            assert_eq!(b.connection_exists(old), !released);
+            assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
+        }
     }
 }
 
@@ -3537,28 +3573,25 @@ fn time_wait_old_expiry_and_slot_generation_do_not_remove_or_restore_replacement
     ] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
+        let expiry = 3_000 + cfg.connection.time_wait_us;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
         let baseline = b.buffer_bytes();
         b.release(old).unwrap();
         let seq = h.acknowledgment.wrapping_add(100);
         let syn = tw_segment_with_payload(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)), payload);
-        b.input(240_002_000, ip, &syn).unwrap();
-        let output = packets(&mut b, 240_002_000);
+        b.input(expiry - 1_000, ip, &syn).unwrap();
+        let output = packets(&mut b, expiry - 1_000);
         let new_iss = wire::parse(output[0].0, &output[0].1)
             .unwrap()
             .header
             .sequence;
-        b.on_timeout(240_003_000, 64).unwrap();
-        packets(&mut b, 240_003_000);
+        b.on_timeout(expiry, 64).unwrap();
+        packets(&mut b, expiry);
         assert_eq!(b.buffer_bytes(), baseline);
         assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
         // Reuse the expired slot for another tuple before candidate resolution.
         let spare = b
-            .connect(
-                240_003_000,
-                "192.0.2.2:8081".parse().unwrap(),
-                addresses().0,
-            )
+            .connect(expiry, "192.0.2.2:8081".parse().unwrap(), addresses().0)
             .unwrap();
         let resolution = tw_segment(
             ip,
@@ -3568,15 +3601,15 @@ fn time_wait_old_expiry_and_slot_generation_do_not_remove_or_restore_replacement
             if establish { wire::ACK } else { wire::RST },
             Some((ts + 2, 240002)),
         );
-        b.input(240_003_001, ip, &resolution).unwrap();
-        packets(&mut b, 240_003_001);
+        b.input(expiry + 1, ip, &resolution).unwrap();
+        packets(&mut b, expiry + 1);
         assert_eq!(b.state(spare), Ok(State::SynSent));
         if establish {
             let child = b.accept(listener).unwrap();
             assert_eq!(b.state(child), Ok(State::Established));
             assert_ne!(child, old);
             assert_eq!(
-                b.connect(240_003_001, addresses().1, addresses().0),
+                b.connect(expiry + 1, addresses().1, addresses().0),
                 Err(EndpointError::AddressInUse)
             );
         } else {
@@ -3584,7 +3617,7 @@ fn time_wait_old_expiry_and_slot_generation_do_not_remove_or_restore_replacement
                 b.accept(listener),
                 Err(EndpointError::Connection(Error::WouldBlock))
             );
-            assert!(b.connect(240_003_001, addresses().1, addresses().0).is_ok());
+            assert!(b.connect(expiry + 1, addresses().1, addresses().0).is_ok());
         }
     }
 }
@@ -3654,6 +3687,7 @@ fn timestamps_two_endpoints_reopen_and_transfer_after_time_wait() {
     let mut cfg = config();
     cfg.connection.timestamps = true;
     cfg.reuse_time_wait = true;
+    let expiry = 3_000 + cfg.connection.time_wait_us;
     let (local, remote) = addresses();
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
@@ -3684,8 +3718,8 @@ fn timestamps_two_endpoints_reopen_and_transfer_after_time_wait() {
     let mut bytes = [0; 16];
     assert_eq!(b.read(new, &mut bytes), Ok(10));
     assert_eq!(&bytes[..10], b"new stream");
-    b.on_timeout(240_003_000, 64).unwrap();
-    packets(&mut b, 240_003_000);
+    b.on_timeout(expiry, 64).unwrap();
+    packets(&mut b, expiry);
     assert_eq!(b.state(new), Ok(State::Established));
     assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
 }
@@ -3695,6 +3729,8 @@ fn time_wait_pending_candidate_timeout_restores_original_tuple() {
     let mut cfg = config();
     cfg.connection.timestamps = true;
     cfg.connection.user_timeout_us = 180_000_000;
+    // The old TIME-WAIT must outlive the candidate's handshake timeout.
+    cfg.connection.time_wait_us = 240_000_000;
     let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
     let baseline = b.buffer_bytes();
     let syn = tw_segment(
@@ -4327,6 +4363,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     cfg.preallocate_connections = 1;
     let charge = connection_charge(&cfg);
     cfg.max_buffer_bytes = 2 * charge;
+    let time_wait = cfg.connection.time_wait_us;
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
@@ -4360,7 +4397,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
         assert!(a.connection_exists(id));
     }
     assert_eq!(a.buffer_bytes(), 2 * charge);
-    a.on_timeout(240_000_000, 2).unwrap();
+    a.on_timeout(time_wait, 2).unwrap();
     assert!(!a.connection_exists(first));
     assert!(!a.connection_exists(second));
     assert_eq!(a.buffer_bytes(), charge);
@@ -4370,28 +4407,28 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
         packets(&mut b, 0);
     }
     assert_eq!(b.buffer_bytes(), 2 * charge);
-    b.on_timeout(240_000_000, 2).unwrap();
+    b.on_timeout(time_wait, 2).unwrap();
     assert_eq!(b.buffer_bytes(), charge);
     // At the reserved budget, active and passive opens must still be admitted.
-    let fresh = a.connect(240_000_000, local, remote).unwrap();
-    pump(&mut a, &mut b, 240_000_000);
+    let fresh = a.connect(time_wait, local, remote).unwrap();
+    pump(&mut a, &mut b, time_wait);
     let server = b.accept(listener).unwrap();
     assert_ne!(fresh, first);
     assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
     a.write(fresh, b"old bytes").unwrap();
     a.shutdown(fresh).unwrap();
-    pump(&mut a, &mut b, 240_000_000);
+    pump(&mut a, &mut b, time_wait);
     assert_eq!(b.state(server), Ok(State::CloseWait));
     // Keep old unread payload and EOF in the receive buffer through abort/reclaim.
     b.abort(server).unwrap();
     b.release(server).unwrap();
-    pump(&mut a, &mut b, 240_000_000);
+    pump(&mut a, &mut b, time_wait);
     a.release(fresh).unwrap();
-    packets(&mut a, 240_000_000);
-    b.on_timeout(480_000_000, 1).unwrap();
+    packets(&mut a, time_wait);
+    b.on_timeout(2 * time_wait, 1).unwrap();
     assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
-    let replacement = a.connect(480_000_001, local, remote).unwrap();
-    pump(&mut a, &mut b, 480_000_001);
+    let replacement = a.connect(2 * time_wait + 1, local, remote).unwrap();
+    pump(&mut a, &mut b, 2 * time_wait + 1);
     let server = b.accept(listener).unwrap();
     assert_eq!(b.readable_bytes(server), Ok(0));
     assert_eq!(
@@ -4405,7 +4442,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
         }
     }
     a.write(replacement, b"new").unwrap();
-    pump(&mut a, &mut b, 480_000_001);
+    pump(&mut a, &mut b, 2 * time_wait + 1);
     let mut out = [0xaa; 16];
     assert_eq!(b.read(server, &mut out), Ok(3));
     assert_eq!(&out[..3], b"new");
@@ -4419,6 +4456,7 @@ fn receive_preallocation_time_wait_fallback_keeps_ownership_and_charges() {
     cfg.preallocate_connections = 2;
     let charge = connection_charge(&cfg);
     cfg.max_buffer_bytes = 2 * charge;
+    let expiry = 3_000 + cfg.connection.time_wait_us;
     let (mut b, _, old, ip, h, _) = time_wait_endpoint(cfg);
     let tuple = Tuple {
         local: addresses().1,
@@ -4440,18 +4478,18 @@ fn receive_preallocation_time_wait_fallback_keeps_ownership_and_charges() {
     assert!(b.connection_exists(old));
     assert!(!b.connection_exists(child));
     assert_eq!(b.buffer_bytes(), 2 * charge);
-    b.on_timeout(240_003_000, 64).unwrap();
-    packets(&mut b, 240_003_000);
+    b.on_timeout(expiry, 64).unwrap();
+    packets(&mut b, expiry);
     assert!(!b.connection_exists(old));
     assert_eq!(b.buffer_bytes(), 2 * charge);
-    assert!(b.connect(240_003_000, tuple.local, tuple.remote).is_ok());
+    assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
     assert_eq!(b.buffer_bytes(), 2 * charge);
 }
 
 // Exact BASE-044 recommendation, reconciled with application-visible ABORT CLOSED.
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2
 //= type=test
-//= reason=IPv4/IPv6 terminal resets reserve bounded tuple ownership before output and for exactly configured 2MSL after successful generation; released and retained handles expire safely.
+//= reason=IPv4/IPv6 terminal resets reserve bounded tuple ownership before output and for exactly the configured TIME-WAIT duration after successful generation; released and retained handles expire safely.
 //# The side of a connection issuing a reset should enter the TIME-WAIT state, as
 //# this generally helps to reduce the load on busy servers for reasons described
 //# in [70].
@@ -4468,7 +4506,7 @@ fn reset_quarantine_output_commit_exact_boundary_and_replacement_ownership() {
                 addresses()
             };
             let mut cfg = config();
-            cfg.connection.time_wait_us = 240_000_123;
+            cfg.connection.time_wait_us = 1_000_123;
             let duration = cfg.connection.time_wait_us;
             let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
             let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
@@ -4750,6 +4788,7 @@ fn reset_failed_child_unlinks_backlog_before_output_and_quarantine_expiry() {
 
 #[test]
 fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
+    let time_wait = config().connection.time_wait_us;
     for (release_old, payload) in [
         (false, b"".as_slice()),
         (true, b"".as_slice()),
@@ -4778,14 +4817,16 @@ fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
         assert!(b.poll_transmit(5_000, &mut [0; 1], 1).is_err());
         assert_eq!(b.connection_id(tuple), Some(candidate));
         packets(&mut b, 6_000);
-        b.on_timeout(240_003_000, 1).unwrap(); // Old TIME-WAIT expires first.
-        packets(&mut b, 240_003_000);
+        b.on_timeout(3_000 + time_wait, 1).unwrap(); // Old TIME-WAIT expires first.
+        packets(&mut b, 3_000 + time_wait);
         assert_eq!(b.connection_exists(old), !release_old);
         assert_eq!(b.connection_id(tuple), Some(candidate));
-        b.on_timeout(240_006_000, 1).unwrap();
+        b.on_timeout(6_000 + time_wait, 1).unwrap();
         assert!(!b.connection_exists(candidate));
         assert_eq!(b.connection_id(tuple), None);
-        let replacement = b.connect(240_006_000, tuple.local, tuple.remote).unwrap();
+        let replacement = b
+            .connect(6_000 + time_wait, tuple.local, tuple.remote)
+            .unwrap();
         if !release_old {
             b.release(old).unwrap();
         }
@@ -5378,7 +5419,7 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     a.release(client).unwrap();
     packets(&mut a, 0);
     assert_eq!(a.buffer_bytes(), grown_charge);
-    a.on_timeout(240_000_000, 64).unwrap();
+    a.on_timeout(config().connection.time_wait_us, 64).unwrap();
     assert!(!a.connection_exists(client));
     assert_eq!(a.buffer_bytes(), 0);
 }
@@ -5729,10 +5770,11 @@ fn tx_timestamp_terminal_cancellation_release_and_reused_generation() {
             .packet
             .unwrap();
         assert_eq!(tx.tx_timestamp, None); // Final RST carries no payload range.
-        a.on_timeout(240_000_002, 16).unwrap();
-        a.poll_transmit(240_000_002, &mut [0; 2048], 16).unwrap();
+        let expiry = 2 + config().connection.time_wait_us;
+        a.on_timeout(expiry, 16).unwrap();
+        a.poll_transmit(expiry, &mut [0; 2048], 16).unwrap();
         let (local, remote) = addresses();
-        let replacement = a.connect(240_000_002, local, remote).unwrap();
+        let replacement = a.connect(expiry, local, remote).unwrap();
         assert_ne!(replacement, client);
         a.set_tx_timestamp_capacity(replacement, 1).unwrap();
         a.write_with_timestamp(
