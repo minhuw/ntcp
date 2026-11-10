@@ -1897,8 +1897,10 @@ impl Owner {
                 && let Some(s) = self.sockets.get_mut(listener)
                 && s.acceptable
             {
-                // Core Acceptable covers empty->nonempty. A subsequent child
-                // is also a Linux ET wake even while the accept queue is ready.
+                // A child joining a ready accept queue is a Linux ET wake.
+                // The core's Acceptable, drained later in this pass, marks it
+                // too; an edge observer compares generations, so the second
+                // increment adds no wake.
                 s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
             }
             if Some(cid) == new_child
@@ -2739,7 +2741,7 @@ impl Owner {
                     }
                 };
                 out.addr = Some(peer);
-                // Core emits Acceptable on empty->nonempty; stay readable until accept returns EAGAIN.
+                // Core emits Acceptable for each child that joins; stay readable until accept returns EAGAIN.
             }
             Op::Connect(addr) => {
                 let remote = s.normalize_address(addr, self.local, false)?;

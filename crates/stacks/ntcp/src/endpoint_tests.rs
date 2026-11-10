@@ -283,6 +283,41 @@ fn listener_backlog_and_cleanup_are_bounded() {
 }
 
 #[test]
+fn every_connection_joining_the_accept_queue_raises_acceptable() {
+    // As each new child wakes a Linux listener: a caller that took the
+    // event but not every pending connection hears of the next one, and
+    // joins before the caller looks give one event.
+    let acceptable = |b: &mut Endpoint, listener| {
+        let mut count = 0;
+        while let Some(event) = b.next_event() {
+            count += usize::from(event == Event::Acceptable(listener));
+        }
+        count
+    };
+    let (mut a, mut b, listener, _) = endpoints();
+    let (local, remote) = addresses();
+    pump(&mut a, &mut b, 0);
+    assert_eq!(acceptable(&mut b, listener), 1);
+    let address = |port| core::net::SocketAddr::new(local.ip(), port);
+    a.connect(0, address(40001), remote).unwrap();
+    pump(&mut a, &mut b, 0);
+    assert_eq!(acceptable(&mut b, listener), 1);
+    for port in [40002, 40003] {
+        a.connect(0, address(port), remote).unwrap();
+    }
+    pump(&mut a, &mut b, 0);
+    assert_eq!(acceptable(&mut b, listener), 1);
+    for _ in 0..4 {
+        b.accept(listener).unwrap();
+    }
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(acceptable(&mut b, listener), 0);
+}
+
+#[test]
 fn seeded_duplex_network_faults_preserve_every_byte_and_eventually_close() {
     struct Delayed {
         at: u64,

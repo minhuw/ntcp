@@ -2905,11 +2905,13 @@ impl Endpoint {
             if let Some(listener) = self.listeners[parent.slot].as_mut()
                 && !listener.closing
             {
-                let was_empty = listener.pending.is_empty();
+                // Every connection that joins the queue raises Acceptable,
+                // as each new child wakes a Linux listener (sk_data_ready):
+                // an edge-triggered caller that took fewer than all pending
+                // connections hears of the next one. The ready queue holds
+                // the listener once, so joins before a drain coalesce.
                 listener.pending.push_back(id);
-                if was_empty {
-                    self.events.push(self.config.max_connections + parent.slot);
-                }
+                self.events.push(self.config.max_connections + parent.slot);
             }
         }
         let slot = self.slots[index].as_ref().unwrap();
