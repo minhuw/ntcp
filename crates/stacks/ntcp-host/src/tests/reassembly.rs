@@ -250,11 +250,7 @@ fn limits_are_validated_and_capacity_is_backed_by_storage() {
             ..good
         },
         ReassemblyLimits {
-            ipv4_timeout_seconds: 59,
-            ..good
-        },
-        ReassemblyLimits {
-            ipv4_timeout_seconds: 121,
+            ipv4_timeout_seconds: 0,
             ..good
         },
         // IPv6 1500 octets in 8-octet fragments needs 183 descriptors.
@@ -289,8 +285,9 @@ fn limits_are_validated_and_capacity_is_backed_by_storage() {
     };
     assert_eq!(minimal.datagram_capacity(true), Some(1500));
     assert_eq!(minimal.datagram_capacity(false), Some(1484));
-    // Both 60 and 120 seconds are within RFC 1122 section 3.3.2's range.
-    for seconds in [60, 120] {
+    // Any nonzero IPv4 timeout is accepted, within RFC 1122 section 3.3.2's
+    // recommended range (60 to 120) or not.
+    for seconds in [1, 30, 60, 120, 121, u64::MAX] {
         Reassembly::new(
             ReassemblyLimits {
                 ipv4_timeout_seconds: seconds,
@@ -346,7 +343,7 @@ fn host_states_capacity_per_family_and_rejects_invalid_configuration() {
             mms_r: 65535,
         })
     );
-    host_limits.reassembly.ipv4_timeout_seconds = 30;
+    host_limits.reassembly.ipv4_timeout_seconds = 0;
     assert!(matches!(
         Host::new(
             ContextId::new(5),
@@ -1021,6 +1018,49 @@ fn expiry_runs_without_traffic_and_reports_only_after_fragment_zero() {
     );
     assert_eq!(expire_all(&mut r, 60 * SECOND).len(), 1);
     assert_eq!(r.next_deadline(), Some(120 * SECOND));
+}
+
+// An IPv4 timeout below RFC 1122 section 3.3.2's recommended range, such as
+// Linux's 30 seconds, expires IPv4 assemblies alone; IPv6 keeps 60 seconds.
+// The largest timeout saturates its deadline instead of overflowing.
+#[test]
+fn ipv4_timeouts_outside_the_recommended_range_apply_to_ipv4_alone() {
+    let f = fixture();
+    let d = data(16, 14);
+    let mut r = Reassembly::new(
+        ReassemblyLimits {
+            ipv4_timeout_seconds: 30,
+            ..limits()
+        },
+        SECOND,
+    )
+    .unwrap();
+    for v6 in [false, true] {
+        assert_eq!(
+            feed(&mut r, &f, SECOND, frag(v6, 21, 0, true, &d[..8])),
+            Out::Held
+        );
+    }
+    assert_eq!(r.next_deadline(), Some(31 * SECOND));
+    assert!(expire_all(&mut r, 31 * SECOND - 1).is_empty());
+    assert_eq!(expire_all(&mut r, 31 * SECOND).len(), 1);
+    assert_eq!(r.next_deadline(), Some(61 * SECOND));
+    assert_eq!(expire_all(&mut r, 61 * SECOND).len(), 1);
+    assert_eq!(r.counters().expired, 2);
+    let mut r = Reassembly::new(
+        ReassemblyLimits {
+            ipv4_timeout_seconds: u64::MAX,
+            ..limits()
+        },
+        SECOND,
+    )
+    .unwrap();
+    assert_eq!(
+        feed(&mut r, &f, SECOND, frag(false, 22, 0, true, &d[..8])),
+        Out::Held
+    );
+    assert_eq!(r.next_deadline(), Some(u64::MAX));
+    assert!(expire_all(&mut r, u64::MAX - 1).is_empty());
 }
 
 #[test]

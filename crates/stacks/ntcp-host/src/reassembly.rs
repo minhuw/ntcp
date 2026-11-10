@@ -41,9 +41,9 @@ pub struct ReassemblyLimits {
     /// Largest reconstructed IPv6 packet, the 40-octet header included
     /// (Payload Length at most 65535, so at most 65575).
     pub ipv6_datagram: usize,
-    /// Fixed IPv4 reassembly timeout in seconds. RFC 1122 section 3.3.2
-    /// recommends a fixed value between 60 and 120 seconds; the TTL of
-    /// arriving fragments is never used.
+    /// Fixed IPv4 reassembly timeout in seconds, at least 1. RFC 1122
+    /// section 3.3.2 recommends a fixed value between 60 and 120 seconds;
+    /// Linux uses 30. The TTL of arriving fragments is never used.
     pub ipv4_timeout_seconds: u64,
 }
 
@@ -93,9 +93,12 @@ impl ReassemblyLimits {
             return Ok(());
         }
         let descriptors = self.assemblies.checked_mul(self.fragments);
+        // The IPv4 timeout is the embedding's policy, RFC 1122's range only a
+        // recommendation. A zero timeout would expire every assembly on its
+        // first fragment; no value overflows, as deadlines saturate.
         if !(576..=65535).contains(&self.ipv4_datagram)
             || !(1500..=65575).contains(&self.ipv6_datagram)
-            || !(60..=120).contains(&self.ipv4_timeout_seconds)
+            || self.ipv4_timeout_seconds == 0
             || descriptors.is_none_or(|n| n > u32::MAX as usize)
             || self.buffered_bytes > u32::MAX as usize
             || self.datagram_capacity(false).is_none_or(|n| n < 576)
