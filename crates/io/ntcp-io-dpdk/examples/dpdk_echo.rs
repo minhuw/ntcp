@@ -129,14 +129,20 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     process::ExitCode,
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 const NANOS: u64 = 1_000_000_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// After the measured window: in-flight responses, then FIN exchanges.
-const DRAIN: Duration = Duration::from_secs(1);
+// After the measured window: in-flight responses, then FIN exchanges. A
+// response whose request or reply segment was lost waits for a retransmission
+// timeout (ntcp's is at least 1 s, doubled after a lost retransmission), so
+// the drain outlasts one timeout and its backoff.
+const DRAIN: Duration = Duration::from_secs(3);
 const LINGER: Duration = Duration::from_secs(1);
 const CALIBRATION_PERIOD: u64 = NANOS / 10;
 const CALIBRATION_WINDOW: usize = 32;
@@ -403,6 +409,50 @@ struct Worker {
     connections: usize,
     // Shared-address mode: the flows and this worker's member index.
     flows: Option<(SharedFlows, usize)>,
+    finished: Finished,
+}
+
+// Workers that have finished their exchange. A worker's queue can carry
+// frames for the others (ARP for every address lands on one queue, and with
+// no steering every member's flows arrive on the first member's queue), and
+// no other worker reads it, so each keeps driving until all have finished.
+// A worker that fails or panics counts when its Worker drops.
+struct Finished {
+    count: Arc<AtomicUsize>,
+    workers: usize,
+    counted: bool,
+}
+
+impl Finished {
+    fn mark(&mut self) {
+        if !std::mem::replace(&mut self.counted, true) {
+            self.count.fetch_add(1, Ordering::Release);
+        }
+    }
+    fn all(&self) -> bool {
+        self.count.load(Ordering::Acquire) == self.workers
+    }
+}
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.mark();
+    }
+}
+
+// Serve the queue for the other workers, discarding events, until every
+// worker has finished.
+fn serve_others(network: &mut Network<HostedQueue>, finished: &Finished) {
+    let mut events = [Event::NetworkStopped; 64];
+    while !finished.all() {
+        if network
+            .drive(now_ns(), WorkBudget::new(64, 64, 64, 64))
+            .is_err()
+        {
+            return;
+        }
+        while network.drain_events(&mut events).more {}
+    }
 }
 
 fn main() -> ExitCode {
@@ -527,7 +577,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     // Members share one secret, as one host has one: each member's ISNs and
     // SYN cookies must hold for flows another member hands it.
     let common = shared.as_ref().map(|_| random_secret()).transpose()?;
-    let args = std::sync::Arc::new(args);
+    let args = Arc::new(args);
+    let finished = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::new();
     for (index, &connections) in shares.iter().enumerate() {
         let worker = Worker {
@@ -542,6 +593,11 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             },
             connections,
             flows: shared.as_ref().map(|(flows, _)| (flows.clone(), index)),
+            finished: Finished {
+                count: finished.clone(),
+                workers: shares.len(),
+                counted: false,
+            },
         };
         let args = args.clone();
         workers.push(
@@ -872,7 +928,7 @@ fn serve(worker: Worker, original: libc::cpu_set_t, args: &Args) -> Report {
 }
 
 fn serve_into(
-    worker: Worker,
+    mut worker: Worker,
     original: libc::cpu_set_t,
     args: &Args,
     report: &mut Report,
@@ -941,6 +997,8 @@ fn serve_into(
         calibrate.then_some(&mut calibration),
         report,
     );
+    worker.finished.mark();
+    serve_others(&mut network, &worker.finished);
     // Counters and fit also describe a failed run.
     let counters = network.counters();
     report.arp_sent = counters.arp_sent;

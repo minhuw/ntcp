@@ -119,14 +119,20 @@ use std::{
     io::{self, Read},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     process::ExitCode,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 const NANOS: u64 = 1_000_000_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// After the measured window: in-flight responses, then FIN exchanges.
-const DRAIN: Duration = Duration::from_secs(1);
+// After the measured window: in-flight responses, then FIN exchanges. A
+// response whose request or reply segment was lost waits for a retransmission
+// timeout (ntcp's is at least 1 s, doubled after a lost retransmission), so
+// the drain outlasts one timeout and its backoff.
+const DRAIN: Duration = Duration::from_secs(3);
 const LINGER: Duration = Duration::from_secs(1);
 const REQUEST_LEN: usize = 16;
 // ntcp's Toeplitz hashes the received packet's IPv4 addresses and TCP ports,
@@ -366,6 +372,50 @@ struct Worker {
     connections: usize,
     // Some under --shared: the worker's Network is member `index`.
     flows: Option<SharedFlows>,
+    finished: Finished,
+}
+
+// Workers that have finished their exchange. A worker's queue can carry
+// frames for the others (ARP for every address lands on one queue, and with
+// no steering every member's flows arrive on the first member's queue), and
+// no other worker reads it, so each keeps driving until all have finished.
+// A worker that fails or panics counts when its Worker drops.
+struct Finished {
+    count: Arc<AtomicUsize>,
+    workers: usize,
+    counted: bool,
+}
+
+impl Finished {
+    fn mark(&mut self) {
+        if !std::mem::replace(&mut self.counted, true) {
+            self.count.fetch_add(1, Ordering::Release);
+        }
+    }
+    fn all(&self) -> bool {
+        self.count.load(Ordering::Acquire) == self.workers
+    }
+}
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.mark();
+    }
+}
+
+// Serve the queue for the other workers, discarding events, until every
+// worker has finished.
+fn serve_others(network: &mut Network<HostedQueue>, finished: &Finished) {
+    let mut events = [Event::NetworkStopped; 64];
+    while !finished.all() {
+        if network
+            .drive(now_ns(), WorkBudget::new(64, 64, 64, 64))
+            .is_err()
+        {
+            return;
+        }
+        while network.drain_events(&mut events).more {}
+    }
 }
 
 fn main() -> ExitCode {
@@ -554,6 +604,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         .and_then(|mut f| f.read_exact(&mut secret))
         .map_err(|e| format!("/dev/urandom: {e}"))?;
     let args = Arc::new(args);
+    let finished = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::new();
     for (index, &queue) in args.queues.iter().enumerate() {
         let worker = Worker {
@@ -565,6 +616,11 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             secret,
             connections: shares[index],
             flows: flows.clone(),
+            finished: Finished {
+                count: finished.clone(),
+                workers: args.queues.len(),
+                counted: false,
+            },
         };
         let args = args.clone();
         workers.push(
@@ -768,7 +824,7 @@ fn serve(worker: Worker, args: &Args) -> Report {
     report
 }
 
-fn serve_into(worker: Worker, args: &Args, report: &mut Report) -> Result<(), String> {
+fn serve_into(mut worker: Worker, args: &Args, report: &mut Report) -> Result<(), String> {
     if let Some(cpu) = &worker.cpu {
         set_affinity(cpu).map_err(|e| format!("sched_setaffinity: {e}"))?;
     }
@@ -802,6 +858,8 @@ fn serve_into(worker: Worker, args: &Args, report: &mut Report) -> Result<(), St
     };
     let mut network = network.map_err(|e| format!("network: {e}"))?;
     let outcome = exchange(&mut network, args, worker.connections, worker.index, report);
+    worker.finished.mark();
+    serve_others(&mut network, &worker.finished);
     // Counters also describe a failed run.
     let counters = network.counters();
     report.arp_sent = counters.arp_sent;

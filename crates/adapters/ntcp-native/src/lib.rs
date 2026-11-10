@@ -296,7 +296,10 @@ impl<P: PacketIo> Network<P> {
     /// of its flows go unanswered. A member that joins the number owns the
     /// same flows (by address, those of its own address) and answers what
     /// remains of the earlier member's connections with resets, as a
-    /// restarted host does.
+    /// restarted host does. Its queue goes with it too: whatever arrives
+    /// there for other members' flows (all of them on a port that steers
+    /// nothing) is no longer handed over, so a member whose queue receives
+    /// traffic keeps driving while other members serve connections.
     ///
     /// Under `FlowOwnership::TaggedPorts` ephemeral ports are the member's
     /// own tagged ports within `ephemeral_ports`, which must hold one
