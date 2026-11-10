@@ -35,7 +35,7 @@ Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious R
 # 6928-015
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-1"
-reason = "ConnectionConfig implements settable Rfc5681/Iw10 selection, with default-disabled IW10 and explicit opt-in evidenced by source/tests. Explicit user-approved implementation-audit scope exception only for deployment monitoring effort and application/service interactions: enabling vendors/operators retain that obligation outside this audit. No deployment safety/monitoring result or evidence supporting IW>10 is claimed; the implemented IW10 bound, cache/fallback and timer requirements are not excluded."
+reason = "ConnectionConfig implements settable Rfc5681/Iw10 selection, with IW10 disabled in ConnectionConfig::default and explicit opt-in evidenced by source/tests; ntcp-native's NetworkConfig::new opts in by default, as Linux's TCP_INIT_CWND has been 10 since 2.6.39. Explicit user-approved implementation-audit scope exception only for deployment monitoring effort and application/service interactions: enabling vendors/operators retain that obligation outside this audit. No deployment safety/monitoring result or evidence supporting IW>10 is claimed; the implemented IW10 bound, cache/fallback and timer requirements are not excluded."
 quote = '''
 We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
 '''
@@ -75,7 +75,7 @@ Pacing is not required in this proposal due to a strong preference for a simple 
 # 6928-022
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
-reason = "Internet-wide default experiment/research prerequisite is outside a library annotation audit: no default IW10 rollout is proposed, and default prohibition is separately evidenced. Researchers/deployers still owe experiments before broader default enablement; this is not a safety waiver for opt-in sender obligations."
+reason = "Internet-wide default experiment/research prerequisite is outside a library annotation audit: the core default stays RFC5681 and its default prohibition is separately evidenced; ntcp-native's NetworkConfig::new enables IW10 by default to match Linux, whose IW10 default is the deployed experiment the RFC describes. Researchers/deployers still owe experiments before broader default enablement; this is not a safety waiver for opt-in sender obligations."
 quote = '''
 Further experiments are required before a larger initial window shall be enabled by default in the Internet. The existing measurement results indicate that this does not cause significant harm to other traffic. However, widespread use in the Internet could reveal issues not known yet, e.g., regarding fairness or impact on latency- sensitive traffic such as VoIP.
 '''

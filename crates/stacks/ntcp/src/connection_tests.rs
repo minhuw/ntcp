@@ -15712,6 +15712,37 @@ fn ecn_setup_output_is_atomic_and_synack_flags_are_not_echoed_reserved_bits() {
 }
 
 #[test]
+fn ecn_without_initiation_answers_a_setup_syn_but_sends_none() {
+    // As Linux's tcp_ecn=2: the active open asks for no ECN, so neither side
+    // marks; a peer that asks is answered, and the connection is ECN-capable.
+    for (client_initiates, negotiated) in [(false, false), (true, true)] {
+        let mut client = config(1024, 64);
+        client.ecn_initiate = client_initiates;
+        let mut server = config(1024, 64);
+        server.ecn_initiate = false;
+        let mut a = Connection::active(tuple(), client, 10, 0).unwrap();
+        let syn = packet(&mut a, 1);
+        let parsed = wire::parse(ip(tuple()), &syn).unwrap();
+        assert_eq!(
+            parsed.header.flags & (ECE | CWR),
+            if client_initiates { ECE | CWR } else { 0 }
+        );
+        let mut b = Connection::passive(reverse(tuple()), server, 900, 1, &parsed).unwrap();
+        let synack = deliver(&mut b, &mut a, 2);
+        let synack = wire::parse(ip(reverse(tuple())), &synack).unwrap();
+        assert_eq!(
+            synack.header.flags & (ECE | CWR),
+            if negotiated { ECE } else { 0 }
+        );
+        deliver(&mut a, &mut b, 3);
+        assert_eq!((a.ecn_send(), b.ecn_send()), (negotiated, negotiated));
+        a.write(&[1; 64]).unwrap();
+        packet(&mut a, 4);
+        assert_eq!(a.last_output_ecn(), if negotiated { 2 } else { 0 });
+    }
+}
+
+#[test]
 fn shrink_silence_times_out_from_first_committed_unanswered_retransmission() {
     for iss in [100, u32::MAX - 4] {
         let mut cfg = config(64, 8);

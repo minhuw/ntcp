@@ -1,5 +1,5 @@
-// NetworkConfig::new's TCP loss recovery and ACK timing, as Linux defaults
-// them: SACK negotiated on the SYN, and a lost tail segment retransmitted
+// NetworkConfig::new's TCP defaults, as Linux's: SACK and timestamps offered
+// on the SYN and no ECN asked for, and a lost tail segment retransmitted
 // near the 200 ms RTO floor rather than RFC 6298's 1 s. Two Networks over an
 // in-memory IP wire that can drop a chosen segment.
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
@@ -58,15 +58,16 @@ fn tcp_payload(packet: &[u8]) -> usize {
     total - ihl - offset
 }
 
-// Whether a SYN carries the SACK-permitted option (kind 4).
-fn sack_permitted(packet: &[u8]) -> bool {
+// Whether a SYN carries the option of `wanted` kind (4 SACK-permitted, 8
+// timestamps).
+fn has_option(packet: &[u8], wanted: u8) -> bool {
     let header = tcp(packet);
     let mut options = &header[20..usize::from(header[12] >> 4) * 4];
     while let [kind, rest @ ..] = options {
         match kind {
             0 => return false,
             1 => options = rest,
-            4 => return true,
+            kind if *kind == wanted => return true,
             _ => {
                 let len = usize::from(rest[0]).max(2);
                 options = &options[len.min(options.len())..];
@@ -114,7 +115,10 @@ fn step(now: &mut u64, client: &mut Network<Wire>, server: &mut Network<Wire>) -
 fn defaults_follow_linux_and_stay_configurable() {
     let config = NetworkConfig::new(address(1), 1500);
     let c = &config.tcp.connection;
-    assert!(c.sack && c.rack && c.tlp && c.adaptive_ack);
+    assert!(c.sack && c.rack && c.tlp && c.adaptive_ack && c.timestamps);
+    assert!(c.ecn && !c.ecn_initiate && c.prr && !c.prr_pacing);
+    assert_eq!(c.initial_window, ntcp::InitialWindow::Iw10);
+    assert_eq!(c.congestion_algorithm, ntcp::CongestionAlgorithm::Cubic);
     assert_eq!((c.rto_min_us, c.delayed_ack_us), (200_000, 200_000));
     // The RFC baseline of the Endpoint is still a configuration away.
     let mut config = config;
@@ -124,6 +128,11 @@ fn defaults_follow_linux_and_stay_configurable() {
     config.tcp.connection.tlp = baseline.tlp;
     config.tcp.connection.rto_min_us = baseline.rto_min_us;
     config.tcp.connection.adaptive_ack = baseline.adaptive_ack;
+    config.tcp.connection.timestamps = baseline.timestamps;
+    config.tcp.connection.ecn_initiate = baseline.ecn_initiate;
+    config.tcp.connection.initial_window = baseline.initial_window;
+    config.tcp.connection.congestion_algorithm = baseline.congestion_algorithm;
+    config.tcp.connection.prr = baseline.prr;
     let (incoming, outgoing) = (Queue::default(), Queue::default());
     let wire = Wire {
         incoming,
@@ -135,7 +144,7 @@ fn defaults_follow_linux_and_stay_configurable() {
 }
 
 #[test]
-fn sack_is_offered_and_a_lost_tail_segment_returns_near_the_200_ms_floor() {
+fn the_syn_offers_sack_and_timestamps_without_ecn_and_a_lost_tail_returns_near_200_ms() {
     let (a, b) = (Queue::default(), Queue::default());
     let (mut client, client_wire) = side(1, &a, &b);
     let (mut server, _) = side(2, &b, &a);
@@ -149,7 +158,10 @@ fn sack_is_offered_and_a_lost_tail_segment_returns_near_the_200_ms_floor() {
         }
         assert!(now < 100 * MS, "handshake did not finish");
     };
-    assert!(sack_permitted(&client_wire.sent.borrow()[0]));
+    let syn = client_wire.sent.borrow()[0].clone();
+    assert!(has_option(&syn, 4) && has_option(&syn, 8));
+    // No ECE or CWR on the SYN: ECN is answered, never asked for.
+    assert_eq!(tcp(&syn)[13] & 0xc0, 0);
     client.set_nodelay(id, true).unwrap();
     for _ in 0..20 {
         step(&mut now, &mut client, &mut server);

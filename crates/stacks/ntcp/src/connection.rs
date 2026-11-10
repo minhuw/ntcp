@@ -162,6 +162,10 @@ pub struct ConnectionConfig {
     pub send_ip_payload_limit: u16,
     pub nagle: bool,
     pub ecn: bool,
+    // With ecn: an active open sends an ECN-setup SYN. False only answers a
+    // peer's ECN-setup SYN, as Linux does by default (tcp_ecn=2); without
+    // ecn nothing is negotiated either way.
+    pub ecn_initiate: bool,
     pub recovery_algorithm: RecoveryAlgorithm,
     // Optional growth/backoff policy; does not select loss recovery or PRR.
     pub congestion_algorithm: CongestionAlgorithm,
@@ -414,6 +418,7 @@ impl Default for ConnectionConfig {
             send_ip_payload_limit: u16::MAX,
             nagle: true,
             ecn: true,
+            ecn_initiate: true,
             recovery_algorithm: RecoveryAlgorithm::default(),
             congestion_algorithm: CongestionAlgorithm::default(),
             cubic_hystart: true,
@@ -9535,7 +9540,8 @@ impl Connection {
             && self.config.ecn
             && !self.syn_timed_out
             && !self.ecn_sent_plain
-            && (self.state == State::SynSent || self.ecn_peer_setup && !self.ecn_peer_plain);
+            && (self.state == State::SynSent && self.config.ecn_initiate
+                || self.ecn_peer_setup && !self.ecn_peer_plain);
         let fresh_data = reset.is_none()
             && !syn
             && !retransmitted
