@@ -2802,24 +2802,33 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
     reply.flags |= ntcp::wire::FIN;
     input_packet(&mut owner, ip, reply, &[]);
     assert_eq!(owner.inner.endpoint.state(id), Ok(State::TimeWait));
-    let retained_bytes = owner.inner.endpoint.buffer_bytes();
     owner.inner.endpoint.release(id).unwrap();
     assert!(owner.inner.endpoint.state(id).is_err());
+    // Released with the ACK of the peer's FIN still owed, the connection
+    // sends it under its own policy.
     assert!(owner.inner.endpoint.connection_exists(id));
     owner.gc_ip_options();
     assert_eq!(owner.connection_options.len(), 1);
-    let (_, bytes) = poll_frame(&mut owner).unwrap();
-    check_ip(&bytes, 184, false);
-    // Even after its last ACK, a released TIME-WAIT record still owns policy
-    // and buffers. A repeated FIN must get the original policy, not the new fd's.
-    owner.gc_ip_options();
-    assert_eq!(owner.connection_options.len(), 1);
-    assert_eq!(owner.inner.endpoint.buffer_bytes(), retained_bytes);
-    input_packet(&mut owner, ip, reply, &[]);
     let (ack_tx, bytes) = poll_frame(&mut owner).unwrap();
     assert_eq!(ack_tx.connection, Some(id));
     check_ip(&bytes, 184, false);
-    assert_eq!(owner.inner.endpoint.buffer_bytes(), retained_bytes);
+    // That was its last output: only its TIME-WAIT record remains, holding
+    // neither the connection's buffers nor its adapter metadata.
+    assert!(!owner.inner.endpoint.connection_exists(id));
+    assert_eq!(owner.inner.endpoint.time_wait_connections(), 1);
+    owner.gc_ip_options();
+    assert!(owner.connection_options.is_empty());
+    assert_eq!(owner.inner.endpoint.buffer_bytes(), reservation_bytes);
+    // The record ACKs a repeated FIN on the stateless lane, as Linux answers
+    // for a timewait socket from its control socket: with the connection's
+    // TOS (tw_tos), not the new fd's, and with DF and Identification 0 (the
+    // control socket's IP_PMTUDISC_DO, tcp_sk_init), not IP_PMTUDISC_DONT.
+    input_packet(&mut owner, ip, reply, &[]);
+    let (ack_tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(ack_tx.connection, None);
+    assert_ne!(packet_header(&bytes).flags & ntcp::wire::ACK, 0);
+    check_ip(&bytes, 184, true);
+    assert_eq!(owner.inner.endpoint.buffer_bytes(), reservation_bytes);
     let expiry = owner
         .inner
         .endpoint
@@ -2830,9 +2839,7 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
     let elapsed = owner.inner.now();
     owner.advance_clock(expiry.wrapping_sub(elapsed));
     assert!(poll_frame(&mut owner).is_none());
-    assert!(!owner.inner.endpoint.connection_exists(id));
-    owner.gc_ip_options();
-    assert!(owner.connection_options.is_empty());
+    assert_eq!(owner.inner.endpoint.time_wait_connections(), 0);
     assert_eq!(owner.inner.endpoint.buffer_bytes(), reservation_bytes);
     assert_eq!(execute_value(&mut owner, 12, fd, 6, 0), Ok(4));
     assert_eq!(
@@ -2897,11 +2904,15 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
     let retained_bytes = owner.inner.endpoint.buffer_bytes();
     for released in [false, true] {
         if released {
+            // Its ACK sent, the released connection leaves only a TIME-WAIT
+            // record, which answers on the stateless lane.
             owner.inner.endpoint.release(id).unwrap();
+            assert!(!owner.inner.endpoint.connection_exists(id));
         }
+        assert_eq!(owner.inner.endpoint.time_wait_connections(), 1);
         input_packet(&mut owner, ip, peer_fin, &[]);
         let (tx, bytes) = poll_frame(&mut owner).unwrap();
-        assert_eq!(tx.connection, Some(id));
+        assert_eq!(tx.connection, (!released).then_some(id));
         assert_eq!(packet_header(&bytes).flags, ntcp::wire::ACK);
         incoming.source_port = 51000;
         incoming.flags = ntcp::wire::ACK;
@@ -2913,9 +2924,27 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
         assert_eq!(reset.flags, ntcp::wire::RST);
         assert_eq!(reset.sequence, 1234);
         assert_eq!(owner.connection_options.len(), LIMIT);
-        assert_eq!(owner.inner.endpoint.buffer_bytes(), retained_bytes);
+        // The record holds none of the connection's buffers.
+        assert_eq!(
+            owner.inner.endpoint.buffer_bytes() < retained_bytes,
+            released
+        );
     }
+    // Nor its metadata: a new passive open takes that slot, and fills
+    // the metadata again with core room left.
+    incoming.source_port = 50000 + LIMIT as u16;
     incoming.flags = ntcp::wire::SYN;
+    incoming.acknowledgment = 0;
+    input_packet(&mut owner, ip, incoming, &[]);
+    assert_ne!(
+        packet_header(&poll_frame(&mut owner).unwrap().1).flags & ntcp::wire::SYN,
+        0
+    );
+    assert_eq!(owner.connection_options.len(), LIMIT);
+    assert!(owner.connection_options.iter().all(|p| p.0 != id));
+    let retained_bytes = owner.inner.endpoint.buffer_bytes();
+    incoming.source_port = 51000;
+    incoming.acknowledgment = 1234;
     let mut bytes = [0; 64];
     let len = ntcp::wire::encode(ip, incoming, &[], &[], &mut bytes).unwrap();
     assert_eq!(
