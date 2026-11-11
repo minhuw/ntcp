@@ -996,3 +996,166 @@ fn only_definitely_submitted_unfragmentable_bytes_prove_size() {
         }
     }
 }
+
+// IP packets around `tcp` bytes of `packet`'s connection.
+fn ip_frame(packet: Transmit, tcp: &[u8]) -> Vec<u8> {
+    let base = if packet.ip.source.is_ipv4() { 20 } else { 40 };
+    let mut frame = vec![0; base + tcp.len()];
+    frame[base..].copy_from_slice(tcp);
+    let packet = Transmit {
+        len: tcp.len(),
+        ..packet
+    };
+    let n = if packet.ip.source.is_ipv4() {
+        ntcp_ip::encode(&mut frame, packet, 0).unwrap()
+    } else {
+        ntcp_ip6::encode(&mut frame, packet).unwrap()
+    };
+    frame.truncate(n);
+    frame
+}
+// A group's aggregate, as an embedding hands it to a segmenting backend
+// (one IP header, both checksum fields zero), and the packets the backend
+// cuts from it, as Linux tcp_gso_segment cuts them.
+fn group_frames(endpoint: &Endpoint, group: ntcp::TransmitGroup) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let view = endpoint.transmit_group(group).unwrap();
+    let mut tcp = vec![0; view.packet.len];
+    let n = ntcp::wire::encode(view.packet.ip, view.header, view.options, &[], &mut tcp).unwrap();
+    tcp[16..18].fill(0);
+    tcp[n..].copy_from_slice(view.payload);
+    let size = view.segment_payload_len;
+    let segments = (0..view.segment_count)
+        .map(|k| {
+            let mut header = view.header;
+            header.sequence = header.sequence.wrapping_add((k * size) as u32);
+            if k + 1 != view.segment_count {
+                header.flags &= !ntcp::wire::PSH;
+            }
+            if k != 0 {
+                header.flags &= !ntcp::wire::CWR;
+            }
+            let mut out = vec![0; 2048];
+            let len = ntcp::wire::encode(
+                view.packet.ip,
+                header,
+                view.options,
+                &view.payload[k * size..(k + 1) * size],
+                &mut out,
+            )
+            .unwrap();
+            ip_frame(view.packet, &out[..len])
+        })
+        .collect();
+    let mut frame = ip_frame(view.packet, &tcp);
+    if view.packet.ip.source.is_ipv4() {
+        frame[10..12].fill(0);
+    }
+    (frame, segments)
+}
+
+// A group goes through the same transaction as one packet: a blocked call
+// keeps it for a retry, a submitted one is accepted with every segment's
+// receipt, and a path that changed before a retry refuses it before any
+// backend call. Nothing is ledger evidence, and the stream arrives once.
+#[test]
+fn groups_retry_submit_and_refuse_like_one_packet() {
+    for v6 in [false, true] {
+        let mut cfg = config(4);
+        cfg.connection.pmtud.as_mut().unwrap().initial_search_low = Some(1500);
+        let (local, remote) = addresses(v6);
+        let mut a = managed_configured(local, 1030, cfg.clone(), true, None);
+        let mut b = managed(remote, 1031, cfg.clone());
+        let listener = b.1.listen(remote, 1).unwrap();
+        let id =
+            a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+                .unwrap();
+        let mut now = 0;
+        pump(&mut a, &mut b, &mut now);
+        let child = b.1.accept(listener).unwrap();
+        let limits = ntcp::TransmitGroupLimits {
+            max_bytes: usize::MAX,
+            max_segments: usize::MAX,
+            allow_psh: false,
+            allow_cwr: false,
+            allow_options: true,
+        };
+        let payload: Vec<u8> = (0..16000).map(|i| (i * 3) as u8).collect();
+        a.1.write(id, &payload).unwrap();
+        now += 10;
+        let (attempt, _, _) = selected(&mut a.1, now).unwrap();
+        let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+        let group =
+            a.1.prepare_transmit_group(attempt, limits)
+                .unwrap()
+                .unwrap();
+        let (frame, segments) = group_frames(&a.1, group);
+        assert!(segments.len() >= 2);
+        let mut calls = 0;
+        for retry in 0..2 {
+            let result =
+                a.0.submit_group(&mut a.1, now + retry, context, group, &frame, |_| {
+                    calls += 1;
+                    BackendOutcome::WouldBlock
+                })
+                .unwrap();
+            assert!(matches!(result, Submission::Blocked(_)));
+        }
+        // Not the aggregate: a frame one octet short of it.
+        assert_eq!(
+            a.0.submit_group(
+                &mut a.1,
+                now + 2,
+                context,
+                group,
+                &frame[..frame.len() - 1],
+                |_| { panic!("a frame of another length reached the backend") }
+            ),
+            Err(Error::Obsolete)
+        );
+        let result =
+            a.0.submit_group(&mut a.1, now + 3, context, group, &frame, |_| {
+                calls += 1;
+                BackendOutcome::Submitted
+            })
+            .unwrap();
+        assert!(result == Submission::Submitted);
+        assert_eq!(calls, 3);
+        assert!(a.1.transmit_group(group).is_none());
+        for segment in &segments {
+            input(&mut b.0, &mut b.1, b.2, now + 4, segment, 0);
+        }
+        // The next group meets a path that shrank after its authority.
+        now += 10;
+        let (attempt, _, _) = selected(&mut a.1, now).unwrap();
+        let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+        let group =
+            a.1.prepare_transmit_group(attempt, limits)
+                .unwrap()
+                .unwrap();
+        let (frame, _) = group_frames(&a.1, group);
+        let mtu = if v6 { 1280 } else { 1100 };
+        let path = a.0.binding(id).unwrap().snapshot.path();
+        a.0.trusted_decrease(now + 1, path, mtu).unwrap();
+        assert_eq!(
+            a.0.submit_group(&mut a.1, now + 2, context, group, &frame, |_| {
+                panic!("an obsolete group reached the backend")
+            }),
+            Err(Error::Obsolete)
+        );
+        assert!(a.1.reject_unsubmitted_group(group).unwrap());
+        now += 20;
+        while a.1.is_output_reserved(id) {
+            let frame = send(&mut a, now).unwrap();
+            assert!(frame.len() <= mtu as usize);
+            input(&mut b.0, &mut b.1, b.2, now + 1, &frame, 0);
+        }
+        assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
+        for _ in 0..10 {
+            now += 10;
+            pump(&mut a, &mut b, &mut now);
+        }
+        let mut bytes = vec![0; payload.len()];
+        assert_eq!(b.1.read(child, &mut bytes).unwrap(), payload.len());
+        assert_eq!(bytes, payload);
+    }
+}

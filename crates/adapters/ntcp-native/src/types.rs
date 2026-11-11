@@ -187,6 +187,11 @@ pub struct DrainReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkBudget {
     pub receive: usize,
+    /// Frames handed to the backend, or tried. An aggregate the backend
+    /// segments (TCP segmentation offload) is one, as Linux's qdisc quota
+    /// counts a GSO skb once; `DriveReport::transmitted` and
+    /// `Counters::transmitted` count its segments, as a device's tx_packets
+    /// does.
     pub transmit: usize,
     pub timers: usize,
     pub reclaim: usize,
@@ -227,6 +232,11 @@ pub struct TimestampSupport {
 pub struct Counters {
     pub received: u64,
     pub transmitted: u64,
+    // Aggregates the backend took to segment, whose segments transmitted
+    // counts, and aggregates it refused (Unsupported or InvalidInput),
+    // whose output went out a segment at a time instead.
+    pub segmented: u64,
+    pub segmentation_refused: u64,
     pub discarded: u64,
     pub backend_backpressure: u64,
     pub timestamp_metadata_lost: u64,

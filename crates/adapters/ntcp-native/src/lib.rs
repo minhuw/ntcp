@@ -121,6 +121,11 @@ pub struct Network<P: PacketIo> {
     flows: Option<flows::Member>,
     inlet: Option<flows::Inlet>,
     tx_cursor: usize,
+    // The backend's TCP segmentation, when reservations are sized for it
+    // (`NetworkConfig::gso`), and the frame of the aggregate being
+    // submitted, built again for every call.
+    segmentation: Option<ntcp_io::TcpSegmentationCapabilities>,
+    aggregate: Vec<u8>,
     // The one transmit slot of ARP control frames (empty without ARP).
     control: Vec<u8>,
     rx: Vec<u8>,
@@ -574,7 +579,21 @@ impl<P: PacketIo> Network<P> {
                 },
             )?;
         host.attach(&mut endpoint)?;
-        endpoint.enable_output_reservations_with_capacity(owners)?;
+        let gso = config.gso(&io);
+        match gso {
+            Some(gso) => endpoint.enable_output_reservations_with_gso(owners, gso)?,
+            None => endpoint.enable_output_reservations_with_capacity(owners)?,
+        }
+        let segmentation = gso.and(io.tcp_segmentation_capabilities());
+        // The largest frame an aggregate fills: the backend's, within the
+        // largest IP packet of the local family.
+        let aggregate = match segmentation {
+            Some(c) => bytes(
+                c.max_aggregate_len
+                    .min(config.link.offset() + 65535 + if local.is_ipv4() { 0 } else { 40 }),
+            )?,
+            None => Vec::new(),
+        };
         let retained = config.retained_receive_packets.unwrap_or(owners);
         let ip_capacity = config.mtu as usize;
         // A reassembled datagram is completed into `completed` and may be
@@ -676,6 +695,8 @@ impl<P: PacketIo> Network<P> {
             flows,
             inlet,
             tx_cursor: 0,
+            segmentation,
+            aggregate,
             control,
             // Capture an oversized physical frame safely before the Host rejects it.
             rx: bytes(65575 + 14)?,

@@ -100,7 +100,7 @@ fn side(n: u8, incoming: &Queue, outgoing: &Queue) -> (Network<Wire>, Wire) {
     };
     let mut config = NetworkConfig::new(address(n), 1500);
     config.tcp.max_connections = 4;
-    config.tcp.max_buffer_bytes = config.buffer_budget(4).unwrap();
+    config.tcp.max_buffer_bytes = config.buffer_budget(4, &wire).unwrap();
     (Network::new(config, wire, [n; 32], 0).unwrap(), probe)
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
 unsafe extern "C" {
     fn ntcp_test_tso_gate();
@@ -13,6 +14,8 @@ unsafe extern "C" {
     fn ntcp_test_hold(leave: u32);
     fn ntcp_test_release();
     fn ntcp_test_finish();
+    fn ntcp_test_take(out: *mut u8, cap: u32, mss: *mut u32) -> u32;
+    fn ntcp_test_inject(frame: *const u8, length: u32) -> i32;
 }
 
 #[test]
@@ -261,5 +264,181 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         ntcp_test_loopback(); // Asserts every segment has zero offload flags.
         assert_eq!(io.receive(&mut [0; 64]).unwrap(), Some(64));
         assert_eq!(ntcp_test_available(), 1023);
+        io.tx_scheduling = None;
+        segmented_network(io);
+        assert_eq!(ntcp_test_available(), 1023);
     }
+}
+
+// The software peer of a Network on the ring port.
+struct Peer {
+    incoming: Rc<RefCell<VecDeque<Vec<u8>>>>,
+    outgoing: Rc<RefCell<VecDeque<Vec<u8>>>>,
+}
+impl PacketIo for Peer {
+    fn layer(&self) -> PacketLayer {
+        PacketLayer::Ethernet
+    }
+    fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+        let Some(frame) = self.incoming.borrow_mut().pop_front() else {
+            return Ok(None);
+        };
+        out[..frame.len()].copy_from_slice(&frame);
+        Ok(Some(frame.len()))
+    }
+    fn transmit(&mut self, frame: &[u8]) -> io::Result<TxOutcome> {
+        self.outgoing.borrow_mut().push_back(frame.to_vec());
+        Ok(TxOutcome::Submitted)
+    }
+}
+fn sum(mut acc: u32, bytes: &[u8]) -> u32 {
+    for word in bytes.chunks(2) {
+        acc += u32::from(u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)]));
+    }
+    acc
+}
+fn fold(mut acc: u32) -> u16 {
+    while acc > 0xffff {
+        acc = (acc & 0xffff) + (acc >> 16);
+    }
+    !(acc as u16)
+}
+// The segments a device cuts from an IPv4 TSO frame, as Linux
+// tcp_gso_segment does, every length and checksum filled.
+fn cut(frame: &[u8], mss: usize) -> Vec<Vec<u8>> {
+    let tcp = 14 + 20;
+    let payload = tcp + usize::from(frame[tcp + 12] >> 4) * 4;
+    let data = &frame[payload..];
+    let count = data.len().div_ceil(mss);
+    let sequence = u32::from_be_bytes(frame[tcp + 4..tcp + 8].try_into().unwrap());
+    (0..count)
+        .map(|n| {
+            let mut s = frame[..payload].to_vec();
+            s.extend_from_slice(&data[n * mss..((n + 1) * mss).min(data.len())]);
+            let len = (s.len() - 14) as u16;
+            s[16..18].copy_from_slice(&len.to_be_bytes());
+            s[24..26].fill(0);
+            let ip = fold(sum(0, &s[14..tcp]));
+            s[24..26].copy_from_slice(&ip.to_be_bytes());
+            s[tcp + 4..tcp + 8]
+                .copy_from_slice(&sequence.wrapping_add((n * mss) as u32).to_be_bytes());
+            if n + 1 != count {
+                s[tcp + 13] &= !0x09;
+            }
+            if n != 0 {
+                s[tcp + 13] &= !0x80;
+            }
+            s[tcp + 16..tcp + 18].fill(0);
+            let pseudo = sum(
+                sum(sum(0, &s[26..34]), &[0, 6]),
+                &((s.len() - tcp) as u16).to_be_bytes(),
+            );
+            let tcp_sum = fold(sum(pseudo, &s[tcp..]));
+            s[tcp + 16..tcp + 18].copy_from_slice(&tcp_sum.to_be_bytes());
+            s
+        })
+        .collect()
+}
+
+// ntcp-native over the ring port with TSO: aggregates leave as one TSO mbuf
+// chain each (offload metadata checked by the fixture), which the test cuts
+// as a device would for a software peer; the pool's room for a whole
+// aggregate runs out and blocks it until the ring drains. The stream
+// arrives whole. Real ring mbufs, NOT NIC segmentation.
+unsafe fn segmented_network(mut io: Dpdk) {
+    use ntcp_native::{EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, WorkBudget};
+    io.tso = Some(TsoConfig {
+        mtu: 1500,
+        room: 128,
+        max_descriptors: 512,
+    });
+    let link = |side: u8| Link::Ethernet {
+        local_mac: [2, 0, 0, 0, 0, side],
+        next_hop: EthernetNextHop::Fixed([2, 0, 0, 0, 0, 3 - side]),
+    };
+    let config = |address: &str, side: u8| {
+        let mut config = NetworkConfig::new(address.parse().unwrap(), 1500);
+        config.tcp.max_connections = 2;
+        config.tcp.connection.send_capacity = 256 * 1024;
+        config.tcp.connection.receive_capacity = 256 * 1024;
+        config.link = link(side);
+        config
+    };
+    let mut ca = config("10.74.0.1", 1);
+    ca.tcp.max_buffer_bytes = ca.buffer_budget(2, &io).unwrap();
+    let incoming = Rc::new(RefCell::new(VecDeque::new()));
+    let outgoing = Rc::new(RefCell::new(VecDeque::new()));
+    let peer = Peer {
+        incoming: incoming.clone(),
+        outgoing: outgoing.clone(),
+    };
+    let mut cb = config("10.74.0.2", 2);
+    cb.tcp.max_buffer_bytes = cb.buffer_budget(2, &peer).unwrap();
+    let mut a = Network::new(ca, io, [1; 32], 0).unwrap();
+    let mut b = Network::new(cb, peer, [2; 32], 0).unwrap();
+    let listener = b.listen(9000, 1).unwrap();
+    let client = a.connect("10.74.0.2:9000".parse().unwrap()).unwrap();
+    let data: Vec<u8> = (0..300_000).map(|i| (i * 7 % 251) as u8).collect();
+    let budget = WorkBudget::new(64, 64, 64, 64);
+    let (mut server, mut sent, mut received) = (None, 0, Vec::new());
+    let (mut frame, mut out) = (vec![0; MAX_PACKET_LEN], vec![0; 65536]);
+    let (mut aggregates, mut blocked) = (0, 0);
+    let mut backlog = VecDeque::new();
+    for step in 1..20_000u64 {
+        let now = step * 1000;
+        if sent < data.len()
+            && let Ok(receipt) = a.try_write(client, &data[sent..], Default::default())
+        {
+            sent += receipt.accepted;
+        }
+        let pressure = a.counters().backend_backpressure;
+        a.drive(now, budget).unwrap();
+        blocked += usize::from(a.counters().backend_backpressure > pressure);
+        loop {
+            let mut mss = 0;
+            let len = unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) };
+            if len == 0 {
+                break;
+            }
+            let frame = &frame[..len as usize];
+            if mss == 0 {
+                incoming.borrow_mut().push_back(frame.to_vec());
+            } else {
+                aggregates += 1;
+                assert!(frame.len() > 1514);
+                incoming.borrow_mut().extend(cut(frame, mss as usize));
+            }
+        }
+        b.drive(now, budget).unwrap();
+        backlog.extend(outgoing.borrow_mut().drain(..));
+        while let Some(frame) = backlog.front() {
+            if unsafe { ntcp_test_inject(frame.as_ptr(), frame.len() as u32) } != 0 {
+                break;
+            }
+            backlog.pop_front();
+        }
+        if server.is_none() {
+            server = b.accept(listener).ok();
+        }
+        if let Some(server) = server {
+            while let Ok(ReadOutcome::Data { len, .. }) = b.try_read(server, &mut out) {
+                received.extend_from_slice(&out[..len]);
+            }
+        }
+        if received.len() == data.len() {
+            break;
+        }
+    }
+    assert_eq!(received, data);
+    // What is left on the rings goes back to the pool.
+    for step in 0..4 {
+        a.drive(30_000_000 + step, budget).unwrap();
+        let mut mss = 0;
+        while unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) } != 0 {}
+    }
+    assert!(aggregates > 0);
+    assert_eq!(a.counters().segmented, aggregates as u64);
+    assert!(blocked > 0, "no aggregate waited for the pool");
+    eprintln!("ring PMD: {aggregates} TSO chains, {blocked} drives blocked");
+    drop(a);
 }

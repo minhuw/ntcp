@@ -71,16 +71,46 @@ pub struct NetworkConfig {
     pub reassembly_datagrams: usize,
 }
 impl NetworkConfig {
-    /// The `tcp.max_buffer_bytes` a Network with this configuration needs
-    /// to hold `connections` connections at once: its output reservations,
-    /// one per connection slot and one for stateless replies, and each
-    /// connection's buffers and timestamp records. None if it overflows.
-    pub fn buffer_budget(&self, connections: usize) -> Option<usize> {
+    /// The `tcp.max_buffer_bytes` a Network with this configuration on
+    /// backend `io` needs to hold `connections` connections at once: its
+    /// output reservations, one per connection slot and one for stateless
+    /// replies, and each connection's buffers and timestamp records. None
+    /// if it overflows.
+    ///
+    /// On a backend that segments TCP aggregates
+    /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the
+    /// Network is built, so a backend's segmentation is enabled first) each
+    /// reservation also holds the payload of the largest aggregate, about
+    /// 64 KiB on a DPDK port.
+    pub fn buffer_budget(&self, connections: usize, io: &impl PacketIo) -> Option<usize> {
         let reservations = self.tcp.max_connections.checked_add(1)?;
         self.tcp
             .connection_charge(self.tx_timestamp_phases, self.rx_timestamp_ranges)?
             .checked_mul(connections)?
-            .checked_add(self.tcp.output_reservations_charge(reservations, None)?)
+            .checked_add(
+                self.tcp
+                    .output_reservations_charge(reservations, self.gso(io))?,
+            )
+    }
+    // The output reservations of a backend that segments TCP aggregates, as
+    // Linux hands a TSO device skbs of many segments whenever the device
+    // offers it: each reservation selects at most the payload of the
+    // largest aggregate, after the link, IP and TCP headers of its frame,
+    // and the backend's segments. None without segmentation, or when an
+    // aggregate cannot carry two segments of the MTU's size (a DPDK port
+    // without multi-segment mbufs): no aggregate could form, and the
+    // reservations' room would go unused.
+    pub(crate) fn gso(&self, io: &impl PacketIo) -> Option<ntcp::GsoLimits> {
+        let capabilities = io.tcp_segmentation_capabilities()?;
+        let ip = if self.local_address.is_ipv4() { 20 } else { 40 };
+        let max_bytes = capabilities
+            .max_aggregate_len
+            .checked_sub(self.link.offset() + ip + 20)?;
+        let segment = (self.mtu as usize).checked_sub(ip + 20)?;
+        (capabilities.max_segments >= 2 && max_bytes >= 2 * segment).then_some(ntcp::GsoLimits {
+            max_bytes,
+            max_segments: capabilities.max_segments,
+        })
     }
     /// A Network's configuration with Linux's TCP defaults, where
     /// `EndpointConfig::default` keeps the RFC baseline that conformance

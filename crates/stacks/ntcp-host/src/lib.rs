@@ -7,7 +7,7 @@ use ntcp::{
     ConnectionId, CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError,
     ExpectedRegistrations, Instant, IpMetadata, Ipv4Options, Ipv4RegistrationPlan, ManagedError,
     NetworkError, OutgoingIpv4Options, PathFactoryRequest, PathProvider, PmtuFeedback,
-    PreparedFactory, PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt,
+    PreparedFactory, PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt, TransmitGroup,
 };
 use ntcp_icmp::{FeedbackKind, QuotedTransport};
 pub use ntcp_path as path;
@@ -2962,6 +2962,136 @@ impl Host {
                 Ok(Submission::PossiblySubmitted)
             }
         }
+    }
+
+    /// `submit` for a transmit group (`Endpoint::prepare_transmit_group`),
+    /// one aggregate the backend cuts into its segments. `context` is the
+    /// authority `egress_context` gave the attempt the group was prepared
+    /// from; `frame` starts at IP and holds the whole aggregate: one IP
+    /// header whose length covers it all, the group's TCP header and every
+    /// segment's payload. Its checksum fields, an IPv4 header's and the
+    /// TCP checksum, are zero: the backend fills them for every segment it
+    /// cuts, as Linux's segmentation does (inet_gso_segment, tcp_gso_segment). At
+    /// every call, before the backend's, the frame and path are revalidated
+    /// as `validate_egress` revalidates one packet, except that each
+    /// physical segment, not the aggregate, must fit the first hop and the
+    /// ordinary budget (a group never carries a discovery probe), and that
+    /// the aggregate must be unfragmentable: an IPv4 path that clears DF
+    /// leases each packet its own Identification, which one header cannot
+    /// carry for many (`Unsupported`). Then `Endpoint::validate_transmit_group`.
+    /// A definite submission certifies every segment's size evidence
+    /// (`Endpoint::accept_transmit_group_submitted`). A connection's output
+    /// keeps no ledger evidence, so no ticket is involved; refusals change
+    /// nothing, and the caller rejects the group (`Obsolete` after a path
+    /// change, which also brings the binding up to date, as for one packet).
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_group(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        context: EgressContext,
+        group: TransmitGroup,
+        frame: &[u8],
+        submit: impl FnOnce(EgressContext) -> BackendOutcome,
+    ) -> Result<Submission, Error> {
+        let segment = self.validate_group_egress(endpoint, now, context, group, frame)?;
+        self.now = self.now.max(now);
+        let none = SubmissionTicket { ticket: None };
+        match submit(context) {
+            BackendOutcome::Submitted => {
+                let receipt = ntcp::PhysicalReceipt {
+                    ip_packet_len: segment as u32,
+                    dont_fragment: true,
+                };
+                let accepted = endpoint.accept_transmit_group_submitted(now, group, receipt);
+                assert!(matches!(accepted, Ok(true)), "validated group acceptance");
+                Ok(Submission::Submitted)
+            }
+            BackendOutcome::WouldBlock => Ok(Submission::Blocked(none)),
+            BackendOutcome::Rejected => Ok(Submission::Rejected(none)),
+            BackendOutcome::NotSubmitted => Ok(Submission::Cancelled),
+            BackendOutcome::Unknown => Ok(Submission::PossiblySubmitted),
+        }
+    }
+    // `submit_group`'s checks; the IP length of each physical segment.
+    fn validate_group_egress(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        context: EgressContext,
+        group: TransmitGroup,
+        frame: &[u8],
+    ) -> Result<usize, Error> {
+        self.check_endpoint(endpoint)?;
+        let view = endpoint.transmit_group(group).ok_or(Error::Obsolete)?;
+        let packet = view.packet;
+        let segment_tcp = packet.len - view.payload.len() + view.segment_payload_len;
+        let owner = packet.connection.ok_or(Error::Obsolete)?;
+        let route = endpoint.managed_route(owner)?;
+        if route.client != context.binding.client {
+            return Err(Error::Obsolete);
+        }
+        if self.paths.stamp(context.binding.client) != Ok(context.binding.snapshot.stamp()) {
+            self.authorized_refresh(endpoint, owner, &packet)?;
+            return Err(Error::Obsolete);
+        }
+        let snapshot = context.binding.snapshot;
+        let ipv4 = packet.ip.source.is_ipv4();
+        let (ip, header, total, protocol) = if ipv4 {
+            // The header as one packet carries it, its checksum filled.
+            let len = frame.first().map_or(0, |b| usize::from(b & 15) * 4);
+            if frame.len() < len.max(20) || frame[10..12] != [0, 0] {
+                return Err(Error::Obsolete);
+            }
+            let mut copy = [0; 60];
+            copy[..len].copy_from_slice(&frame[..len]);
+            let sum = ntcp_ip_common::checksum(&copy[..len]);
+            copy[10..12].copy_from_slice(&sum.to_be_bytes());
+            ntcp_ip::quote_header(&copy[..len])?
+        } else {
+            ntcp_ip6::quote_header(frame)?
+        };
+        let class = if ipv4 {
+            frame[1]
+        } else {
+            (frame[0] << 4) | (frame[1] >> 4)
+        };
+        let plan = self.header_plan(snapshot.key())?;
+        let expected_header = transmit_header_len(&packet, plan)?;
+        let actual_destination = if ipv4 {
+            IpAddr::V4(core::net::Ipv4Addr::new(
+                frame[16], frame[17], frame[18], frame[19],
+            ))
+        } else {
+            IpAddr::V6(core::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[24..40]).unwrap(),
+            ))
+        };
+        if !ipv4 && planned_routing(plan.segments, frame) != Some(plan.segments.len()) {
+            return Err(Error::Obsolete);
+        }
+        let segment = header + segment_tcp;
+        let ordinary = route.ordinary_ip_budget.min(snapshot.ip_packet_budget()?);
+        if actual_destination != snapshot.key().forwarding_destination().address()
+            || protocol != 6
+            || ip != packet.ip
+            || frame.len() != total
+            || total != packet.len + expected_header
+            || header != expected_header
+            || Dscp::from_traffic_class(class).value() != packet.dscp
+            || (class & 3) != packet.ecn
+            || segment as u32 > snapshot.first_hop_mtu()
+            || segment as u32 > ordinary
+        {
+            return Err(Error::Obsolete);
+        }
+        if ipv4 && (snapshot.clears_dont_fragment() || !unfragmentable(frame)) {
+            return Err(Error::Unsupported);
+        }
+        if !endpoint.validate_transmit_group(now, group)? {
+            return Err(Error::Obsolete);
+        }
+        Ok(segment)
     }
 }
 

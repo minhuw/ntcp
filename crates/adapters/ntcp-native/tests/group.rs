@@ -1021,7 +1021,9 @@ fn idle_connections_give_no_events() {
 fn the_buffer_budget_admits_exactly_its_connections() {
     let address = "10.73.0.1".parse().unwrap();
     let peer = SocketAddr::new("10.73.0.2".parse().unwrap(), 9000);
-    let budget = config(address, false, 1).buffer_budget(3).unwrap();
+    let budget = config(address, false, 1)
+        .buffer_budget(3, &wires(PacketLayer::Ip).0)
+        .unwrap();
     let admitted = |budget: usize| {
         let mut config = config(address, false, 1);
         config.tcp.max_buffer_bytes = budget;

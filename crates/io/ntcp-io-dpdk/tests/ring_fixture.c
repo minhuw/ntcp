@@ -189,9 +189,8 @@ void ntcp_test_tso_gate(void) {
     assert(ntcp_dpdk_tso_gate(multi, multi, 0, 8, 0, 16, &limit) == -ENOTSUP);
     assert(ntcp_dpdk_tso_gate(multi, multi, 0, 8, 4, 0, &limit) == -ENOTSUP);
 }
-void ntcp_test_check_tso(unsigned l3, unsigned l4, unsigned mss, unsigned length) {
-    struct rte_mbuf *m;
-    assert(rte_ring_dequeue(tx, (void **)&m) == 0);
+static void check_tso(struct rte_mbuf *m, unsigned l3, unsigned l4, unsigned mss,
+                      unsigned length) {
     assert(m->pkt_len == length && m->l2_len == 14 && m->l3_len == l3);
     assert(m->l4_len == l4 && m->tso_segsz == mss);
     uint64_t expected = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_TCP_CKSUM |
@@ -217,7 +216,49 @@ void ntcp_test_check_tso(unsigned l3, unsigned l4, unsigned mss, unsigned length
         bytes += s->data_len; segments++;
     }
     assert(bytes == length && segments == m->nb_segs);
+}
+void ntcp_test_check_tso(unsigned l3, unsigned l4, unsigned mss, unsigned length) {
+    struct rte_mbuf *m;
+    assert(rte_ring_dequeue(tx, (void **)&m) == 0);
+    check_tso(m, l3, l4, mss, length);
     rte_pktmbuf_free(m);
+}
+// One transmitted frame copied into `out`, its length, or 0 when the tx ring
+// is empty; `*mss` is its TSO segment size, 0 for an ordinary frame. A TSO
+// chain's offload metadata is checked as ntcp_test_check_tso checks it.
+unsigned ntcp_test_take(uint8_t *out, unsigned cap, unsigned *mss) {
+    struct rte_mbuf *m;
+    if (rte_ring_dequeue(tx, (void **)&m)) return 0;
+    unsigned length = m->pkt_len;
+    assert(length <= cap);
+    const void *bytes = rte_pktmbuf_read(m, 0, length, out);
+    if (bytes != out) memcpy(out, bytes, length);
+    *mss = 0;
+    if (m->ol_flags & RTE_MBUF_F_TX_TCP_SEG) {
+        unsigned l3 = m->l3_len;
+        check_tso(m, l3, (out[14 + l3 + 12] >> 4) * 4u, m->tso_segsz, length);
+        *mss = m->tso_segsz;
+    } else {
+        for (struct rte_mbuf *s = m; s; s = s->next) assert(s->ol_flags == 0);
+    }
+    rte_pktmbuf_free(m);
+    return length;
+}
+// `frame` on the rx ring, in a chain of pool mbufs: 0, or -1 without room.
+int ntcp_test_inject(const uint8_t *frame, unsigned length) {
+    struct rte_mbuf *head = NULL, *tail = NULL;
+    for (unsigned offset = 0; offset < length;) {
+        struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+        if (!m) { rte_pktmbuf_free(head); return -1; }
+        unsigned chunk = RTE_MIN(length - offset, (unsigned)rte_pktmbuf_tailroom(m));
+        memcpy(rte_pktmbuf_append(m, (uint16_t)chunk), frame + offset, chunk);
+        if (!head) head = m;
+        else { tail->next = m; head->nb_segs++; head->pkt_len += chunk; }
+        tail = m;
+        offset += chunk;
+    }
+    if (rte_ring_enqueue(rx, head)) { rte_pktmbuf_free(head); return -1; }
+    return 0;
 }
 
 // Inspect the original external payload addresses, then perform actual mbuf

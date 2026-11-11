@@ -4,7 +4,8 @@ use ntcp_host::{
     NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
-    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, TimestampUnit, TxOutcome,
+    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, TcpSegmentationError,
+    TcpSegmentationRequest, TimestampUnit, TxOutcome,
 };
 
 pub(super) struct PendingFrame {
@@ -16,6 +17,12 @@ pub(super) struct PendingFrame {
     // Waiting while ARP resolves its next hop: not retried before the
     // Host's wake, and no backend backpressure.
     held: bool,
+    // The aggregate prepared from `attempt`, which preparation retired,
+    // kept for a retry while the backend blocks.
+    group: Option<ntcp::TransmitGroup>,
+    // Polled again after the backend refused its aggregate: sent a segment
+    // at a time.
+    scalar: bool,
 }
 pub(super) struct TxSlot {
     pub bytes: Vec<u8>,
@@ -810,22 +817,52 @@ impl<P: PacketIo> Network<P> {
     // instant. A poll that skipped an idle ready-queue entry still reports
     // more work, and the next connection may have a packet.
     fn transmit_slot(&mut self, slot: &mut TxSlot, report: &mut DriveReport) -> Result<bool> {
+        if slot.pending.is_none()
+            && let Some(idle) = self.fill(slot, None, report)?
+        {
+            return Ok(idle);
+        }
+        loop {
+            match self.send(slot, report)? {
+                // The backend refused the aggregate, which the endpoint
+                // took back: its first segment goes out alone, in this turn.
+                Some(owner) => {
+                    if let Some(idle) = self.fill(slot, Some(owner), report)? {
+                        return Ok(idle);
+                    }
+                }
+                None => return Ok(false),
+            }
+        }
+    }
+    // Polls the endpoint's next packet into empty `slot`, or that of
+    // `owner`'s reservation; Some ends the slot's turn, Some(true) when the
+    // endpoint has nothing left to offer.
+    fn fill(
+        &mut self,
+        slot: &mut TxSlot,
+        owner: Option<ntcp::ConnectionId>,
+        report: &mut DriveReport,
+    ) -> Result<Option<bool>> {
         let offset = self.config.link.offset();
-        if slot.pending.is_none() {
+        {
             let header = if self.config.local_address.is_ipv4() {
                 20
             } else {
                 40
             };
-            let (poll, attempt) = match self.endpoint.poll_reserved_transmit(
-                self.now,
-                &mut slot.bytes[offset + header..],
-                1,
-            ) {
+            let out = &mut slot.bytes[offset + header..];
+            let polled = match owner {
+                None => self.endpoint.poll_reserved_transmit(self.now, out, 1),
+                Some(id) => self
+                    .endpoint
+                    .poll_reserved_transmit_for(self.now, id, out, 1),
+            };
+            let (poll, attempt) = match polled {
                 Ok(result) => result,
                 Err(EndpointError::OutputReserved) => {
                     report.tx_blocked = true;
-                    return Ok(true);
+                    return Ok(Some(true));
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -841,7 +878,7 @@ impl<P: PacketIo> Network<P> {
                 report.more_work |= more_work;
             }
             let Some(packet) = poll.packet else {
-                return Ok(!more_work);
+                return Ok(Some(owner.is_none() && !more_work));
             };
             let attempt = attempt.ok_or(Error::InvalidHandle)?;
             let ip_len = if packet.ip.source.is_ipv4() {
@@ -880,11 +917,24 @@ impl<P: PacketIo> Network<P> {
                 ticket: None,
                 ip_len,
                 held: false,
+                group: None,
+                scalar: owner.is_some(),
             });
         }
+        Ok(None)
+    }
+    // One physical attempt of `slot`'s frame. Some(owner): the backend
+    // refused the aggregate prepared from it, and the endpoint took its
+    // reservation back unattempted.
+    fn send(
+        &mut self,
+        slot: &mut TxSlot,
+        report: &mut DriveReport,
+    ) -> Result<Option<ntcp::ConnectionId>> {
+        let offset = self.config.link.offset();
         let pending = slot.pending.as_mut().unwrap();
         if pending.held {
-            return Ok(false);
+            return Ok(None);
         }
         let context = match pending.context {
             Some(context) => context,
@@ -898,13 +948,13 @@ impl<P: PacketIo> Network<P> {
                 }
                 Err(ntcp_host::Error::Capacity | ntcp_host::Error::Allocation) => {
                     report.tx_blocked = true;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(ntcp_host::Error::Obsolete) => {
                     self.endpoint.reject_unsubmitted(pending.attempt)?;
                     slot.pending = None;
                     report.more_work = true;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(error) => return Err(error.into()),
             },
@@ -924,7 +974,7 @@ impl<P: PacketIo> Network<P> {
                 //# packet when the address has been resolved.
                 Ok(NeighborHop::Held) => {
                     pending.held = true;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // No neighbor entry or held record is free: the attempt is
                 // withdrawn unsubmitted, retried on TCP's own clock.
@@ -932,7 +982,7 @@ impl<P: PacketIo> Network<P> {
                     self.endpoint
                         .discard_unsubmitted(self.now, pending.attempt, None)?;
                     slot.pending = None;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -941,6 +991,24 @@ impl<P: PacketIo> Network<P> {
             Some(ticket) => ticket,
             None => self.host.submission_ticket(&mut self.endpoint, context)?,
         };
+        if pending.group.is_none()
+            && !pending.scalar
+            && pending.owner.is_some()
+            && let Some(capabilities) = self.segmentation
+        {
+            let ecn = if self.config.local_address.is_ipv4() {
+                slot.bytes[offset + 1] & 3
+            } else {
+                (slot.bytes[offset + 1] >> 4) & 3
+            };
+            let attempt = pending.attempt;
+            let group = self.prepare_group(capabilities, attempt, ecn)?;
+            slot.pending.as_mut().unwrap().group = group;
+        }
+        let pending = slot.pending.as_mut().unwrap();
+        if let Some(group) = pending.group {
+            return self.send_group(slot, context, ticket, group, report);
+        }
         let packet = &slot.bytes[offset..offset + pending.ip_len];
         let wire_len = (offset + pending.ip_len).max(if offset == 0 { 0 } else { 60 });
         let wire = &slot.bytes[..wire_len];
@@ -991,7 +1059,172 @@ impl<P: PacketIo> Network<P> {
                 return Err(refused.error.into());
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+    // The aggregate of `attempt`'s reservation the backend can segment: as
+    // many of its full segments as the aggregate's frame holds, the backend
+    // cuts and their frames take on the wire, each at most the device's
+    // MTU. The segments of a reservation of fewer, its last one with PSH
+    // while the backend cannot place PSH, and every segment marked ECT or
+    // CE go out one at a time: no backend copies an IP ECN codepoint into
+    // the segments it cuts (DPDK refuses it), so such an aggregate would
+    // only be built to be refused. `ecn`: the attempt's codepoint.
+    fn prepare_group(
+        &mut self,
+        capabilities: ntcp_io::TcpSegmentationCapabilities,
+        attempt: ntcp::TransmitAttempt,
+        ecn: u8,
+    ) -> Result<Option<ntcp::TransmitGroup>> {
+        let Some(s) = self.endpoint.transmit_segmentation(attempt) else {
+            return Ok(None);
+        };
+        let offset = self.config.link.offset();
+        let ip = if self.config.local_address.is_ipv4() {
+            20
+        } else {
+            40
+        };
+        let packet = ip + s.tcp_header_len + s.segment_payload_len;
+        if ecn != 0 || packet > capabilities.local_ip_mtu as usize {
+            return Ok(None);
+        }
+        let frame = (offset + packet).max(if offset == 0 { 0 } else { 60 });
+        let limits = ntcp::TransmitGroupLimits {
+            max_bytes: self
+                .aggregate
+                .len()
+                .saturating_sub(offset + ip + s.tcp_header_len),
+            max_segments: capabilities
+                .max_segments
+                .min(capabilities.max_wire_bytes / frame),
+            allow_psh: capabilities.allow_psh,
+            allow_cwr: capabilities.allow_cwr,
+            // Data segments carry timestamps and SACK blocks, which stay
+            // valid repeated in every segment, as Linux's TSO repeats them;
+            // a backend that cannot copy them refuses the aggregate.
+            allow_options: true,
+        };
+        match self.endpoint.prepare_transmit_group(attempt, limits) {
+            Ok(group) => Ok(group),
+            // Departure records cannot take this group's segments at once
+            // (RACK's interval storage); one at a time they may.
+            Err(EndpointError::Connection(ntcp::Error::InvalidArgument)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+    // One physical attempt of the aggregate `group`, prepared from `slot`'s
+    // frame, whose Ethernet header (its next hop resolved) it shares, and
+    // whose context and ticket it keeps for a retry while the backend
+    // blocks. The frame is built again for each attempt: the group's TCP
+    // header and one IP header around the whole aggregate, their checksum
+    // fields zero, which the backend fills for every segment it cuts.
+    // Some(owner) as for `send`.
+    fn send_group(
+        &mut self,
+        slot: &mut TxSlot,
+        context: EgressContext,
+        ticket: SubmissionTicket,
+        group: ntcp::TransmitGroup,
+        report: &mut DriveReport,
+    ) -> Result<Option<ntcp::ConnectionId>> {
+        let offset = self.config.link.offset();
+        let header = if self.config.local_address.is_ipv4() {
+            20
+        } else {
+            40
+        };
+        let mut request = TcpSegmentationRequest {
+            segment_payload_len: 0,
+        };
+        let (mut ip_len, mut segments) = (0, 0);
+        // A stale group is refused by the Host before any backend call.
+        if let Some(view) = self.endpoint.transmit_group(group) {
+            let tcp = &mut self.aggregate[offset + header..];
+            let tcp_len = ntcp::wire::encode(view.packet.ip, view.header, view.options, &[], tcp)
+                .map_err(|_| Error::Unsupported("TCP aggregate header"))?;
+            tcp[16..18].fill(0);
+            tcp[tcp_len..tcp_len + view.payload.len()].copy_from_slice(view.payload);
+            ip_len = if view.packet.ip.source.is_ipv4() {
+                ntcp_ip::encode(&mut self.aggregate[offset..], view.packet, 0)
+            } else {
+                ntcp_ip6::encode(&mut self.aggregate[offset..], view.packet)
+            }
+            .map_err(|e| Error::Host(e.into()))?;
+            if view.packet.ip.source.is_ipv4() {
+                self.aggregate[offset + 10..offset + 12].fill(0);
+            }
+            self.aggregate[..offset].copy_from_slice(&slot.bytes[..offset]);
+            request.segment_payload_len = view.segment_payload_len;
+            segments = view.segment_count;
+        }
+        let packet = &self.aggregate[offset..offset + ip_len];
+        let wire = &self.aggregate[..offset + ip_len];
+        let io = &mut self.io;
+        let mut failure = None;
+        let result =
+            self.host
+                .submit_group(&mut self.endpoint, self.now, context, group, packet, |_| {
+                    match io.transmit_segmented(wire, request) {
+                        Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
+                        Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
+                            BackendOutcome::WouldBlock
+                        }
+                        // Both certify that nothing was submitted.
+                        Err(
+                            TcpSegmentationError::Unsupported | TcpSegmentationError::InvalidInput,
+                        ) => BackendOutcome::NotSubmitted,
+                        Err(TcpSegmentationError::Other(error)) => {
+                            failure = Some(error);
+                            BackendOutcome::Unknown
+                        }
+                    }
+                });
+        let pending = slot.pending.as_mut().unwrap();
+        let owner = pending.owner.ok_or(Error::InvalidHandle)?;
+        match result {
+            Ok(Submission::Submitted) => {
+                slot.pending = None;
+                report.transmitted += segments;
+                self.counters.segmented += 1;
+            }
+            Ok(Submission::Blocked(_) | Submission::Rejected(_)) => {
+                pending.ticket = Some(ticket);
+                report.tx_blocked = true;
+                self.counters.backend_backpressure += 1;
+            }
+            Ok(Submission::PossiblySubmitted) => {
+                return Err(Error::Backend(failure.unwrap_or_else(|| {
+                    io::Error::other("unknown aggregate submission outcome")
+                })));
+            }
+            // The backend, or the Host for a path that clears DF, cannot
+            // send this aggregate: its segments go out one at a time.
+            Ok(Submission::Cancelled) | Err(ntcp_host::Error::Unsupported) => {
+                self.host.cancel_submission(ticket);
+                slot.pending = None;
+                self.counters.segmentation_refused += 1;
+                if self.endpoint.reject_unsubmitted_group(group)? {
+                    return Ok(Some(owner));
+                }
+                report.more_work = true;
+            }
+            // The path changed since the group was prepared: polled again,
+            // the reservation is cut for the new path.
+            Err(
+                ntcp_host::Error::Obsolete
+                | ntcp_host::Error::Endpoint(EndpointError::ReservationMtuTooSmall),
+            ) => {
+                self.host.cancel_submission(ticket);
+                slot.pending = None;
+                self.endpoint.reject_unsubmitted_group(group)?;
+                report.more_work = true;
+            }
+            Err(error) => {
+                pending.ticket = Some(ticket);
+                return Err(error.into());
+            }
+        }
+        Ok(None)
     }
     // A frame of `owner` left its transmit slot, ending the reservation that
     // kept the connection's events, and its close, from being acted on.
@@ -1057,10 +1290,27 @@ impl<P: PacketIo> Network<P> {
                             if let Some(ticket) = pending.ticket {
                                 self.host.cancel_submission(ticket);
                             }
+                            // An aggregate's reservation, taken back, is
+                            // polled again for the attempt to withdraw.
+                            let attempt = match pending.group {
+                                None => Some(pending.attempt),
+                                Some(group) => {
+                                    self.endpoint.reject_unsubmitted_group(group)?;
+                                    self.endpoint
+                                        .poll_reserved_transmit_for(
+                                            self.now,
+                                            core,
+                                            &mut slot.bytes,
+                                            1,
+                                        )?
+                                        .1
+                                }
+                            };
                             // Every retained frame is certified unsubmitted. The
                             // explicit abort below supersedes its restored work.
-                            self.endpoint
-                                .discard_unsubmitted(self.now, pending.attempt, None)?;
+                            if let Some(attempt) = attempt {
+                                self.endpoint.discard_unsubmitted(self.now, attempt, None)?;
+                            }
                         }
                     }
                 }

@@ -63,12 +63,12 @@ fn network(
     config.tcp.max_listeners = 2;
     config.tcp.connection.send_capacity = 2048;
     config.tcp.connection.receive_capacity = 8192;
-    config.tcp.max_buffer_bytes = config.buffer_budget(8).unwrap();
     config.ephemeral_ports = ports;
     let wire = Wire {
         incoming: incoming.clone(),
         outgoing: outgoing.clone(),
     };
+    config.tcp.max_buffer_bytes = config.buffer_budget(8, &wire).unwrap();
     Network::new(config, wire, [side; 32], 0).unwrap()
 }
 
