@@ -127,11 +127,20 @@ impl NetworkConfig {
     /// - delayed ACKs that adapt between 40 and 200 ms to the peer's sending
     ///   (TCP_ATO_MIN, TCP_DELACK_MAX);
     /// - a 60 s TIME-WAIT (TCP_TIMEWAIT_LEN), where the Endpoint's default
-    ///   lingers 120 s.
+    ///   lingers 120 s;
+    /// - a SYN that passes RFC 6191's timestamp and sequence checks reopens
+    ///   a tuple in TIME-WAIT for the listener on its port
+    ///   (`tcp.reuse_time_wait`), as Linux always lets it
+    ///   (tcp_timewait_state_process, TCP_TW_SYN). An active open still
+    ///   never takes a tuple in TIME-WAIT, as Linux's tcp_tw_reuse allows
+    ///   only over loopback by default.
     ///
-    /// Each remains a field of `tcp.connection` to change.
+    /// Each remains a field of `tcp` or `tcp.connection` to change.
     pub fn new(local_address: IpAddr, mtu: u32) -> Self {
-        let mut tcp = EndpointConfig::default();
+        let mut tcp = EndpointConfig {
+            reuse_time_wait: true,
+            ..EndpointConfig::default()
+        };
         let connection = &mut tcp.connection;
         connection.sack = true;
         connection.rack = true;

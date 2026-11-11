@@ -260,6 +260,8 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     c.coalesce_read_window_updates = false;
     c.send_ip_payload_limit = 65515;
     if let Profile::Upstream(o) = profile {
+        // Linux's listeners take a fresh SYN for a tuple in TIME-WAIT.
+        config.reuse_time_wait = true;
         config.max_buffer_bytes = if o.budget224m {
             224
         } else if o.budget128m {
@@ -443,6 +445,7 @@ mod setup_profile_tests {
         assert!(c.output_group_flush);
         assert_eq!(c.delayed_ack_us, 200_000);
         assert_eq!(c.time_wait_us, 60_000_000);
+        assert!(base.reuse_time_wait);
         assert_eq!(base.max_buffer_bytes, 32 * 1024 * 1024);
         assert_eq!(base.preallocate_connections, 1);
         for (token, field) in [

@@ -1,7 +1,8 @@
 // NetworkConfig::new's TCP defaults, as Linux's: SACK and timestamps offered
 // on the SYN and no ECN asked for, a lost tail segment retransmitted near
-// the 200 ms RTO floor rather than RFC 6298's 1 s, and a 60 s TIME-WAIT. Two
-// Networks over an in-memory IP wire that can drop a chosen segment.
+// the 200 ms RTO floor rather than RFC 6298's 1 s, a 60 s TIME-WAIT, and a
+// listener that takes a fresh SYN for a tuple in TIME-WAIT. Two Networks over
+// an in-memory IP wire that can drop a chosen segment.
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use ntcp_native::*;
 use std::{
@@ -86,6 +87,15 @@ fn address(side: u8) -> IpAddr {
 }
 
 fn side(n: u8, incoming: &Queue, outgoing: &Queue) -> (Network<Wire>, Wire) {
+    side_with(n, incoming, outgoing, |_| {})
+}
+
+fn side_with(
+    n: u8,
+    incoming: &Queue,
+    outgoing: &Queue,
+    edit: impl FnOnce(&mut NetworkConfig),
+) -> (Network<Wire>, Wire) {
     let make = || Wire {
         incoming: incoming.clone(),
         outgoing: outgoing.clone(),
@@ -101,6 +111,7 @@ fn side(n: u8, incoming: &Queue, outgoing: &Queue) -> (Network<Wire>, Wire) {
     let mut config = NetworkConfig::new(address(n), 1500);
     config.tcp.max_connections = 4;
     config.tcp.max_buffer_bytes = config.buffer_budget(4, &wire).unwrap();
+    edit(&mut config);
     (Network::new(config, wire, [n; 32], 0).unwrap(), probe)
 }
 
@@ -121,6 +132,7 @@ fn defaults_follow_linux_and_stay_configurable() {
     assert_eq!(c.congestion_algorithm, ntcp::CongestionAlgorithm::Cubic);
     assert_eq!((c.rto_min_us, c.delayed_ack_us), (200_000, 200_000));
     assert_eq!(c.time_wait_us, 60_000_000);
+    assert!(config.tcp.reuse_time_wait);
     // The RFC baseline of the Endpoint is still a configuration away.
     let mut config = config;
     let baseline = ntcp::ConnectionConfig::default();
@@ -135,6 +147,7 @@ fn defaults_follow_linux_and_stay_configurable() {
     config.tcp.connection.congestion_algorithm = baseline.congestion_algorithm;
     config.tcp.connection.prr = baseline.prr;
     config.tcp.connection.time_wait_us = baseline.time_wait_us;
+    config.tcp.reuse_time_wait = ntcp::EndpointConfig::default().reuse_time_wait;
     let wire = || Wire {
         incoming: Queue::default(),
         outgoing: Queue::default(),
@@ -239,4 +252,103 @@ fn the_syn_offers_sack_and_timestamps_without_ecn_and_a_lost_tail_returns_near_2
         "recovered after {} ms",
         recovery / MS
     );
+}
+
+// The server closes first, so its side of the tuple is in TIME-WAIT. A
+// replayed SYN of the old incarnation opens nothing and leaves it there; the
+// client's next SYN from the same port reopens the tuple at once, as a Linux
+// listener takes it (tcp_timewait_state_process, TCP_TW_SYN), rather than
+// after the 60 s.
+#[test]
+fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
+    const CLIENT_PORT: u16 = 40000;
+    let (a, b) = (Queue::default(), Queue::default());
+    // The client offers no timestamps, so the server judges each SYN by its
+    // sequence number alone (RFC 6191): ntcp draws a connection's TSval
+    // offset per incarnation, and a later incarnation's SYN may carry a
+    // TSval below the one the TIME-WAIT last saw.
+    let (mut client, client_wire) = side_with(1, &a, &b, |c| c.tcp.connection.timestamps = false);
+    let (mut server, server_wire) = side(2, &b, &a);
+    let listener = server.listen(PORT, 4).unwrap();
+    let peer = SocketAddr::new(address(2), PORT);
+    let id = client.connect_from(peer, Some(CLIENT_PORT)).unwrap();
+    let mut now = 0;
+    let accepted = loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(accepted) = server.accept(listener) {
+            break accepted;
+        }
+        assert!(now < 100 * MS, "handshake did not finish");
+    };
+    let old_syn = client_wire.sent.borrow()[0].clone();
+    assert_eq!(tcp(&old_syn)[13], 0x02);
+    server.close(accepted).unwrap();
+    loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(ReadOutcome::Eof) = client.try_read(id, &mut [0; 8]) {
+            break;
+        }
+        assert!(now < 1_000 * MS, "the FIN never arrived");
+    }
+    client.close(id).unwrap();
+    // Taking the closed connections' events releases them: the server's
+    // TIME-WAIT is then a record, and the client's port is free.
+    let mut events = [Event::NetworkStopped; 16];
+    for _ in 0..20 {
+        step(&mut now, &mut client, &mut server);
+        client.drain_events(&mut events);
+        server.drain_events(&mut events);
+    }
+    assert!(client.connection_info(id).is_err());
+    assert!(server.connection_info(accepted).is_err());
+    assert_eq!(server.counters().time_wait_connections, 1);
+    assert_eq!(client.counters().time_wait_connections, 0);
+    // The old incarnation's SYN: its sequence number is below the FIN the
+    // TIME-WAIT acknowledged. Only the server takes it in, and whatever it
+    // answers stays off the wire: a client's RST to an ACK would end the
+    // TIME-WAIT (Linux's tcp_rfc1337=0 does the same).
+    let sent = server_wire.sent.borrow().len();
+    b.borrow_mut().push_back(old_syn);
+    for _ in 0..20 {
+        now += MS;
+        server.drive(now, BUDGET).unwrap();
+    }
+    a.borrow_mut().clear();
+    assert!(
+        server_wire.sent.borrow()[sent..]
+            .iter()
+            .all(|packet| tcp(packet)[13] & 0x02 == 0)
+    );
+    assert!(!server.acceptable(listener).unwrap());
+    assert_eq!(server.counters().time_wait_connections, 1);
+    let syns = client_wire.sent.borrow().len();
+    let id = client.connect_from(peer, Some(CLIENT_PORT)).unwrap();
+    let accepted = loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(accepted) = server.accept(listener) {
+            break accepted;
+        }
+        assert!(now < 2_000 * MS, "the tuple did not reopen");
+    };
+    // The first SYN reopened it, without a retransmission.
+    let client_syns = client_wire.sent.borrow()[syns..]
+        .iter()
+        .filter(|packet| tcp(packet)[13] & 0x02 != 0)
+        .count();
+    assert_eq!(client_syns, 1);
+    // The new connection took the tuple and ended the TIME-WAIT.
+    assert_eq!(server.counters().time_wait_connections, 0);
+    let receipt = client
+        .try_write(id, &[9; 10], WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, 10);
+    let mut out = [0; 16];
+    loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(ReadOutcome::Data { len, .. }) = server.try_read(accepted, &mut out) {
+            assert_eq!(&out[..len], &[9; 10]);
+            break;
+        }
+        assert!(now < 3_000 * MS, "no data on the new connection");
+    }
 }

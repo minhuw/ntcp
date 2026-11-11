@@ -103,6 +103,9 @@ pub struct EndpointConfig {
     pub preallocate_connections: usize,
     pub ipv4_options_enabled: bool,
     pub error_reports: bool,
+    // A SYN that passes RFC 6191's checks reopens a tuple in TIME-WAIT for
+    // the listener on its port, as Linux's always does (TCP_TW_SYN). Off in
+    // the RFC baseline; an active open never takes a tuple in TIME-WAIT.
     pub reuse_time_wait: bool,
     // TIME-WAIT records kept for released connections, Linux's
     // tcp_max_tw_buckets: beyond it a connection closes without TIME-WAIT.
