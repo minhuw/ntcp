@@ -1,7 +1,8 @@
 // The local ports a Network's opens take: an explicit port, or one of the
 // ephemeral range, is refused while a connection or listener uses it, and
-// taken again once the slot that used it is freed. Two Networks over an
-// in-memory IP wire.
+// taken again once the slot that used it is freed; an open finds no slot
+// in a full table until one is freed. Two Networks over an in-memory IP
+// wire.
 use ntcp::EndpointError;
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use ntcp_native::*;
@@ -259,4 +260,45 @@ fn accepted_connections_keep_their_listeners_port() {
     pair.server.abort(first).unwrap();
     pair.steps(4);
     assert!(in_use(pair.server.connect_from(client_address, Some(PORT))));
+}
+
+// A full table of connections or listeners refuses opens until a slot is
+// freed, an aborted connection's once it is reclaimed and a closed
+// listener's at the next drive, and then gives back that slot only, under a
+// handle its old one cannot reach.
+#[test]
+fn a_full_table_takes_again_only_the_slots_freed() {
+    let mut pair = Pair::new(40000..=40015, 50000..=50000);
+    let server_address = SocketAddr::new(address(2), PORT);
+    let opened: Vec<_> = (0..8)
+        .map(|_| pair.client.connect(server_address).unwrap())
+        .collect();
+    // Ports remain; slots do not.
+    assert!(exhausted(pair.client.connect(server_address)));
+    pair.steps(4);
+    pair.client.abort(opened[3]).unwrap();
+    pair.steps(4);
+    assert!(exhausted(pair.client.connect(server_address)));
+    pair.reclaim(opened[3]);
+    let next = pair.client.connect(server_address).unwrap();
+    assert!(!opened.contains(&next));
+    assert!(matches!(
+        pair.client.connection_info(opened[3]),
+        Err(Error::InvalidHandle)
+    ));
+    assert!(exhausted(pair.client.connect(server_address)));
+
+    let second = pair.server.listen(PORT + 1, 8).unwrap();
+    assert!(exhausted(pair.server.listen(PORT + 2, 8)));
+    pair.server.close_listener(second).unwrap();
+    assert!(exhausted(pair.server.listen(PORT + 2, 8)));
+    pair.step();
+    let third = pair.server.listen(PORT + 2, 8).unwrap();
+    assert_ne!(third, second);
+    assert!(matches!(
+        pair.server.acceptable(second),
+        Err(Error::InvalidHandle)
+    ));
+    assert!(pair.server.acceptable(third).is_ok());
+    assert!(exhausted(pair.server.listen(PORT + 3, 8)));
 }

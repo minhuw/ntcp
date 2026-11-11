@@ -82,6 +82,10 @@ pub struct Network<P: PacketIo> {
     // a free slot holds no state, event or work.
     live_connections: Vec<usize>,
     live_listeners: Vec<usize>,
+    // Free slots of `connections` and `listeners`, the one the next open
+    // takes last: an open finds a slot without a pass over the table.
+    free_connections: Vec<usize>,
+    free_listeners: Vec<usize>,
     events: VecDeque<Event>,
     event_capacity: usize,
     // Connection slots, then listener slots at `max_connections + slot`,
@@ -148,6 +152,32 @@ fn indices(capacity: usize) -> Result<Vec<usize>> {
         .try_reserve_exact(capacity)
         .map_err(|_| Error::Capacity)?;
     Ok(result)
+}
+// Every slot of a table of `capacity`, free, slot 0 to be taken first.
+// The slot freed last is taken next, as a slab cache hands out the object
+// it was given back last: an open reuses a slot of recent connections, not
+// one never touched, while there is one.
+fn free_slots(capacity: usize) -> Result<Vec<usize>> {
+    let mut result = indices(capacity)?;
+    result.extend((0..capacity).rev());
+    Ok(result)
+}
+// Gives vacated `slot` back to `free`, unless its generation is spent: the
+// slot then retires, so that no two of its handles are alike.
+fn give_back<T>(free: &mut Vec<usize>, slots: &[Slot<T>], slot: usize) {
+    debug_assert!(slots[slot].value.is_none() && free.len() < free.capacity());
+    if slots[slot].generation < u64::MAX {
+        free.push(slot);
+    }
+}
+// The full-scan form of a free list, for debug builds: the slots that are
+// neither occupied nor retired, each once.
+fn listed_free<T>(free: &[usize], slots: &[Slot<T>]) -> bool {
+    let mut listed = vec![false; slots.len()];
+    free.iter()
+        .all(|&s| !std::mem::replace(&mut listed[s], true))
+        && (0..slots.len())
+            .all(|i| listed[i] == (slots[i].value.is_none() && slots[i].generation < u64::MAX))
 }
 fn occupy(live: &mut Vec<usize>, slot: usize) {
     let at = live.partition_point(|&s| s < slot);
@@ -601,6 +631,8 @@ impl<P: PacketIo> Network<P> {
         let listeners = table(config.tcp.max_listeners)?;
         let live_connections = indices(config.tcp.max_connections)?;
         let live_listeners = indices(config.tcp.max_listeners)?;
+        let free_connections = free_slots(config.tcp.max_connections)?;
+        let free_listeners = free_slots(config.tcp.max_listeners)?;
         let tx_frames = indices(owners)?;
         let slots = config.tcp.max_connections + config.tcp.max_listeners;
         let ports = PortUsers::new(slots)?;
@@ -624,6 +656,8 @@ impl<P: PacketIo> Network<P> {
             listener_map,
             live_connections,
             live_listeners,
+            free_connections,
+            free_listeners,
             events,
             event_capacity,
             ready,
@@ -814,6 +848,8 @@ impl<P: PacketIo> Network<P> {
                 .copied()
                 .eq(occupied(&self.listeners))
         );
+        debug_assert!(listed_free(&self.free_connections, &self.connections));
+        debug_assert!(listed_free(&self.free_listeners, &self.listeners));
         debug_assert!(
             self.tx_frames
                 .iter()
@@ -858,11 +894,9 @@ impl<P: PacketIo> Network<P> {
             .and_then(|s| s.value.as_ref())
             .ok_or(Error::InvalidHandle)
     }
+    // The connection slot the next install takes.
     fn free_connection_slot(&self) -> Result<usize> {
-        self.connections
-            .iter()
-            .position(|s| s.value.is_none() && s.generation < u64::MAX)
-            .ok_or(Error::Capacity)
+        self.free_connections.last().copied().ok_or(Error::Capacity)
     }
     fn install(&mut self, slot: usize, core: ntcp::ConnectionId) -> Result<ConnId> {
         let tuple = self.endpoint.tuple(core)?;
@@ -886,6 +920,8 @@ impl<P: PacketIo> Network<P> {
             arrived: false,
             write_waiting: None,
         });
+        let taken = self.free_connections.pop();
+        debug_assert_eq!(taken, Some(slot));
         occupy(&mut self.live_connections, slot);
         self.ports.take(tuple.local.port());
         self.connection_map.insert(core, slot);
@@ -1047,11 +1083,7 @@ impl<P: PacketIo> Network<P> {
                 "another member of the shared flows owns this tagged port",
             ));
         }
-        let slot = self
-            .listeners
-            .iter()
-            .position(|s| s.value.is_none() && s.generation < u64::MAX)
-            .ok_or(Error::Capacity)?;
+        let slot = *self.free_listeners.last().ok_or(Error::Capacity)?;
         let address = SocketAddr::new(self.config.local_address, port);
         let zone = match address.ip() {
             std::net::IpAddr::V6(a) if a.is_unicast_link_local() => Some(self.ingress.link()),
@@ -1072,6 +1104,8 @@ impl<P: PacketIo> Network<P> {
             closing: false,
             acceptable: false,
         });
+        let taken = self.free_listeners.pop();
+        debug_assert_eq!(taken, Some(slot));
         occupy(&mut self.live_listeners, slot);
         self.ports.take(port);
         self.listener_map.insert(core, slot);

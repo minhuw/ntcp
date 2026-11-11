@@ -1019,6 +1019,7 @@ impl<P: PacketIo> Network<P> {
                         self.listener_map.remove(&core);
                         self.listeners[index].value = None;
                         vacate(&mut self.live_listeners, index);
+                        give_back(&mut self.free_listeners, &self.listeners, index);
                         self.ports.give(port);
                         if let Some(flows) = &mut self.flows {
                             flows.unlisten(port);
@@ -1107,6 +1108,7 @@ impl<P: PacketIo> Network<P> {
                 self.connection_map.remove(&core);
                 self.connections[index].value = None;
                 vacate(&mut self.live_connections, index);
+                give_back(&mut self.free_connections, &self.connections, index);
                 self.ports.give(port);
             }
         }
