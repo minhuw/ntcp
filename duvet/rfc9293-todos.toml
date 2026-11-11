@@ -11,7 +11,7 @@ if the send window is zero, in order to "probe" the window.
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
-reason = "Deliberate Linux-style deviation: TIME-WAIT lasts ConnectionConfig::time_wait_us, 120 s by default, which lingers 2xMSL only for an MSL of 60 s, not the 2 minutes of section 3.4.2 that CallerTimebase::max_segment_lifetime_us keeps. Any positive value may be configured, for example for benchmarks, as Linux fixes 60 s (TCP_TIMEWAIT_LEN); zero is refused because TIME-WAIT must outlive the instant it begins for the ACK of the peer's FIN to be sent. RFC 6191 timestamp-based TIME-WAIT reuse is unchanged, and the same duration bounds the tuple reservation after a locally generated reset (section 3.5.2)."
+reason = "Deliberate Linux-style deviation: TIME-WAIT lasts ConnectionConfig::time_wait_us, 120 s by default, which lingers 2xMSL only for an MSL of 60 s, not the 2 minutes of section 3.4.2 that CallerTimebase::max_segment_lifetime_us keeps. Any positive value may be configured, for example for benchmarks; Linux fixes 60 s (TCP_TIMEWAIT_LEN), and ntcp_native::NetworkConfig::new, which keeps Linux's TCP defaults, and the packetdrill upstream profile configure it; zero is refused because TIME-WAIT must outlive the instant it begins for the ACK of the peer's FIN to be sent. RFC 6191 timestamp-based TIME-WAIT reuse is unchanged, and the same duration bounds the tuple reservation after a locally generated reset (section 3.5.2)."
 quote = '''
 When a connection is closed actively, it MUST linger in the TIME-WAIT
 state for a time 2xMSL (Maximum Segment Lifetime) (MUST-13).

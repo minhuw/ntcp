@@ -1,7 +1,7 @@
 // NetworkConfig::new's TCP defaults, as Linux's: SACK and timestamps offered
-// on the SYN and no ECN asked for, and a lost tail segment retransmitted
-// near the 200 ms RTO floor rather than RFC 6298's 1 s. Two Networks over an
-// in-memory IP wire that can drop a chosen segment.
+// on the SYN and no ECN asked for, a lost tail segment retransmitted near
+// the 200 ms RTO floor rather than RFC 6298's 1 s, and a 60 s TIME-WAIT. Two
+// Networks over an in-memory IP wire that can drop a chosen segment.
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use ntcp_native::*;
 use std::{
@@ -120,6 +120,7 @@ fn defaults_follow_linux_and_stay_configurable() {
     assert_eq!(c.initial_window, ntcp::InitialWindow::Iw10);
     assert_eq!(c.congestion_algorithm, ntcp::CongestionAlgorithm::Cubic);
     assert_eq!((c.rto_min_us, c.delayed_ack_us), (200_000, 200_000));
+    assert_eq!(c.time_wait_us, 60_000_000);
     // The RFC baseline of the Endpoint is still a configuration away.
     let mut config = config;
     let baseline = ntcp::ConnectionConfig::default();
@@ -133,14 +134,63 @@ fn defaults_follow_linux_and_stay_configurable() {
     config.tcp.connection.initial_window = baseline.initial_window;
     config.tcp.connection.congestion_algorithm = baseline.congestion_algorithm;
     config.tcp.connection.prr = baseline.prr;
-    let (incoming, outgoing) = (Queue::default(), Queue::default());
-    let wire = Wire {
-        incoming,
-        outgoing,
+    config.tcp.connection.time_wait_us = baseline.time_wait_us;
+    let wire = || Wire {
+        incoming: Queue::default(),
+        outgoing: Queue::default(),
         sent: Rc::default(),
         drop_data: Rc::default(),
     };
-    assert!(Network::new(config, wire, [1; 32], 0).is_ok());
+    assert!(Network::new(config.clone(), wire(), [1; 32], 0).is_ok());
+    // Any positive TIME-WAIT is accepted; only zero, which would end before
+    // the ACK of the peer's FIN left, is refused.
+    for time_wait_us in [1, 1_000, u64::MAX] {
+        config.tcp.connection.time_wait_us = time_wait_us;
+        assert!(Network::new(config.clone(), wire(), [1; 32], 0).is_ok());
+    }
+    config.tcp.connection.time_wait_us = 0;
+    assert!(Network::new(config, wire(), [1; 32], 0).is_err());
+}
+
+// The side that closes first waits 60 s, TCP_TIMEWAIT_LEN, before its
+// connection leaves TIME-WAIT.
+#[test]
+fn time_wait_lasts_60_s() {
+    let (a, b) = (Queue::default(), Queue::default());
+    let (mut client, _) = side(1, &a, &b);
+    let (mut server, _) = side(2, &b, &a);
+    let listener = server.listen(PORT, 4).unwrap();
+    let id = client.connect(SocketAddr::new(address(2), PORT)).unwrap();
+    let mut now = 0;
+    let accepted = loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(accepted) = server.accept(listener) {
+            break accepted;
+        }
+        assert!(now < 100 * MS, "handshake did not finish");
+    };
+    client.close(id).unwrap();
+    loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(ReadOutcome::Eof) = server.try_read(accepted, &mut [0; 8]) {
+            break;
+        }
+        assert!(now < 1_000 * MS, "the FIN never arrived");
+    }
+    server.close(accepted).unwrap();
+    // TIME-WAIT begins at the drive that first counts it.
+    let began = loop {
+        let at = step(&mut now, &mut client, &mut server);
+        if client.counters().time_wait_connections == 1 {
+            break at;
+        }
+        assert!(at < 1_000 * MS, "TIME-WAIT never began");
+    };
+    let end = began + 60_000 * MS;
+    client.drive(end - 1, BUDGET).unwrap();
+    assert_eq!(client.counters().time_wait_connections, 1);
+    client.drive(end, BUDGET).unwrap();
+    assert_eq!(client.counters().time_wait_connections, 0);
 }
 
 #[test]

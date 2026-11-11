@@ -125,7 +125,9 @@ impl NetworkConfig {
     /// - a 200 ms floor under the sampled retransmission timeout
     ///   (TCP_RTO_MIN, below RFC 6298 section 2.4's 1 s SHOULD);
     /// - delayed ACKs that adapt between 40 and 200 ms to the peer's sending
-    ///   (TCP_ATO_MIN, TCP_DELACK_MAX).
+    ///   (TCP_ATO_MIN, TCP_DELACK_MAX);
+    /// - a 60 s TIME-WAIT (TCP_TIMEWAIT_LEN), where the Endpoint's default
+    ///   lingers 120 s.
     ///
     /// Each remains a field of `tcp.connection` to change.
     pub fn new(local_address: IpAddr, mtu: u32) -> Self {
@@ -146,6 +148,7 @@ impl NetworkConfig {
         connection.rto_min_us = 200_000;
         connection.adaptive_ack = true;
         connection.delayed_ack_us = 200_000;
+        connection.time_wait_us = 60_000_000;
         Self {
             local_address,
             mtu,

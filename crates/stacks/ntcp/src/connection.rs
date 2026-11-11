@@ -244,10 +244,11 @@ pub struct ConnectionConfig {
     pub user_timeout_us: u64,
     // TIME-WAIT duration after an active close, and the tuple reservation
     // after a locally generated reset. The 120 s default lingers 2xMSL only
-    // for a 60 s MSL, not RFC 9293's 2 minutes, and Linux fixes 60 s
-    // (TCP_TIMEWAIT_LEN); any positive value may be configured, a shorter
-    // one for example for benchmarks. RFC 6191 timestamp-based reuse applies
-    // within whatever duration is configured.
+    // for a 60 s MSL, not RFC 9293's 2 minutes; Linux fixes 60 s
+    // (TCP_TIMEWAIT_LEN), which ntcp-native's Linux defaults and the
+    // packetdrill upstream profile configure. Any positive value may be
+    // configured, a shorter one for example for benchmarks. RFC 6191
+    // timestamp-based reuse applies within whatever duration is configured.
     pub time_wait_us: u64,
     pub keepalive: Option<KeepaliveConfig>,
 }

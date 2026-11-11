@@ -304,6 +304,7 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         }
         c.adaptive_ack = !o.immediate_ack;
         c.delayed_ack_us = if o.immediate_ack { 0 } else { 200_000 };
+        c.time_wait_us = 60_000_000;
         if let Some(mtu) = o.link_mtu {
             c.pmtud = Some(ntcp::PmtudConfig::new(mtu));
         } else if o.pmtud1500 {
@@ -441,6 +442,7 @@ mod setup_profile_tests {
         assert!(c.abort_with_ack);
         assert!(c.output_group_flush);
         assert_eq!(c.delayed_ack_us, 200_000);
+        assert_eq!(c.time_wait_us, 60_000_000);
         assert_eq!(base.max_buffer_bytes, 32 * 1024 * 1024);
         assert_eq!(base.preallocate_connections, 1);
         for (token, field) in [
