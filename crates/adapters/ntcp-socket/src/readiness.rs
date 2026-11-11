@@ -969,6 +969,15 @@ pub unsafe extern "C" fn ntcp_managed___ppoll_chk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::ManuallyDrop;
+    // Fixtures reserve no EPOLL_FDS slot and own no retained fd. Epoll::drop
+    // would free slot 0 and close fd -1, untracking whichever real epoll a
+    // concurrent test holds in that slot, so fixtures are never dropped.
+    fn exclusive_fixtures<const N: usize>(
+        entries: [(i32, Epoll); N],
+    ) -> ManuallyDrop<BTreeMap<i32, Epoll>> {
+        ManuallyDrop::new(BTreeMap::from(entries))
+    }
     fn exclusive_fixture(events: u32) -> Epoll {
         Epoll {
             slot: 0,
@@ -997,7 +1006,7 @@ mod tests {
     fn exclusive_arbitration_preserves_ordinary_observers_edges_and_handoff() {
         for edge in [0, EPOLLET] {
             let mask = (EPOLLIN | EPOLLEXCLUSIVE | edge) as u32;
-            let mut map = BTreeMap::from([
+            let mut map = exclusive_fixtures([
                 (1, exclusive_fixture(mask)),
                 (2, exclusive_fixture(mask)),
                 (3, exclusive_fixture((EPOLLIN | EPOLLET) as u32)),
@@ -1018,7 +1027,7 @@ mod tests {
             claim_exclusive(&mut map, 2, (4, 42), second, EPOLLIN as u32);
             assert!(!eligible(&map[&1].regs[&(4, 42)], EPOLLIN as u32, second));
             assert!(!eligible(&map[&2].regs[&(4, 42)], EPOLLIN as u32, first));
-            map.remove(&2);
+            std::mem::forget(map.remove(&2));
             release_exclusive(&mut map, 42);
             assert!(eligible(&map[&1].regs[&(4, 42)], EPOLLIN as u32, second));
         }
@@ -1026,7 +1035,8 @@ mod tests {
     #[test]
     fn exclusive_claims_do_not_consume_other_readiness_classes() {
         let mask = (EPOLLIN | EPOLLOUT | EPOLLET | EPOLLEXCLUSIVE) as u32;
-        let mut map = BTreeMap::from([(1, exclusive_fixture(mask)), (2, exclusive_fixture(mask))]);
+        let mut map =
+            exclusive_fixtures([(1, exclusive_fixture(mask)), (2, exclusive_fixture(mask))]);
         let observed = [1, 1, 0, 0, 0];
         claim_exclusive(&mut map, 1, (4, 42), observed, EPOLLIN as u32);
         assert_eq!(
