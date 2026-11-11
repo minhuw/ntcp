@@ -9484,15 +9484,16 @@ impl Connection {
                     || self.limited_pending)
                     || usable.saturating_sub(sent) >= self.mss;
                 let tail_sendable = credit_left
-                    && (record < bounded || record == unsent
-                        && !(self.config.nagle && !flush && !tail_fin)
-                        && (flush
-                            || self.shutdown
-                            || self.sws_override
-                            || self.send.pushed(offset + sent, tail))
-                        && (!(self.cork || self.more)
-                            || self.shutdown
-                            || flush_credit.saturating_sub(sent) >= tail));
+                    && (record < bounded
+                        || record == unsent
+                            && !(self.config.nagle && !flush && !tail_fin)
+                            && (flush
+                                || self.shutdown
+                                || self.sws_override
+                                || self.send.pushed(offset + sent, tail))
+                            && (!(self.cork || self.more)
+                                || self.shutdown
+                                || flush_credit.saturating_sub(sent) >= tail));
                 let tail = if full == record / wire_mss && full < limit && tail_sendable {
                     tail
                 } else {
@@ -9507,13 +9508,19 @@ impl Connection {
                 if (!self.config.output_group_flush || startup_flush)
                     && edge < total
                     && edge >= wire_mss
-                    && edge % wire_mss == 0
-                    && self.send.pushed(offset + edge - wire_mss, unsent - edge + wire_mss)
+                    && edge.is_multiple_of(wire_mss)
+                    && self
+                        .send
+                        .pushed(offset + edge - wire_mss, unsent - edge + wire_mss)
                 {
                     segments = edge / wire_mss;
                     total = edge;
                 }
-                let last = if total % wire_mss != 0 { tail } else { wire_mss };
+                let last = if !total.is_multiple_of(wire_mss) {
+                    tail
+                } else {
+                    wire_mss
+                };
                 // A PUSH in an intermediate physical segment must not migrate.
                 // Leave such selections scalar, including successive PUSH writes.
                 if segments >= 2 && !self.send.pushed(offset, total - last) {

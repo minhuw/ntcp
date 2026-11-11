@@ -5217,18 +5217,15 @@ impl Endpoint {
             .checked_sub(r.offset)
             .ok_or(Error::InvalidArgument)?;
         let size = s.segment_payload_len;
-        let mut segments = remaining
-            .div_ceil(size)
-            .min(limits.max_segments)
-            .min(if remaining <= limits.max_bytes {
+        let mut segments = remaining.div_ceil(size).min(limits.max_segments).min(
+            if remaining <= limits.max_bytes {
                 usize::MAX
             } else {
                 limits.max_bytes / size
-            });
+            },
+        );
         // Without PSH (and FIN) support the final segment stays scalar.
-        if !limits.allow_psh
-            && flags & (wire::PSH | wire::FIN) != 0
-            && segments * size >= remaining
+        if !limits.allow_psh && flags & (wire::PSH | wire::FIN) != 0 && segments * size >= remaining
         {
             segments = segments.saturating_sub(1);
         }

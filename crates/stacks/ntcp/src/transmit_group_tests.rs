@@ -41,19 +41,19 @@ fn connected_with(
 ) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     let config = |receive| {
         let mut config = ConnectionConfig {
-        pmtud: Some(crate::PmtudConfig {
-            initial_search_low: Some(if ipv6 { 1280 } else { 1040 }),
-            ..crate::PmtudConfig::new(1500)
-        }),
-        mss: 1000,
-        nagle: false,
-        sack: true,
-        timestamps,
-        prr_pacing: false,
-        initial_window: crate::InitialWindow::Iw10,
-        send_capacity: 16_384,
-        receive_capacity: receive,
-        ..ConnectionConfig::default()
+            pmtud: Some(crate::PmtudConfig {
+                initial_search_low: Some(if ipv6 { 1280 } else { 1040 }),
+                ..crate::PmtudConfig::new(1500)
+            }),
+            mss: 1000,
+            nagle: false,
+            sack: true,
+            timestamps,
+            prr_pacing: false,
+            initial_window: crate::InitialWindow::Iw10,
+            send_capacity: 16_384,
+            receive_capacity: receive,
+            ..ConnectionConfig::default()
         };
         adjust(&mut config);
         config
@@ -933,7 +933,11 @@ fn recovery_groups_new_data_within_its_credit() {
 // scalar, and one without GSO. The first `lost` segments of the first
 // flight are lost. Checks they send the same wire and the first two
 // record the same throughout; returns the groups sent while `during`.
-fn lossy_transfer(prr: bool, lost: usize, during: fn(&crate::connection::Connection) -> bool) -> usize {
+fn lossy_transfer(
+    prr: bool,
+    lost: usize,
+    during: fn(&crate::connection::Connection) -> bool,
+) -> usize {
     let gso = |(mut e, peer, id, server): (Endpoint, Endpoint, ConnectionId, ConnectionId)| {
         e.enable_output_reservations_with_gso(
             1,
@@ -998,10 +1002,7 @@ fn lossy_transfer(prr: bool, lost: usize, during: fn(&crate::connection::Connect
         }
         acks = deliver(&mut peer, &wire, now);
     }
-    assert_eq!(
-        a.send_progress(id).unwrap().acknowledged,
-        data.len() as u64
-    );
+    assert_eq!(a.send_progress(id).unwrap().acknowledged, data.len() as u64);
     let mut received = std::vec![0; 16_000];
     let mut n = 0;
     while n < received.len() {
