@@ -2170,3 +2170,100 @@ fn blocked_members_are_woken_by_another_members_handoffs() {
         }
     }
 }
+
+// 13. A group of one: Hash flows whose table is [0], as a deployment with a
+// single queue runs them. Its member owns every flow of ADDRESS, takes in
+// every packet itself, and hands nothing off: it is a lone Network.
+
+fn group_of_one() -> Lan {
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: vec![0],
+    };
+    let flows = SharedFlows::new(ownership, limits(1, INBOX)).unwrap();
+    let config = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
+    let station = join(&flows, &neighbors(1), 0, config);
+    Lan::new(vec![station], Dispatch::Queue0, Some(flows))
+}
+
+#[test]
+fn a_group_of_one_accepts_passive_opens_and_hands_nothing_off() {
+    let Passive { lan, servers } = passive(group_of_one(), 64, 4 * MSS, 5 * SECOND);
+    assert_eq!(servers[0].connections.len(), 64);
+    assert_eq!(lan.handoffs(), (0, 0, 0));
+    // Its member reassembles every datagram and takes it in.
+    let mut lan = group_of_one();
+    lan.router.fragment = Some(576);
+    let Passive { mut lan, .. } = passive(lan, 8, 8 * MSS, 5 * SECOND);
+    assert!(lan.network(0).reassembly_counters().completed > 0);
+    assert_eq!(lan.handoffs(), (0, 0, 0));
+}
+
+// The peer and the one Network of `lan` each open `n` connections to the
+// other's echo listener, at once, and every one echoes without a reset: the
+// local ports the Network's active opens chose, and the TCP segments it
+// sent.
+fn both_ways(lan: &mut Lan, n: usize) -> (Vec<u16>, usize) {
+    let mut server = Echo::new(lan.network(0));
+    let mut peer_server = Echo::new(&mut lan.peer.network);
+    let to_peer = SocketAddr::new(PEER.into(), LISTEN);
+    let to_port = SocketAddr::new(ADDRESS.into(), LISTEN);
+    // Whether the Network opened it, and the connection.
+    let mut clients: Vec<(bool, Client)> = Vec::new();
+    for i in 0..n {
+        let connection = lan.network(0).connect(to_peer).unwrap();
+        clients.push((true, Client::new(connection, payload(i, 4 * MSS))));
+        let from = Some(20_000 + 97 * i as u16);
+        let connection = lan.peer.network.connect_from(to_port, from).unwrap();
+        clients.push((false, Client::new(connection, payload(n + i, 4 * MSS))));
+    }
+    let done = lan.run(5 * SECOND, |lan| {
+        server.serve(lan.network(0));
+        peer_server.serve(&mut lan.peer.network);
+        for (own, client) in &mut clients {
+            client.pump(if *own {
+                lan.network(0)
+            } else {
+                &mut lan.peer.network
+            });
+        }
+        clients.iter().all(|(_, c)| c.done())
+    });
+    assert!(done);
+    lan.assert_no_resets();
+    for (i, (_, client)) in clients.iter().enumerate() {
+        assert!(client.received == client.payload, "connection {i}");
+    }
+    assert_eq!(server.connections.len(), n);
+    assert_eq!(peer_server.connections.len(), n);
+    let ports = clients
+        .iter()
+        .filter(|(own, _)| *own)
+        .map(|(_, c)| {
+            let info = lan.network(0).connection_info(c.connection).unwrap();
+            assert_eq!(info.state, State::Established);
+            info.local.port()
+        })
+        .collect();
+    (ports, lan.segments[0])
+}
+
+// Every candidate ephemeral port's flow is the member's own: its active
+// opens take the ports the lone Network takes, in the order it does, and
+// both send the same segments.
+#[test]
+fn a_group_of_one_opens_and_accepts_as_a_lone_network() {
+    let n = 16;
+    let mut lan = lone();
+    let (lone_ports, lone_segments) = both_ways(&mut lan, n);
+    let first = *NetworkConfig::new(IpAddr::V4(ADDRESS), 1500)
+        .ephemeral_ports
+        .start();
+    let expected: Vec<u16> = (first..).take(n).collect();
+    assert_eq!(lone_ports, expected);
+    let mut lan = group_of_one();
+    let (ports, segments) = both_ways(&mut lan, n);
+    assert_eq!(ports, lone_ports);
+    assert_eq!(segments, lone_segments);
+    assert_eq!(lan.handoffs(), (0, 0, 0));
+}
