@@ -9394,10 +9394,21 @@ impl Connection {
             if self.ecn_pause.is_some_and(|deadline| now < deadline) {
                 count = 0;
             }
+            // Startup retains the window-exhaustion flush boundary: ACK
+            // progress is needed to release the next flight. After congestion
+            // reduction, a singleton is not an extra aggregation group; avoid
+            // forcing its flush unless the application requested PUSH.
+            let startup_flush = self.prr.is_none()
+                && !self.congestion.in_recovery()
+                && self.congestion.ecn_prr_end().is_none()
+                && cwnd < self.congestion.ssthresh();
             // Extend only an already-admissible full-sized fresh segment.
-            // PRR may group new data using its existing byte credit; repairs
-            // retain their separate, immutable reservation/undo policy.
-            let prr_group = self.config.output_group_flush && self.prr.is_some();
+            // Recovery (PRR, RFC 6675 pipe, RACK losses) admits new data from
+            // a byte credit each segment consumes, and sending new data marks
+            // no loss for a repair to take first, so a group within the credit
+            // is what scalar selection sends: Linux likewise sends TSO skbs
+            // within PRR's quota. Repairs retain their separate, immutable
+            // reservation/undo policy.
             // Keep protocol scratch/MTU unchanged: only the first segment is
             // encoded here; separately reserved storage retains the whole range.
             let group_eligible = count == wire_mss
@@ -9410,15 +9421,10 @@ impl Connection {
                 && !self.probe_pending
                 && self.pmtud.as_ref().is_none_or(|p| p.probe.is_none())
                 && candidate.is_none()
-                && (!self.congestion.in_recovery() || prr_group)
-                && (self.prr.is_none() || prr_group)
-                && self.congestion.ecn_prr_end().is_none()
-                && (self.sack_recovery.is_none() || prr_group)
                 && self.sack_post_rto.is_none()
                 && self.sack_fallback.is_none()
                 && self.consecutive_timeouts == 0
                 && self.rack.valid()
-                && (self.rack.counts().lost == 0 || prr_group)
                 && !self.limited_pending
                 && self.ecn_pause.is_none()
                 && !self.pacing_enabled()
@@ -9470,8 +9476,14 @@ impl Connection {
                 let sent = full * wire_mss;
                 let flush = flush_credit > sent;
                 let tail_fin = fin_admissible && ((sent + tail) as u32) < timestamp_credit;
-                let tail_sendable = record < bounded
-                    || record == unsent
+                // SACK-based recovery admits a segment only with a full
+                // SMSS of credit left (RFC 6675 section 5, rule C).
+                let credit_left = !(self.sack_recovery.is_some()
+                    || self.sack_post_rto.is_some()
+                    || self.limited_pending)
+                    || usable.saturating_sub(sent) >= self.mss;
+                let tail_sendable = credit_left
+                    && (record < bounded || record == unsent
                         && !(self.config.nagle && !flush && !tail_fin)
                         && (flush
                             || self.shutdown
@@ -9479,17 +9491,30 @@ impl Connection {
                             || self.send.pushed(offset + sent, tail))
                         && (!(self.cork || self.more)
                             || self.shutdown
-                            || flush_credit.saturating_sub(sent) >= tail);
+                            || flush_credit.saturating_sub(sent) >= tail));
                 let tail = if full == record / wire_mss && full < limit && tail_sendable {
                     tail
                 } else {
                     0
                 };
-                let segments = full + usize::from(tail != 0);
-                let total = sent + tail;
+                let mut segments = full + usize::from(tail != 0);
+                let mut total = sent + tail;
+                // Scalar selection pushes the segment that fills the window
+                // or cwnd (burst_push below). PRR admits by its own credit, so
+                // that edge can fall inside the group, which then ends there.
+                let edge = (self.snd_wnd.min(cwnd).saturating_sub(self.flight())) as usize;
+                if (!self.config.output_group_flush || startup_flush)
+                    && edge < total
+                    && edge >= wire_mss
+                    && edge % wire_mss == 0
+                    && self.send.pushed(offset + edge - wire_mss, unsent - edge + wire_mss)
+                {
+                    segments = edge / wire_mss;
+                    total = edge;
+                }
+                let last = if total % wire_mss != 0 { tail } else { wire_mss };
                 // A PUSH in an intermediate physical segment must not migrate.
                 // Leave such selections scalar, including successive PUSH writes.
-                let last = if tail != 0 { tail } else { wire_mss };
                 if segments >= 2 && !self.send.pushed(offset, total - last) {
                     count = total;
                     segmentation = Some(crate::TransmitSegmentation {
@@ -9500,14 +9525,6 @@ impl Connection {
                     });
                 }
             }
-            // Startup retains the window-exhaustion flush boundary: ACK
-            // progress is needed to release the next flight. After congestion
-            // reduction, a singleton is not an extra aggregation group; avoid
-            // forcing its flush unless the application requested PUSH.
-            let startup_flush = self.prr.is_none()
-                && !self.congestion.in_recovery()
-                && self.congestion.ecn_prr_end().is_none()
-                && cwnd < self.congestion.ssthresh();
             burst_push = (!self.config.output_group_flush || !group_eligible || startup_flush)
                 && count != 0
                 && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)

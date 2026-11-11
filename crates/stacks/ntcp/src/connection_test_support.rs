@@ -110,3 +110,8 @@ pub(crate) fn departure_snapshot(a: &Connection) -> alloc::string::String {
         )
     )
 }
+
+// Whether loss or ECN recovery governs the connection's sending.
+pub(crate) fn recovering(a: &Connection) -> bool {
+    a.prr.is_some() || a.sack_recovery.is_some() || a.congestion.in_recovery()
+}

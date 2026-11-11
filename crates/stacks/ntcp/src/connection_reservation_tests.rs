@@ -632,15 +632,12 @@ fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
 
 #[test]
 fn gso_conservative_fallbacks_keep_scalar_paths() {
-    // A queued FIN (former case 0) ends a group: transmit_group_tests.
-    for case in (1..12).filter(|&case| case != 8) {
+    // A queued FIN (former case 0) and recovery's PRR credit (former cases
+    // 5 and 11) admit groups: transmit_group_tests.
+    for case in (1..11).filter(|&case| case != 5 && case != 8) {
         let cfg = ConnectionConfig {
             initial_window: InitialWindow::Iw10,
-            congestion_algorithm: if case == 11 {
-                CongestionAlgorithm::Cubic
-            } else {
-                CongestionAlgorithm::Reno
-            },
+            congestion_algorithm: CongestionAlgorithm::Reno,
             ..config(4096, 100)
         };
         let (mut a, _) = pair(cfg, 0);
@@ -650,7 +647,6 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
             2 => a.retx_pending = true,
             3 => a.probe_pending = true,
             4 => a.tlp_pending = true,
-            5 => a.prr = Some(Prr::new(100, 100)),
             6 => a.config.pacing = Some(crate::PacingConfig::default()),
             7 => {
                 a.config.prr = true;
@@ -667,14 +663,6 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
                     },
                     999,
                 );
-            }
-            11 => {
-                assert!(a.congestion.start_ecn_prr(
-                    a.snd_nxt.wrapping_add(1000),
-                    1000,
-                    a.congestion.ssthresh(),
-                    100
-                ));
             }
             _ => unreachable!(),
         }
@@ -1254,4 +1242,110 @@ fn late_fresh_rejection_cannot_restart_an_expired_application_deadline() {
     assert_eq!(a.transport_info().unacked, 0);
     assert_eq!(a.resource_probes, 0);
     assert_eq!(a.consecutive_timeouts, 0);
+}
+
+// GSO-selects `a`'s output at `now` and checks that each segment its
+// reservation emits is what `scalar`, in the same state, sends then.
+fn gso_matches_scalar(
+    a: &mut Connection,
+    scalar: &mut Connection,
+    now: Instant,
+) -> crate::TransmitSegmentation {
+    use crate::output_reservation::OutputReservation;
+    let mut reservation = OutputReservation::new();
+    reservation.bytes.resize(2048, 0);
+    reservation.payload.resize(4000, 0);
+    let mut bytes = [0; 2048];
+    let n = a
+        .transmit_selected_with_gso(
+            now,
+            &mut bytes,
+            true,
+            Some(crate::output_reservation::GsoBuffer {
+                limits: crate::GsoLimits {
+                    max_bytes: 4000,
+                    max_segments: 16,
+                },
+                payload: &mut reservation.payload,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let departure = a.last_departure.unwrap();
+    let s = departure.segmentation.unwrap();
+    let token = reservation.token().unwrap();
+    reservation.capture(
+        crate::Transmit {
+            connection: None,
+            tx_timestamp: None,
+            ipv4_options: Default::default(),
+            ecn: 0,
+            ip: ip(tuple()),
+            len: n,
+            hop_limit: 64,
+            dscp: 0,
+        },
+        &bytes,
+        token,
+    );
+    reservation.current.as_mut().unwrap().departure = Some(departure);
+    let limit = a.path_payload_limit();
+    while reservation.current.as_ref().unwrap().offset < s.payload_len {
+        let p = reservation.fragment(limit, &mut bytes).unwrap();
+        let mut expected = [0; 2048];
+        let n = scalar.transmit(now, &mut expected).unwrap().unwrap();
+        assert_eq!(&bytes[..p.len], &expected[..n]);
+        let r = reservation.current.as_mut().unwrap();
+        r.offset += r.emitted_bytes;
+    }
+    s
+}
+
+#[test]
+fn gso_in_recovery_ends_where_scalar_admission_does() {
+    let cfg = ConnectionConfig {
+        nagle: false,
+        sack: true,
+        rack: true,
+        initial_window: InitialWindow::Iw10,
+        ..config(4096, 100)
+    };
+    // PRR admits by its credit (600) while cwnd leaves 200: scalar output
+    // pushes the segment that fills cwnd and goes on, so the group ends
+    // with that segment.
+    let (mut a, _) = pair(cfg.clone(), 0);
+    let (mut scalar, _) = pair(cfg.clone(), 0);
+    for c in [&mut a, &mut scalar] {
+        c.write(&[1; 1000]).unwrap();
+        let mut prr = Prr::new(1000, 100);
+        prr.acknowledge(1000, 2000, 600, false);
+        assert_eq!(prr.credit(), 600);
+        c.prr = Some(prr);
+        c.congestion.prr_window(200);
+    }
+    let s = gso_matches_scalar(&mut a, &mut scalar, 40);
+    assert_eq!(s.payload_len, 200);
+    assert_ne!(s.terminal_flags & PSH, 0);
+    assert_eq!(gso_matches_scalar(&mut a, &mut scalar, 40).payload_len, 400);
+
+    // SACK recovery admits a segment only with an SMSS of credit: 450
+    // sends four full segments, and the 50-byte rest waits.
+    let (mut a, _) = pair(cfg.clone(), 0);
+    let (mut scalar, _) = pair(cfg, 0);
+    for c in [&mut a, &mut scalar] {
+        c.write(&[1; 450]).unwrap();
+        let mut prr = Prr::new(1000, 100);
+        prr.acknowledge(1000, 2000, 450, false);
+        c.prr = Some(prr);
+        c.sack_recovery = Some(SackRecovery {
+            recovery_point: c.snd_nxt,
+            high_rxt: c.snd_una,
+            rescue_rxt: None,
+            entry_pending: false,
+            pipe: 0,
+        });
+    }
+    assert_eq!(gso_matches_scalar(&mut a, &mut scalar, 40).payload_len, 400);
+    assert_eq!(scalar.transmit(40, &mut [0; 2048]).unwrap(), None);
+    assert_eq!(a.transmit(40, &mut [0; 2048]).unwrap(), None);
 }

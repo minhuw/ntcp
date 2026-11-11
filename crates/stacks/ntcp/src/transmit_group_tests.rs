@@ -1,6 +1,6 @@
 extern crate std;
 use super::*;
-use crate::connection::test_support::departure_snapshot;
+use crate::connection::test_support::{departure_snapshot, recovering};
 use std::vec::Vec;
 
 // A connected pair whose client polls through one GSO reservation. The
@@ -27,6 +27,15 @@ fn connected(
     timestamps: bool,
     peer_receive: usize,
 ) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
+    connected_with(ipv6, timestamps, peer_receive, false)
+}
+
+fn connected_with(
+    ipv6: bool,
+    timestamps: bool,
+    peer_receive: usize,
+    prr: bool,
+) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     let config = |receive| ConnectionConfig {
         pmtud: Some(crate::PmtudConfig {
             initial_search_low: Some(if ipv6 { 1280 } else { 1040 }),
@@ -36,6 +45,7 @@ fn connected(
         nagle: false,
         sack: true,
         timestamps,
+        prr,
         prr_pacing: false,
         initial_window: crate::InitialWindow::Iw10,
         send_capacity: 16_384,
@@ -856,4 +866,109 @@ fn short_last_segment_joins_a_group_exactly_when_scalar_selection_sends_it() {
         // The wire is what selection without GSO sends at that instant.
         assert_eq!(wire, scalar(&mut b, bid, 2));
     }
+}
+
+// Delivers `wire` to `peer` at `now` and returns its ACKs.
+fn deliver(
+    peer: &mut Endpoint,
+    wire: &[Vec<u8>],
+    now: Instant,
+) -> Vec<(crate::IpMetadata, Vec<u8>)> {
+    let mut acks = Vec::new();
+    for segment in wire {
+        peer.input(now, ip(), segment).unwrap();
+        acks.extend(sent(peer, now));
+    }
+    acks
+}
+
+// New data in loss recovery: the recovery credit (PRR's, or RFC 6675's
+// cwnd - pipe) admits groups, which send what scalar selection sends after
+// the repair, as Linux sends TSO skbs within PRR's quota.
+#[test]
+fn recovery_groups_new_data_within_its_credit() {
+    for prr in [false, true] {
+        recovery_groups(prr);
+    }
+}
+
+fn recovery_groups(prr: bool) {
+    let gso = |(mut e, peer, id, server): (Endpoint, Endpoint, ConnectionId, ConnectionId)| {
+        e.enable_output_reservations_with_gso(
+            1,
+            crate::GsoLimits {
+                max_bytes: 8000,
+                max_segments: 8,
+            },
+        )
+        .unwrap();
+        (e, peer, id, server)
+    };
+    let (mut a, mut peer, id, server) = gso(connected_with(false, true, 65_535, prr));
+    let (mut b, _, bid, _) = gso(connected_with(false, true, 65_535, prr));
+    let (mut c, _, cid, _) = connected_with(false, true, 65_535, prr);
+    c.enable_output_reservations().unwrap();
+    let data: Vec<u8> = (0..16_000).map(|i| (i * 11) as u8).collect();
+    for (e, id) in [(&mut a, id), (&mut b, bid), (&mut c, cid)] {
+        assert_eq!(e.write(id, &data).unwrap(), data.len());
+    }
+    let mut now = 2;
+    let (wire, _) = drain(&mut a, id, now);
+    assert_eq!(wire, scalar(&mut b, bid, now));
+    assert_eq!(wire, scalar(&mut c, cid, now));
+    // The first segment is lost; the peer SACKs the rest.
+    let mut acks = deliver(&mut peer, &wire[1..], 3);
+    let mut recovery_groups = 0;
+    for _ in 0..64 {
+        now += 1;
+        for (ip, ack) in &acks {
+            a.input(now, *ip, ack).unwrap();
+            b.input(now, *ip, ack).unwrap();
+            c.input(now, *ip, ack).unwrap();
+        }
+        assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+        let in_recovery = recovering(&a.retained_slot(id).unwrap().connection);
+        let (wire, groups) = drain(&mut a, id, now);
+        if in_recovery {
+            recovery_groups += groups.len();
+        }
+        assert_eq!(wire, scalar(&mut b, bid, now));
+        assert_eq!(wire, scalar(&mut c, cid, now));
+        assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+        if wire.is_empty() {
+            if a.send_progress(id).unwrap().acknowledged == data.len() as u64 {
+                break;
+            }
+            // Nothing to send until a timer: the peer's (a delayed ACK) or
+            // the senders', run on all three alike.
+            let deadline = a.next_deadline().unwrap();
+            assert_eq!(b.next_deadline(), Some(deadline));
+            acks.clear();
+            if let Some(ack_at) = peer.next_deadline().filter(|&t| t < deadline) {
+                now = ack_at;
+                peer.on_timeout(now, 16).unwrap();
+                acks = sent(&mut peer, now);
+            } else {
+                now = deadline;
+                for e in [&mut a, &mut b, &mut c] {
+                    e.on_timeout(now, 16).unwrap();
+                }
+            }
+            continue;
+        }
+        acks = deliver(&mut peer, &wire, now);
+    }
+    assert_eq!(
+        a.send_progress(id).unwrap().acknowledged,
+        data.len() as u64
+    );
+    assert!(recovery_groups != 0, "prr {prr}");
+    let mut received = std::vec![0; 16_000];
+    let mut n = 0;
+    while n < received.len() {
+        let read = peer.read(server, &mut received[n..]).unwrap();
+        assert_ne!(read, 0);
+        n += read;
+    }
+    assert_eq!(received, data);
 }
