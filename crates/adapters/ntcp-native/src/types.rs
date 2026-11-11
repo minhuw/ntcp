@@ -261,4 +261,8 @@ pub struct Counters {
     // Connections in TIME-WAIT now, released or not: Linux's sockstat `tw`
     // (`Endpoint::time_wait_connections`).
     pub time_wait_connections: usize,
+    // Released connections closed without TIME-WAIT because the endpoint
+    // already kept max_time_wait records: Linux's TCPTimeWaitOverflow
+    // (`Endpoint::time_wait_overflows`).
+    pub time_wait_overflows: u64,
 }

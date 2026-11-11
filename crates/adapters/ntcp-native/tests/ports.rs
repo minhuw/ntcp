@@ -53,8 +53,12 @@ fn network(
     incoming: &Queue,
     outgoing: &Queue,
     ports: RangeInclusive<u16>,
+    max_time_wait: Option<usize>,
 ) -> Network<Wire> {
     let mut config = NetworkConfig::new(address(side), 1500);
+    if let Some(records) = max_time_wait {
+        config.tcp.max_time_wait = records;
+    }
     config.tcp.max_connections = 8;
     config.tcp.max_listeners = 2;
     config.tcp.connection.send_capacity = 2048;
@@ -76,9 +80,17 @@ struct Pair {
 }
 impl Pair {
     fn new(client_ports: RangeInclusive<u16>, server_ports: RangeInclusive<u16>) -> Self {
+        Self::with_server_records(client_ports, server_ports, None)
+    }
+    // A pair whose server keeps at most `max_time_wait` TIME-WAIT records.
+    fn with_server_records(
+        client_ports: RangeInclusive<u16>,
+        server_ports: RangeInclusive<u16>,
+        max_time_wait: Option<usize>,
+    ) -> Self {
         let (a, b) = (Queue::default(), Queue::default());
-        let client = network(1, &a, &b, client_ports);
-        let mut server = network(2, &b, &a, server_ports);
+        let client = network(1, &a, &b, client_ports, None);
+        let mut server = network(2, &b, &a, server_ports, max_time_wait);
         let listener = server.listen(PORT, 8).unwrap();
         Self {
             client,
@@ -343,4 +355,43 @@ fn server_closed_connections_beyond_the_slots_within_one_time_wait() {
         assert_eq!(pair.server.counters().time_wait_connections, n);
     }
     assert!(pair.now < pair.server.config().tcp.connection.time_wait_us);
+}
+
+// Past max_time_wait records, a server-closed connection closes without
+// TIME-WAIT, and Counters reports it as Linux's TCPTimeWaitOverflow.
+#[test]
+fn server_closed_connections_past_the_records_overflow() {
+    let mut pair = Pair::with_server_records(40000..=40100, 50000..=50000, Some(2));
+    let server_address = SocketAddr::new(address(2), PORT);
+    for n in 1..=4usize {
+        let client = pair.client.connect(server_address).unwrap();
+        let server = pair.accepted();
+        pair.server.close(server).unwrap();
+        for _ in 0..100 {
+            pair.step();
+            if matches!(
+                pair.client.try_read(client, &mut [0; 8]),
+                Ok(ReadOutcome::Eof)
+            ) {
+                break;
+            }
+        }
+        pair.client.close(client).unwrap();
+        for _ in 0..100 {
+            pair.step();
+            if matches!(
+                pair.server.connection_info(server),
+                Err(Error::InvalidHandle)
+            ) {
+                break;
+            }
+        }
+        let counters = pair.server.counters();
+        assert_eq!(counters.time_wait_connections, n.min(2), "{n}");
+        assert_eq!(
+            counters.time_wait_overflows,
+            n.saturating_sub(2) as u64,
+            "{n}"
+        );
+    }
 }

@@ -743,6 +743,7 @@ impl<P: PacketIo> Network<P> {
             listen_overflows: self.endpoint.listen_overflows(),
             listen_drops: self.endpoint.listen_drops(),
             time_wait_connections: self.endpoint.time_wait_connections(),
+            time_wait_overflows: self.endpoint.time_wait_overflows(),
             ..self.counters
         }
     }
