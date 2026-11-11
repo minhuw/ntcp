@@ -306,11 +306,12 @@ fn pump(
     for _ in 0..256 {
         *now += 10;
         let mut work = false;
-        if let Some(frame) = emit(&mut a.0, &mut a.1, *now) {
+        // A reservation's segments all go before its owner takes input.
+        while let Some(frame) = emit(&mut a.0, &mut a.1, *now) {
             input(&mut b.0, &mut b.1, b.2, *now + 1, &frame, 12);
             work = true;
         }
-        if let Some(frame) = emit(&mut b.0, &mut b.1, *now + 2) {
+        while let Some(frame) = emit(&mut b.0, &mut b.1, *now + 2) {
             input(&mut a.0, &mut a.1, a.2, *now + 3, &frame, 24);
             work = true;
         }

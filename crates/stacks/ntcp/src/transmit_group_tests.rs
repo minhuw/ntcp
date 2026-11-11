@@ -10,6 +10,23 @@ fn pair(
     timestamps: bool,
     peer_receive: usize,
 ) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
+    let (mut a, b, client, server) = connected(ipv6, timestamps, peer_receive);
+    a.enable_output_reservations_with_gso(
+        1,
+        crate::GsoLimits {
+            max_bytes: 8000,
+            max_segments: 8,
+        },
+    )
+    .unwrap();
+    (a, b, client, server)
+}
+
+fn connected(
+    ipv6: bool,
+    timestamps: bool,
+    peer_receive: usize,
+) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     let config = |receive| ConnectionConfig {
         pmtud: Some(crate::PmtudConfig {
             initial_search_low: Some(if ipv6 { 1280 } else { 1040 }),
@@ -65,14 +82,6 @@ fn pair(
         dst.input(1, p.ip, &bytes[..p.len]).unwrap();
     }
     let server = b.accept(listener).unwrap();
-    a.enable_output_reservations_with_gso(
-        1,
-        crate::GsoLimits {
-            max_bytes: 8000,
-            max_segments: 8,
-        },
-    )
-    .unwrap();
     (a, b, client, server)
 }
 
@@ -91,7 +100,8 @@ fn snapshot(e: &Endpoint, id: ConnectionId) -> std::string::String {
 }
 
 // The physical segments a backend cuts from the aggregate, as Linux
-// tcp_gso_segment does: PSH on the last, CWR on the first only.
+// tcp_gso_segment does: full segments and the remainder, PSH on the last,
+// CWR on the first only.
 fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
     let size = view.segment_payload_len;
     (0..view.segment_count)
@@ -109,7 +119,7 @@ fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
                 view.packet.ip,
                 header,
                 view.options,
-                &view.payload[n * size..(n + 1) * size],
+                &view.payload[n * size..((n + 1) * size).min(view.payload.len())],
                 &mut out,
             )
             .unwrap();
@@ -179,7 +189,10 @@ fn group_acceptance_records_what_scalar_acceptance_at_its_instant_records() {
                     .unwrap()
                     .unwrap();
                 let view = a.transmit_group(group).unwrap();
-                assert_eq!(view.segment_count, s.payload_len / s.segment_payload_len);
+                assert_eq!(
+                    view.segment_count,
+                    s.payload_len.div_ceil(s.segment_payload_len)
+                );
                 assert!(view.segment_count >= 6, "{}", view.segment_count);
                 assert_eq!(view.options.len(), if timestamps { 12 } else { 0 });
                 assert_eq!(view.packet.len, s.tcp_header_len + view.payload.len());
@@ -201,7 +214,14 @@ fn group_acceptance_records_what_scalar_acceptance_at_its_instant_records() {
                     assert_eq!(&expected[..packet.len], &segment[..]);
                     let attempt = b_attempt.unwrap();
                     assert!(if submitted {
-                        b.accept_transmit_submitted(3, attempt, each).unwrap()
+                        // Each physical segment's own size, the short last
+                        // one included.
+                        let ip_header = if ipv6 { 40 } else { 20 };
+                        let actual = crate::PhysicalReceipt {
+                            ip_packet_len: (ip_header + segment.len()) as u32,
+                            ..each
+                        };
+                        b.accept_transmit_submitted(3, attempt, actual).unwrap()
                     } else {
                         b.accept_transmit(3, attempt).unwrap()
                     });
@@ -509,8 +529,9 @@ fn group_loss_is_detected_and_repaired_like_scalar_loss_and_repairs_stay_scalar(
     let data: Vec<u8> = (0..7000).map(|i| (i * 3) as u8).collect();
     a.write(id, &data).unwrap();
     b.write(bid, &data).unwrap();
+    // Seven full segments and the short last one.
     let mut wire = group(&mut a, id, 2);
-    assert_eq!(wire.len(), 7);
+    assert_eq!(wire.len(), 8);
     wire.extend(scalar(&mut a, id, 2));
     assert_eq!(wire, scalar(&mut b, bid, 2));
     assert_eq!(snapshot(&a, id), snapshot(&b, bid));
@@ -679,5 +700,100 @@ fn group_prepared_before_a_path_decrease_is_refused_and_resplit() {
         assert_eq!(a.prepare_transmit_group(attempt, limits()).unwrap(), None);
         assert!(a.accept_transmit(3, attempt).unwrap());
     }
-    assert_eq!(total, 7 * 988);
+    assert_eq!(total, 7000);
+}
+
+// Polls `id` at `now` until it holds nothing, sending every attempt that
+// can become a group as one and the rest as scalar segments. Returns the
+// wire and the segment count of each group.
+fn drain(e: &mut Endpoint, id: ConnectionId, now: Instant) -> (Vec<Vec<u8>>, Vec<usize>) {
+    let mut out = [0; 2048];
+    let (mut wire, mut groups) = (Vec::new(), Vec::new());
+    loop {
+        let (poll, attempt) = e.poll_reserved_transmit_for(now, id, &mut out, 16).unwrap();
+        let Some(p) = poll.packet else {
+            return (wire, groups);
+        };
+        let attempt = attempt.unwrap();
+        if let Some(group) = e.prepare_transmit_group(attempt, limits()).unwrap() {
+            let segments = cut(&e.transmit_group(group).unwrap());
+            groups.push(segments.len());
+            wire.extend(segments);
+            assert!(e.accept_transmit_group(now, group).unwrap());
+        } else {
+            wire.push(out[..p.len].to_vec());
+            assert!(e.accept_transmit(now, attempt).unwrap());
+        }
+    }
+}
+
+#[test]
+fn short_last_segment_joins_a_group_exactly_when_scalar_selection_sends_it() {
+    type Write = fn(&mut Endpoint, ConnectionId);
+    // (Nagle, writes, segments of each group); 988-byte segments.
+    let cases: [(bool, Write, &[usize]); 6] = [
+        // The response's last bytes go at once: 7 x 988 + 84.
+        (
+            false,
+            |e, id| {
+                e.write(id, &[1; 7000]).unwrap();
+            },
+            &[8],
+        ),
+        // Nagle holds them while the full segments are unacknowledged.
+        (
+            true,
+            |e, id| {
+                e.write(id, &[1; 7000]).unwrap();
+            },
+            &[7],
+        ),
+        // A completed record ends its group with its last bytes, even under
+        // Nagle; the next record is a group of its own.
+        (
+            true,
+            |e, id| {
+                e.write_with_options(id, &[1; 2500], false, true).unwrap();
+                e.write(id, &[2; 3000]).unwrap();
+            },
+            &[3, 3],
+        ),
+        // More data is promised (MSG_MORE) or not pushed: held, as in
+        // scalar selection.
+        (
+            false,
+            |e, id| {
+                e.write_with_options(id, &[1; 7000], true, false).unwrap();
+            },
+            &[7],
+        ),
+        (
+            false,
+            |e, id| {
+                e.write_with_push(id, &[1; 7000], false).unwrap();
+            },
+            &[7],
+        ),
+        // Exactly full segments: no short one.
+        (
+            false,
+            |e, id| {
+                e.write(id, &[1; 4 * 988]).unwrap();
+            },
+            &[4],
+        ),
+    ];
+    for (nagle, write, groups) in cases {
+        let (mut a, _, id, _) = pair(false, true, 16_384);
+        let (mut b, _, bid, _) = connected(false, true, 16_384);
+        b.enable_output_reservations().unwrap();
+        a.set_nagle(id, nagle).unwrap();
+        b.set_nagle(bid, nagle).unwrap();
+        write(&mut a, id);
+        write(&mut b, bid);
+        let (wire, sizes) = drain(&mut a, id, 2);
+        assert_eq!(sizes, groups);
+        // The wire is what selection without GSO sends at that instant.
+        assert_eq!(wire, scalar(&mut b, bid, 2));
+    }
 }

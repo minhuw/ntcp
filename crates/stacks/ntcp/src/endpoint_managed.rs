@@ -311,10 +311,11 @@ impl Endpoint {
     }
 
     /// `accept_transmit_group` for a backend outcome of definitely
-    /// Submitted. `receipt` is the provenance of each physical segment the
-    /// backend cut from the aggregate (all have the same size); like
-    /// `accept_transmit_submitted`, it certifies every segment's size
-    /// evidence. A group never carries a PMTU probe.
+    /// Submitted. `receipt` is the provenance of each full-sized physical
+    /// segment the backend cut from the aggregate; a short last segment is
+    /// that packet less its missing payload. Like `accept_transmit_submitted`,
+    /// it certifies every segment's size evidence. A group never carries a
+    /// PMTU probe.
     pub fn accept_transmit_group_submitted(
         &mut self,
         now: Instant,
@@ -327,21 +328,26 @@ impl Endpoint {
             .and_then(|slot| slot.current.as_ref())
             .and_then(|r| {
                 let group = r.group.filter(|g| g.token == token)?;
-                Some((r.packet.connection?, r.departure?, r.offset, group.segments))
+                Some((r.packet.connection?, r.departure?, r.offset, group))
             });
         if !self.accept_transmit_group(now, token)? {
             return Ok(false);
         }
-        if let Some((id, departure, offset, segments)) = physical
+        if let Some((id, departure, offset, group)) = physical
             && let Some(s) = departure.segmentation
             && let Ok(slot) = self.retained_slot_mut(id)
         {
-            for n in 0..segments {
+            let size = s.segment_payload_len;
+            for n in 0..group.segments {
+                let count = size.min(group.bytes - n * size);
                 slot.connection.certify_submission(
                     &departure,
-                    offset + n * s.segment_payload_len,
-                    s.segment_payload_len,
-                    receipt,
+                    offset + n * size,
+                    count,
+                    PhysicalReceipt {
+                        ip_packet_len: receipt.ip_packet_len.saturating_sub((size - count) as u32),
+                        ..receipt
+                    },
                 );
             }
         }

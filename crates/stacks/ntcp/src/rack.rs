@@ -559,30 +559,29 @@ impl Rack {
         true
     }
 
-    // `validate_departure` of `segments` consecutive `size`-byte departures
-    // from `start`, all committed at `now` one after another: each segment
-    // becomes its own physical transmission, so every inner edge may split
-    // an interval. Count those splits before an indivisible submission.
+    // `validate_departure` of the consecutive departures of `bytes` from
+    // `start` in `size`-byte segments (the last may be shorter), all
+    // committed at `now` one after another: each segment becomes its own
+    // physical transmission, so every inner edge may split an interval.
+    // Count those splits before an indivisible submission.
     pub(crate) fn validate_departure_group(
         &self,
         selection: DepartureSelection,
         start: Seq,
         size: u32,
-        segments: usize,
+        bytes: usize,
         now: u64,
     ) -> bool {
-        let Some(bytes) = (size as usize).checked_mul(segments) else {
-            return false;
-        };
-        if size == 0 || segments == 0 || bytes >= 1 << 31 {
+        if size == 0 || bytes == 0 || bytes >= 1 << 31 {
             return false;
         }
         if !self.validate_departure(selection, start, start.wrapping_add(bytes as u32), now) {
             return false;
         }
+        let segments = bytes.div_ceil(size as usize);
         let splits = (0..=segments)
             .filter(|&i| {
-                let edge = start.wrapping_add((i * size as usize) as u32);
+                let edge = start.wrapping_add((i * size as usize).min(bytes) as u32);
                 self.intervals
                     .iter()
                     .any(|r| edge.after(r.start) && r.end.after(edge))

@@ -388,18 +388,26 @@ fn group_departure_preflight_capacity_wrap_and_distinct_physical_identity() {
             rack.transmit(base, base.wrapping_add(32), 10, false);
             let token = rack.departure_selection().unwrap();
             let before = alloc::format!("{rack:?}");
-            for (size, count, now) in [
-                (0, 3, 20),
+            for (size, bytes, now) in [
+                (0, 24, 20),
+                (8, 0, 20),
                 (8, usize::MAX, 20),
-                (8, 3, 9),
-                (u32::MAX, 3, 20),
+                (8, 24, 9),
+                (u32::MAX, 3 * u32::MAX as usize, 20),
             ] {
-                assert!(!rack.validate_departure_group(token, base, size, count, now));
+                assert!(!rack.validate_departure_group(token, base, size, bytes, now));
             }
             assert_eq!(
-                rack.validate_departure_group(token, base, 8, 3, 20),
+                rack.validate_departure_group(token, base, 8, 24, 20),
                 capacity == 4
             );
+            // A short last segment ends at its own edge, not a full one: two
+            // inner edges and the end split the interval.
+            assert_eq!(
+                rack.validate_departure_group(token, base, 8, 20, 20),
+                capacity == 4
+            );
+            assert!(rack.validate_departure_group(token, base, 16, 20, 20));
             assert_eq!(alloc::format!("{rack:?}"), before);
             if capacity == 3 {
                 // Scalar fallback still works when the whole prefix cannot.
@@ -423,7 +431,7 @@ fn group_departure_preflight_capacity_wrap_and_distinct_physical_identity() {
                 assert_eq!(original_packet(&rack, start), Some((start, end, 20, false)));
             }
             assert!(!rack.intervals.last().unwrap().departure_committed);
-            assert!(!rack.validate_departure_group(token, base, 8, 3, 20));
+            assert!(!rack.validate_departure_group(token, base, 8, 24, 20));
             assert!(rack.commit_departure(token, base.wrapping_add(24), base.wrapping_add(32), 30));
             assert_eq!(
                 rack.head_transmission(base.wrapping_add(24)),

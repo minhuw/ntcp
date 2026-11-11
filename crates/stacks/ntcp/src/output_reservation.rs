@@ -83,10 +83,12 @@ pub struct TransmitGroup(pub(crate) TransmitAttempt);
 /// Logical aggregate, not a checksummed jumbo wire packet: `header` and
 /// `options` are the first segment's TCP header with the group's terminal
 /// flags, `payload` the contiguous payload of all `segment_count` segments of
-/// `segment_payload_len` bytes each. `packet.len` is the aggregate's TCP
-/// length (header, options and all payload); it has no timestamp observation.
-/// Segment n carries sequence `header.sequence + n * segment_payload_len`;
-/// PSH belongs to the last segment and CWR to the first only.
+/// `segment_payload_len` bytes each but the last, which may be shorter (as
+/// with Linux TSO, the device cuts `segment_payload_len` chunks and the
+/// remainder). `packet.len` is the aggregate's TCP length (header, options
+/// and all payload); it has no timestamp observation. Segment n carries
+/// sequence `header.sequence + n * segment_payload_len`; PSH belongs to the
+/// last segment and CWR to the first only.
 pub struct TransmitGroupView<'a> {
     pub packet: Transmit,
     pub header: wire::Header,

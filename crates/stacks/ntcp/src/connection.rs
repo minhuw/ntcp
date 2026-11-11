@@ -2970,28 +2970,24 @@ impl Connection {
         Ok(())
     }
 
-    /// `validate_reserved_output` of `segments` full segments of a GSO
-    /// reservation from `offset`, each accepted at `now` in turn: once this
+    /// `validate_reserved_output` of the segments of a GSO reservation that
+    /// cover `bytes` from `offset`, each accepted at `now` in turn: once this
     /// holds, none of those acceptances can fail part way through a group.
     pub(crate) fn validate_reserved_group(
         &self,
         now: Instant,
         d: &Departure,
         offset: usize,
-        segments: usize,
+        bytes: usize,
     ) -> Result<(), Error> {
         let s = d.segmentation.ok_or(Error::InvalidArgument)?;
-        let bytes = s
-            .segment_payload_len
-            .checked_mul(segments)
-            .ok_or(Error::InvalidArgument)?;
         self.validate_reserved_output(now, d, offset, bytes)?;
         if let Some(selection) = self.reserved_ledger
             && !self.rack.validate_departure_group(
                 selection,
                 Seq(d.start).wrapping_add(offset as u32),
                 s.segment_payload_len as u32,
-                segments,
+                bytes,
                 now,
             )
         {
@@ -9462,13 +9458,40 @@ impl Connection {
                 } else {
                     buffer.limits.max_segments
                 };
-                let segments = (self.send.record_len(offset, bounded) / wire_mss)
-                    .min(buffer.limits.max_segments)
-                    .min(group_limit);
-                let total = segments * wire_mss;
+                let record = self.send.record_len(offset, bounded);
+                let limit = buffer.limits.max_segments.min(group_limit);
+                let full = (record / wire_mss).min(limit);
+                // A short last segment ends the group, as it may end a Linux
+                // TSO skb (tcp_mss_split_point), exactly when scalar selection
+                // sends it right after the full ones, which it sees in flight:
+                // it completes a record, or it ends the queue and neither
+                // Nagle, aggregation nor CORK holds it (SWS cannot: it is all
+                // there is). A window- or credit-clipped remainder stays.
+                let tail = record - full * wire_mss;
+                let sent = full * wire_mss;
+                let flush = flush_credit > sent;
+                let tail_fin = fin_admissible && ((sent + tail) as u32) < timestamp_credit;
+                let tail_sendable = record < bounded
+                    || record == unsent
+                        && !(self.config.nagle && !flush && !tail_fin)
+                        && (flush
+                            || self.shutdown
+                            || self.sws_override
+                            || self.send.pushed(offset + sent, tail))
+                        && (!(self.cork || self.more)
+                            || self.shutdown
+                            || flush_credit.saturating_sub(sent) >= tail);
+                let tail = if full == record / wire_mss && full < limit && tail_sendable {
+                    tail
+                } else {
+                    0
+                };
+                let segments = full + usize::from(tail != 0);
+                let total = sent + tail;
                 // A PUSH in an intermediate physical segment must not migrate.
                 // Leave such selections scalar, including successive PUSH writes.
-                if segments >= 2 && !self.send.pushed(offset, total - wire_mss) {
+                let last = if tail != 0 { tail } else { wire_mss };
+                if segments >= 2 && !self.send.pushed(offset, total - last) {
                     count = total;
                     segmentation = Some(crate::TransmitSegmentation {
                         payload_len: total,

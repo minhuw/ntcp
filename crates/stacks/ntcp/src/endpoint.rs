@@ -5197,9 +5197,10 @@ impl Endpoint {
         let original =
             wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).map_err(Error::Wire)?;
         // The aggregate must split into exactly the segments scalar polling
-        // emits from here: full-sized at the current path limit, with the
-        // same flags and options. SYN, FIN and URG have per-segment meaning
-        // a header template cannot carry; GSO selection never sets them.
+        // emits from here: full-sized at the current path limit but for the
+        // reservation's short last one, with the same flags and options.
+        // SYN, FIN and URG have per-segment meaning a header template cannot
+        // carry; GSO selection never sets them.
         if d.syn
             || flags & (wire::SYN | wire::FIN | wire::RST | wire::URG) != 0
             || r.emitted_bytes != s.segment_payload_len
@@ -5214,28 +5215,32 @@ impl Endpoint {
             .payload_len
             .checked_sub(r.offset)
             .ok_or(Error::InvalidArgument)?;
-        let mut segments = (remaining / s.segment_payload_len)
+        let size = s.segment_payload_len;
+        let mut segments = remaining
+            .div_ceil(size)
             .min(limits.max_segments)
-            .min(limits.max_bytes / s.segment_payload_len);
+            .min(if remaining <= limits.max_bytes {
+                usize::MAX
+            } else {
+                limits.max_bytes / size
+            });
         // Without PSH support the final segment stays scalar.
-        if !limits.allow_psh
-            && flags & wire::PSH != 0
-            && segments * s.segment_payload_len == remaining
-        {
+        if !limits.allow_psh && flags & wire::PSH != 0 && segments * size >= remaining {
             segments = segments.saturating_sub(1);
         }
         if segments < 2 {
             return Ok(None);
         }
+        let bytes = (segments * size).min(remaining);
         // Every acceptance check of every segment, before issuing a token the
         // backend may submit as one indivisible object.
-        owner.validate_reserved_group(self.now, &d, r.offset, segments)?;
+        owner.validate_reserved_group(self.now, &d, r.offset, bytes)?;
         let token = crate::TransmitGroup(self.reservations[index].token()?);
         let r = self.reservations[index].current.as_mut().unwrap();
         r.group = Some(crate::output_reservation::PreparedGroup {
             token,
             segments,
-            bytes: segments * s.segment_payload_len,
+            bytes,
         });
         // A private attempt identity keeps every held-output barrier.
         r.attempt = Some(token.0);
@@ -5304,7 +5309,7 @@ impl Endpoint {
         let owner = &self
             .retained_slot(r.packet.connection.ok_or(EndpointError::InvalidHandle)?)?
             .connection;
-        owner.validate_reserved_group(now, &d, r.offset, group.segments)?;
+        owner.validate_reserved_group(now, &d, r.offset, group.bytes)?;
         if owner.path_payload_limit() < s.tcp_header_len + s.segment_payload_len {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
@@ -5343,7 +5348,7 @@ impl Endpoint {
                     now,
                     &mut departure,
                     offset + n * size,
-                    size,
+                    size.min(group.bytes - n * size),
                     finished && n + 1 == group.segments,
                 )
                 .expect("preflighted group departure");
