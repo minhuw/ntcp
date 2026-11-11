@@ -960,7 +960,9 @@ impl<P: PacketIo> Network<P> {
                     .filter(|l| l.port == port)
                     .count()
         );
-        self.ports.users(port) != 0
+        // A closed connection's slot is freed once its TIME-WAIT is a record
+        // of the endpoint's; the port stays taken until that ends.
+        self.ports.users(port) != 0 || self.endpoint.time_wait_holds_port(port)
     }
     fn scoped(&self, tuple: Tuple) -> ntcp::ScopedTuple {
         let link_local = [tuple.local.ip(), tuple.remote.ip()]

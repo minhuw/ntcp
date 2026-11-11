@@ -59,6 +59,7 @@ pub use receive_metadata::RxPacketMetadata;
 mod sack;
 mod schedule;
 mod seq;
+mod time_wait;
 mod tx_timestamp;
 pub mod wire;
 

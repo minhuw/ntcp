@@ -652,7 +652,9 @@ fn managed_native_public_rust_fast_open_helper_and_fd_alias_use_production_attac
 
 #[test]
 fn managed_native_time_wait_replacement_capacity_keeps_old_binding_and_cancels_provisional() {
-    for capacity in [1, 2] {
+    // A held TIME-WAIT connection keeps its slot and binding; a released one
+    // leaves a TIME-WAIT record holding neither.
+    for (capacity, released) in [(1, false), (2, false), (1, true), (2, true)] {
         let (mut a, wa) = native(false, 2, capacity);
         let (mut b, wb) = native(false, 3, capacity);
         let listen = listener(&mut b);
@@ -672,20 +674,24 @@ fn managed_native_time_wait_replacement_capacity_keeps_old_binding_and_cancels_p
         a.execute(client, Op::Shutdown(SHUT_WR)).unwrap();
         exchange(&mut a, &mut b, &wa, &wb);
         assert_eq!(b.endpoint.state(old), Ok(ntcp::State::TimeWait));
-        b.endpoint.release(old).unwrap();
-        b.sockets.remove(&server);
+        if released {
+            b.endpoint.release(old).unwrap();
+            b.sockets.remove(&server);
+        }
         a.endpoint.release(peer).unwrap();
         a.sockets.remove(&client);
         a.service_egress().unwrap();
         a.collect_paths().unwrap();
         b.collect_paths().unwrap();
-        let retained = b.host.as_ref().unwrap().binding(old).unwrap();
+        let retained = b.host.as_ref().unwrap().binding(old).ok();
+        assert_eq!(retained.is_none(), released);
+        assert_eq!(b.endpoint.time_wait_connections(), 1);
         a.test_now = Some(1_001_000);
         b.test_now = Some(1_001_000);
         let next = new(&mut a, SOCK_NONBLOCK);
         a.start_connection(next, local, remote, None, None).unwrap();
         flush(&mut a, &mut b, &wa);
-        assert_eq!(b.host.as_ref().unwrap().binding(old).unwrap(), retained);
+        assert_eq!(b.host.as_ref().unwrap().binding(old).ok(), retained);
         let current = b
             .endpoint
             .connection_id(ntcp::Tuple {
@@ -693,13 +699,16 @@ fn managed_native_time_wait_replacement_capacity_keeps_old_binding_and_cancels_p
                 remote: local,
             })
             .unwrap();
-        if capacity == 1 {
+        if capacity == 1 && !released {
             assert_eq!(current, old);
             assert_eq!(b.host.as_ref().unwrap().binding_count(), 1);
             assert_eq!(b.host.as_ref().unwrap().paths().usage().clients, 1);
         } else {
             assert_ne!(current, old);
-            assert_eq!(b.host.as_ref().unwrap().binding_count(), 2);
+            assert_eq!(
+                b.host.as_ref().unwrap().binding_count(),
+                1 + usize::from(!released)
+            );
             exchange(&mut a, &mut b, &wa, &wb);
             let accepted = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
             assert_eq!(connection(&b, accepted), current);

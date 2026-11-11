@@ -2031,6 +2031,8 @@ impl Owner {
                 .connection_options
                 .iter()
                 .any(|p| p.5.port() == port && self.endpoint.connection_exists(p.0))
+            // A released connection's TIME-WAIT keeps its port.
+            && !self.endpoint.time_wait_holds_port(port)
     }
     fn apply_options(&mut self, cid: ConnectionId, s: &Socket) -> Result<()> {
         // Validate the fallible option before changing the infallible one.

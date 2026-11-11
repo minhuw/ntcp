@@ -145,10 +145,11 @@ fn exhausted<T: std::fmt::Debug>(result: Result<T>) -> bool {
     matches!(result, Err(Error::Capacity))
 }
 
-// A closed connection's port stays taken through TIME-WAIT, while its
-// released slot waits for the endpoint to reclaim it, and is free after.
+// A closed connection's port stays taken through TIME-WAIT, after its
+// released slot was freed into the endpoint's TIME-WAIT record, and is free
+// after.
 #[test]
-fn a_closed_connections_port_is_taken_until_it_is_reclaimed() {
+fn a_closed_connections_port_is_taken_until_its_time_wait_ends() {
     let mut pair = Pair::new(40000..=40000, 50000..=50000);
     let server_address = SocketAddr::new(address(2), PORT);
     let client = pair.client.connect(server_address).unwrap();
@@ -163,19 +164,23 @@ fn a_closed_connections_port_is_taken_until_it_is_reclaimed() {
     pair.server.close(server).unwrap();
     for _ in 0..100 {
         pair.step();
-        if pair.client.connection_info(client).unwrap().state == State::TimeWait {
+        if pair.client.counters().time_wait_connections == 1 {
             break;
         }
     }
     pair.steps(4);
-    let info = pair.client.connection_info(client).unwrap();
-    assert_eq!(info.state, State::TimeWait);
-    assert!(info.application_closed);
+    // The application closed it and drained its events: the slot is free.
+    assert_eq!(pair.client.counters().time_wait_connections, 1);
+    assert!(matches!(
+        pair.client.connection_info(client),
+        Err(Error::InvalidHandle)
+    ));
     assert!(in_use(
         pair.client.connect_from(server_address, Some(40000))
     ));
     assert!(exhausted(pair.client.connect(server_address)));
     pair.reclaim(client);
+    assert_eq!(pair.client.counters().time_wait_connections, 0);
     let next = pair.client.connect(server_address).unwrap();
     assert_eq!(local_port(&pair.client, next), 40000);
     pair.accepted();
@@ -301,4 +306,41 @@ fn a_full_table_takes_again_only_the_slots_freed() {
     ));
     assert!(pair.server.acceptable(third).is_ok());
     assert!(exhausted(pair.server.listen(PORT + 3, 8)));
+}
+
+// A server that closes first frees each connection's slot once TIME-WAIT
+// holds only its tuple: four times its eight slots of short connections
+// complete within one TIME-WAIT period.
+#[test]
+fn server_closed_connections_beyond_the_slots_within_one_time_wait() {
+    let mut pair = Pair::new(40000..=40100, 50000..=50000);
+    let server_address = SocketAddr::new(address(2), PORT);
+    for n in 1..=32 {
+        let client = pair.client.connect(server_address).unwrap();
+        let server = pair.accepted();
+        pair.server.close(server).unwrap();
+        for _ in 0..100 {
+            pair.step();
+            if matches!(
+                pair.client.try_read(client, &mut [0; 8]),
+                Ok(ReadOutcome::Eof)
+            ) {
+                break;
+            }
+        }
+        pair.client.close(client).unwrap();
+        for _ in 0..100 {
+            pair.step();
+            if pair.server.counters().time_wait_connections == n
+                && matches!(
+                    pair.server.connection_info(server),
+                    Err(Error::InvalidHandle)
+                )
+            {
+                break;
+            }
+        }
+        assert_eq!(pair.server.counters().time_wait_connections, n);
+    }
+    assert!(pair.now < pair.server.config().tcp.connection.time_wait_us);
 }

@@ -302,7 +302,9 @@ fn active_selected_route_including_empty_direct_keeps_precedence_on_wire() {
 
 #[test]
 fn time_wait_replacement_learns_later_route_and_failed_candidate_keeps_retained_owner() {
-    for capacity in [1, 2] {
+    // A held TIME-WAIT connection keeps its slot and binding; a released
+    // one leaves a TIME-WAIT record holding neither.
+    for (capacity, released) in [(1, false), (2, false), (1, true), (2, true)] {
         let mut cfg = config(capacity);
         cfg.reuse_time_wait = true;
         cfg.ipv4_options_enabled = true;
@@ -320,15 +322,20 @@ fn time_wait_replacement_learns_later_route_and_failed_candidate_keeps_retained_
             .unwrap();
         b.0.refresh(&mut b.1, old).unwrap();
         a.1.release(client).unwrap();
-        b.1.release(old).unwrap();
+        if released {
+            b.1.release(old).unwrap();
+        }
         a.0.collect(&a.1).unwrap();
         b.0.collect(&b.1).unwrap();
-        let retained = b.1.managed_path(old).unwrap();
-        assert_eq!(retained.forwarding_destination, IpAddr::V4(hop(9)));
-        let pins =
+        let retained = b.1.managed_path(old).ok();
+        assert_eq!(retained.is_none(), released);
+        assert_eq!(b.0.binding(old).is_err(), released);
+        let pins = retained.map(|retained| {
+            assert_eq!(retained.forwarding_destination, IpAddr::V4(hop(9)));
             b.0.paths()
                 .path_pins(retained.binding.snapshot.path())
-                .unwrap();
+                .unwrap()
+        });
         now += 1_000_000;
         let (local, remote) = addresses(false);
         let mut active = options(&cfg, 24);
@@ -338,21 +345,21 @@ fn time_wait_replacement_learns_later_route_and_failed_candidate_keeps_retained_
                 .unwrap();
         let syn = emit(&mut a.0, &mut a.1, now + 1).unwrap();
         receive(&mut b, now + 2, &syn, &LATER);
-        assert_eq!(b.1.managed_path(old).unwrap(), retained);
-        assert_eq!(b.0.binding(old).unwrap(), retained.binding);
-        assert_eq!(
-            b.0.paths()
-                .path_pins(retained.binding.snapshot.path())
-                .unwrap(),
-            pins
-        );
+        assert_eq!(b.1.managed_path(old).ok(), retained);
+        if let Some(retained) = retained {
+            assert_eq!(b.0.binding(old).unwrap(), retained.binding);
+            assert_eq!(
+                b.0.paths().path_pins(retained.binding.snapshot.path()).ok(),
+                pins
+            );
+        }
         let current =
             b.1.connection_id(Tuple {
                 local: remote,
                 remote: local,
             })
             .unwrap();
-        if capacity == 1 {
+        if capacity == 1 && !released {
             assert_eq!(current, old);
             assert_eq!(b.0.binding_count(), 1);
             assert_eq!(b.0.paths().usage().clients, 1);
@@ -382,7 +389,7 @@ fn time_wait_replacement_learns_later_route_and_failed_candidate_keeps_retained_
                     .address(),
                 IpAddr::V4(hop(13))
             );
-            assert_eq!(b.1.managed_path(old).unwrap(), retained);
+            assert_eq!(b.1.managed_path(old).ok(), retained);
         }
     }
 }

@@ -948,8 +948,10 @@ fn shared_payload_barrier_adds_external_bytes_once_and_splits_obsolete_output() 
 }
 
 #[test]
-fn released_time_wait_binding_survives_factory_capacity_rollback_and_success() {
-    for capacity in [1, 2] {
+fn time_wait_binding_survives_factory_capacity_rollback_and_success() {
+    // A TIME-WAIT connection its application still holds keeps its slot and
+    // binding; a released one leaves a TIME-WAIT record holding neither.
+    for (capacity, released) in [(1, false), (2, false), (1, true), (2, true)] {
         let mut cfg = config(capacity);
         cfg.reuse_time_wait = true;
         cfg.connection.timestamps = false;
@@ -969,27 +971,36 @@ fn released_time_wait_binding_survives_factory_capacity_rollback_and_success() {
         pump(&mut a, &mut b, &mut now);
         assert_eq!(a.1.state(old).unwrap(), State::TimeWait);
         assert_eq!(b.1.state(peer).unwrap(), State::Closed);
-        a.1.release(old).unwrap();
+        if released {
+            a.1.release(old).unwrap();
+        }
         b.1.release(peer).unwrap();
         a.0.collect(&a.1).unwrap();
         b.0.collect(&b.1).unwrap();
-        assert!(a.1.connection_exists(old));
-        assert_eq!(a.1.retained_tuple(old).unwrap(), Tuple { local, remote });
-        let retained = a.0.binding(old).unwrap();
+        assert_eq!(a.1.connection_exists(old), !released);
+        let retained = if released {
+            assert!(a.0.binding(old).is_err());
+            assert_eq!(a.0.binding_count(), 0);
+            None
+        } else {
+            assert_eq!(a.1.retained_tuple(old).unwrap(), Tuple { local, remote });
+            Some(a.0.binding(old).unwrap())
+        };
+        assert_eq!(a.1.time_wait_connections(), 1);
         now += 1_000_000;
         b.1.connect_with_path_provider(now, remote, local, options(&cfg, 12), &mut b.0)
             .unwrap();
         let syn = emit(&mut b.0, &mut b.1, now + 1).unwrap();
         input(&mut a.0, &mut a.1, a.2, now + 2, &syn, 24);
-        assert_eq!(a.0.binding(old).unwrap(), retained);
+        assert_eq!(a.0.binding(old).ok(), retained);
         let current = a.1.connection_id(Tuple { local, remote }).unwrap();
-        if capacity == 1 {
+        if capacity == 1 && !released {
             assert_eq!(current, old);
             assert_eq!(a.0.binding_count(), 1);
             assert_eq!(a.0.paths().usage().clients, 1);
         } else {
             assert_ne!(current, old);
-            assert_eq!(a.0.binding_count(), 2);
+            assert_eq!(a.0.binding_count(), 1 + usize::from(!released));
             assert_eq!(
                 a.1.managed_path(current).unwrap().binding.client,
                 a.0.binding(current).unwrap().client

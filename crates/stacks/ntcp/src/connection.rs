@@ -43,10 +43,10 @@ pub type Instant = u64;
 // 2147s exceeds the configured MSL maximum (255s) and precedes sign-bit wrap.
 // Linux compares floor-seconds (up to <1s earlier); we use exact elapsed us,
 // retaining the same conservative bound, not identical quantized deadlines.
-const PAWS_RECENT_EXPIRY_US: u64 = 2_147_000_000;
+pub(crate) const PAWS_RECENT_EXPIRY_US: u64 = 2_147_000_000;
 // RFC 7323 section 5.5: a peer invalidates TS.Recent only once idle for more
 // than 24 days, whatever shorter limit this receiver applies to itself.
-const PEER_TS_RECENT_IDLE_US: u64 = 24 * 86_400 * 1_000_000;
+pub(crate) const PEER_TS_RECENT_IDLE_US: u64 = 24 * 86_400 * 1_000_000;
 
 // Adaptive ACK timeout floor (Linux TCP_ATO_MIN); a shorter delayed_ack_us lowers it.
 const ACK_TIMEOUT_FLOOR_US: u64 = 40_000;
@@ -1778,35 +1778,57 @@ impl Connection {
     //# of the incoming SYN segment are included in the heuristics performed for
     //# allowing a high connection-establishment rate.
     pub(crate) fn reuse_syn(&self, now: Instant, syn: &Segment<'_>, timestamps: bool) -> bool {
-        if !self.time_wait_valid(now) {
-            return false;
+        self.time_wait_valid(now)
+            && crate::time_wait::fresh_syn(
+                self.timestamps,
+                self.ts_latest,
+                self.receive.next(),
+                syn,
+                timestamps,
+            )
+    }
+
+    // What TIME-WAIT keeps once this connection is gone; None before it is
+    // in TIME-WAIT with nothing left to send.
+    pub(crate) fn time_wait_record(
+        &self,
+        hop_limit: u8,
+        dscp: u8,
+        ipv4_options: crate::OutgoingIpv4Options,
+    ) -> Option<crate::time_wait::Record> {
+        if self.state != State::TimeWait || !self.output_idle() {
+            return None;
         }
-        // receive.next() acknowledges the peer FIN. Compare strictly after
-        // FIN itself so FIN+1 is fresh and the exact serial half-space from FIN
-        // remains unordered.
-        let peer_fin = self.receive.next().wrapping_add(u32::MAX);
-        let newer_sequence = Seq(syn.header.sequence).after(peer_fin);
-        match (
-            self.timestamps,
-            timestamps.then_some(syn.options.timestamps).flatten(),
-        ) {
-            (true, Some((value, _))) => {
-                Seq(value).after(Seq(self.ts_latest)) || value == self.ts_latest && newer_sequence
-            }
-            (false, Some(_)) => true,
-            (_, None) => newer_sequence,
-        }
+        // The ACK of the peer's FIN has gone out, offering no window past it.
+        debug_assert_eq!(self.receive_window(), 0);
+        debug_assert_eq!(self.last_ack_sent, self.receive.next());
+        Some(crate::time_wait::Record {
+            tuple: self.scoped_tuple(),
+            snd_nxt: self.snd_nxt,
+            rcv_nxt: self.receive.next(),
+            ack_floor: self
+                .snd_una
+                .wrapping_add(0u32.wrapping_sub(self.max_snd_wnd)),
+            timestamps: self.timestamps,
+            timestamp_offset: self.timestamp_offset,
+            ts_recent: self.ts_recent,
+            ts_latest: self.ts_latest,
+            ts_recent_at: self.ts_recent_at,
+            last_timestamp_sent_at: self.last_timestamp_sent_at,
+            deadline: self.time_wait_deadline?,
+            challenge_start: self.challenge_ack_start,
+            challenge_sent: self.challenge_ack_sent,
+            ack_pending: false,
+            challenge_pending: false,
+            hop_limit,
+            dscp,
+            ipv4_options,
+            reply_header: None,
+        })
     }
 
     pub(crate) fn reuse_iss(&self, candidate: u32) -> u32 {
-        // Preserve secret-derived entropy, projecting into the forward serial
-        // half-space only when necessary. Include pure ACKs at snd_nxt in
-        // the old frontier: offsets 1..2^31-1 are strictly serially greater.
-        if Seq(candidate).after(self.snd_nxt) {
-            candidate
-        } else {
-            self.snd_nxt.wrapping_add(1 + candidate % 0x7fff_ffff).0
-        }
+        crate::time_wait::reincarnation_iss(self.snd_nxt, candidate)
     }
 
     #[cfg(test)]

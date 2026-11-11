@@ -381,7 +381,9 @@ fn detached_and_released_time_wait_ports_stay_owned_until_collection() {
     assert_eq!(a.endpoint.state(cid), Ok(State::TimeWait));
     a.endpoint.release(cid).unwrap();
     assert!(a.endpoint.tuple(cid).is_err());
-    assert!(a.endpoint.connection_exists(cid));
+    // Released, only its TIME-WAIT record remains, and holds the port.
+    assert!(!a.endpoint.connection_exists(cid));
+    assert!(a.endpoint.time_wait_holds_port(local.port()));
     controlled(&mut a, &[local.port(), local.port()]);
     assert_ne!(a.port().unwrap(), local.port());
     a.test_now = Some(500_000_000);

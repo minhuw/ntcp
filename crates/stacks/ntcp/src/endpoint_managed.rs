@@ -662,11 +662,15 @@ impl Endpoint {
             remote: SocketAddr::new(ip.source, segment.header.source_port),
         };
         let scoped = ScopedTuple { tuple, zone };
-        let target = self.tuples.find(self.hash(scoped), scoped);
-        let replacement = target.is_some_and(|index| {
-            self.config.reuse_time_wait
-                && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
-        });
+        let target = self.lookup(scoped);
+        let replacement = self.config.reuse_time_wait
+            && match target {
+                Some(super::Target::Connection(index)) => {
+                    self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
+                }
+                Some(super::Target::TimeWait(_)) => true,
+                None => false,
+            };
         // Only a connection request can open through a listener.
         let listener = ((target.is_none() || replacement)
             && segment.header.flags & (SYN | ACK | RST) == SYN)
@@ -728,6 +732,21 @@ impl Endpoint {
             if entry.0.destination.is_ipv6() {
                 entry.4 = provider.reply_header_len(entry.0, entry.5, dscp);
             }
+        }
+        // So is a TIME-WAIT record's ACK.
+        if let Some(super::Target::TimeWait(index)) = target
+            && ip.destination.is_ipv6()
+            && self.time_wait.resolve(self.time_wait.id(index)).is_some()
+            && self.time_wait.record(index).tuple == scoped
+            && self.time_wait.record(index).owes_output()
+        {
+            let record = self.time_wait.record(index);
+            let reply = IpMetadata {
+                source: ip.destination,
+                destination: ip.source,
+            };
+            let header = provider.reply_header_len(reply, zone, record.dscp);
+            self.time_wait.record_mut(index).reply_header = header;
         }
         result
     }

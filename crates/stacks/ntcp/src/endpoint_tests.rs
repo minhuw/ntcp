@@ -2755,7 +2755,22 @@ fn ipv4_outgoing_requests_and_received_owned_snapshot() {
 }
 
 fn time_wait_endpoint(
+    cfg: EndpointConfig,
+) -> (
+    Endpoint,
+    ListenerId,
+    ConnectionId,
+    IpMetadata,
+    wire::Header,
+    u32,
+) {
+    time_wait_endpoint_with(cfg, true)
+}
+
+// `b` closed first and is in TIME-WAIT, with `reuse_time_wait` as given.
+fn time_wait_endpoint_with(
     mut cfg: EndpointConfig,
+    reuse: bool,
 ) -> (
     Endpoint,
     ListenerId,
@@ -2766,7 +2781,7 @@ fn time_wait_endpoint(
 ) {
     let (local, remote) = addresses();
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    cfg.reuse_time_wait = true;
+    cfg.reuse_time_wait = reuse;
     let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
@@ -2927,14 +2942,17 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
         cfg.connection.timestamps = true;
         let expiry = 3_000 + cfg.connection.time_wait_us;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
-        let baseline = b.buffer_bytes();
+        let charge = b.buffer_bytes();
         if released {
+            // Released, its TIME-WAIT keeps no buffers.
             b.release(old).unwrap();
+            assert_eq!(b.buffer_bytes(), 0);
         }
+        let baseline = b.buffer_bytes();
         let seq = h.acknowledgment.wrapping_add(100);
         let syn = tw_segment_with_payload(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)), payload);
         b.input(4_000, ip, &syn).unwrap();
-        assert_eq!(b.buffer_bytes(), baseline * 2);
+        assert_eq!(b.buffer_bytes(), baseline + charge);
         let output = packets(&mut b, 4_000);
         let new_iss = wire::parse(output[0].0, &output[0].1)
             .unwrap()
@@ -2997,7 +3015,9 @@ fn short_time_wait_ends_at_its_configured_deadline() {
                 b.release(old).unwrap();
             }
             b.on_timeout(expiry - 1, 64).unwrap();
-            assert!(b.connection_exists(old));
+            // A released connection's TIME-WAIT outlives the connection.
+            assert_eq!(b.connection_exists(old), !released);
+            assert_eq!(b.time_wait_connections(), 1);
             assert_eq!(
                 b.connect(expiry - 1, tuple.local, tuple.remote),
                 Err(EndpointError::AddressInUse)
@@ -3005,6 +3025,7 @@ fn short_time_wait_ends_at_its_configured_deadline() {
             b.on_timeout(expiry, 64).unwrap();
             assert!(packets(&mut b, expiry).is_empty());
             assert_eq!(b.connection_exists(old), !released);
+            assert_eq!(b.time_wait_connections(), 0);
             assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
         }
     }
@@ -4675,25 +4696,34 @@ fn receive_preallocation_time_wait_fallback_keeps_ownership_and_charges() {
         local: addresses().1,
         remote: addresses().0,
     };
+    // Released, the connection is reclaimed into its TIME-WAIT record and
+    // its receive storage returns to the pool.
     b.release(old).unwrap();
+    assert!(!b.connection_exists(old));
+    assert_eq!(b.buffer_bytes(), 2 * charge);
     let seq = h.acknowledgment.wrapping_add(100);
     let syn = tw_segment(ip, h, seq, 0, wire::SYN, None);
     assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
     let child = b.connection_id(tuple).unwrap();
     assert_ne!(child, old);
-    assert!(b.connection_exists(old));
+    assert_eq!(b.time_wait_connections(), 1);
     assert_eq!(b.buffer_bytes(), 2 * charge);
     packets(&mut b, 4_000);
     let rst = tw_segment(ip, h, seq + 1, 0, wire::RST, None);
     b.input(5_000, ip, &rst).unwrap();
     packets(&mut b, 5_000);
-    assert_eq!(b.connection_id(tuple), Some(old));
-    assert!(b.connection_exists(old));
+    // The tuple is back in TIME-WAIT.
+    assert_eq!(b.connection_id(tuple), None);
+    assert_eq!(
+        b.connect(5_000, tuple.local, tuple.remote),
+        Err(EndpointError::AddressInUse)
+    );
+    assert_eq!(b.time_wait_connections(), 1);
     assert!(!b.connection_exists(child));
     assert_eq!(b.buffer_bytes(), 2 * charge);
     b.on_timeout(expiry, 64).unwrap();
     packets(&mut b, expiry);
-    assert!(!b.connection_exists(old));
+    assert_eq!(b.time_wait_connections(), 0);
     assert_eq!(b.buffer_bytes(), 2 * charge);
     assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
     assert_eq!(b.buffer_bytes(), 2 * charge);
@@ -5022,7 +5052,8 @@ fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
         let candidate = b.connection_id(tuple).unwrap();
         b.abort(candidate).unwrap();
         assert_eq!(b.connection_id(tuple), Some(candidate));
-        assert!(b.connection_exists(old));
+        assert_eq!(b.connection_exists(old), !release_old);
+        assert_eq!(b.time_wait_connections(), 1);
         assert_eq!(
             b.accept(listener),
             Err(EndpointError::Connection(Error::WouldBlock))
@@ -6572,6 +6603,9 @@ fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
 
 #[path = "endpoint_time_wait_tests.rs"]
 mod time_wait;
+
+#[path = "endpoint_time_wait_record_tests.rs"]
+mod time_wait_record;
 
 #[path = "endpoint_handshake_limit_tests.rs"]
 mod handshake_limit;

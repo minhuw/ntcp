@@ -2345,6 +2345,7 @@ mod linux {
             ipv4_options_enabled,
             error_reports: true,
             reuse_time_wait: false,
+            max_time_wait: EndpointConfig::default().max_time_wait,
             connection: ConnectionConfig {
                 timestamps,
                 sack,
