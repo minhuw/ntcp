@@ -632,9 +632,10 @@ fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
 
 #[test]
 fn gso_conservative_fallbacks_keep_scalar_paths() {
-    // A queued FIN (former case 0) and recovery's PRR credit (former cases
-    // 5 and 11) admit groups: transmit_group_tests.
-    for case in (1..11).filter(|&case| case != 5 && case != 8) {
+    // A queued FIN (former case 0), recovery's PRR credit (former cases 5
+    // and 11) and timeout recovery (former case 9) admit groups:
+    // transmit_group_tests.
+    for case in (1..11).filter(|&case| ![5, 8, 9].contains(&case)) {
         let cfg = ConnectionConfig {
             initial_window: InitialWindow::Iw10,
             congestion_algorithm: CongestionAlgorithm::Reno,
@@ -652,7 +653,6 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
                 a.config.prr = true;
                 a.config.prr_pacing = true;
             }
-            9 => a.consecutive_timeouts = 1,
             10 => {
                 a.tx_timestamps.resize(1, usize::MAX).unwrap();
                 a.tx_timestamps.insert(

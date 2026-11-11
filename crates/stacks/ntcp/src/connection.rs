@@ -9421,9 +9421,6 @@ impl Connection {
                 && !self.probe_pending
                 && self.pmtud.as_ref().is_none_or(|p| p.probe.is_none())
                 && candidate.is_none()
-                && self.sack_post_rto.is_none()
-                && self.sack_fallback.is_none()
-                && self.consecutive_timeouts == 0
                 && self.rack.valid()
                 && !self.limited_pending
                 && self.ecn_pause.is_none()

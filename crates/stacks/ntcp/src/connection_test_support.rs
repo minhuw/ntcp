@@ -115,3 +115,8 @@ pub(crate) fn departure_snapshot(a: &Connection) -> alloc::string::String {
 pub(crate) fn recovering(a: &Connection) -> bool {
     a.prr.is_some() || a.sack_recovery.is_some() || a.congestion.in_recovery()
 }
+
+// Whether the connection is still repairing after a retransmission timeout.
+pub(crate) fn timer_recovering(a: &Connection) -> bool {
+    a.consecutive_timeouts != 0 || a.sack_post_rto.is_some() || a.sack_fallback.is_some()
+}

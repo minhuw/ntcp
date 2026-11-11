@@ -1,6 +1,6 @@
 extern crate std;
 use super::*;
-use crate::connection::test_support::{departure_snapshot, recovering};
+use crate::connection::test_support::{departure_snapshot, recovering, timer_recovering};
 use std::vec::Vec;
 
 // A connected pair whose client polls through one GSO reservation. The
@@ -888,11 +888,16 @@ fn deliver(
 #[test]
 fn recovery_groups_new_data_within_its_credit() {
     for prr in [false, true] {
-        recovery_groups(prr);
+        assert_ne!(lossy_transfer(prr, 1, recovering), 0, "prr {prr}");
     }
 }
 
-fn recovery_groups(prr: bool) {
+// Sends 16000 bytes from three senders alike: one that sends every
+// groupable attempt as a group, one polling the same GSO reservations
+// scalar, and one without GSO. The first `lost` segments of the first
+// flight are lost. Checks they send the same wire and the first two
+// record the same throughout; returns the groups sent while `during`.
+fn lossy_transfer(prr: bool, lost: usize, during: fn(&crate::connection::Connection) -> bool) -> usize {
     let gso = |(mut e, peer, id, server): (Endpoint, Endpoint, ConnectionId, ConnectionId)| {
         e.enable_output_reservations_with_gso(
             1,
@@ -916,9 +921,8 @@ fn recovery_groups(prr: bool) {
     let (wire, _) = drain(&mut a, id, now);
     assert_eq!(wire, scalar(&mut b, bid, now));
     assert_eq!(wire, scalar(&mut c, cid, now));
-    // The first segment is lost; the peer SACKs the rest.
-    let mut acks = deliver(&mut peer, &wire[1..], 3);
-    let mut recovery_groups = 0;
+    let mut acks = deliver(&mut peer, &wire[lost.min(wire.len())..], 3);
+    let mut groups_during = 0;
     for _ in 0..64 {
         now += 1;
         for (ip, ack) in &acks {
@@ -927,10 +931,10 @@ fn recovery_groups(prr: bool) {
             c.input(now, *ip, ack).unwrap();
         }
         assert_eq!(snapshot(&a, id), snapshot(&b, bid));
-        let in_recovery = recovering(&a.retained_slot(id).unwrap().connection);
+        let counted = during(&a.retained_slot(id).unwrap().connection);
         let (wire, groups) = drain(&mut a, id, now);
-        if in_recovery {
-            recovery_groups += groups.len();
+        if counted {
+            groups_during += groups.len();
         }
         assert_eq!(wire, scalar(&mut b, bid, now));
         assert_eq!(wire, scalar(&mut c, cid, now));
@@ -962,7 +966,6 @@ fn recovery_groups(prr: bool) {
         a.send_progress(id).unwrap().acknowledged,
         data.len() as u64
     );
-    assert!(recovery_groups != 0, "prr {prr}");
     let mut received = std::vec![0; 16_000];
     let mut n = 0;
     while n < received.len() {
@@ -971,4 +974,19 @@ fn recovery_groups(prr: bool) {
         n += read;
     }
     assert_eq!(received, data);
+    groups_during
+}
+
+// After a retransmission timeout, while its repairs are under way (RFC
+// 6675 section 5.1 / go-back-N to the timeout's boundary), new data that
+// cwnd admits is grouped too, as Linux sends TSO skbs in the Loss state.
+#[test]
+fn groups_follow_a_retransmission_timeout() {
+    for prr in [false, true] {
+        assert_ne!(
+            lossy_transfer(prr, usize::MAX, timer_recovering),
+            0,
+            "prr {prr}"
+        );
+    }
 }
