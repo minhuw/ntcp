@@ -100,8 +100,8 @@ fn snapshot(e: &Endpoint, id: ConnectionId) -> std::string::String {
 }
 
 // The physical segments a backend cuts from the aggregate, as Linux
-// tcp_gso_segment does: full segments and the remainder, PSH on the last,
-// CWR on the first only.
+// tcp_gso_segment does: full segments and the remainder, PSH and FIN on the
+// last, CWR on the first only.
 fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
     let size = view.segment_payload_len;
     (0..view.segment_count)
@@ -109,7 +109,7 @@ fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
             let mut header = view.header;
             header.sequence = header.sequence.wrapping_add((n * size) as u32);
             if n + 1 != view.segment_count {
-                header.flags &= !wire::PSH;
+                header.flags &= !(wire::PSH | wire::FIN);
             }
             if n != 0 {
                 header.flags &= !wire::CWR;
@@ -574,7 +574,7 @@ fn group_loss_is_detected_and_repaired_like_scalar_loss_and_repairs_stay_scalar(
 }
 
 #[test]
-fn group_output_carrying_sack_options_or_fin_stays_scalar() {
+fn group_output_carrying_sack_options_stays_scalar() {
     // A data segment reporting SACK blocks: GSO selection leaves it scalar.
     let (mut a, mut peer, id, server) = pair(false, true, 16_384);
     peer.write(server, &[9; 2000]).unwrap();
@@ -599,27 +599,87 @@ fn group_output_carrying_sack_options_or_fin_stays_scalar() {
     assert_eq!(a.transmit_segmentation(attempt), None);
     assert_eq!(a.prepare_transmit_group(attempt, limits()).unwrap(), None);
     assert!(a.accept_transmit(3, attempt).unwrap());
+}
 
-    // FIN after a group goes out with the scalar tail; a queued FIN keeps
-    // the whole flight scalar.
-    let (mut a, mut peer, id, server) = pair(false, true, 16_384);
-    a.write(id, &[1; 7000]).unwrap();
-    let mut wire = group(&mut a, id, 2);
-    a.close(id).unwrap();
-    let tail = ungroupable(&mut a, id, 2);
-    let last = wire::parse(p.ip, tail.last().unwrap()).unwrap();
-    assert_ne!(last.header.flags & wire::FIN, 0);
-    wire.extend(tail);
-    for segment in &wire {
-        peer.input(3, p.ip, segment).unwrap();
+// A FIN queued behind the data ends the group on its last segment, as
+// tcp_gso_segment keeps FIN on the last segment of a TSO skb; a backend
+// without PSH/FIN support leaves that segment scalar.
+#[test]
+fn queued_fin_ends_a_group_on_its_last_segment() {
+    for (length, allow_psh) in [(7000, true), (7 * 988, true), (7000, false)] {
+        for nagle in [false, true] {
+            let (mut a, mut peer, id, server) = pair(false, true, 16_384);
+            let (mut b, _, bid, _) = pair(false, true, 16_384);
+            let (mut c, _, cid, _) = connected(false, true, 16_384);
+            c.enable_output_reservations().unwrap();
+            let data: Vec<u8> = (0..length).map(|i| (i * 5) as u8).collect();
+            for (e, id) in [(&mut a, id), (&mut b, bid), (&mut c, cid)] {
+                e.set_nagle(id, nagle).unwrap();
+                e.write(id, &data).unwrap();
+                e.close(id).unwrap();
+            }
+            let mut out = [0; 2048];
+            let (_, attempt) = a.poll_reserved_transmit_for(2, id, &mut out, 1).unwrap();
+            let s = a.transmit_segmentation(attempt.unwrap()).unwrap();
+            assert_eq!(s.payload_len, length);
+            assert_ne!(s.terminal_flags & wire::FIN, 0);
+            // The first scalar segment never carries the range's FIN.
+            let first = wire::parse(ip(), &out[..32 + s.segment_payload_len]).unwrap();
+            assert_eq!(first.header.flags & (wire::FIN | wire::PSH), 0);
+            let group = a
+                .prepare_transmit_group(
+                    attempt.unwrap(),
+                    crate::TransmitGroupLimits {
+                        allow_psh,
+                        ..limits()
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            let view = a.transmit_group(group).unwrap();
+            let segments = length.div_ceil(988);
+            assert_eq!(view.segment_count, segments - usize::from(!allow_psh));
+            assert_eq!(view.header.flags & wire::FIN != 0, allow_psh);
+            let mut wire = cut(&view);
+            // Scalar acceptance of the same segments records the same.
+            let scalar_b = scalar(&mut b, bid, 2);
+            for (n, segment) in wire.iter().enumerate() {
+                assert_eq!(segment, &scalar_b[n]);
+            }
+            assert!(a.accept_transmit_group(2, group).unwrap());
+            wire.extend(ungroupable(&mut a, id, 2));
+            assert_eq!(wire, scalar_b);
+            assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+            // And selection without GSO sends the same wire.
+            assert_eq!(wire, scalar(&mut c, cid, 2));
+            let last = wire::parse(ip(), wire.last().unwrap()).unwrap();
+            assert_eq!(last.header.flags & wire::FIN, wire::FIN);
+            for segment in &wire[..wire.len() - 1] {
+                let flags = wire::parse(ip(), segment).unwrap().header.flags;
+                assert_eq!(flags & (wire::FIN | wire::PSH), 0);
+            }
+            for segment in &wire {
+                peer.input(3, ip(), segment).unwrap();
+            }
+            assert_eq!(peer.read(server, &mut [0; 8000]).unwrap(), length);
+            assert_eq!(peer.state(server).unwrap(), State::CloseWait);
+            // The peer's ACK of data and FIN completes both alike.
+            let acks = sent(&mut peer, 3);
+            for (ip, ack) in &acks {
+                a.input(4, *ip, ack).unwrap();
+                b.input(4, *ip, ack).unwrap();
+            }
+            assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+            assert_eq!(a.state(id).unwrap(), State::FinWait2);
+        }
     }
-    assert_eq!(peer.read(server, &mut [0; 8000]).unwrap(), 7000);
-    assert_eq!(peer.state(server).unwrap(), State::CloseWait);
-    let (mut a, _, id, _) = pair(false, true, 16_384);
-    a.write(id, &[1; 7000]).unwrap();
-    a.close(id).unwrap();
-    let flight = ungroupable(&mut a, id, 2);
-    assert!(flight.len() >= 7);
+}
+
+fn ip() -> crate::IpMetadata {
+    crate::IpMetadata {
+        source: "192.0.2.1".parse().unwrap(),
+        destination: "192.0.2.2".parse().unwrap(),
+    }
 }
 
 #[test]

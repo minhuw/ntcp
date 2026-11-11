@@ -5199,10 +5199,11 @@ impl Endpoint {
         // The aggregate must split into exactly the segments scalar polling
         // emits from here: full-sized at the current path limit but for the
         // reservation's short last one, with the same flags and options.
-        // SYN, FIN and URG have per-segment meaning a header template cannot
-        // carry; GSO selection never sets them.
+        // SYN and URG have per-segment meaning a header template cannot
+        // carry; GSO selection never sets them. FIN, like PSH, belongs to the
+        // last segment.
         if d.syn
-            || flags & (wire::SYN | wire::FIN | wire::RST | wire::URG) != 0
+            || flags & (wire::SYN | wire::RST | wire::URG) != 0
             || r.emitted_bytes != s.segment_payload_len
             || r.offset % s.segment_payload_len != 0
             || owner.path_payload_limit() < s.tcp_header_len + s.segment_payload_len
@@ -5224,8 +5225,11 @@ impl Endpoint {
             } else {
                 limits.max_bytes / size
             });
-        // Without PSH support the final segment stays scalar.
-        if !limits.allow_psh && flags & wire::PSH != 0 && segments * size >= remaining {
+        // Without PSH (and FIN) support the final segment stays scalar.
+        if !limits.allow_psh
+            && flags & (wire::PSH | wire::FIN) != 0
+            && segments * size >= remaining
+        {
             segments = segments.saturating_sub(1);
         }
         if segments < 2 {
@@ -5258,12 +5262,12 @@ impl Endpoint {
         let s = r.departure?.segmentation?;
         let original = wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).ok()?;
         // The flags `fragment` gives the group's first segment, except that
-        // PSH stays for the backend to place on the last one.
+        // PSH and FIN stay for the backend to place on the last one.
         let mut header = original.header;
         header.sequence = header.sequence.wrapping_add(r.offset as u32);
         header.flags = s.terminal_flags;
         if r.offset + group.bytes != s.payload_len {
-            header.flags &= !wire::PSH;
+            header.flags &= !(wire::PSH | wire::FIN);
         }
         if r.offset != 0 {
             header.flags &= !wire::CWR;

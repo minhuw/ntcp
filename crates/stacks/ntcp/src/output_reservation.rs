@@ -62,15 +62,18 @@ pub struct TransmitSegmentation {
 
 /// What one backend aggregate may carry: its bounds, and the per-segment
 /// header semantics the backend reproduces, as Linux tcp_gso_segment does
-/// (PSH only on the last segment, CWR only on the first, every TCP option
-/// repeated on every segment). A declined semantic shortens or refuses the
-/// group; it never changes the bytes on the wire.
+/// (PSH and FIN only on the last segment, CWR only on the first, every TCP
+/// option repeated on every segment). A declined semantic shortens or
+/// refuses the group; it never changes the bytes on the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitGroupLimits {
     /// Maximum payload bytes (excludes all repeated protocol headers).
     pub max_bytes: usize,
     /// Maximum number of physical segments; fewer than two declines.
     pub max_segments: usize,
+    /// PSH and FIN on the last segment only. Linux clears both together on
+    /// all others (tcp_gso_segment), and NETIF_F_TSO has no separate FIN
+    /// capability: a device placing one there places the other.
     pub allow_psh: bool,
     pub allow_cwr: bool,
     pub allow_options: bool,
@@ -87,8 +90,8 @@ pub struct TransmitGroup(pub(crate) TransmitAttempt);
 /// with Linux TSO, the device cuts `segment_payload_len` chunks and the
 /// remainder). `packet.len` is the aggregate's TCP length (header, options
 /// and all payload); it has no timestamp observation. Segment n carries
-/// sequence `header.sequence + n * segment_payload_len`; PSH belongs to the
-/// last segment and CWR to the first only.
+/// sequence `header.sequence + n * segment_payload_len`; PSH and FIN belong
+/// to the last segment and CWR to the first only.
 pub struct TransmitGroupView<'a> {
     pub packet: Transmit,
     pub header: wire::Header,

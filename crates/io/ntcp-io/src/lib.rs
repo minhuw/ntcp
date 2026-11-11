@@ -50,9 +50,10 @@ pub struct TcpSegmentationCapabilities {
     // excluding FCS/preamble.
     pub max_wire_bytes: usize,
     pub local_ip_mtu: u32,
-    // The device keeps PSH only on the last emitted segment / CWR only on the
-    // first, as Linux does (NETIF_F_TSO_ECN). False: the aggregate must not
-    // carry it. Other flags and TCP options are backend-specific.
+    // The device keeps PSH and FIN only on the last emitted segment / CWR
+    // only on the first, as Linux does (tcp_gso_segment, NETIF_F_TSO_ECN).
+    // False: the aggregate must not carry it. Other flags and TCP options
+    // are backend-specific.
     pub allow_psh: bool,
     pub allow_cwr: bool,
 }

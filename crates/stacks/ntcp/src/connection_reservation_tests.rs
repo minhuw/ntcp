@@ -632,7 +632,8 @@ fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
 
 #[test]
 fn gso_conservative_fallbacks_keep_scalar_paths() {
-    for case in (0..12).filter(|&case| case != 8) {
+    // A queued FIN (former case 0) ends a group: transmit_group_tests.
+    for case in (1..12).filter(|&case| case != 8) {
         let cfg = ConnectionConfig {
             initial_window: InitialWindow::Iw10,
             congestion_algorithm: if case == 11 {
@@ -645,7 +646,6 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
         let (mut a, _) = pair(cfg, 0);
         a.write(&[1; 1000]).unwrap();
         match case {
-            0 => a.shutdown = true,
             1 => a.snd_up = Some(a.snd_nxt.wrapping_add(900)),
             2 => a.retx_pending = true,
             3 => a.probe_pending = true,

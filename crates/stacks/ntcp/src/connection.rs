@@ -9404,7 +9404,6 @@ impl Connection {
                 && count != 0
                 && packet_mss == wire_mss
                 && reserve
-                && !self.shutdown
                 && !urgent
                 && !self.retx_pending
                 && !self.tlp_pending
@@ -9876,7 +9875,11 @@ impl Connection {
         let mut wire_header = header;
         if let Some(s) = &mut segmentation {
             s.terminal_flags = flags;
-            wire_header.flags &= !PSH;
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+            //# Queue this until all preceding SENDs have been segmentized, then form a
+            //# FIN segment and send it.
+            // FIN, like PSH, belongs to the range's last segment only.
+            wire_header.flags &= !(PSH | FIN);
         }
         let shared_payload = if count != 0 && !keepalive {
             shared
