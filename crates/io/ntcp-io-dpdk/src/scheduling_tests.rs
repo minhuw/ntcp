@@ -2,7 +2,7 @@ use super::*;
 
 unsafe extern "C" {
     fn ntcp_test_tso_gate();
-    fn ntcp_test_check_tso(l3: u32, mss: u32, length: u32);
+    fn ntcp_test_check_tso(l3: u32, l4: u32, mss: u32, length: u32);
     fn ntcp_test_init() -> i32;
     fn ntcp_test_pool() -> *mut c_void;
     fn ntcp_test_available() -> u32;
@@ -47,21 +47,28 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
             room: 128,
             max_descriptors: 512,
         });
-        for v6 in [false, true] {
+        let caps = io.tcp_segmentation_capabilities().unwrap();
+        assert!(!caps.allow_psh && !caps.allow_cwr);
+        // No options, timestamps (data offset 8), and the 60-byte maximum.
+        for (v6, l4) in [false, true]
+            .into_iter()
+            .flat_map(|v6| [20, 32, 60].map(|l4| (v6, l4)))
+        {
             let l3 = if v6 { 40 } else { 20 };
-            let mut packet = vec![0; 14 + l3 + 20 + 300];
+            let mut packet = vec![0; 14 + l3 + l4 + 300];
             packet[12..14].copy_from_slice(&(if v6 { 0x86ddu16 } else { 0x0800 }).to_be_bytes());
             if v6 {
                 packet[14] = 0x60;
                 packet[20] = 6;
-                packet[18..20].copy_from_slice(&320u16.to_be_bytes());
+                packet[18..20].copy_from_slice(&((l4 + 300) as u16).to_be_bytes());
             } else {
                 packet[14] = 0x45;
                 packet[23] = 6;
-                packet[16..18].copy_from_slice(&340u16.to_be_bytes());
+                packet[16..18].copy_from_slice(&((20 + l4 + 300) as u16).to_be_bytes());
             }
-            packet[14 + l3 + 12] = 0x50;
+            packet[14 + l3 + 12] = (l4 as u8 / 4) << 4;
             packet[14 + l3 + 13] = 0x10;
+            packet[14 + l3 + 20..14 + l3 + l4].fill(1); // NOP padding
             for _ in 0..7 {
                 assert_eq!(
                     io.transmit_segmented(&packet, request).unwrap(),
@@ -75,7 +82,7 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
             );
             assert_eq!(ntcp_test_available(), available);
             for _ in 0..7 {
-                ntcp_test_check_tso(l3 as u32, 100, packet.len() as u32);
+                ntcp_test_check_tso(l3 as u32, l4 as u32, 100, packet.len() as u32);
             }
             assert_eq!(ntcp_test_available(), 1023);
             for leave in [0, 1, 2] {
@@ -95,6 +102,14 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
             assert_eq!(ntcp_test_tx_count(), 0);
             assert_eq!(ntcp_test_available(), 1023);
             io.tso.as_mut().unwrap().max_descriptors = 512;
+            // Headers must fit the head mbuf; the device cannot take them split.
+            io.tso.as_mut().unwrap().room = (14 + l3 + l4 - 1) as u16;
+            assert!(matches!(
+                io.transmit_segmented(&packet, request),
+                Err(TcpSegmentationError::Unsupported)
+            ));
+            assert_eq!(ntcp_test_available(), 1023);
+            io.tso.as_mut().unwrap().room = 128;
         }
         io.tso = None;
         let clock = ClockDescriptor {

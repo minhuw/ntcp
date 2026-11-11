@@ -317,8 +317,11 @@ impl PacketIo for Dpdk {
             max_aggregate_len: MAX_PACKET_LEN
                 .min(usize::from(c.room) * usize::from(c.max_descriptors)),
             max_segments: 64,
-            max_wire_bytes: MAX_PACKET_LEN + 63 * 74,
+            // 63 more copies of the largest header: Ethernet, IPv6, 60-byte TCP.
+            max_wire_bytes: MAX_PACKET_LEN + 63 * 114,
             local_ip_mtu: u32::from(c.mtu),
+            allow_psh: false,
+            allow_cwr: false,
         })
     }
 
@@ -329,8 +332,8 @@ impl PacketIo for Dpdk {
     ) -> Result<TxOutcome, TcpSegmentationError> {
         let config = self.tso.ok_or(TcpSegmentationError::Unsupported)?;
         let caps = self.tcp_segmentation_capabilities().unwrap();
-        let l3 = segmentation::validate(packet, request.segment_payload_len, caps)?;
-        if usize::from(config.room) < 14 + usize::from(l3) + 20 {
+        let (l3, l4) = segmentation::validate(packet, request.segment_payload_len, caps)?;
+        if config.room < 14 + l3 + l4 {
             return Err(TcpSegmentationError::Unsupported);
         }
         // SAFETY: validated lengths/header subset, live exclusive borrowed queue;

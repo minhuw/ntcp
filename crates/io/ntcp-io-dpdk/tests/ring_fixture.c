@@ -189,11 +189,11 @@ void ntcp_test_tso_gate(void) {
     assert(ntcp_dpdk_tso_gate(multi, multi, 0, 8, 0, 16, &limit) == -ENOTSUP);
     assert(ntcp_dpdk_tso_gate(multi, multi, 0, 8, 4, 0, &limit) == -ENOTSUP);
 }
-void ntcp_test_check_tso(unsigned l3, unsigned mss, unsigned length) {
+void ntcp_test_check_tso(unsigned l3, unsigned l4, unsigned mss, unsigned length) {
     struct rte_mbuf *m;
     assert(rte_ring_dequeue(tx, (void **)&m) == 0);
     assert(m->pkt_len == length && m->l2_len == 14 && m->l3_len == l3);
-    assert(m->l4_len == 20 && m->tso_segsz == mss);
+    assert(m->l4_len == l4 && m->tso_segsz == mss);
     uint64_t expected = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_TCP_CKSUM |
         (l3 == 20 ? RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM : RTE_MBUF_F_TX_IPV6);
     assert(m->ol_flags == expected);

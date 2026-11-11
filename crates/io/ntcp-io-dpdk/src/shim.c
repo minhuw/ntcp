@@ -230,9 +230,12 @@ int ntcp_dpdk_tso_transmit(uint16_t port, uint16_t queue, void *pool,
     const struct ntcp_tso_config *config) {
     // Rust validates bytes before this internal ABI. Recheck allocation geometry
     // before allocating, including contiguous complete headers in the head mbuf.
+    // l4_len is the TCP data offset: the device repeats the options too.
     if ((l3 != 20 && l3 != 40) || !mss || !config->room ||
-        length <= 14u + l3 + 20u || length > NTCP_DPDK_MAX_PACKET_LEN ||
-        config->room < 14u + l3 + 20u ||
+        length <= 14u + l3 + 20u || length > NTCP_DPDK_MAX_PACKET_LEN)
+        return -EINVAL;
+    uint16_t l4 = (packet[14 + l3 + 12] >> 4) * 4;
+    if (l4 < 20 || length <= 14u + l3 + l4 || config->room < 14u + l3 + l4 ||
         (length + config->room - 1) / config->room > config->max_descriptors)
         return -EINVAL;
     struct rte_mbuf *head = NULL, *tail = NULL;
@@ -251,7 +254,7 @@ int ntcp_dpdk_tso_transmit(uint16_t port, uint16_t queue, void *pool,
     }
     head->l2_len = 14;
     head->l3_len = l3;
-    head->l4_len = 20;
+    head->l4_len = l4;
     head->tso_segsz = mss;
     head->ol_flags = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_TCP_CKSUM;
     struct rte_tcp_hdr *tcp = rte_pktmbuf_mtod_offset(head, struct rte_tcp_hdr *, 14 + l3);
