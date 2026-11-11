@@ -579,7 +579,7 @@ impl PathService {
     }
     pub fn acquire_via(&mut self, request: PathRequest, forwarding_destination: ScopedAddress) -> Result<(ClientId, PathSnapshot), Error> {
         let resolved = self.resolve_via(request, forwarding_destination)?;
-        let client_slot = self.clients.free()?;
+        let client_slot = *self.free_clients.last().ok_or(Error::Capacity)?;
         let (index, new) = self.path_slot(resolved.key)?;
         let needed = if new { 2 } else { 1 };
         let generation = self
@@ -597,6 +597,7 @@ impl PathService {
             self.paths.slots[index].value.unwrap().snapshot.path()
         };
         self.pin(path);
+        self.free_clients.pop();
         let client = ClientId(self.clients.insert(
             self.context,
             client_slot,
@@ -606,6 +607,7 @@ impl PathService {
         self.dirtied += 1;
         self.generation = generation;
         self.revision = revision;
+        debug_assert!(self.clients.lists_free(&self.free_clients));
         Ok((client, self.snapshot(client)?))
     }
 
@@ -664,6 +666,8 @@ impl PathService {
         let old = self.clients.get(self.context, client.0)?;
         self.unpin(old.path);
         self.clients.slots[client.0.slot].value = None;
+        self.free_clients.push(client.0.slot);
+        debug_assert!(self.clients.lists_free(&self.free_clients));
         Ok(())
     }
 

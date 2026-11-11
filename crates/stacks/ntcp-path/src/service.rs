@@ -453,6 +453,18 @@ impl<T: Copy> Table<T> {
     fn used(&self) -> usize {
         self.slots.iter().filter(|s| s.value.is_some()).count()
     }
+    /// Whether `free` lists each unoccupied slot once and nothing else: the
+    /// full scan a free list replaces, for debug assertions.
+    fn lists_free(&self, free: &[usize]) -> bool {
+        let mut listed = alloc::vec![false; self.slots.len()];
+        free.iter()
+            .all(|&slot| !core::mem::replace(&mut listed[slot], true))
+            && self
+                .slots
+                .iter()
+                .zip(listed)
+                .all(|(s, listed)| listed == s.value.is_none())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -476,6 +488,10 @@ pub struct PathService {
     routes: Table<Route>,
     paths: Table<CachedPath>,
     clients: Table<Client>,
+    // The unoccupied `clients` slots, taken from the end: room for every
+    // slot is allocated with the table, so acquiring and releasing a client
+    // never allocates nor passes over the clients.
+    free_clients: Vec<usize>,
     // Owner policy per route slot, preallocated beside the route table.
     route_admin: Vec<RouteAdmin>,
     // Immutable SR segment list S1..Sn of the route in the same slot and
@@ -508,6 +524,7 @@ impl PathService {
             (limits.routes, size_of::<Slot<Route>>()),
             (limits.paths, size_of::<Slot<CachedPath>>()),
             (limits.clients, size_of::<Slot<Client>>()),
+            (limits.clients, size_of::<usize>()),
             (limits.routes, size_of::<RouteAdmin>()),
             (limits.routes, size_of::<Box<[Ipv6Addr]>>()),
             (limits.paths, size_of::<Option<redirect::Redirect>>()),
@@ -526,6 +543,15 @@ impl PathService {
             routes: Table::new(limits.routes)?,
             paths: Table::new(limits.paths)?,
             clients: Table::new(limits.clients)?,
+            // Descending, so that a new service hands out slot 0 first.
+            free_clients: {
+                let mut slots = Vec::new();
+                slots
+                    .try_reserve_exact(limits.clients)
+                    .map_err(|_| Error::Allocation)?;
+                slots.extend((0..limits.clients).rev());
+                slots
+            },
             route_admin: {
                 let mut records = Vec::new();
                 records

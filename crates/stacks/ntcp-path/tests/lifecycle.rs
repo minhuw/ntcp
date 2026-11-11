@@ -739,6 +739,33 @@ fn deterministic_idle_eviction_and_repeated_lifecycle_has_no_pin_or_client_leaks
 }
 
 #[test]
+fn released_client_slots_are_acquired_again_until_the_table_is_full() {
+    let (mut service, _, _, req) = setup(1, 3, false, 1500);
+    let mut clients: Vec<_> = (0..3).map(|_| service.acquire(req).unwrap().0).collect();
+    assert_eq!(service.acquire(req), Err(Error::Capacity));
+    for round in 0..3 {
+        // Any one released slot, and only that one, is acquired again, under
+        // a new handle.
+        let released = clients[round];
+        service.release(released).unwrap();
+        assert_eq!(service.usage().clients, 2);
+        let (client, _) = service.acquire(req).unwrap();
+        assert_ne!(client, released);
+        assert_eq!(service.is_dirty(released), Err(Error::StaleHandle));
+        assert_eq!(service.acquire(req), Err(Error::Capacity));
+        clients[round] = client;
+    }
+    for client in clients {
+        service.release(client).unwrap();
+    }
+    assert_eq!(service.usage().clients, 0);
+    for _ in 0..3 {
+        service.acquire(req).unwrap();
+    }
+    assert_eq!(service.acquire(req), Err(Error::Capacity));
+}
+
+#[test]
 fn zero_and_overflowing_path_client_capacities_are_checked() {
     for (paths, clients) in [(0, 1), (1, 0), (0, 0)] {
         let (mut service, _, _, req) = setup(paths, clients, false, 1500);
