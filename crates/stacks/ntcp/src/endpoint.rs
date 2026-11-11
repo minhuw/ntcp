@@ -397,7 +397,6 @@ struct Slot {
     // ponytail: quarantine retains slot/buffers within existing connection/byte bounds;
     // compact tombstones can reclaim buffer slack if reset churn matters.
     reset_deadline: Option<Instant>,
-    fallback: Option<Fallback>,
     // The connection's state was TIME-WAIT at its last refresh: counted in
     // `time_wait_connections`.
     time_wait: bool,
@@ -408,15 +407,6 @@ struct Slot {
     explicit_route: bool,
     received_ipv4_options: Option<Ipv4Options>,
 }
-// The TIME-WAIT incarnation a reopened connection returns its tuple to if
-// it closes before establishing (RFC 9293 section 3.6.1 MAY-2 (2)): a
-// connection an application still holds, or a TIME-WAIT record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Fallback {
-    Connection(ConnectionId),
-    TimeWait(crate::time_wait::TimeWaitRef),
-}
-
 // What a segment's tuple names: a connection slot or a TIME-WAIT record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Target {
@@ -1708,50 +1698,40 @@ impl Endpoint {
         }
     }
 
+    // `replaces` names the TIME-WAIT incarnation, a connection the
+    // application still holds or a record, whose tuple a reopening SYN gives
+    // to `connection`. Its TIME-WAIT ends at once, as Linux deletes the
+    // timewait socket before its listener takes the SYN (tcp_v4_rcv,
+    // TCP_TW_SYN).
     fn insert(
         &mut self,
         connection: Connection,
         listener: Option<ListenerId>,
-        fallback: Option<Fallback>,
+        replaces: Option<Target>,
     ) -> Result<ConnectionId, EndpointError> {
         let tuple = connection.scoped_tuple();
         let admission = (|| {
             let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
-            match fallback {
-                Some(Fallback::Connection(old)) => {
-                    if self.generations.get(old.slot) != Some(&old.generation)
-                        || !self.slots[old.slot].as_ref().is_some_and(|slot| {
-                            slot.mapped
-                                && slot.connection.scoped_tuple() == tuple
-                                && slot.connection.time_wait_valid(self.now)
-                        })
-                    {
-                        return Err(EndpointError::AddressInUse);
-                    }
-                    if !self
-                        .tuples
-                        .replace(self.hash(tuple), tuple, old.slot, index)
+            if self.lookup(tuple) != replaces {
+                return Err(EndpointError::AddressInUse);
+            }
+            match replaces {
+                Some(Target::Connection(old)) => {
+                    if !self.slots[old]
+                        .as_ref()
+                        .is_some_and(|slot| slot.connection.time_wait_valid(self.now))
+                        || !self.tuples.replace(self.hash(tuple), tuple, old, index)
                     {
                         return Err(EndpointError::AddressInUse);
                     }
                 }
-                Some(Fallback::TimeWait(old)) => {
-                    if !self.time_wait.resolve(old).is_some_and(|old| {
-                        self.time_wait.mapped(old)
-                            && self.time_wait.record(old).tuple == tuple
-                            && self.time_wait.record(old).valid(self.now)
-                    }) || self.tuples.find(self.hash(tuple), tuple).is_some()
-                    {
+                Some(Target::TimeWait(old)) => {
+                    if !self.time_wait.record(old).valid(self.now) {
                         return Err(EndpointError::AddressInUse);
                     }
                     self.tuples.insert(self.hash(tuple), tuple, index)?;
                 }
-                None => {
-                    if self.lookup(tuple).is_some() {
-                        return Err(EndpointError::AddressInUse);
-                    }
-                    self.tuples.insert(self.hash(tuple), tuple, index)?;
-                }
+                None => self.tuples.insert(self.hash(tuple), tuple, index)?,
             }
             Ok(index)
         })();
@@ -1762,12 +1742,16 @@ impl Endpoint {
                 return Err(error);
             }
         };
-        match fallback {
-            Some(Fallback::Connection(old)) => {
-                self.slots[old.slot].as_mut().unwrap().mapped = false;
-                self.output.remove(old.slot);
+        match replaces {
+            Some(Target::Connection(old)) => {
+                // The application sees it CLOSED, as a Linux socket is once
+                // tcp_time_wait has handed its TIME-WAIT on.
+                let slot = self.slots[old].as_mut().unwrap();
+                slot.mapped = false;
+                slot.connection.end_time_wait();
+                self.output.remove(old);
             }
-            Some(Fallback::TimeWait(old)) => self.time_wait.release_tuple(old.index),
+            Some(Target::TimeWait(old)) => self.remove_time_wait(old),
             None => {}
         }
         self.free.pop();
@@ -1787,7 +1771,6 @@ impl Endpoint {
             closed_output_drained: false,
             mapped: true,
             reset_deadline: None,
-            fallback,
             time_wait: false,
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
@@ -1820,6 +1803,9 @@ impl Endpoint {
                 .push(id);
         }
         self.refresh(index);
+        if let Some(Target::Connection(old)) = replaces {
+            self.refresh(old);
+        }
         Ok(id)
     }
 
@@ -2870,41 +2856,23 @@ impl Endpoint {
         else {
             return false;
         };
-        let id = self.id(index);
-        let mapped = slot.mapped;
-        let tuple = record.tuple;
+        // A connection whose tuple went to a reopened one left TIME-WAIT then.
+        debug_assert!(slot.mapped);
+        let hash = self.hash(record.tuple);
         self.reclaim(index);
-        // An unmapped connection lent its tuple to a reopened one, which may
-        // still return it: the record takes over that fallback. Superseded or
-        // not, it stays until its own TIME-WAIT ends, as the connection did.
-        let hash = self.hash(tuple);
-        match self.insert_time_wait(hash as u64, record) {
-            Some(record) if !mapped => {
-                self.time_wait.release_tuple(record.index);
-                if let Some(child) = self.tuples.find(hash, tuple)
-                    && self.slots[child].as_ref().unwrap().fallback
-                        == Some(Fallback::Connection(id))
-                {
-                    self.slots[child].as_mut().unwrap().fallback = Some(Fallback::TimeWait(record));
-                }
-            }
-            Some(_) => {}
-            None => self.time_wait_overflows += 1,
+        if !self.insert_time_wait(hash as u64, record) {
+            self.time_wait_overflows += 1;
         }
         true
     }
 
     // The one place TIME-WAIT records are stored.
-    fn insert_time_wait(
-        &mut self,
-        hash: u64,
-        record: crate::time_wait::Record,
-    ) -> Option<crate::time_wait::TimeWaitRef> {
+    fn insert_time_wait(&mut self, hash: u64, record: crate::time_wait::Record) -> bool {
         self.time_wait.insert(hash, record)
     }
 
     // The one place TIME-WAIT records end: expiry, an acceptable RST, a
-    // failed restore, or an ambiguous timestamp clock.
+    // reopening SYN, or an ambiguous timestamp clock.
     fn remove_time_wait(&mut self, index: u32) {
         self.time_wait.remove(index);
     }
@@ -3020,58 +2988,6 @@ impl Endpoint {
                     self.setup_loss_cache.pop_front();
                 }
                 self.setup_loss_cache.push_back(key);
-            }
-        }
-        if let Some(slot) = self.slots[index].as_ref()
-            && (slot.connection.handshake_complete()
-                || (slot.connection.state() == State::Closed
-                    && !slot.connection.reset_pending()
-                    && slot.reset_deadline.is_none()))
-            && let Some(old) = slot.fallback
-        {
-            let failed = slot.connection.state() == State::Closed;
-            let tuple = slot.connection.scoped_tuple();
-            self.slots[index].as_mut().unwrap().fallback = None;
-            match old {
-                // Released handles are intentionally eligible; generation, tuple,
-                // state, deadline and current mapping ownership must all still match.
-                Fallback::Connection(old) => {
-                    if failed
-                        && self.generations.get(old.slot) == Some(&old.generation)
-                        && self.slots[old.slot].as_ref().is_some_and(|slot| {
-                            !slot.mapped
-                                && slot.connection.scoped_tuple() == tuple
-                                && slot.connection.time_wait_valid(self.now)
-                        })
-                        && self
-                            .tuples
-                            .replace(self.hash(tuple), tuple, index, old.slot)
-                    {
-                        self.slots[index].as_mut().unwrap().mapped = false;
-                        self.slots[old.slot].as_mut().unwrap().mapped = true;
-                        self.output.push(old.slot);
-                    }
-                }
-                Fallback::TimeWait(old) => {
-                    // An established reincarnation leaves the record to its
-                    // own expiry, as it leaves a connection.
-                    if let Some(old) = self.time_wait.resolve(old) {
-                        let record = self.time_wait.record(old);
-                        if failed
-                            && !self.time_wait.mapped(old)
-                            && record.tuple == tuple
-                            && record.valid(self.now)
-                        {
-                            self.tuples.remove(self.hash(tuple), tuple, index);
-                            self.slots[index].as_mut().unwrap().mapped = false;
-                            if self.time_wait.remap(old) {
-                                self.time_wait.update(old, false);
-                            } else {
-                                self.remove_time_wait(old);
-                            }
-                        }
-                    }
-                }
             }
         }
         if self.slots[index]
@@ -3777,16 +3693,10 @@ impl Endpoint {
         self.listen_drops += 1;
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
-    //# However, it MAY accept a new SYN from the remote TCP endpoint to
-    //# reopen the connection directly from TIME-WAIT state (MAY-2), if it:
-    //#
-    //# (1)  assigns its initial sequence number for the new connection to be
-    //#      larger than the largest sequence number it used on the previous
-    //#      connection incarnation, and
-    //#
-    //# (2)  returns to TIME-WAIT state if the SYN turns out to be an old
-    //#      duplicate.
+    // RFC 9293 section 3.6.1 MAY-2 is recorded as an exception: the new
+    // incarnation's ISN follows the old one's (reuse_iss), but the old
+    // TIME-WAIT ends when the new connection takes the tuple, as in Linux,
+    // and nothing returns to it if the SYN was an old duplicate.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
     //# This algorithm for reducing TIME-WAIT is a Best
     //# Current Practice that SHOULD be implemented since Timestamp Options
@@ -3850,26 +3760,18 @@ impl Endpoint {
         let buffer_capacities = record.buffer_capacities;
         let rx_ranges = record.rx_timestamp_capacity;
         let candidate = self.isn(scoped);
-        let (iss, offset, fallback) = match target {
+        let (iss, offset) = match target {
             Target::Connection(index) => {
                 let old = &self.slots[index].as_ref().unwrap().connection;
-                (
-                    old.reuse_iss(candidate),
-                    old.timestamp_offset(),
-                    Fallback::Connection(self.id(index)),
-                )
+                (old.reuse_iss(candidate), old.timestamp_offset())
             }
             Target::TimeWait(index) => {
                 let old = self.time_wait.record(index);
-                (
-                    old.reuse_iss(candidate),
-                    old.timestamp_offset,
-                    Fallback::TimeWait(self.time_wait.id(index)),
-                )
+                (old.reuse_iss(candidate), old.timestamp_offset)
             }
         };
         // Allocate the entire bounded child before transferring tuple ownership.
-        // The old timer/record survives independently until its original expiry.
+        // The old incarnation keeps TIME-WAIT until the child takes its tuple.
         let mut connection = match self.new_connection_with_buffers(
             tuple,
             iss,
@@ -3893,7 +3795,7 @@ impl Endpoint {
             self.recycle_connection(connection);
             return Err(error.into());
         }
-        let id = self.insert(connection, Some(listener), Some(fallback))?;
+        let id = self.insert(connection, Some(listener), Some(target))?;
         let slot = self.slots[id.slot].as_mut().unwrap();
         slot.received_dscp = Some(traffic_class >> 2);
         // Input validated the route before selecting the TIME-WAIT reuse path.
@@ -4982,11 +4884,10 @@ impl Endpoint {
 
     /// Connections in TIME-WAIT now, as Linux reports its TIME-WAIT sockets
     /// (/proc/net/sockstat `tw`), released or not, kept whole or as a
-    /// TIME-WAIT record. An incarnation that a
-    /// reopening SYN superseded stays until its own TIME-WAIT ends (the new
-    /// one may still fail and return the tuple to it). A connection that
-    /// holds its tuple for the TIME-WAIT duration after sending a reset is
-    /// CLOSED, not counted. For administrative reporting.
+    /// TIME-WAIT record. A reopening SYN ends the TIME-WAIT of the
+    /// incarnation it replaces, as Linux deletes its timewait socket. A
+    /// connection that holds its tuple for the TIME-WAIT duration after
+    /// sending a reset is CLOSED, not counted. For administrative reporting.
     pub fn time_wait_connections(&self) -> usize {
         debug_assert_eq!(
             self.time_wait_slots,
@@ -6843,7 +6744,7 @@ mod recovery_observation_tests {
     }
 
     #[test]
-    fn reserved_tuple_insert_rejects_duplicates_and_invalid_fallback_owners() {
+    fn reserved_tuple_insert_rejects_duplicates_and_replacing_a_live_owner() {
         let config = EndpointConfig {
             max_connections: 3,
             ..EndpointConfig::default()
@@ -6865,17 +6766,15 @@ mod recovery_observation_tests {
         let owner = b.connection_id(tuple).unwrap();
         b.abort(owner).unwrap(); // Terminal pending reset, automatically unlinked/released.
         let charge = b.buffer_bytes();
-        for fallback in [
+        // The owner is not in TIME-WAIT, and no record holds the tuple.
+        for replaces in [
             None,
-            Some(owner),
-            Some(ConnectionId {
-                generation: owner.generation + 1,
-                ..owner
-            }),
+            Some(Target::Connection(owner.slot)),
+            Some(Target::TimeWait(0)),
         ] {
             let connection = b.new_connection(tuple, 100, None).unwrap();
             assert_eq!(
-                b.insert(connection, None, fallback.map(Fallback::Connection)),
+                b.insert(connection, None, replaces),
                 Err(EndpointError::AddressInUse)
             );
             assert_eq!(b.connection_id(tuple), Some(owner));

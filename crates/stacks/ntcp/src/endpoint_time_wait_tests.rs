@@ -153,7 +153,7 @@ fn reopened_syn_data_keeps_ordinary_tfo_authorization_window_and_first_receive_m
                     .unwrap();
                 let child = b.connection_id(tuple).unwrap();
                 assert_ne!(child, old);
-                assert_eq!(b.state(old), Ok(State::TimeWait));
+                assert_eq!(b.state(old), Ok(State::Closed));
                 assert_eq!(b.state(child), Ok(State::SynReceived));
                 let early = mode == 2 || mode == 1 && token == 3;
                 // Recognized TFO without authorization discards SYN data. A
@@ -292,7 +292,7 @@ fn reopened_data_syn_completes_with_real_peer_without_replay_or_double_delivery(
         pump(&mut a, &mut b, 14_000);
         assert_eq!(a.read(second, &mut read), Ok(9));
         assert_eq!(&read[..9], b"new reply");
-        assert_eq!(b.state(old), Ok(State::TimeWait));
+        assert_eq!(b.state(old), Ok(State::Closed));
     }
 }
 
@@ -354,7 +354,7 @@ fn data_syn_output_reservation_preserves_old_owner_until_retry() {
         }),
         Some(old)
     );
-    assert_eq!(b.state(old), Ok(State::TimeWait));
+    assert_eq!(b.state(old), Ok(State::Closed));
 }
 
 //= https://www.rfc-editor.org/rfc/rfc6191#section-2
@@ -668,13 +668,11 @@ fn timestamps_sent_on_a_connection_and_its_reincarnation_never_decrease() {
 }
 
 #[test]
-fn data_syn_candidate_timeout_and_allocation_failure_restore_old_owner() {
+fn data_syn_allocation_failure_keeps_old_owner_and_candidate_timeout_frees_the_tuple() {
     for failure in 0..2 {
         let mut cfg = config();
         cfg.connection.timestamps = true;
         cfg.connection.user_timeout_us = 180_000_000;
-        // The old TIME-WAIT must outlive the candidate's handshake timeout.
-        cfg.connection.time_wait_us = 240_000_000;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
         let tuple = Tuple {
             local: addresses().1,
@@ -712,10 +710,12 @@ fn data_syn_candidate_timeout_and_allocation_failure_restore_old_owner() {
         packets(&mut b, 5_000);
         b.on_timeout(180_005_000, 64).unwrap();
         packets(&mut b, 180_005_000);
-        assert_eq!(b.connection_id(tuple), Some(old));
-        assert_eq!(b.state(old), Ok(State::TimeWait));
+        // The candidate ended the old TIME-WAIT when it took the tuple.
+        assert_eq!(b.connection_id(tuple), None);
+        assert_eq!(b.state(old), Ok(State::Closed));
+        assert_eq!(b.time_wait_connections(), 0);
         assert_eq!(b.buffer_bytes(), baseline);
-        assert_eq!(b.next_deadline(), deadline);
+        assert_eq!(b.next_deadline(), None);
         assert_eq!(
             b.accept(listener),
             Err(EndpointError::Connection(Error::WouldBlock))

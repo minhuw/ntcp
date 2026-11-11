@@ -736,7 +736,7 @@ impl Endpoint {
         // So is a TIME-WAIT record's ACK.
         if let Some(super::Target::TimeWait(index)) = target
             && ip.destination.is_ipv6()
-            && self.time_wait.resolve(self.time_wait.id(index)).is_some()
+            && self.time_wait.contains(index)
             && self.time_wait.record(index).tuple == scoped
             && self.time_wait.record(index).owes_output()
         {

@@ -2892,12 +2892,18 @@ fn time_wait_reuse_timestamp_and_sequence_freshness() {
                 },
                 "old_ts={old_ts} case={case}"
             );
-            assert_eq!(b.state(old), Ok(State::TimeWait));
             // A stale SYN is the TIME-WAIT connection's to drop, not the
-            // listener's; a fresh one supersedes the old incarnation, which
-            // stays in TIME-WAIT.
+            // listener's; a fresh one ends the old incarnation's TIME-WAIT.
+            assert_eq!(
+                b.state(old),
+                Ok(if expected {
+                    State::Closed
+                } else {
+                    State::TimeWait
+                })
+            );
             assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0));
-            assert_eq!(b.time_wait_connections(), 1);
+            assert_eq!(b.time_wait_connections(), usize::from(!expected));
             assert_eq!(
                 b.accept(listener),
                 Err(EndpointError::Connection(Error::WouldBlock))
@@ -2919,19 +2925,13 @@ fn time_wait_reuse_timestamp_and_sequence_freshness() {
     }
 }
 
-//= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
-//= type=test
-//# However, it MAY accept a new SYN from the remote TCP endpoint to
-//# reopen the connection directly from TIME-WAIT state (MAY-2), if it:
-//#
-//# (1)  assigns its initial sequence number for the new connection to be
-//#      larger than the largest sequence number it used on the previous
-//#      connection incarnation, and
-//#
-//# (2)  returns to TIME-WAIT state if the SYN turns out to be an old
-//#      duplicate.
+// A SYN that reopens a TIME-WAIT tuple ends that TIME-WAIT at once, as
+// Linux deletes its timewait socket before its listener takes the SYN
+// (tcp_v4_rcv, TCP_TW_SYN). When the SYN was an old duplicate and the new
+// connection fails before establishing, nothing returns to TIME-WAIT: the
+// tuple is free.
 #[test]
-fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles() {
+fn a_reopened_connection_that_fails_leaves_no_time_wait() {
     for (released, payload) in [
         (false, b"".as_slice()),
         (true, b"".as_slice()),
@@ -2940,7 +2940,6 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
     ] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
-        let expiry = 3_000 + cfg.connection.time_wait_us;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
         let charge = b.buffer_bytes();
         if released {
@@ -2953,7 +2952,15 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
         let syn = tw_segment_with_payload(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)), payload);
         b.input(4_000, ip, &syn).unwrap();
         assert_eq!(b.buffer_bytes(), baseline + charge);
+        assert_eq!(b.time_wait_connections(), 0);
+        if released {
+            assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
+        } else {
+            // The application still holding it sees it closed.
+            assert_eq!(b.state(old), Ok(State::Closed));
+        }
         let output = packets(&mut b, 4_000);
+        assert_eq!(output.len(), 1);
         let new_iss = wire::parse(output[0].0, &output[0].1)
             .unwrap()
             .header
@@ -2966,30 +2973,15 @@ fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles
             b.accept(listener),
             Err(EndpointError::Connection(Error::WouldBlock))
         );
-        packets(&mut b, 5_000);
+        assert!(packets(&mut b, 5_000).is_empty());
         assert_eq!(b.buffer_bytes(), baseline);
+        assert_eq!(b.time_wait_connections(), 0);
         let tuple = Tuple {
             local: addresses().1,
             remote: addresses().0,
         };
-        assert_eq!(
-            b.connect(5_000, tuple.local, tuple.remote),
-            Err(EndpointError::AddressInUse)
-        );
-        b.on_timeout(expiry - 1, 64).unwrap();
-        assert_eq!(
-            b.connect(expiry - 1, tuple.local, tuple.remote),
-            Err(EndpointError::AddressInUse)
-        );
-        b.on_timeout(expiry, 64).unwrap();
-        packets(&mut b, expiry);
-        if released {
-            assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
-            assert_eq!(b.buffer_bytes(), 0);
-        } else {
-            assert_eq!(b.state(old), Ok(State::Closed));
-        }
-        assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
+        assert_eq!(b.connection_id(tuple), None);
+        assert!(b.connect(5_000, tuple.local, tuple.remote).is_ok());
     }
 }
 
@@ -3510,7 +3502,14 @@ fn rfc6191_sequence_reuse_uses_peer_fin_serial_frontier() {
                             },
                             "fin={fin} offset={offset} old_ts={old_timestamps} incoming_ts={incoming_timestamps}"
                         );
-                        assert_eq!(b.state(old), Ok(State::TimeWait));
+                        assert_eq!(
+                            b.state(old),
+                            Ok(if accepted {
+                                State::Closed
+                            } else {
+                                State::TimeWait
+                            })
+                        );
                         let output = packets(&mut b, 4_000);
                         assert_eq!(output.len(), usize::from(accepted));
                         if accepted {
@@ -3855,25 +3854,27 @@ fn time_wait_connections_follow_entry_release_expiry_and_abort() {
     assert_eq!(a.time_wait_connections(), 0);
 }
 
-// RFC 9293 3.6.1 (2): the incarnation a reopening SYN supersedes stays in
-// TIME-WAIT, to take its tuple back should the SYN turn out an old
-// duplicate, until its own TIME-WAIT ends.
+// The incarnation a reopening SYN replaces leaves TIME-WAIT, and the gauge,
+// at once, as Linux deletes its timewait socket; neither the new
+// connection's fate nor the old deadline brings it back.
 #[test]
-fn time_wait_connections_keep_a_superseded_incarnation_until_its_expiry() {
-    for establish in [false, true] {
+fn time_wait_connections_drop_when_a_syn_reopens_the_tuple() {
+    for (released, establish) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut cfg = config();
         cfg.connection.timestamps = true;
         let expiry = 3_000 + cfg.connection.time_wait_us;
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
-        b.release(old).unwrap();
+        if released {
+            b.release(old).unwrap();
+        }
         assert_eq!(b.time_wait_connections(), 1);
         let seq = h.acknowledgment.wrapping_add(100);
         let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)));
         assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
+        assert_eq!(b.time_wait_connections(), 0);
         let output = packets(&mut b, 4_000);
         let synack = wire::parse(output[0].0, &output[0].1).unwrap();
         let echo = synack.options.timestamps.unwrap().0;
-        assert_eq!(b.time_wait_connections(), 1);
         let resolution = if establish {
             tw_segment(
                 ip,
@@ -3905,13 +3906,14 @@ fn time_wait_connections_keep_a_superseded_incarnation_until_its_expiry() {
                 Err(EndpointError::Connection(Error::WouldBlock))
             );
         }
-        assert_eq!(b.time_wait_connections(), 1);
-        b.on_timeout(expiry - 1, 64).unwrap();
-        assert_eq!(b.time_wait_connections(), 1);
+        assert_eq!(b.time_wait_connections(), 0);
         b.on_timeout(expiry, 64).unwrap();
         packets(&mut b, expiry);
-        assert!(!b.connection_exists(old));
         assert_eq!(b.time_wait_connections(), 0);
+        assert_eq!(b.connection_exists(old), !released);
+        if !released {
+            assert_eq!(b.state(old), Ok(State::Closed));
+        }
         assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0));
     }
 }
@@ -3958,13 +3960,13 @@ fn timestamps_two_endpoints_reopen_and_transfer_after_time_wait() {
     assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
 }
 
+// A reopened connection whose handshake times out leaves its tuple free:
+// the TIME-WAIT it replaced ended when it took the tuple.
 #[test]
-fn time_wait_pending_candidate_timeout_restores_original_tuple() {
+fn time_wait_reopened_candidate_timeout_frees_the_tuple() {
     let mut cfg = config();
     cfg.connection.timestamps = true;
     cfg.connection.user_timeout_us = 180_000_000;
-    // The old TIME-WAIT must outlive the candidate's handshake timeout.
-    cfg.connection.time_wait_us = 240_000_000;
     let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
     let baseline = b.buffer_bytes();
     let syn = tw_segment(
@@ -3980,16 +3982,13 @@ fn time_wait_pending_candidate_timeout_restores_original_tuple() {
     b.on_timeout(180_004_000, 64).unwrap();
     packets(&mut b, 180_004_000);
     assert_eq!(b.buffer_bytes(), baseline);
-    assert_eq!(b.state(old), Ok(State::TimeWait));
+    assert_eq!(b.state(old), Ok(State::Closed));
+    assert_eq!(b.time_wait_connections(), 0);
     assert_eq!(
         b.accept(listener),
         Err(EndpointError::Connection(Error::WouldBlock))
     );
-    assert_eq!(
-        b.connect(180_004_000, addresses().1, addresses().0),
-        Err(EndpointError::AddressInUse)
-    );
-    assert_eq!(b.next_deadline(), Some(240_003_000));
+    assert!(b.connect(180_004_000, addresses().1, addresses().0).is_ok());
 }
 
 #[test]
@@ -4125,7 +4124,7 @@ fn time_wait_reuse_keeps_new_syn_return_route_and_timestamp_options() {
             .timestamps
             .is_some()
     );
-    assert_eq!(b.state(old).unwrap(), State::TimeWait);
+    assert_eq!(b.state(old).unwrap(), State::Closed);
 }
 
 #[test]
@@ -4685,12 +4684,11 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
 }
 
 #[test]
-fn receive_preallocation_time_wait_fallback_keeps_ownership_and_charges() {
+fn receive_preallocation_time_wait_reopen_keeps_charges() {
     let mut cfg = config();
     cfg.preallocate_connections = 2;
     let charge = connection_charge(&cfg);
     cfg.max_buffer_bytes = 2 * charge;
-    let expiry = 3_000 + cfg.connection.time_wait_us;
     let (mut b, _, old, ip, h, _) = time_wait_endpoint(cfg);
     let tuple = Tuple {
         local: addresses().1,
@@ -4706,26 +4704,18 @@ fn receive_preallocation_time_wait_fallback_keeps_ownership_and_charges() {
     assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
     let child = b.connection_id(tuple).unwrap();
     assert_ne!(child, old);
-    assert_eq!(b.time_wait_connections(), 1);
+    assert_eq!(b.time_wait_connections(), 0);
     assert_eq!(b.buffer_bytes(), 2 * charge);
     packets(&mut b, 4_000);
     let rst = tw_segment(ip, h, seq + 1, 0, wire::RST, None);
     b.input(5_000, ip, &rst).unwrap();
     packets(&mut b, 5_000);
-    // The tuple is back in TIME-WAIT.
+    // Nothing returns to TIME-WAIT: the tuple is free.
     assert_eq!(b.connection_id(tuple), None);
-    assert_eq!(
-        b.connect(5_000, tuple.local, tuple.remote),
-        Err(EndpointError::AddressInUse)
-    );
-    assert_eq!(b.time_wait_connections(), 1);
+    assert_eq!(b.time_wait_connections(), 0);
     assert!(!b.connection_exists(child));
     assert_eq!(b.buffer_bytes(), 2 * charge);
-    b.on_timeout(expiry, 64).unwrap();
-    packets(&mut b, expiry);
-    assert_eq!(b.time_wait_connections(), 0);
-    assert_eq!(b.buffer_bytes(), 2 * charge);
-    assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
+    assert!(b.connect(5_000, tuple.local, tuple.remote).is_ok());
     assert_eq!(b.buffer_bytes(), 2 * charge);
 }
 
@@ -5030,7 +5020,7 @@ fn reset_failed_child_unlinks_backlog_before_output_and_quarantine_expiry() {
 }
 
 #[test]
-fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
+fn time_wait_reuse_local_reset_keeps_candidate_quarantine() {
     let time_wait = config().connection.time_wait_us;
     for (release_old, payload) in [
         (false, b"".as_slice()),
@@ -5053,7 +5043,7 @@ fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
         b.abort(candidate).unwrap();
         assert_eq!(b.connection_id(tuple), Some(candidate));
         assert_eq!(b.connection_exists(old), !release_old);
-        assert_eq!(b.time_wait_connections(), 1);
+        assert_eq!(b.time_wait_connections(), 0);
         assert_eq!(
             b.accept(listener),
             Err(EndpointError::Connection(Error::WouldBlock))
@@ -5061,7 +5051,7 @@ fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
         assert!(b.poll_transmit(5_000, &mut [0; 1], 1).is_err());
         assert_eq!(b.connection_id(tuple), Some(candidate));
         packets(&mut b, 6_000);
-        b.on_timeout(3_000 + time_wait, 1).unwrap(); // Old TIME-WAIT expires first.
+        b.on_timeout(3_000 + time_wait, 1).unwrap(); // The old TIME-WAIT would have ended.
         packets(&mut b, 3_000 + time_wait);
         assert_eq!(b.connection_exists(old), !release_old);
         assert_eq!(b.connection_id(tuple), Some(candidate));
@@ -5079,7 +5069,7 @@ fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
 }
 
 #[test]
-fn early_fin_passive_accept_waits_for_handshake_ack_and_reuse_failure_rolls_back() {
+fn early_fin_passive_accept_waits_for_handshake_ack_and_reuse_failure_frees_the_tuple() {
     let (mut a, mut b, listener, _) = endpoints();
     let (tuple, _) = passive_quote(&mut a, &mut b);
     let child = b.connection_id(tuple).unwrap();
@@ -5118,7 +5108,9 @@ fn early_fin_passive_accept_waits_for_handshake_ack_and_reuse_failure_rolls_back
     b.input(5_000, ip, &tw_segment(ip, h, seq + 1, 0, wire::RST, None))
         .unwrap();
     packets(&mut b, 5_000);
-    assert_eq!(b.connection_id(tuple), Some(old));
+    assert_eq!(b.connection_id(tuple), None);
+    assert_eq!(b.state(old), Ok(State::Closed));
+    assert_eq!(b.time_wait_connections(), 0);
     assert!(!b.connection_exists(candidate));
 }
 
@@ -5371,7 +5363,7 @@ fn timestamp_privacy_echo_rtt_and_reactive_reset_without_local_enable() {
 }
 
 #[test]
-fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
+fn timestamp_offset_time_wait_reuse_keeps_virtual_clock() {
     for (granularity, payload) in [
         (crate::TimestampGranularity::Milliseconds, b"".as_slice()),
         (crate::TimestampGranularity::Microseconds, b"".as_slice()),
@@ -5425,27 +5417,7 @@ fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
             synack.options.timestamps.unwrap().0,
             old_value.wrapping_add((1_000 / granularity.tick_us()) as u32)
         );
-        let reset = tw_segment(
-            ip,
-            h,
-            seq.wrapping_add(1),
-            synack.header.sequence.wrapping_add(1),
-            wire::RST | wire::ACK,
-            None,
-        );
-        b.input(5_100, ip, &reset).unwrap();
-        assert_eq!(b.state(old), Ok(State::TimeWait));
-        b.input(6_000, ip, &duplicate_fin).unwrap();
-        let output = packets(&mut b, 6_000).pop().unwrap();
-        assert_eq!(
-            wire::parse(output.0, &output.1)
-                .unwrap()
-                .options
-                .timestamps
-                .unwrap()
-                .0,
-            old_value.wrapping_add((2_000 / granularity.tick_us()) as u32)
-        );
+        assert_eq!(b.state(old), Ok(State::Closed));
     }
 }
 

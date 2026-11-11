@@ -207,6 +207,26 @@ class TimeWaitPersistInventories(unittest.TestCase):
             for annotation in audit.source_annotations(path.read_text()):
                 self.assertNotEqual(audit.clause_key(annotation), key, str(path))
 
+    def test_rfc9293_time_wait_reopen_is_a_recorded_exception(self):
+        # A reopening SYN ends the old TIME-WAIT at once, as Linux does, so
+        # condition (2) of MAY-2 (return to TIME-WAIT after an old duplicate)
+        # is not met: an extracted requirement closed only by its exception,
+        # which no source or test annotation cites.
+        manifest = json.loads((ROOT / "duvet/extracted-requirements.json").read_text())
+        may = [r for r in manifest["rfcs"]["9293"]["requirements"] if "(MAY-2)" in r["quote"]]
+        self.assertEqual(len(may), 1)
+        key = audit.clause_key(may[0])
+        exceptions = [r for kind, r in audit.toml_entries(ROOT / "duvet/rfc9293-todos.toml")
+                      if kind == "EXCEPTION" and audit.clause_key(r) == key]
+        self.assertEqual(len(exceptions), 1)
+        for fact in ("EndpointConfig::reuse_time_wait", "RFC 6191", "condition (1)",
+                     "TCP_TW_SYN", "Condition (2) is not met",
+                     "leaves the TIME-WAIT unchanged"):
+            self.assertIn(fact, exceptions[0]["reason"])
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                self.assertNotEqual(audit.clause_key(annotation), key, str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

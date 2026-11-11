@@ -38,7 +38,7 @@ fn time_wait_data_syn_reserves_native_metadata_before_replacement_and_snapshots_
 }
 
 #[test]
-fn time_wait_data_syn_reset_restores_old_metadata_at_capacity() {
+fn time_wait_data_syn_reset_keeps_old_metadata_at_capacity() {
     time_wait_data_syn_metadata(true);
 }
 
@@ -224,7 +224,8 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     let child = b.endpoint.connection_id(tuple).unwrap();
     assert_ne!(child, old);
     assert_eq!(b.endpoint.state(child), Ok(State::SynReceived));
-    assert_eq!(b.endpoint.state(old), Ok(State::TimeWait));
+    // The SYN ended the old socket's TIME-WAIT, as in Linux.
+    assert_eq!(b.endpoint.state(old), Ok(State::Closed));
     assert_eq!(b.connection_options.len(), LIMIT);
     let snapshot = b.connection_options.iter().find(|p| p.0 == child).unwrap();
     assert_eq!((snapshot.1, snapshot.5), (44, tuple.local));
@@ -234,8 +235,9 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     let synack = output(&mut b, 6_000);
     assert_eq!(synack.acknowledgment, 103);
     if reset_candidate {
-        // A reset at RCV.NXT restores the retained owner. Changing listener
-        // policy must not reapply it to that existing TIME-WAIT connection.
+        // A reset at RCV.NXT ends the candidate and frees the tuple. The old
+        // socket keeps its own metadata: changing listener policy must not
+        // reapply to it.
         b.execute(listener, Op::Set(IPPROTO_IP, IP_TOS, 88))
             .unwrap();
         b.sockets.get_mut(&listener).unwrap().receive_timeout_us = 456_000;
@@ -247,8 +249,9 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
         let reset = request(ip, 40000, 103, 0, ntcp::wire::RST, &[]);
         b.input_stamped(7_000, ip, 0, &reset, Default::default())
             .unwrap();
-        assert_eq!(b.endpoint.connection_id(tuple), Some(old));
-        assert_eq!(b.endpoint.state(old), Ok(State::TimeWait));
+        assert_eq!(b.endpoint.connection_id(tuple), None);
+        assert_eq!(b.endpoint.state(old), Ok(State::Closed));
+        assert_eq!(b.endpoint.time_wait_connections(), 0);
         assert_eq!(b.connection_options.len(), admitted_snapshots.0.len());
         assert_eq!(b.connection_options, admitted_snapshots.0);
         assert_eq!(b.child_timeouts, admitted_snapshots.1);
@@ -295,8 +298,8 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
         assert!(b.connection_options.len() <= b.socket_limit());
         assert!(b.child_timeouts.len() <= b.socket_limit());
         assert!(b.child_timestamps.len() <= b.socket_limit());
-        // A retransmitted peer FIN elicits an ACK from the restored owner,
-        // exposing its actual send policy rather than only the saved snapshot.
+        // No TIME-WAIT is left to ACK a retransmitted peer FIN: the
+        // listener resets it.
         b.input_stamped(8_000, ip, 0, &close, Default::default())
             .unwrap();
         let mut bytes = [0; 128];
@@ -306,14 +309,9 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
             .unwrap()
             .packet
             .unwrap();
-        assert_eq!(tx.connection, Some(old));
-        assert_eq!(
-            tx.dscp,
-            old_snapshots.0.iter().find(|p| p.0 == old).unwrap().1 >> 2
-        );
-        let ack = ntcp::wire::parse(tx.ip, &bytes[..tx.len]).unwrap().header;
-        assert_eq!(ack.acknowledgment, final_ack.acknowledgment);
-        assert_eq!(ack.flags, ntcp::wire::ACK);
+        assert_eq!(tx.connection, None);
+        let reset = ntcp::wire::parse(tx.ip, &bytes[..tx.len]).unwrap().header;
+        assert_eq!(reset.flags, ntcp::wire::RST);
         return;
     }
     b.sockets.get_mut(&listener).unwrap().receive_timeout_us = 456_000;

@@ -225,13 +225,11 @@ fn a_time_wait_record_keeps_the_challenge_ack_budget() {
 }
 
 // A fresh SYN reopens a record's tuple as it reopens a connection's (RFC
-// 6191), and an old duplicate's failure returns the tuple to TIME-WAIT.
-//= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
-//= type=test
-//# (2)  returns to TIME-WAIT state if the SYN turns out to be an old
-//#      duplicate.
+// 6191) and ends its TIME-WAIT at once, as Linux deletes its timewait
+// socket: an old duplicate's failure leaves the tuple free, and a later FIN
+// of the old incarnation finds only the listener.
 #[test]
-fn a_time_wait_record_reopens_and_takes_its_tuple_back_as_its_connection() {
+fn a_time_wait_record_reopens_and_ends_its_time_wait_as_its_connection() {
     for timestamps in [false, true] {
         let mut cfg = config();
         cfg.connection.timestamps = timestamps;
@@ -243,14 +241,8 @@ fn a_time_wait_record_reopens_and_takes_its_tuple_back_as_its_connection() {
         assert_eq!(synack.len(), 1);
         let synack = wire::parse(synack[0].0, &synack[0].1).unwrap().header;
         assert_eq!(synack.flags, wire::SYN | wire::ACK);
-        // Superseded, the incarnation stays counted until its own expiry.
-        assert_eq!(twins.record.time_wait_connections(), 1);
+        assert_eq!(twins.record.time_wait_connections(), 0);
         let rst = twins.segment(rcv + 101, synack.sequence + 1, wire::RST, None, b"");
-        twins.input(5_000, &rst);
-        assert_eq!(
-            twins.record.accept(twins.listener),
-            Err(EndpointError::Connection(Error::WouldBlock))
-        );
         let fin = twins.segment(
             rcv - 1,
             snd,
@@ -258,16 +250,26 @@ fn a_time_wait_record_reopens_and_takes_its_tuple_back_as_its_connection() {
             fresh.map(|v| v + 1),
             b"",
         );
-        let ack = twins.input(6_000, &fin);
-        assert_eq!(ack.len(), 1);
-        assert_eq!(
-            wire::parse(ack[0].0, &ack[0].1)
-                .unwrap()
-                .header
-                .acknowledgment,
-            rcv
-        );
-        // A reincarnation that establishes leaves the old record to expire.
+        // Fed without `Twins::input`, whose `connect` probe would open the
+        // tuple this leaves free.
+        for endpoint in [&mut twins.held, &mut twins.record] {
+            endpoint.input(5_000, twins.ip, &rst).unwrap();
+            assert!(sent(endpoint, 5_000).is_empty());
+            assert_eq!(
+                endpoint.accept(twins.listener),
+                Err(EndpointError::Connection(Error::WouldBlock))
+            );
+            assert_eq!(endpoint.connection_id(tuple()), None);
+            assert_eq!(endpoint.time_wait_connections(), 0);
+            endpoint.input(6_000, twins.ip, &fin).unwrap();
+            let reset = sent(endpoint, 6_000);
+            assert_eq!(reset.len(), 1);
+            assert_eq!(
+                wire::parse(reset[0].0, &reset[0].1).unwrap().header.flags,
+                wire::RST
+            );
+        }
+        // Nor does a reincarnation that establishes leave the old record.
         let mut twins = self::twins(&cfg, true);
         let syn = twins.segment(rcv + 100, 0, wire::SYN, fresh, b"");
         let synack = twins.input(4_000, &syn);
@@ -277,12 +279,11 @@ fn a_time_wait_record_reopens_and_takes_its_tuple_back_as_its_connection() {
         let held = twins.held.accept(twins.listener).unwrap();
         let child = twins.record.accept(twins.listener).unwrap();
         assert_eq!(twins.record.state(child), Ok(State::Established));
-        assert_eq!(twins.record.time_wait_connections(), 1);
+        assert_eq!(twins.record.time_wait_connections(), 0);
+        assert_eq!(twins.held.time_wait_connections(), 0);
         let expiry = 3_000 + cfg.connection.time_wait_us;
         twins.held.on_timeout(expiry, 64).unwrap();
         twins.record.on_timeout(expiry, 64).unwrap();
-        assert_eq!(twins.record.time_wait_connections(), 0);
-        assert_eq!(twins.held.time_wait_connections(), 0);
         assert_eq!(twins.held.state(held), twins.record.state(child));
         assert_eq!(twins.record.connection_id(tuple()), Some(child));
     }

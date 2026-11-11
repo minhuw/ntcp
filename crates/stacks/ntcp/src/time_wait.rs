@@ -318,13 +318,6 @@ pub(crate) fn reincarnation_iss(snd_nxt: Seq, candidate: u32) -> u32 {
     }
 }
 
-// A record's identity: its index and the generation it was stored with.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct TimeWaitRef {
-    pub(crate) index: u32,
-    generation: u32,
-}
-
 #[derive(Clone, Copy)]
 struct Links {
     previous: u32,
@@ -338,7 +331,6 @@ const UNLINKED: Links = Links {
 struct Entry {
     record: Record,
     hash: u64,
-    mapped: bool,
     // Position in the timer heap.
     timer: u32,
     output: Links,
@@ -402,7 +394,6 @@ fn output(entry: &mut Entry) -> &mut Links {
 /// of records, not a FIFO.
 pub(crate) struct TimeWaitTable {
     entries: Vec<Option<Entry>>,
-    generations: Vec<u32>,
     free: Vec<u32>,
     index: Vec<u32>,
     timers: Vec<u32>,
@@ -437,7 +428,6 @@ impl TimeWaitTable {
         ports.resize(ports_len, 0);
         Ok(Self {
             entries: Vec::new(),
-            generations: Vec::new(),
             free: Vec::new(),
             index,
             ports,
@@ -480,7 +470,6 @@ impl TimeWaitTable {
             let position = self.position(hash, probe);
             if self.index[position] == NONE {
                 self.index[position] = index;
-                self.entries[index as usize].as_mut().unwrap().mapped = true;
                 return true;
             }
         }
@@ -490,11 +479,7 @@ impl TimeWaitTable {
     // Backward-shift deletion: no tombstones, so a miss ends at the first
     // empty position however long the table has churned.
     fn unmap(&mut self, index: u32) {
-        let entry = self.entries[index as usize].as_mut().unwrap();
-        if !core::mem::take(&mut entry.mapped) {
-            return;
-        }
-        let hash = entry.hash;
+        let hash = self.entries[index as usize].as_ref().unwrap().hash;
         let mask = self.index.len() - 1;
         let mut hole = (0..PROBES)
             .map(|probe| self.position(hash, probe))
@@ -517,25 +502,23 @@ impl TimeWaitTable {
         self.index[hole] = NONE;
     }
 
-    /// Store `record` mapped under `hash`. None at the bound, when storage
+    /// Store `record` mapped under `hash`. False at the bound, when storage
     /// cannot grow, or when its probe budget is exhausted.
-    pub(crate) fn insert(&mut self, hash: u64, record: Record) -> Option<TimeWaitRef> {
+    pub(crate) fn insert(&mut self, hash: u64, record: Record) -> bool {
         if self.len >= self.limit {
-            return None;
+            return false;
         }
         let index = match self.free.pop() {
             Some(index) => index,
             None => {
                 let index = self.entries.len();
                 if self.entries.try_reserve(1).is_err()
-                    || self.generations.try_reserve(1).is_err()
                     || self.timers.try_reserve(1).is_err()
                     || self.free.try_reserve(index + 1).is_err()
                 {
-                    return None;
+                    return false;
                 }
                 self.entries.push(None);
-                self.generations.push(0);
                 index as u32
             }
         };
@@ -543,7 +526,6 @@ impl TimeWaitTable {
         self.entries[index as usize] = Some(Entry {
             record,
             hash,
-            mapped: false,
             timer: NONE,
             output: UNLINKED,
             queued: false,
@@ -551,15 +533,12 @@ impl TimeWaitTable {
         if !self.map(index) {
             self.entries[index as usize] = None;
             self.free.push(index);
-            return None;
+            return false;
         }
         self.push_timer(index);
         self.ports[usize::from(port)] += 1;
         self.len += 1;
-        Some(TimeWaitRef {
-            index,
-            generation: self.generations[index as usize],
-        })
+        true
     }
 
     pub(crate) fn remove(&mut self, index: u32) -> Record {
@@ -568,38 +547,16 @@ impl TimeWaitTable {
         self.remove_timer(index);
         let entry = self.entries[index as usize].take().unwrap();
         self.ports[usize::from(entry.record.tuple.tuple.local.port())] -= 1;
-        self.generations[index as usize] = self.generations[index as usize].wrapping_add(1);
         self.free.push(index);
         self.len -= 1;
         entry.record
     }
 
-    pub(crate) fn id(&self, index: u32) -> TimeWaitRef {
-        TimeWaitRef {
-            index,
-            generation: self.generations[index as usize],
-        }
-    }
-
-    pub(crate) fn resolve(&self, id: TimeWaitRef) -> Option<u32> {
-        (self.generations.get(id.index as usize) == Some(&id.generation)
-            && self.entries[id.index as usize].is_some())
-        .then_some(id.index)
-    }
-
-    pub(crate) fn mapped(&self, index: u32) -> bool {
-        self.entries[index as usize].as_ref().unwrap().mapped
-    }
-
-    // A record whose tuple a reopened connection took: it neither receives
-    // nor sends until `remap` gives the tuple back.
-    pub(crate) fn release_tuple(&mut self, index: u32) {
-        self.unmap(index);
-        self.dequeue(index);
-    }
-
-    pub(crate) fn remap(&mut self, index: u32) -> bool {
-        self.map(index)
+    // Whether a record is stored at `index`.
+    pub(crate) fn contains(&self, index: u32) -> bool {
+        self.entries
+            .get(index as usize)
+            .is_some_and(Option::is_some)
     }
 
     pub(crate) fn record(&self, index: u32) -> &Record {
@@ -617,7 +574,7 @@ impl TimeWaitTable {
             self.sift_down(position);
         }
         let entry = self.entries[index as usize].as_mut().unwrap();
-        if entry.record.owes_output() && entry.mapped && !entry.queued {
+        if entry.record.owes_output() && !entry.queued {
             entry.queued = true;
             link(&mut self.entries, &mut self.output, index, output);
         } else if !entry.record.owes_output() {

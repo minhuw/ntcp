@@ -1832,6 +1832,17 @@ impl Connection {
         crate::time_wait::reincarnation_iss(self.snd_nxt, candidate)
     }
 
+    // TIME-WAIT ends: at its timer, or when a reopening SYN gave the tuple
+    // to a new connection.
+    pub(crate) fn end_time_wait(&mut self) {
+        debug_assert_eq!(self.state, State::TimeWait);
+        self.state = State::Closed;
+        self.pacing_deadline = None;
+        self.pacer = Pacer::default();
+        self.time_wait_deadline = None;
+        self.ack_pending = false;
+    }
+
     #[cfg(test)]
     pub(crate) fn transport_info(&self) -> TransportInfo {
         self.transport_info_at(self.now)
@@ -10801,11 +10812,7 @@ impl Connection {
         //# If the time-wait timeout expires on a connection, delete the TCB, enter the
         //# CLOSED state, and return.
         if due(self.time_wait_deadline, now) {
-            self.state = State::Closed;
-            self.pacing_deadline = None;
-            self.pacer = Pacer::default();
-            self.time_wait_deadline = None;
-            self.ack_pending = false;
+            self.end_time_wait();
             return Ok(());
         }
         if core::mem::take(&mut self.timestamp_ambiguous) {
