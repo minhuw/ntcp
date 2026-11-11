@@ -2658,6 +2658,9 @@ mod tests {
     static SIGNAL_SOCKET: AtomicI32 = AtomicI32::new(-1);
     static SIGNAL_EPOLL: AtomicI32 = AtomicI32::new(-1);
     static SIGNAL_RESULT: AtomicI32 = AtomicI32::new(0);
+    // Distinct pass values: the close check cannot pass on signal_io's result.
+    const SIGNAL_IO_PASSED: i32 = 1;
+    const SIGNAL_CLOSE_PASSED: i32 = 2;
     extern "C" fn signal_io(_: i32) {
         let byte = 1u8;
         let native = unsafe {
@@ -2720,7 +2723,10 @@ mod tests {
             && native_select
             && native_pselect
             && virtual_poll;
-        SIGNAL_RESULT.store(if passed { 1 } else { -1 }, Ordering::Relaxed);
+        SIGNAL_RESULT.store(
+            if passed { SIGNAL_IO_PASSED } else { -1 },
+            Ordering::Relaxed,
+        );
     }
     unsafe extern "C" fn signal_close(_: i32) {
         let managed =
@@ -2743,9 +2749,9 @@ mod tests {
         let native = alias >= 0 && unsafe { close(alias) } == 0;
         SIGNAL_RESULT.store(
             if managed && managed_read && managed_epoll && native {
-                1
+                SIGNAL_CLOSE_PASSED
             } else {
-                -1
+                -SIGNAL_CLOSE_PASSED
             },
             Ordering::Relaxed,
         );
@@ -2765,7 +2771,22 @@ mod tests {
         let mut action: sigaction = unsafe { std::mem::zeroed() };
         let mut old: sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = signal_io as *const () as usize;
+        SIGNAL_RESULT.store(0, Ordering::Relaxed);
         assert_eq!(unsafe { libc::sigaction(SIGUSR1, &action, &mut old) }, 0);
+        // On every exit, failed assertions included: drop an unfired hook so
+        // it cannot leak to a later close on this thread, and restore the
+        // process-wide handler and alarm.
+        struct Restore(sigaction);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                NATIVE_CLOSE_ENTERED.with(|hook| hook.borrow_mut().take());
+                unsafe {
+                    libc::alarm(0);
+                    libc::sigaction(SIGUSR1, &self.0, ptr::null_mut());
+                }
+            }
+        }
+        let restore = Restore(old);
         unsafe {
             libc::alarm(5);
         }
@@ -2783,7 +2804,8 @@ mod tests {
             }),
             0
         );
-        assert_eq!(SIGNAL_RESULT.load(Ordering::Relaxed), 1);
+        assert_eq!(SIGNAL_RESULT.load(Ordering::Relaxed), SIGNAL_IO_PASSED);
+        SIGNAL_RESULT.store(0, Ordering::Relaxed);
         // Interrupt the exported C native close while its reader is held.
         // All managed registry access fails closed at Rust DEPTH=1; nested
         // native dup/close stays lockfree even while TOKENS is held.
@@ -2805,8 +2827,11 @@ mod tests {
         );
         let native = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
         assert!(native >= 0);
+        let entered = std::rc::Rc::new(Cell::new(false));
+        let hook_entered = entered.clone();
         NATIVE_CLOSE_ENTERED.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(|| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hook_entered.set(true);
                 assert_eq!(
                     unsafe {
                         syscall(
@@ -2822,13 +2847,14 @@ mod tests {
         });
         {
             let _tokens = TOKENS.lock().unwrap();
+            // Every managed writer holds TOKENS while FD_MUTATION is -1, so
+            // no thread is mid-change and the native reader is admitted.
+            assert!(FD_MUTATION.load(Ordering::Acquire) >= 0);
             assert_eq!(unsafe { close(native) }, 0);
         }
-        unsafe {
-            libc::alarm(0);
-            libc::sigaction(SIGUSR1, &old, ptr::null_mut());
-        }
-        assert_eq!(SIGNAL_RESULT.load(Ordering::Relaxed), 1);
+        drop(restore);
+        assert!(entered.get(), "close did not enter its native fast path");
+        assert_eq!(SIGNAL_RESULT.load(Ordering::Relaxed), SIGNAL_CLOSE_PASSED);
         let mut byte = 0u8;
         assert_eq!(
             unsafe { read(pipes[0], (&mut byte as *mut u8).cast(), 1) },
