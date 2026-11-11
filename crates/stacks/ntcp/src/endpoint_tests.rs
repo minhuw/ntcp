@@ -3121,7 +3121,18 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
                             },
                             "old={old_timestamps} server={server_timestamps} client={client_timestamps} ts_delta={timestamp_delta} seq_delta={sequence_delta}"
                         );
-                        assert_eq!(b.state(old), Ok(State::TimeWait));
+                        // A reopening SYN ends the old TIME-WAIT at once, as
+                        // Linux deletes its timewait socket (TCP_TW_SYN); the
+                        // application still holding it sees it closed.
+                        assert_eq!(
+                            b.state(old),
+                            Ok(if expected {
+                                State::Closed
+                            } else {
+                                State::TimeWait
+                            })
+                        );
+                        assert_eq!(b.time_wait_connections(), usize::from(!expected));
                         assert_eq!(
                             b.accept(listener),
                             Err(EndpointError::Connection(Error::WouldBlock))
@@ -3175,7 +3186,8 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
                                     .unwrap();
                                 assert_eq!(b.state(child), Ok(State::SynReceived));
                                 assert_eq!(packets(&mut b, 5_000).len(), 1);
-                                assert_eq!(b.state(old), Ok(State::TimeWait));
+                                assert_eq!(b.state(old), Ok(State::Closed));
+                                assert_eq!(b.time_wait_connections(), 0);
                             }
                         }
                     }
@@ -3311,7 +3323,18 @@ fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization() {
                                 },
                                 "old={old_timestamps} local={server_timestamps} peer={client_timestamps} ts={timestamp_delta} seq={sequence_delta} flags={auxiliary}"
                             );
-                            assert_eq!(b.state(old), Ok(State::TimeWait));
+                            // An accepted SYN ends the old TIME-WAIT at once
+                            // (TCP_TW_SYN), leaving its metadata and data as
+                            // they were.
+                            assert_eq!(
+                                b.state(old),
+                                Ok(if expected {
+                                    State::Closed
+                                } else {
+                                    State::TimeWait
+                                })
+                            );
+                            assert_eq!(b.time_wait_connections(), usize::from(!expected));
                             assert_eq!(b.received_ipv4_options(old).unwrap(), old_options);
                             assert_eq!(b.readable_bytes(old), Ok(0));
                             let current = b.connection_id(tuple).unwrap();
@@ -3384,6 +3407,8 @@ fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization() {
                                 );
                                 assert_ne!(b.connection_id(tuple), Some(old));
                                 assert_eq!(packets(&mut b, 5_000).len(), 1);
+                                assert_eq!(b.state(old), Ok(State::Closed));
+                                assert_eq!(b.time_wait_connections(), 0);
                             }
                         }
                     }

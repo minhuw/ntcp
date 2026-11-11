@@ -348,6 +348,10 @@ fn packet_test_timestamp_default_controls_time_wait_reuse_without_changing_old_s
         deliver(&mut client, 210, &packet(&mut server, 200));
         assert_eq!(server.state(child), Ok(State::TimeWait));
         server.release(child).unwrap();
+        // Released with its last ACK sent, only its TIME-WAIT record holds
+        // the tuple.
+        assert!(!server.connection_exists(child));
+        assert_eq!(server.time_wait_connections(), 1);
         let old_expiry = server.next_deadline();
         let tuple = Tuple {
             local: remote,
@@ -379,14 +383,28 @@ fn packet_test_timestamp_default_controls_time_wait_reuse_without_changing_old_s
             server.input(300, first_syn.0, &syn),
             Ok(InputDisposition::Dropped)
         );
-        assert_eq!(server.connection_id(tuple), Some(child));
+        // The record is untouched: still in TIME-WAIT, its timer unchanged,
+        // nothing sent and no connection opened.
+        assert_eq!(server.time_wait_connections(), 1);
+        assert_eq!(server.connection_id(tuple), None);
         assert_eq!(server.next_deadline(), old_expiry);
+        assert!(
+            server
+                .poll_transmit(300, &mut [0; 2000], 8)
+                .unwrap()
+                .packet
+                .is_none()
+        );
         server.packet_test_timestamp_default(true);
         assert_eq!(
             server.input(301, first_syn.0, &syn),
             Ok(InputDisposition::Processed)
         );
-        assert_ne!(server.connection_id(tuple), Some(child));
+        let reopened = server.connection_id(tuple).unwrap();
+        assert_ne!(reopened, child);
+        assert_eq!(server.state(reopened), Ok(State::SynReceived));
+        // The new connection's tuple ends the record's TIME-WAIT.
+        assert_eq!(server.time_wait_connections(), 0);
         let reply = packet(&mut server, 301);
         let reply = wire::parse(reply.0, &reply.1).unwrap();
         assert_eq!(
