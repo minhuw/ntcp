@@ -739,6 +739,52 @@ fn deterministic_idle_eviction_and_repeated_lifecycle_has_no_pin_or_client_leaks
 }
 
 #[test]
+fn dirtied_clients_are_queued_once_until_taken() {
+    let (mut service, _, _, req) = setup(4, 4, false, 1500);
+    let (a, first) = service.acquire(req).unwrap();
+    let (b, _) = service.acquire(req).unwrap();
+    // New clients are dirty, and queued in the order they were dirtied.
+    assert_eq!(service.queued_dirty(), 2);
+    assert_eq!(service.take_dirty(), Some(a));
+    assert_eq!(service.take_dirty(), Some(b));
+    assert_eq!((service.take_dirty(), service.queued_dirty()), (None, 0));
+    clean(&mut service, a);
+    clean(&mut service, b);
+    // Two changes to their path queue each client once.
+    service.trusted_decrease(first.path(), 1400).unwrap();
+    service.trusted_decrease(first.path(), 1300).unwrap();
+    assert_eq!(service.queued_dirty(), 2);
+    // Taking does not acknowledge; one acknowledged since it was queued is
+    // taken as None.
+    clean(&mut service, a);
+    assert_eq!(service.take_dirty(), None);
+    assert_eq!(service.take_dirty(), Some(b));
+    assert!(service.is_dirty(b).unwrap());
+    // A holder that could not serve it queues it again, while it is dirty.
+    service.requeue_dirty(b).unwrap();
+    service.requeue_dirty(a).unwrap();
+    assert_eq!(service.queued_dirty(), 1);
+    assert_eq!(service.take_dirty(), Some(b));
+    clean(&mut service, b);
+    service.requeue_dirty(b).unwrap();
+    assert_eq!(service.queued_dirty(), 0);
+    // A client released while queued is taken as None; a rebound one under
+    // its new handle.
+    let (c, _) = service.acquire(req).unwrap();
+    service.release(c).unwrap();
+    assert_eq!(service.take_dirty(), None);
+    let other = PathRequest {
+        destination: address("203.0.113.1"),
+        ..req
+    };
+    let (rebound, _) = service.rebind(b, other).unwrap();
+    assert_eq!(service.requeue_dirty(b), Err(Error::StaleHandle));
+    assert_eq!(service.take_dirty(), Some(rebound));
+    assert_eq!((service.take_dirty(), service.queued_dirty()), (None, 0));
+    assert_eq!(rebound.index(), b.index());
+}
+
+#[test]
 fn released_client_slots_are_acquired_again_until_the_table_is_full() {
     let (mut service, _, _, req) = setup(1, 3, false, 1500);
     let mut clients: Vec<_> = (0..3).map(|_| service.acquire(req).unwrap().0).collect();

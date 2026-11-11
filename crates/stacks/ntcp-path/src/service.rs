@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::{
     cmp::Reverse,
     mem::size_of,
@@ -492,6 +492,12 @@ pub struct PathService {
     // slot is allocated with the table, so acquiring and releasing a client
     // never allocates nor passes over the clients.
     free_clients: Vec<usize>,
+    // The client slots dirtied since they were last taken (`take_dirty`),
+    // oldest first, and per slot whether it is queued, so that a slot is
+    // queued once however often it is dirtied: room for every slot is
+    // allocated with the table.
+    dirty_queue: VecDeque<usize>,
+    queued: Vec<bool>,
     // Owner policy per route slot, preallocated beside the route table.
     route_admin: Vec<RouteAdmin>,
     // Immutable SR segment list S1..Sn of the route in the same slot and
@@ -525,6 +531,8 @@ impl PathService {
             (limits.paths, size_of::<Slot<CachedPath>>()),
             (limits.clients, size_of::<Slot<Client>>()),
             (limits.clients, size_of::<usize>()),
+            (limits.clients, size_of::<usize>()),
+            (limits.clients, size_of::<bool>()),
             (limits.routes, size_of::<RouteAdmin>()),
             (limits.routes, size_of::<Box<[Ipv6Addr]>>()),
             (limits.paths, size_of::<Option<redirect::Redirect>>()),
@@ -551,6 +559,21 @@ impl PathService {
                     .map_err(|_| Error::Allocation)?;
                 slots.extend((0..limits.clients).rev());
                 slots
+            },
+            dirty_queue: {
+                let mut slots = VecDeque::new();
+                slots
+                    .try_reserve_exact(limits.clients)
+                    .map_err(|_| Error::Allocation)?;
+                slots
+            },
+            queued: {
+                let mut queued = Vec::new();
+                queued
+                    .try_reserve_exact(limits.clients)
+                    .map_err(|_| Error::Allocation)?;
+                queued.resize(limits.clients, false);
+                queued
             },
             route_admin: {
                 let mut records = Vec::new();

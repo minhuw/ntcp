@@ -257,6 +257,13 @@ pub(crate) struct Udp {
 const UNSPECIFIED: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 impl Udp {
+    // Each flow holding a path, by slot, with its client.
+    pub(crate) fn clients(&self) -> impl Iterator<Item = (usize, ntcp_path::ClientId)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| Some((slot, s.flow.as_ref()?.path?.client)))
+    }
     pub fn new(limits: UdpLimits) -> Result<Self, Error> {
         if limits.flows != 0
             && (limits.receive_datagrams == 0
@@ -481,6 +488,7 @@ impl Host {
                 let resolved = self.paths.resolve_via(request, via)?;
                 self.forwarding_resolved(resolved.key())?;
                 let (client, snapshot) = self.paths.acquire_via(request, via)?;
+                self.holders[client.index()] = crate::Holder::Flow(slot);
                 // The flow observes its initial path here (and through
                 // `udp_path_limits`); only later changes notify it.
                 self.paths.acknowledge(client, snapshot.stamp())?;
@@ -515,6 +523,7 @@ impl Host {
     pub fn udp_close(&mut self, id: UdpFlowId) -> Result<(), Error> {
         let flow = self.udp.flow(id)?;
         if let Some(path) = flow.path {
+            self.holders[path.client.index()] = crate::Holder::None;
             self.paths.release(path.client)?;
         }
         if let Some(index) = self.ledger.owner_index(Owner::Datagram {
@@ -793,6 +802,7 @@ impl Host {
                     Some(old) => self.paths.rebind_via(old.client, request, via)?,
                     None => self.paths.acquire_via(request, via)?,
                 };
+                self.holders[client.index()] = crate::Holder::Flow(slot);
                 PreparedPath { client, snapshot }
             }
         };

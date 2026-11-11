@@ -15,6 +15,15 @@ pub use admin::*;
 handle!(PathId);
 handle!(ClientId);
 
+impl ClientId {
+    /// The client's slot, below the service's client limit: an embedding
+    /// may keep its own per-client records by it. A released client's slot
+    /// is reused by a later client, which has another handle.
+    pub const fn index(self) -> usize {
+        self.0.slot
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidationReason {
     SourceRemoved,
@@ -427,12 +436,21 @@ impl PathService {
     //# The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
     fn mark_dirty(&mut self, path: PathId) {
         self.dirtied += 1;
-        for slot in &mut self.clients.slots {
-            if let Some(client) = &mut slot.value {
-                if client.path == path {
-                    client.dirty = true;
-                }
+        for index in 0..self.clients.slots.len() {
+            if let Some(client) = &mut self.clients.slots[index].value
+                && client.path == path
+            {
+                client.dirty = true;
+                self.queue_dirty(index);
             }
+        }
+    }
+    // Every client made dirty, by a change to its path or as a new or
+    // rebound client, is queued for `take_dirty`.
+    fn queue_dirty(&mut self, slot: usize) {
+        if !core::mem::replace(&mut self.queued[slot], true) {
+            debug_assert!(self.dirty_queue.len() < self.dirty_queue.capacity());
+            self.dirty_queue.push_back(slot);
         }
     }
 
@@ -604,6 +622,7 @@ impl PathService {
             generation,
             Client { path, dirty: true },
         ));
+        self.queue_dirty(client_slot);
         self.dirtied += 1;
         self.generation = generation;
         self.revision = revision;
@@ -656,6 +675,7 @@ impl PathService {
             generation,
             Client { path, dirty: true },
         ));
+        self.queue_dirty(client.0.slot);
         self.dirtied += 1;
         self.generation = generation;
         self.revision = revision;
@@ -726,6 +746,41 @@ impl PathService {
     /// has none to look for.
     pub fn dirtied(&self) -> u64 {
         self.dirtied
+    }
+
+    /// Clients queued for `take_dirty`: a pass that takes this many visits
+    /// every client dirtied before it began, and none it queues again.
+    pub fn queued_dirty(&self) -> usize {
+        self.dirty_queue.len()
+    }
+
+    /// Takes the client queued first: its handle while it is still dirty,
+    /// otherwise (acknowledged or released since, or none queued) None. A
+    /// client is queued when it is acquired or rebound, and when a change to
+    /// its path dirties it, once until it is taken: a holder serves the
+    /// clients that may need it without a pass over every client. Taking
+    /// does not acknowledge; a holder that could not serve the client queues
+    /// it again (`requeue_dirty`).
+    pub fn take_dirty(&mut self) -> Option<ClientId> {
+        let slot = self.dirty_queue.pop_front()?;
+        self.queued[slot] = false;
+        let record = &self.clients.slots[slot];
+        record.value.filter(|c| c.dirty).map(|_| {
+            ClientId(Handle {
+                context: self.context,
+                slot,
+                generation: record.generation,
+            })
+        })
+    }
+
+    /// Queue a client taken by `take_dirty` again, after those queued now,
+    /// if it is still dirty.
+    pub fn requeue_dirty(&mut self, client: ClientId) -> Result<(), Error> {
+        if self.clients.get_ref(self.context, client.0)?.dirty {
+            self.queue_dirty(client.0.slot);
+        }
+        Ok(())
     }
 
     /// Callback-free, allocation-free bounded scan. Reading does not consume.

@@ -577,6 +577,14 @@ struct Registration {
     plan: Ipv4RegistrationPlan,
     authorized: path::PathKey,
 }
+// What holds a PathService client (`Host::holders`). Output leases and
+// ICMP output are not listed: they read their path when they use it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Holder {
+    None,
+    Binding(usize),
+    Flow(usize),
+}
 #[derive(Clone, Copy)]
 struct Lease {
     attempt: TransmitAttempt,
@@ -612,10 +620,12 @@ pub struct Host {
     // whose owners hold results to publish.
     unaged: Live,
     unpublished: Live,
-    // The endpoint's reclaim count and the PathService's dirtied count
-    // when the last pass that depends on them completed.
+    // The endpoint's reclaim count when the last collection completed.
     reclaimed: u64,
-    dirtied: u64,
+    // Per PathService client slot (`ClientId::index`), the binding or
+    // datagram flow it serves, which a change service pass brings a dirty
+    // client taken from the service's queue to.
+    holders: Vec<Holder>,
     leases: Vec<Option<Lease>>,
     ledger: Ledger,
     udp: Udp,
@@ -723,7 +733,7 @@ impl Host {
             unaged: Live::new(limits.bindings)?,
             unpublished: Live::new(limits.bindings)?,
             reclaimed: 0,
-            dirtied: 0,
+            holders: table(path_limits.clients, Holder::None)?,
             leases: table(limits.output_leases, None)?,
             ledger: Ledger::new(limits.ledger)?,
             udp: Udp::new(limits.udp)?,
@@ -1084,6 +1094,23 @@ impl Host {
         }
         self.live_bindings.iter().find(|&index| owned(index))
     }
+    // Whether `holders` names exactly the bindings' and flows' clients:
+    // the scans it replaces, for debug assertions.
+    fn holders_listed(&self) -> bool {
+        let bindings = (0..self.bindings.len()).filter_map(|index| {
+            let client = self.bindings[index]?.prepared.client;
+            Some((client, Holder::Binding(index)))
+        });
+        let flows = self
+            .udp
+            .clients()
+            .map(|(slot, client)| (client, Holder::Flow(slot)));
+        let mut listed = 0;
+        bindings.chain(flows).all(|(client, holder)| {
+            listed += 1;
+            self.holders[client.index()] == holder
+        }) && self.holders.iter().filter(|&&h| h != Holder::None).count() == listed
+    }
     // The record of a prepared binding no connection has committed yet.
     fn provisional(&self, prepared: PreparedPath) -> Option<usize> {
         debug_assert!(
@@ -1351,37 +1378,40 @@ impl Host {
                 Err(error) => report.fail(error),
             }
         }
-        // Clients become dirty only by what advances `dirtied`. A pass that
-        // left one dirty by a failure is made again.
-        let dirtied = self.paths.dirtied();
-        if dirtied != self.dirtied {
-            let failed = report.failed;
-            let mut next = 0;
-            while let Some(index) = self.live_bindings.next(next) {
-                next = index + 1;
-                let Some((owner, client)) = self.bindings[index]
-                    .as_ref()
-                    .and_then(|b| Some((b.owner?, b.prepared.client)))
-                else {
-                    continue;
-                };
-                if !self.paths.is_dirty(client)? {
-                    continue;
+        debug_assert!(self.holders_listed());
+        // The path service queues each client it makes dirty. A pass serves
+        // those queued when it began: a TCP binding's by budget-only
+        // application, a datagram flow's by its change notification. One
+        // that fails stays dirty and is queued again for the next pass.
+        for _ in 0..self.paths.queued_dirty() {
+            let Some(client) = self.paths.take_dirty() else {
+                continue;
+            };
+            let served = match self.holders[client.index()] {
+                Holder::Binding(index) => {
+                    let binding = self.bindings[index].unwrap();
+                    debug_assert_eq!(binding.prepared.client, client);
+                    match binding.owner {
+                        Some(owner) => self.refresh(endpoint, owner).map(|_| true),
+                        // Not yet committed: served once it is.
+                        None => Ok(false),
+                    }
                 }
-                match self.refresh(endpoint, owner) {
-                    Ok(_) => report.applied += 1,
-                    Err(error) => report.fail(error),
-                }
+                Holder::Flow(slot) => self.udp_service(slot),
+                Holder::None => continue,
+            };
+            match served {
+                Ok(true) => report.applied += 1,
+                Ok(false) => {}
+                Err(error) => report.fail(error),
             }
-            for slot in 0..self.udp.limits.flows {
-                match self.udp_service(slot) {
-                    Ok(true) => report.applied += 1,
-                    Ok(false) => {}
-                    Err(error) => report.fail(error),
-                }
-            }
-            if report.failed == failed {
-                self.dirtied = dirtied;
+            // A client rebound before its service failed is stale: the
+            // rebind queued its successor.
+            if !matches!(served, Ok(true))
+                && let Err(error) = self.paths.requeue_dirty(client)
+                && error != path::Error::StaleHandle
+            {
+                return Err(error.into());
             }
         }
         Ok(report)
@@ -1528,6 +1558,7 @@ impl Host {
                 {
                     *entry = None;
                 }
+                self.holders[binding.prepared.client.index()] = Holder::None;
                 self.paths.release(binding.prepared.client)?;
             }
         }
@@ -3183,6 +3214,7 @@ impl PathProvider for Host {
         let resolved = self.paths.resolve_via(request, via)?;
         self.forwarding_resolved(resolved.key())?;
         let (client, snapshot) = self.paths.acquire_via(request, via)?;
+        self.holders[client.index()] = Holder::Binding(index);
         let prepared = PreparedPath { client, snapshot };
         // A planned open is authorized for exactly the authority selected
         // in this serialized preparation.
@@ -3222,6 +3254,7 @@ impl PathProvider for Host {
         let index = self
             .provisional(prepared)
             .expect("prepared binding preflight");
+        self.holders[prepared.client.index()] = Holder::None;
         self.paths
             .release(prepared.client)
             .expect("live provisional client");
