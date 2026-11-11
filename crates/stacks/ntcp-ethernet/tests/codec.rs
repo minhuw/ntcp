@@ -333,6 +333,7 @@ fn ethernet_fragment_framing_and_padding() {
 // host, which originates their errors; physical truncation is refused. The
 // non-reassembling framing still refuses every extension selector.
 #[test]
+#[cfg(feature = "ipv6")]
 fn fragment_framing_passes_complete_ipv6_packets_with_faulty_extensions() {
     let mut ip = vec![0u8; IPV6_HEADER + 24];
     ip[0] = 0x60;
