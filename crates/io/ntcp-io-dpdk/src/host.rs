@@ -4,7 +4,7 @@
 //! Teardown order is structural: flows and queues hold the port, so the port
 //! is stopped and closed, and its pools freed, only after all of them drop.
 
-use crate::native::Dpdk;
+use crate::native::{Dpdk, tso_check};
 use ntcp_io::{
     ClockDescriptor, ClockDomain, OwnedPacket, PacketIo, PacketLayer, Payload, ReceivedPacket,
     TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
@@ -35,6 +35,7 @@ struct PortSetup {
     rx_timestamps: u8,
     rss: u8,
     rss_key_len: u8,
+    tcp_segmentation: u8,
     rss_key: *const u8,
 }
 
@@ -62,6 +63,7 @@ unsafe extern "C" {
         tx_desc: *mut u16,
         stage: *mut i32,
         key_size: *mut u8,
+        tcp_segmentation: *mut u8,
     ) -> i32;
     fn ntcp_dpdk_port_queue_setup(
         port: u16,
@@ -257,6 +259,19 @@ pub struct PortConfig {
     /// what flow rules match, so the table would spread nothing. `Port::rss`
     /// reads the key and redirection table back.
     pub rss: bool,
+    /// TCP segmentation offload, when the device offers it: TX offloads
+    /// RTE_ETH_TX_OFFLOAD_TCP_TSO, TCP_CKSUM and IPV4_CKSUM, the checksum
+    /// offloads filling each segment's checksums, enabled on the port, and
+    /// every hosted queue opted in at attach (`Dpdk::enable_tcp_segmentation`),
+    /// before any Network reads its `tcp_segmentation_capabilities`. A device
+    /// without all three starts without them, and one whose queues that
+    /// opt-in refuses (it cannot read a queue's actual configuration, as on
+    /// net_tap) keeps them unused; `Port::tcp_segmentation` tells which.
+    /// Only frames handed to `transmit_segmented` use them. An aggregate is
+    /// a chain of mbufs of `mbuf_data_size` octets, up to 64 KiB, held from
+    /// the queue's pool until the device has sent it; a pool short of them
+    /// blocks the aggregate (WouldBlock) until the ring drains.
+    pub tcp_segmentation: bool,
     /// Hash key for `rss`, exactly the device's hash key size (40 octets on
     /// mlx5). None keeps the PMD's key. Its length is checked whenever it is
     /// given, also with a single queue, where it goes unused.
@@ -279,6 +294,7 @@ impl PortConfig {
             rx_timestamps: false,
             rss: false,
             rss_key: None,
+            tcp_segmentation: false,
         }
     }
 }
@@ -296,6 +312,7 @@ struct PortInner {
     taken: Box<[AtomicBool]>,
     clock: Option<ClockDescriptor>,
     rss: bool,
+    tcp_segmentation: bool,
     // ethdev keeps a pointer to the configured key; it lives with the port.
     _rss_key: Option<Box<[u8]>>,
 }
@@ -324,9 +341,10 @@ impl Drop for PortInner {
 /// A started Ethernet port owned by this process (ethdev ownership), with
 /// one pool per queue pair on the device's NUMA socket. RX keeps complete,
 /// untransformed frames: no VLAN/QinQ stripping, LRO or other byte-changing
-/// offloads; RX scatter and TX multi-segment are enabled only as described on
-/// `PortConfig`. Queues receive what flows steer to them; without `rss`,
-/// unmatched traffic goes to queue 0 (or, isolated, to the kernel).
+/// offloads; RX scatter, TX multi-segment and TCP segmentation are enabled
+/// only as described on `PortConfig`. Queues receive what flows steer to
+/// them; without `rss`, unmatched traffic goes to queue 0 (or, isolated, to
+/// the kernel).
 pub struct Port {
     inner: Arc<PortInner>,
 }
@@ -374,6 +392,7 @@ impl Port {
                 },
             }),
             rss,
+            tcp_segmentation: false,
             _rss_key: rss_key,
         };
         if config.isolate {
@@ -394,12 +413,14 @@ impl Port {
             rx_timestamps: u8::from(config.rx_timestamps),
             rss: u8::from(rss),
             rss_key_len,
+            tcp_segmentation: u8::from(config.tcp_segmentation),
             rss_key: inner
                 ._rss_key
                 .as_ref()
                 .map_or(std::ptr::null(), |key| key.as_ptr()),
         };
         let (mut rx_desc, mut tx_desc, mut stage, mut key_size) = (0, 0, 0, 0);
+        let mut tcp_segmentation = 0;
         // SAFETY: claimed port; all pointers are valid for the call, and the
         // key for as long as the port (it is owned by `inner`).
         let result = unsafe {
@@ -410,6 +431,7 @@ impl Port {
                 &mut tx_desc,
                 &mut stage,
                 &mut key_size,
+                &mut tcp_segmentation,
             )
         };
         if result < 0 {
@@ -430,6 +452,7 @@ impl Port {
             };
             return Err(dpdk_error(context, result));
         }
+        inner.tcp_segmentation = tcp_segmentation != 0;
         if u64::from(config.mbufs_per_queue) <= u64::from(rx_desc) + u64::from(tx_desc) {
             return Err(invalid(&format!(
                 "mbufs_per_queue {} must exceed rx_desc {rx_desc} + tx_desc {tx_desc}",
@@ -469,6 +492,14 @@ impl Port {
             return Err(dpdk_error("rte_eth_dev_start", result));
         }
         inner.started = true;
+        // The adapter's own check (Dpdk::enable_tcp_segmentation) of every
+        // queue: a device can take the offloads yet keep a queue's actual
+        // configuration unreadable (net_tap has no txq_info_get), which the
+        // check refuses, and then no queue segments.
+        inner.tcp_segmentation &= inner.pools.iter().zip(0..).all(|(pool, queue)| {
+            // SAFETY: started port with this queue and its pool configured.
+            unsafe { tso_check(port, queue, pool.as_ptr()) }.is_ok()
+        });
         Ok(Port {
             inner: Arc::new(inner),
         })
@@ -488,6 +519,13 @@ impl Port {
     /// `read_clock`.
     pub fn clock(&self) -> Option<ClockDescriptor> {
         self.inner.clock
+    }
+
+    /// Whether `tcp_segmentation` was requested, the device offered it and
+    /// every queue passed the adapter's check: every attached queue then
+    /// takes TCP aggregates.
+    pub fn tcp_segmentation(&self) -> bool {
+        self.inner.tcp_segmentation
     }
 
     /// Current device clock (rte_eth_read_clock), in the same raw units as
@@ -876,7 +914,8 @@ impl QueueHandle {
     /// Run on the worker thread that will poll the queue. Registers the thread
     /// with EAL (rte_thread_register; this disables DPDK multi-process) unless
     /// it already is an EAL lcore, and builds the adapter. With
-    /// `rx_timestamps`, RX timestamps carry `Port::clock()`.
+    /// `rx_timestamps`, RX timestamps carry `Port::clock()`; with
+    /// `Port::tcp_segmentation`, the queue takes TCP aggregates.
     pub fn attach(mut self) -> io::Result<HostedQueue> {
         let registration = Registration::acquire()?;
         let pool = self.port.pools[usize::from(self.queue)];
@@ -893,6 +932,9 @@ impl QueueHandle {
             unsafe { Dpdk::from_borrowed(self.port.port, self.queue, self.queue, pool.as_ptr()) }?;
         if let Some(clock) = self.port.clock {
             io.enable_rx_timestamps(clock)?;
+        }
+        if self.port.tcp_segmentation {
+            io.enable_tcp_segmentation()?;
         }
         self.attached = true;
         Ok(HostedQueue {

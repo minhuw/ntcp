@@ -520,7 +520,7 @@ static const uint64_t ntcp_rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_I
 // frames larger than one mbuf) are enabled on RX; nothing strips or merges.
 int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *config,
                              uint16_t *rx_desc, uint16_t *tx_desc, int *stage,
-                             uint8_t *key_size) {
+                             uint8_t *key_size, uint8_t *tcp_segmentation) {
     struct rte_eth_dev_info info;
     *stage = NTCP_STAGE_INFO;
     int result = rte_eth_dev_info_get(port, &info);
@@ -552,6 +552,15 @@ int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *confi
         *stage = NTCP_STAGE_MULTI_SEGS;
         return -ENOTSUP;
     }
+    // TCP segmentation, when requested and the device offers it with the
+    // checksum offloads that fill each segment's checksums
+    // (ntcp_dpdk_tso_gate). Only mbufs that ask for them, by their ol_flags
+    // (ntcp_dpdk_tso_transmit), are segmented or checksummed.
+    const uint64_t segmentation = RTE_ETH_TX_OFFLOAD_TCP_TSO |
+        RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+    *tcp_segmentation = config->tcp_segmentation &&
+        (info.tx_offload_capa & segmentation) == segmentation;
+    if (*tcp_segmentation) tx |= segmentation;
     // Without RSS a queue receives only what flows steer to it (or queue 0's
     // default traffic), so each worker sees exactly its own connections. With
     // RSS, unsteered traffic is spread by the device's hash and redirection

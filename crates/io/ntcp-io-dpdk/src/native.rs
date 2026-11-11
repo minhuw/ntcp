@@ -27,7 +27,7 @@ pub use shared::DpdkBuffer;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct TsoConfig {
+pub(crate) struct TsoConfig {
     mtu: u16,
     room: u16,
     max_descriptors: u16,
@@ -114,6 +114,21 @@ pub struct Dpdk {
     rx_timestamp: Option<TimestampConfig>,
     tx_scheduling: Option<TimestampConfig>,
     _local: PhantomData<Rc<()>>,
+}
+
+// enable_tcp_segmentation's check of TX queue `queue`'s actual offloads,
+// descriptor limits, MTU and pool geometry, also for the host that
+// configured the port (Port::start).
+// The caller guarantees that EAL is initialized and that the port, its
+// configured queue and the pktmbuf pool are live for the call.
+pub(crate) unsafe fn tso_check(port: u16, queue: u16, pool: *mut c_void) -> io::Result<TsoConfig> {
+    let mut config = TsoConfig::default();
+    // SAFETY: as the caller guarantees; config is writable.
+    let result = unsafe { ntcp_dpdk_tso_check(port, queue, pool, &mut config) };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+    Ok(config)
 }
 
 impl Dpdk {
@@ -203,15 +218,8 @@ impl Dpdk {
     // Read-only control-plane opt-in. The borrowed MTU/config/pool geometry must
     // remain unchanged, as required by from_borrowed. No per-packet query.
     pub fn enable_tcp_segmentation(&mut self) -> io::Result<()> {
-        let mut config = TsoConfig::default();
         // SAFETY: the host keeps the port, queue and pool live and unchanged.
-        let result = unsafe {
-            ntcp_dpdk_tso_check(self.port, self.tx_queue, self.pool.as_ptr(), &mut config)
-        };
-        if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result));
-        }
-        self.tso = Some(config);
+        self.tso = Some(unsafe { tso_check(self.port, self.tx_queue, self.pool.as_ptr()) }?);
         Ok(())
     }
 

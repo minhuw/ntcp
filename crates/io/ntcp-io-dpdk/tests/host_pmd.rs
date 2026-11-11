@@ -97,6 +97,7 @@ fn hosted_ring_ports() {
     rejected_configurations(eal);
     mac_addresses(eal);
     rss_ports(eal);
+    segmentation_not_offered(eal);
     outstanding_mbufs_retain_pool(eal);
 }
 
@@ -112,6 +113,7 @@ fn port_lifecycle(eal: &'static Eal) {
     assert_eq!(port.queues(), 4);
     assert_eq!(pools(), (4, 4));
     assert_eq!(port.clock(), None);
+    assert!(!port.tcp_segmentation()); // Off by default.
     assert_eq!(
         port.read_clock().unwrap_err().kind(),
         ErrorKind::Unsupported
@@ -474,6 +476,24 @@ fn rss_ports(eal: &'static Eal) {
         ErrorKind::InvalidInput
     );
     assert_eq!(port_named("net_null5"), None);
+    assert_eq!(pools(), (0, 0));
+}
+
+// The ring PMD offers no TCP segmentation: a port that asks for it starts
+// without, and its queues take no aggregates but send frames as before.
+fn segmentation_not_offered(eal: &'static Eal) {
+    let mut config = PortConfig::new("net_ring7");
+    config.tcp_segmentation = true;
+    let port = Port::start(eal, config).unwrap();
+    assert!(!port.tcp_segmentation());
+    let mut queue = port.take_queue(0).unwrap().attach().unwrap();
+    assert_eq!(queue.tcp_segmentation_capabilities(), None);
+    let (sent, mut out) = (frame(4, 3000), vec![0; 4096]);
+    assert_eq!(queue.transmit(&sent).unwrap(), TxOutcome::Submitted);
+    assert_eq!(queue.receive(&mut out).unwrap(), Some(sent.len()));
+    assert_eq!(&out[..sent.len()], sent.as_slice());
+    drop((port, queue));
+    assert_eq!(port_named("net_ring7"), None);
     assert_eq!(pools(), (0, 0));
 }
 

@@ -3,16 +3,19 @@
 // thread, the Networks sharing the port's ARP table. With `--members N` the
 // port instead serves one address with N Networks, one per queue pair and
 // worker, that divide its flows (ntcp-native's SharedFlows) and each open
-// their share of the connections. Each connection sends a 16-octet request
-// ([request id: u64 LE][delay us: u64 LE = 0]), waits for the same 16
-// octets back and sends the next. It prints `METRIC name=value` lines and
-// exits nonzero on any failure or if no request completed.
+// their share of the connections. Each connection sends a request of
+// `--request-size` octets (default 16): [request id: u64 LE][delay us: u64
+// LE = 0], then pseudorandom octets drawn from the id and their offset. It
+// waits for the same octets back, compares every one, and sends the next.
+// A larger request needs a peer that echoes the byte stream unchanged, as
+// ntcp-lab's does. It prints `METRIC name=value` lines and exits nonzero
+// on any failure, a differing echo included, or if no request completed.
 //
 //   dpdk_echo --dev DEVARGS [--eal ARG]... --ip A.B.C.D [--ip ...] --prefix LEN
 //             [--gateway A.B.C.D] [--neighbor A.B.C.D=MAC]... --server IP:PORT
-//             [--connections N] [--duration SECS] [--isolate] [--rx-timestamps]
-//             [--cpu N]... [--members N [--steering auto|rules|rss|none]]
-//             [--secret-from-urandom]
+//             [--connections N] [--duration SECS] [--request-size OCTETS]
+//             [--isolate] [--rx-timestamps] [--cpu N]...
+//             [--members N [--steering auto|rules|rss|none]] [--secret-from-urandom]
 //
 // Questions an embedding answers, and this example's answers:
 //
@@ -112,8 +115,17 @@
 //   tiers above it were passed over, are printed, and the choice is
 //   reported as `METRIC steering`. An explicit `--steering rules` or `rss`
 //   fails instead of falling back.
+// - TCP segmentation: the port asks for TSO (`PortConfig::tcp_segmentation`)
+//   and gets it where the device offers it with TCP and IPv4 checksum
+//   offloads; each queue then takes aggregates of many segments, cut by the
+//   device, which also fills their checksums (`PORT ... tso=`, `METRIC
+//   t<k>_tso`). Elsewhere every segment leaves on its own, as before. Only a
+//   write of more than a segment forms an aggregate: requests of 16 octets
+//   never do, `--request-size 65536` does. The echo checks each request's
+//   octets end to end, so a wrongly cut or checksummed aggregate shows as a
+//   differing echo, or as a segment the peer drops and ntcp retransmits.
 
-use ntcp_io::ClockDescriptor;
+use ntcp_io::{ClockDescriptor, PacketIo};
 use ntcp_io_dpdk::{
     ClockCalibration, ClockFit, Eal, Flow, HostedQueue, Port, PortConfig, QueueHandle,
     RssAlgorithm, bracketed_reading,
@@ -148,7 +160,9 @@ const CALIBRATION_PERIOD: u64 = NANOS / 10;
 const CALIBRATION_WINDOW: usize = 32;
 // Device clock reads per paired reading; the most tightly bracketed is kept.
 const CALIBRATION_READS: usize = 3;
+// A request's header, and the whole of the default request.
 const REQUEST_LEN: usize = 16;
+const MAX_REQUEST: usize = 1 << 24;
 // Tagged local ports of `--steering rules`: the IANA dynamic range
 // 49152-65535, NetworkConfig's default ephemeral ports.
 const TAG_PREFIX: u16 = 0xC000;
@@ -175,6 +189,7 @@ struct Args {
     server: SocketAddrV4,
     connections: usize,
     duration: Duration,
+    request_size: usize,
     isolate: bool,
     rx_timestamps: bool,
     cpus: Vec<usize>,
@@ -196,8 +211,8 @@ enum Steering {
 
 const USAGE: &str = "usage: dpdk_echo --dev DEVARGS [--eal ARG]... --ip A.B.C.D [--ip ...] \
 --prefix LEN [--gateway A.B.C.D] [--neighbor A.B.C.D=MAC]... --server IP:PORT \
-[--connections N] [--duration SECS] [--isolate] [--rx-timestamps] [--cpu N]... \
-[--members N [--steering auto|rules|rss|none]] [--secret-from-urandom]
+[--connections N] [--duration SECS] [--request-size OCTETS] [--isolate] [--rx-timestamps] \
+[--cpu N]... [--members N [--steering auto|rules|rss|none]] [--secret-from-urandom]
 
 Without --members, one Network per --ip, each on its own queue (and --cpu, if given).
 --members N: N Networks share the single --ip, one per queue (and --cpu, if given),
@@ -208,7 +223,10 @@ mirrored), 3 rules (member k opens from local ports 0xC000 | k under the mask
 0xC000 | 2^b - 1, b bits numbering the members, and one TCP port rule per member
 steers them to its queue; other flows as rss when usable, else as none; with
 --isolate only on mlx5, which orders the port rules before the address rule).
-auto takes rules when every member's rule installs, else rss when usable, else none.";
+auto takes rules when every member's rule installs, else rss when usable, else none.
+--request-size (default 16, at least 16): each request's octets, echoed and compared;
+above one segment ntcp sends them as TSO aggregates where the port offers TSO
+(METRIC tso_queues, segmented, segmentation_refused).";
 
 fn parse_mac(text: &str) -> Result<[u8; 6], String> {
     let mut mac = [0; 6];
@@ -234,6 +252,7 @@ fn parse_args() -> Result<Args, String> {
         server: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
         connections: 1,
         duration: Duration::from_secs(10),
+        request_size: REQUEST_LEN,
         isolate: false,
         rx_timestamps: false,
         cpus: Vec::new(),
@@ -264,6 +283,12 @@ fn parse_args() -> Result<Args, String> {
             "--duration" => {
                 let seconds: f64 = value()?.parse().map_err(|_| bad("seconds"))?;
                 args.duration = Duration::try_from_secs_f64(seconds).map_err(|_| bad("seconds"))?;
+            }
+            "--request-size" => {
+                args.request_size = value()?.parse().map_err(|_| bad("octets"))?;
+                if !(REQUEST_LEN..=MAX_REQUEST).contains(&args.request_size) {
+                    return Err(bad(&format!("octets ({REQUEST_LEN} to {MAX_REQUEST})")));
+                }
             }
             "--isolate" => args.isolate = true,
             "--rx-timestamps" => args.rx_timestamps = true,
@@ -363,6 +388,8 @@ fn first_cpu(set: &libc::cpu_set_t) -> Option<usize> {
 #[derive(Default)]
 struct Report {
     requests: u64,
+    // Octets of the requests whose echo matched, the request headers included.
+    echoed: u64,
     window_ns: u64,
     software_rtt: Vec<u64>,
     hardware_rtt: Vec<u64>,
@@ -376,6 +403,10 @@ struct Report {
     handed_off: u64,
     handoffs_received: u64,
     handoffs_dropped: u64,
+    // The queue's largest TCP aggregate, None without TCP segmentation.
+    tso: Option<usize>,
+    // Network::counters at the end.
+    counters: ntcp_native::Counters,
     clock: Option<String>,
     fit: Option<ClockFit>,
     calibration_rejected: u64,
@@ -383,9 +414,8 @@ struct Report {
 }
 
 struct Pending {
-    request: [u8; REQUEST_LEN],
+    id: u64,
     written: usize,
-    response: [u8; REQUEST_LEN],
     received: usize,
     started: u64,
     scheduled: Option<u64>,
@@ -396,7 +426,28 @@ struct Connection {
     id: ConnId,
     connected: bool,
     closed: bool,
+    // The pending request's octets, and what has come back of them.
+    request: Vec<u8>,
+    response: Vec<u8>,
     pending: Option<Pending>,
+}
+
+// Request `id`: its header, then octets that depend on the id and their
+// offset (splitmix64 over consecutive states), so an octet echoed from
+// another offset, request or connection differs.
+fn fill_request(request: &mut [u8], id: u64) {
+    let (header, payload) = request.split_at_mut(REQUEST_LEN);
+    header[..8].copy_from_slice(&id.to_le_bytes());
+    header[8..].fill(0);
+    let mut state = id;
+    for chunk in payload.chunks_mut(8) {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
+    }
 }
 
 struct Worker {
@@ -493,6 +544,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     config.queues = threads as u16;
     config.isolate = args.isolate;
     config.rx_timestamps = args.rx_timestamps;
+    // Where the device offers it; Port::tcp_segmentation tells.
+    config.tcp_segmentation = true;
     // An isolated port spreads nothing by RSS; Port::start refuses both.
     // Under rules, RSS spreads the flows no rule takes.
     config.rss = args.members.is_some()
@@ -512,10 +565,11 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let mac = port.mac_address()?;
     let mac_text = mac.map(|o| format!("{o:02x}")).join(":");
     eprintln!(
-        "PORT {} mac={mac_text} queues={} clock={:?}",
+        "PORT {} mac={mac_text} queues={} clock={:?} tso={}",
         port.port_id(),
         port.queues(),
-        port.clock()
+        port.clock(),
+        port.tcp_segmentation()
     );
     // Before any member joins: ownership is fixed for the port's life.
     let steered = match args.members {
@@ -883,11 +937,14 @@ fn summarize(reports: &[Report], neighbors: &SharedNeighbors, steering: Option<S
         for (index, report) in reports.iter().enumerate() {
             eprintln!(
                 "MEMBER {index} connections={} handed_off={} handoffs_received={} \
-                 handoffs_dropped={}",
+                 handoffs_dropped={} tso={} segmented={} segmentation_refused={}",
                 report.connections,
                 report.handed_off,
                 report.handoffs_received,
-                report.handoffs_dropped
+                report.handoffs_dropped,
+                report.tso.is_some(),
+                report.counters.segmented,
+                report.counters.segmentation_refused
             );
         }
         println!("METRIC handed_off={}", sum(|r| r.handed_off));
@@ -902,7 +959,44 @@ fn summarize(reports: &[Report], neighbors: &SharedNeighbors, steering: Option<S
         };
         println!("METRIC steering={code}");
     }
+    println!("METRIC echoed_bytes={}", sum(|r| r.echoed));
+    let tso = reports.iter().filter(|r| r.tso.is_some()).count();
+    println!("METRIC tso_queues={tso}");
+    println!("METRIC segmented={}", sum(|r| r.counters.segmented));
+    println!(
+        "METRIC segmentation_refused={}",
+        sum(|r| r.counters.segmentation_refused)
+    );
+    println!("METRIC transmitted={}", sum(|r| r.counters.transmitted));
+    println!("METRIC received={}", sum(|r| r.counters.received));
     for (index, report) in reports.iter().enumerate() {
+        // Per worker (member k, or the k-th --ip): its queue's segmentation
+        // and its Network's counters.
+        let c = &report.counters;
+        println!("METRIC t{index}_tso={}", u8::from(report.tso.is_some()));
+        if let Some(len) = report.tso {
+            println!("METRIC t{index}_tso_max_aggregate_len={len}");
+        }
+        println!("METRIC t{index}_connections={}", report.connections);
+        println!("METRIC t{index}_requests={}", report.requests);
+        println!("METRIC t{index}_echoed_bytes={}", report.echoed);
+        println!("METRIC t{index}_segmented={}", c.segmented);
+        println!(
+            "METRIC t{index}_segmentation_refused={}",
+            c.segmentation_refused
+        );
+        println!("METRIC t{index}_transmitted={}", c.transmitted);
+        println!("METRIC t{index}_received={}", c.received);
+        println!("METRIC t{index}_discarded={}", c.discarded);
+        println!(
+            "METRIC t{index}_backend_backpressure={}",
+            c.backend_backpressure
+        );
+        println!("METRIC t{index}_arp_sent={}", c.arp_sent);
+        println!("METRIC t{index}_arp_received={}", c.arp_received);
+        println!("METRIC t{index}_handed_off={}", c.handed_off);
+        println!("METRIC t{index}_handoffs_received={}", c.handoffs_received);
+        println!("METRIC t{index}_handoffs_dropped={}", c.handoffs_dropped);
         println!(
             "METRIC t{index}_calibration_rejected={}",
             report.calibration_rejected
@@ -938,6 +1032,10 @@ fn serve_into(
         .map_err(|e| format!("sched_setaffinity: {e}"))?;
     let queue = worker.handle.attach().map_err(|e| format!("attach: {e}"))?;
     let clock = queue.clock();
+    // Read once, as the Network reads it when it is built.
+    report.tso = queue
+        .tcp_segmentation_capabilities()
+        .map(|c| c.max_aggregate_len);
     let mut calibration = ClockCalibration::new(CALIBRATION_WINDOW).unwrap();
     let calibrate = match queue.read_clock() {
         Ok(_) => true,
@@ -1006,6 +1104,7 @@ fn serve_into(
     report.handed_off = counters.handed_off;
     report.handoffs_received = counters.handoffs_received;
     report.handoffs_dropped = counters.handoffs_dropped;
+    report.counters = counters;
     report.fit = calibration.fit().copied();
     outcome
 }
@@ -1034,6 +1133,8 @@ fn exchange(
             id,
             connected: false,
             closed: false,
+            request: vec![0; args.request_size],
+            response: vec![0; args.request_size],
             pending: None,
         });
     }
@@ -1121,8 +1222,7 @@ fn exchange(
                     continue;
                 };
                 if let Some(pending) = &mut connections[slot].pending
-                    && u64::from_le_bytes(pending.request[..8].try_into().unwrap())
-                        == observation.cookie
+                    && pending.id == observation.cookie
                 {
                     // A partial write's later stamp covers its last octet.
                     pending.scheduled = Some(value);
@@ -1176,38 +1276,40 @@ fn exchange(
 
         for connection in &mut connections {
             if connection.pending.is_none() && now < end {
-                let mut request = [0; REQUEST_LEN];
-                request[..8].copy_from_slice(&next_request.to_le_bytes());
-                next_request += 1;
+                fill_request(&mut connection.request, next_request);
                 connection.pending = Some(Pending {
-                    request,
+                    id: next_request,
                     written: 0,
-                    response: [0; REQUEST_LEN],
                     received: 0,
                     started: now_ns(),
                     scheduled: None,
                     rx_stamp: None,
                 });
+                next_request += 1;
             }
             let Some(pending) = &mut connection.pending else {
                 continue;
             };
-            if pending.written < REQUEST_LEN {
+            let size = connection.request.len();
+            if pending.written < size {
                 let options = WriteOptions {
                     timestamps: TxTimestampRequest {
-                        cookie: u64::from_le_bytes(pending.request[..8].try_into().unwrap()),
+                        cookie: pending.id,
                         scheduled: true,
                         ..TxTimestampRequest::default()
                     },
                 };
-                match network.try_write(connection.id, &pending.request[pending.written..], options)
-                {
+                match network.try_write(
+                    connection.id,
+                    &connection.request[pending.written..],
+                    options,
+                ) {
                     Ok(receipt) => pending.written += receipt.accepted,
                     Err(error) if error.is_would_block() => {}
                     Err(error) => return Err(format!("write: {error}")),
                 }
             }
-            match network.try_read(connection.id, &mut pending.response[pending.received..]) {
+            match network.try_read(connection.id, &mut connection.response[pending.received..]) {
                 Ok(ReadOutcome::Data {
                     len,
                     last_byte_timestamps,
@@ -1230,17 +1332,25 @@ fn exchange(
                 }
                 Err(error) => return Err(format!("read: {error}")),
             }
-            if pending.received < REQUEST_LEN {
+            if pending.received < size {
                 continue;
             }
             let done = now_ns();
             let pending = connection.pending.take().unwrap();
-            if pending.response != pending.request {
+            if connection.response != connection.request {
+                let at = (0..size)
+                    .find(|&i| connection.response[i] != connection.request[i])
+                    .unwrap();
+                let shown = at..size.min(at + REQUEST_LEN);
                 return Err(format!(
-                    "echo differs: sent {:02x?}, received {:02x?}",
-                    pending.request, pending.response
+                    "echo of request {:#x} differs at octet {at} of {size}: sent {:02x?}, \
+                     received {:02x?}",
+                    pending.id,
+                    &connection.request[shown.clone()],
+                    &connection.response[shown]
                 ));
             }
+            report.echoed += size as u64;
             if !rtt_capacity {
                 report.software_rtt.reserve(1 << 20);
                 rtt_capacity = true;
