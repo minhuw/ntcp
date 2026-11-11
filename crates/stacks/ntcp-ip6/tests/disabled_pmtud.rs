@@ -337,6 +337,13 @@ fn disabled_ipv6_full_option_data_and_ack_with_three_sack_blocks() {
         assert!(f.tcp().options.timestamps.is_some());
         assert_eq!(f.tcp().payload.len(), 1180); // 40 IPv6 + 60 TCP + data.
         f.deliver(&mut b, 11);
+        // Like the peer's flight above, a GSO range is submitted whole before
+        // its owner takes input; each segment repeats the SACK blocks.
+        while a.is_output_reserved(id) {
+            let next = take(&mut a, id, 11, mode, 1280);
+            assert_eq!(next.tcp().options.sack_blocks, f.tcp().options.sack_blocks);
+            next.deliver(&mut b, 11);
+        }
         for (i, frame) in sent.iter().enumerate() {
             if ![1, 3, 5].contains(&i) {
                 frame.deliver(&mut a, 11);

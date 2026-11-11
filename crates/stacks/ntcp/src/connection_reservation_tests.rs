@@ -715,7 +715,10 @@ fn gso_pmtu_probe_sack_and_timestamp_credit_fallbacks() {
     let n = gso_select(&mut a, 40, &mut [0; 1000], &mut bytes).unwrap();
     let parsed = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
     assert!(parsed.options.sack_blocks.iter().any(Option::is_some));
-    assert_eq!(a.last_departure.unwrap().segmentation, None);
+    // Ordinary SACK blocks repeat on every segment of the range; a pending
+    // D-SACK keeps the output scalar (transmit_group_tests).
+    let s = a.last_departure.unwrap().segmentation.unwrap();
+    assert_eq!(s.tcp_header_len, 20 + parsed.raw_options.len());
 
     let (mut a, _) = pair(
         ConnectionConfig {

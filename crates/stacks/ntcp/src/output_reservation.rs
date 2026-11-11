@@ -406,8 +406,9 @@ impl OutputReservation {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
         if segmentation.is_some() {
-            // GSO admission excludes SACK-bearing output; preserve negotiated TS
-            // padding and all other option bytes, rather than repacking them.
+            // Every segment repeats the selected options, SACK blocks included
+            // (GSO admission excludes a D-SACK); preserve negotiated TS padding
+            // and all other option bytes, rather than repacking them.
             used = original.raw_options.len();
             options[..used].copy_from_slice(original.raw_options);
             if used > option_budget {

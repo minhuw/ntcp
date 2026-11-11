@@ -9424,7 +9424,13 @@ impl Connection {
                 && !self.limited_pending
                 && !self.pacing_enabled()
                 && self.tx_timestamps.is_empty()
-                && sack_option_len == 0
+                //= https://www.rfc-editor.org/rfc/rfc2883#section-4
+                //# (2) Each duplicate contiguous sequence of data received is reported
+                //# in at most one D-SACK block.
+                // Every segment of a range repeats its options, as Linux TSO
+                // repeats the skb's: ordinary SACK blocks may repeat, a
+                // D-SACK block may not.
+                && (sack_option_len == 0 || !self.receive.dsack_pending())
                 && gso.is_some();
             if group_eligible {
                 let buffer = gso.as_ref().unwrap();

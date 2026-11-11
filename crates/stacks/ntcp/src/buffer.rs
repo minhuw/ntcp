@@ -722,6 +722,11 @@ impl ReceiveBuffer {
         self.dsack = None;
     }
 
+    // Whether the next SACK-bearing output reports a duplicate.
+    pub(crate) fn dsack_pending(&self) -> bool {
+        self.dsack.is_some()
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc2018#section-4
     //= reason=Ordinary SACK selects newest contiguous retained union first, except arrivals advancing the cumulative frontier. RFC 2883 DSACK is a separate first-block extension, not asserted as ordinary RFC 2018 behavior.
     //# * The first SACK block (i.e., the one immediately following the kind and

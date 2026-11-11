@@ -589,32 +589,62 @@ fn group_loss_is_detected_and_repaired_like_scalar_loss_and_repairs_stay_scalar(
     assert_eq!(&received[..], &data[..]);
 }
 
+// The SACK blocks of each sender's data, segment by segment.
+fn sack_blocks(wire: &[Vec<u8>]) -> Vec<[Option<(u32, u32)>; 4]> {
+    wire.iter()
+        .map(|s| wire::parse(ip(), s).unwrap().options.sack_blocks)
+        .collect()
+}
+
+// Data reporting ordinary SACK blocks goes as a group that repeats them on
+// every segment, as Linux TSO repeats the skb's options and as scalar
+// output repeats them while the hole stays. A D-SACK is reported once
+// (RFC 2883 section 4): its segment stays scalar, and the rest groups.
 #[test]
-fn group_output_carrying_sack_options_stays_scalar() {
-    // A data segment reporting SACK blocks: GSO selection leaves it scalar.
-    let (mut a, mut peer, id, server) = pair(false, true, 16_384);
-    peer.write(server, &[9; 2000]).unwrap();
-    let from_peer = sent(&mut peer, 2);
-    assert!(from_peer.len() >= 2);
-    // The first is lost: the rest arrive out of order.
-    for (ip, segment) in &from_peer[1..] {
-        a.input(2, *ip, segment).unwrap();
+fn sack_blocks_repeat_in_a_group_but_a_dsack_stays_scalar() {
+    for dsack in [false, true] {
+        let (mut a, mut peer, id, server) = pair(false, true, 16_384);
+        let (mut b, _, bid, _) = pair(false, true, 16_384);
+        let (mut c, _, cid, _) = connected(false, true, 16_384);
+        c.enable_output_reservations().unwrap();
+        peer.write(server, &[9; 3000]).unwrap();
+        let from_peer = sent(&mut peer, 2);
+        assert!(from_peer.len() >= 3);
+        // The second is lost: the third arrives out of order. A repeated
+        // first is a duplicate below the hole.
+        let mut arriving = std::vec![from_peer[0].clone(), from_peer[2].clone()];
+        if dsack {
+            arriving.push(from_peer[0].clone());
+        }
+        for (e, id) in [(&mut a, id), (&mut b, bid), (&mut c, cid)] {
+            for (ip, segment) in &arriving {
+                e.input(2, *ip, segment).unwrap();
+            }
+            e.write(id, &[1; 7000]).unwrap();
+        }
+        let (wire, groups) = drain(&mut a, id, 3);
+        assert_eq!(wire, scalar(&mut b, bid, 3));
+        assert_eq!(wire, scalar(&mut c, cid, 3));
+        assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+        assert!(!groups.is_empty());
+        let blocks = sack_blocks(&wire);
+        // One duplicate block, on the first segment only, then the hole's.
+        let ordinary = if dsack { &blocks[1] } else { &blocks[0] };
+        assert!(ordinary[0].is_some());
+        if dsack {
+            assert_ne!(blocks[0], *ordinary);
+            assert_eq!(groups[0], wire.len() - 1);
+        } else {
+            assert_eq!(groups[0], wire.len());
+        }
+        let skip = usize::from(dsack);
+        assert!(blocks[skip..].iter().all(|b| b == ordinary));
+        // The peer, missing nothing it will not be repaired, reads it all.
+        for segment in &wire {
+            peer.input(4, ip(), segment).unwrap();
+        }
+        assert_eq!(peer.read(server, &mut [0; 8000]).unwrap(), 7000);
     }
-    a.write(id, &[1; 7000]).unwrap();
-    let mut out = [0; 2048];
-    let (poll, attempt) = a.poll_reserved_transmit_for(3, id, &mut out, 1).unwrap();
-    let p = poll.packet.unwrap();
-    assert!(
-        wire::parse(p.ip, &out[..p.len])
-            .unwrap()
-            .options
-            .sack_blocks[0]
-            .is_some()
-    );
-    let attempt = attempt.unwrap();
-    assert_eq!(a.transmit_segmentation(attempt), None);
-    assert_eq!(a.prepare_transmit_group(attempt, limits()).unwrap(), None);
-    assert!(a.accept_transmit(3, attempt).unwrap());
 }
 
 // A FIN queued behind the data ends the group on its last segment, as
