@@ -1349,3 +1349,27 @@ fn gso_in_recovery_ends_where_scalar_admission_does() {
     assert_eq!(scalar.transmit(40, &mut [0; 2048]).unwrap(), None);
     assert_eq!(a.transmit(40, &mut [0; 2048]).unwrap(), None);
 }
+
+// An ECN pause withholds data until its deadline (count is zero before it);
+// from the deadline on, before the timer clears it, a group sends what
+// scalar selection does.
+#[test]
+fn gso_after_an_expired_ecn_pause() {
+    let cfg = ConnectionConfig {
+        nagle: false,
+        initial_window: InitialWindow::Iw10,
+        ..config(4096, 100)
+    };
+    let (mut a, _) = pair(cfg.clone(), 0);
+    let (mut scalar, _) = pair(cfg, 0);
+    for c in [&mut a, &mut scalar] {
+        c.write(&[1; 450]).unwrap();
+        c.ecn_pause = Some(40);
+    }
+    let mut payload = [0; 1000];
+    assert_eq!(gso_select(&mut a, 39, &mut payload, &mut [0; 2048]), None);
+    assert_eq!(scalar.transmit(39, &mut [0; 2048]).unwrap(), None);
+    let s = gso_matches_scalar(&mut a, &mut scalar, 40);
+    assert_eq!((s.payload_len, s.segment_payload_len), (450, 100));
+    assert_eq!(a.ecn_pause, Some(40));
+}

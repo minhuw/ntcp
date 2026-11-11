@@ -9423,7 +9423,6 @@ impl Connection {
                 && candidate.is_none()
                 && self.rack.valid()
                 && !self.limited_pending
-                && self.ecn_pause.is_none()
                 && !self.pacing_enabled()
                 && self.tx_timestamps.is_empty()
                 && sack_option_len == 0
