@@ -381,6 +381,59 @@ fn departure_retry_crosses_physical_originals_without_rewriting_history() {
 }
 
 #[test]
+fn group_departure_preflight_capacity_wrap_and_distinct_physical_identity() {
+    for base in [Seq(100), Seq(u32::MAX - 15)] {
+        for capacity in [3, 4] {
+            let mut rack = Rack::with_capacity(capacity).unwrap();
+            rack.transmit(base, base.wrapping_add(32), 10, false);
+            let token = rack.departure_selection().unwrap();
+            let before = alloc::format!("{rack:?}");
+            for (size, count, now) in [
+                (0, 3, 20),
+                (8, usize::MAX, 20),
+                (8, 3, 9),
+                (u32::MAX, 3, 20),
+            ] {
+                assert!(!rack.validate_departure_group(token, base, size, count, now));
+            }
+            assert_eq!(
+                rack.validate_departure_group(token, base, 8, 3, 20),
+                capacity == 4
+            );
+            assert_eq!(alloc::format!("{rack:?}"), before);
+            if capacity == 3 {
+                // Scalar fallback still works when the whole prefix cannot.
+                assert!(rack.commit_departure(token, base, base.wrapping_add(8), 20));
+                continue;
+            }
+            crate::allocation_tests::fail_after(0, || {
+                for n in 0..3 {
+                    assert!(rack.commit_departure(
+                        token,
+                        base.wrapping_add(n * 8),
+                        base.wrapping_add((n + 1) * 8),
+                        20
+                    ));
+                }
+            });
+            for n in 0..3 {
+                let start = base.wrapping_add(n * 8);
+                let end = base.wrapping_add((n + 1) * 8);
+                assert_eq!(rack.head_transmission(start), Some((end, 20)));
+                assert_eq!(original_packet(&rack, start), Some((start, end, 20, false)));
+            }
+            assert!(!rack.intervals.last().unwrap().departure_committed);
+            assert!(!rack.validate_departure_group(token, base, 8, 3, 20));
+            assert!(rack.commit_departure(token, base.wrapping_add(24), base.wrapping_add(32), 30));
+            assert_eq!(
+                rack.head_transmission(base.wrapping_add(24)),
+                Some((base.wrapping_add(32), 30))
+            );
+        }
+    }
+}
+
+#[test]
 fn departure_capacity_no_allocation_and_failure_atomicity() {
     let mut rack = Rack::with_capacity(256).unwrap();
     rack.transmit(Seq(0), Seq(256), 10, false);

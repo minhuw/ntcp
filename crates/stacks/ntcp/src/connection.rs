@@ -2936,6 +2936,36 @@ impl Connection {
         Ok(())
     }
 
+    /// `validate_reserved_output` of `segments` full segments of a GSO
+    /// reservation from `offset`, each accepted at `now` in turn: once this
+    /// holds, none of those acceptances can fail part way through a group.
+    pub(crate) fn validate_reserved_group(
+        &self,
+        now: Instant,
+        d: &Departure,
+        offset: usize,
+        segments: usize,
+    ) -> Result<(), Error> {
+        let s = d.segmentation.ok_or(Error::InvalidArgument)?;
+        let bytes = s
+            .segment_payload_len
+            .checked_mul(segments)
+            .ok_or(Error::InvalidArgument)?;
+        self.validate_reserved_output(now, d, offset, bytes)?;
+        if let Some(selection) = self.reserved_ledger
+            && !self.rack.validate_departure_group(
+                selection,
+                Seq(d.start).wrapping_add(offset as u32),
+                s.segment_payload_len as u32,
+                segments,
+                now,
+            )
+        {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
     fn record_fin_departure(&mut self, start: Seq, payload: usize) {
         self.fin_needs_separate_credit = payload == 0
             || self

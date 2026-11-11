@@ -310,6 +310,44 @@ impl Endpoint {
         Ok(true)
     }
 
+    /// `accept_transmit_group` for a backend outcome of definitely
+    /// Submitted. `receipt` is the provenance of each physical segment the
+    /// backend cut from the aggregate (all have the same size); like
+    /// `accept_transmit_submitted`, it certifies every segment's size
+    /// evidence. A group never carries a PMTU probe.
+    pub fn accept_transmit_group_submitted(
+        &mut self,
+        now: Instant,
+        token: crate::TransmitGroup,
+        receipt: PhysicalReceipt,
+    ) -> Result<bool, EndpointError> {
+        let physical = self
+            .reservations
+            .get(token.0.reservation)
+            .and_then(|slot| slot.current.as_ref())
+            .and_then(|r| {
+                let group = r.group.filter(|g| g.token == token)?;
+                Some((r.packet.connection?, r.departure?, r.offset, group.segments))
+            });
+        if !self.accept_transmit_group(now, token)? {
+            return Ok(false);
+        }
+        if let Some((id, departure, offset, segments)) = physical
+            && let Some(s) = departure.segmentation
+            && let Ok(slot) = self.retained_slot_mut(id)
+        {
+            for n in 0..segments {
+                slot.connection.certify_submission(
+                    &departure,
+                    offset + n * s.segment_payload_len,
+                    s.segment_payload_len,
+                    receipt,
+                );
+            }
+        }
+        Ok(true)
+    }
+
     /// Host-correlated hard/soft error for an exact connection generation,
     /// with the same TCP semantics as `network_error`. Source Quench is
     /// discarded (RFC 6633).

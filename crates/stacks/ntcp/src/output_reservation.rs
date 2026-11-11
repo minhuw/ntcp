@@ -50,13 +50,57 @@ pub struct GsoLimits {
 }
 
 /// Segmentation of the entire selected range. Polling still returns one actual
-/// segment; this descriptor does not authorize hardware/group submission.
+/// segment; only `Endpoint::prepare_transmit_group` turns a prefix of the
+/// remaining range into one backend aggregate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitSegmentation {
     pub payload_len: usize,
     pub segment_payload_len: usize,
     pub tcp_header_len: usize,
     pub terminal_flags: u8,
+}
+
+/// What one backend aggregate may carry: its bounds, and the per-segment
+/// header semantics the backend reproduces, as Linux tcp_gso_segment does
+/// (PSH only on the last segment, CWR only on the first, every TCP option
+/// repeated on every segment). A declined semantic shortens or refuses the
+/// group; it never changes the bytes on the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransmitGroupLimits {
+    /// Maximum payload bytes (excludes all repeated protocol headers).
+    pub max_bytes: usize,
+    /// Maximum number of physical segments; fewer than two declines.
+    pub max_segments: usize,
+    pub allow_psh: bool,
+    pub allow_cwr: bool,
+    pub allow_options: bool,
+}
+
+/// One prepared, indivisible backend submission; never a scalar attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransmitGroup(pub(crate) TransmitAttempt);
+
+/// Logical aggregate, not a checksummed jumbo wire packet: `header` and
+/// `options` are the first segment's TCP header with the group's terminal
+/// flags, `payload` the contiguous payload of all `segment_count` segments of
+/// `segment_payload_len` bytes each. `packet.len` is the aggregate's TCP
+/// length (header, options and all payload); it has no timestamp observation.
+/// Segment n carries sequence `header.sequence + n * segment_payload_len`;
+/// PSH belongs to the last segment and CWR to the first only.
+pub struct TransmitGroupView<'a> {
+    pub packet: Transmit,
+    pub header: wire::Header,
+    pub options: &'a [u8],
+    pub payload: &'a [u8],
+    pub segment_payload_len: usize,
+    pub segment_count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedGroup {
+    pub token: TransmitGroup,
+    pub segments: usize,
+    pub bytes: usize,
 }
 
 pub(crate) struct GsoBuffer<'a> {
@@ -87,6 +131,8 @@ pub(crate) struct ReservedOutput {
     pub emitted_packet: Transmit,
     pub packet: Transmit,
     pub attempt: Option<TransmitAttempt>,
+    // Set together with `attempt`, which then names this group.
+    pub group: Option<PreparedGroup>,
     pub abandon_attempt: TransmitAttempt,
     pub offset: usize,
     pub sacks: usize,
@@ -173,6 +219,7 @@ impl OutputReservation {
             emitted_packet: packet,
             packet,
             attempt: Some(attempt),
+            group: None,
             abandon_attempt: attempt,
             offset: 0,
             sacks: 0,
@@ -262,6 +309,7 @@ impl OutputReservation {
             emitted_packet: packet,
             packet,
             attempt: Some(attempt),
+            group: None,
             abandon_attempt: attempt,
             offset: 0,
             sacks: 0,

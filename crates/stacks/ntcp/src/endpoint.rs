@@ -4992,6 +4992,236 @@ impl Endpoint {
             .flatten()
     }
 
+    /// Offer the consecutive full segments of a GSO reservation from the
+    /// current attempt's segment on as one backend aggregate, within
+    /// `limits`. The attempt must be certainly unsubmitted. Changes no TCP
+    /// state: like every reservation, the range was selected when polled,
+    /// and its departure (RACK transmission, RTT and PMTU evidence, PRR,
+    /// timers) is recorded only by `accept_transmit_group`. None or an
+    /// error leaves the attempt intact; success replaces it with the group,
+    /// which alone can then be accepted, rejected or abandoned.
+    pub fn prepare_transmit_group(
+        &mut self,
+        attempt: crate::TransmitAttempt,
+        limits: crate::TransmitGroupLimits,
+    ) -> Result<Option<crate::TransmitGroup>, EndpointError> {
+        let index = attempt.reservation;
+        let Some(slot) = self.reservations.get(index) else {
+            return Ok(None);
+        };
+        let Some(r) = slot
+            .current
+            .as_ref()
+            .filter(|r| r.attempt == Some(attempt) && !slot.is_shared())
+        else {
+            return Ok(None);
+        };
+        let (Some(id), Some(d)) = (r.packet.connection, r.departure) else {
+            return Ok(None);
+        };
+        let Some(s) = d.segmentation else {
+            return Ok(None);
+        };
+        let flags = s.terminal_flags;
+        let owner = &self.retained_slot(id)?.connection;
+        let original =
+            wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).map_err(Error::Wire)?;
+        // The aggregate must split into exactly the segments scalar polling
+        // emits from here: full-sized at the current path limit, with the
+        // same flags and options. SYN, FIN and URG have per-segment meaning
+        // a header template cannot carry; GSO selection never sets them.
+        if d.syn
+            || flags & (wire::SYN | wire::FIN | wire::RST | wire::URG) != 0
+            || r.emitted_bytes != s.segment_payload_len
+            || r.offset % s.segment_payload_len != 0
+            || owner.path_payload_limit() < s.tcp_header_len + s.segment_payload_len
+            || !limits.allow_cwr && r.offset == 0 && flags & wire::CWR != 0
+            || !limits.allow_options && !original.raw_options.is_empty()
+        {
+            return Ok(None);
+        }
+        let remaining = s
+            .payload_len
+            .checked_sub(r.offset)
+            .ok_or(Error::InvalidArgument)?;
+        let mut segments = (remaining / s.segment_payload_len)
+            .min(limits.max_segments)
+            .min(limits.max_bytes / s.segment_payload_len);
+        // Without PSH support the final segment stays scalar.
+        if !limits.allow_psh
+            && flags & wire::PSH != 0
+            && segments * s.segment_payload_len == remaining
+        {
+            segments = segments.saturating_sub(1);
+        }
+        if segments < 2 {
+            return Ok(None);
+        }
+        // Every acceptance check of every segment, before issuing a token the
+        // backend may submit as one indivisible object.
+        owner.validate_reserved_group(self.now, &d, r.offset, segments)?;
+        let token = crate::TransmitGroup(self.reservations[index].token()?);
+        let r = self.reservations[index].current.as_mut().unwrap();
+        r.group = Some(crate::output_reservation::PreparedGroup {
+            token,
+            segments,
+            bytes: segments * s.segment_payload_len,
+        });
+        // A private attempt identity keeps every held-output barrier.
+        r.attempt = Some(token.0);
+        r.abandon_attempt = token.0;
+        Ok(Some(token))
+    }
+
+    pub fn transmit_group(
+        &self,
+        token: crate::TransmitGroup,
+    ) -> Option<crate::TransmitGroupView<'_>> {
+        let slot = self.reservations.get(token.0.reservation)?;
+        let r = slot.current.as_ref()?;
+        let group = r.group.filter(|g| g.token == token)?;
+        let s = r.departure?.segmentation?;
+        let original = wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).ok()?;
+        // The flags `fragment` gives the group's first segment, except that
+        // PSH stays for the backend to place on the last one.
+        let mut header = original.header;
+        header.sequence = header.sequence.wrapping_add(r.offset as u32);
+        header.flags = s.terminal_flags;
+        if r.offset + group.bytes != s.payload_len {
+            header.flags &= !wire::PSH;
+        }
+        if r.offset != 0 {
+            header.flags &= !wire::CWR;
+        }
+        Some(crate::TransmitGroupView {
+            packet: Transmit {
+                len: s.tcp_header_len + group.bytes,
+                tx_timestamp: None,
+                ..r.packet
+            },
+            header,
+            options: original.raw_options,
+            payload: &slot.payload[r.offset..r.offset + group.bytes],
+            segment_payload_len: s.segment_payload_len,
+            segment_count: group.segments,
+        })
+    }
+
+    /// Read-only form of every check `accept_transmit_group` performs, as
+    /// `preflight_accept_transmit` is for one attempt. False for a stale
+    /// token. Call immediately before each submission (including WouldBlock
+    /// retries), serializing endpoint access through submission and
+    /// acceptance: a path that shrank since preparation fails here with
+    /// `ReservationMtuTooSmall`, and the group must be rejected and the
+    /// reservation polled again, which splits it for the new path.
+    pub fn validate_transmit_group(
+        &self,
+        now: Instant,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        let Some(r) = self
+            .reservations
+            .get(token.0.reservation)
+            .and_then(|slot| slot.current.as_ref())
+        else {
+            return Ok(false);
+        };
+        let Some(group) = r.group.filter(|g| g.token == token) else {
+            return Ok(false);
+        };
+        let d = r.departure.unwrap();
+        let s = d.segmentation.unwrap();
+        let owner = &self
+            .retained_slot(r.packet.connection.ok_or(EndpointError::InvalidHandle)?)?
+            .connection;
+        owner.validate_reserved_group(now, &d, r.offset, group.segments)?;
+        if owner.path_payload_limit() < s.tcp_header_len + s.segment_payload_len {
+            return Err(EndpointError::ReservationMtuTooSmall);
+        }
+        self.check_clock(now)?;
+        Ok(true)
+    }
+
+    /// Record the backend's submission of the whole group at `now`, its
+    /// submission time: exactly what accepting each of its segments in turn
+    /// at `now` records, so every segment departs at `now` (Linux likewise
+    /// stamps every segment of a TSO skb with the skb's departure). Errors
+    /// are those of `validate_transmit_group` and change nothing.
+    pub fn accept_transmit_group(
+        &mut self,
+        now: Instant,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        if !self.validate_transmit_group(now, token)? {
+            return Ok(false);
+        }
+        let index = token.0.reservation;
+        let r = self.reservations[index].current.as_ref().unwrap();
+        let group = r.group.unwrap();
+        let mut departure = r.departure.unwrap();
+        let size = departure.segmentation.unwrap().segment_payload_len;
+        let (offset, id) = (r.offset, r.packet.connection.unwrap());
+        let finished = offset + group.bytes == departure.payload;
+        // Checked above.
+        self.clock(now)?;
+        let owner = &mut self.retained_slot_mut(id)?.connection;
+        for n in 0..group.segments {
+            // The group preflight covers every segment, and nothing else
+            // runs between these acceptances.
+            let withdrawn = owner
+                .accept_reserved_output(
+                    now,
+                    &mut departure,
+                    offset + n * size,
+                    size,
+                    finished && n + 1 == group.segments,
+                )
+                .expect("preflighted group departure");
+            // Only PTB repairs withdraw a suffix; GSO selects fresh data.
+            debug_assert!(!withdrawn);
+        }
+        let r = self.reservations[index].current.as_mut().unwrap();
+        r.emitted_bytes = group.bytes;
+        r.emitted_sacks = 0;
+        r.group = None;
+        self.complete_reserved_accept(index, Some(departure), finished);
+        Ok(true)
+    }
+
+    /// Only for a backend's synchronous, certainly-unsubmitted refusal of
+    /// the group (WouldBlock keeps it for a retry instead). Nothing departed:
+    /// the reservation is unattempted again, and polling it emits the same
+    /// scalar segment the group started with.
+    pub fn reject_unsubmitted_group(
+        &mut self,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        let index = token.0.reservation;
+        let Some(r) = self
+            .reservations
+            .get_mut(index)
+            .and_then(|slot| slot.current.as_mut())
+        else {
+            return Ok(false);
+        };
+        if !r.group.is_some_and(|g| g.token == token) {
+            return Ok(false);
+        }
+        r.group = None;
+        self.set_reservation_attempt(index, None);
+        Ok(true)
+    }
+
+    /// `abandon_transmit` for a group, with its certainly-unsubmitted
+    /// precondition. The handle survives rejection and accepted prefixes
+    /// until a later attempt or group replaces it.
+    pub fn abandon_transmit_group(
+        &mut self,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        self.abandon_transmit(token.0)
+    }
+
     pub fn is_output_reserved(&self, id: ConnectionId) -> bool {
         let reserved = self.reservation_of(Some(id)).is_some();
         debug_assert_eq!(
@@ -7366,6 +7596,10 @@ mod fast_open_key_tests;
 #[cfg(test)]
 #[path = "output_reservation_tests.rs"]
 mod output_reservation_tests;
+
+#[cfg(test)]
+#[path = "transmit_group_tests.rs"]
+mod transmit_group_tests;
 
 #[cfg(test)]
 #[path = "endpoint_ptb_reserved_tests.rs"]

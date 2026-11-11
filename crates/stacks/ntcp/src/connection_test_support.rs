@@ -83,3 +83,30 @@ pub(crate) fn drain_wire(
     }
     panic!("output did not quiesce");
 }
+
+// Everything a departure records, for comparing connections that should
+// have recorded the same transmissions at the same times.
+pub(crate) fn departure_snapshot(a: &Connection) -> alloc::string::String {
+    alloc::format!(
+        "{:?}",
+        (
+            (
+                a.now,
+                a.snd_una,
+                a.snd_nxt,
+                a.last_sent,
+                a.last_timestamp_sent_at
+            ),
+            (a.sample, a.sample_departure, a.rto_deadline, a.tlp_deadline),
+            (a.pacing_deadline, a.pacer, a.prr, &a.congestion, &a.rtt),
+            (
+                &a.rack,
+                &a.pmtud,
+                a.reserved_ledger,
+                a.repair_undo.is_some()
+            ),
+            a.transport_info(),
+            a.next_deadline(),
+        )
+    )
+}

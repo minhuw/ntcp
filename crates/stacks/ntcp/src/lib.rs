@@ -31,7 +31,10 @@ mod fast_open_tests;
 mod managed_path;
 pub use managed_path::{DiscoveryIntent, FactoryRole, ManagedError, ManagedOpenOptions, ManagedPathInfo, ManagedRoute, PathFactoryRequest, PathProvider, PreparedFactory, PreparedPath, ReceiveIpCapability, TransportCeilings};
 mod output_reservation;
-pub use output_reservation::{GsoLimits, TransmitAttempt, TransmitSegmentation};
+pub use output_reservation::{
+    GsoLimits, TransmitAttempt, TransmitGroup, TransmitGroupLimits, TransmitGroupView,
+    TransmitSegmentation,
+};
 #[cfg(test)]
 mod endpoint_tests;
 mod hystart;
