@@ -68,6 +68,11 @@ pub struct Network<P: PacketIo> {
     ingress: IngressContext,
     now: Instant,
     next_port: u16,
+    // The local port of every occupied slot of `connections` and
+    // `listeners`: a port counts from install or listen until its slot is
+    // freed, a released connection's until the endpoint reclaims it, so
+    // through TIME-WAIT.
+    ports: PortUsers,
     connections: Vec<Slot<Connection>>,
     connection_map: HashMap<ntcp::ConnectionId, usize>,
     listeners: Vec<Slot<Listener>>,
@@ -199,6 +204,38 @@ impl SlotQueue {
     }
     fn is_empty(&self) -> bool {
         self.order.is_empty()
+    }
+}
+// The number of slots using each local port, as Linux's bind hash keeps a
+// bucket per port with its owners: an open finds whether a port is taken
+// without a pass over the slots. A counter per port, not a set of ports,
+// because the connections a listener accepts share its port. Indexed by
+// the port, not hashed: every port has its counter, allocated whole when
+// the network is built (256 KiB), so taking one never allocates or
+// rehashes.
+struct PortUsers {
+    users: Vec<u32>,
+}
+impl PortUsers {
+    // Room for `slots` users of one port.
+    fn new(slots: usize) -> Result<Self> {
+        u32::try_from(slots).map_err(|_| Error::Capacity)?;
+        let ports = usize::from(u16::MAX) + 1;
+        let mut users = Vec::new();
+        users
+            .try_reserve_exact(ports)
+            .map_err(|_| Error::Capacity)?;
+        users.resize(ports, 0);
+        Ok(Self { users })
+    }
+    fn take(&mut self, port: u16) {
+        self.users[usize::from(port)] += 1;
+    }
+    fn give(&mut self, port: u16) {
+        self.users[usize::from(port)] -= 1;
+    }
+    fn users(&self, port: u16) -> u32 {
+        self.users[usize::from(port)]
     }
 }
 fn bytes(capacity: usize) -> Result<Vec<u8>> {
@@ -566,6 +603,7 @@ impl<P: PacketIo> Network<P> {
         let live_listeners = indices(config.tcp.max_listeners)?;
         let tx_frames = indices(owners)?;
         let slots = config.tcp.max_connections + config.tcp.max_listeners;
+        let ports = PortUsers::new(slots)?;
         let (ready, maintain) = (SlotQueue::new(slots)?, SlotQueue::new(slots)?);
         let stamped = SlotQueue::new(config.tcp.max_connections)?;
         let releasing = indices(config.tcp.max_connections)?;
@@ -579,6 +617,7 @@ impl<P: PacketIo> Network<P> {
             ingress,
             now,
             next_port,
+            ports,
             connections,
             connection_map,
             listeners,
@@ -848,6 +887,7 @@ impl<P: PacketIo> Network<P> {
             write_waiting: None,
         });
         occupy(&mut self.live_connections, slot);
+        self.ports.take(tuple.local.port());
         self.connection_map.insert(core, slot);
         self.touch(slot);
         self.check_live();
@@ -866,15 +906,22 @@ impl<P: PacketIo> Network<P> {
         }
     }
     fn port_in_use(&self, port: u16) -> bool {
-        self.connections
-            .iter()
-            .filter_map(|s| s.value.as_ref())
-            .any(|c| c.local.port() == port)
-            || self
-                .listeners
+        // The full-scan form of `ports`, for debug builds.
+        debug_assert_eq!(
+            self.ports.users(port) as usize,
+            self.connections
                 .iter()
                 .filter_map(|s| s.value.as_ref())
-                .any(|l| l.port == port)
+                .filter(|c| c.local.port() == port)
+                .count()
+                + self
+                    .listeners
+                    .iter()
+                    .filter_map(|s| s.value.as_ref())
+                    .filter(|l| l.port == port)
+                    .count()
+        );
+        self.ports.users(port) != 0
     }
     fn scoped(&self, tuple: Tuple) -> ntcp::ScopedTuple {
         let link_local = [tuple.local.ip(), tuple.remote.ip()]
@@ -1026,6 +1073,7 @@ impl<P: PacketIo> Network<P> {
             acceptable: false,
         });
         occupy(&mut self.live_listeners, slot);
+        self.ports.take(port);
         self.listener_map.insert(core, slot);
         if let Some(flows) = &mut self.flows {
             flows.listen(port);

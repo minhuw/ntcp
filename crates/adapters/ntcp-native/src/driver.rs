@@ -1019,6 +1019,7 @@ impl<P: PacketIo> Network<P> {
                         self.listener_map.remove(&core);
                         self.listeners[index].value = None;
                         vacate(&mut self.live_listeners, index);
+                        self.ports.give(port);
                         if let Some(flows) = &mut self.flows {
                             flows.unlisten(port);
                         }
@@ -1096,7 +1097,8 @@ impl<P: PacketIo> Network<P> {
             let mut k = 0;
             while k < self.releasing.len() {
                 let index = self.releasing[k];
-                let core = self.connections[index].value.as_ref().unwrap().core;
+                let c = self.connections[index].value.as_ref().unwrap();
+                let (core, port) = (c.core, c.local.port());
                 if self.endpoint.connection_exists(core) {
                     k += 1;
                     continue;
@@ -1105,6 +1107,7 @@ impl<P: PacketIo> Network<P> {
                 self.connection_map.remove(&core);
                 self.connections[index].value = None;
                 vacate(&mut self.live_connections, index);
+                self.ports.give(port);
             }
         }
         Ok(())
