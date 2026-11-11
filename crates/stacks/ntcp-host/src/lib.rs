@@ -599,6 +599,12 @@ pub struct Host {
     // Occupied `bindings` records: what service and collection passes and
     // owner lookups visit.
     live_bindings: Live,
+    // The unoccupied `bindings` records, taken from the end, and the
+    // occupied ones no connection has committed yet: a factory finds its
+    // record, and a commit or cancel its own, without a pass over the
+    // bindings.
+    free_bindings: Vec<usize>,
+    provisional: Live,
     // Per endpoint connection slot (`ConnectionId::index`), the binding its
     // owner generation committed, if any; sized when attached.
     owner_bindings: Vec<Option<usize>>,
@@ -640,6 +646,30 @@ pub struct Host {
 pub struct HeaderPlan<'a> {
     pub segments: &'a [core::net::Ipv6Addr],
     pub len: usize,
+}
+
+// Every slot of a `count`-slot table, descending, so that taking from the
+// end hands out slot 0 first, with room for all of them, so that freeing a
+// slot never allocates.
+fn free_slots(count: usize) -> Result<Vec<usize>, Error> {
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(count)
+        .map_err(|_| Error::Allocation)?;
+    slots.extend((0..count).rev());
+    Ok(slots)
+}
+
+// Whether `free` lists each unoccupied slot of `table` once and nothing
+// else: the full scan a free list replaces, for debug assertions.
+fn lists_free<T>(free: &[usize], table: &[Option<T>]) -> bool {
+    let mut listed = alloc::vec![false; table.len()];
+    free.iter()
+        .all(|&slot| !core::mem::replace(&mut listed[slot], true))
+        && table
+            .iter()
+            .zip(listed)
+            .all(|(record, listed)| listed == record.is_none())
 }
 
 fn table<T: Clone>(count: usize, value: T) -> Result<Vec<T>, Error> {
@@ -687,6 +717,8 @@ impl Host {
             ports: table(path_limits.links, None)?,
             bindings: table(limits.bindings, None)?,
             live_bindings: Live::new(limits.bindings)?,
+            free_bindings: free_slots(limits.bindings)?,
+            provisional: Live::new(limits.bindings)?,
             owner_bindings: Vec::new(),
             unaged: Live::new(limits.bindings)?,
             unpublished: Live::new(limits.bindings)?,
@@ -1054,7 +1086,15 @@ impl Host {
     }
     // The record of a prepared binding no connection has committed yet.
     fn provisional(&self, prepared: PreparedPath) -> Option<usize> {
-        self.live_bindings.iter().find(|&index| {
+        debug_assert!(
+            self.provisional
+                .iter()
+                .eq(self
+                    .live_bindings
+                    .iter()
+                    .filter(|&index| self.bindings[index].unwrap().owner.is_none()))
+        );
+        self.provisional.iter().find(|&index| {
             self.bindings[index]
                 .as_ref()
                 .is_some_and(|b| b.owner.is_none() && b.prepared == prepared)
@@ -1477,6 +1517,7 @@ impl Host {
             {
                 let binding = self.bindings[index].take().unwrap();
                 self.live_bindings.remove(index);
+                self.free_bindings.push(index);
                 for set in [&mut self.unaged, &mut self.unpublished] {
                     if set.contains(index) {
                         set.remove(index);
@@ -1498,6 +1539,7 @@ impl Host {
                 self.paths.release(lease.take().unwrap().prepared.client)?;
             }
         }
+        debug_assert!(lists_free(&self.free_bindings, &self.bindings));
         self.reclaimed = reclaimed;
         self.maintain_ledger(endpoint);
         Ok(())
@@ -3121,11 +3163,7 @@ impl PathProvider for Host {
         // Derived before anything is acquired, so that a Host without a
         // receive capability for the family retains nothing.
         let receive = self.receive_ip_capability(request.tuple.local.is_ipv6())?;
-        let index = self
-            .bindings
-            .iter()
-            .position(Option::is_none)
-            .ok_or(Error::Capacity)?;
+        let index = *self.free_bindings.last().ok_or(Error::Capacity)?;
         let destination = request
             .ipv4_options
             .source_route
@@ -3158,7 +3196,10 @@ impl PathProvider for Host {
                 authorized: snapshot.key(),
             }),
         });
+        self.free_bindings.pop();
         self.live_bindings.insert(index);
+        self.provisional.insert(index);
+        debug_assert!(lists_free(&self.free_bindings, &self.bindings));
         Ok(PreparedFactory {
             path: prepared,
             receive,
@@ -3169,6 +3210,7 @@ impl PathProvider for Host {
             .provisional(prepared)
             .expect("prepared binding preflight");
         self.bindings[index].as_mut().unwrap().owner = Some(connection);
+        self.provisional.remove(index);
         if let Some(entry) = self.owner_bindings.get_mut(connection.index()) {
             *entry = Some(index);
         }
@@ -3185,6 +3227,9 @@ impl PathProvider for Host {
             .expect("live provisional client");
         self.bindings[index] = None;
         self.live_bindings.remove(index);
+        self.provisional.remove(index);
+        self.free_bindings.push(index);
+        debug_assert!(lists_free(&self.free_bindings, &self.bindings));
     }
     // The header plan of the path `egress_context` would select for this
     // stateless reply now (on its zone's link); a reply without one fails

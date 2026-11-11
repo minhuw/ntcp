@@ -612,6 +612,50 @@ fn factory_rollbacks_and_raw_managed_bypass_are_bounded() {
     assert_eq!(host.paths().usage().clients, 0);
 }
 
+// A binding record freed by a cancelled factory or by collection is
+// prepared again: a one-connection Host prepares many more factories, and
+// opens many more connections, than it has records, one after another.
+#[test]
+fn cancelled_and_collected_bindings_are_prepared_again() {
+    let cfg = config(1);
+    let (local, remote) = addresses(false);
+    let (mut host, mut endpoint, _) = managed(local, 33, cfg.clone());
+    for round in 0..8 {
+        let start = round * 100;
+        let local = SocketAddr::new(local.ip(), 1000 + round as u16);
+        // More factories than records, each cancelled, as by a construction
+        // that fails after its path was prepared.
+        for _ in 0..4 {
+            let prepared = host
+                .prepare(ntcp::PathFactoryRequest {
+                    tuple: Tuple { local, remote },
+                    zone: None,
+                    role: ntcp::FactoryRole::Active,
+                    listener: None,
+                    dscp: Dscp::new(0).unwrap(),
+                    ipv4_options: OutgoingIpv4Options::default(),
+                    registration: None,
+                })
+                .unwrap();
+            host.cancel(prepared.path);
+            assert_eq!(host.binding_count(), 0);
+        }
+        let id = endpoint
+            .connect_with_path_provider(start, local, remote, options(&cfg, 0), &mut host)
+            .unwrap();
+        assert_eq!(host.binding_count(), 1);
+        endpoint.abort(id).unwrap();
+        while emit(&mut host, &mut endpoint, start + 1).is_some() {}
+        endpoint.release(id).unwrap();
+        for now in start + 2..start + 10 {
+            endpoint.poll_transmit(now, &mut [0; 2048], 32).unwrap();
+            host.collect(&endpoint).unwrap();
+        }
+        assert_eq!(host.binding_count(), 0);
+        assert_eq!(host.paths().usage().clients, 0);
+    }
+}
+
 #[test]
 fn ingress_requires_live_local_owner_and_supported_current_framing() {
     let cfg = config(2);
