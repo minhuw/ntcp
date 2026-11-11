@@ -9419,7 +9419,6 @@ impl Connection {
                 && !self.retx_pending
                 && !self.tlp_pending
                 && !self.probe_pending
-                && self.pmtud.as_ref().is_none_or(|p| p.probe.is_none())
                 && candidate.is_none()
                 && self.rack.valid()
                 && !self.limited_pending

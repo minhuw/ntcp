@@ -1,6 +1,8 @@
 extern crate std;
 use super::*;
-use crate::connection::test_support::{departure_snapshot, recovering, timer_recovering};
+use crate::connection::test_support::{
+    departure_snapshot, probe_size, recovering, timer_recovering,
+};
 use std::vec::Vec;
 
 // A connected pair whose client polls through one GSO reservation. The
@@ -27,16 +29,18 @@ fn connected(
     timestamps: bool,
     peer_receive: usize,
 ) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
-    connected_with(ipv6, timestamps, peer_receive, false)
+    connected_with(ipv6, timestamps, peer_receive, |_| {})
 }
 
+// `connected` with `adjust` applied to both sides' configuration.
 fn connected_with(
     ipv6: bool,
     timestamps: bool,
     peer_receive: usize,
-    prr: bool,
+    adjust: impl Fn(&mut ConnectionConfig),
 ) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
-    let config = |receive| ConnectionConfig {
+    let config = |receive| {
+        let mut config = ConnectionConfig {
         pmtud: Some(crate::PmtudConfig {
             initial_search_low: Some(if ipv6 { 1280 } else { 1040 }),
             ..crate::PmtudConfig::new(1500)
@@ -45,12 +49,14 @@ fn connected_with(
         nagle: false,
         sack: true,
         timestamps,
-        prr,
         prr_pacing: false,
         initial_window: crate::InitialWindow::Iw10,
         send_capacity: 16_384,
         receive_capacity: receive,
         ..ConnectionConfig::default()
+        };
+        adjust(&mut config);
+        config
     };
     let endpoint = |receive| {
         Endpoint::new(
@@ -909,9 +915,9 @@ fn lossy_transfer(prr: bool, lost: usize, during: fn(&crate::connection::Connect
         .unwrap();
         (e, peer, id, server)
     };
-    let (mut a, mut peer, id, server) = gso(connected_with(false, true, 65_535, prr));
-    let (mut b, _, bid, _) = gso(connected_with(false, true, 65_535, prr));
-    let (mut c, _, cid, _) = connected_with(false, true, 65_535, prr);
+    let (mut a, mut peer, id, server) = gso(connected_with(false, true, 65_535, |c| c.prr = prr));
+    let (mut b, _, bid, _) = gso(connected_with(false, true, 65_535, |c| c.prr = prr));
+    let (mut c, _, cid, _) = connected_with(false, true, 65_535, |c| c.prr = prr);
     c.enable_output_reservations().unwrap();
     let data: Vec<u8> = (0..16_000).map(|i| (i * 11) as u8).collect();
     for (e, id) in [(&mut a, id), (&mut b, bid), (&mut c, cid)] {
@@ -989,4 +995,126 @@ fn groups_follow_a_retransmission_timeout() {
             "prr {prr}"
         );
     }
+}
+
+// With a PMTU probe out, the trailing segments behind it go as a group and
+// leave what their scalar acceptance leaves, the probe's PMTU state
+// included; the peer's ACKs then confirm the probe alike.
+#[test]
+fn group_after_a_pmtu_probe_records_what_scalar_acceptance_records() {
+    // A peer MSS above the 1040-byte search floor allows an upward probe.
+    let gso = |(mut e, peer, id, server): (Endpoint, Endpoint, ConnectionId, ConnectionId)| {
+        e.enable_output_reservations_with_gso(
+            1,
+            crate::GsoLimits {
+                max_bytes: 8000,
+                max_segments: 8,
+            },
+        )
+        .unwrap();
+        (e, peer, id, server)
+    };
+    let (mut a, mut peer, id, _) = gso(connected_with(false, true, 65_535, |c| c.mss = 1460));
+    let (mut b, _, bid, _) = gso(connected_with(false, true, 65_535, |c| c.mss = 1460));
+    let data: Vec<u8> = (0..12_000).map(|i| (i * 13) as u8).collect();
+    a.write(id, &data).unwrap();
+    b.write(bid, &data).unwrap();
+    let probe = |e: &Endpoint, id| probe_size(&e.retained_slot(id).unwrap().connection);
+    let search_low = |e: &Endpoint, id| e.path_mtu_info(id).unwrap().unwrap().search_low;
+    let before = search_low(&a, id);
+    // The probe: one scalar segment above the search floor.
+    let mut out = [0; 2048];
+    let mut wire = Vec::new();
+    for (e, id) in [(&mut a, id), (&mut b, bid)] {
+        let (poll, attempt) = e.poll_reserved_transmit_for(2, id, &mut out, 1).unwrap();
+        let p = poll.packet.unwrap();
+        let attempt = attempt.unwrap();
+        assert_eq!(e.transmit_segmentation(attempt), None);
+        assert!(e.accept_transmit(2, attempt).unwrap());
+        assert_eq!(probe(e, id), Some(p.len as u32 + 20));
+        assert!(p.len as u32 + 20 > before);
+        if wire.is_empty() {
+            wire.push(out[..p.len].to_vec());
+        }
+    }
+    assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+    let (rest, groups) = drain(&mut a, id, 2);
+    assert!(!groups.is_empty());
+    assert!(probe(&a, id).is_some());
+    assert_eq!(rest, scalar(&mut b, bid, 2));
+    assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+    wire.extend(rest);
+    let acks = deliver(&mut peer, &wire, 3);
+    for (ip, ack) in &acks {
+        a.input(4, *ip, ack).unwrap();
+        b.input(4, *ip, ack).unwrap();
+    }
+    assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+    // The probe succeeded behind the group.
+    assert_eq!(probe(&a, id), None);
+    assert!(search_low(&a, id) > before);
+}
+
+// Bulk output keeps forming groups while PLPMTUD searches from its default
+// start (card 3 saw none over 600 KB): probes go out alone, the segments
+// around them in groups, as Linux keeps TSO output during MTU probing.
+#[test]
+fn groups_form_while_plpmtud_searches() {
+    let gso = |(mut e, peer, id, server): (Endpoint, Endpoint, ConnectionId, ConnectionId)| {
+        e.enable_output_reservations_with_gso(
+            1,
+            crate::GsoLimits {
+                max_bytes: 16_000,
+                max_segments: 16,
+            },
+        )
+        .unwrap();
+        (e, peer, id, server)
+    };
+    let adjust = |c: &mut ConnectionConfig| {
+        c.mss = 1460;
+        c.pmtud = Some(crate::PmtudConfig::new(1500));
+    };
+    let (mut a, mut peer, id, server) = gso(connected_with(false, true, 65_535, adjust));
+    let (mut c, _, cid, _) = connected_with(false, true, 65_535, adjust);
+    c.enable_output_reservations().unwrap();
+    let total = 600_000;
+    let (mut written, mut received, mut grouped, mut probes) = (0, 0, 0, 0);
+    let mut now = 2;
+    while received < total {
+        let chunk: Vec<u8> = (written..(written + 16_384).min(total))
+            .map(|i| (i * 7) as u8)
+            .collect();
+        let n = a.write(id, &chunk).unwrap();
+        assert_eq!(c.write(cid, &chunk).unwrap(), n);
+        written += n;
+        let (wire, groups) = drain(&mut a, id, now);
+        assert_eq!(wire, scalar(&mut c, cid, now));
+        grouped += groups.iter().sum::<usize>();
+        probes += usize::from(probe_size(&a.retained_slot(id).unwrap().connection).is_some());
+        let mut acks = deliver(&mut peer, &wire, now);
+        if acks.is_empty() {
+            now = peer.next_deadline().unwrap();
+            peer.on_timeout(now, 16).unwrap();
+            acks = sent(&mut peer, now);
+        }
+        now += 1;
+        for (ip, ack) in &acks {
+            a.input(now, *ip, ack).unwrap();
+            c.input(now, *ip, ack).unwrap();
+        }
+        let mut buffer = [0; 65_536];
+        while let Ok(n) = peer.read(server, &mut buffer) {
+            if n == 0 {
+                break;
+            }
+            received += n;
+        }
+    }
+    let info = a.path_mtu_info(id).unwrap().unwrap();
+    assert_eq!(info.search_low, 1500, "{info:?}");
+    assert!(probes != 0);
+    // Most of the transfer leaves in groups.
+    let segments = total.div_ceil(1448);
+    assert!(grouped > segments / 2, "{grouped} of {segments}");
 }

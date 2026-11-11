@@ -1373,3 +1373,35 @@ fn gso_after_an_expired_ecn_pause() {
     assert_eq!((s.payload_len, s.segment_payload_len), (450, 100));
     assert_eq!(a.ecn_pause, Some(40));
 }
+
+// The data that follows a PMTU probe (RFC 4821 section 7.4's trailing
+// segments) is ordinary output at the current size: it is grouped as
+// Linux keeps sending TSO skbs while tcp_mtu_probe's probe is out. The
+// probe itself stays scalar.
+#[test]
+fn gso_groups_the_output_after_a_pmtu_probe() {
+    let cfg = ConnectionConfig {
+        nagle: false,
+        pmtud: Some(crate::PmtudConfig::new(1500)),
+        initial_window: InitialWindow::Iw10,
+        ..config(8192, 1000)
+    };
+    let (mut a, _) = pair(cfg.clone(), 0);
+    let (mut scalar, _) = pair(cfg, 0);
+    for c in [&mut a, &mut scalar] {
+        c.write(&[1; 6000]).unwrap();
+    }
+    let mut probe = [0; 2048];
+    let n = gso_select(&mut a, 40, &mut [0; 6000], &mut probe).unwrap();
+    assert_eq!(a.last_departure.unwrap().segmentation, None);
+    commit_reserved(&mut a, 40);
+    let mut expected = [0; 2048];
+    assert_eq!(scalar.transmit(40, &mut expected).unwrap(), Some(n));
+    assert_eq!(&probe[..n], &expected[..n]);
+    let size = a.pmtud.as_ref().unwrap().probe.unwrap().size;
+    assert_eq!(size, n as u32 + 20);
+    let s = gso_matches_scalar(&mut a, &mut scalar, 40);
+    assert!(s.payload_len / s.segment_payload_len >= 3, "{s:?}");
+    assert!(s.tcp_header_len + s.segment_payload_len + 20 < size as usize);
+    assert!(a.pmtud.as_ref().unwrap().probe.is_some());
+}

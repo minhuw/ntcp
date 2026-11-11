@@ -120,3 +120,8 @@ pub(crate) fn recovering(a: &Connection) -> bool {
 pub(crate) fn timer_recovering(a: &Connection) -> bool {
     a.consecutive_timeouts != 0 || a.sack_post_rto.is_some() || a.sack_fallback.is_some()
 }
+
+// The IP size of the PMTU probe in flight, if any.
+pub(crate) fn probe_size(a: &Connection) -> Option<u32> {
+    a.pmtud.as_ref()?.probe.map(|p| p.size)
+}
