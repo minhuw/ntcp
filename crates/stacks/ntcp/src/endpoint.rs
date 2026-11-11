@@ -538,6 +538,9 @@ pub struct Endpoint {
     progress_una: Vec<u32>,
     deadlines: Deadlines,
     reclaimed: u64,
+    // The last `max_connections` reclaimed connections, the one counted
+    // `n` (from 0) at `n % max_connections`: `reclaimed_since`.
+    reclaims: Vec<ConnectionId>,
     // `listen_overflows`, `listen_drops` and `time_wait_connections`, the
     // last for connections; records count themselves.
     listen_overflows: u64,
@@ -674,6 +677,14 @@ impl Endpoint {
         generations.resize(count, 1);
         let mut free = reserved_vec(count)?;
         free.extend((0..count).rev());
+        let mut reclaims = reserved_vec(count)?;
+        reclaims.resize(
+            count,
+            ConnectionId {
+                slot: 0,
+                generation: 0,
+            },
+        );
         let mut listeners = reserved_vec(listeners_count)?;
         listeners.resize_with(listeners_count, || None);
         let mut listener_generations = reserved_vec(listeners_count)?;
@@ -723,6 +734,7 @@ impl Endpoint {
             },
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
             reclaimed: 0,
+            reclaims,
             listen_overflows: 0,
             listen_drops: 0,
             time_wait_slots: 0,
@@ -2804,6 +2816,7 @@ impl Endpoint {
 
     fn reclaim(&mut self, index: usize) {
         let id = self.id(index);
+        debug_assert!(!self.is_output_reserved(id));
         let slot = self.slots[index].take().unwrap();
         self.occupied.remove(index);
         let tuple = slot.connection.scoped_tuple();
@@ -2822,6 +2835,8 @@ impl Endpoint {
             self.time_wait_slots -= 1;
         }
         self.recycle_connection(slot.connection);
+        let at = (self.reclaimed % self.reclaims.len() as u64) as usize;
+        self.reclaims[at] = id;
         self.reclaimed += 1;
         if let Some(generation) = self.generations[index].checked_add(1) {
             self.generations[index] = generation;
@@ -4801,6 +4816,17 @@ impl Endpoint {
     // changed.
     pub fn reclaimed(&self) -> u64 {
         self.reclaimed
+    }
+
+    /// The connections reclaimed since `reclaimed` was `since`, oldest
+    /// first. None once more than `max_connections` have been: the endpoint
+    /// keeps no more, and the caller checks its state per connection
+    /// (`connection_exists`) instead, a pass that many reclaims pay for.
+    pub fn reclaimed_since(&self, since: u64) -> Option<impl Iterator<Item = ConnectionId> + '_> {
+        debug_assert!(since <= self.reclaimed);
+        let count = self.reclaims.len() as u64;
+        (self.reclaimed.checked_sub(since)? <= count)
+            .then(|| (since..self.reclaimed).map(move |n| self.reclaims[(n % count) as usize]))
     }
 
     // Includes released records retained for final output or a reset's

@@ -1339,22 +1339,30 @@ impl<P: PacketIo> Network<P> {
             {
                 self.endpoint.release(core)?;
                 c.released = true;
-                self.releasing.push(index);
             }
         }
+        // The released connections the endpoint reclaimed since the last
+        // pass or, past what it keeps of them, every one gone.
         let reclaimed = self.endpoint.reclaimed();
-        if reclaimed != self.reclaimed {
-            self.reclaimed = reclaimed;
-            let mut k = 0;
-            while k < self.releasing.len() {
-                let index = self.releasing[k];
+        if let Some(gone) = self.endpoint.reclaimed_since(self.reclaimed) {
+            for core in gone {
+                if let Some(index) = self.connection_map.remove(&core) {
+                    let c = self.connections[index].value.take().unwrap();
+                    debug_assert!(c.released);
+                    vacate(&mut self.live_connections, index);
+                    give_back(&mut self.free_connections, &self.connections, index);
+                    self.ports.give(c.local.port());
+                }
+            }
+        } else {
+            let mut next = 0;
+            while let Some(index) = next_live(&self.live_connections, next) {
+                next = index + 1;
                 let c = self.connections[index].value.as_ref().unwrap();
                 let (core, port) = (c.core, c.local.port());
-                if self.endpoint.connection_exists(core) {
-                    k += 1;
+                if !c.released || self.endpoint.connection_exists(core) {
                     continue;
                 }
-                self.releasing.swap_remove(k);
                 self.connection_map.remove(&core);
                 self.connections[index].value = None;
                 vacate(&mut self.live_connections, index);
@@ -1362,6 +1370,7 @@ impl<P: PacketIo> Network<P> {
                 self.ports.give(port);
             }
         }
+        self.reclaimed = reclaimed;
         Ok(())
     }
 }

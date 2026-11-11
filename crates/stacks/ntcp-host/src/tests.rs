@@ -656,6 +656,96 @@ fn cancelled_and_collected_bindings_are_prepared_again() {
     }
 }
 
+// Collection frees the binding of each connection the endpoint reclaims,
+// however its slot ended (a TIME-WAIT record, a released closed
+// connection, an abort's reset quarantine, a rolled back open), looking at
+// those connections only, not at every live binding. Past what the endpoint
+// keeps of its reclaims it looks at every binding once.
+#[test]
+fn collection_frees_reclaimed_bindings_without_a_pass_over_the_live() {
+    let cfg = config(8);
+    let (local, remote) = addresses(false);
+    let mut a = managed(local, 121, cfg.clone());
+    let mut b = managed(remote, 122, cfg.clone());
+    let listener = b.1.listen(remote, 8).unwrap();
+    let mut now = 0;
+    let (mut clients, mut servers) = (Vec::new(), Vec::new());
+    for port in 2000..2006 {
+        let from = SocketAddr::new(local.ip(), port);
+        clients.push(
+            a.1.connect_with_path_provider(now, from, remote, options(&cfg, 12), &mut a.0)
+                .unwrap(),
+        );
+        pump(&mut a, &mut b, &mut now);
+        servers.push(b.1.accept(listener).unwrap());
+    }
+    assert_eq!(a.0.binding_count(), 6);
+    let ended = |a: &mut (Host, Endpoint, IngressContext), id, live| {
+        a.0.collect(&a.1).unwrap();
+        assert!(!a.1.connection_exists(id));
+        assert!(a.0.binding(id).is_err());
+        assert_eq!(a.0.binding_count(), live);
+        assert_eq!(a.0.paths().usage().clients, live);
+        assert_eq!(a.0.collect_visits, a.1.reclaimed());
+    };
+    // Closing first: the released TIME-WAIT connection becomes a record.
+    a.1.shutdown(clients[0]).unwrap();
+    pump(&mut a, &mut b, &mut now);
+    b.1.shutdown(servers[0]).unwrap();
+    pump(&mut a, &mut b, &mut now);
+    assert_eq!(a.1.state(clients[0]).unwrap(), State::TimeWait);
+    a.1.release(clients[0]).unwrap();
+    ended(&mut a, clients[0], 5);
+    // Closing second: the released closed connection.
+    b.1.shutdown(servers[1]).unwrap();
+    pump(&mut a, &mut b, &mut now);
+    a.1.shutdown(clients[1]).unwrap();
+    pump(&mut a, &mut b, &mut now);
+    assert_eq!(a.1.state(clients[1]).unwrap(), State::Closed);
+    a.1.release(clients[1]).unwrap();
+    ended(&mut a, clients[1], 4);
+    // An abort, whose reset holds the slot as long as TIME-WAIT.
+    a.1.abort(clients[2]).unwrap();
+    pump(&mut a, &mut b, &mut now);
+    a.1.release(clients[2]).unwrap();
+    now += cfg.connection.time_wait_us;
+    a.1.on_timeout(now, 64).unwrap();
+    a.1.poll_transmit(now, &mut [0; 2048], 32).unwrap();
+    ended(&mut a, clients[2], 3);
+    // A rolled back open, its slot taken again before any collection: the
+    // later generation's commit frees the earlier one's binding.
+    let from = SocketAddr::new(local.ip(), 2010);
+    let cancelled =
+        a.1.connect_with_path_provider(now, from, remote, options(&cfg, 12), &mut a.0)
+            .unwrap();
+    a.1.cancel_unsubmitted_open(cancelled).unwrap();
+    let reopened =
+        a.1.connect_with_path_provider(now, from, remote, options(&cfg, 12), &mut a.0)
+            .unwrap();
+    assert_eq!(reopened.index(), cancelled.index());
+    assert_eq!(a.0.binding_count(), 4);
+    a.1.cancel_unsubmitted_open(reopened).unwrap();
+    ended(&mut a, reopened, 3);
+    assert!(a.0.binding(cancelled).is_err());
+    // Many more reclaims than the endpoint keeps, then one pass over the
+    // live bindings; none leaks.
+    let reclaimed = a.1.reclaimed();
+    for _ in 0..3 * cfg.max_connections {
+        let id =
+            a.1.connect_with_path_provider(now, from, remote, options(&cfg, 12), &mut a.0)
+                .unwrap();
+        a.1.cancel_unsubmitted_open(id).unwrap();
+        assert_eq!(a.0.binding_count(), 4);
+    }
+    a.0.collect(&a.1).unwrap();
+    assert_eq!(a.0.binding_count(), 3);
+    assert_eq!(a.0.paths().usage().clients, 3);
+    assert_eq!(a.0.collect_visits, reclaimed + 4);
+    for &id in &clients[3..] {
+        assert!(a.0.binding(id).is_ok());
+    }
+}
+
 #[test]
 fn ingress_requires_live_local_owner_and_supported_current_framing() {
     let cfg = config(2);

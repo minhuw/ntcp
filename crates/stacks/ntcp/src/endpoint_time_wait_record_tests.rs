@@ -288,9 +288,15 @@ fn a_time_wait_record_reopens_and_takes_its_tuple_back_as_its_connection() {
     }
 }
 
-// `server` closes first, `client` follows; returns once both are released,
-// the server's connection in TIME-WAIT.
-fn server_closes(a: &mut Endpoint, b: &mut Endpoint, listener: ListenerId, port: u16, now: u64) {
+// `server` closes first, `client` follows; returns both once they are
+// released, the server's connection in TIME-WAIT.
+fn server_closes(
+    a: &mut Endpoint,
+    b: &mut Endpoint,
+    listener: ListenerId,
+    port: u16,
+    now: u64,
+) -> (ConnectionId, ConnectionId) {
     let local = core::net::SocketAddr::new(addresses().0.ip(), port);
     let client = a.connect(now, local, addresses().1).unwrap();
     pump(a, b, now);
@@ -303,6 +309,7 @@ fn server_closes(a: &mut Endpoint, b: &mut Endpoint, listener: ListenerId, port:
     assert_eq!(a.state(client), Ok(State::Closed));
     b.release(server).unwrap();
     a.release(client).unwrap();
+    (client, server)
 }
 
 // A server that closes first keeps no connection slot through TIME-WAIT:
@@ -368,6 +375,56 @@ fn time_wait_records_are_bounded_and_overflow_closes() {
             let flags = wire::parse(reply[0].0, &reply[0].1).unwrap().header.flags;
             assert_eq!(flags & wire::RST != 0, !kept, "port {port}");
         }
+    }
+}
+
+// Every end of a connection's slot is in `reclaimed_since` once, in order:
+// a TIME-WAIT record taking over, a close without TIME-WAIT past the record
+// limit, a released closed connection, an abort and a rolled back open.
+// Past `max_connections` reclaims it keeps none.
+#[test]
+fn reclaimed_since_lists_every_reclaim_once() {
+    for limit in [0, 2] {
+        let mut cfg = config();
+        cfg.max_connections = 4;
+        cfg.max_time_wait = limit;
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let listener = b.listen(addresses().1, 2).unwrap();
+        let (mut clients, mut servers) = (Vec::new(), Vec::new());
+        for i in 0..4 {
+            let (client, server) = server_closes(&mut a, &mut b, listener, 40_000 + i, 1_000);
+            clients.push(client);
+            servers.push(server);
+        }
+        pump(&mut a, &mut b, 1_000);
+        assert_eq!(b.time_wait_overflows(), 4 - limit as u64);
+        let since = |e: &Endpoint, n| e.reclaimed_since(n).map(Iterator::collect::<Vec<_>>);
+        assert_eq!(since(&a, 0), Some(clients.clone()));
+        assert_eq!(since(&b, 0), Some(servers));
+        let local = core::net::SocketAddr::new(addresses().0.ip(), 40_010);
+        let aborted = a.connect(2_000, local, addresses().1).unwrap();
+        pump(&mut a, &mut b, 2_000);
+        a.abort(aborted).unwrap();
+        a.release(aborted).unwrap();
+        // Its reset holds the slot as long as TIME-WAIT.
+        packets(&mut a, 2_000);
+        assert!(a.connection_exists(aborted));
+        let end = 2_000 + config().connection.time_wait_us;
+        a.on_timeout(end, 64).unwrap();
+        packets(&mut a, end);
+        let local = core::net::SocketAddr::new(addresses().0.ip(), 40_011);
+        let cancelled = a.connect(end, local, addresses().1).unwrap();
+        a.cancel_unsubmitted_open(cancelled).unwrap();
+        assert!(!a.connection_exists(aborted) && !a.connection_exists(cancelled));
+        assert_eq!(a.reclaimed(), 6);
+        assert_eq!(since(&a, 4), Some(vec![aborted, cancelled]));
+        assert_eq!(
+            since(&a, 2),
+            Some(vec![clients[2], clients[3], aborted, cancelled])
+        );
+        assert_eq!(since(&a, 1), None);
+        assert_eq!(since(&a, 6), Some(Vec::new()));
     }
 }
 

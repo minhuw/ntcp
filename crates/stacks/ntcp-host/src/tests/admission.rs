@@ -210,7 +210,9 @@ fn full_endpoint_backlog_or_uncollected_bindings_do_not_turn_admissible_syns_int
             .unwrap();
         b.1.cancel_unsubmitted_open(id).unwrap();
     }
-    assert_eq!(b.0.binding_count(), 2);
+    // Uncollected, but the second generation's commit freed the first's:
+    // a slot keeps one binding.
+    assert_eq!(b.0.binding_count(), 1);
     let (_, _, frame) = request(&mut a, local, &cfg, 0);
     let result = b.0.input_ip(
         &mut b.1,

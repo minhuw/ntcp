@@ -622,6 +622,9 @@ pub struct Host {
     unpublished: Live,
     // The endpoint's reclaim count when the last collection completed.
     reclaimed: u64,
+    // Reclaimed connections and bindings collection has looked at.
+    #[cfg(test)]
+    collect_visits: u64,
     // Per PathService client slot (`ClientId::index`), the binding or
     // datagram flow it serves, which a change service pass brings a dirty
     // client taken from the service's queue to.
@@ -733,6 +736,8 @@ impl Host {
             unaged: Live::new(limits.bindings)?,
             unpublished: Live::new(limits.bindings)?,
             reclaimed: 0,
+            #[cfg(test)]
+            collect_visits: 0,
             holders: table(path_limits.clients, Holder::None)?,
             leases: table(limits.output_leases, None)?,
             ledger: Ledger::new(limits.ledger)?,
@@ -1085,14 +1090,16 @@ impl Host {
                 .as_ref()
                 .is_some_and(|b| b.owner == Some(owner))
         };
-        // The index names the newest generation committed in a slot; an
-        // older one not yet collected is found by the scan.
-        if let Some(Some(index)) = self.owner_bindings.get(owner.index()).copied()
-            && owned(index)
-        {
-            return Some(index);
-        }
-        self.live_bindings.iter().find(|&index| owned(index))
+        // A slot's binding is its newest committed generation's: committing
+        // one frees the binding of the slot's reclaimed predecessor.
+        let index = self
+            .owner_bindings
+            .get(owner.index())
+            .copied()
+            .flatten()
+            .filter(|&index| owned(index));
+        debug_assert_eq!(index, self.live_bindings.iter().find(|&index| owned(index)));
+        index
     }
     // Whether `holders` names exactly the bindings' and flows' clients:
     // the scans it replaces, for debug assertions.
@@ -1535,31 +1542,35 @@ impl Host {
         self.check_endpoint(endpoint)?;
         // A committed binding outlives its connection until the endpoint
         // reclaims it (and a reclaimed connection holds no reservation):
-        // while the reclaim count stands still, there are none to collect.
+        // free those of the connections reclaimed since the last collection,
+        // each the one its slot names, or, past what the endpoint keeps of
+        // them, of every connection gone.
         let reclaimed = endpoint.reclaimed();
-        let gone = reclaimed != self.reclaimed;
-        let mut next = 0;
-        while gone && let Some(index) = self.live_bindings.next(next) {
-            next = index + 1;
-            if let Some(id) = self.bindings[index].as_ref().and_then(|b| b.owner)
-                && !endpoint.connection_exists(id)
-                && !endpoint.is_output_reserved(id)
-            {
-                let binding = self.bindings[index].take().unwrap();
-                self.live_bindings.remove(index);
-                self.free_bindings.push(index);
-                for set in [&mut self.unaged, &mut self.unpublished] {
-                    if set.contains(index) {
-                        set.remove(index);
-                    }
-                }
-                if let Some(entry) = self.owner_bindings.get_mut(id.index())
-                    && *entry == Some(index)
+        if let Some(gone) = endpoint.reclaimed_since(self.reclaimed) {
+            for id in gone {
+                #[cfg(test)]
                 {
-                    *entry = None;
+                    self.collect_visits += 1;
                 }
-                self.holders[binding.prepared.client.index()] = Holder::None;
-                self.paths.release(binding.prepared.client)?;
+                if let Some(index) = self.owner_bindings[id.index()]
+                    && self.bindings[index].as_ref().unwrap().owner == Some(id)
+                {
+                    self.free_binding(index)?;
+                }
+            }
+        } else {
+            let mut next = 0;
+            while let Some(index) = self.live_bindings.next(next) {
+                next = index + 1;
+                #[cfg(test)]
+                {
+                    self.collect_visits += 1;
+                }
+                if let Some(id) = self.bindings[index].as_ref().and_then(|b| b.owner)
+                    && !endpoint.connection_exists(id)
+                {
+                    self.free_binding(index)?;
+                }
             }
         }
         for lease in &mut self.leases {
@@ -1573,6 +1584,25 @@ impl Host {
         debug_assert!(lists_free(&self.free_bindings, &self.bindings));
         self.reclaimed = reclaimed;
         self.maintain_ledger(endpoint);
+        Ok(())
+    }
+
+    // Free the committed binding `index`, whose connection the endpoint has
+    // reclaimed.
+    fn free_binding(&mut self, index: usize) -> Result<(), Error> {
+        let binding = self.bindings[index].take().unwrap();
+        let owner = binding.owner.unwrap();
+        self.live_bindings.remove(index);
+        self.free_bindings.push(index);
+        for set in [&mut self.unaged, &mut self.unpublished] {
+            if set.contains(index) {
+                set.remove(index);
+            }
+        }
+        debug_assert_eq!(self.owner_bindings[owner.index()], Some(index));
+        self.owner_bindings[owner.index()] = None;
+        self.holders[binding.prepared.client.index()] = Holder::None;
+        self.paths.release(binding.prepared.client)?;
         Ok(())
     }
 
@@ -3371,11 +3401,17 @@ impl PathProvider for Host {
         let index = self
             .provisional(prepared)
             .expect("prepared binding preflight");
+        // The slot's previous connection, reclaimed before this one took the
+        // slot, may not have been collected yet: its binding goes now, so a
+        // slot has the one binding `owner_bindings` names.
+        if let Some(previous) = self.owner_bindings[connection.index()] {
+            debug_assert_ne!(self.bindings[previous].unwrap().owner, Some(connection));
+            self.free_binding(previous)
+                .expect("live committed binding client");
+        }
         self.bindings[index].as_mut().unwrap().owner = Some(connection);
         self.provisional.remove(index);
-        if let Some(entry) = self.owner_bindings.get_mut(connection.index()) {
-            *entry = Some(index);
-        }
+        self.owner_bindings[connection.index()] = Some(index);
         if self.search_aging.is_some() {
             self.unaged.insert(index);
         }

@@ -96,10 +96,8 @@ pub struct Network<P: PacketIo> {
     maintain: SlotQueue,
     // Connection slots whose TX timestamps may be ready to drain.
     stamped: SlotQueue,
-    // Released connection slots, kept until the endpoint reclaims their
-    // connections, and the endpoint's reclaim count they were last checked
-    // at.
-    releasing: Vec<usize>,
+    // The endpoint's reclaim count when released connection slots were last
+    // freed (`maintain_connections`).
     reclaimed: u64,
     staged_timestamp: Option<TimestampEvent>,
     backend_clocks: Vec<(u64, ntcp_io::ClockDescriptor)>,
@@ -657,7 +655,6 @@ impl<P: PacketIo> Network<P> {
         let ports = PortUsers::new(slots)?;
         let (ready, maintain) = (SlotQueue::new(slots)?, SlotQueue::new(slots)?);
         let stamped = SlotQueue::new(config.tcp.max_connections)?;
-        let releasing = indices(config.tcp.max_connections)?;
         let next_port = *config.ephemeral_ports.start();
         Ok(Self {
             config,
@@ -682,7 +679,6 @@ impl<P: PacketIo> Network<P> {
             ready,
             maintain,
             stamped,
-            releasing,
             reclaimed: 0,
             staged_timestamp: None,
             backend_clocks,
