@@ -657,9 +657,16 @@ impl Endpoint {
                 },
                 registration: None,
             };
-            self.path_factory(provider, request, |endpoint| {
+            let result = self.path_factory(provider, request, |endpoint| {
                 endpoint.input_scoped(now, ip, zone, traffic_class, options, bytes, metadata)
-            })
+            });
+            // The provider has no path to answer on (no route, or no path
+            // capacity): the listener drops the SYN, as Linux's does one it
+            // finds no route for.
+            if matches!(result, Err(ManagedError::Provider(_))) {
+                self.count_listen_drop(false);
+            }
+            result
         } else {
             // Admitted and looked up above; nothing since changed either.
             self.input_admitted(

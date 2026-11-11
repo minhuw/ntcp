@@ -2878,6 +2878,11 @@ fn time_wait_reuse_timestamp_and_sequence_freshness() {
                 "old_ts={old_ts} case={case}"
             );
             assert_eq!(b.state(old), Ok(State::TimeWait));
+            // A stale SYN is the TIME-WAIT connection's to drop, not the
+            // listener's; a fresh one supersedes the old incarnation, which
+            // stays in TIME-WAIT.
+            assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0));
+            assert_eq!(b.time_wait_connections(), 1);
             assert_eq!(
                 b.accept(listener),
                 Err(EndpointError::Connection(Error::WouldBlock))
@@ -3714,6 +3719,179 @@ fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
         assert_eq!(b.buffer_bytes(), bytes);
         assert_eq!(b.state(old), Ok(State::TimeWait));
         assert!(packets(&mut b, 4_000).is_empty());
+        // A fresh SYN the listener has no room for is its drop, at a full
+        // backlog also an overflow; a closed listener took none.
+        let counted = match pressure {
+            0 | 1 => (0, 1),
+            2 => (0, 0),
+            _ => (1, 1),
+        };
+        assert_eq!((b.listen_overflows(), b.listen_drops()), counted);
+        assert_eq!(b.time_wait_connections(), 1);
+    }
+}
+
+// Linux counts a SYN its full accept queue refuses in ListenOverflows and
+// ListenDrops, and one refused for memory in ListenDrops alone.
+#[test]
+fn listen_overflows_and_drops_count_the_syns_a_listener_refuses() {
+    // A full backlog, no connection slot, no buffer budget.
+    for case in 0..3 {
+        let mut cfg = config();
+        if case == 1 {
+            cfg.max_connections = 2;
+        }
+        if case == 2 {
+            cfg.max_buffer_bytes = connection_charge(&cfg);
+        }
+        let (local, remote) = addresses();
+        let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let listener = b.listen(remote, [1, 2, 4][case]).unwrap();
+        if case == 1 {
+            // An accepted connection holds one of the two slots, outside
+            // the backlog.
+            let earlier = core::net::SocketAddr::new(local.ip(), 40002);
+            a.connect(0, earlier, remote).unwrap();
+            pump(&mut a, &mut b, 0);
+            b.accept(listener).unwrap();
+        }
+        let first = a.connect(0, local, remote).unwrap();
+        let other = core::net::SocketAddr::new(local.ip(), 40001);
+        let second = a.connect(0, other, remote).unwrap();
+        let mut syns = packets(&mut a, 0);
+        assert_eq!(syns.len(), 2);
+        let (ip, refused) = syns.pop().unwrap();
+        deliver(&mut b, 0, syns);
+        assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0));
+        assert_eq!(b.input(0, ip, &refused), Ok(InputDisposition::Dropped));
+        let overflows = u64::from(case == 0);
+        assert_eq!((b.listen_overflows(), b.listen_drops()), (overflows, 1));
+        pump(&mut a, &mut b, 0);
+        b.accept(listener).unwrap();
+        assert_eq!(a.state(first), Ok(State::Established));
+        // The retransmitted SYN finds the accepted connection gone from the
+        // backlog, but still holding its slot and budget.
+        tick(&mut a, &mut b, 1_000_000);
+        if case == 0 {
+            assert_eq!(a.state(second), Ok(State::Established));
+            assert_eq!((b.listen_overflows(), b.listen_drops()), (1, 1));
+        } else {
+            assert_eq!(a.state(second), Ok(State::SynSent));
+            assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 2));
+        }
+    }
+}
+
+#[test]
+fn time_wait_connections_follow_entry_release_expiry_and_abort() {
+    let time_wait = |a: &mut Endpoint, b: &mut Endpoint, client| {
+        let listener = b.listen(addresses().1, 4).unwrap();
+        pump(a, b, 0);
+        let server = b.accept(listener).unwrap();
+        a.shutdown(client).unwrap();
+        pump(a, b, 1_000);
+        assert_eq!(a.state(client), Ok(State::FinWait2));
+        assert_eq!(a.time_wait_connections(), 0);
+        b.shutdown(server).unwrap();
+        pump(a, b, 2_000);
+        assert_eq!(a.state(client), Ok(State::TimeWait));
+        // Only the side that closed first waits.
+        assert_eq!(b.state(server), Ok(State::Closed));
+        assert_eq!(
+            (a.time_wait_connections(), b.time_wait_connections()),
+            (1, 0)
+        );
+    };
+    let (local, remote) = addresses();
+    let expiry = 2_000 + config().connection.time_wait_us;
+    for released in [false, true] {
+        let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        time_wait(&mut a, &mut b, client);
+        if released {
+            a.release(client).unwrap();
+        }
+        a.on_timeout(expiry - 1, 64).unwrap();
+        assert_eq!(a.time_wait_connections(), 1);
+        a.on_timeout(expiry, 64).unwrap();
+        assert!(packets(&mut a, expiry).is_empty());
+        assert_eq!(a.time_wait_connections(), 0);
+        assert_eq!(a.connection_exists(client), !released);
+    }
+    // An abort ends TIME-WAIT at once.
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    time_wait(&mut a, &mut b, client);
+    a.abort(client).unwrap();
+    assert_eq!(a.state(client), Ok(State::Closed));
+    assert_eq!(a.time_wait_connections(), 0);
+    a.release(client).unwrap();
+    assert!(packets(&mut a, 2_000).is_empty());
+    assert!(!a.connection_exists(client));
+    assert_eq!(a.time_wait_connections(), 0);
+}
+
+// RFC 9293 3.6.1 (2): the incarnation a reopening SYN supersedes stays in
+// TIME-WAIT, to take its tuple back should the SYN turn out an old
+// duplicate, until its own TIME-WAIT ends.
+#[test]
+fn time_wait_connections_keep_a_superseded_incarnation_until_its_expiry() {
+    for establish in [false, true] {
+        let mut cfg = config();
+        cfg.connection.timestamps = true;
+        let expiry = 3_000 + cfg.connection.time_wait_us;
+        let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
+        b.release(old).unwrap();
+        assert_eq!(b.time_wait_connections(), 1);
+        let seq = h.acknowledgment.wrapping_add(100);
+        let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)));
+        assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
+        let output = packets(&mut b, 4_000);
+        let synack = wire::parse(output[0].0, &output[0].1).unwrap();
+        let echo = synack.options.timestamps.unwrap().0;
+        assert_eq!(b.time_wait_connections(), 1);
+        let resolution = if establish {
+            tw_segment(
+                ip,
+                h,
+                seq + 1,
+                synack.header.sequence.wrapping_add(1),
+                wire::ACK,
+                Some((ts + 2, echo)),
+            )
+        } else {
+            // The old SYN's originator rejects the unexpected SYN-ACK.
+            tw_segment(
+                ip,
+                h,
+                seq + 1,
+                synack.header.sequence.wrapping_add(1),
+                wire::RST,
+                None,
+            )
+        };
+        b.input(5_000, ip, &resolution).unwrap();
+        packets(&mut b, 5_000);
+        if establish {
+            let new = b.accept(listener).unwrap();
+            assert_eq!(b.state(new), Ok(State::Established));
+        } else {
+            assert_eq!(
+                b.accept(listener),
+                Err(EndpointError::Connection(Error::WouldBlock))
+            );
+        }
+        assert_eq!(b.time_wait_connections(), 1);
+        b.on_timeout(expiry - 1, 64).unwrap();
+        assert_eq!(b.time_wait_connections(), 1);
+        b.on_timeout(expiry, 64).unwrap();
+        packets(&mut b, expiry);
+        assert!(!b.connection_exists(old));
+        assert_eq!(b.time_wait_connections(), 0);
+        assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0));
     }
 }
 

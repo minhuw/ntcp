@@ -1128,3 +1128,106 @@ fn event_driven_exchanges_complete_under_backpressure_and_partial_reads() {
     }
     panic!("exchanges stalled: {done:?}, awaiting {awaited:?}, unwritten {unwritten:?}");
 }
+
+// A listener's refused SYNs count as Linux's ListenOverflows and
+// ListenDrops: a full backlog in both, no connection slot in the drops
+// alone. An active open without a slot fails with Error::Capacity instead.
+#[test]
+fn listen_overflows_and_drops_count_refused_syns() {
+    let (ip_a, ip_b): (IpAddr, IpAddr) =
+        ("10.73.0.1".parse().unwrap(), "10.73.0.2".parse().unwrap());
+    for full_backlog in [true, false] {
+        let (wire_a, wire_b) = wires(PacketLayer::Ip);
+        let mut config_b = config(ip_b, false, 2);
+        if !full_backlog {
+            config_b.tcp.max_connections = 2;
+        }
+        let mut a = Network::new(config(ip_a, false, 1), wire_a, [1; 32], 0).unwrap();
+        let mut b = Network::new(config_b, wire_b, [2; 32], 0).unwrap();
+        let peer = SocketAddr::new(ip_b, 9000);
+        let listener = b.listen(9000, if full_backlog { 1 } else { 2 }).unwrap();
+        let mut now = 0;
+        let mut step = |a: &mut Network<Wire>, b: &mut Network<Wire>| {
+            now += 10_000;
+            a.drive(now, BUDGET).unwrap();
+            b.drive(now, BUDGET).unwrap();
+        };
+        let mut accepted = Vec::new();
+        if !full_backlog {
+            // An accepted connection holds one of the two slots, outside
+            // the backlog.
+            a.connect(peer).unwrap();
+            for _ in 0..10 {
+                step(&mut a, &mut b);
+            }
+            accepted.push(b.accept(listener).unwrap());
+        }
+        let first = a.connect(peer).unwrap();
+        let second = a.connect(peer).unwrap();
+        step(&mut a, &mut b);
+        let counters = b.counters();
+        let overflows = u64::from(full_backlog);
+        assert_eq!(
+            (counters.listen_overflows, counters.listen_drops),
+            (overflows, 1)
+        );
+        if !full_backlog {
+            assert!(matches!(
+                b.connect(SocketAddr::new(ip_a, 9000)),
+                Err(Error::Capacity)
+            ));
+        }
+        // The second's SYN, retransmitted after a second, finds the first
+        // accepted and gone from the backlog, but still holding a slot.
+        for _ in 0..150 {
+            step(&mut a, &mut b);
+            accepted.extend(b.accept(listener));
+        }
+        let state = |id| a.connection_info(id).unwrap().state;
+        assert_eq!(state(first), State::Established);
+        assert_eq!(accepted.len(), 2);
+        let counters = b.counters();
+        if full_backlog {
+            assert_eq!(state(second), State::Established);
+            assert_eq!((counters.listen_overflows, counters.listen_drops), (1, 1));
+        } else {
+            assert_eq!(state(second), State::SynSent);
+            assert_eq!((counters.listen_overflows, counters.listen_drops), (0, 2));
+        }
+    }
+}
+
+// TIME-WAIT occupancy, as Linux's sockstat `tw`: the side that closes first
+// waits, its handle released or not, until TIME-WAIT ends.
+#[test]
+fn time_wait_connections_count_the_connections_waiting() {
+    let mut pair = Pair::new(false, false);
+    assert_eq!(pair.a.counters().time_wait_connections, 0);
+    pair.a.close(pair.client).unwrap();
+    for _ in 0..10 {
+        pair.step();
+    }
+    assert!(matches!(
+        pair.b.try_read(pair.server, &mut [0; 8]),
+        Ok(ReadOutcome::Eof)
+    ));
+    assert_eq!(pair.a.counters().time_wait_connections, 0);
+    pair.b.close(pair.server).unwrap();
+    for _ in 0..10 {
+        pair.step();
+        drain(&mut pair.a);
+        drain(&mut pair.b);
+    }
+    assert!(matches!(
+        pair.a.connection_info(pair.client),
+        Ok(ConnectionInfo {
+            state: State::TimeWait,
+            ..
+        }) | Err(Error::InvalidHandle)
+    ));
+    assert_eq!(pair.a.counters().time_wait_connections, 1);
+    assert_eq!(pair.b.counters().time_wait_connections, 0);
+    pair.now += pair.a.config().tcp.connection.time_wait_us;
+    pair.step();
+    assert_eq!(pair.a.counters().time_wait_connections, 0);
+}

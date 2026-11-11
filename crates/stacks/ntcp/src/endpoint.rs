@@ -392,6 +392,9 @@ struct Slot {
     // compact tombstones can reclaim buffer slack if reset churn matters.
     reset_deadline: Option<Instant>,
     fallback: Option<ConnectionId>,
+    // The connection's state was TIME-WAIT at its last refresh: counted in
+    // `time_wait_connections`.
+    time_wait: bool,
     hop_limit: u8,
     dscp: u8,
     received_dscp: Option<u8>,
@@ -410,6 +413,20 @@ impl CrossingSynAuthorization {
     pub(crate) fn consume(self) -> (bool, Option<wire::FastOpenCookie>) {
         (self.early, self.response)
     }
+}
+
+// Why passive admission refuses a SYN (`Endpoint::passive_refusal`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PassiveRefusal {
+    // The TIME-WAIT connection of its tuple may not be reopened: reset
+    // pending or quarantined, or the SYN is not fresh (RFC 6191).
+    TimeWait,
+    // The listener's backlog is full.
+    Backlog,
+    // No connection slot or buffer budget for the connection.
+    Resources,
+    // A tuple no connection may have (a zero port).
+    Invalid,
 }
 
 struct Listener {
@@ -499,6 +516,10 @@ pub struct Endpoint {
     progress_una: Vec<u32>,
     deadlines: Deadlines,
     reclaimed: u64,
+    // `listen_overflows`, `listen_drops` and `time_wait_connections`.
+    listen_overflows: u64,
+    listen_drops: u64,
+    time_wait: usize,
     // Stateless replies: addresses, header, IPv4 options, timestamp echo and,
     // when a managed provider stated it at queueing, the complete IP header
     // length (extensions included) of the IPv6 path the reply leaves on (a
@@ -675,6 +696,9 @@ impl Endpoint {
             },
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
             reclaimed: 0,
+            listen_overflows: 0,
+            listen_drops: 0,
+            time_wait: 0,
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
             config,
             routes: Vec::new(),
@@ -1690,6 +1714,7 @@ impl Endpoint {
             mapped: true,
             reset_deadline: None,
             fallback,
+            time_wait: false,
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
             received_dscp: None,
@@ -2731,6 +2756,9 @@ impl Endpoint {
         self.advice.remove(index);
         self.progress.remove(index);
         self.deadlines.set(index, None);
+        if slot.time_wait {
+            self.time_wait -= 1;
+        }
         self.recycle_connection(slot.connection);
         self.reclaimed += 1;
         if let Some(generation) = self.generations[index].checked_add(1) {
@@ -2770,6 +2798,17 @@ impl Endpoint {
         // Sixty seconds and latest-reset batch retention are local policy.
         let reset_cooldown = self.config.connection.timebase.ticks_from_us(60_000_000);
         if let Some(slot) = self.slots[index].as_mut() {
+            // Every change of a connection's state is followed by its
+            // refresh, or ends in its reclaim.
+            let time_wait = slot.connection.state() == State::TimeWait;
+            if slot.time_wait != time_wait {
+                slot.time_wait = time_wait;
+                if time_wait {
+                    self.time_wait += 1;
+                } else {
+                    self.time_wait -= 1;
+                }
+            }
             if core::mem::take(&mut slot.connection.fast_open_negative)
                 && let Some(service) = self.fast_open.as_mut()
             {
@@ -3330,7 +3369,10 @@ impl Endpoint {
             if segment.header.flags & SYN == 0 {
                 return Ok(InputDisposition::Dropped);
             }
-            if !self.passive_room(now, None, listener, tuple, segment) {
+            if let Some(refusal) = self.passive_refusal(now, None, listener, tuple, segment) {
+                if refusal != PassiveRefusal::Invalid {
+                    self.count_listen_drop(refusal == PassiveRefusal::Backlog);
+                }
                 return Ok(InputDisposition::Dropped);
             }
             let record = self.listeners[listener.slot].as_ref().unwrap();
@@ -3348,7 +3390,10 @@ impl Endpoint {
                 timestamps,
             ) {
                 Ok(connection) => connection,
-                Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
+                Err(Error::NoMemory) => {
+                    self.count_listen_drop(false);
+                    return Ok(InputDisposition::Dropped);
+                }
                 Err(error) => return Err(error.into()),
             };
             connection.set_handshake_retransmission_limit(handshake_retransmission_limit);
@@ -3363,7 +3408,10 @@ impl Endpoint {
                     Self::save_ipv4_options(slot, options, route);
                     return Ok(InputDisposition::Processed);
                 }
-                Err(EndpointError::LimitReached) => return Ok(InputDisposition::Dropped),
+                Err(EndpointError::LimitReached) => {
+                    self.count_listen_drop(false);
+                    return Ok(InputDisposition::Dropped);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -3454,24 +3502,53 @@ impl Endpoint {
         tuple: ScopedTuple,
         syn: &wire::Segment<'_>,
     ) -> bool {
-        let record = self.listeners[listener.slot].as_ref().unwrap();
-        if record.children.len() >= record.backlog {
-            return false;
-        }
-        match target {
-            None => self
-                .resource_admission(tuple, record.buffer_capacities)
-                .is_ok(),
-            Some(index) => {
-                let slot = self.slots[index].as_ref().unwrap();
-                !slot.connection.reset_pending()
-                    && slot.reset_deadline.is_none()
-                    && self.has_capacity(record.buffer_capacities)
-                    && slot
-                        .connection
-                        .reuse_syn(now, syn, self.new_connection_timestamps())
+        self.passive_refusal(now, target, listener, tuple, syn)
+            .is_none()
+    }
+
+    // Why `passive_room` refuses a SYN. A SYN that may not reopen its
+    // TIME-WAIT connection is that connection's to drop and never reaches
+    // the listener's queue, as in Linux, so it is told apart first.
+    fn passive_refusal(
+        &self,
+        now: Instant,
+        target: Option<usize>,
+        listener: ListenerId,
+        tuple: ScopedTuple,
+        syn: &wire::Segment<'_>,
+    ) -> Option<PassiveRefusal> {
+        if let Some(index) = target {
+            let slot = self.slots[index].as_ref().unwrap();
+            if slot.connection.reset_pending()
+                || slot.reset_deadline.is_some()
+                || !slot
+                    .connection
+                    .reuse_syn(now, syn, self.new_connection_timestamps())
+            {
+                return Some(PassiveRefusal::TimeWait);
             }
         }
+        let record = self.listeners[listener.slot].as_ref().unwrap();
+        if record.children.len() >= record.backlog {
+            return Some(PassiveRefusal::Backlog);
+        }
+        match target {
+            None => match self.resource_admission(tuple, record.buffer_capacities) {
+                Ok(()) => None,
+                Err(EndpointError::LimitReached) => Some(PassiveRefusal::Resources),
+                Err(_) => Some(PassiveRefusal::Invalid),
+            },
+            Some(_) => {
+                (!self.has_capacity(record.buffer_capacities)).then_some(PassiveRefusal::Resources)
+            }
+        }
+    }
+
+    // A SYN a listener took and dropped (`listen_drops`), one refused for
+    // its full backlog also an overflow (`listen_overflows`).
+    fn count_listen_drop(&mut self, overflow: bool) {
+        self.listen_overflows += u64::from(overflow);
+        self.listen_drops += 1;
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
@@ -3535,7 +3612,10 @@ impl Endpoint {
         let Some(listener) = self.match_listener(tuple.local, scoped.zone) else {
             return Ok(InputDisposition::Dropped);
         };
-        if !self.passive_room(self.now, Some(index), listener, scoped, syn) {
+        if let Some(refusal) = self.passive_refusal(self.now, Some(index), listener, scoped, syn) {
+            if refusal != PassiveRefusal::TimeWait {
+                self.count_listen_drop(refusal == PassiveRefusal::Backlog);
+            }
             return Ok(InputDisposition::Dropped);
         }
         let record = self.listeners[listener.slot].as_ref().unwrap();
@@ -3560,7 +3640,10 @@ impl Endpoint {
             timestamps,
         ) {
             Ok(connection) => connection,
-            Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
+            Err(Error::NoMemory) => {
+                self.count_listen_drop(false);
+                return Ok(InputDisposition::Dropped);
+            }
             Err(error) => return Err(error.into()),
         };
         // Reuse keeps the old local virtual clock: peer PAWS must not see a
@@ -4628,6 +4711,46 @@ impl Endpoint {
     /// once, never sent on another link. For administrative reporting.
     pub fn undeliverable_control_replies(&self) -> u64 {
         self.undeliverable_control
+    }
+
+    /// SYNs a listener dropped because its backlog was full, as Linux counts
+    /// those its full accept queue refuses (LINUX_MIB_LISTENOVERFLOWS). The
+    /// backlog bounds a listener's unaccepted connections, half-open and
+    /// established alike, so this also counts what Linux refuses at its SYN
+    /// queue, there in ListenDrops alone. For administrative reporting.
+    pub fn listen_overflows(&self) -> u64 {
+        self.listen_overflows
+    }
+
+    /// SYNs a listener dropped for lack of room, as Linux counts every SYN
+    /// its listener drops (LINUX_MIB_LISTENDROPS): `listen_overflows`, and
+    /// those refused for want of a connection slot (`max_connections`) or
+    /// buffer budget (`max_buffer_bytes`), whose connection could not be
+    /// allocated, or that a managed path provider found no path to answer.
+    /// A SYN that may not reopen its TIME-WAIT connection is that
+    /// connection's to drop and is not counted. For administrative
+    /// reporting.
+    pub fn listen_drops(&self) -> u64 {
+        self.listen_drops
+    }
+
+    /// Connections in TIME-WAIT now, as Linux reports its TIME-WAIT sockets
+    /// (/proc/net/sockstat `tw`), released or not. An incarnation that a
+    /// reopening SYN superseded stays until its own TIME-WAIT ends (the new
+    /// one may still fail and return the tuple to it). A connection that
+    /// holds its tuple for the TIME-WAIT duration after sending a reset is
+    /// CLOSED, not counted. For administrative reporting.
+    pub fn time_wait_connections(&self) -> usize {
+        debug_assert_eq!(
+            self.time_wait,
+            self.occupied
+                .iter()
+                .filter(|&index| self.slots[index]
+                    .as_ref()
+                    .is_some_and(|slot| slot.connection.state() == State::TimeWait))
+                .count()
+        );
+        self.time_wait
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {

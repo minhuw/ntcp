@@ -187,6 +187,10 @@ fn full_endpoint_backlog_or_uncollected_bindings_do_not_turn_admissible_syns_int
             Ok(ntcp::InputDisposition::Dropped)
         );
         assert_eq!(usage(&b.0), before);
+        // Each of the two refused SYNs is one listen drop and, the first
+        // connection being unaccepted either way, an overflow of the full
+        // backlog.
+        assert_eq!((b.1.listen_overflows(), b.1.listen_drops()), (2, 2));
     }
     // Bindings sized max_connections+1 can only be full of uncollected
     // generations once the Endpoint itself has room.
@@ -223,6 +227,35 @@ fn full_endpoint_backlog_or_uncollected_bindings_do_not_turn_admissible_syns_int
     let mut now = 10;
     pump(&mut a, &mut b, &mut now);
     b.1.accept(listener).unwrap();
+    assert_eq!((b.1.listen_overflows(), b.1.listen_drops()), (0, 0));
+}
+
+// Linux counts a SYN its listener finds no route to answer in ListenDrops.
+#[test]
+fn managed_syn_without_a_path_to_answer_is_a_listen_drop() {
+    for v6 in [false, true] {
+        let (local, remote) = addresses(v6);
+        let mut b = managed(remote, 55, config(4));
+        b.1.listen(remote, 4).unwrap();
+        let request =
+            b.0.request(remote.ip(), local.ip(), None, Dscp::new(12).unwrap())
+                .unwrap();
+        let route = b.0.paths().resolve(request).unwrap().key().route();
+        b.0.remove_route(route).unwrap();
+        let ip = IpMetadata {
+            source: local.ip(),
+            destination: remote.ip(),
+        };
+        let (result, prepared) = core_input(&mut b, 1, ip, &syn(ip, local.port()));
+        println!("unrouted SYN v6={v6}: {result:?}");
+        assert_eq!(
+            result,
+            Err(ManagedError::Provider(Error::Path(path::Error::NoRoute)))
+        );
+        assert_eq!(prepared, 1);
+        assert_eq!(b.0.binding_count(), 0);
+        assert_eq!((b.1.listen_overflows(), b.1.listen_drops()), (0, 1));
+    }
 }
 
 #[test]

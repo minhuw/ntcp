@@ -247,4 +247,18 @@ pub struct Counters {
     pub handed_off: u64,
     pub handoffs_received: u64,
     pub handoffs_dropped: u64,
+    // SYNs a listener dropped because its backlog (its unaccepted
+    // connections, half-open and established) was full: Linux's
+    // ListenOverflows (`Endpoint::listen_overflows`).
+    pub listen_overflows: u64,
+    // SYNs a listener dropped for lack of room: listen_overflows, and those
+    // refused for want of a connection slot or buffer budget, whose
+    // connection could not be allocated or that had no path to answer on:
+    // Linux's ListenDrops (`Endpoint::listen_drops`). Each such SYN is also
+    // in discarded. An active open refused for the same reasons, or for
+    // want of an ephemeral port, fails with Error::Capacity instead.
+    pub listen_drops: u64,
+    // Connections in TIME-WAIT now, released or not: Linux's sockstat `tw`
+    // (`Endpoint::time_wait_connections`).
+    pub time_wait_connections: usize,
 }

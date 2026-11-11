@@ -740,6 +740,9 @@ impl<P: PacketIo> Network<P> {
         Counters {
             retained_input: self.retained.len(),
             resolution_failures: self.host.arp_counters().resolution_failures,
+            listen_overflows: self.endpoint.listen_overflows(),
+            listen_drops: self.endpoint.listen_drops(),
+            time_wait_connections: self.endpoint.time_wait_connections(),
             ..self.counters
         }
     }
