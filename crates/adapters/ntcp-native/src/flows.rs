@@ -203,7 +203,24 @@ fn hashing(key: &[u8], table: Vec<usize>, members: usize) -> Result<(Toeplitz, B
     let hash = Toeplitz::new(key).ok_or(Error::InvalidConfig(
         "a flow key covers IPv4 addresses and ports",
     ))?;
+    // A table whose entries all name one member, as a group of one's does
+    // whatever its length, selects it whatever the hash: it is kept as
+    // that one entry, for `select`.
+    let table = match table[..] {
+        [first, ..] if table.iter().all(|&m| m == first) => vec![first],
+        _ => table,
+    };
     Ok((hash, table.into_boxed_slice()))
+}
+
+// The member of `table` that `hash` selects. A table of one entry names its
+// member whatever the hash, which is then not computed: a group of one
+// hashes none of the packets it can only take in itself.
+fn select(table: &[usize], toeplitz: &Toeplitz, hash: impl FnOnce(&Toeplitz) -> u32) -> usize {
+    match table {
+        [member] => *member,
+        _ => table[hash(toeplitz) as usize & (table.len() - 1)],
+    }
 }
 
 // One member's place in the flows.
@@ -488,14 +505,14 @@ impl Shared {
                 table,
             } => self
                 .serves(address, me)
-                .then(|| table[hash(toeplitz) as usize & (table.len() - 1)]),
+                .then(|| select(table, toeplitz, hash)),
             Ownership::TaggedPorts {
                 hash: toeplitz,
                 table,
                 tags,
             } => self.serves(address, me).then(|| {
                 port.and_then(|p| tags.member(p))
-                    .unwrap_or_else(|| table[hash(toeplitz) as usize & (table.len() - 1)])
+                    .unwrap_or_else(|| select(table, toeplitz, hash))
             }),
         }
     }
@@ -1080,6 +1097,53 @@ mod tests {
             c.join(1, REMOTE.into(), MTU, 0),
             Err(Error::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn a_table_of_one_member_gives_it_every_hashed_flow() {
+        // A group of one, and under TaggedPorts two members of which the
+        // table names one: member 1 owns its tagged ports alone. A table of
+        // one entry, and a longer one that names one member.
+        for table in [vec![0], vec![0; 8]] {
+            let one = hashed(1, table.clone());
+            let a = one.join(0, LOCAL.into(), MTU, 0).unwrap();
+            let two = tagged(2, table, 0xc000, 0xc000).unwrap();
+            let b = two.join(0, LOCAL.into(), MTU, 0).unwrap();
+            let c = two.join(1, LOCAL.into(), MTU, 0).unwrap();
+            for port in (0..=u16::MAX).step_by(61).chain([0xc000, 0xc001]) {
+                let local = SocketAddrV4::new(LOCAL, port);
+                let tag = (port & 0xc000 == 0xc000).then_some(usize::from(port & 1));
+                for remote in [
+                    SocketAddrV4::new(REMOTE, 80),
+                    SocketAddrV4::new(ROUTER, 40000),
+                ] {
+                    let segment = {
+                        let mut segment = ipv4(20, 40, 0, TCP, *remote.ip(), LOCAL);
+                        segment.extend_from_slice(&tcp(remote.port(), port, 20));
+                        segment
+                    };
+                    assert_eq!(one.owner(local, remote), Some(0), "{local} {remote}");
+                    assert_eq!(a.elsewhere(key(&segment)), None);
+                    assert!(a.owns(port, remote.into()));
+                    let owner = tag.unwrap_or(0);
+                    assert_eq!(two.owner(local, remote), Some(owner), "{local} {remote}");
+                    for member in [&b, &c] {
+                        let elsewhere = (owner != member.index).then_some(owner);
+                        assert_eq!(member.elsewhere(key(&segment)), elsewhere);
+                        assert_eq!(member.owns(port, remote.into()), owner == member.index);
+                    }
+                }
+            }
+            // Fragments too.
+            let fragment = key(&packet(MORE, TCP, &[0; 8]));
+            assert_eq!(one.reassembler(REMOTE, LOCAL), Some(0));
+            assert_eq!(a.elsewhere(fragment), None);
+            assert_eq!(two.reassembler(REMOTE, LOCAL), Some(0));
+            assert_eq!(
+                (b.elsewhere(fragment), c.elsewhere(fragment)),
+                (None, Some(0))
+            );
+        }
     }
 
     #[test]
