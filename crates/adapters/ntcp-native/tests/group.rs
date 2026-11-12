@@ -889,9 +889,15 @@ fn connection_info_is_current_without_events_and_close_still_completes() {
     pair.a.drive(pair.now, BUDGET).unwrap();
     let state = |pair: &Pair| pair.a.connection_info(pair.client).unwrap().state;
     assert_eq!(state(&pair), State::FinWait1);
-    // The peer acknowledges the FIN; the next drive of `a` takes the ACK.
-    pair.step();
-    pair.step();
+    // The peer acknowledges the FIN when its delayed ACK is due (it waits
+    // for a reply to carry it, as Linux does); the next drive of `a` takes
+    // the ACK.
+    for _ in 0..30 {
+        pair.step();
+        if state(&pair) != State::FinWait1 {
+            break;
+        }
+    }
     assert_eq!(state(&pair), State::FinWait2);
     assert!(matches!(
         pair.b.try_read(pair.server, &mut [0; 8]),

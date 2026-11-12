@@ -7602,6 +7602,22 @@ impl Connection {
                 self.progress_at = self.now;
             }
         }
+        // A FIN that ends the peer's stream in ESTABLISHED leaves the
+        // application to answer it, as a server does that closes on EOF, so
+        // the adaptive engine turns interactive and delays its ACK for the
+        // reply's FIN to carry, as Linux's tcp_fin enters pingpong mode on
+        // the move to CLOSE-WAIT. Linux delays it by the delayed-ACK
+        // engine's timeout, which stays zero until data first arrives
+        // (tcp_event_data_recv), so a FIN on a connection that received none
+        // is acknowledged at once, as is one in FIN-WAIT, which nothing
+        // local follows (tcp_fin sends that ACK itself).
+        let fin_awaits_reply = self.config.adaptive_ack
+            && self.ack_engine_initialized
+            && outcome.fin
+            && self.state == State::Established;
+        if fin_awaits_reply {
+            self.ack_interactive = true;
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
         //# A TCP endpoint SHOULD implement a delayed ACK (SHLD-18), but an ACK should
         //# not be excessively delayed; in particular, the delay MUST be less than 0.5
@@ -7638,8 +7654,8 @@ impl Connection {
                 || outcome.out_of_order
                 || self.receive.sack_blocks(1)[0].is_some()
                 || !outcome.advanced
-                || advanced as usize > count
-                || flags & FIN != 0
+                || advanced.saturating_sub(u32::from(outcome.fin)) as usize > count
+                || (flags & FIN != 0 && !fin_awaits_reply)
                 || self.receive_window() == 0
                 || self.unacked_segments >= 2
                 || self.unacked_bytes >= 2 * u32::from(rmss)

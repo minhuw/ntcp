@@ -69,6 +69,54 @@ fn startup_response_delayed_fin_and_timer_in_both_clock_units() {
     }
 }
 
+// A FIN that moves ESTABLISHED to CLOSE-WAIT turns the engine interactive
+// and waits for the application's reply, as Linux's tcp_fin enters pingpong
+// mode: a close then carries the ACK on its FIN, and without one the
+// delayed ACK leaves at its deadline. Quick-ACK credit does not hurry it.
+#[test]
+fn fin_in_established_waits_for_the_reply() {
+    for (payload, close) in [(&b""[..], true), (&b""[..], false), (&b"last"[..], true)] {
+        let (mut a, _) = pair(adaptive_config(), 100);
+        data(&mut a, 100, b"request");
+        packet(&mut a, 100);
+        a.read(&mut [0; 32]).unwrap();
+        assert!(a.ack_quick != 0 && !a.ack_interactive);
+        let (next, ack) = (a.receive.next(), a.snd_nxt);
+        inject(&mut a, 200, next, ack, ACK | FIN, 8192, payload);
+        assert_eq!(a.state, State::CloseWait);
+        assert!(a.ack_interactive);
+        assert!(!a.ack_pending);
+        let deadline = 200 + a.ack_ato;
+        assert_eq!(a.ack_deadline, Some(deadline));
+        assert_eq!(a.transmit(201, &mut [0; 2048]), Ok(None));
+        if close {
+            a.read(&mut [0; 32]).unwrap();
+            a.close().unwrap();
+            let bytes = packet(&mut a, 202);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.flags & (ACK | FIN), ACK | FIN);
+            assert_eq!(Seq(segment.header.acknowledgment), a.receive.next());
+            assert_eq!(a.ack_deadline, None);
+            assert_eq!(a.transmit(203, &mut [0; 2048]), Ok(None));
+        } else {
+            a.timeout(deadline).unwrap();
+            assert!(a.ack_pending);
+            let bytes = packet(&mut a, deadline);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.flags & (ACK | FIN), ACK);
+            assert_eq!(Seq(segment.header.acknowledgment), a.receive.next());
+        }
+    }
+    // Before any data the delayed-ACK engine has no timeout to wait (Linux's
+    // ato is still zero): the FIN is acknowledged at once.
+    let (mut a, _) = pair(adaptive_config(), 100);
+    let (next, ack) = (a.receive.next(), a.snd_nxt);
+    inject(&mut a, 200, next, ack, ACK | FIN, 8192, b"");
+    assert_eq!(a.state, State::CloseWait);
+    assert!(a.ack_pending);
+    assert_eq!(a.ack_deadline, None);
+}
+
 #[test]
 fn reserved_commit_not_selection_counts_once_and_uses_departure_time() {
     for late in [false, true] {
@@ -152,8 +200,18 @@ fn mandatory_feedback_overrides_interactive_delay() {
                 data(&mut a, 101, b"ab"); // Gap fill.
             }
             4 => {
+                // A FIN beyond a gap; an in-order FIN waits for the reply
+                // (fin_in_established_waits_for_the_reply).
                 let next = a.receive.next();
-                inject(&mut a, 100, next, Seq(108), ACK | FIN, 8192, b"");
+                inject(
+                    &mut a,
+                    100,
+                    next.wrapping_add(1),
+                    Seq(108),
+                    ACK | FIN,
+                    8192,
+                    b"",
+                );
             }
             5 => data(&mut a, 100, &[1; 8192]), // Receive window exhausted.
             _ => {
