@@ -815,6 +815,11 @@ impl Endpoint {
         Ok(self.retained_slot(id)?.connection.scoped_tuple())
     }
 
+    // The state of a connection, released or not, until it is reclaimed.
+    pub fn retained_state(&self, id: ConnectionId) -> Result<crate::State, EndpointError> {
+        Ok(self.retained_slot(id)?.connection.state())
+    }
+
     pub fn managed_path(&self, id: ConnectionId) -> Result<ManagedPathInfo, EndpointError> {
         let slot = self.retained_slot(id)?;
         let connection = &slot.connection;

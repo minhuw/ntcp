@@ -1,0 +1,27 @@
+# Selected RFC 6056 clauses: ephemeral port selection by RFC 6056 Algorithm 4
+# as Linux's __inet_hash_connect implements it (crates/stacks/ntcp ephemeral.rs,
+# used by ntcp-native and ntcp-socket active opens). Whitespace reflow only.
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6056#section-3.3"
+quote = '''
+Ephemeral port selection algorithms SHOULD obfuscate the selection of their ephemeral ports, since this helps to mitigate a number of attacks that depend on the attacker's ability to guess or know the five-tuple that identifies the transport-protocol instance to be attacked.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6056#section-3.3.3"
+quote = '''
+The function should use both IP addresses, the remote port, and a secret key value to compute the offset.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6056#section-3.3.4"
+quote = '''
+The array "table[]" assures that successive transport-protocol instances with the same remote endpoint will use increasing ephemeral port numbers.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6056#section-3.4"
+quote = '''
+To protect against this, the secret key should be of a reasonable length. Key lengths of 128 bits should be adequate.
+'''

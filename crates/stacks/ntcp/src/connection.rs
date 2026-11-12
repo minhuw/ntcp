@@ -1852,6 +1852,7 @@ impl Connection {
         hop_limit: u8,
         dscp: u8,
         mark: u32,
+        reuse_address: bool,
         ipv4_options: crate::OutgoingIpv4Options,
     ) -> Option<crate::time_wait::Record> {
         if self.state != State::TimeWait || !self.output_idle() {
@@ -1881,6 +1882,7 @@ impl Connection {
             hop_limit,
             dscp,
             mark,
+            reuse_address,
             ipv4_options,
             reply_header: None,
         })

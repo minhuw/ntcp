@@ -163,7 +163,7 @@ def reconstruct(rows):
 class FastOpenInventory(unittest.TestCase):
     def test_full_operative_registration_and_official_commitment(self):
         scopes, document = check_registration(), ledger()
-        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200, 826})
+        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200, 826, 6056})
         scope = scopes[7413]
         self.assertEqual(scope["scope_kind"], "full-operative")
         self.assertEqual(scope["extraction"], "manual")

@@ -15,7 +15,7 @@ from test_annotation_inventory import report_fixture, report_scopes
 # registration floor. These scoped additions cannot silently replace an old RFC.
 FINAL_RFCS = {9293, 2018, 6675, 8985, 9937, 6298, 5681, 6582, 6928, 7323,
               2883, 3168, 5961, 3042, 9406, 9438, 1191, 8201, 4821, 5927,
-              7413, 6191, 6429, 791, 1122, 3542, 6864, 8200, 826}
+              7413, 6191, 6429, 791, 1122, 3542, 6864, 8200, 826, 6056}
 CONTRACT = {
     8200: (9, 9, 0, "Standards Track",
            "371ae3f133d562db5d6385e6def4ca9914c4f831be228ea7779fd28799c2f490",
@@ -33,7 +33,7 @@ def ledger(n):
 class Ipv6Inventory(unittest.TestCase):
     def test_final_registration_and_exact_scoped_clause_contract(self):
         scopes = check_registration()
-        self.assertEqual(len(scopes), 29)
+        self.assertEqual(len(scopes), 30)
         self.assertEqual(set(scopes), FINAL_RFCS)
         for n, (total, covered, todos, status, text_hash, clauses_hash) in CONTRACT.items():
             with self.subTest(rfc=n):

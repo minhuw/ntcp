@@ -413,6 +413,8 @@ struct Slot {
     hop_limit: u8,
     dscp: u8,
     mark: u32,
+    // The application's SO_REUSEADDR, which its TIME-WAIT record keeps.
+    reuse_address: bool,
     received_dscp: Option<u8>,
     ipv4_options: OutgoingIpv4Options,
     explicit_route: bool,
@@ -1833,6 +1835,7 @@ impl Endpoint {
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
             mark: 0,
+            reuse_address: false,
             received_dscp: None,
             ipv4_options: OutgoingIpv4Options::default(),
             explicit_route: false,
@@ -2912,6 +2915,7 @@ impl Endpoint {
             slot.hop_limit,
             slot.dscp,
             slot.mark,
+            slot.reuse_address,
             slot.ipv4_options,
         ) else {
             return false;
@@ -2962,6 +2966,50 @@ impl Endpoint {
     /// connection that used it was reclaimed.
     pub fn time_wait_holds_port(&self, port: u16) -> bool {
         self.time_wait.holds_port(port)
+    }
+
+    /// The tuple and SO_REUSEADDR (`set_reuse_address`) of every TIME-WAIT
+    /// record whose local port is `port`, for a bind to judge, as Linux's
+    /// inet_csk_bind_conflict walks the timewait sockets of the port's bind
+    /// bucket. None without a pass over the records while no record holds
+    /// the port (`time_wait_holds_port`); else a pass over all of them.
+    pub fn time_wait_binds(&self, port: u16) -> impl Iterator<Item = (ScopedTuple, bool)> + '_ {
+        self.time_wait
+            .holds_port(port)
+            .then(|| self.time_wait.indices())
+            .into_iter()
+            .flatten()
+            .map(|index| self.time_wait.record(index))
+            .filter(move |record| record.tuple.tuple.local.port() == port)
+            .map(|record| (record.tuple, record.reuse_address))
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
+    //# A connection is defined by a pair of sockets.  Connections can be
+    //# reused.
+    /// Whether a connection or a TIME-WAIT record has `tuple`, so that an
+    /// active open of it would be refused (`EndpointError::AddressInUse`):
+    /// the check an adapter's ephemeral port selection makes of each
+    /// candidate (`EphemeralPorts::select`), as Linux's
+    /// __inet_check_established looks up the established hash. One lookup
+    /// in the tuple tables, whatever the number of connections.
+    pub fn tuple_in_use(&self, tuple: ScopedTuple) -> bool {
+        self.lookup(tuple).is_some()
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc6056#section-3.4
+    //# To protect against this, the secret key should be of a reasonable
+    //# length.  Key lengths of 128 bits should be adequate.
+    /// The state of ephemeral port selection for this endpoint's active
+    /// opens (RFC 6056 Algorithm 4), keyed by the endpoint's secret under
+    /// its own label, as the ISN and lookup keys are: the ports it selects
+    /// are unpredictable to whoever does not know the secret.
+    pub fn ephemeral_ports(&self) -> Result<crate::EphemeralPorts, EndpointError> {
+        let mut mac = self.keyed.clone();
+        mac.update(b"ntcp ephemeral port key");
+        let key = mac.finalize().into_bytes()[..16].try_into().unwrap();
+        crate::EphemeralPorts::new(key, self.config.connection.timebase)
+            .map_err(|_| Error::NoMemory.into())
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7413#section-3
@@ -4826,6 +4874,22 @@ impl Endpoint {
     }
     pub fn mark(&self, id: ConnectionId) -> Result<u32, EndpointError> {
         Ok(self.slot(id)?.mark)
+    }
+    // Whether the application lets other sockets bind the connection's
+    // local address while it, or its TIME-WAIT record, holds it (Linux's
+    // sk_reuse, which the timewait socket keeps as tw_reuse). The Endpoint
+    // only keeps it for the adapter's bind checks (`time_wait_binds`).
+    pub fn set_reuse_address(
+        &mut self,
+        id: ConnectionId,
+        reuse: bool,
+    ) -> Result<(), EndpointError> {
+        self.slot_mut(id)?.reuse_address = reuse;
+        Ok(())
+    }
+    // Also of a released connection, until it is reclaimed or a record.
+    pub fn reuse_address(&self, id: ConnectionId) -> Result<bool, EndpointError> {
+        Ok(self.retained_slot(id)?.reuse_address)
     }
     pub fn close_reason(
         &self,

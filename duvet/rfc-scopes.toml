@@ -237,3 +237,11 @@ scope_kind = "scoped-operative"
 scope = "SCOPED: sticky outgoing IPV6_TCLASS on AF_INET6 TCP sockets: normal default zero, integer range validation, reset, readback and live outgoing traffic-class policy with transport-controlled ECN override. No full-document or full advanced IPv6 socket API conformance: ancillary sendmsg overrides, received traffic class/IPV6_RECVTCLASS, UDP/raw sockets, extension headers, multicast policy and other advanced APIs are outside this inventory."
 extraction = "manual"
 inventory = "duvet/rfc3542-inventory.json"
+
+[[rfc]]
+id = 6056
+document_status = "Best Current Practice"
+scope_kind = "selected-requirements"
+scope = "SELECTED: ephemeral port selection for active opens by Algorithm 4 (keyed per-destination offset, per-space increments) as Linux's __inet_hash_connect, its secret key, the port range and the bind(port 0) case. NAPT, other transports and secret rekeying are outside this inventory."
+extraction = "manual"
+inventory = "duvet/rfc6056-additions.toml"

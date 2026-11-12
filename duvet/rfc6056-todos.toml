@@ -1,0 +1,22 @@
+# Deliberate Linux-compatible deviations from RFC 6056.
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6056#section-3.2"
+reason = "Linux's default ip_local_port_range, 32768-60999, as ntcp_native::NetworkConfig::new keeps Linux's defaults and ntcp-socket's unbound sockets choose from (runtime_ports.rs RANGE): ports below it are left to the services applications bind, and the range is no longer a bound on connections, since ports are shared across destinations. NetworkConfig::ephemeral_ports configures another range."
+quote = '''
+However, ephemeral port selection algorithms should use the whole range 1024-65535.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6056#section-3.2"
+reason = "The ranges are Linux's ip_local_port_range by default (see the exception above), not the largest possible; NetworkConfig::ephemeral_ports may be set to 1024-65535."
+quote = '''
+Ephemeral port selection algorithms SHOULD use the largest possible port range, since this reduces the chances of an off-path attacker of guessing the selected port numbers.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6056#section-3.5"
+reason = "bind(port 0) and listen on an unbound ntcp-socket socket, which have no destination for Algorithm 4, choose as Linux's inet_csk_find_open_port: a random start in the range, keyed per draw, then a scan of the odd offsets and then the even ones (EphemeralPorts::select_unbound), Algorithm 1's shape rather than Algorithm 2's fresh random choice per candidate. Connect of an unbound socket binds lazily, at connect, by Algorithm 4."
+quote = '''
+Transport protocols implementing Algorithm 3 or Algorithm 4 should consider using Algorithm 2 when facing the scenario just described.
+'''

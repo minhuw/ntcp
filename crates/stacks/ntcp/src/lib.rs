@@ -17,6 +17,8 @@ mod buffer;
 mod connection;
 mod cubic;
 mod endpoint;
+mod ephemeral;
+pub use ephemeral::EphemeralPorts;
 mod fast_open;
 #[cfg(feature = "tfo-linux-cookie")]
 pub use fast_open::LinuxSipHash24Key;

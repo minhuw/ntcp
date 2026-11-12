@@ -50,7 +50,7 @@ def ledger(n):
 class Ipv4Inventory(unittest.TestCase):
     def test_registration_scoped_status_and_exact_clause_contract(self):
         scopes = check_registration()
-        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200, 826})
+        self.assertEqual(set(scopes), set(ORIGINAL_RFCS) | {6191, 6429, 791, 1122, 6864, 3542, 8200, 826, 6056})
         for n, (total, covered, todos, text_hash, clauses_hash) in CONTRACT.items():
             with self.subTest(rfc=n):
                 document, scope = ledger(n), scopes[n]

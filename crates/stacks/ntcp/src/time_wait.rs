@@ -42,6 +42,8 @@ pub(crate) struct Record {
     pub(crate) dscp: u8,
     // The connection's mark when it entered TIME-WAIT (Linux's tw_mark).
     pub(crate) mark: u32,
+    // The connection's SO_REUSEADDR when it entered TIME-WAIT (tw_reuse).
+    pub(crate) reuse_address: bool,
     pub(crate) ipv4_options: OutgoingIpv4Options,
     // The complete IP header length of the path a managed reply leaves on,
     // as a managed input stated it (see the Endpoint's control replies).

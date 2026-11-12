@@ -195,6 +195,11 @@ format = "ietf"
 source = "https://www.rfc-editor.org/rfc/rfc3542"
 format = "ietf"
 
+# Selected ephemeral port selection clauses (BCP 156).
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6056"
+format = "ietf"
+
 [report.html]
 enabled = false
 
