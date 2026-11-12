@@ -324,6 +324,27 @@ impl Scoreboard {
         bytes > 2 * u64::from(mss)
     }
 
+    // The unsacked bytes IsLost (at `mss`) holds lost are exactly those
+    // below the returned edge. Within the hole before range k, every byte
+    // has ranges k.. above it and their bytes, so IsLost only grows toward
+    // the cumulative edge, and the three highest ranges decide where it
+    // turns.
+    pub(crate) fn lost_edge(&self, mss: u32) -> Seq {
+        let ranges = &self.ranges[..self.len];
+        let size = |i: usize| u64::from(ranges[i].1.distance_from(ranges[i].0));
+        let limit = 2 * u64::from(mss);
+        let n = ranges.len();
+        if n >= 1 && size(n - 1) > limit {
+            ranges[n - 1].0
+        } else if n >= 2 && size(n - 2) + size(n - 1) > limit {
+            ranges[n - 2].0
+        } else if n >= 3 {
+            ranges[n - 3].0
+        } else {
+            self.ack
+        }
+    }
+
     // Each yielded interval is wholly unsacked, so IsLost is constant within it:
     // every byte has the same discontiguous ranges and SACKed byte count above.
     fn holes(&self, ack: Seq, high_data: Seq) -> impl Iterator<Item = (Seq, Seq)> + '_ {
@@ -969,6 +990,47 @@ mod tests {
                     "round={round} ranges={:?} query={from:?}..{to:?}",
                     &s.ranges[..s.len]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn lost_edge_splits_unsacked_bytes_as_is_lost_does() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u32| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % u64::from(n)) as u32
+        };
+        for round in 0..400 {
+            let base = Seq([0, u32::MAX - 3000, next(u32::MAX)][round % 3]);
+            let seq = |offset: u32| base.wrapping_add(offset);
+            let mut s = Scoreboard::new();
+            s.update(seq(0), seq(4000), &[None; 4]);
+            for _ in 0..next(12) {
+                let left = next(3800);
+                let right = left + 1 + next(150);
+                update(
+                    &mut s,
+                    seq(0).0,
+                    seq(4000).0,
+                    &[(seq(left).0, seq(right).0)],
+                );
+            }
+            for mss in [1, 10, 40, 100, 1000, u32::MAX] {
+                let edge = s.lost_edge(mss).distance_from(seq(0));
+                for (left, right) in s.holes(seq(0), seq(4000)) {
+                    let (left, right) = (left.distance_from(seq(0)), right.distance_from(seq(0)));
+                    let lost = s.is_lost(seq(left), mss);
+                    assert_eq!(
+                        lost,
+                        right <= edge,
+                        "round={round} mss={mss} edge={edge} hole={left}..{right} ranges={:?}",
+                        &s.ranges[..s.len]
+                    );
+                    assert!(lost || left >= edge);
+                }
             }
         }
     }

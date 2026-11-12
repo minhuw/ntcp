@@ -4,7 +4,10 @@
 // buffer's existing per-byte metadata, beside an outstanding-PTB-copy bit for
 // the RFC 6675 pipe; only the FIN control position, pending and copy counts
 // (constant-time "no work" test), the bounds of marked bytes with a selection
-// hint, and the RTO takeover boundary live here. No packet-path allocation.
+// hint, and the RTO takeover boundary live here. Every change of the pending
+// marks also keeps the counts the estimator reads: per RACK interval (summed
+// over those awaiting retransmission) and below the RFC 6675 lost edge.
+// No packet-path allocation.
 use super::*;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -34,6 +37,14 @@ pub(super) struct PtbRepair {
     // progress (cumulative advance or newly SACKed bytes).
     restart: bool,
     restart_spent: bool,
+    // RFC 6675 SetPipe treats as lost exactly the unsacked bytes below
+    // Scoreboard::lost_edge: an edge and the pending bytes below it, kept by
+    // every change of the marks and moved before output reads it.
+    lost_edge: Option<(Seq, usize)>,
+    // Tests: estimate and select by scanning the marks, as before the kept
+    // counts, to compare every emitted segment with them.
+    #[cfg(test)]
+    pub(super) scan: bool,
 }
 
 impl Connection {
@@ -145,10 +156,14 @@ impl Connection {
         }
         let base = self.send_base;
         for (left, right) in self.scoreboard.unsacked(low, high) {
-            let marked = self.send.mark_ptb(
-                left.distance_from(base) as usize,
-                right.distance_from(left) as usize,
-            );
+            let marked = change_marks(
+                &mut self.rack,
+                &mut self.send,
+                base,
+                &mut self.ptb.lost_edge,
+                (left, right),
+                |send, offset, count| send.mark_ptb(offset, count) as isize,
+            ) as usize;
             if marked != 0 {
                 self.ptb.next = Some(match self.ptb.next {
                     Some(next) if self.ptb.pending != 0 => earlier(next, left),
@@ -274,9 +289,37 @@ impl Connection {
 
     // Pending bytes the recovery estimator still counts as in flight: those
     // RACK has not marked lost, or that RFC 6675 SetPipe does not treat as
-    // lost (never subtract bytes already excluded by loss inference). Only
-    // lost ranges inside the pending bounds are visited.
-    fn ptb_still_counted(&self, rack: bool) -> u32 {
+    // lost (never subtract bytes already excluded by loss inference). Both
+    // counts of lost pending bytes are kept as the marks change.
+    pub(super) fn ptb_still_counted(&self, rack: bool) -> u32 {
+        if self.ptb.pending == 0 {
+            return 0;
+        }
+        #[cfg(test)]
+        if self.ptb.scan {
+            return self.ptb_still_counted_scan(rack);
+        }
+        let lost = if rack {
+            let (base, send) = (self.send_base, &self.send);
+            match self
+                .rack
+                .ptb_lost(|left, right| marked(send, base, left, right))
+            {
+                Some(lost) => lost as usize,
+                // Partly marked intervals too scattered to find.
+                None => return self.ptb_still_counted_scan(true),
+            }
+        } else {
+            self.ptb_below(self.scoreboard.lost_edge(self.mss as u32))
+        };
+        let counted = self.ptb.pending.saturating_sub(lost) as u32;
+        debug_assert_eq!(counted, self.ptb_still_counted_scan(rack));
+        counted
+    }
+
+    // ptb_still_counted by visiting the lost ranges inside the pending
+    // bounds and counting their marks.
+    pub(super) fn ptb_still_counted_scan(&self, rack: bool) -> u32 {
         let Some((low, high)) = self.ptb.span.filter(|_| self.ptb.pending != 0) else {
             return 0;
         };
@@ -311,6 +354,63 @@ impl Connection {
                 .for_each(|(l, r)| count(l, r));
         }
         self.ptb.pending.saturating_sub(lost) as u32
+    }
+
+    // Pending bytes below `edge`: the kept count, moved by the marks between
+    // its edge and this one.
+    fn ptb_below(&self, edge: Seq) -> usize {
+        match self.ptb.lost_edge {
+            Some((old, below)) if edge.after(old) => below + self.ptb_count(old, edge),
+            Some((old, below)) => below - self.ptb_count(edge, old),
+            None => self
+                .ptb
+                .span
+                .map_or(0, |(low, _)| self.ptb_count(low, edge)),
+        }
+    }
+
+    // Pending bytes in [left, right).
+    fn ptb_count(&self, left: Seq, right: Seq) -> usize {
+        self.ptb_window(left, right)
+            .map_or(0, |(offset, count)| self.send.count_ptb(offset, count))
+    }
+
+    // Before output reads the estimator: restate the RACK intervals only
+    // partly marked, and move the RFC 6675 lost edge to the scoreboard's
+    // (each byte the edge passes is counted once). Outside that recovery
+    // the edge is dropped, so it never trails the flight; entering it again
+    // counts the pending bytes below the edge once.
+    fn ptb_sync(&mut self) {
+        if self.ptb.pending == 0 {
+            return;
+        }
+        let (base, send) = (self.send_base, &self.send);
+        self.rack
+            .settle_ptb(|left, right| marked(send, base, left, right));
+        self.ptb.lost_edge = if self.sack_recovery.is_some() && !self.rack_enabled() {
+            let edge = self.scoreboard.lost_edge(self.mss as u32);
+            Some((edge, self.ptb_below(edge)))
+        } else {
+            None
+        };
+    }
+
+    // Change the marks of [left, right) by op, which returns the change in
+    // pending bytes of the range it is given.
+    fn change_ptb(
+        &mut self,
+        left: Seq,
+        right: Seq,
+        op: impl FnMut(&mut SendBuffer, usize, usize) -> isize,
+    ) -> isize {
+        change_marks(
+            &mut self.rack,
+            &mut self.send,
+            self.send_base,
+            &mut self.ptb.lost_edge,
+            (left, right),
+            op,
+        )
     }
 
     /// A PTB repair at `seq` may advance a HighRxt-style frontier at `from`
@@ -383,7 +483,15 @@ impl Connection {
                 0
             };
             let from = later(self.ptb.next.unwrap_or(base), base).distance_from(base) as usize;
-            let run = self.send.next_ptb(from, sent);
+            #[cfg(test)]
+            let limit = if self.ptb.scan {
+                usize::MAX
+            } else {
+                packet_mss
+            };
+            #[cfg(not(test))]
+            let limit = packet_mss;
+            let run = self.send.next_ptb(from, sent, limit);
             // Everything skipped has left the pending set for good.
             if let Some((offset, _)) = run {
                 self.ptb.next = Some(base.wrapping_add(offset as u32));
@@ -392,6 +500,7 @@ impl Connection {
         } else {
             None
         };
+        self.ptb_sync();
         let credit = match self.prr {
             Some(prr) => prr.credit(),
             None if self.ptb.restart => u32::MAX,
@@ -465,10 +574,16 @@ impl Connection {
             return;
         }
         let base = self.send_base;
-        let cleared = self.send.mark_retransmitted(
-            start.distance_from(base) as usize,
-            end.distance_from(start) as usize,
-        );
+        let cleared = if self.ptb.pending == 0 {
+            self.send.mark_retransmitted(
+                start.distance_from(base) as usize,
+                end.distance_from(start) as usize,
+            )
+        } else {
+            -self.change_ptb(start, end, |send, offset, count| {
+                -(send.mark_retransmitted(offset, count) as isize)
+            }) as usize
+        };
         self.ptb.pending -= cleared;
         if ptb && self.sack_recovery_enabled() {
             // Bytes below HighRxt are already counted by SetPipe's
@@ -586,11 +701,16 @@ impl Connection {
     // and abandonment work stays within the remaining marked bytes.
     fn ptb_release(&mut self, left: Seq, right: Seq) {
         if let Some((offset, count)) = self.ptb_window(left, right) {
-            let (pending, copies) = self.send.release_ptb(offset, count);
-            self.ptb.pending -= pending;
-            self.ptb.copies -= copies;
             let left = self.send_base.wrapping_add(offset as u32);
             let right = left.wrapping_add(count as u32);
+            let mut copies = 0;
+            let pending = -self.change_ptb(left, right, |send, offset, count| {
+                let (pending, released) = send.release_ptb(offset, count);
+                copies += released;
+                -(pending as isize)
+            }) as usize;
+            self.ptb.pending -= pending;
+            self.ptb.copies -= copies;
             if let Some((low, high)) = &mut self.ptb.span {
                 if *low == left {
                     *low = right;
@@ -616,6 +736,7 @@ impl Connection {
     fn ptb_settle(&mut self) {
         if self.ptb.pending == 0 {
             self.ptb.next = None;
+            self.ptb.lost_edge = None;
             if self.ptb.copies == 0 {
                 self.ptb.span = None;
             }
@@ -653,4 +774,54 @@ fn widen(span: &mut Option<(Seq, Seq)>, left: Seq, right: Seq) {
         Some((low, high)) => (earlier(low, left), later(high, right)),
         None => (left, right),
     });
+}
+
+// Applies op to the send-buffer marks of `range` (inside the buffer from
+// `base`), then restates the RACK intervals overlapping it and the pending
+// bytes below the lost edge. op returns the change in pending bytes of the
+// range it is given; the total is returned.
+fn change_marks(
+    rack: &mut Rack,
+    send: &mut SendBuffer,
+    base: Seq,
+    lost_edge: &mut Option<(Seq, usize)>,
+    (left, right): (Seq, Seq),
+    mut op: impl FnMut(&mut SendBuffer, usize, usize) -> isize,
+) -> isize {
+    if !right.after(left) {
+        return 0;
+    }
+    let mut apply = |send: &mut SendBuffer, left: Seq, right: Seq| {
+        if right.after(left) {
+            op(
+                send,
+                left.distance_from(base) as usize,
+                right.distance_from(left) as usize,
+            )
+        } else {
+            0
+        }
+    };
+    let total = match lost_edge {
+        Some((edge, below)) if edge.after(left) => {
+            let cut = earlier(*edge, right);
+            let low = apply(send, left, cut);
+            *below = below.wrapping_add_signed(low);
+            low + apply(send, cut, right)
+        }
+        _ => apply(send, left, right),
+    };
+    if total != 0 {
+        let send = &*send;
+        rack.restate_ptb(left, right, |left, right| marked(send, base, left, right));
+    }
+    total
+}
+
+// Pending bytes of [left, right) in the send buffer from `base`.
+fn marked(send: &SendBuffer, base: Seq, left: Seq, right: Seq) -> u32 {
+    let len = send.len();
+    let offset = (later(left, base).distance_from(base) as usize).min(len);
+    let end = (later(right, base).distance_from(base) as usize).min(len);
+    send.count_ptb(offset, end.saturating_sub(offset)) as u32
 }

@@ -51,7 +51,22 @@ struct Interval {
     // This committed retransmission copy has not shared an extra loss response.
     // Splits copy the marker; only successful retransmit commits renew it.
     loss_response_pending: bool,
+    // Which bytes carry PTB repair work (the send buffer's marks).
+    ptb: Ptb,
 }
+
+// Whether no byte of an interval, all or only some carry PTB work. The
+// ledger's interval budget leaves one byte for it, not a count: the bytes
+// of Some intervals are counted in the send buffer when asked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ptb {
+    None,
+    All,
+    Some,
+}
+
+// Ranges holding every Ptb::Some interval.
+const PTB_SOME_SPANS: usize = 8;
 
 // Independent of byte/PRR delivery: survives RTO SACK reneging.
 const PACKET_DELIVERED: u8 = 1 << 0;
@@ -136,6 +151,8 @@ struct Tally {
     short: u32,
     // Intervals awaiting retransmission and not SACKed.
     lost: u32,
+    // Bytes of those intervals wholly carrying PTB work.
+    ptb_lost: u32,
     // By original wire packet (packet_counts) and by delivery unit
     // (diagnostic_packet_counts).
     packets: Counts,
@@ -147,6 +164,7 @@ impl Tally {
         self.pipe = self.pipe - before.pipe + after.pipe;
         self.short = self.short - before.short + after.short;
         self.lost = self.lost - before.lost + after.lost;
+        self.ptb_lost = self.ptb_lost - before.ptb_lost + after.ptb_lost;
         self.packets.apply(before.packets, after.packets);
         self.units.apply(before.units, after.units);
     }
@@ -219,6 +237,11 @@ pub(crate) struct Rack {
     dirty: [(Seq, Seq); DIRTY],
     dirty_len: usize,
     rescan: bool,
+    // Every Ptb::Some interval lies in one of these disjoint ranges, or
+    // anywhere with ptb_some_all.
+    ptb_some: [(Seq, Seq); PTB_SOME_SPANS],
+    ptb_some_len: usize,
+    ptb_some_all: bool,
 }
 
 fn sent_after(a: (u64, Seq), b: (u64, Seq)) -> bool {
@@ -319,6 +342,9 @@ impl Rack {
             dirty: [(Seq(0), Seq(0)); DIRTY],
             dirty_len: 0,
             rescan: false,
+            ptb_some: [(Seq(0), Seq(0)); PTB_SOME_SPANS],
+            ptb_some_len: 0,
+            ptb_some_all: false,
         })
     }
 
@@ -492,6 +518,8 @@ impl Rack {
         self.intervals.clear();
         self.tally = Tally::default();
         self.dirty_len = 0;
+        self.ptb_some_len = 0;
+        self.ptb_some_all = false;
         self.delivered_segments_valid = false;
         self.departure_selection = None;
         self.fallback = Some(boundary);
@@ -510,6 +538,7 @@ impl Rack {
         let before = self.contribution(hull);
         let mut right = self.intervals[i];
         right.start = edge;
+        // Pieces of a Some interval stay inside its noted range.
         self.intervals[i].end = edge;
         self.intervals[i].set_stats_flag(DELIVERY_END, false);
         self.intervals.insert(i + 1, right);
@@ -629,6 +658,9 @@ impl Rack {
             tally.short +=
                 u32::from(r.transmission_end.distance_from(r.transmission_start) < self.short_mss);
             tally.lost += u32::from(!r.sacked && r.needs_retransmit);
+            if !r.sacked && r.needs_retransmit && r.ptb == Ptb::All {
+                tally.ptb_lost += r.end.distance_from(r.start);
+            }
         }
         let (mut i, end) = hull.packets;
         while i < end {
@@ -1156,6 +1188,7 @@ impl Rack {
                 original_lost: false,
                 needs_retransmit: false,
                 loss_response_pending: false,
+                ptb: Ptb::None,
             });
         } else {
             self.abandon(end);
@@ -1829,6 +1862,121 @@ impl Rack {
             })
     }
 
+    // PTB repair bytes in intervals awaiting retransmission and not SACKed:
+    // those pipe() no longer counts. count returns the marked bytes of a
+    // range; only Some intervals are counted. None when they are too
+    // scattered to be found but by a walk.
+    pub(crate) fn ptb_lost(&self, mut count: impl FnMut(Seq, Seq) -> u32) -> Option<u32> {
+        if self.ptb_some_all {
+            return None;
+        }
+        let mut lost = self.tally.ptb_lost;
+        for &(start, end) in &self.ptb_some[..self.ptb_some_len] {
+            let (first, last) = self.overlapping(start, end);
+            for r in self.intervals.range(first, last) {
+                if r.ptb == Ptb::Some && !r.sacked && r.needs_retransmit {
+                    lost += count(r.start, r.end);
+                }
+            }
+        }
+        Some(lost)
+    }
+
+    // The PTB marks of [start, end) changed: restate every interval
+    // overlapping it from count (the marked bytes of a range). Cost follows
+    // those intervals and their bytes.
+    pub(crate) fn restate_ptb(
+        &mut self,
+        start: Seq,
+        end: Seq,
+        mut count: impl FnMut(Seq, Seq) -> u32,
+    ) {
+        if !end.after(start) {
+            return;
+        }
+        let (first, last) = self.overlapping(start, end);
+        for i in first..last {
+            self.restate_one(i, &mut count);
+        }
+        self.verify();
+    }
+
+    fn restate_one(&mut self, i: usize, count: &mut impl FnMut(Seq, Seq) -> u32) {
+        let r = &self.intervals[i];
+        let len = r.end.distance_from(r.start);
+        let ptb = match count(r.start, r.end) {
+            0 => Ptb::None,
+            n if n == len => Ptb::All,
+            _ => Ptb::Some,
+        };
+        if ptb == Ptb::Some {
+            self.note_ptb_some(r.start, r.end);
+        }
+        let r = &mut self.intervals[i];
+        if !r.sacked && r.needs_retransmit {
+            if r.ptb == Ptb::All {
+                self.tally.ptb_lost -= len;
+            }
+            if ptb == Ptb::All {
+                self.tally.ptb_lost += len;
+            }
+        }
+        r.ptb = ptb;
+    }
+
+    // Restate the Some intervals, so that the noted ranges hold only those
+    // still partly carrying PTB work.
+    pub(crate) fn settle_ptb(&mut self, mut count: impl FnMut(Seq, Seq) -> u32) {
+        let (mut spans, mut len) = (self.ptb_some, self.ptb_some_len);
+        if self.ptb_some_all {
+            len = 0;
+            if let (Some(first), Some(last)) = (self.intervals.first(), self.intervals.last()) {
+                spans[0] = (first.start, last.end);
+                len = 1;
+            }
+        }
+        self.ptb_some_len = 0;
+        self.ptb_some_all = false;
+        for &(start, end) in &spans[..len] {
+            let (first, last) = self.overlapping(start, end);
+            for i in first..last {
+                if self.intervals[i].ptb == Ptb::Some {
+                    self.restate_one(i, &mut count);
+                }
+            }
+        }
+        self.verify();
+    }
+
+    fn note_ptb_some(&mut self, start: Seq, end: Seq) {
+        if self.ptb_some_all {
+            return;
+        }
+        let (mut start, mut end) = (start, end);
+        // Join every noted range touching it, keeping the ranges disjoint.
+        let mut kept = 0;
+        for k in 0..self.ptb_some_len {
+            let span = self.ptb_some[k];
+            if !start.after(span.1) && !span.0.after(end) {
+                if start.after(span.0) {
+                    start = span.0;
+                }
+                if span.1.after(end) {
+                    end = span.1;
+                }
+            } else {
+                self.ptb_some[kept] = span;
+                kept += 1;
+            }
+        }
+        if kept < PTB_SOME_SPANS {
+            self.ptb_some[kept] = (start, end);
+            self.ptb_some_len = kept + 1;
+        } else {
+            self.ptb_some_all = true;
+        }
+    }
+
     // SACK/ACK splits are not short wire packets: use the committed span.
     pub(crate) fn has_short_transmission(&mut self, mss: u32) -> bool {
         if mss != self.short_mss {
@@ -1868,6 +2016,8 @@ impl Rack {
         self.intervals.clear();
         self.tally = Tally::default();
         self.dirty_len = 0;
+        self.ptb_some_len = 0;
+        self.ptb_some_all = false;
         self.departure_selection = None;
         true
     }

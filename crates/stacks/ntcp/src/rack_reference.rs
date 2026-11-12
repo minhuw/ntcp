@@ -4,7 +4,7 @@
 // operations and compare every result and the intervals themselves.
 use super::{
     Counts, DELIVERY_END, DIAGNOSTIC_LOST, DIAGNOSTIC_RETRY, DepartureSelection, Interval,
-    MAX_MULTIPLIER, MIN_RTT_BUCKET, OriginalRetrySpan, PACKET_DELIVERED, PACKET_INCLUDES_FIN,
+    MAX_MULTIPLIER, MIN_RTT_BUCKET, OriginalRetrySpan, PACKET_DELIVERED, PACKET_INCLUDES_FIN, Ptb,
     RetryUndo, SYN_PAYLOAD, sent_after,
 };
 use crate::{
@@ -596,6 +596,7 @@ impl Reference {
                 original_lost: false,
                 needs_retransmit: false,
                 loss_response_pending: false,
+                ptb: Ptb::None,
             });
         } else {
             self.abandon(end);

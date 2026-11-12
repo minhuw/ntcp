@@ -300,22 +300,35 @@ impl SendBuffer {
         cleared
     }
 
-    // First contiguous run of PTB work in [offset, end): (offset, length).
-    pub(crate) fn next_ptb(&self, offset: usize, end: usize) -> Option<(usize, usize)> {
-        self.next_flagged(PTB_PENDING, offset, end)
+    // First contiguous run of PTB work in [offset, end): (offset, length),
+    // its length counted to at most `limit`.
+    pub(crate) fn next_ptb(
+        &self,
+        offset: usize,
+        end: usize,
+        limit: usize,
+    ) -> Option<(usize, usize)> {
+        self.next_flagged(PTB_PENDING, offset, end, limit)
     }
 
     // First contiguous run of outstanding PTB copies in [offset, end).
     pub(crate) fn next_ptb_copy(&self, offset: usize, end: usize) -> Option<(usize, usize)> {
-        self.next_flagged(PTB_COPY, offset, end)
+        self.next_flagged(PTB_COPY, offset, end, usize::MAX)
     }
 
-    fn next_flagged(&self, flag: u8, offset: usize, end: usize) -> Option<(usize, usize)> {
+    fn next_flagged(
+        &self,
+        flag: u8,
+        offset: usize,
+        end: usize,
+        limit: usize,
+    ) -> Option<(usize, usize)> {
         let end = end.min(self.marks.len());
         let start = (offset..end).find(|&i| self.marks[i] & flag != 0)?;
         let len = self
             .marks
             .range(start..end)
+            .take(limit)
             .take_while(|&byte| byte & flag != 0)
             .count();
         Some((start, len))

@@ -1124,3 +1124,128 @@ fn paced_repairs(ipv4: bool, algorithm: CongestionAlgorithm) {
     assert!(times[times.len() - 1] > times[0]);
     assert!(waited != 0);
 }
+
+// The kept counts of lost PTB work against the scanning form they replace:
+// two equal connection pairs see the same drops, Packet Too Big reports
+// (some quoting a few bytes of the next segment), reordering and timeouts;
+// one estimates and selects by scanning the marks. Every segment either
+// side emits must be identical, and at every step both kept counts equal
+// their scans.
+#[test]
+fn kept_ptb_counts_emit_what_scanning_did() {
+    let (mut ptbs, mut timeouts) = (0, 0);
+    for seed in 1..=40u64 {
+        let rack = seed % 2 == 0;
+        let prr = seed % 4 < 2;
+        let ipv4 = seed % 3 != 0;
+        let algorithm = if seed % 5 < 3 {
+            CongestionAlgorithm::Cubic
+        } else {
+            CongestionAlgorithm::Reno
+        };
+        let (p, t) = kept_ptb_counts(seed, ipv4, rack, prr, algorithm);
+        ptbs += p;
+        timeouts += t;
+    }
+    // Both repair paths and RTO takeover were exercised.
+    assert!(
+        ptbs > 400 && timeouts > 10,
+        "ptbs={ptbs} timeouts={timeouts}"
+    );
+}
+
+// Returns the reports and timeouts it made.
+fn kept_ptb_counts(
+    seed: u64,
+    ipv4: bool,
+    rack: bool,
+    prr: bool,
+    algorithm: CongestionAlgorithm,
+) -> (u32, u32) {
+    let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut next = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    let cfg = ConnectionConfig {
+        rack,
+        prr,
+        delayed_ack_us: 0,
+        ..cfg(true, algorithm)
+    };
+    let iss = [7, u32::MAX - 20_000][seed as usize % 2];
+    let mut pairs = [
+        super::pmtud_policy::family_pair(cfg.clone(), ipv4, iss),
+        super::pmtud_policy::family_pair(cfg, ipv4, iss),
+    ];
+    pairs[1].0.ptb.scan = true;
+    let mut now = 40;
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    let mut sink = vec![0; 1 << 17];
+    let (mut ptbs, mut timeouts) = (0, 0);
+    for step in 0..400 {
+        let chunk = vec![step as u8; next(20_000) as usize];
+        let mut outputs = Vec::new();
+        for (a, b) in &mut pairs {
+            // A full send buffer takes nothing.
+            assert!(matches!(a.write(&chunk), Ok(_) | Err(Error::WouldBlock)));
+            if a.next_deadline().is_some_and(|deadline| deadline <= now) {
+                timeouts += u32::from(a.rto_deadline.is_some_and(|d| d <= now));
+                a.timeout(now).unwrap();
+            }
+            outputs.push(poll(a, now, 24));
+            while b.read(&mut sink).is_ok_and(|n| n != 0) {}
+        }
+        assert_eq!(outputs[0], outputs[1], "seed={seed} step={step}");
+        for bytes in &outputs[0] {
+            let s = span(&pairs[0].0, bytes);
+            match next(20) {
+                0 | 1 if s.1.after(s.0) => {
+                    // Too big: a quote may run a little into the next segment.
+                    let extra = [0, 0, 1, 12][next(4) as usize];
+                    let quote = (s.0, s.1.wrapping_add(extra), s.2);
+                    for (a, _) in &mut pairs {
+                        report(a, now, quote, 1280);
+                    }
+                    ptbs += 1;
+                }
+                2 => {}
+                3 | 4 => held.push(bytes.clone()),
+                _ => {
+                    for (_, b) in &mut pairs {
+                        input(b, bytes, now);
+                    }
+                }
+            }
+        }
+        if !held.is_empty() && next(3) == 0 {
+            let late = held.remove(next(held.len() as u64) as usize);
+            for (_, b) in &mut pairs {
+                input(b, &late, now);
+            }
+        }
+        let acks: Vec<_> = pairs.iter_mut().map(|(_, b)| poll(b, now, 16)).collect();
+        assert_eq!(acks[0], acks[1], "seed={seed} step={step}");
+        for (a, _) in &mut pairs {
+            for bytes in &acks[0] {
+                input(a, bytes, now);
+            }
+        }
+        let a = &pairs[0].0;
+        for rack in [true, false] {
+            assert_eq!(
+                a.ptb_still_counted(rack),
+                a.ptb_still_counted_scan(rack),
+                "seed={seed} step={step} rack={rack}"
+            );
+        }
+        // Mostly back-to-back rounds; now and then a gap past RTO.
+        now += match next(12) {
+            0 => 1_000_000 + next(1_000_000),
+            _ => 1 + next(3) * next(60),
+        };
+    }
+    (ptbs, timeouts / 2)
+}
