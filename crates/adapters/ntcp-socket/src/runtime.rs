@@ -23,7 +23,7 @@ use ntcp_io::{PacketIo, TxOutcome};
 use ntcp_io_tun::Tun;
 use send::LogicalSend;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroU8,
     sync::mpsc::{self, Receiver, SyncSender},
@@ -694,6 +694,12 @@ struct Owner {
     // Installed with every Host this owner attaches.
     segment_routes: Vec<crate::SegmentRoute>,
     sockets: BTreeMap<u64, Socket>,
+    // The socket holding each connection and listener, as Linux's sock
+    // leads to its socket: an event, a segment or a timestamp reaches its
+    // socket without visiting the others. Kept with `Socket::handle` by
+    // `alloc`, `set_handle` and `remove_socket`; one entry per handle.
+    connection_holders: HashMap<ConnectionId, u64>,
+    listener_holders: HashMap<ListenerId, u64>,
     // The `io.*` port's address: the runtime's address family and the
     // source of connections no other port's address is selected for.
     local: IpAddr,
@@ -1122,6 +1128,8 @@ impl Owner {
             socket_policy: crate::SocketPolicy::default(),
             segment_routes: Vec::new(),
             sockets: BTreeMap::new(),
+            connection_holders: HashMap::new(),
+            listener_holders: HashMap::new(),
             local,
             clock,
             started,
@@ -1863,9 +1871,8 @@ impl Owner {
             None => self.endpoint.matching_listener(tuple.local),
         });
         let listener_options = listener.and_then(|listener| {
-            self.sockets
-                .values()
-                .find(|s| matches!(s.handle, Handle::Listener(id) if id == listener))
+            self.listener_socket(listener)
+                .map(|id| &self.sockets[&id])
                 .map(|s| {
                     (
                         s.wire_tos(self.local),
@@ -1932,11 +1939,9 @@ impl Owner {
                 Some(*cid) != before && !self.connection_options.iter().any(|p| p.0 == *cid)
             });
         if let Some(cid) = new_child
-            && let Some((&listener, s)) = self
-                .sockets
-                .iter()
-                .find(|(_, s)| matches!(s.handle, Handle::Listener(id) if Some(id) == listener))
+            && let Some(listener) = listener.and_then(|listener| self.listener_socket(listener))
         {
+            let s = &self.sockets[&listener];
             // Runtime bind policy admits only one listener per port. Input can
             // only create passive children; active opens go through Connect.
             // ponytail: bounded linear metadata lookup, index if LIMIT grows.
@@ -2014,7 +2019,14 @@ impl Owner {
             let Some(event) = self.endpoint.next_event() else {
                 break;
             };
-            for s in self.sockets.values_mut() {
+            let holder = match &event {
+                Event::Acceptable(listener) | Event::PassiveError { listener, .. } => {
+                    self.listener_socket(*listener)
+                }
+                Event::Connection(cid, _) => self.connection_socket(*cid),
+                Event::RouteAdvice(_) => None,
+            };
+            if let Some(s) = holder.and_then(|id| self.sockets.get_mut(&id)) {
                 match (s.handle, &event) {
                     (Handle::Listener(id), Event::Acceptable(other)) if id == *other => {
                         s.acceptable = true;
@@ -2060,6 +2072,71 @@ impl Owner {
             let _ = self.refresh_readiness(id);
         }
     }
+    // The socket holding connection `cid`.
+    fn connection_socket(&self, cid: ConnectionId) -> Option<u64> {
+        let id = self.connection_holders.get(&cid).copied().filter(|id| {
+            self.sockets
+                .get(id)
+                .is_some_and(|s| matches!(s.handle, Handle::Connection(c) if c == cid))
+        });
+        // Debug builds cross-check the index against the pass it replaces.
+        debug_assert_eq!(
+            id,
+            self.sockets
+                .iter()
+                .find(|(_, s)| matches!(s.handle, Handle::Connection(c) if c == cid))
+                .map(|(&id, _)| id)
+        );
+        id
+    }
+    // The socket holding listener `listener`.
+    fn listener_socket(&self, listener: ListenerId) -> Option<u64> {
+        let id = self.listener_holders.get(&listener).copied().filter(|id| {
+            self.sockets
+                .get(id)
+                .is_some_and(|s| matches!(s.handle, Handle::Listener(l) if l == listener))
+        });
+        debug_assert_eq!(
+            id,
+            self.sockets
+                .iter()
+                .find(|(_, s)| matches!(s.handle, Handle::Listener(l) if l == listener))
+                .map(|(&id, _)| id)
+        );
+        id
+    }
+    // Enters (`held`) or leaves socket `id`'s `handle` in the holders.
+    fn hold(&mut self, id: u64, handle: Handle, held: bool) {
+        match handle {
+            Handle::Connection(cid) if held => {
+                debug_assert!(self.sockets.iter().all(|(&other, s)| other == id
+                    || !matches!(s.handle, Handle::Connection(c) if c == cid)));
+                self.connection_holders.insert(cid, id);
+            }
+            Handle::Connection(cid) => {
+                if self.connection_holders.get(&cid) == Some(&id) {
+                    self.connection_holders.remove(&cid);
+                }
+            }
+            Handle::Listener(listener) if held => {
+                debug_assert!(self.sockets.iter().all(|(&other, s)| other == id
+                    || !matches!(s.handle, Handle::Listener(l) if l == listener)));
+                self.listener_holders.insert(listener, id);
+            }
+            Handle::Listener(listener) => {
+                if self.listener_holders.get(&listener) == Some(&id) {
+                    self.listener_holders.remove(&listener);
+                }
+            }
+            Handle::Fresh => (),
+        }
+    }
+    // Gives socket `id` `handle`, in the holders too.
+    fn set_handle(&mut self, id: u64, handle: Handle) {
+        let old = std::mem::replace(&mut self.sockets.get_mut(&id).unwrap().handle, handle);
+        self.hold(id, old, false);
+        self.hold(id, handle, true);
+    }
     fn alloc(&mut self, s: Socket) -> Result<i32> {
         if self.sockets.len() == self.socket_limit() || self.next_id > i32::MAX as u64 {
             return Err(EMFILE);
@@ -2069,6 +2146,7 @@ impl Owner {
         if let Some(local) = s.local {
             self.port_index.socket(local.port(), s.binding, true);
         }
+        self.hold(id, s.handle, true);
         self.sockets.insert(id, s);
         self.settle_timestamp_charge(id);
         Ok(id as i32)
@@ -2835,7 +2913,7 @@ impl Owner {
                 if s.domain == AF_INET6 && s.bound_addr.is_none() {
                     s.bound_addr = Some(SocketAddr::new(s.api_unspecified(), local.port()));
                 }
-                s.handle = Handle::Listener(listener);
+                self.set_handle(id, Handle::Listener(listener));
             }
             Op::Accept(flags) => {
                 if self.sockets.len() == self.socket_limit() {

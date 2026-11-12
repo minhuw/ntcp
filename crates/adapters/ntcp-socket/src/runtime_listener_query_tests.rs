@@ -45,7 +45,7 @@ fn listener_query_checks_port_closing_state_and_generation() {
     let next = a.endpoint.listen(address, 4).unwrap();
     assert_ne!(first, next);
     assert!(!present(&mut a, 8080)); // New core generation cannot revive old label.
-    a.sockets.get_mut(&fd).unwrap().handle = Handle::Listener(next);
+    a.set_handle(fd, Handle::Listener(next));
     assert!(present(&mut a, 8080));
     a.execute(fd, Op::Close).unwrap();
     assert!(!present(&mut a, 8080));

@@ -233,9 +233,9 @@ impl Owner {
     }
     pub(super) fn backend_sources(&self, token: ntcp::TxTimestampToken) -> (bool, bool) {
         let range = token.stream_range();
-        self.sockets
-            .values()
-            .filter(|s| matches!(s.handle, Handle::Connection(cid) if cid == token.connection()))
+        self.connection_socket(token.connection())
+            .map(|id| &self.sockets[&id])
+            .into_iter()
             .flat_map(|s| &s.timestamps.pending)
             .filter(|p| (range.start..range.end).contains(&p.target))
             .fold((false, false), |(sw, hw), p| {
@@ -260,6 +260,7 @@ impl Owner {
     }
     pub(super) fn remove_socket(&mut self, id: u64) -> Option<Socket> {
         let s = self.sockets.remove(&id)?;
+        self.hold(id, s.handle, false);
         self.timestamp_total -= s.timestamp_charged;
         Some(s)
     }
@@ -551,10 +552,9 @@ impl Owner {
         let range = token.stream_range();
         let mut retained: Option<PacketPayload> = None;
         let mut global = self.timestamp_charge();
-        for s in self
-            .sockets
-            .values_mut()
-            .filter(|s| matches!(s.handle, Handle::Connection(cid) if cid == token.connection()))
+        if let Some(s) = self
+            .connection_socket(token.connection())
+            .and_then(|id| self.sockets.get_mut(&id))
         {
             let mut charge = s.timestamp_charge();
             for index in 0..s.timestamps.pending.len() {

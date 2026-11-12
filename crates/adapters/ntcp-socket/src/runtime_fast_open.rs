@@ -53,8 +53,8 @@ impl Owner {
     // Called after failed completion, immediately if there is no accepted data
     // or after the final read. Keep the terminal transport snapshot for queries.
     pub(super) fn release_failed_connect(&mut self, id: u64, cid: ConnectionId) {
+        self.set_handle(id, Handle::Fresh);
         let s = self.sockets.get_mut(&id).unwrap();
-        s.handle = Handle::Fresh;
         s.peer_fin = false;
         s.write_shutdown = false;
         s.read_shutdown = false;
@@ -227,8 +227,8 @@ impl Owner {
             self.port_index.defer((deferred, peer), false);
         }
         self.set_local(id, local, binding);
+        self.set_handle(id, Handle::Connection(cid));
         let s = self.sockets.get_mut(&id).unwrap();
-        s.handle = Handle::Connection(cid);
         s.connect_pending = true;
         s.deferred_peer = None;
         s.deferred_client_policy = None;
