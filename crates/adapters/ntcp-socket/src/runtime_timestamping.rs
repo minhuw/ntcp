@@ -272,6 +272,9 @@ impl Owner {
         }
         let s = self.sockets.remove(&id)?;
         self.rx_software -= usize::from(s.timestamps.options.flags & RX_SOFTWARE != 0);
+        if let Some(local) = s.local {
+            self.port_sockets.remove(&(local.port(), id));
+        }
         self.hold(id, s.handle, false);
         self.timestamp_total -= s.timestamp_charged;
         Some(s)

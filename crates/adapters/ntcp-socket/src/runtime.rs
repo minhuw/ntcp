@@ -23,7 +23,7 @@ use ntcp_io::{PacketIo, TxOutcome};
 use ntcp_io_tun::Tun;
 use send::LogicalSend;
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroU8,
     sync::mpsc::{self, Receiver, SyncSender},
@@ -897,6 +897,12 @@ struct Owner {
     // The users of each local port, and the order an unbound socket's
     // connect tries ports in (RFC 6056 Algorithm 4), from `ephemeral_ports`.
     port_index: ports::PortIndex,
+    // The sockets with a local address on each port, and the connections
+    // whose options hold one (a superset: entries a test collected
+    // directly may remain), as Linux's bind bucket lists a port's owners:
+    // a bind is judged against its port's users only.
+    port_sockets: BTreeSet<(u16, u64)>,
+    port_connections: HashMap<u16, HashSet<ConnectionId>>,
     ephemeral: ntcp::EphemeralPorts,
     ephemeral_ports: std::ops::RangeInclusive<u16>,
     next_id: u64,
@@ -1326,6 +1332,8 @@ impl Owner {
             #[cfg(feature = "packet-test")]
             next_port: 40000,
             port_index: ports::PortIndex::new(),
+            port_sockets: BTreeSet::new(),
+            port_connections: HashMap::new(),
             ephemeral,
             ephemeral_ports: ports::RANGE,
             next_id: 1,
@@ -2451,6 +2459,7 @@ impl Owner {
         self.next_id += 1;
         if let Some(local) = s.local {
             self.port_index.socket(local.port(), s.binding, true);
+            self.port_sockets.insert((local.port(), id));
         }
         self.hold(id, s.handle, true);
         self.rx_software += usize::from(s.timestamps.options.flags & crate::timestamping::RX_SOFTWARE != 0);
@@ -2537,9 +2546,17 @@ impl Owner {
         let s = self.sockets.get_mut(&id).unwrap();
         if let Some(old) = s.local.replace(local) {
             self.port_index.socket(old.port(), s.binding, false);
+            self.port_sockets.remove(&(old.port(), id));
         }
         s.binding = binding;
         self.port_index.socket(local.port(), binding, true);
+        self.port_sockets.insert((local.port(), id));
+    }
+    // The sockets with a local address on `port`.
+    fn sockets_on(&self, port: u16) -> impl Iterator<Item = (u64, &Socket)> + '_ {
+        self.port_sockets
+            .range((port, 0)..=(port, u64::MAX))
+            .map(|&(_, id)| (id, &self.sockets[&id]))
     }
     fn push_connection_options(
         &mut self,
@@ -2554,29 +2571,43 @@ impl Owner {
     ) {
         self.port_index
             .connection(options.4.port(), options.5, true);
+        self.port_connections
+            .entry(options.4.port())
+            .or_default()
+            .insert(options.0);
         self.connection_options.push(options);
     }
     // Forgets the options of connections the endpoint has reclaimed since
     // the last call (those its reclaim log names), and the ports they held.
     fn collect_connection_options(&mut self) {
         let since = self.options_reclaimed;
-        let (index, endpoint, options) = (
+        let (index, endpoint, options, ports) = (
             &mut self.port_index,
             &self.endpoint,
             &mut self.connection_options,
+            &mut self.port_connections,
         );
+        let mut forget = |p: &ConnectionOptions| {
+            index.connection(p.4.port(), p.5, false);
+            if let Some(users) = ports.get_mut(&p.4.port()) {
+                users.remove(&p.0);
+                if users.is_empty() {
+                    ports.remove(&p.4.port());
+                }
+            }
+        };
         match reclaimed_since(endpoint, since) {
             Some(reclaimed) => {
                 for cid in reclaimed {
                     if let Some(p) = options.remove(cid) {
-                        index.connection(p.4.port(), p.5, false);
+                        forget(&p);
                     }
                 }
             }
             None => options.retain(|p| {
                 let exists = endpoint.connection_exists(p.0);
                 if !exists {
-                    index.connection(p.4.port(), p.5, false);
+                    forget(p);
                 }
                 exists
             }),
@@ -2611,29 +2642,34 @@ impl Owner {
                     .flatten()
                     .any(|bound| address_policy::binding_overlap(bound, local))
         };
-        let held = |cid: ConnectionId| {
-            self.sockets
-                .values()
-                .any(|s| matches!(s.handle, Handle::Connection(id) if id == cid))
+        let held = |cid: ConnectionId| self.connection_socket(cid).is_some();
+        let conflicts = |p: &ConnectionOptions| {
+            p.4.port() == wire.port()
+                && !held(p.0)
+                && self
+                    .endpoint
+                    .retained_state(p.0)
+                    .is_ok_and(|state| state != State::Closed)
+                && !(reuse && self.endpoint.reuse_address(p.0) == Ok(true))
+                && self
+                    .endpoint
+                    .retained_scoped_tuple(p.0)
+                    .is_ok_and(|tuple| overlaps(tuple.tuple().local, tuple.zone()))
         };
+        // The port's connections only: none elsewhere can overlap.
+        let on_port = self.port_connections.get(&wire.port());
+        let connection = on_port
+            .into_iter()
+            .flatten()
+            .filter_map(|&cid| self.connection_options.get(cid))
+            .any(conflicts);
+        debug_assert_eq!(connection, self.connection_options.iter().any(conflicts));
         self.endpoint
             .time_wait_binds(wire.port())
             .any(|(tuple, tw_reuse)| {
                 !(reuse && tw_reuse) && overlaps(tuple.tuple().local, tuple.zone())
             })
-            || self.connection_options.iter().any(|p| {
-                p.4.port() == wire.port()
-                    && !held(p.0)
-                    && self
-                        .endpoint
-                        .retained_state(p.0)
-                        .is_ok_and(|state| state != State::Closed)
-                    && !(reuse && self.endpoint.reuse_address(p.0) == Ok(true))
-                    && self
-                        .endpoint
-                        .retained_scoped_tuple(p.0)
-                        .is_ok_and(|tuple| overlaps(tuple.tuple().local, tuple.zone()))
-            })
+            || connection
     }
     fn apply_options(&mut self, cid: ConnectionId, s: &Socket) -> Result<()> {
         // Validate the fallible option before changing the infallible one.
@@ -3118,12 +3154,18 @@ impl Owner {
                     addr.set_port(self.bind_port(reuse)?);
                     local.set_port(addr.port());
                 }
-                if self.sockets.iter().any(|(&other, s)| {
+                // A binding overlaps only one on its own port.
+                let conflicts = |(other, s): (u64, &Socket)| {
                     other != id
                         && !(reuse && s.reuse && matches!(s.handle, Handle::Connection(_)))
                         && s.conflicts_binding(addr, local, new_v6only, zone)
-                }) || self.closed_binding_conflict(addr, local, new_v6only, zone, reuse)
-                {
+                };
+                let socket = self.sockets_on(local.port()).any(conflicts);
+                debug_assert_eq!(
+                    socket,
+                    self.sockets.iter().map(|(&id, s)| (id, s)).any(conflicts)
+                );
+                if socket || self.closed_binding_conflict(addr, local, new_v6only, zone, reuse) {
                     return Err(EADDRINUSE);
                 }
                 self.set_local(id, local, ports::Binding::Bound);
