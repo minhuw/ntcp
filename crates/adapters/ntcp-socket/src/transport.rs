@@ -378,6 +378,7 @@ mod tests {
             sacked: 1,
             lost: 1,
             retransmitted: 2,
+            total_retrans: 0,
             reordering: 3,
             reordering_events: 0xabcdef01,
             resource_probes: 0,

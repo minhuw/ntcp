@@ -548,6 +548,9 @@ pub struct Endpoint {
     // Released connections that closed without TIME-WAIT because the table
     // was full (Linux's TCPTimeWaitOverflow).
     time_wait_overflows: u64,
+    // `loss_counters`: what connections counted, taken at their refresh or
+    // reclaim.
+    loss_counters: crate::LossCounters,
     // Stateless replies: addresses, header, IPv4 options, timestamp echo and,
     // when a managed provider stated it at queueing, the complete IP header
     // length (extensions included) of the IPv6 path the reply leaves on (a
@@ -739,6 +742,7 @@ impl Endpoint {
             time_wait: crate::time_wait::TimeWaitTable::new(config.max_time_wait)
                 .map_err(|_| Error::NoMemory)?,
             time_wait_overflows: 0,
+            loss_counters: crate::LossCounters::default(),
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
             config,
             routes: Vec::new(),
@@ -2835,6 +2839,7 @@ impl Endpoint {
         if slot.time_wait {
             self.time_wait_slots -= 1;
         }
+        self.loss_counters.add(slot.connection.loss_events);
         self.recycle_connection(slot.connection);
         let at = (self.reclaimed % self.reclaims.len() as u64) as usize;
         self.reclaims[at] = id;
@@ -2900,6 +2905,20 @@ impl Endpoint {
         self.time_wait_overflows
     }
 
+    /// Retransmissions, retransmission timeouts, tail loss probes, loss
+    /// recovery entries and D-SACKs received, over every connection since
+    /// the endpoint's creation, after Linux's MIB counters (`LossCounters`).
+    /// For administrative reporting.
+    pub fn loss_counters(&self) -> crate::LossCounters {
+        // Every connection's refresh took what it counted.
+        debug_assert!(self.occupied.iter().all(|index| {
+            self.slots[index]
+                .as_ref()
+                .is_none_or(|slot| slot.connection.loss_events == crate::LossCounters::default())
+        }));
+        self.loss_counters
+    }
+
     /// Whether a TIME-WAIT record holds `port` as its local port: a port
     /// stays bound through TIME-WAIT, as in a Linux bind bucket, after the
     /// connection that used it was reclaimed.
@@ -2949,6 +2968,8 @@ impl Endpoint {
                     self.time_wait_slots -= 1;
                 }
             }
+            self.loss_counters
+                .add(core::mem::take(&mut slot.connection.loss_events));
             if core::mem::take(&mut slot.connection.fast_open_negative)
                 && let Some(service) = self.fast_open.as_mut()
             {
@@ -7926,6 +7947,10 @@ mod suspend_tests;
 #[cfg(test)]
 #[path = "endpoint_reset_defense_tests.rs"]
 mod reset_defense_tests;
+
+#[cfg(test)]
+#[path = "endpoint_loss_counter_tests.rs"]
+mod loss_counter_tests;
 
 #[cfg(all(test, feature = "packet-test-controls"))]
 mod timestamp_default_control_tests {

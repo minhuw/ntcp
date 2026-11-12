@@ -1233,3 +1233,88 @@ fn time_wait_connections_count_the_connections_waiting() {
     pair.step();
     assert_eq!(pair.a.counters().time_wait_connections, 0);
 }
+
+// Segments lost on the wire are resent, and Network::counters reports what
+// the core counts, as Linux's MIB: a lost tail is resent by a loss probe
+// (RetransSegs, TCPLossProbes), a lost first segment of a flight by SACK
+// recovery (TCPSackRecovery); the receiving side retransmits nothing.
+#[test]
+fn counters_report_retransmissions_through_real_loss() {
+    let (ip_a, ip_b): (IpAddr, IpAddr) =
+        ("10.73.0.1".parse().unwrap(), "10.73.0.2".parse().unwrap());
+    let (wire_a, wire_b) = wires(PacketLayer::Ip);
+    let to_b = wire_a.outgoing.clone();
+    let mut config_a = config(ip_a, false, 1);
+    config_a.tcp.connection.send_capacity = 8192;
+    let mut a = Network::new(config_a, wire_a, [1; 32], 0).unwrap();
+    let mut b = Network::new(config(ip_b, false, 2), wire_b, [2; 32], 0).unwrap();
+    let listener = b.listen(9000, 1).unwrap();
+    let client = a.connect(SocketAddr::new(ip_b, 9000)).unwrap();
+    let mut now = 0;
+    let mut server = None;
+    for _ in 0..100 {
+        now += 1000;
+        a.drive(now, BUDGET).unwrap();
+        b.drive(now, BUDGET).unwrap();
+        if let Ok(id) = b.accept(listener) {
+            server = Some(id);
+            break;
+        }
+    }
+    let server = server.unwrap();
+    let mut received = 0;
+    // Sends `len` bytes, losing the `lost`th segment a sends first.
+    let mut transfer = |a: &mut Network<Wire>, b: &mut Network<Wire>, len: usize, lost: usize| {
+        let data = std::vec![7; len];
+        assert_eq!(
+            a.try_write(client, &data, WriteOptions::default())
+                .unwrap()
+                .accepted,
+            len
+        );
+        now += 1000;
+        a.drive(now, BUDGET).unwrap();
+        assert!(to_b.borrow_mut().remove(lost).is_some());
+        let target = received + len;
+        let mut out = [0; 4096];
+        for _ in 0..10_000 {
+            now += 1000;
+            a.drive(now, BUDGET).unwrap();
+            b.drive(now, BUDGET).unwrap();
+            while let Ok(ReadOutcome::Data { len, .. }) = b.try_read(server, &mut out) {
+                received += len;
+            }
+            if received == target {
+                return;
+            }
+        }
+        panic!("transfer stalled at {received} of {target}");
+    };
+    transfer(&mut a, &mut b, 200, 0);
+    let counters = a.counters();
+    assert_eq!(
+        (
+            counters.retransmitted_segments,
+            counters.loss_probes,
+            counters.timeouts,
+            counters.sack_recoveries
+        ),
+        (1, 1, 0, 0)
+    );
+    // A flight whose first segment is lost: the SACKs of the rest start
+    // recovery.
+    transfer(&mut a, &mut b, 4000, 0);
+    let counters = a.counters();
+    assert_eq!(
+        (
+            counters.retransmitted_segments,
+            counters.timeout_retransmitted_segments,
+            counters.loss_probes,
+            counters.timeouts,
+            counters.sack_recoveries,
+            counters.reno_recoveries
+        ),
+        (2, 0, 1, 0, 1, 0)
+    );
+    assert_eq!(b.counters().retransmitted_segments, 0);
+}

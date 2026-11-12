@@ -568,6 +568,10 @@ pub struct TransportInfo {
     pub lost: u32,
     // Outstanding, non-lost retransmissions, excluding SACKed retransmissions.
     pub retransmitted: u32,
+    // Cumulative over the connection's life: segments sent carrying
+    // retransmitted sequence space, as LossCounters::retransmitted_segments
+    // counts them: Linux's tcpi_total_retrans.
+    pub total_retrans: u64,
     pub reordering: u32,
     // Saturating observed reordering detections for never-retransmitted
     // original data. SACK and cumulative hole filling each count once per
@@ -795,6 +799,12 @@ pub(crate) struct Connection {
     syn_retransmissions: u32,
     handshake_retransmission_limit: Option<NonZeroU8>,
     committed_syn_retransmissions: u8,
+    // Segments sent carrying retransmitted sequence space, over the
+    // connection's life (`TransportInfo::total_retrans`).
+    total_retrans: u64,
+    // Loss events the endpoint has not yet taken into its LossCounters, at
+    // the connection's refresh or reclaim.
+    pub(crate) loss_events: crate::LossCounters,
     syn_committed: bool,
     sack_send: bool,
     sack_receive: bool,
@@ -1181,6 +1191,8 @@ impl Connection {
             syn_retransmissions: 0,
             handshake_retransmission_limit: None,
             committed_syn_retransmissions: 0,
+            total_retrans: 0,
+            loss_events: crate::LossCounters::default(),
             syn_committed: false,
             sack_send: false,
             sack_receive: false,
@@ -1879,6 +1891,7 @@ impl Connection {
             sacked: counts.sacked,
             lost: counts.lost,
             retransmitted: counts.retransmitted,
+            total_retrans: self.total_retrans,
             reordering: self.rack.reordering,
             reordering_events: self.rack.reordering_events,
             resource_probes: self.resource_probes,
@@ -2312,6 +2325,7 @@ impl Connection {
         {
             return false;
         }
+        self.loss_events.sack_recoveries += 1;
         self.note_iw_loss(self.snd_una);
         self.reset_tlp();
         self.sack_recovery = Some(SackRecovery {
@@ -3161,6 +3175,14 @@ impl Connection {
                 d.fin && finished && d.fin_retransmission,
                 d.ptb_repair,
             );
+            if sequence {
+                self.count_retransmitted_segment(d.timeout_recovery);
+            }
+        }
+        // The probe's first accepted sequence-bearing segment sends it.
+        if sequence && d.loss_probe {
+            self.loss_events.loss_probes += 1;
+            d.loss_probe = false;
         }
         if d.ptb_repair {
             self.commit_ptb_copy(
@@ -3234,6 +3256,13 @@ impl Connection {
             self.arm_work();
         }
         Ok(withdrawn)
+    }
+
+    // One accepted segment carried retransmitted sequence space.
+    fn count_retransmitted_segment(&mut self, timeout_recovery: bool) {
+        self.total_retrans += 1;
+        self.loss_events.retransmitted_segments += 1;
+        self.loss_events.timeout_retransmitted_segments += u64::from(timeout_recovery);
     }
 
     pub(crate) fn abandon_reserved_output(&mut self) {
@@ -6464,6 +6493,7 @@ impl Connection {
                 &segment.options.sack_blocks,
             );
             dsack = update.dsack;
+            self.loss_events.dsack_received += u64::from(update.dsack);
             if update.overflow {
                 // SACK advice exhaustion disables inference, never timestamp
                 // retention: normal RTO still needs each latest wire boundary.
@@ -6544,6 +6574,7 @@ impl Connection {
         // RFC 8985 section 7.4.2: an ACK beyond a retransmitted probe without
         // duplicate-delivery evidence needs the same loss/ECN epoch guards as
         // fast recovery, but no retransmission (the probe repaired the loss).
+        self.loss_events.loss_probe_recoveries += u64::from(tlp_repaired);
         let tlp_reduced =
             tlp_repaired && self.congestion.on_tlp_repair(ack, tlp_flight, self.snd_nxt);
         if tlp_reduced {
@@ -6755,6 +6786,7 @@ impl Connection {
                 ece,
                 probe,
             ) {
+                self.loss_events.reno_recoveries += 1;
                 if self.config.prr {
                     self.prr = Some(Prr::new(self.data_flight(), self.mss as u32));
                 }
@@ -10025,6 +10057,7 @@ impl Connection {
             && count != 0
             && pmtu_probe.is_none()
             && self.initial_pacing_room() >= count as u32;
+        let timeout_recovery = self.sack_post_rto.is_some() || self.consecutive_timeouts != 0;
         self.last_departure = reserve.then_some(Departure {
             discovery: pmtu_probe.and_then(|(size, _, _)| self.managed_path.map(|binding| crate::DiscoveryIntent {
                 binding,
@@ -10070,6 +10103,8 @@ impl Connection {
                     .map(|(_, sent)| sent.saturating_add(self.rto()))
             }),
             tlp: (fresh_data || new_fin) && !tlp,
+            loss_probe: tlp,
+            timeout_recovery,
             persist: probe && !urgent_probe,
             keepalive,
             shrink: retransmit
@@ -10124,6 +10159,9 @@ impl Connection {
                 flags & FIN != 0 && !new_fin,
                 ptb_repair,
             );
+            if count != 0 || syn || flags & FIN != 0 {
+                self.count_retransmitted_segment(timeout_recovery);
+            }
         }
         self.last_output_range = if count != 0 && !keepalive {
             let data_seq = seq.wrapping_add(u32::from(syn));
@@ -10445,6 +10483,9 @@ impl Connection {
             self.ptb_repair_committed();
         }
         if tlp && length != 0 {
+            if !reserve {
+                self.loss_events.loss_probes += 1;
+            }
             // A probe is not Limited Transmit: it must neither earn its
             // duplicate-ACK credit nor be excluded from congestion FlightSize.
             self.limited_pending = false;
@@ -10975,6 +11016,7 @@ impl Connection {
         {
             self.rto_deadline = head_sent.map(|sent| sent.saturating_add(self.rto()));
         } else if expired_loss == Some(LossTimer::Rto) {
+            self.loss_events.timeouts += 1;
             self.growth_dupack_bytes = 0;
             self.congestion.disarm_initial_ack_heuristic();
             // A genuinely transmitted TFO request that reaches RTO trains the

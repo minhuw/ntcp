@@ -26,6 +26,12 @@ pub(crate) struct Departure {
     pub rto_head: bool,
     pub prior_rto_deadline: Option<Instant>,
     pub tlp: bool,
+    // A tail loss probe (RFC 8985 section 7), of new data or a
+    // retransmission: counted in LossCounters::loss_probes at acceptance.
+    pub loss_probe: bool,
+    // Selected while its connection recovered from a retransmission timeout
+    // (`TransportInfo::loss`).
+    pub timeout_recovery: bool,
     pub persist: bool,
     pub keepalive: bool,
     pub shrink: bool,

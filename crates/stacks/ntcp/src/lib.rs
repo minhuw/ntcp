@@ -39,6 +39,7 @@ pub use output_reservation::{
 mod endpoint_tests;
 mod hystart;
 mod ipv4_options;
+mod loss_counters;
 mod pacing;
 mod pmtud;
 pub use pmtud::{
@@ -77,6 +78,7 @@ pub use ipv4_options::{
     Ipv4RegistrationError, Ipv4RegistrationPlan, Ipv4Timestamp, Ipv4TimestampProvider,
     OutgoingIpv4Options, RegisteredOption, SourceRoute, TimestampRequest, copied_fragment_options,
 };
+pub use loss_counters::LossCounters;
 pub use recovery::{CongestionAlgorithm, InitialWindow, RecoveryAlgorithm};
 pub use wire::{IpMetadata, WireError};
 

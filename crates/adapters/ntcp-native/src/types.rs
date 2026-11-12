@@ -275,4 +275,30 @@ pub struct Counters {
     // already kept max_time_wait records: Linux's TCPTimeWaitOverflow
     // (`Endpoint::time_wait_overflows`).
     pub time_wait_overflows: u64,
+    // Cumulative loss and retransmission events, after Linux's MIB
+    // (`ntcp::LossCounters`, `Endpoint::loss_counters`). A segment counts
+    // once the backend took it, each segment of an aggregate once.
+    // Segments sent carrying retransmitted sequence space: Linux's
+    // RetransSegs.
+    pub retransmitted_segments: u64,
+    // Of those, the ones sent while recovering from a retransmission
+    // timeout (Linux's TCP_CA_Loss: TCPSlowStartRetrans and the timer's own
+    // resends).
+    pub timeout_retransmitted_segments: u64,
+    // Retransmission timeouts, SYN and SYN-ACK ones and each backoff
+    // included: Linux's TCPTimeouts.
+    pub timeouts: u64,
+    // Tail loss probes sent: Linux's TCPLossProbes.
+    pub loss_probes: u64,
+    // ACKs showing a retransmitting loss probe repaired a loss: Linux's
+    // TCPLossProbeRecovery.
+    pub loss_probe_recoveries: u64,
+    // Entries into SACK-based (RFC 6675 or RACK) loss recovery: Linux's
+    // TCPSackRecovery.
+    pub sack_recoveries: u64,
+    // Entries into NewReno fast recovery, without SACK information: Linux's
+    // TCPRenoRecovery.
+    pub reno_recoveries: u64,
+    // ACKs carrying a D-SACK: Linux's TCPDSACKRecv plus TCPDSACKOfoRecv.
+    pub dsack_received: u64,
 }

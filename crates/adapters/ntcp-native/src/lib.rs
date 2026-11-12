@@ -754,6 +754,7 @@ impl<P: PacketIo> Network<P> {
         self.now
     }
     pub fn counters(&self) -> Counters {
+        let loss = self.endpoint.loss_counters();
         Counters {
             retained_input: self.retained.len(),
             resolution_failures: self.host.arp_counters().resolution_failures,
@@ -761,6 +762,14 @@ impl<P: PacketIo> Network<P> {
             listen_drops: self.endpoint.listen_drops(),
             time_wait_connections: self.endpoint.time_wait_connections(),
             time_wait_overflows: self.endpoint.time_wait_overflows(),
+            retransmitted_segments: loss.retransmitted_segments,
+            timeout_retransmitted_segments: loss.timeout_retransmitted_segments,
+            timeouts: loss.timeouts,
+            loss_probes: loss.loss_probes,
+            loss_probe_recoveries: loss.loss_probe_recoveries,
+            sack_recoveries: loss.sack_recoveries,
+            reno_recoveries: loss.reno_recoveries,
+            dsack_received: loss.dsack_received,
             ..self.counters
         }
     }
