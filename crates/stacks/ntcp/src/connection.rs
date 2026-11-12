@@ -930,6 +930,12 @@ pub(crate) struct Connection {
     ecn_backoff: Option<(Seq, u64)>,
     last_output_ecn: u8,
     pub(crate) accepted_metadata: bool,
+    // Set by the Endpoint for the input of an unaccepted passive child whose
+    // listener's accept queue is full: the ACK that would complete the
+    // handshake is dropped, `establishment_held` raised, and the child stays
+    // in SYN-RECEIVED to retransmit its SYN-ACK.
+    pub(crate) hold_establishment: bool,
+    pub(crate) establishment_held: bool,
     sample: Option<(Seq, Instant)>,
     // Reserved control RTT uses physical departure; sample's time still names
     // the immutable wire TSval for ordinary RTTM echo validation.
@@ -1289,6 +1295,8 @@ impl Connection {
             ecn_backoff: None,
             last_output_ecn: 0,
             accepted_metadata: false,
+            hold_establishment: false,
+            establishment_held: false,
             sample: None,
             sample_departure: None,
             rtt_sample_after: None,
@@ -6243,6 +6251,15 @@ impl Connection {
         //# discarded and an ACK sent back.
         if !self.snd_nxt.at_or_after(ack) || !ack.at_or_after(oldest_ack) {
             self.immediate_ack();
+            return Ok(());
+        }
+        // As Linux's tcp_check_req with tcp_abort_on_overflow off, after the
+        // same sequence, PAWS, RST, SYN and ACK checks: the request stays,
+        // marked acked, its SYN-ACK retransmits, and the peer's next ACK
+        // completes it once accept() made room. Nothing of the segment is
+        // taken, neither its timestamp nor its data.
+        if self.hold_establishment && self.handshake_pending() && ack.after(self.snd_una) {
+            self.establishment_held = true;
             return Ok(());
         }
         // TCP sequence and ACK validation must precede timestamp refresh.

@@ -1137,23 +1137,25 @@ fn event_driven_exchanges_complete_under_backpressure_and_partial_reads() {
     panic!("exchanges stalled: {done:?}, awaiting {awaited:?}, unwritten {unwritten:?}");
 }
 
-// A listener's refused SYNs count as Linux's ListenOverflows and
-// ListenDrops: a full backlog in both, no connection slot in the drops
-// alone. An active open without a slot fails with Error::Capacity instead.
+// A listener's refused SYNs count as Linux's ListenDrops: a full SYN queue
+// (backlog 0 holds one half-open connection, and ntcp has no SYN cookies)
+// and no connection slot alike. An active open without a slot fails with
+// Error::Capacity instead. A full accept queue is also an overflow
+// (accept_queue_overflow_holds_the_handshake_until_accept).
 #[test]
 fn listen_overflows_and_drops_count_refused_syns() {
     let (ip_a, ip_b): (IpAddr, IpAddr) =
         ("10.73.0.1".parse().unwrap(), "10.73.0.2".parse().unwrap());
-    for full_backlog in [true, false] {
+    for full_syn_queue in [true, false] {
         let (wire_a, wire_b) = wires(PacketLayer::Ip);
         let mut config_b = config(ip_b, false, 2);
-        if !full_backlog {
+        if !full_syn_queue {
             config_b.tcp.max_connections = 2;
         }
         let mut a = Network::new(config(ip_a, false, 1), wire_a, [1; 32], 0).unwrap();
         let mut b = Network::new(config_b, wire_b, [2; 32], 0).unwrap();
         let peer = SocketAddr::new(ip_b, 9000);
-        let listener = b.listen(9000, if full_backlog { 1 } else { 2 }).unwrap();
+        let listener = b.listen(9000, if full_syn_queue { 0 } else { 2 }).unwrap();
         let mut now = 0;
         let mut step = |a: &mut Network<Wire>, b: &mut Network<Wire>| {
             now += 10_000;
@@ -1161,9 +1163,9 @@ fn listen_overflows_and_drops_count_refused_syns() {
             b.drive(now, BUDGET).unwrap();
         };
         let mut accepted = Vec::new();
-        if !full_backlog {
+        if !full_syn_queue {
             // An accepted connection holds one of the two slots, outside
-            // the backlog.
+            // the listener's queues.
             a.connect(peer).unwrap();
             for _ in 0..10 {
                 step(&mut a, &mut b);
@@ -1174,19 +1176,15 @@ fn listen_overflows_and_drops_count_refused_syns() {
         let second = a.connect(peer).unwrap();
         step(&mut a, &mut b);
         let counters = b.counters();
-        let overflows = u64::from(full_backlog);
-        assert_eq!(
-            (counters.listen_overflows, counters.listen_drops),
-            (overflows, 1)
-        );
-        if !full_backlog {
+        assert_eq!((counters.listen_overflows, counters.listen_drops), (0, 1));
+        if !full_syn_queue {
             assert!(matches!(
                 b.connect(SocketAddr::new(ip_a, 9000)),
                 Err(Error::Capacity)
             ));
         }
         // The second's SYN, retransmitted after a second, finds the first
-        // accepted and gone from the backlog, but still holding a slot.
+        // gone from the SYN queue, but still holding a slot.
         for _ in 0..150 {
             step(&mut a, &mut b);
             accepted.extend(b.accept(listener));
@@ -1195,14 +1193,67 @@ fn listen_overflows_and_drops_count_refused_syns() {
         assert_eq!(state(first), State::Established);
         assert_eq!(accepted.len(), 2);
         let counters = b.counters();
-        if full_backlog {
+        if full_syn_queue {
             assert_eq!(state(second), State::Established);
-            assert_eq!((counters.listen_overflows, counters.listen_drops), (1, 1));
+            assert_eq!((counters.listen_overflows, counters.listen_drops), (0, 1));
         } else {
             assert_eq!(state(second), State::SynSent);
             assert_eq!((counters.listen_overflows, counters.listen_drops), (0, 2));
         }
     }
+}
+
+// As Linux's, the listen backlog bounds the SYN queue and the accept queue
+// to backlog + 1 each. A handshake whose last ACK finds the accept queue
+// full is held half-open: that ACK is dropped as an overflow (Linux's
+// tcp_v4_syn_recv_sock: ListenOverflows and ListenDrops), the SYN-ACK is
+// retransmitted, and the connection completes once accept() makes room.
+#[test]
+fn accept_queue_overflow_holds_the_handshake_until_accept() {
+    let (ip_a, ip_b): (IpAddr, IpAddr) =
+        ("10.73.0.1".parse().unwrap(), "10.73.0.2".parse().unwrap());
+    let (wire_a, wire_b) = wires(PacketLayer::Ip);
+    let mut a = Network::new(config(ip_a, false, 1), wire_a, [1; 32], 0).unwrap();
+    let mut b = Network::new(config(ip_b, false, 2), wire_b, [2; 32], 0).unwrap();
+    let peer = SocketAddr::new(ip_b, 9000);
+    let listener = b.listen(9000, 1).unwrap();
+    let mut now = 0;
+    let mut step = |a: &mut Network<Wire>, b: &mut Network<Wire>| {
+        now += 10_000;
+        a.drive(now, BUDGET).unwrap();
+        b.drive(now, BUDGET).unwrap();
+    };
+    let first = a.connect(peer).unwrap();
+    for _ in 0..10 {
+        step(&mut a, &mut b);
+    }
+    // One established, unaccepted: both later SYNs find room, and the
+    // second of their handshakes finds the accept queue full.
+    let second = a.connect(peer).unwrap();
+    let third = a.connect(peer).unwrap();
+    for _ in 0..10 {
+        step(&mut a, &mut b);
+    }
+    let state = |a: &Network<Wire>, id| a.connection_info(id).unwrap().state;
+    for id in [first, second, third] {
+        assert_eq!(state(&a, id), State::Established);
+    }
+    let counters = b.counters();
+    assert_eq!((counters.listen_overflows, counters.listen_drops), (1, 1));
+    let mut accepted = vec![b.accept(listener).unwrap(), b.accept(listener).unwrap()];
+    assert!(matches!(b.accept(listener), Err(Error::WouldBlock(_))));
+    // The retransmitted SYN-ACK, after a second, draws the ACK that
+    // completes it.
+    for _ in 0..150 {
+        step(&mut a, &mut b);
+        accepted.extend(b.accept(listener));
+    }
+    assert_eq!(accepted.len(), 3);
+    for id in accepted {
+        assert_eq!(b.connection_info(id).unwrap().state, State::Established);
+    }
+    let counters = b.counters();
+    assert_eq!((counters.listen_overflows, counters.listen_drops), (1, 1));
 }
 
 // TIME-WAIT occupancy, as Linux's sockstat `tw`: the side that closes first

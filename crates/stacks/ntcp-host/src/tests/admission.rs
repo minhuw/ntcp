@@ -156,22 +156,24 @@ fn full_endpoint_backlog_or_uncollected_bindings_do_not_turn_admissible_syns_int
         let packet = ntcp_ip::parse(&frame, false).unwrap();
         (packet.ip, packet.payload.to_vec(), frame)
     };
-    // Endpoint slots exhausted by an established flow, then a full backlog.
-    for backlog in [false, true] {
-        let cfg = config(if backlog { 4 } else { 1 });
+    // Endpoint slots exhausted by an established flow, then a full SYN
+    // queue (backlog 0 holds one half-open connection), then a full accept
+    // queue (one established connection).
+    for case in ["slots", "syn queue", "accept queue"] {
+        let cfg = config(if case == "slots" { 1 } else { 4 });
         let mut a = managed(local, 51, config(4));
         let mut b = managed(remote, 52, cfg.clone());
-        b.1.listen(remote, 1).unwrap();
+        b.1.listen(remote, usize::from(case == "slots")).unwrap();
         let (_, _, first) = request(&mut a, local, &cfg, 0);
         input(&mut b.0, &mut b.1, b.2, 1, &first, 12);
-        if !backlog {
+        if case != "syn queue" {
             let mut now = 10;
             pump(&mut a, &mut b, &mut now);
         }
         let before = usage(&b.0);
         let (ip, tcp, frame) = request(&mut a, second, &cfg, 5000);
         let (result, prepared) = core_input(&mut b, 6000, ip, &tcp);
-        println!("backlog={backlog}: {result:?}, provider prepares {prepared}");
+        println!("{case}: {result:?}, provider prepares {prepared}");
         assert_eq!(result, Ok(ntcp::InputDisposition::Dropped));
         assert_eq!(prepared, 0);
         assert_eq!(
@@ -187,10 +189,10 @@ fn full_endpoint_backlog_or_uncollected_bindings_do_not_turn_admissible_syns_int
             Ok(ntcp::InputDisposition::Dropped)
         );
         assert_eq!(usage(&b.0), before);
-        // Each of the two refused SYNs is one listen drop and, the first
-        // connection being unaccepted either way, an overflow of the full
-        // backlog.
-        assert_eq!((b.1.listen_overflows(), b.1.listen_drops()), (2, 2));
+        // Each of the two refused SYNs is one listen drop, and an overflow
+        // of the full accept queue.
+        let overflows = if case == "accept queue" { 2 } else { 0 };
+        assert_eq!((b.1.listen_overflows(), b.1.listen_drops()), (overflows, 2));
     }
     // Bindings sized max_connections+1 can only be full of uncollected
     // generations once the Endpoint itself has room.

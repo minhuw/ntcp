@@ -172,12 +172,13 @@ fn established_reset_before_or_after_accept_preserves_terminal_data_and_status()
 #[test]
 fn terminal_pending_children_preserve_fifo_backlog_and_same_tuple_ownership() {
     for v6 in [false, true] {
-        let mut p = Passive::new(v6, 2, false);
+        // Backlog 1: the accept queue is full at two.
+        let mut p = Passive::new(v6, 1, false);
         let first = p.connect(40000, 0, true, false, &[7; 10]);
         p.reset(40000, 1, 10);
         let second = p.connect(40001, 2, true, false, &[]);
         p.reset(40001, 3, 0);
-        assert_eq!(p.endpoint.listener_queue_info(p.listener).unwrap(), (2, 2));
+        assert_eq!(p.endpoint.listener_queue_info(p.listener).unwrap(), (2, 1));
         let retained = p.endpoint.buffer_bytes();
         p.input(4, p.header(40002, 100, 0, wire::SYN), &[], &[])
             .unwrap();

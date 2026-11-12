@@ -264,16 +264,20 @@ pub struct Counters {
     // in discarded).
     pub redirected: u64,
     pub redirects_dropped: u64,
-    // SYNs a listener dropped because its backlog (its unaccepted
-    // connections, half-open and established) was full: Linux's
-    // ListenOverflows (`Endpoint::listen_overflows`).
+    // SYNs, and last ACKs of handshakes, a listener dropped because its
+    // accept queue (established connections not yet accepted, at most
+    // backlog + 1) was full: Linux's ListenOverflows
+    // (`Endpoint::listen_overflows`). A dropped last ACK leaves its
+    // connection half-open, its SYN-ACK retransmitted, and counts again for
+    // each such ACK until accept() makes room.
     pub listen_overflows: u64,
-    // SYNs a listener dropped for lack of room: listen_overflows, and those
-    // refused for want of a connection slot or buffer budget, whose
-    // connection could not be allocated or that had no path to answer on:
-    // Linux's ListenDrops (`Endpoint::listen_drops`). Each such SYN is also
-    // in discarded. An active open refused for the same reasons, or for
-    // want of an ephemeral port, fails with Error::Capacity instead.
+    // What a listener dropped for lack of room: listen_overflows, SYNs its
+    // full SYN queue (half-open connections, at most backlog + 1) refused,
+    // and SYNs refused for want of a connection slot or buffer budget,
+    // whose connection could not be allocated or that had no path to answer
+    // on: Linux's ListenDrops (`Endpoint::listen_drops`). Each such packet
+    // is also in discarded. An active open refused for the same reasons, or
+    // for want of an ephemeral port, fails with Error::Capacity instead.
     pub listen_drops: u64,
     // Connections in TIME-WAIT now, released or not: Linux's sockstat `tw`
     // (`Endpoint::time_wait_connections`).

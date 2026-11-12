@@ -3722,12 +3722,28 @@ fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
             b.close_listener(listener).unwrap();
         }
         if pressure == 3 {
-            for port in 40001..40005 {
+            // A full accept queue: backlog 4 holds five. A full SYN queue
+            // would not refuse it, as Linux's tcp_conn_request skips that
+            // bound for a SYN reopening a TIME-WAIT.
+            for port in 40001..40006 {
                 let mut header = h;
                 header.destination_port = port;
                 let syn = tw_segment(ip, header, 99, 0, wire::SYN, Some((4, 0)));
                 b.input(3_000, ip, &syn).unwrap();
+                let synack = packets(&mut b, 3_000);
+                let reply = wire::parse(synack[0].0, &synack[0].1).unwrap();
+                let echo = reply.options.timestamps.unwrap().0;
+                let ack = tw_segment(
+                    ip,
+                    header,
+                    100,
+                    reply.header.sequence.wrapping_add(1),
+                    wire::ACK,
+                    Some((5, echo)),
+                );
+                assert_eq!(b.input(3_000, ip, &ack), Ok(InputDisposition::Processed));
             }
+            assert_eq!(b.listener_queue_info(listener), Ok((5, 4)));
         }
         packets(&mut b, 3_000);
         let bytes = b.buffer_bytes();
@@ -3759,8 +3775,8 @@ fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
         } else {
             assert!(output.is_empty());
         }
-        // At a full backlog the drop is also an overflow; a closed listener
-        // took none.
+        // At a full accept queue the drop is also an overflow; a closed
+        // listener took none.
         let counted = match pressure {
             0 | 1 => (0, 1),
             2 => (0, 0),
@@ -3839,11 +3855,14 @@ fn a_time_wait_answers_a_syn_that_may_not_reopen_it_as_without_reuse() {
     }
 }
 
-// Linux counts a SYN its full accept queue refuses in ListenOverflows and
-// ListenDrops, and one refused for memory in ListenDrops alone.
+// Linux counts a SYN its full SYN queue refuses (tcp_syncookies=0), and one
+// refused for memory, in ListenDrops alone; one its full accept queue
+// refuses also in ListenOverflows
+// (accept_queue_overflows_count_refused_syns_and_held_acks).
 #[test]
 fn listen_overflows_and_drops_count_the_syns_a_listener_refuses() {
-    // A full backlog, no connection slot, no buffer budget.
+    // A full SYN queue (backlog 0 holds one), no connection slot, no buffer
+    // budget.
     for case in 0..3 {
         let mut cfg = config();
         if case == 1 {
@@ -3855,7 +3874,7 @@ fn listen_overflows_and_drops_count_the_syns_a_listener_refuses() {
         let (local, remote) = addresses();
         let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
         let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
-        let listener = b.listen(remote, [1, 2, 4][case]).unwrap();
+        let listener = b.listen(remote, [0, 2, 4][case]).unwrap();
         if case == 1 {
             // An accepted connection holds one of the two slots, outside
             // the backlog.
@@ -3873,22 +3892,191 @@ fn listen_overflows_and_drops_count_the_syns_a_listener_refuses() {
         deliver(&mut b, 0, syns);
         assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0));
         assert_eq!(b.input(0, ip, &refused), Ok(InputDisposition::Dropped));
-        let overflows = u64::from(case == 0);
-        assert_eq!((b.listen_overflows(), b.listen_drops()), (overflows, 1));
+        assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 1));
         pump(&mut a, &mut b, 0);
         b.accept(listener).unwrap();
         assert_eq!(a.state(first), Ok(State::Established));
         // The retransmitted SYN finds the accepted connection gone from the
-        // backlog, but still holding its slot and budget.
+        // SYN queue, but still holding its slot and budget.
         tick(&mut a, &mut b, 1_000_000);
         if case == 0 {
             assert_eq!(a.state(second), Ok(State::Established));
-            assert_eq!((b.listen_overflows(), b.listen_drops()), (1, 1));
+            assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 1));
         } else {
             assert_eq!(a.state(second), Ok(State::SynSent));
             assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 2));
         }
     }
+}
+
+// A SYN burst past the backlog: as in Linux, the SYN queue takes backlog + 1
+// SYNs and drops the rest (ListenDrops alone, as without SYN cookies), the
+// accept queue takes backlog + 1 connections, and a SYN finding it full is
+// dropped as an overflow. The peers retransmit their SYNs, and every
+// connection completes as accept() makes room.
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
+//= type=test
+//# If passive, enter the LISTEN state and return.
+fn syn_burst_past_the_backlog_fills_both_queues_and_completes_on_retries() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.max_connections = 16;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    assert_eq!(
+        b.listen(remote, 17),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    let listener = b.listen(remote, 1).unwrap();
+    let clients: Vec<_> = (40001..40007)
+        .map(|port| {
+            a.connect(0, core::net::SocketAddr::new(local.ip(), port), remote)
+                .unwrap()
+        })
+        .collect();
+    let established = |a: &Endpoint| {
+        clients
+            .iter()
+            .filter(|&&id| a.state(id) == Ok(State::Established))
+            .count()
+    };
+    pump(&mut a, &mut b, 0);
+    // Two SYNs taken and four dropped; both handshakes joined the accept
+    // queue.
+    assert_eq!(b.listener_queue_info(listener), Ok((2, 1)));
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 4));
+    assert_eq!(established(&a), 2);
+    // The retransmitted SYNs find the accept queue full.
+    tick(&mut a, &mut b, 1_000_000);
+    assert_eq!(b.listener_queue_info(listener), Ok((2, 1)));
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (4, 8));
+    assert_eq!(established(&a), 2);
+    let mut accepted = Vec::new();
+    let mut now = 1_000_000;
+    while accepted.len() < clients.len() && now < 64_000_000 {
+        accepted.extend(core::iter::from_fn(|| b.accept(listener).ok()));
+        now += 100_000;
+        tick(&mut a, &mut b, now);
+    }
+    accepted.extend(core::iter::from_fn(|| b.accept(listener).ok()));
+    assert_eq!(accepted.len(), clients.len());
+    assert_eq!(established(&a), clients.len());
+    for id in accepted {
+        assert_eq!(b.state(id), Ok(State::Established));
+    }
+}
+
+// A handshake whose last ACK finds its listener's accept queue full stays
+// half-open, as Linux's request does with tcp_abort_on_overflow off
+// (tcp_check_req): that ACK, and the data that follows it, are dropped and
+// each counted in ListenOverflows and ListenDrops (tcp_v4_syn_recv_sock);
+// the SYN-ACK is retransmitted, and the connection completes with the
+// peer's next segment once accept() has made room.
+#[test]
+fn accept_queue_overflow_holds_the_handshake_until_accept() {
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    // Backlog 1: either queue holds two.
+    let listener = b.listen(remote, 1).unwrap();
+    let port = |port| core::net::SocketAddr::new(local.ip(), port);
+    let from = |packets: &[(IpMetadata, Vec<u8>)], port: u16| {
+        packets
+            .iter()
+            .filter(|(ip, bytes)| wire::parse(*ip, bytes).unwrap().header.source_port == port)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    a.connect(0, port(40001), remote).unwrap();
+    a.connect(0, port(40002), remote).unwrap();
+    let syns = packets(&mut a, 0);
+    deliver(&mut b, 0, syns);
+    let synacks = packets(&mut b, 0);
+    deliver(&mut a, 0, synacks);
+    let acks = packets(&mut a, 0);
+    deliver(&mut b, 0, from(&acks, 40001));
+    // The third finds room in both queues: one half-open, one established.
+    let third = a.connect(0, port(40003), remote).unwrap();
+    let syn = packets(&mut a, 0);
+    deliver(&mut b, 0, syn);
+    let synack = packets(&mut b, 0);
+    deliver(&mut a, 0, synack);
+    assert_eq!(a.state(third), Ok(State::Established));
+    let last = packets(&mut a, 0);
+    deliver(&mut b, 0, from(&acks, 40002));
+    assert_eq!(b.listener_queue_info(listener), Ok((2, 1)));
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0));
+    for (ip, bytes) in last {
+        assert_eq!(b.input(0, ip, &bytes), Ok(InputDisposition::Dropped));
+    }
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (1, 1));
+    a.write(third, b"hi").unwrap();
+    for (ip, bytes) in packets(&mut a, 0) {
+        assert_eq!(b.input(0, ip, &bytes), Ok(InputDisposition::Dropped));
+    }
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (2, 2));
+    assert_eq!(b.listener_queue_info(listener), Ok((2, 1)));
+    let first = b.accept(listener).unwrap();
+    assert_eq!(b.listener_queue_info(listener), Ok((1, 1)));
+    // Nothing completes it until the peer sends again.
+    assert!(packets(&mut b, 0).is_empty());
+    let mut now = 0;
+    while b.listener_queue_info(listener) == Ok((1, 1)) && now < 8_000_000 {
+        now += 100_000;
+        tick(&mut a, &mut b, now);
+    }
+    assert_eq!(b.listener_queue_info(listener), Ok((2, 1)));
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (2, 2));
+    let second = b.accept(listener).unwrap();
+    let child = b.accept(listener).unwrap();
+    for id in [first, second, child] {
+        assert_eq!(b.state(id), Ok(State::Established));
+    }
+    tick(&mut a, &mut b, now + 2_000_000);
+    let mut bytes = [0; 8];
+    assert_eq!(b.read(child, &mut bytes), Ok(2));
+    assert_eq!(&bytes[..2], b"hi");
+}
+
+// A SYN reopening a TIME-WAIT skips the SYN queue's bound, as Linux's
+// tcp_conn_request does one its TIME-WAIT socket handed on (tcp_tw_isn),
+// but not the accept queue's
+// (time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged).
+#[test]
+fn a_syn_reopening_a_time_wait_skips_the_syn_queue_bound() {
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    let (mut b, _, old, ip, h, ts) = time_wait_endpoint(cfg);
+    let syn_from = |port| {
+        let mut header = h;
+        header.destination_port = port;
+        tw_segment(ip, header, 99, 0, wire::SYN, Some((4, 0)))
+    };
+    // Backlog 4: five half-open connections fill the SYN queue.
+    for port in 40001..40006 {
+        assert_eq!(
+            b.input(3_000, ip, &syn_from(port)),
+            Ok(InputDisposition::Processed)
+        );
+    }
+    assert_eq!(
+        b.input(3_000, ip, &syn_from(40006)),
+        Ok(InputDisposition::Dropped)
+    );
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 1));
+    packets(&mut b, 3_000);
+    let syn = tw_segment(
+        ip,
+        h,
+        h.acknowledgment + 100,
+        0,
+        wire::SYN,
+        Some((ts + 1, 0)),
+    );
+    assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
+    assert_eq!(b.state(old), Ok(State::Closed));
+    assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 1));
 }
 
 #[test]

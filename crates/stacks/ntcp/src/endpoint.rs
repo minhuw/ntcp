@@ -441,8 +441,11 @@ enum PassiveRefusal {
     // The TIME-WAIT connection of its tuple may not be reopened: reset
     // pending or quarantined, or the SYN is not fresh (RFC 6191).
     TimeWait,
-    // The listener's backlog is full.
-    Backlog,
+    // The listener's SYN queue (its half-open children) is full.
+    SynQueue,
+    // The listener's accept queue (its established, unaccepted children) is
+    // full: Linux's ListenOverflows.
+    AcceptQueue,
     // No connection slot or buffer budget for the connection.
     Resources,
     // A tuple no connection may have (a zero port).
@@ -463,13 +466,28 @@ struct Listener {
     address: SocketAddr,
     // Present exactly for a link-local address of a managed Endpoint.
     zone: Option<ntcp_path::LinkId>,
+    // The listen() backlog, Linux's sk_max_ack_backlog: it bounds the SYN
+    // queue and the accept queue each.
     backlog: usize,
+    // Every unaccepted child, half-open or established; `pending` the
+    // established ones, in the order they joined the accept queue.
     children: Vec<ConnectionId>,
     pending: VecDeque<ConnectionId>,
     closing: bool,
 }
 
 impl Listener {
+    // As Linux's inet_csk_reqsk_queue_is_full and sk_acceptq_is_full, a
+    // queue is full once it holds more than the backlog, so a SYN or a
+    // handshake's last ACK finding one entry fewer makes it backlog + 1.
+    fn syn_queue_full(&self) -> bool {
+        self.children.len() - self.pending.len() > self.backlog
+    }
+
+    fn accept_queue_full(&self) -> bool {
+        self.pending.len() > self.backlog
+    }
+
     fn reset_debt(&mut self, now: Instant) -> usize {
         if self.reset_debt_expiry.is_some_and(|expiry| now >= expiry) {
             self.reset_debt = 0;
@@ -1193,6 +1211,13 @@ impl Endpoint {
     //# Every passive OPEN call either creates a new connection record in
     //# LISTEN state, or it returns an error; it MUST NOT affect any
     //# previously created connection record (MUST-41).
+    /// `backlog` is Linux's listen() backlog after its somaxconn clamp
+    /// (sk_max_ack_backlog), at most `max_connections`. It bounds the
+    /// listener's SYN queue, its half-open children, and its accept queue,
+    /// its established children not yet accepted, each to `backlog + 1`, as
+    /// Linux does: a SYN finding either full is dropped, and so is the last
+    /// ACK of a handshake finding the accept queue full, its child left in
+    /// SYN-RECEIVED to retransmit the SYN-ACK.
     pub fn listen(
         &mut self,
         address: SocketAddr,
@@ -1227,7 +1252,6 @@ impl Endpoint {
             || !(self.address_policy)(AddressValidation::Bind {
                 local: address.ip(),
             })
-            || backlog == 0
             || backlog > self.config.max_connections
         {
             return Err(Error::InvalidArgument.into());
@@ -1251,11 +1275,16 @@ impl Endpoint {
             .enumerate()
             .position(|(i, l)| l.is_none() && self.listener_generations[i] != u64::MAX)
             .ok_or(EndpointError::LimitReached)?;
-        let children = reserved_vec(backlog)?;
+        // Both queues full; a child is a connection, so no more than
+        // max_connections in all. Only TIME-WAIT reopens, which skip the SYN
+        // queue's bound as in Linux, reserve beyond (`reopen_time_wait`).
+        let children = reserved_vec((2 * (backlog + 1)).min(self.config.max_connections))?;
         let mut pending = VecDeque::new();
         pending
-            .try_reserve_exact(backlog)
+            .try_reserve_exact(backlog + 1)
             .map_err(|_| Error::NoMemory)?;
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
+        //# If passive, enter the LISTEN state and return.
         self.listeners[slot] = Some(Listener {
             early_data_policy: crate::FastOpenEarlyDataPolicy::RequireCookie,
             fast_open_limit: 0,
@@ -1823,11 +1852,9 @@ impl Endpoint {
             Self::sync_ip_header_len(slot);
         }
         if let Some(parent) = listener {
-            self.listeners[parent.slot]
-                .as_mut()
-                .unwrap()
-                .children
-                .push(id);
+            let children = &mut self.listeners[parent.slot].as_mut().unwrap().children;
+            debug_assert!(children.len() < children.capacity());
+            children.push(id);
         }
         self.refresh(index);
         if let Some(Target::Connection(old)) = replaces {
@@ -3103,6 +3130,9 @@ impl Endpoint {
                 // an edge-triggered caller that took fewer than all pending
                 // connections hears of the next one. The ready queue holds
                 // the listener once, so joins before a drain coalesce.
+                // A child joins only one the queue has room for: its SYN
+                // or its handshake's last ACK found the queue not full.
+                debug_assert!(!listener.accept_queue_full());
                 listener.pending.push_back(id);
                 self.events.push(self.config.max_connections + parent.slot);
             }
@@ -3509,9 +3539,19 @@ impl Endpoint {
                 slot.connection.state() == State::SynSent
                     && segment.header.flags & (SYN | ACK | RST) == SYN
             });
+            // An unaccepted child yet to join its listener's accept queue
+            // completes its handshake only if the queue has room.
+            let hold = slot
+                .listener
+                .filter(|_| !slot.accepted_ready)
+                .is_some_and(|parent| {
+                    self.listener(parent)
+                        .is_ok_and(|listener| listener.accept_queue_full())
+                });
             let authorization =
                 authority.map(|id| self.crossing_syn_authorization(id, tuple, segment));
             let slot = self.slots[index].as_mut().unwrap();
+            slot.connection.hold_establishment = hold;
             slot.received_dscp = Some(traffic_class >> 2);
             let admitted = if let Some(authorization) = authorization {
                 slot.connection.input_with_receive_authorization(
@@ -3532,8 +3572,18 @@ impl Endpoint {
             if slot.connection.accepted_metadata {
                 Self::save_ipv4_options(slot, options, route);
             }
+            slot.connection.hold_establishment = false;
+            // Linux counts it at tcp_v4_syn_recv_sock's exit_overflow.
+            let held = core::mem::take(&mut slot.connection.establishment_held);
+            if held {
+                self.count_listen_drop(true);
+            }
             self.refresh(index);
-            return Ok(InputDisposition::Processed);
+            return Ok(if held {
+                InputDisposition::Dropped
+            } else {
+                InputDisposition::Processed
+            });
         }
         if let Some(listener) = self.match_listener(tuple.tuple.local, zone) {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
@@ -3556,7 +3606,7 @@ impl Endpoint {
             }
             if let Some(refusal) = self.passive_refusal(now, None, listener, tuple, segment) {
                 if refusal != PassiveRefusal::Invalid {
-                    self.count_listen_drop(refusal == PassiveRefusal::Backlog);
+                    self.count_listen_drop(refusal == PassiveRefusal::AcceptQueue);
                 }
                 return Ok(InputDisposition::Dropped);
             }
@@ -3722,8 +3772,16 @@ impl Endpoint {
             return Some(PassiveRefusal::TimeWait);
         }
         let record = self.listeners[listener.slot].as_ref().unwrap();
-        if record.children.len() >= record.backlog {
-            return Some(PassiveRefusal::Backlog);
+        // In Linux's order (tcp_conn_request): the SYN queue, which a SYN
+        // reopening a TIME-WAIT skips, then the accept queue. Without SYN
+        // cookies a full SYN queue drops the SYN, as Linux's does with
+        // tcp_syncookies=0 (TCPReqQFullDrop); Linux's default,
+        // tcp_syncookies=1, answers it with a cookie SYN-ACK instead.
+        if target.is_none() && record.syn_queue_full() {
+            return Some(PassiveRefusal::SynQueue);
+        }
+        if record.accept_queue_full() {
+            return Some(PassiveRefusal::AcceptQueue);
         }
         match target {
             None => match self.resource_admission(tuple, record.buffer_capacities) {
@@ -3737,8 +3795,9 @@ impl Endpoint {
         }
     }
 
-    // A SYN a listener took and dropped (`listen_drops`), one refused for
-    // its full backlog also an overflow (`listen_overflows`).
+    // A SYN, or the last ACK of a handshake, a listener took and dropped
+    // (`listen_drops`), one refused for its full accept queue also an
+    // overflow (`listen_overflows`).
     fn count_listen_drop(&mut self, overflow: bool) {
         self.listen_overflows += u64::from(overflow);
         self.listen_drops += 1;
@@ -3796,10 +3855,22 @@ impl Endpoint {
         match self.passive_refusal(self.now, Some(target), listener, scoped, syn) {
             Some(PassiveRefusal::TimeWait) => return Ok(None),
             Some(refusal) => {
-                self.count_listen_drop(refusal == PassiveRefusal::Backlog);
+                self.count_listen_drop(refusal == PassiveRefusal::AcceptQueue);
                 return Ok(Some(InputDisposition::Dropped));
             }
             None => {}
+        }
+        // Past the SYN queue's bound, the child needs room of its own among
+        // the listener's children.
+        if self.listeners[listener.slot]
+            .as_mut()
+            .unwrap()
+            .children
+            .try_reserve(1)
+            .is_err()
+        {
+            self.count_listen_drop(false);
+            return Ok(Some(InputDisposition::Dropped));
         }
         let record = self.listeners[listener.slot].as_ref().unwrap();
         let application_timeout = record.application_timeout_us;
@@ -4919,19 +4990,23 @@ impl Endpoint {
         self.undeliverable_control
     }
 
-    /// SYNs a listener dropped because its backlog was full, as Linux counts
-    /// those its full accept queue refuses (LINUX_MIB_LISTENOVERFLOWS). The
-    /// backlog bounds a listener's unaccepted connections, half-open and
-    /// established alike, so this also counts what Linux refuses at its SYN
-    /// queue, there in ListenDrops alone. For administrative reporting.
+    /// What a listener dropped because its accept queue was full, as Linux
+    /// counts LINUX_MIB_LISTENOVERFLOWS: a SYN (tcp_conn_request), and the
+    /// last ACK of a handshake, whose child stays half-open
+    /// (tcp_v4_syn_recv_sock), counted again for each such ACK the peer
+    /// sends. A SYN its full SYN queue refuses is not counted, even when
+    /// the accept queue is full too, as Linux checks the SYN queue first.
+    /// For administrative reporting.
     pub fn listen_overflows(&self) -> u64 {
         self.listen_overflows
     }
 
-    /// SYNs a listener dropped for lack of room, as Linux counts every SYN
-    /// its listener drops (LINUX_MIB_LISTENDROPS): `listen_overflows`, and
-    /// those refused for want of a connection slot (`max_connections`) or
-    /// buffer budget (`max_buffer_bytes`), whose connection could not be
+    /// What a listener dropped for lack of room, as Linux counts
+    /// LINUX_MIB_LISTENDROPS (tcp_listendrop): `listen_overflows`, SYNs its
+    /// full SYN queue refuses (with tcp_syncookies=0, as ntcp has no SYN
+    /// cookies; Linux also counts them in TCPReqQFullDrop), and SYNs
+    /// refused for want of a connection slot (`max_connections`) or buffer
+    /// budget (`max_buffer_bytes`), whose connection could not be
     /// allocated, or that a managed path provider found no path to answer.
     /// A SYN that may not reopen its TIME-WAIT connection is that
     /// connection's to drop and is not counted. For administrative

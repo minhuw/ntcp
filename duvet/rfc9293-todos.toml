@@ -24,3 +24,20 @@ quote = '''
 However, it MAY accept a new SYN from the remote TCP endpoint to
 reopen the connection directly from TIME-WAIT state (MAY-2), if it:
 '''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2"
+reason = "Deliberate Linux-style deviation (tcp_conn_request, without SYN cookies): a listener bounds its SYN queue, its half-open children, and its accept queue, its established children not yet accepted, each by the listen backlog, Linux's sk_max_ack_backlog: either is full once it holds more than the backlog (inet_csk_reqsk_queue_is_full, sk_acceptq_is_full). A SYN finding the SYN queue full is dropped without a SYN-ACK and counted in listen_drops (Linux with tcp_syncookies=0: TCPReqQFullDrop, ListenDrops; Linux's default tcp_syncookies=1 answers it with a cookie SYN-ACK instead, and ntcp has no SYN cookies); a SYN reopening a TIME-WAIT skips that bound, as Linux's tcp_tw_isn does. A SYN then finding the accept queue full is dropped and counted in listen_overflows and listen_drops (ListenOverflows, ListenDrops). The peer retransmits its SYN. Linux's further no-cookie bound, the last quarter of tcp_max_syn_backlog kept for peers with cached metrics (tcp_peer_is_proven), is not implemented: ntcp keeps no such per-destination proof."
+quote = '''
+ISS
+should be selected and a SYN segment sent of the form:
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+reason = "Deliberate Linux-style deviation (tcp_check_req, tcp_v4_syn_recv_sock, tcp_abort_on_overflow=0): an unaccepted passive child whose listener's accept queue is full (it holds more than the listen backlog) does not enter ESTABLISHED on the ACK of its SYN. After the ordinary sequence, PAWS, RST, SYN and ACK-range checks, the segment is dropped whole, its timestamp and data untaken, and counted in listen_overflows and listen_drops (ListenOverflows, ListenDrops); the child stays in SYN-RECEIVED, retransmits its SYN-ACK on its timer within its handshake retransmission limit, and enters ESTABLISHED on the peer's next acceptable ACK once accept() has made room in the queue. A Fast Open child admitted early joins the accept queue at its SYN and is unaffected."
+quote = '''
+If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED
+state and continue processing with the variables below
+set to:
+'''
