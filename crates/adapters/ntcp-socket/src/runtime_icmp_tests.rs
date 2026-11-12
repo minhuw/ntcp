@@ -390,7 +390,7 @@ fn packet_icmp_retained_generation_cannot_migrate_to_a_reused_tuple() {
             .unwrap()
     );
     a.endpoint.release(old).unwrap();
-    a.sockets.remove(&clients[0]);
+    a.remove_socket(clients[0]);
     let replacement = new(&mut a, SOCK_NONBLOCK);
     a.execute(replacement, Op::Bind(tuple.local)).unwrap();
     assert_eq!(

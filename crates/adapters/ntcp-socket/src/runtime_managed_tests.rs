@@ -690,10 +690,10 @@ fn managed_native_time_wait_replacement_capacity_keeps_old_binding_and_cancels_p
         assert_eq!(b.endpoint.state(old), Ok(ntcp::State::TimeWait));
         if released {
             b.endpoint.release(old).unwrap();
-            b.sockets.remove(&server);
+            b.remove_socket(server);
         }
         a.endpoint.release(peer).unwrap();
-        a.sockets.remove(&client);
+        a.remove_socket(client);
         a.service_egress().unwrap();
         a.collect_paths().unwrap();
         b.collect_paths().unwrap();
@@ -748,7 +748,7 @@ fn managed_native_released_final_output_pins_binding_until_exact_owner_disappear
     assert!(a.endpoint.cancel_unsubmitted_open(cid).is_err());
     a.endpoint.abort(cid).unwrap();
     a.endpoint.release(cid).unwrap();
-    a.sockets.remove(&client);
+    a.remove_socket(client);
     a.collect_paths().unwrap();
     assert!(a.endpoint.connection_exists(cid));
     assert_eq!(a.host.as_ref().unwrap().binding(cid).unwrap(), binding);

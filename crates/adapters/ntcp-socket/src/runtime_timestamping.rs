@@ -259,6 +259,7 @@ impl Owner {
         }
     }
     pub(super) fn remove_socket(&mut self, id: u64) -> Option<Socket> {
+        unqueue_changed(&mut self.sockets, &mut self.changed, id);
         let s = self.sockets.remove(&id)?;
         self.hold(id, s.handle, false);
         self.timestamp_total -= s.timestamp_charged;
@@ -271,6 +272,7 @@ impl Owner {
         s.timestamps.pending_charge = s.timestamps.pending.iter().map(Pending::charge).sum();
         s.completion_charge = s.completions.iter().map(Completion::charge).sum();
         s.settle_timestamp_charge(&mut self.timestamp_total);
+        self.touch(id);
     }
     pub(super) fn timestamp_options(&mut self, id: u64, name: i32, flags: u32) -> Result<()> {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
@@ -594,7 +596,8 @@ impl Owner {
     }
     pub(super) fn drain_timestamps(&mut self, pair: ClockPair) {
         let mut global = self.timestamp_charge();
-        for s in self.sockets.values_mut() {
+        let mut changed = None;
+        for (&id, s) in self.sockets.iter_mut() {
             let Handle::Connection(cid) = s.handle else {
                 continue;
             };
@@ -608,8 +611,10 @@ impl Owner {
             }
             if drained {
                 s.settle_timestamp_charge(&mut self.timestamp_total);
+                queue_local(s, id, &mut changed);
             }
         }
+        self.splice_changed(changed);
     }
     fn timestamp_event(
         s: &mut Socket,
@@ -732,6 +737,7 @@ impl Owner {
             Self::timestamp_event(s, event, pair, Some((options, base)), &mut global);
         }
         s.settle_timestamp_charge(&mut self.timestamp_total);
+        self.touch(id);
     }
     pub(super) fn software_transmitted(
         &mut self,

@@ -617,7 +617,7 @@ fn managed_scheduled_held_reset_across_a_path_change_ends_its_lease() {
             exchange(&mut a, &mut b, &wa, &wb);
             a.endpoint.abort(cid).unwrap();
             a.endpoint.release(cid).unwrap();
-            a.sockets.remove(&client);
+            a.remove_socket(client);
             (&mut a, &wa)
         } else {
             flush(&mut a, &mut b, &wa);
@@ -1656,7 +1656,7 @@ fn managed_native_retained_segment_keeps_its_processing_through_replay() {
                     .unwrap()
             );
             a.endpoint.release(cid).unwrap();
-            a.sockets.remove(&client);
+            a.remove_socket(client);
             let replacement = new(&mut a, SOCK_NONBLOCK);
             a.execute(replacement, Op::Bind(tuple.local)).unwrap();
             assert_eq!(

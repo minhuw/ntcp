@@ -511,6 +511,10 @@ struct Socket {
     completion_charge: usize,
     // This socket's share of Owner::timestamp_total at its last settle.
     timestamp_charged: usize,
+    // Links of Owner::changed, the sockets the next event pass refreshes.
+    queued: bool,
+    changed_prev: Option<u64>,
+    changed_next: Option<u64>,
 }
 impl Socket {
     fn server_cookie_for(&self, remote: SocketAddr) -> Option<FastOpenCookie> {
@@ -596,6 +600,9 @@ impl Socket {
             timestamps: TimestampState::default(),
             completion_charge: 0,
             timestamp_charged: 0,
+            queued: false,
+            changed_prev: None,
+            changed_next: None,
         }
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
@@ -626,6 +633,46 @@ impl Socket {
             probes: self.probes as u32,
             send_garbage: false,
         })
+    }
+}
+// Links socket `id` at the head of the `changed` list, once.
+fn queue_changed(sockets: &mut BTreeMap<u64, Socket>, changed: &mut Option<u64>, id: u64) {
+    let Some(s) = sockets.get_mut(&id) else {
+        return;
+    };
+    if s.queued {
+        return;
+    }
+    s.queued = true;
+    s.changed_prev = None;
+    s.changed_next = changed.replace(id);
+    if let Some(next) = s.changed_next {
+        sockets.get_mut(&next).unwrap().changed_prev = Some(id);
+    }
+}
+// Links socket `s` (`id`) at the head of `local`, a chain kept by a pass
+// over the sockets that cannot reach the `changed` list's other sockets
+// while it holds this one; `Owner::splice_changed` adds the chain after.
+fn queue_local(s: &mut Socket, id: u64, local: &mut Option<u64>) {
+    if !s.queued {
+        s.queued = true;
+        s.changed_prev = None;
+        s.changed_next = local.replace(id);
+    }
+}
+// Unlinks socket `id` from the `changed` list, before its removal.
+fn unqueue_changed(sockets: &mut BTreeMap<u64, Socket>, changed: &mut Option<u64>, id: u64) {
+    let Some(s) = sockets.get_mut(&id).filter(|s| s.queued) else {
+        return;
+    };
+    s.queued = false;
+    let (prev, next) = (s.changed_prev.take(), s.changed_next.take());
+    match prev {
+        Some(prev) => sockets.get_mut(&prev).unwrap().changed_next = next,
+        None => *changed = next,
+    }
+    if let Some(next) = next {
+        sockets.get_mut(&next).unwrap().changed_prev = prev;
     }
 }
 fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
@@ -700,6 +747,16 @@ struct Owner {
     // `alloc`, `set_handle` and `remove_socket`; one entry per handle.
     connection_holders: HashMap<ConnectionId, u64>,
     listener_holders: HashMap<ListenerId, u64>,
+    // The sockets whose readiness may have changed since their last
+    // refresh, refreshed by the next event pass, as Linux's sk_data_ready
+    // and sk_write_space wake only the socket an event concerns: those an
+    // event or an operation concerned, those with a completion queued,
+    // those whose connection may transmit (`Endpoint::ready_connections`
+    // at the last pass, which moves the unsent count) and those held by
+    // output (whose release has no event). A list linked through the
+    // sockets, as Linux links a socket into a wait queue: queueing one
+    // never allocates.
+    changed: Option<u64>,
     // The `io.*` port's address: the runtime's address family and the
     // source of connections no other port's address is selected for.
     local: IpAddr,
@@ -902,6 +959,9 @@ impl Owner {
 
     fn apply_socket_config_at(&mut self, config: &SocketConfig, now: u64) -> Result<()> {
         let managed = config.fast_open_keys_managed().map_err(|_| EINVAL)?;
+        if self.socket_policy.notsent_lowat != config.socket.notsent_lowat {
+            self.touch_all();
+        }
         self.socket_policy = config.socket;
         self.endpoint
             .set_fast_open_cookie_lifetime(config.fast_open_cookie_lifetime);
@@ -1130,6 +1190,7 @@ impl Owner {
             sockets: BTreeMap::new(),
             connection_holders: HashMap::new(),
             listener_holders: HashMap::new(),
+            changed: None,
             local,
             clock,
             started,
@@ -2026,6 +2087,9 @@ impl Owner {
                 Event::Connection(cid, _) => self.connection_socket(*cid),
                 Event::RouteAdvice(_) => None,
             };
+            if let Some(id) = holder {
+                self.touch(id);
+            }
             if let Some(s) = holder.and_then(|id| self.sockets.get_mut(&id)) {
                 match (s.handle, &event) {
                     (Handle::Listener(id), Event::Acceptable(other)) if id == *other => {
@@ -2066,11 +2130,89 @@ impl Owner {
                 }
             }
         }
-        // ponytail: bounded per-socket scan; index changed connections if LIMIT grows.
-        let ids: Vec<_> = self.sockets.keys().copied().collect();
-        for id in ids {
+        // Output selected since the last pass may hold a connection.
+        self.queue_transmitting();
+        // Detach the list: a socket queued while it is refreshed (one held
+        // by output) joins the next pass's.
+        let mut next = self.changed.take();
+        while let Some(id) = next {
+            let s = self.sockets.get_mut(&id).expect("queued socket is live");
+            next = s.changed_next.take();
+            s.changed_prev = None;
+            s.queued = false;
             let _ = self.refresh_readiness(id);
         }
+        // Their unsent counts move as they transmit before the next pass:
+        // look at them again then.
+        self.queue_transmitting();
+        // Debug builds cross-check against the refresh of every socket
+        // that this replaces: nothing else changed any socket's readiness.
+        if cfg!(debug_assertions) {
+            for (&id, s) in &self.sockets {
+                if let Ok(bits) = self.readiness_bits(id) {
+                    assert_eq!(
+                        bits, s.readiness,
+                        "readiness of socket {id} changed with nothing to refresh it"
+                    );
+                }
+            }
+        }
+    }
+    // Queues the sockets of connections with output to send or held by
+    // egress: at most the connections egress is serving.
+    fn queue_transmitting(&mut self) {
+        let (holders, sockets, changed) = (
+            &self.connection_holders,
+            &mut self.sockets,
+            &mut self.changed,
+        );
+        let held = self.egress.iter().flat_map(|e| e.held_owners());
+        for cid in self.endpoint.ready_connections().chain(held) {
+            if let Some(&id) = holders.get(&cid) {
+                queue_changed(sockets, changed, id);
+            }
+        }
+    }
+    // Queues socket `id` for the next event pass's readiness refresh.
+    fn touch(&mut self, id: u64) {
+        queue_changed(&mut self.sockets, &mut self.changed, id);
+    }
+    // Adds a chain `queue_local` built to the `changed` list.
+    fn splice_changed(&mut self, local: Option<u64>) {
+        let Some(first) = local else {
+            return;
+        };
+        let (mut prev, mut tail) = (None, first);
+        loop {
+            let s = self.sockets.get_mut(&tail).unwrap();
+            s.changed_prev = prev;
+            match s.changed_next {
+                Some(next) => (prev, tail) = (Some(tail), next),
+                None => break,
+            }
+        }
+        let old = self.changed.replace(first);
+        self.sockets.get_mut(&tail).unwrap().changed_next = old;
+        if let Some(old) = old {
+            self.sockets.get_mut(&old).unwrap().changed_prev = Some(tail);
+        }
+    }
+    // Every socket, after a change of policy all of them read.
+    fn touch_all(&mut self) {
+        let mut next = self.sockets.keys().next().copied();
+        while let Some(id) = next {
+            self.touch(id);
+            next = self.socket_after(id);
+        }
+    }
+    // The socket after `id` in id order: a pass that changes each socket
+    // in turn, without a list of them.
+    fn socket_after(&self, id: u64) -> Option<u64> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.sockets
+            .range((Excluded(id), Unbounded))
+            .next()
+            .map(|(&id, _)| id)
     }
     // The socket holding connection `cid`.
     fn connection_socket(&self, cid: ConnectionId) -> Option<u64> {
@@ -2136,6 +2278,7 @@ impl Owner {
         let old = std::mem::replace(&mut self.sockets.get_mut(&id).unwrap().handle, handle);
         self.hold(id, old, false);
         self.hold(id, handle, true);
+        self.touch(id);
     }
     fn alloc(&mut self, s: Socket) -> Result<i32> {
         if self.sockets.len() == self.socket_limit() || self.next_id > i32::MAX as u64 {
@@ -2148,6 +2291,7 @@ impl Owner {
         }
         self.hold(id, s.handle, true);
         self.sockets.insert(id, s);
+        self.touch(id);
         self.settle_timestamp_charge(id);
         Ok(id as i32)
     }
@@ -2415,7 +2559,7 @@ impl Owner {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
         // A held native owner cannot service its I/O yet, but querying it must
         // not block a poll/epoll scan of unrelated descriptors.
-        if self.egress.is_some() && self.command_held(id, &Op::Read(0)) {
+        if self.readiness_held(id) {
             return Ok(0);
         }
         let mut bits = 0;
@@ -2483,8 +2627,15 @@ impl Owner {
         }
         Ok(bits)
     }
+    fn readiness_held(&self, id: u64) -> bool {
+        self.egress.is_some() && self.command_held(id, &Op::Read(0))
+    }
     fn refresh_readiness(&mut self, id: u64) -> Result<i32> {
         let bits = self.readiness_bits(id)?;
+        // Releasing held output sends no event: look again next pass.
+        if self.readiness_held(id) {
+            self.touch(id);
+        }
         let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
         for (i, bit) in socket_options::EDGE_BITS.into_iter().enumerate() {
             if bits & !s.readiness & bit != 0 {
@@ -2542,7 +2693,15 @@ impl Owner {
         let _ = self.refresh_readiness(id);
         result
     }
+    // Operation `op` on socket `id`. Its effects may move the socket's
+    // readiness, and what it queued (output leaving, say) may move it
+    // again before the next pass: the socket is refreshed then.
     fn dispatch(&mut self, id: u64, op: Op) -> Result<Reply> {
+        let result = self.dispatch_op(id, op);
+        self.touch(id);
+        result
+    }
+    fn dispatch_op(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.prune_child_timeouts();
         let mut out = Reply::default();
         if matches!(op, Op::SetDestinationRoute(..)) {
@@ -3752,6 +3911,10 @@ impl Owner {
                             .map_err(engine)?;
                     }
                 }
+                // The queue links are the live socket's, not the copy's.
+                let live = &self.sockets[&id];
+                (candidate.queued, candidate.changed_prev, candidate.changed_next) =
+                    (live.queued, live.changed_prev, live.changed_next);
                 self.sockets.insert(id, candidate);
                 self.settle_timestamp_charge(id);
                 // Linux tcp_setsockopt calls sk_write_space even for a repeated

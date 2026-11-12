@@ -149,6 +149,12 @@ impl Egress {
     pub(super) fn has_held(&self) -> bool {
         self.tx.iter().any(|s| s.entry.is_some()) || !self.received.is_empty()
     }
+    // The connections whose output or input this holds, which hold their
+    // sockets' readiness: at most one per slot.
+    pub(super) fn held_owners(&self) -> impl Iterator<Item = ConnectionId> + '_ {
+        let tx = self.tx.iter().filter_map(|s| s.entry.as_ref()?.owner);
+        tx.chain(self.rx.iter().filter_map(|slot| slot.owner))
+    }
     pub(super) fn retained_rx(&self, id: ConnectionId) -> bool {
         self.rx.iter().any(|slot| slot.owner == Some(id))
     }

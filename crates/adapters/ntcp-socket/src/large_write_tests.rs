@@ -405,9 +405,9 @@ fn logical_option_change_preserves_deferred_completion_reservations() {
     let progress = a.endpoint.send_progress(cid).unwrap();
     let charge = a.timestamp_charge();
     let capacity = a.sockets[&client].completions.capacity();
-    // Readiness, queue and pending clones allocate first. Fail restoration of
-    // empty observations, then the joint queue, leaving the original untouched.
-    for after in [3, 4] {
+    // Queue and pending clones allocate first. Fail restoration of empty
+    // observations, then the joint queue, leaving the original untouched.
+    for after in [2, 3] {
         assert_eq!(
             timestamp_allocator::fail_after(after, || a
                 .execute(client, Op::Set(IPPROTO_TCP, TCP_INQ, 1)))

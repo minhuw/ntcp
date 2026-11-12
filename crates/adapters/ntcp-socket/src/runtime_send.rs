@@ -233,7 +233,8 @@ impl LogicalSend {
 }
 impl Owner {
     pub(super) fn collect_zero_copy(&mut self) {
-        for socket in self.sockets.values_mut() {
+        let mut changed = None;
+        for (&id, socket) in self.sockets.iter_mut() {
             let mut index = 0;
             let mut collected = false;
             while index < socket.zc_leases.len() {
@@ -259,8 +260,10 @@ impl Owner {
             }
             if collected {
                 socket.settle_timestamp_charge(&mut self.timestamp_total);
+                queue_local(socket, id, &mut changed);
             }
         }
+        self.splice_changed(changed);
     }
     // One bounded copy/admission per service turn. No foreign data survives a
     // turn except bytes already owned by TCP; the cursor advances only on write.
@@ -568,6 +571,7 @@ impl Owner {
             }
             s.settle_timestamp_charge(&mut self.timestamp_total);
         }
+        self.touch(id);
         self.collect_zero_copy();
         // A blocking implicit connect has only provisionally copied SYN data.
         // Its failure is not an ordinary post-handshake partial send success.
@@ -621,11 +625,13 @@ impl Owner {
                 send.batch_turns += 1;
             }
             let _ = self.refresh_readiness(request.id);
+            self.touch(request.id);
             request.send = Some(send);
             return false;
         }
         let result = self.finish_send(request.id, &mut send, result);
         let _ = self.refresh_readiness(request.id);
+        self.touch(request.id);
         let _ = request.reply.send(result);
         true
     }
