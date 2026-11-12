@@ -172,7 +172,13 @@ fn in_use<T: std::fmt::Debug>(result: Result<T>) -> bool {
     matches!(result, Err(Error::Tcp(EndpointError::AddressInUse)))
 }
 
-fn exhausted<T: std::fmt::Debug>(result: Result<T>) -> bool {
+// No ephemeral port is left to the destination (Linux's EADDRNOTAVAIL).
+fn ports_exhausted<T: std::fmt::Debug>(result: Result<T>) -> bool {
+    matches!(result, Err(Error::AddressNotAvailable))
+}
+
+// No connection or listener slot is free.
+fn slots_exhausted<T: std::fmt::Debug>(result: Result<T>) -> bool {
     matches!(result, Err(Error::Capacity))
 }
 
@@ -212,7 +218,7 @@ fn a_closed_connections_tuple_is_taken_until_its_time_wait_ends() {
     assert!(in_use(
         pair.client.connect_from(server_address, Some(40000))
     ));
-    assert!(exhausted(pair.client.connect(server_address)));
+    assert!(ports_exhausted(pair.client.connect(server_address)));
     let other = SocketAddr::new(address(2), PORT + 1);
     let second = pair.server.listen(PORT + 1, 8).unwrap();
     let elsewhere = pair.client.connect(other).unwrap();
@@ -233,12 +239,13 @@ fn a_closed_connections_tuple_is_taken_until_its_time_wait_ends() {
 // is reclaimed.
 #[test]
 fn an_ephemeral_range_runs_out_per_destination() {
-    let mut pair = Pair::new(40000..=40003, 50000..=50000);
+    // Two ports to each of two destinations hold four of the eight slots.
+    let mut pair = Pair::new(40000..=40001, 50000..=50000);
     let second = pair.server.listen(PORT + 1, 8).unwrap();
     let mut opened = Vec::new();
     for to in [PORT, PORT + 1] {
         let server_address = SocketAddr::new(address(2), to);
-        let mut ports: Vec<u16> = (0..4)
+        let mut ports: Vec<u16> = (0..2)
             .map(|_| {
                 let id = pair.client.connect(server_address).unwrap();
                 opened.push(id);
@@ -246,9 +253,9 @@ fn an_ephemeral_range_runs_out_per_destination() {
             })
             .collect();
         // Slots remain; this destination's ports do not.
-        assert!(exhausted(pair.client.connect(server_address)));
+        assert!(ports_exhausted(pair.client.connect(server_address)));
         ports.sort_unstable();
-        assert_eq!(ports, [40000, 40001, 40002, 40003]);
+        assert_eq!(ports, [40000, 40001]);
     }
     pair.steps(4);
     assert!(pair.server.accept(pair.listener).is_ok());
@@ -257,14 +264,40 @@ fn an_ephemeral_range_runs_out_per_destination() {
     let freed = local_port(&pair.client, opened[1]);
     pair.client.abort(opened[1]).unwrap();
     pair.steps(4);
-    assert!(exhausted(pair.client.connect(first)));
+    assert!(ports_exhausted(pair.client.connect(first)));
     pair.reclaim(opened[1]);
     let next = pair.client.connect(first).unwrap();
     assert_eq!(local_port(&pair.client, next), freed);
-    assert!(exhausted(pair.client.connect(first)));
-    assert!(exhausted(
+    assert!(ports_exhausted(pair.client.connect(first)));
+    assert!(ports_exhausted(
         pair.client.connect(SocketAddr::new(address(2), PORT + 1))
     ));
+}
+
+// A destination whose ephemeral ports are all taken refuses an open with
+// AddressNotAvailable while slots remain, as Linux's __inet_hash_connect
+// returns EADDRNOTAVAIL; a full table refuses one with Capacity while the
+// destination still has ports.
+#[test]
+fn port_exhaustion_and_a_full_table_are_told_apart() {
+    let (a, b) = (Queue::default(), Queue::default());
+    let mut client = built(1, &a, &b, [1; 32], |config| {
+        config.ephemeral_ports = 40000..=40003;
+        config.tcp.max_connections = 6;
+    });
+    let first = SocketAddr::new(address(2), PORT);
+    let second = SocketAddr::new(address(2), PORT + 1);
+    for _ in 0..4 {
+        client.connect(first).unwrap();
+    }
+    // Two slots remain; the first destination's ports do not.
+    assert!(ports_exhausted(client.connect(first)));
+    for _ in 0..2 {
+        client.connect(second).unwrap();
+    }
+    // The second destination has two ports left; no slot is.
+    assert!(slots_exhausted(client.connect(second)));
+    assert!(slots_exhausted(client.connect(first)));
 }
 
 // The bind conflict rules, as Linux's bind bucket keeps them. A port a
@@ -298,7 +331,7 @@ fn listeners_and_explicit_opens_take_their_ports() {
     for peer in [client_address, other_client, third_client] {
         let ephemeral = pair.server.connect(peer).unwrap();
         assert_eq!(local_port(&pair.server, ephemeral), PORT + 2);
-        assert!(exhausted(pair.server.connect(peer)));
+        assert!(ports_exhausted(pair.server.connect(peer)));
     }
     assert!(in_use(pair.server.connect_from(
         SocketAddr::new(address(1), 7003),
@@ -306,7 +339,7 @@ fn listeners_and_explicit_opens_take_their_ports() {
     )));
     pair.server.close_listener(pair.listener).unwrap();
     assert!(in_use(pair.server.connect_from(client_address, Some(PORT))));
-    assert!(exhausted(pair.server.connect(client_address)));
+    assert!(ports_exhausted(pair.server.connect(client_address)));
     pair.step();
     let reused = pair.server.connect(client_address).unwrap();
     assert_eq!(local_port(&pair.server, reused), PORT);
@@ -349,11 +382,11 @@ fn a_full_table_takes_again_only_the_slots_freed() {
         .map(|_| pair.client.connect(server_address).unwrap())
         .collect();
     // Ports remain; slots do not.
-    assert!(exhausted(pair.client.connect(server_address)));
+    assert!(slots_exhausted(pair.client.connect(server_address)));
     pair.steps(4);
     pair.client.abort(opened[3]).unwrap();
     pair.steps(4);
-    assert!(exhausted(pair.client.connect(server_address)));
+    assert!(slots_exhausted(pair.client.connect(server_address)));
     pair.reclaim(opened[3]);
     let next = pair.client.connect(server_address).unwrap();
     assert!(!opened.contains(&next));
@@ -361,12 +394,12 @@ fn a_full_table_takes_again_only_the_slots_freed() {
         pair.client.connection_info(opened[3]),
         Err(Error::InvalidHandle)
     ));
-    assert!(exhausted(pair.client.connect(server_address)));
+    assert!(slots_exhausted(pair.client.connect(server_address)));
 
     let second = pair.server.listen(PORT + 1, 8).unwrap();
-    assert!(exhausted(pair.server.listen(PORT + 2, 8)));
+    assert!(slots_exhausted(pair.server.listen(PORT + 2, 8)));
     pair.server.close_listener(second).unwrap();
-    assert!(exhausted(pair.server.listen(PORT + 2, 8)));
+    assert!(slots_exhausted(pair.server.listen(PORT + 2, 8)));
     pair.step();
     let third = pair.server.listen(PORT + 2, 8).unwrap();
     assert_ne!(third, second);
@@ -375,7 +408,7 @@ fn a_full_table_takes_again_only_the_slots_freed() {
         Err(Error::InvalidHandle)
     ));
     assert!(pair.server.acceptable(third).is_ok());
-    assert!(exhausted(pair.server.listen(PORT + 3, 8)));
+    assert!(slots_exhausted(pair.server.listen(PORT + 3, 8)));
 }
 
 // A server that closes first frees each connection's slot once TIME-WAIT

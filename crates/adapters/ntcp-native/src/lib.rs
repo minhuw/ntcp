@@ -1106,7 +1106,8 @@ impl<P: PacketIo> Network<P> {
     // made, fastreuse >= 0). A TIME-WAIT record of the tuple is not
     // reused: Linux reuses one only with tcp_tw_reuse, by default for
     // loopback alone, and these are no loopback opens. Ports run out per
-    // destination, not for the network.
+    // destination, not for the network, and then the open fails with
+    // AddressNotAvailable, as Linux's with EADDRNOTAVAIL.
     fn allocate_port(&mut self, peer: SocketAddr) -> Result<u16> {
         self.check_port(*self.config.ephemeral_ports.start());
         let (local, link) = (self.config.local_address, self.ingress.link());
@@ -1149,7 +1150,7 @@ impl<P: PacketIo> Network<P> {
                 })
                 .map(|index| tagged[index])
         };
-        selected.ok_or(Error::Capacity)
+        selected.ok_or(Error::AddressNotAvailable)
     }
     pub fn connect(&mut self, peer: SocketAddr) -> Result<ConnId> {
         self.connect_from(peer, None)

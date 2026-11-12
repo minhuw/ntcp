@@ -1700,7 +1700,7 @@ fn active_opens_take_their_members_tagged_ports_until_they_run_out() {
             clients.push((k, Client::new(connection, data)));
         }
         assert!(
-            matches!(lan.network(k).connect(to), Err(Error::Capacity)),
+            matches!(lan.network(k).connect(to), Err(Error::AddressNotAvailable)),
             "member {k}"
         );
     }

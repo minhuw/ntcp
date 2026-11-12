@@ -34,9 +34,12 @@ pub enum BlockReason {
 pub enum Error {
     InvalidConfig(&'static str),
     InvalidHandle,
-    // No connection slot, listener slot or ephemeral port is free, or a
-    // table of fixed size is full.
+    // No connection or listener slot is free, or a table of fixed size is
+    // full.
     Capacity,
+    // An open given no local port found no ephemeral port it may take to
+    // this destination: Linux's EADDRNOTAVAIL (__inet_hash_connect).
+    AddressNotAvailable,
     // The buffer budget (`tcp.max_buffer_bytes`) or the allocator refused
     // memory: an open whose buffers do not fit, or growth of a connection's
     // buffers. Linux's ENOMEM.
@@ -61,6 +64,9 @@ impl fmt::Display for Error {
             Self::InvalidConfig(s) => write!(f, "invalid native network configuration: {s}"),
             Self::InvalidHandle => f.write_str("handle belongs to another instance or generation"),
             Self::Capacity => f.write_str("native network capacity exhausted"),
+            Self::AddressNotAvailable => {
+                f.write_str("no ephemeral port is left for this destination")
+            }
             Self::NoMemory => f.write_str("native network buffer memory exhausted"),
             Self::TimeWentBackwards => f.write_str("network time went backwards"),
             Self::WouldBlock(reason) => write!(f, "operation would block: {reason:?}"),
@@ -284,9 +290,10 @@ pub struct Counters {
     // and SYNs refused for want of a connection slot or buffer budget,
     // whose connection could not be allocated or that had no path to answer
     // on: Linux's ListenDrops (`Endpoint::listen_drops`). Each such packet
-    // is also in discarded. An active open refused for want of a slot or an
-    // ephemeral port fails with Error::Capacity instead, and one whose
-    // buffers the budget or the allocator refused with Error::NoMemory.
+    // is also in discarded. An active open refused for want of a slot fails
+    // with Error::Capacity instead, one for want of an ephemeral port with
+    // Error::AddressNotAvailable, and one whose buffers the budget or the
+    // allocator refused with Error::NoMemory.
     pub listen_drops: u64,
     // Connections in TIME-WAIT now, released or not: Linux's sockstat `tw`
     // (`Endpoint::time_wait_connections`).

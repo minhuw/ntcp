@@ -442,7 +442,10 @@ fn active_opens_avoid_every_members_listening_ports() {
     let second = opening.network.connect(to).unwrap();
     assert_eq!(local(&opening, second), owned[0]);
     // The range's other ports are the listening member's flows.
-    assert!(matches!(opening.network.connect(to), Err(Error::Capacity)));
+    assert!(matches!(
+        opening.network.connect(to),
+        Err(Error::AddressNotAvailable)
+    ));
     // A member number joins once.
     let port = Port {
         incoming: Queue::default(),
@@ -502,7 +505,7 @@ fn a_members_ports_are_shared_across_destinations_within_its_flows() {
         loop {
             match opening.network.connect(SocketAddr::V4(remote)) {
                 Ok(id) => taken.push(opening.network.connection_info(id).unwrap().local.port()),
-                Err(Error::Capacity) => break,
+                Err(Error::AddressNotAvailable) => break,
                 Err(e) => panic!("{e:?}"),
             }
         }
