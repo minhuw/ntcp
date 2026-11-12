@@ -608,6 +608,186 @@ unsafe fn zeroed_vec<T>(len: usize) -> Result<Vec<T>, ()> {
     Ok(unsafe { Vec::from_raw_parts(pointer.cast(), len, len) })
 }
 
+// The presence bits of the 32 slots of one metadata word.
+const PRESENT_BITS: u64 = 0x5555_5555_5555_5555;
+
+// One bit per chunk of 32 receive slots (one metadata word), summarized
+// upwards 64 bits per word, so that the next or previous chunk of interest
+// is found in one step per level whatever the distance, as Linux finds the
+// out-of-order queue's next skb in its rbtree rather than by walking the
+// window. A chunk bit is stored as `interest ^ flip`: a summary of chunks
+// holding a byte keeps flip 0, one of chunks missing a byte keeps it set,
+// so that zeroed storage is the empty ring's state for both. A word's bit at
+// the next level up is set exactly when the word has an interesting bit.
+#[derive(Debug)]
+struct ChunkSummary {
+    // Level k occupies words[levels[k]..levels[k + 1]]; level 0 holds the
+    // chunk bits and the last level a single word, kept in `top` rather
+    // than allocated, so a ring of up to 64 chunks allocates nothing here.
+    words: Vec<u64>,
+    top: u64,
+    levels: [usize; 8],
+    depth: usize,
+    flip: u64,
+}
+
+impl ChunkSummary {
+    // The heap bytes `new(chunks, _)` allocates: every word but the top.
+    fn allocation_bytes(chunks: usize) -> usize {
+        let (mut len, mut total) = (chunks.div_ceil(64).max(1), 0);
+        loop {
+            total += len;
+            if len == 1 {
+                break;
+            }
+            len = len.div_ceil(64);
+        }
+        (total - 1) * core::mem::size_of::<u64>()
+    }
+
+    fn new(chunks: usize, flip: bool) -> Result<Self, ()> {
+        let mut levels = [0; 8];
+        let (mut depth, mut len, mut total) = (0, chunks.div_ceil(64).max(1), 0);
+        loop {
+            levels[depth] = total;
+            total += len;
+            depth += 1;
+            if len == 1 {
+                break;
+            }
+            len = len.div_ceil(64);
+        }
+        levels[depth] = total;
+        Ok(Self {
+            // SAFETY: zero is a valid u64.
+            words: unsafe { zeroed_vec(total - 1)? },
+            top: 0,
+            levels,
+            depth,
+            flip: if flip { !0 } else { 0 },
+        })
+    }
+
+    fn storage_bytes(&self) -> usize {
+        self.words.capacity() * core::mem::size_of::<u64>()
+    }
+
+    fn clear(&mut self) {
+        self.words.fill(0);
+        self.top = 0;
+    }
+
+    // Word `at` of the levels as stored, the last one being `top`.
+    fn raw(&self, at: usize) -> u64 {
+        *self.words.get(at).unwrap_or(&self.top)
+    }
+
+    fn set_raw(&mut self, at: usize, value: u64) {
+        *self.words.get_mut(at).unwrap_or(&mut self.top) = value;
+    }
+
+    // The interesting bits of word `word` of level `level`, or none past the
+    // level's end (a summary bit of a word that does not exist).
+    fn interest(&self, level: usize, word: usize) -> u64 {
+        let at = self.levels[level] + word;
+        if at < self.levels[level + 1] {
+            self.raw(at) ^ self.flip
+        } else {
+            0
+        }
+    }
+
+    fn mark(&mut self, chunk: usize, interesting: bool) {
+        self.mark_level(0, chunk, interesting);
+    }
+
+    // `mark` for every chunk of `chunks`, a word at a time.
+    fn mark_run(&mut self, chunks: core::ops::Range<usize>, interesting: bool) {
+        let mut chunk = chunks.start;
+        while chunk < chunks.end {
+            let word = chunk / 64;
+            let end = chunks.end.min((word + 1) * 64);
+            let bits = (!0 >> (64 - (end - chunk))) << (chunk % 64);
+            let at = self.levels[0] + word;
+            let old = self.raw(at) ^ self.flip;
+            let new = if interesting { old | bits } else { old & !bits };
+            self.set_raw(at, new ^ self.flip);
+            if (old != 0) != (new != 0) {
+                self.mark_level(1, word, new != 0);
+            }
+            chunk = end;
+        }
+    }
+
+    // Sets bit `index` of level `level` and the summary bits above it.
+    fn mark_level(&mut self, level: usize, mut index: usize, mut interesting: bool) {
+        for level in level..self.depth {
+            let at = self.levels[level] + index / 64;
+            let bit = 1 << (index % 64);
+            let old = self.raw(at) ^ self.flip;
+            let new = if interesting { old | bit } else { old & !bit };
+            if new == old {
+                return;
+            }
+            self.set_raw(at, new ^ self.flip);
+            if (old != 0) == (new != 0) {
+                return;
+            }
+            interesting = new != 0;
+            index /= 64;
+        }
+    }
+
+    // The first interesting chunk at or after `chunk`. A chunk past the end
+    // of the ring may be returned; callers bound the result.
+    fn next(&self, chunk: usize) -> Option<usize> {
+        let (mut level, mut index) = (0, chunk);
+        loop {
+            let bits = self.interest(level, index / 64) & (!0 << (index % 64));
+            if bits != 0 {
+                index = index / 64 * 64 + bits.trailing_zeros() as usize;
+                break;
+            }
+            if level + 1 == self.depth {
+                return None;
+            }
+            level += 1;
+            index = index / 64 + 1;
+        }
+        while level > 0 {
+            level -= 1;
+            let bits = self.interest(level, index);
+            if bits == 0 {
+                return None;
+            }
+            index = index * 64 + bits.trailing_zeros() as usize;
+        }
+        Some(index)
+    }
+
+    // The last interesting chunk at or before `chunk`, a chunk of the ring.
+    fn previous(&self, chunk: usize) -> Option<usize> {
+        let (mut level, mut index) = (0, chunk);
+        loop {
+            let bits = self.interest(level, index / 64) & (!0 >> (63 - index % 64));
+            if bits != 0 {
+                index = index / 64 * 64 + 63 - bits.leading_zeros() as usize;
+                break;
+            }
+            if index < 64 || level + 1 == self.depth {
+                return None;
+            }
+            level += 1;
+            index = index / 64 - 1;
+        }
+        while level > 0 {
+            level -= 1;
+            index = index * 64 + 63 - self.interest(level, index).leading_zeros() as usize;
+        }
+        Some(index)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
     // A set presence bit implies the payload byte in that slot was initialized.
@@ -617,6 +797,9 @@ pub(crate) struct ReceiveBuffer {
     data: Vec<MaybeUninit<u8>>,
     pushed: bool,
     metadata: Vec<u8>,
+    // Chunks of `metadata` holding a present slot, and chunks missing one.
+    holding: ChunkSummary,
+    missing: ChunkSummary,
     read_base: Seq,
     head: usize,
     contiguous_len: usize,
@@ -657,10 +840,13 @@ impl ReceiveBuffer {
         // Zeroed bytes clear every bit. SAFETY: zero is a valid u8.
         let metadata = unsafe { zeroed_vec(capacity.div_ceil(4))? };
         let report_pending = unsafe { zeroed_vec(capacity.div_ceil(8))? };
+        let chunks = capacity.div_ceil(32);
         Ok(Self {
             data,
             pushed: false,
             metadata,
+            holding: ChunkSummary::new(chunks, false)?,
+            missing: ChunkSummary::new(chunks, true)?,
             read_base: start,
             head: 0,
             contiguous_len: 0,
@@ -696,6 +882,7 @@ impl ReceiveBuffer {
             let index = self.index(offset);
             self.set_present(index, true);
         }
+        self.summarize_logical(0, count);
         self.occupied = count;
         self.contiguous_len = count;
         self.pushed = push && count != 0;
@@ -707,16 +894,21 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.data.capacity() + self.metadata.capacity() + self.report_pending.capacity()
+        self.data.capacity()
+            + self.metadata.capacity()
+            + self.report_pending.capacity()
+            + self.holding.storage_bytes()
+            + self.missing.storage_bytes()
     }
 
     // What `new(_, capacity)` allocates: storage_bytes of the ring it
     // returns, 1.375 bytes a slot (payload, 2-bit presence/PUSH, 1-bit
-    // pending report).
+    // pending report) and the two chunk summaries, 1/128 byte a slot.
     pub(crate) fn allocation_bytes(capacity: usize) -> Option<usize> {
         capacity
             .checked_add(capacity.div_ceil(4))?
-            .checked_add(capacity.div_ceil(8))
+            .checked_add(capacity.div_ceil(8))?
+            .checked_add(2 * ChunkSummary::allocation_bytes(capacity.div_ceil(32)))
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -736,9 +928,12 @@ impl ReceiveBuffer {
                 result.report_pending[offset / 8] |= 1 << (offset % 8);
             }
         }
+        result.summarize(0..self.data.len());
         Ok(Self {
             data: result.data,
             metadata: result.metadata,
+            holding: result.holding,
+            missing: result.missing,
             report_pending: result.report_pending,
             head: 0,
             ..*self
@@ -778,14 +973,20 @@ impl ReceiveBuffer {
         self.report_pending
             .try_reserve_exact(pending_len - self.report_pending.len())
             .map_err(|_| ())?;
+        // The summaries are rebuilt for the new chunks once the slots moved.
+        let holding = ChunkSummary::new(new.div_ceil(32), false)?;
+        let missing = ChunkSummary::new(new.div_ceil(32), true)?;
         // MaybeUninit elements need no initialization, and capacity was reserved.
         unsafe { self.data.set_len(new) };
         // Slots past the old end are empty: their bits in a shared last byte
         // were never set.
         self.metadata.resize(metadata_len, 0);
         self.report_pending.resize(pending_len, 0);
+        self.holding = holding;
+        self.missing = missing;
         let (head, added) = (self.head, new - old);
         if head == 0 {
+            self.summarize(0..old);
             return Ok(());
         }
         let (from, to, count) = if head <= added && head <= old - head {
@@ -798,11 +999,17 @@ impl ReceiveBuffer {
         self.data.copy_within(from..from + count, to);
         move_fields(&mut self.metadata, 2, from, to, count);
         move_fields(&mut self.report_pending, 1, from, to, count);
+        // The slots of the old ring, wherever they are now.
+        for range in self.ranges(0, old) {
+            self.summarize(range);
+        }
         Ok(())
     }
 
     pub(crate) fn clear(&mut self) {
         self.metadata.fill(0);
+        self.holding.clear();
+        self.missing.clear();
         self.pushed = false;
         self.read_base = Seq(0);
         self.head = 0;
@@ -1176,24 +1383,16 @@ impl ReceiveBuffer {
         {
             return None;
         }
-        // Scan packed presence words backwards as well as forwards. Ring edges
-        // and the unaligned ends use single-slot checks; PUSH bits are ignored.
-        let mut left = offset;
-        while left > self.contiguous_len {
-            let index = self.index(left - 1);
-            if index % 32 == 31 && left - self.contiguous_len >= 32 {
-                let byte = index / 4 - 7;
-                let word = u64::from_le_bytes(self.metadata[byte..byte + 8].try_into().unwrap())
-                    & 0x5555_5555_5555_5555;
-                if word == 0x5555_5555_5555_5555 {
-                    left -= 32;
-                    continue;
-                }
-            }
-            if !self.is_present(index) {
+        // The block reaches back to just past the last missing slot, or to the
+        // contiguous prefix; both edges are found through the chunk summaries.
+        let mut left = self.contiguous_len;
+        let mut end = offset;
+        for range in self.ranges(left, offset - left).into_iter().rev() {
+            end -= range.len();
+            if let Some(index) = self.find_slot_back(range.clone(), false) {
+                left = end + index - range.start + 1;
                 break;
             }
-            left -= 1;
         }
         let right = self.find_presence(offset, false);
         Some((
@@ -1202,13 +1401,13 @@ impl ReceiveBuffer {
         ))
     }
 
-    // Bounded by the byte window; skips 32 slots per packed word, without
-    // crossing the physical ring edge or reading beyond the metadata allocation.
-    fn find_presence(&self, mut offset: usize, present: bool) -> usize {
+    // The first offset from `offset` whose slot's presence is `present`, or
+    // the capacity. The chunk summaries skip every chunk without such a slot,
+    // so the cost does not grow with the distance.
+    fn find_presence(&self, offset: usize, present: bool) -> usize {
         let capacity = self.data.len();
         // The contiguous prefix accounts for every retained byte on the common
-        // in-order path; searching the unused receive window would add O(capacity)
-        // work to every outgoing SACK-capable packet.
+        // in-order path.
         if present && self.occupied == self.contiguous_len {
             return if offset < self.contiguous_len {
                 offset
@@ -1216,24 +1415,124 @@ impl ReceiveBuffer {
                 capacity
             };
         }
-        while offset < capacity {
-            let index = self.index(offset);
-            if index.is_multiple_of(32) && index + 32 <= capacity && offset + 32 <= capacity {
-                let byte = index / 4;
-                let word = u64::from_le_bytes(self.metadata[byte..byte + 8].try_into().unwrap());
-                let matching = (if present { word } else { !word }) & 0x5555_5555_5555_5555;
-                if matching == 0 {
-                    offset += 32;
-                    continue;
-                }
-                return offset + matching.trailing_zeros() as usize / 2;
+        if offset >= capacity {
+            return capacity;
+        }
+        let mut at = offset;
+        for range in self.ranges(offset, capacity - offset) {
+            if let Some(index) = self.find_slot(range.clone(), present) {
+                return at + index - range.start;
             }
-            if self.is_present(index) == present {
-                return offset;
-            }
-            offset += 1;
+            at += range.len();
         }
         capacity
+    }
+
+    // The presence bits of chunk `chunk` (its metadata word, PUSH bits
+    // masked), and the presence bits of its slots within the ring.
+    fn chunk_presence(&self, chunk: usize) -> (u64, u64) {
+        let byte = chunk * 8;
+        let word = match self.metadata.get(byte..byte + 8) {
+            Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap()),
+            None => {
+                let mut raw = [0; 8];
+                let tail = &self.metadata[byte..];
+                raw[..tail.len()].copy_from_slice(tail);
+                u64::from_le_bytes(raw)
+            }
+        };
+        let slots = (self.data.len() - chunk * 32).min(32);
+        let valid = PRESENT_BITS >> (64 - 2 * slots);
+        (word & valid, valid)
+    }
+
+    // The presence bits of chunk `chunk` whose presence is `present`.
+    fn chunk_matching(&self, chunk: usize, present: bool) -> u64 {
+        let (word, valid) = self.chunk_presence(chunk);
+        if present { word } else { valid & !word }
+    }
+
+    fn summary(&self, present: bool) -> &ChunkSummary {
+        if present {
+            &self.holding
+        } else {
+            &self.missing
+        }
+    }
+
+    // The first slot of physical `range` whose presence is `present`.
+    fn find_slot(&self, range: core::ops::Range<usize>, present: bool) -> Option<usize> {
+        if range.is_empty() {
+            return None;
+        }
+        let mut chunk = range.start / 32;
+        let mut bits = self.chunk_matching(chunk, present) & (!0 << (2 * (range.start % 32)));
+        while bits == 0 {
+            chunk = self.summary(present).next(chunk + 1)?;
+            if chunk * 32 >= range.end {
+                return None;
+            }
+            bits = self.chunk_matching(chunk, present);
+        }
+        let index = chunk * 32 + bits.trailing_zeros() as usize / 2;
+        (index < range.end).then_some(index)
+    }
+
+    // The last slot of physical `range` whose presence is `present`.
+    fn find_slot_back(&self, range: core::ops::Range<usize>, present: bool) -> Option<usize> {
+        if range.is_empty() {
+            return None;
+        }
+        let last = range.end - 1;
+        let mut chunk = last / 32;
+        let mut bits = self.chunk_matching(chunk, present) & (!0 >> (63 - 2 * (last % 32)));
+        while bits == 0 {
+            if chunk == 0 {
+                return None;
+            }
+            chunk = self.summary(present).previous(chunk - 1)?;
+            if (chunk + 1) * 32 <= range.start {
+                return None;
+            }
+            bits = self.chunk_matching(chunk, present);
+        }
+        let index = chunk * 32 + (63 - bits.leading_zeros() as usize) / 2;
+        (index >= range.start).then_some(index)
+    }
+
+    // Brings the chunk summaries up to date with the presence bits of the
+    // chunks of physical `range`.
+    fn summarize(&mut self, range: core::ops::Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        for chunk in range.start / 32..=(range.end - 1) / 32 {
+            let (word, valid) = self.chunk_presence(chunk);
+            self.holding.mark(chunk, word != 0);
+            self.missing.mark(chunk, word != valid);
+        }
+    }
+
+    // `summarize` for physical `range` after every slot of it became present
+    // or absent: only its two end chunks can hold slots outside it.
+    fn summarize_filled(&mut self, range: core::ops::Range<usize>, present: bool) {
+        if range.is_empty() {
+            return;
+        }
+        let (first, last) = (range.start / 32, (range.end - 1) / 32);
+        self.summarize(range.start..range.start + 1);
+        if last > first + 1 {
+            self.holding.mark_run(first + 1..last, present);
+            self.missing.mark_run(first + 1..last, !present);
+        }
+        self.summarize(range.end - 1..range.end);
+    }
+
+    // `summarize` for the slots of `len` bytes from `offset`.
+    fn summarize_logical(&mut self, offset: usize, len: usize) {
+        for range in self.ranges(offset, len) {
+            self.summarize(range);
+        }
     }
 
     fn index(&self, offset: usize) -> usize {
@@ -1286,6 +1585,28 @@ impl ReceiveBuffer {
         for index in index..range.end {
             self.set_present(index, present);
         }
+    }
+
+    // Clears the PUSH marks of every slot of `range`; whether there was one.
+    fn take_push_range(&mut self, range: core::ops::Range<usize>) -> bool {
+        let mut any = false;
+        let mut index = range.start;
+        while index < range.end && !index.is_multiple_of(4) {
+            any |= self.is_push(index);
+            self.set_push(index, false);
+            index += 1;
+        }
+        let whole = (range.end - index) / 4 * 4;
+        for metadata in &mut self.metadata[index / 4..(index + whole) / 4] {
+            any |= *metadata & 0xaa != 0;
+            *metadata &= 0x55;
+        }
+        index += whole;
+        for index in index..range.end {
+            any |= self.is_push(index);
+            self.set_push(index, false);
+        }
+        any
     }
 
     // Whether every slot of `range` holds a byte.
@@ -1353,6 +1674,7 @@ impl ReceiveBuffer {
             }
             copied += len;
             self.set_present_range(range.clone(), false);
+            self.summarize_filled(range.clone(), false);
             self.clear_pending_range(range);
         }
         self.occupied -= count;
@@ -1438,7 +1760,8 @@ impl ReceiveBuffer {
                     );
                 }
                 copied += len;
-                self.set_present_range(range, true);
+                self.set_present_range(range.clone(), true);
+                self.summarize_filled(range, true);
             }
             let end = start + payload.len();
             accepted(start, end);
@@ -1459,6 +1782,8 @@ impl ReceiveBuffer {
         }
         let mut new_anchor = None;
         let mut run = None;
+        // Offsets of the first and past the last byte that became present.
+        let mut stored: Option<(usize, usize)> = None;
         for (offset, &byte) in payload.iter().enumerate() {
             let position = sequence.wrapping_add(offset as u32);
             let distance = position.distance_from(self.read_base) as usize;
@@ -1480,12 +1805,18 @@ impl ReceiveBuffer {
                 new_anchor.get_or_insert(position);
                 let entry = run.get_or_insert((distance, distance));
                 entry.1 = distance + 1;
+                let entry = stored.get_or_insert((distance, distance));
+                entry.0 = entry.0.min(distance);
+                entry.1 = entry.1.max(distance + 1);
             } else if let Some((start, end)) = run.take() {
                 accepted(start, end);
             }
         }
         if let Some((start, end)) = run {
             accepted(start, end);
+        }
+        if let Some((start, end)) = stored {
+            self.summarize_logical(start, end - start);
         }
 
         if let Some(anchor) = new_anchor
@@ -1531,12 +1862,13 @@ impl ReceiveBuffer {
                 self.fin_sequence = Some(end);
             }
         }
-        while self.contiguous_len < capacity && self.is_present(self.index(self.contiguous_len)) {
-            let index = self.index(self.contiguous_len);
-            self.pushed |= self.is_push(index);
-            self.set_push(index, false);
-            self.contiguous_len += 1;
+        // The prefix extends over the retained bytes up to the next missing
+        // slot, taking their PUSH marks.
+        let end = self.find_presence(self.contiguous_len, false);
+        for range in self.ranges(self.contiguous_len, end - self.contiguous_len) {
+            self.pushed |= self.take_push_range(range);
         }
+        self.contiguous_len = end;
         // This buffer consumes FIN once after preceding data; SYN processing is in the
         // connection.
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
@@ -1801,6 +2133,144 @@ mod tests {
         }
         assert_eq!(recv.occupied, occupied_data(recv).iter().flatten().count());
         assert_eq!(recv.has_sack_blocks(), recv.sack_blocks(1)[0].is_some());
+        assert_summaries(recv);
+    }
+
+    // The chunk summaries agree with the presence bits at every level, and
+    // the searches built on them with a pass over the slots.
+    fn assert_summaries(recv: &ReceiveBuffer) {
+        let chunks = recv.capacity().div_ceil(32);
+        for (summary, missing) in [(&recv.holding, false), (&recv.missing, true)] {
+            for chunk in 0..chunks {
+                let (word, valid) = recv.chunk_presence(chunk);
+                let interesting = if missing { word != valid } else { word != 0 };
+                let bit = summary.interest(0, chunk / 64) >> (chunk % 64) & 1;
+                assert_eq!(bit == 1, interesting, "{missing} {chunk}");
+            }
+            for level in 1..summary.depth {
+                for word in 0..summary.levels[level] - summary.levels[level - 1] {
+                    let bit = summary.interest(level, word / 64) >> (word % 64) & 1;
+                    assert_eq!(bit == 1, summary.interest(level - 1, word) != 0);
+                }
+            }
+        }
+        // The first present and the first missing slot from each offset.
+        let capacity = recv.capacity();
+        let mut first = alloc::vec![[capacity; 2]; capacity + 1];
+        for offset in (0..capacity).rev() {
+            first[offset] = first[offset + 1];
+            first[offset][usize::from(recv.is_present(recv.index(offset)))] = offset;
+        }
+        let mut offset = recv.contiguous_len;
+        while offset < capacity {
+            assert_eq!(
+                recv.find_presence(offset, false),
+                first[offset][0],
+                "{offset}"
+            );
+            assert_eq!(
+                recv.find_presence(offset, true),
+                first[offset][1],
+                "{offset}"
+            );
+            offset += 1 + offset % 97;
+        }
+    }
+
+    #[test]
+    fn receive_storage_stays_within_three_bytes_per_slot() {
+        // allocation_bytes is what a ring of each capacity holds, chunk
+        // summaries included, and stays within 3 bytes a slot.
+        for capacity in (1..300).chain([2047, 2048, 2049, 65_536, 1 << 20, 3 << 20]) {
+            let recv = ReceiveBuffer::new(Seq(0), capacity).unwrap();
+            assert!(recv.storage_bytes() <= 3 * capacity, "{capacity}");
+            assert_eq!(
+                Some(recv.storage_bytes()),
+                ReceiveBuffer::allocation_bytes(capacity),
+                "{capacity}"
+            );
+        }
+        let recv = ReceiveBuffer::new(Seq(0), 2048).unwrap();
+        assert_eq!(
+            recv.holding.storage_bytes() + recv.missing.storage_bytes(),
+            0
+        );
+    }
+
+    #[test]
+    fn chunk_summaries_match_a_bitset_over_four_levels() {
+        let mut state = 0x2f6b_95a1_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        // 300,000 chunks: 4,688 words, then 74, 2 and 1.
+        let chunks = 300_000;
+        for flip in [false, true] {
+            let mut summary = ChunkSummary::new(chunks, flip).unwrap();
+            assert_eq!(summary.depth, 4);
+            let mut model = alloc::vec![flip; chunks];
+            for _ in 0..3000 {
+                // Runs, so that whole words and levels empty and fill.
+                let (at, len, set) = (next(chunks), 1 + next(5000), next(2) == 0);
+                let run = at..(at + len).min(chunks);
+                if next(2) == 0 {
+                    summary.mark_run(run.clone(), set);
+                } else {
+                    run.clone().for_each(|chunk| summary.mark(chunk, set));
+                }
+                model[run].fill(set);
+                let chunk = next(chunks);
+                let after = (chunk..chunks).find(|&c| model[c]);
+                assert_eq!(summary.next(chunk).filter(|&c| c < chunks), after);
+                let before = (0..=chunk).rev().find(|&c| model[c]);
+                assert_eq!(summary.previous(chunk), before);
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_summaries_find_blocks_across_levels_wrap_and_growth() {
+        let mut state = 0x6c07_8965_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        // 140,000 slots, 4,375 chunks, summarized in three levels.
+        let start = Seq(u32::MAX - 70_000);
+        let mut recv = ReceiveBuffer::new(start, 140_000).unwrap();
+        assert_eq!(recv.holding.depth, 3);
+        let (mut wrapped, mut grown) = (0, 0);
+        for step in 0..300 {
+            match next(10) {
+                0..=5 => {
+                    // A third fill the hole at the frontier.
+                    let frontier = next(3) == 0;
+                    let offset = recv.contiguous_len + next(if frontier { 1 } else { 140_000 });
+                    let long = next(4) == 0;
+                    let len = 1 + next(if long { 40_000 } else { 3000 });
+                    let sequence = recv.read_base.wrapping_add(offset as u32);
+                    recv.insert(sequence, &alloc::vec![step as u8; len], false);
+                }
+                6..=8 => {
+                    let mut out = alloc::vec![0; next(recv.capacity() + 1)];
+                    recv.read(&mut out);
+                }
+                _ if recv.capacity() < 300_000 => {
+                    let capacity = recv.capacity() + 1 + next(60_000);
+                    recv.grow(capacity).unwrap();
+                    grown += 1;
+                }
+                _ => {}
+            }
+            wrapped += usize::from(recv.head != 0 && recv.occupied > recv.contiguous_len);
+            assert_ranges(&recv);
+        }
+        assert!(wrapped > 20 && grown >= 4, "{wrapped} {grown}");
     }
 
     #[test]
@@ -3037,6 +3507,7 @@ mod tests {
         let storage = recv.storage_bytes();
         // Each attempt fails at the payload, the presence bitmap or the
         // report bitmap, the later ones after earlier reservations held.
+        // The chunk summaries of so small a ring allocate nothing.
         for allocation in [0, 1, 1, 0] {
             assert_eq!(fail_after(allocation, || recv.grow(100)), Err(()));
             assert_eq!(logical(&recv), before);
