@@ -53,6 +53,11 @@ pub(crate) struct SendBuffer {
     head: u64,
     shared: VecDeque<SharedSpan>,
     shared_output: Option<usize>,
+    // Stream position of the last queued byte carrying PUSH, or u64::MAX for
+    // none (no stream reaches that position), so that asking whether the
+    // rest of the queue holds one needs no pass over it, as Linux keeps PSH
+    // on the skb.
+    last_push: u64,
 }
 
 impl SendBuffer {
@@ -70,6 +75,7 @@ impl SendBuffer {
             head: 0,
             shared: VecDeque::new(),
             shared_output: None,
+            last_push: u64::MAX,
         })
     }
 
@@ -84,6 +90,7 @@ impl SendBuffer {
             head: 0,
             shared: VecDeque::new(),
             shared_output: None,
+            last_push: u64::MAX,
         }
     }
 
@@ -190,10 +197,46 @@ impl SendBuffer {
     pub(crate) fn mark_push(&mut self) {
         if let Some(last) = self.marks.back_mut() {
             *last |= 1;
+            self.last_push = self.head.wrapping_add(self.marks.len() as u64 - 1);
         }
     }
 
+    // Offset of the last queued byte carrying PUSH.
+    fn push_offset(&self) -> Option<usize> {
+        Some(self.last_push)
+            .filter(|&position| position != u64::MAX)
+            .map(|position| position.wrapping_sub(self.head) as usize)
+            .filter(|&offset| offset < self.marks.len())
+    }
+
+    // Records a PUSH mark at `offset`, where none is past the last one.
+    fn note_push(&mut self, offset: usize) {
+        if self.push_offset().is_none_or(|last| last < offset) {
+            self.last_push = self.head.wrapping_add(offset as u64);
+        }
+    }
+
+    // Finds the last PUSH mark again after marks at or past it went away.
+    fn find_last_push(&mut self) {
+        self.last_push = self
+            .marks
+            .iter()
+            .rposition(|mark| mark & 1 != 0)
+            .map_or(u64::MAX, |offset| self.head.wrapping_add(offset as u64));
+    }
+
+    // Whether a byte of the range carries PUSH. Only a range ending past the
+    // last mark is folded, and then only its own bytes.
     pub(crate) fn pushed(&self, offset: usize, count: usize) -> bool {
+        let Some(last) = self.push_offset() else {
+            return false;
+        };
+        if last < offset {
+            return false;
+        }
+        if last - offset < count {
+            return true;
+        }
         let [front, back] = self.mark_slices(offset, count);
         front.iter().chain(back).fold(0, |any, mark| any | mark) & 1 != 0
     }
@@ -204,14 +247,24 @@ impl SendBuffer {
                 *mark &= !1;
             }
         }
-        if let Some(last) = self.marks.get_mut(offset + count - 1) {
+        let cleared = self
+            .push_offset()
+            .is_some_and(|last| last >= offset && last - offset < count);
+        let end = offset + count - 1;
+        if let Some(last) = self.marks.get_mut(end) {
             *last |= 1;
+            self.note_push(end);
+        } else if cleared {
+            self.find_last_push();
         }
     }
 
     pub(crate) fn finish_send(&mut self, offset: usize, push: bool, end_of_record: bool) {
         if let Some(mark) = self.marks.get_mut(offset) {
             *mark |= u8::from(push) | (u8::from(end_of_record) << 1);
+            if push {
+                self.note_push(offset);
+            }
         }
     }
 
@@ -367,6 +420,11 @@ impl SendBuffer {
     pub(crate) fn truncate(&mut self, len: usize) {
         self.data.truncate(len);
         self.marks.truncate(len);
+        // Discarding queued bytes is rare; only then is the queue searched
+        // back to its new last mark.
+        if self.last_push != u64::MAX && self.push_offset().is_none() {
+            self.find_last_push();
+        }
         while self
             .shared
             .back()
@@ -394,6 +452,9 @@ impl SendBuffer {
         self.data.drain(..count);
         self.marks.drain(..count);
         self.head = self.head.wrapping_add(count as u64);
+        if self.push_offset().is_none() {
+            self.last_push = u64::MAX;
+        }
         while let Some(span) = self.shared.front_mut() {
             let consumed = self.head.wrapping_sub(span.start) as usize;
             if consumed >= 1usize << (usize::BITS - 1) {
@@ -3189,7 +3250,7 @@ mod tests {
         };
         let mut out = [0; 400];
         for step in 0..4000 {
-            match next(6) {
+            match next(7) {
                 0 | 1 => {
                     let len = next(200);
                     let input: Vec<u8> = (0..len).map(|i| (step + i) as u8).collect();
@@ -3218,6 +3279,11 @@ mod tests {
                     }
                     model[offset + count - 1].1 |= 1;
                 }
+                5 => {
+                    let len = next(model.len() + 1);
+                    send.truncate(len);
+                    model.truncate(len);
+                }
                 _ => {
                     let offset = next(model.len() + 1);
                     let (push, end_of_record) = (next(2) == 0, next(4) == 0);
@@ -3238,6 +3304,10 @@ mod tests {
             assert_eq!(
                 send.pushed(offset, limit),
                 tail.iter().any(|byte| byte.1 & 1 != 0)
+            );
+            assert_eq!(
+                send.pushed(offset, model.len().saturating_sub(offset)),
+                model.iter().skip(offset).any(|byte| byte.1 & 1 != 0)
             );
             assert_eq!(send.copy(offset, &mut out[..limit]), record);
             assert!(
