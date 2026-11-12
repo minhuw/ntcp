@@ -532,6 +532,13 @@ impl<P: PacketIo> Network<P> {
         let Link::Ethernet { local_mac, .. } = self.config.link else {
             return Ok(0);
         };
+        // The tables' next deadline is the earliest time `neighbor_output`
+        // has work: a reply queued, or a request or probe due. Reading it
+        // costs less than polling them for nothing, which is what every
+        // drive finds on a resolved link.
+        if self.host.next_neighbor_deadline().is_none_or(|at| at > now) {
+            return Ok(0);
+        }
         let link = self.ingress.link();
         let mut used = 0;
         while used < limit {
