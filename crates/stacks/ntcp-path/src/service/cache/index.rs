@@ -214,7 +214,7 @@ impl PathIndex {
     }
 }
 
-fn filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, Error> {
+pub(super) fn filled<T: Clone>(count: usize, value: T) -> Result<Vec<T>, Error> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(count)

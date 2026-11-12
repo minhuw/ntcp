@@ -13,6 +13,8 @@ mod admin;
 pub use admin::*;
 mod index;
 pub(super) use index::PathIndex;
+mod members;
+pub(super) use members::PathClients;
 
 handle!(PathId);
 handle!(ClientId);
@@ -439,14 +441,24 @@ impl PathService {
     //# The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
     fn mark_dirty(&mut self, path: PathId) {
         self.dirtied += 1;
-        for index in 0..self.clients.slots.len() {
-            if let Some(client) = &mut self.clients.slots[index].value
-                && client.path == path
-            {
-                client.dirty = true;
-                self.queue_dirty(index);
-            }
+        let mut members = 0;
+        let mut at = self.members.first(path.0.slot);
+        while let Some(index) = at {
+            at = self.members.after(index);
+            let client = self.clients.slots[index].value.as_mut().unwrap();
+            debug_assert_eq!(client.path, path);
+            client.dirty = true;
+            self.queue_dirty(index);
+            members += 1;
         }
+        debug_assert_eq!(
+            members,
+            self.clients
+                .slots
+                .iter()
+                .filter(|s| s.value.as_ref().is_some_and(|c| c.path == path))
+                .count()
+        );
     }
     // Every client made dirty, by a change to its path or as a new or
     // rebound client, is queued for `take_dirty`.
@@ -694,6 +706,7 @@ impl PathService {
             self.slot_path(index)
         };
         self.pin(path);
+        self.members.join(path.0.slot, client_slot);
         self.free_clients.pop();
         let client = ClientId(self.clients.insert(
             self.context,
@@ -748,6 +761,8 @@ impl PathService {
         };
         self.unpin(old.path);
         self.pin(path);
+        self.members.leave(old.path.0.slot, client.0.slot);
+        self.members.join(path.0.slot, client.0.slot);
         let client = ClientId(self.clients.insert(
             self.context,
             client.0.slot,
@@ -764,6 +779,7 @@ impl PathService {
     pub fn release(&mut self, client: ClientId) -> Result<(), Error> {
         let old = self.clients.get(self.context, client.0)?;
         self.unpin(old.path);
+        self.members.leave(old.path.0.slot, client.0.slot);
         self.clients.slots[client.0.slot].value = None;
         self.free_clients.push(client.0.slot);
         debug_assert!(self.clients.lists_free(&self.free_clients));

@@ -282,6 +282,28 @@ fn index_holds(service: &PathService) -> bool {
     }) && service.index.free() == first_free
 }
 
+// Whether each path slot's client list holds exactly the clients of the
+// path in that slot, once each, as a scan of the clients finds them.
+fn members_hold(service: &PathService) -> bool {
+    let mut listed = alloc::vec![None; service.clients.slots.len()];
+    (0..service.paths.slots.len()).all(|path| {
+        let mut at = service.members.first(path);
+        while let Some(client) = at {
+            // A client listed twice (or a cycle) is found here.
+            if listed[client].replace(path).is_some() {
+                return false;
+            }
+            at = service.members.after(client);
+        }
+        true
+    }) && service
+        .clients
+        .slots
+        .iter()
+        .zip(listed)
+        .all(|(record, listed)| record.value.map(|c| c.path.0.slot) == listed)
+}
+
 // A seeded sequence of acquisitions, rebinds, releases, decreases, route
 // changes, Redirects (installed and ended) and exact-path policy through a
 // gateway route, against a full table: after every step the index matches
@@ -402,6 +424,7 @@ fn index_matches_the_scans_under_random_operations() {
                 _ => {}
             }
             assert!(index_holds(&service), "step {step}, collide {collide}");
+            assert!(members_hold(&service), "step {step}, collide {collide}");
             for n in 0..10 {
                 if let Ok(resolved) = service.resolve(request(n)) {
                     assert_eq!(

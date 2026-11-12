@@ -518,6 +518,8 @@ pub struct PathService {
     plateaus: Ipv4Plateaus,
     // Each flow's cached incarnations, the free and the idle path slots.
     index: cache::PathIndex,
+    // The clients of each cached path.
+    members: cache::PathClients,
 }
 
 impl PathService {
@@ -545,7 +547,10 @@ impl PathService {
         ]
         .into_iter()
         .chain(cache::PathIndex::accounting(limits.paths)?)
-        {
+        .chain(cache::PathClients::accounting(
+            limits.paths,
+            limits.clients,
+        )?) {
             bytes = bytes
                 .checked_add(count.checked_mul(size).ok_or(Error::Capacity)?)
                 .filter(|v| *v <= isize::MAX as usize)
@@ -621,6 +626,7 @@ impl PathService {
             dirtied: 0,
             plateaus: Ipv4Plateaus::CONTEMPORARY,
             index: cache::PathIndex::new(limits.paths, lookup_key)?,
+            members: cache::PathClients::new(limits.paths, limits.clients)?,
         })
     }
 
