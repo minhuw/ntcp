@@ -2,7 +2,7 @@
 // Sequence ranges are exclusive and always smaller than half the sequence space.
 use crate::{
     connection::{CallerTimebase, TimestampGranularity},
-    sack::Scoreboard,
+    sack::{FRESH, Scoreboard},
     seq::Seq,
 };
 #[cfg(test)]
@@ -161,6 +161,11 @@ struct Hull {
     units: (usize, usize),
 }
 
+// Ranges changed between ACKs in ways ACK processing reads.
+const DIRTY: usize = 4;
+// What one ACK visits: its cumulative prefix, dirty and fresh ranges.
+const SPANS: usize = 1 + DIRTY + FRESH;
+
 struct AckInput<'a> {
     ack: Seq,
     scoreboard: &'a Scoreboard,
@@ -208,6 +213,12 @@ pub(crate) struct Rack {
     pub(crate) delivered_segments_valid: bool,
     tally: Tally,
     short_mss: u32,
+    // Every interval the scoreboard covers is marked SACKed, except in
+    // these ranges (or anywhere, with rescan): ACKs visit only them, their
+    // cumulative prefix and the scoreboard's fresh ranges.
+    dirty: [(Seq, Seq); DIRTY],
+    dirty_len: usize,
+    rescan: bool,
 }
 
 fn sent_after(a: (u64, Seq), b: (u64, Seq)) -> bool {
@@ -300,6 +311,9 @@ impl Rack {
             delivered_segments_valid: true,
             tally: Tally::default(),
             short_mss: 0,
+            dirty: [(Seq(0), Seq(0)); DIRTY],
+            dirty_len: 0,
+            rescan: false,
         })
     }
 
@@ -463,6 +477,8 @@ impl Rack {
         if self.fallback.is_some_and(|boundary| !boundary.after(ack)) {
             self.fallback = None;
             self.fack = Some(ack);
+            // Advice from before the fallback was never marked.
+            self.rescan = true;
         }
         self.verify();
     }
@@ -470,6 +486,7 @@ impl Rack {
     pub(crate) fn abandon(&mut self, boundary: Seq) {
         self.intervals.clear();
         self.tally = Tally::default();
+        self.dirty_len = 0;
         self.delivered_segments_valid = false;
         self.departure_selection = None;
         self.fallback = Some(boundary);
@@ -696,6 +713,74 @@ impl Rack {
             units: (0, units - count),
         });
         self.tally.apply(before, after);
+        // Losing an incomplete prefix can complete the unit it cut.
+        if let Some(&Interval { start, end, .. }) = self.intervals.first() {
+            self.mark_dirty(start, end);
+        }
+    }
+
+    // Remembers a range whose intervals the next ACK must look at again
+    // although the scoreboard did not change there.
+    fn mark_dirty(&mut self, start: Seq, end: Seq) {
+        if !end.after(start) {
+            return;
+        }
+        for span in &mut self.dirty[..self.dirty_len] {
+            if !start.after(span.1) && !span.0.after(end) {
+                if span.0.after(start) {
+                    span.0 = start;
+                }
+                if end.after(span.1) {
+                    span.1 = end;
+                }
+                return;
+            }
+        }
+        if self.dirty_len < DIRTY {
+            self.dirty[self.dirty_len] = (start, end);
+            self.dirty_len += 1;
+            return;
+        }
+        // Full: widen the nearest range over this one.
+        let gap = |&(left, right): &(Seq, Seq)| {
+            if left.after(end) {
+                left.distance_from(end)
+            } else {
+                start.distance_from(right)
+            }
+        };
+        let nearest = (0..DIRTY).min_by_key(|&i| gap(&self.dirty[i])).unwrap();
+        let span = &mut self.dirty[nearest];
+        if span.0.after(start) {
+            span.0 = start;
+        }
+        if end.after(span.1) {
+            span.1 = end;
+        }
+    }
+
+    // Index ranges, ordered and disjoint, of the intervals overlapping spans.
+    fn index_ranges(&self, spans: &[(Seq, Seq)]) -> ([(usize, usize); SPANS], usize) {
+        let mut ranges = [(0, 0); SPANS];
+        let mut len = 0;
+        for &(start, end) in spans {
+            let (first, last) = self.overlapping(start, end);
+            if first < last {
+                ranges[len] = (first, last);
+                len += 1;
+            }
+        }
+        ranges[..len].sort_unstable();
+        let mut merged = 0;
+        for i in 0..len {
+            if merged > 0 && ranges[i].0 <= ranges[merged - 1].1 {
+                ranges[merged - 1].1 = ranges[merged - 1].1.max(ranges[i].1);
+            } else {
+                ranges[merged] = ranges[i];
+                merged += 1;
+            }
+        }
+        (ranges, merged)
     }
 
     // For tests that edit intervals directly.
@@ -808,6 +893,9 @@ impl Rack {
                     }
                 }
             });
+            // Restored commitment can complete a delivery unit.
+            let (start, end) = (self.intervals[a].start, self.intervals[b - 1].end);
+            self.mark_dirty(start, end);
         }
         self.departure_selection = None; // Generations are never rolled back.
         self.verify();
@@ -960,6 +1048,15 @@ impl Rack {
                 }
             }
         });
+        // Commitment and the new unit edges at both ends can complete a
+        // delivery unit the scoreboard already covers.
+        let dirty_start = self.intervals[from].start;
+        let dirty_end = self
+            .intervals
+            .range(last, self.intervals.len())
+            .next()
+            .map_or(end, |r| r.end);
+        self.mark_dirty(dirty_start, dirty_end);
         self.verify();
     }
 
@@ -1003,12 +1100,14 @@ impl Rack {
             let (first, last) = self.overlapping(start, end);
             if first < last {
                 let (a, b) = (self.packet_start(first), self.packet_end(last));
-                self.retally(a, b, |s| {
+                let unsacked = self.retally(a, b, |s| {
                     for r in s.intervals.range_mut(a, b) {
                         r.original_retransmitted = true;
                     }
+                    let mut unsacked = false;
                     for r in s.intervals.range_mut(first, last) {
                         if !start.after(r.start) && !r.end.after(end) {
+                            unsacked |= r.sacked;
                             r.set_stats_flag(SYN_PAYLOAD, false);
                             r.transmission_start = start;
                             r.transmission_end = end;
@@ -1021,7 +1120,12 @@ impl Rack {
                             r.sacked = false;
                         }
                     }
+                    unsacked
                 });
+                // The scoreboard still covers these: the next ACK marks them again.
+                if unsacked {
+                    self.mark_dirty(start, end);
+                }
             }
         } else if self.intervals.len() < self.capacity {
             self.push(Interval {
@@ -1069,6 +1173,7 @@ impl Rack {
                 }
             }
         }
+        self.mark_dirty(start, end);
         all_credited && !fin_credited
     }
 
@@ -1143,6 +1248,7 @@ impl Rack {
                 r.set_stats_flag(SYN_PAYLOAD, true);
             }
         }
+        self.mark_dirty(start, end);
     }
 
     // Scoreboard is authoritative. Split at its byte edges, never scan send-buffer bytes.
@@ -1227,7 +1333,7 @@ impl Rack {
         &mut self,
         ack: Seq,
         high: Seq,
-        scoreboard: &Scoreboard,
+        scoreboard: &mut Scoreboard,
         now: u64,
         echo: Option<u32>,
         timestamps: Option<TimestampGranularity>,
@@ -1236,8 +1342,38 @@ impl Rack {
     ) -> u32 {
         self.ack_sample = None;
         self.reo_grew = false;
-        let len = self.intervals.len();
-        self.acknowledge_units(ack, Some(scoreboard), &[(0, len)]);
+        // Earlier ACKs marked every interval the scoreboard then covered.
+        // Only the cumulative prefix, newly SACKed ranges and ranges changed
+        // here since can hold work; without a record, visit everything.
+        let fresh = scoreboard.take_fresh();
+        let scoreboard = &*scoreboard;
+        let mut spans = [(Seq(0), Seq(0)); SPANS];
+        let mut count = 0;
+        let mut fresh_from = 0;
+        let everything = self.rescan || fresh.is_none();
+        if let Some(base) = self.intervals.first().map(|r| r.start) {
+            if everything {
+                spans[0] = (base, self.intervals.last().unwrap().end);
+                count = 1;
+            } else {
+                spans[0] = (base, ack);
+                count = 1;
+                for &span in &self.dirty[..self.dirty_len] {
+                    spans[count] = span;
+                    count += 1;
+                }
+                fresh_from = count;
+                let (fresh, len) = fresh.unwrap();
+                for &span in &fresh[..len] {
+                    spans[count] = span;
+                    count += 1;
+                }
+            }
+        }
+        self.dirty_len = 0;
+        self.rescan = false;
+        let (ranges, len) = self.index_ranges(&spans[..count]);
+        self.acknowledge_units(ack, Some(scoreboard), &ranges[..len]);
         if self.fallback.is_some() {
             self.trim_cumulative(ack);
             return 0;
@@ -1246,7 +1382,28 @@ impl Rack {
             self.abandon(high);
             return 0;
         }
-        for &(left, right) in scoreboard.ranges() {
+        // Edges of ranges that existed at the last ACK were split then.
+        let advice = scoreboard.ranges();
+        let (mut first, mut last) = (0, advice.len());
+        if !everything && let Some(&(base, _)) = advice.first() {
+            // Offsets from the lowest range; a span reaching below it counts from 0.
+            let offset = |seq: Seq| {
+                Some(seq.distance_from(base))
+                    .filter(|&d| d < 1 << 31)
+                    .unwrap_or(0)
+            };
+            let fresh = &spans[fresh_from..count];
+            // Only ranges touching a fresh span.
+            if fresh.is_empty() {
+                last = 0;
+            } else {
+                let low = fresh.iter().map(|&(l, _)| offset(l)).min().unwrap();
+                let high = fresh.iter().map(|&(_, r)| offset(r)).max().unwrap();
+                first = advice.partition_point(|&(_, right)| offset(right) < low);
+                last = advice.partition_point(|&(left, _)| offset(left) <= high);
+            }
+        }
+        for &(left, right) in &advice[first..last.max(first)] {
             if !self.split(left) || !self.split(right) {
                 self.abandon(high);
                 return 0;
@@ -1267,23 +1424,30 @@ impl Rack {
             timestamps,
             mss,
         };
-        // Runs of newly covered intervals, retallied together.
-        let mut i = 0;
-        while i < self.intervals.len() {
-            if !self.newly_covered(i, &input) {
-                i += 1;
-                continue;
-            }
-            let mut j = i + 1;
-            while j < self.intervals.len() && self.newly_covered(j, &input) {
-                j += 1;
-            }
-            self.retally(i, j, |s| {
-                for k in i..j {
-                    s.deliver(k, &input, &mut walk);
+        // After the splits, every interval lies wholly in or out of a range.
+        let (ranges, len) = self.index_ranges(&spans[..count]);
+        for &(a, b) in &ranges[..len] {
+            let mut i = a;
+            while i < b {
+                if !self.newly_covered(i, &input) {
+                    i += 1;
+                    continue;
                 }
-            });
-            i = j;
+                let mut j = i + 1;
+                while j < b && self.newly_covered(j, &input) {
+                    j += 1;
+                }
+                self.retally(i, j, |s| {
+                    for k in i..j {
+                        s.deliver(k, &input, &mut walk);
+                    }
+                });
+                i = j;
+            }
+        }
+        #[cfg(debug_assertions)]
+        for i in 0..self.intervals.len() {
+            debug_assert!(!self.newly_covered(i, &input));
         }
         let delivered = walk.delivered;
         self.reordering_events = self
@@ -1527,6 +1691,8 @@ impl Rack {
             packets: (0, len),
             units: (0, len),
         });
+        // Any advice still held must be marked again.
+        self.rescan = true;
         self.verify();
     }
 
@@ -1696,6 +1862,7 @@ impl Rack {
         }
         self.intervals.clear();
         self.tally = Tally::default();
+        self.dirty_len = 0;
         self.departure_selection = None;
         true
     }

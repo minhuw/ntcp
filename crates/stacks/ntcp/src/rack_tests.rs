@@ -116,7 +116,7 @@ fn departure_timestamp_evidence_requires_unchanged_encoding_time() {
                                 rack.acknowledge(
                                     Seq(8),
                                     Seq(8),
-                                    &Scoreboard::new(),
+                                    &mut Scoreboard::new(),
                                     accepted + 100_000 * scale,
                                     Some(granularity.tick_in(echo_time, timebase) as u32),
                                     timestamps,
@@ -161,7 +161,7 @@ fn departure_timestamp_eligibility_survives_splits_and_renews_only_on_transmit()
         rack.acknowledge(
             Seq(0),
             Seq(24),
-            &scoreboard,
+            &mut scoreboard,
             401_000,
             Some(300),
             Some(TimestampGranularity::Milliseconds),
@@ -182,7 +182,7 @@ fn departure_timestamp_eligibility_survives_splits_and_renews_only_on_transmit()
         rack.acknowledge(
             Seq(8),
             Seq(24),
-            &scoreboard,
+            &mut scoreboard,
             401_000,
             Some(300),
             Some(TimestampGranularity::Milliseconds),
@@ -206,7 +206,7 @@ fn departure_timestamp_eligibility_survives_splits_and_renews_only_on_transmit()
         rack.acknowledge(
             Seq(24),
             Seq(24),
-            &Scoreboard::new(),
+            &mut Scoreboard::new(),
             600_000,
             Some(500),
             Some(TimestampGranularity::Milliseconds),
@@ -652,7 +652,7 @@ fn caller_units_scale_minimum_aging_and_retransmission_echoes() {
             rack.acknowledge(
                 Seq(1000),
                 Seq(1000),
-                &Scoreboard::new(),
+                &mut Scoreboard::new(),
                 400_000 * scale,
                 Some(granularity.tick(300_000) as u32),
                 Some(granularity),
@@ -693,7 +693,7 @@ fn capacity_backing_keeps_every_byte_timestamp_after_splits() {
     rack.acknowledge(
         Seq(511),
         Seq(512),
-        &Scoreboard::new(),
+        &mut Scoreboard::new(),
         1000,
         None,
         None,
@@ -850,18 +850,18 @@ fn windowed_minimum_path_migration_and_boundaries() {
 //# be SRTT.
 fn dsack_more_than_255_rounds_and_full_width_window_cap() {
     let mut rack = Rack::new().unwrap();
-    let scoreboard = Scoreboard::new();
+    let mut scoreboard = Scoreboard::new();
     rack.sample(4, 0);
     for round in 1..=400 {
         let ack = Seq(round * 1000);
         let high = ack.wrapping_add(1000);
-        rack.acknowledge(ack, high, &scoreboard, 0, None, None, 1000, true);
+        rack.acknowledge(ack, high, &mut scoreboard, 0, None, None, 1000, true);
         assert_eq!(rack.multiplier, u128::from(round) + 1);
         assert_eq!(
             rack.reo_window(false, Some(400)),
             u64::from(round + 1).min(400)
         );
-        rack.acknowledge(ack, high, &scoreboard, 0, None, None, 1000, true);
+        rack.acknowledge(ack, high, &mut scoreboard, 0, None, None, 1000, true);
         assert_eq!(rack.multiplier, u128::from(round) + 1);
     }
     for minimum in [1, 2, 3, 4, u64::MAX] {
@@ -879,7 +879,7 @@ fn dsack_more_than_255_rounds_and_full_width_window_cap() {
     rack.acknowledge(
         Seq(500_000),
         Seq(501_000),
-        &scoreboard,
+        &mut scoreboard,
         0,
         None,
         None,
@@ -1481,7 +1481,7 @@ fn retransmitted_ack_requires_min_rtt_and_matching_timestamp() {
         (400_000, 300, true),
     ] {
         let mut rack = Rack::new().unwrap();
-        let scoreboard = Scoreboard::new();
+        let mut scoreboard = Scoreboard::new();
         rack.sample(100_000, 0);
         rack.transmit(Seq(0), Seq(1000), 100_000, false);
         rack.transmit(Seq(0), Seq(1000), 300_000, true);
@@ -1489,7 +1489,7 @@ fn retransmitted_ack_requires_min_rtt_and_matching_timestamp() {
             rack.acknowledge(
                 Seq(1000),
                 Seq(1000),
-                &scoreboard,
+                &mut scoreboard,
                 now,
                 Some(echo),
                 Some(TimestampGranularity::Milliseconds),

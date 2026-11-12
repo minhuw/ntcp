@@ -6574,7 +6574,7 @@ impl Connection {
             self.rack.acknowledge(
                 live_ack,
                 self.data_high(),
-                &self.scoreboard,
+                &mut self.scoreboard,
                 now,
                 segment
                     .options
@@ -7214,7 +7214,7 @@ impl Connection {
             self.rack.acknowledge(
                 ack,
                 self.data_high(),
-                &self.scoreboard,
+                &mut self.scoreboard,
                 self.now,
                 echo.map(|value| value.wrapping_sub(self.timestamp_offset)),
                 self.timestamps.then_some(self.config.timestamp_granularity),

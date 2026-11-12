@@ -9,6 +9,8 @@ use crate::seq::Seq;
 const CAPACITY: usize = 64;
 const HALF_SPACE: u32 = 1 << 31;
 const EMPTY: (Seq, Seq) = (Seq(0), Seq(0));
+// Newly SACKed ranges kept for the next taker; one ACK adds at most four.
+pub(crate) const FRESH: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UpdateOutcome {
@@ -26,6 +28,11 @@ pub(crate) struct Scoreboard {
     capacity: usize,
     len: usize,
     ack: Seq,
+    // Every octet SACKed since the last take_fresh lies in one of these
+    // ranges (they may also hold octets SACKed before), so a ledger that
+    // has marked all earlier advice visits only them. None when more were
+    // added than fit: anything may be new.
+    fresh: Option<([(Seq, Seq); FRESH], usize)>,
 }
 
 impl Scoreboard {
@@ -46,6 +53,7 @@ impl Scoreboard {
             capacity,
             len: 0,
             ack: Seq(0),
+            fresh: Some(([EMPTY; FRESH], 0)),
         })
     }
 
@@ -62,6 +70,7 @@ impl Scoreboard {
         result.ranges[..self.len].copy_from_slice(&self.ranges[..self.len]);
         result.len = self.len;
         result.ack = self.ack;
+        result.fresh = self.fresh;
         Ok(result)
     }
 
@@ -78,6 +87,23 @@ impl Scoreboard {
 
     pub(crate) fn clear(&mut self) {
         self.len = 0;
+    }
+
+    // The ranges holding every octet SACKed since the previous call, or None
+    // if they did not fit: the caller must then consider all of ranges().
+    pub(crate) fn take_fresh(&mut self) -> Option<([(Seq, Seq); FRESH], usize)> {
+        self.fresh.replace(([EMPTY; FRESH], 0))
+    }
+
+    fn note_fresh(&mut self, left: Seq, right: Seq) {
+        if let Some((fresh, len)) = &mut self.fresh {
+            if *len == FRESH {
+                self.fresh = None;
+            } else {
+                fresh[*len] = (left, right);
+                *len += 1;
+            }
+        }
     }
 
     #[cfg(test)]
@@ -201,6 +227,7 @@ impl Scoreboard {
             };
             outcome.dsack = below || contained;
         }
+        let old = count;
         for (index, &block) in blocks.iter().enumerate() {
             if index == 0 && outcome.dsack {
                 continue;
@@ -211,6 +238,25 @@ impl Scoreboard {
                 let left = if left.after(ack) { left } else { ack };
                 self.ranges[count] = (left, right);
                 count += 1;
+                // Only the part outside the old ranges at its two ends can
+                // be new: trim a reported block to that hull.
+                let (mut from, mut to) = (left.distance_from(ack), right.distance_from(ack));
+                let first =
+                    self.ranges[..old].partition_point(|&(_, r)| r.distance_from(ack) <= from);
+                if let Some(&(l, r)) = self.ranges[..old].get(first)
+                    && l.distance_from(ack) <= from
+                {
+                    from = r.distance_from(ack);
+                }
+                let last = self.ranges[..old].partition_point(|&(l, _)| l.distance_from(ack) < to);
+                if let Some(&(l, r)) = last.checked_sub(1).map(|i| &self.ranges[i])
+                    && r.distance_from(ack) >= to
+                {
+                    to = l.distance_from(ack);
+                }
+                if from < to {
+                    self.note_fresh(ack.wrapping_add(from), ack.wrapping_add(to));
+                }
             }
         }
 

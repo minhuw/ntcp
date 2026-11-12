@@ -500,7 +500,7 @@ fn reordering_events_deduplicate_each_stage_across_splits_and_wrap() {
                 rack.acknowledge(
                     seq(ack),
                     seq(10_000),
-                    &scoreboard,
+                    &mut scoreboard,
                     40_000,
                     None,
                     None,

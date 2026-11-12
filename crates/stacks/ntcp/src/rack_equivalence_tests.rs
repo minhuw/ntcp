@@ -501,7 +501,7 @@ impl Model {
             let got = self.rack.acknowledge(
                 ack,
                 high,
-                &self.scoreboard,
+                &mut self.scoreboard,
                 now,
                 echo,
                 self.timestamps,
@@ -524,7 +524,7 @@ impl Model {
             let got = self.rack.acknowledge(
                 ack,
                 high,
-                &self.scoreboard,
+                &mut self.scoreboard,
                 now,
                 echo,
                 self.timestamps,

@@ -685,7 +685,7 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
         let ledger_delivery = rack_before.acknowledge(
             Seq(4001),
             a.data_high(),
-            &a.scoreboard,
+            &mut a.scoreboard,
             32_000,
             None,
             None,
