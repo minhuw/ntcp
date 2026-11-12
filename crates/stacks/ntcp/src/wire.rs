@@ -120,13 +120,23 @@ fn checked_length(ip: IpMetadata, len: usize) -> Result<u32, WireError> {
 //# If a segment contains an odd number of header and text octets, alignment can be achieved
 //# by padding the last octet with zeros on its right to form a 16-bit word for checksum
 //# purposes. The pad is not transmitted as part of the segment.
-fn add_words(mut sum: u32, bytes: &[u8]) -> u32 {
-    for word in bytes.chunks(2) {
-        sum += u16::from_be_bytes([word[0], word.get(1).copied().unwrap_or(0)]) as u32;
-        // Fold each word so even the largest IPv6 segment cannot overflow.
-        sum = (sum & 0xffff) + (sum >> 16);
+// Returns the sum folded to 16 bits. Two 16-bit words at a time go into a
+// 64-bit accumulator that cannot overflow for any slice, folded once at the
+// end: a carry out of a word's position is the same end-around carry (2^16
+// is congruent to 1 modulo 2^16 - 1), and a nonzero sum never folds to 0.
+fn add_words(sum: u32, bytes: &[u8]) -> u32 {
+    let mut wide = u64::from(sum);
+    let (pairs, rest) = bytes.as_chunks::<4>();
+    for &pair in pairs {
+        wide += u64::from(u32::from_be_bytes(pair));
     }
-    sum
+    let mut last = [0; 4];
+    last[..rest.len()].copy_from_slice(rest);
+    wide += u64::from(u32::from_be_bytes(last));
+    while wide >> 16 != 0 {
+        wide = (wide & 0xffff) + (wide >> 16);
+    }
+    wide as u32
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
@@ -461,22 +471,26 @@ pub fn encode_shared(
     let n = encode(ip, header, options, &[], out)?;
     out[16..18].fill(0);
     let mut sum = pseudo_header_sum(ip, len)?;
+    // A word may straddle two slices: an odd slice's last octet waits for
+    // the next slice's first.
     let mut odd = None;
-    for bytes in core::iter::once(&out[..n]).chain(payload.iter().map(|p| p.as_slice())) {
-        for &byte in bytes {
-            if let Some(high) = odd.take() {
-                sum += u32::from(u16::from_be_bytes([high, byte]));
-                sum = (sum & 0xffff) + (sum >> 16);
-            } else {
-                odd = Some(byte);
-            }
+    for mut bytes in core::iter::once(&out[..n]).chain(payload.iter().map(|p| p.as_slice())) {
+        if let Some(high) = odd
+            && let Some((&low, rest)) = bytes.split_first()
+        {
+            sum = add_words(sum, &[high, low]);
+            bytes = rest;
+            odd = None;
+        }
+        let even = bytes.len() & !1;
+        sum = add_words(sum, &bytes[..even]);
+        if let Some(&last) = bytes.get(even) {
+            odd = Some(last);
         }
     }
     if let Some(high) = odd {
-        sum += u32::from(high) << 8;
+        sum = add_words(sum, &[high]);
     }
-    sum = (sum & 0xffff) + (sum >> 16);
-    sum = (sum & 0xffff) + (sum >> 16);
     out[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
     Ok(n)
 }
@@ -914,6 +928,27 @@ mod tests {
             Err(WireError::TooLong)
         );
         assert_eq!(out, [0xa5; 80]);
+    }
+
+    #[test]
+    fn wide_sums_match_the_word_reference_at_every_length_and_alignment() {
+        let mut state = 0x2545_f491_u32;
+        let bytes: Vec<u8> = (0..1600)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        for ip in ips() {
+            for start in 0..4 {
+                for len in (0..300).chain([1459, 1460, 1461, 1595]) {
+                    let segment = &bytes[start..start + len];
+                    assert_eq!(checksum(ip, segment), Ok(reference(ip, segment)));
+                }
+            }
+        }
     }
 
     #[test]
