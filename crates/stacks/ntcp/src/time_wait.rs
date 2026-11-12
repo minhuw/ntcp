@@ -5,7 +5,7 @@
 //! its buffers and its slot are freed.
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
     OutgoingIpv4Options,
@@ -335,10 +335,27 @@ const UNLINKED: Links = Links {
 struct Entry {
     record: Record,
     hash: u64,
+    // The next record in its bucket's chain.
+    next: u32,
     // Position in the timer heap.
     timer: u32,
     output: Links,
     queued: bool,
+}
+
+// A record's own allocation, as Linux allocates an inet_timewait_sock per
+// TIME-WAIT. `Box::new` cannot fail, so the box comes from a vector.
+type Stored = Option<Box<[Entry; 1]>>;
+
+fn allocate(entry: Entry) -> Stored {
+    let mut storage = Vec::new();
+    storage.try_reserve_exact(1).ok()?;
+    storage.push(entry);
+    storage.into_boxed_slice().try_into().ok()
+}
+
+fn at(entries: &mut [Stored], index: u32) -> &mut Entry {
+    &mut entries[index as usize].as_mut().unwrap()[0]
 }
 
 #[derive(Clone, Copy, Default)]
@@ -348,39 +365,34 @@ struct Ends {
 }
 
 // A doubly linked FIFO through one Links field of the entries.
-fn link(
-    entries: &mut [Option<Entry>],
-    ends: &mut Ends,
-    index: u32,
-    field: fn(&mut Entry) -> &mut Links,
-) {
-    *field(entries[index as usize].as_mut().unwrap()) = Links {
+fn link(entries: &mut [Stored], ends: &mut Ends, index: u32, field: fn(&mut Entry) -> &mut Links) {
+    *field(at(entries, index)) = Links {
         previous: ends.last.unwrap_or(NONE),
         next: NONE,
     };
     match ends.last {
-        Some(last) => field(entries[last as usize].as_mut().unwrap()).next = index,
+        Some(last) => field(at(entries, last)).next = index,
         None => ends.first = Some(index),
     }
     ends.last = Some(index);
 }
 
 fn unlink(
-    entries: &mut [Option<Entry>],
+    entries: &mut [Stored],
     ends: &mut Ends,
     index: u32,
     field: fn(&mut Entry) -> &mut Links,
 ) {
-    let links = core::mem::replace(field(entries[index as usize].as_mut().unwrap()), UNLINKED);
+    let links = core::mem::replace(field(at(entries, index)), UNLINKED);
     if links.previous == NONE {
         ends.first = (links.next != NONE).then_some(links.next);
     } else {
-        field(entries[links.previous as usize].as_mut().unwrap()).next = links.next;
+        field(at(entries, links.previous)).next = links.next;
     }
     if links.next == NONE {
         ends.last = (links.previous != NONE).then_some(links.previous);
     } else {
-        field(entries[links.next as usize].as_mut().unwrap()).previous = links.previous;
+        field(at(entries, links.next)).previous = links.previous;
     }
 }
 
@@ -388,159 +400,244 @@ fn output(entry: &mut Entry) -> &mut Links {
     &mut entry.output
 }
 
-/// The TIME-WAIT records, at most `limit` (Linux's tcp_max_tw_buckets).
-/// Records are allocated as TIME-WAIT grows; the lookup index (two slots per
-/// record allowed, linear probing within a fixed budget under the Endpoint's
-/// keyed hash) and the per-port counts are allocated whole. Every record has
-/// the same duration, but not every one starts it when it is stored: a
-/// connection whose application released it late joins with an older
-/// deadline than records stored before it. The timers are therefore a heap
-/// of records, not a FIFO.
+/// The TIME-WAIT records, at most `limit` (Linux's tcp_max_tw_buckets),
+/// each allocated when it is stored, as Linux allocates an
+/// inet_timewait_sock. They are found through chains from buckets of the
+/// Endpoint's keyed hash (Linux's ehash): one bucket per record, doubled as
+/// records grow, up to `limit` rounded to a power of two. No insert rehashes
+/// them all: after a doubling, inserts move the earlier buckets' chains two
+/// buckets at a time, and first the one they fall in. Per-port counts are
+/// paged in as ports are used. Nothing is allocated before a record is
+/// stored, and only storing one allocates.
+///
+/// Every record has the same duration, but not every one starts it when it
+/// is stored: a connection whose application released it late joins with an
+/// older deadline than records stored before it. The timers are therefore a
+/// heap of records, not a FIFO.
 pub(crate) struct TimeWaitTable {
-    entries: Vec<Option<Entry>>,
+    entries: Vec<Stored>,
     free: Vec<u32>,
-    index: Vec<u32>,
+    buckets: Vec<u32>,
+    // The buckets before the last doubling, each NONE once its chain moved
+    // to `buckets`; empty once all have.
+    previous: Vec<u32>,
+    // The next bucket of `previous` to move.
+    moving: usize,
     timers: Vec<u32>,
     // Records per local port, as Linux keeps TIME-WAIT in a port's bind
     // bucket: a port stays bound while one of its tuples is in TIME-WAIT.
-    ports: Vec<u32>,
+    // Pages of PORT_PAGE ports, empty until a record uses one of them.
+    ports: Vec<Box<[u32]>>,
     output: Ends,
     len: usize,
     limit: usize,
 }
 
-const PROBES: usize = 64;
+const MIN_BUCKETS: usize = 16;
+// Records an insert lets a chain hold. The keyed hash gives a bucket about
+// one record, so the bound only stops chains built to collide, keeping
+// hostile lookup work fixed.
+const CHAIN: usize = 64;
+const PORT_PAGE: usize = 256;
 
 impl TimeWaitTable {
-    pub(crate) fn new(limit: usize) -> Result<Self, ()> {
-        let (index_len, ports_len) = if limit == 0 {
-            (0, 0)
-        } else {
-            (
-                limit
-                    .checked_mul(2)
-                    .and_then(usize::checked_next_power_of_two)
-                    .ok_or(())?,
-                usize::from(u16::MAX) + 1,
-            )
-        };
-        let mut index = Vec::new();
-        index.try_reserve_exact(index_len).map_err(|_| ())?;
-        index.resize(index_len, NONE);
-        let mut ports = Vec::new();
-        ports.try_reserve_exact(ports_len).map_err(|_| ())?;
-        ports.resize(ports_len, 0);
-        Ok(Self {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
             entries: Vec::new(),
             free: Vec::new(),
-            index,
-            ports,
+            buckets: Vec::new(),
+            previous: Vec::new(),
+            moving: 0,
             timers: Vec::new(),
+            ports: Vec::new(),
             output: Ends::default(),
             len: 0,
             limit,
-        })
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    fn position(&self, hash: u64, probe: usize) -> usize {
-        (hash as usize).wrapping_add(probe) & (self.index.len() - 1)
+    fn entry(&self, index: u32) -> &Entry {
+        &self.entries[index as usize].as_ref().unwrap()[0]
+    }
+
+    // The chain `hash` falls in: its bucket of `previous` until that one
+    // moved, else its bucket of `buckets`. An insert moves its bucket first,
+    // so a chain is never split between the two.
+    fn chain(&self, hash: u64) -> (bool, usize) {
+        if !self.previous.is_empty() {
+            let bucket = hash as usize & (self.previous.len() - 1);
+            if self.previous[bucket] != NONE {
+                return (true, bucket);
+            }
+        }
+        (false, hash as usize & (self.buckets.len() - 1))
     }
 
     pub(crate) fn find(&self, hash: u64, tuple: ScopedTuple) -> Option<u32> {
-        if self.index.is_empty() {
+        if self.buckets.is_empty() {
             return None;
         }
-        for probe in 0..self.index.len().min(PROBES) {
-            match self.index[self.position(hash, probe)] {
-                NONE => return None,
-                index => {
-                    let entry = self.entries[index as usize].as_ref().unwrap();
-                    if entry.hash == hash && entry.record.tuple == tuple {
-                        return Some(index);
-                    }
-                }
+        let mut index = match self.chain(hash) {
+            (true, bucket) => self.previous[bucket],
+            (false, bucket) => self.buckets[bucket],
+        };
+        while index != NONE {
+            let entry = self.entry(index);
+            if entry.hash == hash && entry.record.tuple == tuple {
+                return Some(index);
             }
+            index = entry.next;
         }
         None
     }
 
-    fn map(&mut self, index: u32) -> bool {
-        let hash = self.entries[index as usize].as_ref().unwrap().hash;
-        for probe in 0..self.index.len().min(PROBES) {
-            let position = self.position(hash, probe);
-            if self.index[position] == NONE {
-                self.index[position] = index;
-                return true;
-            }
+    fn unmap(&mut self, index: u32) {
+        let entry = self.entry(index);
+        let next = entry.next;
+        let heads = match self.chain(entry.hash) {
+            (true, bucket) => &mut self.previous[bucket],
+            (false, bucket) => &mut self.buckets[bucket],
+        };
+        if *heads == index {
+            *heads = next;
+            return;
         }
-        false
+        let mut before = *heads;
+        loop {
+            let entry = at(&mut self.entries, before);
+            if entry.next == index {
+                entry.next = next;
+                return;
+            }
+            before = entry.next;
+        }
     }
 
-    // Backward-shift deletion: no tombstones, so a miss ends at the first
-    // empty position however long the table has churned.
-    fn unmap(&mut self, index: u32) {
-        let hash = self.entries[index as usize].as_ref().unwrap().hash;
-        let mask = self.index.len() - 1;
-        let mut hole = (0..PROBES)
-            .map(|probe| self.position(hash, probe))
-            .find(|&position| self.index[position] == index)
-            .expect("a mapped record is within its probe budget");
-        let mut next = (hole + 1) & mask;
-        while self.index[next] != NONE {
-            let home = self.entries[self.index[next] as usize]
-                .as_ref()
-                .unwrap()
-                .hash as usize
-                & mask;
-            // Move it back when the hole lies on its probe path.
-            if next.wrapping_sub(home) & mask >= next.wrapping_sub(hole) & mask {
-                self.index[hole] = self.index[next];
-                hole = next;
-            }
-            next = (next + 1) & mask;
+    // Moves the chain of `previous[bucket]` into `buckets`. A chain of
+    // `buckets` only ever takes records of one chain of `previous`, so
+    // CHAIN still bounds it.
+    fn move_bucket(&mut self, bucket: usize) {
+        let mut index = core::mem::replace(&mut self.previous[bucket], NONE);
+        let mask = self.buckets.len() - 1;
+        while index != NONE {
+            let entry = at(&mut self.entries, index);
+            let head = &mut self.buckets[entry.hash as usize & mask];
+            let next = core::mem::replace(&mut entry.next, *head);
+            *head = index;
+            index = next;
         }
-        self.index[hole] = NONE;
+    }
+
+    fn migrate(&mut self) {
+        for _ in 0..2 {
+            if self.moving == self.previous.len() {
+                break;
+            }
+            self.move_bucket(self.moving);
+            self.moving += 1;
+        }
+        if self.moving == self.previous.len() {
+            self.previous = Vec::new();
+            self.moving = 0;
+        }
+    }
+
+    // Doubles the buckets when records would outnumber them, up to the
+    // bound. False if the allocation failed.
+    fn grow(&mut self) -> bool {
+        let count = self.buckets.len();
+        let most = self.limit.next_power_of_two();
+        if self.len < count || count == most {
+            return true;
+        }
+        // The last doubling came at `count / 2` records, and each of the
+        // `count / 2` or more inserts since moved two of the `count / 2`
+        // buckets before it.
+        assert!(self.previous.is_empty());
+        let count = (count * 2).clamp(MIN_BUCKETS.min(most), most);
+        let mut buckets = Vec::new();
+        if buckets.try_reserve_exact(count).is_err() {
+            return false;
+        }
+        buckets.resize(count, NONE);
+        self.previous = core::mem::replace(&mut self.buckets, buckets);
+        self.moving = 0;
+        true
+    }
+
+    // Allocates the page counting `port`. False if that failed.
+    fn page(&mut self, port: u16) -> bool {
+        if self.ports.is_empty() {
+            let pages = (usize::from(u16::MAX) + 1) / PORT_PAGE;
+            if self.ports.try_reserve_exact(pages).is_err() {
+                return false;
+            }
+            self.ports.resize_with(pages, Box::default);
+        }
+        let page = &mut self.ports[usize::from(port) / PORT_PAGE];
+        if page.is_empty() {
+            let mut counts = Vec::new();
+            if counts.try_reserve_exact(PORT_PAGE).is_err() {
+                return false;
+            }
+            counts.resize(PORT_PAGE, 0);
+            *page = counts.into_boxed_slice();
+        }
+        true
+    }
+
+    fn port(&mut self, port: u16) -> &mut u32 {
+        let port = usize::from(port);
+        &mut self.ports[port / PORT_PAGE][port % PORT_PAGE]
     }
 
     /// Store `record` mapped under `hash`. False at the bound, when storage
-    /// cannot grow, or when its probe budget is exhausted.
+    /// cannot grow, or when its chain is full.
     pub(crate) fn insert(&mut self, hash: u64, record: Record) -> bool {
-        if self.len >= self.limit {
+        let port = record.tuple.tuple.local.port();
+        if self.len >= self.limit || !self.grow() || !self.page(port) {
             return false;
         }
-        let index = match self.free.pop() {
-            Some(index) => index,
-            None => {
-                let index = self.entries.len();
-                if self.entries.try_reserve(1).is_err()
+        self.migrate();
+        if !self.previous.is_empty() {
+            self.move_bucket(hash as usize & (self.previous.len() - 1));
+        }
+        let bucket = hash as usize & (self.buckets.len() - 1);
+        let (mut chained, mut length) = (self.buckets[bucket], 0);
+        while chained != NONE && length < CHAIN {
+            chained = self.entry(chained).next;
+            length += 1;
+        }
+        if length == CHAIN
+            || self.free.is_empty()
+                && (self.entries.try_reserve(1).is_err()
                     || self.timers.try_reserve(1).is_err()
-                    || self.free.try_reserve(index + 1).is_err()
-                {
-                    return false;
-                }
-                self.entries.push(None);
-                index as u32
-            }
-        };
-        let port = record.tuple.tuple.local.port();
-        self.entries[index as usize] = Some(Entry {
+                    || self.free.try_reserve(self.entries.len() + 1).is_err())
+        {
+            return false;
+        }
+        let Some(stored) = allocate(Entry {
             record,
             hash,
+            next: self.buckets[bucket],
             timer: NONE,
             output: UNLINKED,
             queued: false,
-        });
-        if !self.map(index) {
-            self.entries[index as usize] = None;
-            self.free.push(index);
+        }) else {
             return false;
-        }
+        };
+        let index = self.free.pop().unwrap_or_else(|| {
+            self.entries.push(None);
+            (self.entries.len() - 1) as u32
+        });
+        self.entries[index as usize] = Some(stored);
+        self.buckets[bucket] = index;
         self.push_timer(index);
-        self.ports[usize::from(port)] += 1;
+        *self.port(port) += 1;
         self.len += 1;
         true
     }
@@ -549,8 +646,8 @@ impl TimeWaitTable {
         self.unmap(index);
         self.dequeue(index);
         self.remove_timer(index);
-        let entry = self.entries[index as usize].take().unwrap();
-        self.ports[usize::from(entry.record.tuple.tuple.local.port())] -= 1;
+        let [entry] = *self.entries[index as usize].take().unwrap();
+        *self.port(entry.record.tuple.tuple.local.port()) -= 1;
         self.free.push(index);
         self.len -= 1;
         entry.record
@@ -564,20 +661,20 @@ impl TimeWaitTable {
     }
 
     pub(crate) fn record(&self, index: u32) -> &Record {
-        &self.entries[index as usize].as_ref().unwrap().record
+        &self.entry(index).record
     }
 
     pub(crate) fn record_mut(&mut self, index: u32) -> &mut Record {
-        &mut self.entries[index as usize].as_mut().unwrap().record
+        &mut at(&mut self.entries, index).record
     }
 
     // After `record_mut` changed the timer or owed output.
     pub(crate) fn update(&mut self, index: u32, restarted: bool) {
         if restarted {
-            let position = self.entries[index as usize].as_ref().unwrap().timer as usize;
+            let position = self.entry(index).timer as usize;
             self.sift_down(position);
         }
-        let entry = self.entries[index as usize].as_mut().unwrap();
+        let entry = at(&mut self.entries, index);
         if entry.record.owes_output() && !entry.queued {
             entry.queued = true;
             link(&mut self.entries, &mut self.output, index, output);
@@ -587,7 +684,7 @@ impl TimeWaitTable {
     }
 
     fn dequeue(&mut self, index: u32) {
-        let entry = self.entries[index as usize].as_mut().unwrap();
+        let entry = at(&mut self.entries, index);
         if core::mem::take(&mut entry.queued) {
             unlink(&mut self.entries, &mut self.output, index, output);
         }
@@ -605,7 +702,7 @@ impl TimeWaitTable {
 
     fn place(&mut self, position: usize, index: u32) {
         self.timers[position] = index;
-        self.entries[index as usize].as_mut().unwrap().timer = position as u32;
+        at(&mut self.entries, index).timer = position as u32;
     }
 
     fn swap_timers(&mut self, a: usize, b: usize) {
@@ -654,7 +751,7 @@ impl TimeWaitTable {
     }
 
     fn remove_timer(&mut self, index: u32) {
-        let position = self.entries[index as usize].as_ref().unwrap().timer as usize;
+        let position = self.entry(index).timer as usize;
         let last = self.timers.len() - 1;
         self.swap_timers(position, last);
         self.timers.pop();
@@ -673,13 +770,217 @@ impl TimeWaitTable {
     }
 
     pub(crate) fn holds_port(&self, port: u16) -> bool {
+        let port = usize::from(port);
         self.ports
-            .get(usize::from(port))
+            .get(port / PORT_PAGE)
+            .and_then(|page| page.get(port % PORT_PAGE))
             .is_some_and(|&count| count != 0)
     }
 
     // Every record; for rare whole-endpoint events only.
     pub(crate) fn indices(&self) -> impl Iterator<Item = u32> + '_ {
         self.timers.iter().copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::connection::Tuple;
+    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::collections::BTreeMap;
+
+    fn record(peer: u32, local_port: u16, deadline: Instant) -> Record {
+        let address = |ip: u32, port| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port);
+        Record {
+            tuple: ScopedTuple {
+                tuple: Tuple {
+                    local: address(0x0a00_0001, local_port),
+                    remote: address(0x0b00_0000 | peer, 40_000),
+                },
+                zone: None,
+            },
+            snd_nxt: Seq(1),
+            rcv_nxt: Seq(1),
+            ack_floor: Seq(1),
+            timestamps: false,
+            timestamp_offset: 0,
+            ts_recent: 0,
+            ts_latest: 0,
+            ts_recent_at: 0,
+            last_timestamp_sent_at: None,
+            deadline,
+            challenge_start: None,
+            challenge_sent: 0,
+            ack_pending: false,
+            challenge_pending: false,
+            hop_limit: 64,
+            dscp: 0,
+            mark: 0,
+            reuse_address: false,
+            ipv4_options: OutgoingIpv4Options::default(),
+            reply_header: None,
+        }
+    }
+
+    fn mix(mut x: u64) -> u64 {
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+
+    // Every stored record is found, in one chain, and the counts agree.
+    fn check(table: &TimeWaitTable, model: &BTreeMap<u32, (u64, u32)>) {
+        assert_eq!(table.len(), model.len());
+        assert_eq!(table.timers.len(), model.len());
+        for (&peer, &(hash, index)) in model {
+            let tuple = table.record(index).tuple;
+            assert_eq!(
+                tuple.tuple.remote.ip(),
+                record(peer, 0, 0).tuple.tuple.remote.ip()
+            );
+            assert_eq!(table.find(hash, tuple), Some(index));
+        }
+        let chained: usize = table
+            .buckets
+            .iter()
+            .chain(&table.previous)
+            .map(|&head| {
+                let mut count = 0;
+                let mut index = head;
+                while index != NONE {
+                    count += 1;
+                    index = table.entry(index).next;
+                }
+                assert!(count <= CHAIN);
+                count
+            })
+            .sum();
+        assert_eq!(chained, model.len());
+        assert!(table.buckets.len() <= table.limit.next_power_of_two());
+        let mut ports = [0u32; 8];
+        for &(_, index) in model.values() {
+            ports[usize::from(table.record(index).tuple.tuple.local.port() - 1000)] += 1;
+        }
+        for (offset, &count) in ports.iter().enumerate() {
+            assert_eq!(table.holds_port(1000 + offset as u16), count != 0);
+        }
+        if let Some((deadline, _)) = table.first_expiry() {
+            assert!(
+                model
+                    .values()
+                    .all(|&(_, index)| table.record(index).deadline >= deadline)
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_allocated_before_a_record_is_stored() {
+        let table = TimeWaitTable::new(1 << 30);
+        assert_eq!(table.buckets.capacity(), 0);
+        assert_eq!(table.ports.capacity(), 0);
+        assert_eq!(table.entries.capacity(), 0);
+        assert_eq!(table.find(7, record(1, 1000, 5).tuple), None);
+        assert!(!table.holds_port(1000));
+    }
+
+    // Records stored and removed in any order are found through every
+    // doubling, while the earlier buckets move, and the buckets follow the
+    // records up to the bound.
+    #[test]
+    fn records_are_found_while_the_buckets_double() {
+        for limit in [1, 5, 16, 100, 3000] {
+            let mut table = TimeWaitTable::new(limit);
+            let mut model = BTreeMap::new();
+            let mut colliding = 0;
+            let mut peak = 0;
+            for step in 0..20_000u64 {
+                let roll = mix(step ^ (limit as u64) << 32);
+                let peer = (roll % (limit as u64 * 2)) as u32;
+                if let Some((hash, index)) = model.remove(&peer) {
+                    colliding -= usize::from(hash & 0xf_ffff == 5);
+                    let removed = table.remove(index);
+                    assert_eq!(
+                        removed.tuple,
+                        record(peer, removed.tuple.tuple.local.port(), 0).tuple
+                    );
+                } else {
+                    // Some hashes share their low bits, as a chain of
+                    // every size has them all.
+                    let hash = if roll & 3 == 0 && colliding < 32 {
+                        colliding += 1;
+                        (roll >> 40) << 20 | 5
+                    } else {
+                        mix(u64::from(peer)) | 0x8_0000
+                    };
+                    let record = record(peer, 1000 + (peer % 8) as u16, roll >> 48);
+                    assert_eq!(
+                        table.insert(hash, record),
+                        model.len() < limit,
+                        "limit {limit} step {step}"
+                    );
+                    match table.find(hash, record.tuple) {
+                        Some(index) => {
+                            model.insert(peer, (hash, index));
+                        }
+                        None => colliding -= usize::from(hash & 0xf_ffff == 5),
+                    }
+                }
+                peak = peak.max(model.len());
+                assert!(table.buckets.len() <= (2 * peak).max(MIN_BUCKETS));
+                if limit <= 100 || step % 101 == 0 {
+                    check(&table, &model);
+                }
+            }
+            check(&table, &model);
+        }
+    }
+
+    // A chain holds at most CHAIN records; a record in another chain is
+    // still stored.
+    #[test]
+    fn a_full_chain_refuses_a_record() {
+        let mut table = TimeWaitTable::new(1000);
+        let mut model = BTreeMap::new();
+        for peer in 0..CHAIN as u32 {
+            assert!(table.insert(9, record(peer, 1000, 1)));
+            model.insert(
+                peer,
+                (9, table.find(9, record(peer, 1000, 1).tuple).unwrap()),
+            );
+        }
+        assert!(!table.insert(9, record(500, 1000, 1)));
+        assert!(table.insert(10, record(501, 1001, 1)));
+        model.insert(
+            501,
+            (10, table.find(10, record(501, 1001, 1).tuple).unwrap()),
+        );
+        check(&table, &model);
+        let (_, index) = model.remove(&3).unwrap();
+        table.remove(index);
+        assert!(table.insert(9, record(500, 1000, 1)));
+        model.insert(500, (9, table.find(9, record(500, 1000, 1).tuple).unwrap()));
+        check(&table, &model);
+    }
+
+    // A record whose storage cannot be allocated is not stored, and the
+    // table stays as it was.
+    #[test]
+    fn a_failed_allocation_stores_nothing() {
+        let mut table = TimeWaitTable::new(1000);
+        let mut model = BTreeMap::new();
+        for peer in 0..200u32 {
+            let hash = mix(u64::from(peer));
+            let record = record(peer, 1000 + (peer % 8) as u16, u64::from(peer));
+            let mut failure = 0;
+            while !crate::allocation_tests::fail_after(failure, || table.insert(hash, record)) {
+                check(&table, &model);
+                failure += 1;
+            }
+            model.insert(peer, (hash, table.find(hash, record.tuple).unwrap()));
+            check(&table, &model);
+        }
     }
 }

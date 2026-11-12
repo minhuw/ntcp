@@ -771,8 +771,7 @@ impl Endpoint {
             listen_overflows: 0,
             listen_drops: 0,
             time_wait_slots: 0,
-            time_wait: crate::time_wait::TimeWaitTable::new(config.max_time_wait)
-                .map_err(|_| Error::NoMemory)?,
+            time_wait: crate::time_wait::TimeWaitTable::new(config.max_time_wait),
             time_wait_overflows: 0,
             loss_counters: crate::LossCounters::default(),
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
