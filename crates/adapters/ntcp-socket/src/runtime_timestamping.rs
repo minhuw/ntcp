@@ -230,11 +230,14 @@ impl Owner {
                 .filter(|s| s.timestamps.options.flags & RX_SOFTWARE != 0)
                 .count()
         );
-        self.rx_software != 0
-            || self
-                .child_timestamps
+        debug_assert_eq!(
+            self.rx_software_children,
+            self.child_timestamps
                 .iter()
-                .any(|p| p.1.flags & RX_SOFTWARE != 0)
+                .filter(|p| p.1.flags & RX_SOFTWARE != 0)
+                .count()
+        );
+        self.rx_software != 0 || self.rx_software_children != 0
     }
     pub(super) fn backend_sources(&self, token: ntcp::TxTimestampToken) -> (bool, bool) {
         let range = token.stream_range();

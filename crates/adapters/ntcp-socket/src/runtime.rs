@@ -631,6 +631,103 @@ impl Socket {
         })
     }
 }
+// The connections `endpoint` reclaimed since its reclaim count was
+// `since`, oldest first (`Endpoint::reclaimed_since`); None once its log
+// no longer reaches back that far, or for a count from a replaced
+// endpoint: the caller checks each of its entries instead.
+fn reclaimed_since(
+    endpoint: &Endpoint,
+    since: u64,
+) -> Option<impl Iterator<Item = ConnectionId> + '_> {
+    (since <= endpoint.reclaimed())
+        .then(|| endpoint.reclaimed_since(since))
+        .flatten()
+}
+// Metadata the owner keeps per connection beside the endpoint, each entry
+// starting with its connection: in arrival order, found through an index
+// by connection, and removed by moving the last entry into its place
+// (`Vec::swap_remove`), as Linux reaches a socket's state from the socket.
+#[derive(Clone, Debug)]
+struct ByConnection<T> {
+    entries: Vec<T>,
+    index: HashMap<ConnectionId, usize>,
+}
+trait Keyed {
+    fn key(&self) -> ConnectionId;
+}
+impl Keyed for ConnectionOptions {
+    fn key(&self) -> ConnectionId {
+        self.0
+    }
+}
+impl Keyed for ChildOptionsSnapshot {
+    fn key(&self) -> ConnectionId {
+        self.0
+    }
+}
+impl Keyed for (ConnectionId, crate::timestamping::Options) {
+    fn key(&self) -> ConnectionId {
+        self.0
+    }
+}
+impl<T> Default for ByConnection<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+}
+impl<T: Keyed> ByConnection<T> {
+    fn push(&mut self, entry: T) {
+        let previous = self.index.insert(entry.key(), self.entries.len());
+        debug_assert!(previous.is_none(), "one entry per connection");
+        self.entries.push(entry);
+    }
+    fn contains(&self, key: ConnectionId) -> bool {
+        self.index.contains_key(&key)
+    }
+    fn get(&self, key: ConnectionId) -> Option<&T> {
+        self.index.get(&key).map(|&at| &self.entries[at])
+    }
+    fn get_mut(&mut self, key: ConnectionId) -> Option<&mut T> {
+        self.index.get(&key).map(|&at| &mut self.entries[at])
+    }
+    fn remove(&mut self, key: ConnectionId) -> Option<T> {
+        let at = self.index.remove(&key)?;
+        let entry = self.entries.swap_remove(at);
+        if let Some(moved) = self.entries.get(at) {
+            self.index.insert(moved.key(), at);
+        }
+        Some(entry)
+    }
+    // Keeps the entries `keep` holds for, in their order: a pass over all.
+    fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
+        self.entries.retain(keep);
+        self.index.clear();
+        for (at, entry) in self.entries.iter().enumerate() {
+            self.index.insert(entry.key(), at);
+        }
+    }
+}
+impl<T> std::ops::Deref for ByConnection<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.entries
+    }
+}
+impl<'a, T> IntoIterator for &'a ByConnection<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+impl<T: PartialEq> PartialEq for ByConnection<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
 // The lists of sockets that passes visit instead of every socket, linked
 // through the sockets as Linux links a socket into a wait queue: joining
 // one never allocates, and a socket leaves one in constant time.
@@ -704,6 +801,16 @@ pub(crate) fn unsupported_option(reason: &str) -> i32 {
         EOPNOTSUPP
     }
 }
+// A connection's IP options and local address, kept until it is
+// reclaimed (`Owner::connection_options`).
+type ConnectionOptions = (
+    ConnectionId,
+    u8,
+    i32,
+    Option<bool>,
+    SocketAddr,
+    ports::Binding,
+);
 type ChildOptionsSnapshot = (
     ConnectionId,
     u64,
@@ -799,19 +906,20 @@ struct Owner {
     timestamp_cookie: u64,
     // Sum of every socket's settled timestamp charge.
     timestamp_total: usize,
-    child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
+    // Unaccepted children's options, taken by accept and forgotten when
+    // their connection is reclaimed (`prune_child_timeouts`, from the
+    // reclaim count `children_reclaimed`).
+    child_timestamps: ByConnection<(ConnectionId, crate::timestamping::Options)>,
+    // Of `child_timestamps`, those enabling software receive timestamps.
+    rx_software_children: usize,
     pending: VecDeque<Request>,
-    child_timeouts: Vec<ChildOptionsSnapshot>,
+    child_timeouts: ByConnection<ChildOptionsSnapshot>,
+    children_reclaimed: u64,
     // Local tuple survives descriptor close and Endpoint::release until GC
-    // (`collect_connection_options`), and holds its port in `port_index`.
-    connection_options: Vec<(
-        ConnectionId,
-        u8,
-        i32,
-        Option<bool>,
-        SocketAddr,
-        ports::Binding,
-    )>,
+    // (`collect_connection_options`, from the reclaim count
+    // `options_reclaimed`), and holds its port in `port_index`.
+    connection_options: ByConnection<ConnectionOptions>,
+    options_reclaimed: u64,
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
 }
@@ -1226,10 +1334,13 @@ impl Owner {
             reservation_timeout_us: 1_000_000,
             timestamp_cookie: 1,
             timestamp_total: 0,
-            child_timestamps: Vec::new(),
+            child_timestamps: ByConnection::default(),
+            rx_software_children: 0,
             pending: VecDeque::new(),
-            child_timeouts: Vec::new(),
-            connection_options: Vec::new(),
+            child_timeouts: ByConnection::default(),
+            children_reclaimed: 0,
+            connection_options: ByConnection::default(),
+            options_reclaimed: 0,
             #[cfg(feature = "packet-test")]
             packets: None,
         })
@@ -1254,6 +1365,8 @@ impl Owner {
             None,
             SocketConfig::new("test", local).tcp,
         )?;
+        // A new endpoint's reclaim log starts again.
+        (owner.options_reclaimed, owner.children_reclaimed) = (0, 0);
         owner.endpoint = Endpoint::new(
             crate::packet_profile::config(profile),
             [42; 32],
@@ -1315,6 +1428,7 @@ impl Owner {
         assert!(self.packets.is_some());
         assert_eq!(self.host.as_ref().unwrap().binding_count(), 0);
         self.endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).map_err(engine)?;
+        (self.options_reclaimed, self.children_reclaimed) = (0, 0);
         self.defaults = config;
         let previous = self
             .host
@@ -1851,11 +1965,41 @@ impl Owner {
         }
         Ok(())
     }
+    // Forgets the options of children whose connection the endpoint has
+    // reclaimed since the last call: those its reclaim log names, as Linux
+    // frees a request's state with the request.
     fn prune_child_timeouts(&mut self) {
-        self.child_timeouts
-            .retain(|(cid, _, _, _, _)| self.endpoint.connection_exists(*cid));
-        self.child_timestamps
-            .retain(|(cid, _)| self.endpoint.connection_exists(*cid));
+        let since = self.children_reclaimed;
+        let (endpoint, timeouts, stamps, rx) = (
+            &self.endpoint,
+            &mut self.child_timeouts,
+            &mut self.child_timestamps,
+            &mut self.rx_software_children,
+        );
+        match reclaimed_since(endpoint, since) {
+            Some(reclaimed) => {
+                for cid in reclaimed {
+                    timeouts.remove(cid);
+                    if let Some((_, options)) = stamps.remove(cid) {
+                        *rx -= usize::from(options.flags & crate::timestamping::RX_SOFTWARE != 0);
+                    }
+                }
+            }
+            None => {
+                timeouts.retain(|p| endpoint.connection_exists(p.0));
+                stamps.retain(|p| endpoint.connection_exists(p.0));
+                *rx = stamps
+                    .iter()
+                    .filter(|p| p.1.flags & crate::timestamping::RX_SOFTWARE != 0)
+                    .count();
+            }
+        }
+        self.children_reclaimed = self.endpoint.reclaimed();
+        debug_assert!(
+            self.child_timeouts.iter().map(|p| p.0)
+                .chain(self.child_timestamps.iter().map(|p| p.0))
+                .all(|cid| self.endpoint.connection_exists(cid))
+        );
     }
     #[cfg(test)]
     fn input(
@@ -2011,7 +2155,7 @@ impl Owner {
         let new_child = tuple
             .and_then(|tuple| self.arrival_connection(tuple, arrival))
             .filter(|cid| {
-                Some(*cid) != before && !self.connection_options.iter().any(|p| p.0 == *cid)
+                Some(*cid) != before && !self.connection_options.contains(*cid)
             });
         if let Some(cid) = new_child
             && let Some(listener) = listener.and_then(|listener| self.listener_socket(listener))
@@ -2019,9 +2163,10 @@ impl Owner {
             let s = &self.sockets[&listener];
             // Runtime bind policy admits only one listener per port. Input can
             // only create passive children; active opens go through Connect.
-            // ponytail: bounded linear metadata lookup, index if LIMIT grows.
             debug_assert!(self.child_timeouts.len() < LIMIT);
             self.child_timestamps.push((cid, s.timestamps.options));
+            self.rx_software_children +=
+                usize::from(s.timestamps.options.flags & crate::timestamping::RX_SOFTWARE != 0);
             self.child_timeouts.push((
                 cid,
                 listener,
@@ -2049,7 +2194,7 @@ impl Owner {
                     Ok(State::Established | State::CloseWait)
                 )
                 && let Some((_, listener, _, _, _)) =
-                    self.child_timeouts.iter().find(|p| p.0 == cid)
+                    self.child_timeouts.get(cid)
                 && let Some(s) = self.sockets.get_mut(listener)
                 && s.acceptable
             {
@@ -2080,7 +2225,7 @@ impl Owner {
             let state = self.endpoint.state(cid);
             if (matches!(state, Ok(State::Established | State::CloseWait))
                 || state == Ok(State::SynReceived) && self.endpoint.readable_bytes(cid)? != 0)
-                && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
+                && let Some(p) = self.connection_options.get_mut(cid)
                 && p.3.is_none()
             {
                 p.3 = listener_options.map(|p| p.2);
@@ -2411,17 +2556,37 @@ impl Owner {
             .connection(options.4.port(), options.5, true);
         self.connection_options.push(options);
     }
-    // Forgets the options of connections the endpoint no longer has, and the
-    // ports they held.
+    // Forgets the options of connections the endpoint has reclaimed since
+    // the last call (those its reclaim log names), and the ports they held.
     fn collect_connection_options(&mut self) {
-        let (index, endpoint) = (&mut self.port_index, &self.endpoint);
-        self.connection_options.retain(|p| {
-            let exists = endpoint.connection_exists(p.0);
-            if !exists {
-                index.connection(p.4.port(), p.5, false);
+        let since = self.options_reclaimed;
+        let (index, endpoint, options) = (
+            &mut self.port_index,
+            &self.endpoint,
+            &mut self.connection_options,
+        );
+        match reclaimed_since(endpoint, since) {
+            Some(reclaimed) => {
+                for cid in reclaimed {
+                    if let Some(p) = options.remove(cid) {
+                        index.connection(p.4.port(), p.5, false);
+                    }
+                }
             }
-            exists
-        });
+            None => options.retain(|p| {
+                let exists = endpoint.connection_exists(p.0);
+                if !exists {
+                    index.connection(p.4.port(), p.5, false);
+                }
+                exists
+            }),
+        }
+        self.options_reclaimed = self.endpoint.reclaimed();
+        debug_assert!(
+            self.connection_options
+                .iter()
+                .all(|p| self.endpoint.connection_exists(p.0))
+        );
     }
     // Whether a TIME-WAIT record, or a connection whose descriptor is
     // closed and which is not CLOSED (Linux unhashes a closed socket from
@@ -3135,18 +3300,14 @@ impl Owner {
                 let cid = accepted.map_err(engine)?;
                 (child.send_capacity, child.receive_capacity) =
                     self.endpoint.buffer_capacities(cid).map_err(engine)?;
-                if let Some(index) = self
-                    .child_timeouts
-                    .iter()
-                    .position(|(other, _, _, _, _)| *other == cid)
+                if let Some((
+                    _,
+                    _,
+                    receive,
+                    send,
+                    (nodelay, cork, inq, lowat, freebind, other_tos, other_discover, linger),
+                )) = self.child_timeouts.remove(cid)
                 {
-                    let (
-                        _,
-                        _,
-                        receive,
-                        send,
-                        (nodelay, cork, inq, lowat, freebind, other_tos, other_discover, linger),
-                    ) = self.child_timeouts.swap_remove(index);
                     child.receive_timeout_us = receive;
                     child.send_timeout_us = send;
                     child.nodelay = nodelay;
@@ -3175,12 +3336,14 @@ impl Owner {
                     .map_err(engine)?
                     .map_or(0, |us| (us / 1000) as i32);
                 child.mark = self.endpoint.mark(cid).map_err(engine)?;
-                if let Some(p) = self.connection_options.iter().find(|p| p.0 == cid) {
+                if let Some(p) = self.connection_options.get(cid) {
                     child.set_wire_ip_policy(self.local, p.1, p.2);
                     child.zerocopy = p.3.unwrap_or(false);
                 }
-                if let Some(index) = self.child_timestamps.iter().position(|p| p.0 == cid) {
-                    child.timestamps.options = self.child_timestamps.swap_remove(index).1;
+                if let Some((_, options)) = self.child_timestamps.remove(cid) {
+                    self.rx_software_children -=
+                        usize::from(options.flags & crate::timestamping::RX_SOFTWARE != 0);
+                    child.timestamps.options = options;
                 }
                 child.zone = match self.connection_zone(cid) {
                     Ok(zone) => zone,
@@ -3897,7 +4060,7 @@ impl Owner {
                     }
                 }
                 if let Handle::Connection(cid) = s.handle
-                    && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
+                    && let Some(p) = self.connection_options.get_mut(cid)
                 {
                     p.1 = s.wire_tos(self.local);
                     p.2 = s.wire_discover(self.local);

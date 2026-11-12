@@ -383,7 +383,7 @@ impl Owner {
         self.local.is_ipv4()
             && self.host.is_some()
             && owner
-                .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
+                .and_then(|cid| self.connection_options.get(cid))
                 .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
             && attempt.is_none_or(|a| self.endpoint.transmit_discovery_intent(a).is_none())
     }
