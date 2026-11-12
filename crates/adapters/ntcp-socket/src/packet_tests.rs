@@ -1986,6 +1986,7 @@ fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
     owner.sockets.get_mut(&fd).unwrap().completions = (0..LIMIT as u32)
         .map(|n| Completion::ZeroCopy(n + 10, n + 10))
         .collect();
+    owner.recount_timestamp_charge(fd);
     let written = owner
         .inner
         .endpoint
@@ -2039,6 +2040,7 @@ fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
     let socket = owner.sockets.get_mut(&fd).unwrap();
     socket.completions = [Completion::ZeroCopy(1, u32::MAX)].into();
     socket.zc_next = 0;
+    owner.recount_timestamp_charge(fd);
     assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
     assert_eq!(
         owner.sockets[&fd].completions,

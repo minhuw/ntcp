@@ -235,6 +235,7 @@ impl Owner {
     pub(super) fn collect_zero_copy(&mut self) {
         for socket in self.sockets.values_mut() {
             let mut index = 0;
+            let mut collected = false;
             while index < socket.zc_leases.len() {
                 let Some(copied) = socket.zc_leases[index].state.complete() else {
                     index += 1;
@@ -249,11 +250,15 @@ impl Owner {
                 {
                     *hi = pending.id;
                 } else {
-                    socket
-                        .completions
-                        .push_back(Completion::SharedZeroCopy(pending.id, pending.id, copied));
+                    socket.push_completion(Completion::SharedZeroCopy(
+                        pending.id, pending.id, copied,
+                    ));
                 }
                 socket.readiness_generations[2] = socket.readiness_generations[2].wrapping_add(1);
+                collected = true;
+            }
+            if collected {
+                socket.settle_timestamp_charge(&mut self.timestamp_total);
             }
         }
     }
@@ -429,6 +434,7 @@ impl Owner {
                 .zc_leases
                 .try_reserve_exact(pending.saturating_sub(socket.zc_leases.len()))
                 .map_err(|_| ENOBUFS)?;
+            socket.settle_timestamp_charge(&mut self.timestamp_total);
             let state = send.lease.get_or_insert_with(|| {
                 let state = crate::zerocopy::LeaseState::new();
                 if send.accepted != 0 {
@@ -556,10 +562,11 @@ impl Owner {
                 {
                     *hi = next;
                 } else {
-                    s.completions.push_back(Completion::ZeroCopy(next, next));
+                    s.push_completion(Completion::ZeroCopy(next, next));
                 }
                 s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
             }
+            s.settle_timestamp_charge(&mut self.timestamp_total);
         }
         self.collect_zero_copy();
         // A blocking implicit connect has only provisionally copied SYN data.

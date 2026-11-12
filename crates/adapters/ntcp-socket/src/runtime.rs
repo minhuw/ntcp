@@ -507,6 +507,10 @@ struct Socket {
     zc_leases: VecDeque<crate::zerocopy::Pending>,
     completions: VecDeque<Completion>,
     timestamps: TimestampState,
+    // Sum of Completion::charge over `completions`.
+    completion_charge: usize,
+    // This socket's share of Owner::timestamp_total at its last settle.
+    timestamp_charged: usize,
 }
 impl Socket {
     fn server_cookie_for(&self, remote: SocketAddr) -> Option<FastOpenCookie> {
@@ -590,6 +594,8 @@ impl Socket {
             zc_leases: VecDeque::new(),
             completions: VecDeque::new(),
             timestamps: TimestampState::default(),
+            completion_charge: 0,
+            timestamp_charged: 0,
         }
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
@@ -715,6 +721,8 @@ struct Owner {
     egress: Option<egress::Egress>,
     reservation_timeout_us: u64,
     timestamp_cookie: u64,
+    // Sum of every socket's settled timestamp charge.
+    timestamp_total: usize,
     child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
     pending: VecDeque<Request>,
     child_timeouts: Vec<ChildOptionsSnapshot>,
@@ -1134,6 +1142,7 @@ impl Owner {
             egress: None,
             reservation_timeout_us: 1_000_000,
             timestamp_cookie: 1,
+            timestamp_total: 0,
             child_timestamps: Vec::new(),
             pending: VecDeque::new(),
             child_timeouts: Vec::new(),
@@ -2061,6 +2070,7 @@ impl Owner {
             self.port_index.socket(local.port(), s.binding, true);
         }
         self.sockets.insert(id, s);
+        self.settle_timestamp_charge(id);
         Ok(id as i32)
     }
     //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
@@ -2313,12 +2323,13 @@ impl Owner {
             {
                 *hi = next;
             } else {
-                s.completions.push_back(Completion::ZeroCopy(next, next));
+                s.push_completion(Completion::ZeroCopy(next, next));
             }
             s.zc_next = next.wrapping_add(1);
             // A newly completed send wakes ET error-queue consumers even if
             // an older completion still keeps EPOLLERR asserted.
             s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
+            s.settle_timestamp_charge(&mut self.timestamp_total);
         }
         Ok(n as i32)
     }
@@ -3198,7 +3209,9 @@ impl Owner {
                         )? as i32
                     }
                 };
-                self.sockets.get_mut(&id).unwrap().completions.pop_front();
+                let s = self.sockets.get_mut(&id).unwrap();
+                s.pop_completion();
+                s.settle_timestamp_charge(&mut self.timestamp_total);
             }
             Op::Transport(option) | Op::TransportPrefix(option, _) => {
                 let requested = if let Op::TransportPrefix(_, requested) = op {
@@ -3276,7 +3289,7 @@ impl Owner {
                         true
                     }
                 });
-                let s = self.sockets.remove(&id).unwrap();
+                let s = self.remove_socket(id).unwrap();
                 if let Some(local) = s.local {
                     self.port_index.socket(local.port(), s.binding, false);
                     if let Some(peer) = s.deferred_peer {
@@ -3659,6 +3672,7 @@ impl Owner {
                     }
                 }
                 self.sockets.insert(id, candidate);
+                self.settle_timestamp_charge(id);
                 // Linux tcp_setsockopt calls sk_write_space even for a repeated
                 // LOWAT value. Notify each ET registration, not just 0->OUT.
                 if (level, name) == (IPPROTO_TCP, TCP_NOTSENT_LOWAT)

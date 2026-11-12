@@ -391,6 +391,7 @@ fn logical_option_change_preserves_deferred_completion_reservations() {
         .unwrap()
         .completions
         .push_back(Completion::ZeroCopy(10, 10));
+    a.recount_timestamp_charge(client);
     let bytes = vec![1; 150000];
     let (mut request, reply) = logical_request(
         &mut a,

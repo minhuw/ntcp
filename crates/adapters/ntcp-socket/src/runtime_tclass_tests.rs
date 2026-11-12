@@ -444,6 +444,7 @@ fn ipv6_tclass_failed_transactions_keep_exact_sticky_and_wire_policy() {
     let pressure = new(&mut a);
     a.sockets.get_mut(&pressure).unwrap().completions =
         VecDeque::with_capacity(timestamps::RUNTIME_BYTES / std::mem::size_of::<Completion>() + 1);
+    a.recount_timestamp_charge(pressure);
     for value in [-1, 171, -2, 256] {
         assert_eq!(
             a.execute(client, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, value))
@@ -464,6 +465,7 @@ fn ipv6_tclass_failed_transactions_keep_exact_sticky_and_wire_policy() {
         assert_eq!(a.endpoint.transport_info(connection).unwrap(), before);
     }
     a.sockets.get_mut(&pressure).unwrap().completions = VecDeque::new();
+    a.recount_timestamp_charge(pressure);
     a.execute(client, Op::Write(vec![7; 100])).unwrap();
     let mut bytes = [0; 2048];
     let (output, attempt) = a

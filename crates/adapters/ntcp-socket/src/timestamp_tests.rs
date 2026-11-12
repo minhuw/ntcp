@@ -227,6 +227,7 @@ fn timestamp_runtime_payload_fault_control_fault_and_all_truncations() {
             .unwrap()
             .completions
             .push_back(original.clone());
+        a.recount_timestamp_charge(client);
         let mut control = [0u8; 120];
         m.msg_control = control.as_mut_ptr().cast();
         m.msg_controllen = capacity;
@@ -432,6 +433,7 @@ fn timestamp_runtime_generation_reporting_and_syn_id_bases() {
             if tcp_id { 2 } else { 3 }
         );
         a.sockets.get_mut(&client).unwrap().completions.clear();
+        a.recount_timestamp_charge(client);
         timestamp_set(&mut a, client, ts::TX_SOFTWARE | ts::OPT_TSONLY);
         a.execute(client, Op::Write(vec![4])).unwrap();
         pump(&mut a, &mut b);
@@ -670,6 +672,7 @@ fn timestamp_runtime_joint_zerocopy_reservation_is_fallible_before_acceptance() 
             .completions
             .push_back(Completion::ZeroCopy(n, n));
     }
+    a.recount_timestamp_charge(client);
     let Handle::Connection(cid) = a.sockets[&client].handle else {
         unreachable!()
     };
@@ -723,6 +726,7 @@ fn timestamp_runtime_joint_127_boundary_and_zerocopy_coalescing() {
             .completions
             .push_back(Completion::ZeroCopy(n, n));
     }
+    a.recount_timestamp_charge(client);
     let before = a.endpoint.send_progress(cid).unwrap();
     let cookie = a.timestamp_cookie;
     assert_eq!(

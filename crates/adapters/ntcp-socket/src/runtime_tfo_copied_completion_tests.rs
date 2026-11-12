@@ -302,6 +302,7 @@ fn copied_initial_tfo_pending_reservation_stays_charged_and_counter_wraps_once()
             .completions
             .push_back(Completion::ZeroCopy(i as u32 * 2, i as u32 * 2));
     }
+    f.a.recount_timestamp_charge(f.client);
     assert_eq!(
         f.a.reserve_send_completion(f.client, true, true, 0, true),
         Err(ENOBUFS)
@@ -490,6 +491,7 @@ fn initial_tfo_copy_completion_fault_and_full_queue_do_not_start_or_consume_id()
                     s.completions
                         .push_back(Completion::ZeroCopy(i as u32 * 2, i as u32 * 2));
                 }
+                a.recount_timestamp_charge(client);
             }
             let original_count = a.sockets[&client].completions.len();
             let result = a.execute(

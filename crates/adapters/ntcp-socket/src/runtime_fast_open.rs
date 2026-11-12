@@ -61,6 +61,7 @@ impl Owner {
         let options = s.timestamps.options;
         s.timestamps = TimestampState::default();
         s.timestamps.options = options;
+        s.settle_timestamp_charge(&mut self.timestamp_total);
         self.rollback_connection(cid);
     }
 

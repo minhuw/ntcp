@@ -67,13 +67,40 @@ struct Pending {
     payload: PacketPayload,
     observed: Option<Vec<Observation>>,
 }
+impl Pending {
+    fn charge(&self) -> usize {
+        self.phases * RECORD
+            + self.payload.charge()
+            + self
+                .observed
+                .as_ref()
+                .map_or(0, |v| v.capacity() * std::mem::size_of::<Observation>())
+    }
+}
 #[derive(Clone, Default)]
 pub(super) struct TimestampState {
     pub(super) options: Options,
     pub(super) base: u32,
     pending: Vec<Pending>,
+    // Sum of Pending::charge, kept at each change of a pending record.
+    pending_charge: usize,
 }
 impl TimestampState {
+    fn push(&mut self, pending: Pending) {
+        self.pending_charge += pending.charge();
+        self.pending.push(pending);
+    }
+    // Applies a change to one record and carries its charge difference.
+    fn update<T>(&mut self, index: usize, change: impl FnOnce(&mut Pending) -> T) -> T {
+        let pending = &mut self.pending[index];
+        let before = pending.charge();
+        let result = change(pending);
+        self.pending_charge = self.pending_charge - before + pending.charge();
+        result
+    }
+    fn remove(&mut self, index: usize) {
+        self.pending_charge -= self.pending.swap_remove(index).charge();
+    }
     pub(super) fn reserved(&self) -> usize {
         self.pending.iter().map(|p| p.phases).sum()
     }
@@ -91,33 +118,43 @@ impl TimestampState {
                 .sum::<usize>()
     }
     pub(super) fn restore_reservations(&mut self) -> Result<()> {
+        let mut result = Ok(());
         for pending in &mut self.pending {
-            if let Some(observed) = &mut pending.observed {
-                observed
-                    .try_reserve_exact(4 - observed.len())
-                    .map_err(|_| ENOBUFS)?;
+            if let Some(observed) = &mut pending.observed
+                && observed.try_reserve_exact(4 - observed.len()).is_err()
+            {
+                result = Err(ENOBUFS);
+                break;
             }
         }
-        Ok(())
+        // A clone's observation storage has its own capacity: count it anew.
+        self.pending_charge = self.pending.iter().map(Pending::charge).sum();
+        result
     }
     fn charge(&self) -> usize {
-        self.pending.capacity() * std::mem::size_of::<Pending>()
-            + self
-                .pending
-                .iter()
-                .map(|p| {
-                    p.phases * RECORD
-                        + p.payload.charge()
-                        + p.observed
-                            .as_ref()
-                            .map_or(0, |v| v.capacity() * std::mem::size_of::<Observation>())
-                })
-                .sum::<usize>()
+        self.pending.capacity() * std::mem::size_of::<Pending>() + self.pending_charge
     }
 }
 impl Socket {
+    // Retained capacities plus the record sums kept as records are queued and
+    // dequeued, as Linux charges each error-queue skb to sk_rmem_alloc in
+    // sock_queue_err_skb and releases it in sock_rfree.
     fn timestamp_charge(&self) -> usize {
         self.timestamps.charge()
+            + self.zc_leases.capacity() * std::mem::size_of::<crate::zerocopy::Pending>()
+            + self.zc_leases.len() * std::mem::size_of::<crate::zerocopy::LeaseState>()
+            + self.completions.capacity() * std::mem::size_of::<Completion>()
+            + self.completion_charge
+    }
+    // The full sum the kept totals replace, for debug checks.
+    fn recount_timestamp_charge(&self) -> usize {
+        self.timestamps.pending.capacity() * std::mem::size_of::<Pending>()
+            + self
+                .timestamps
+                .pending
+                .iter()
+                .map(Pending::charge)
+                .sum::<usize>()
             + self.zc_leases.capacity() * std::mem::size_of::<crate::zerocopy::Pending>()
             + self.zc_leases.len() * std::mem::size_of::<crate::zerocopy::LeaseState>()
             + self.completions.capacity() * std::mem::size_of::<Completion>()
@@ -126,6 +163,23 @@ impl Socket {
                 .iter()
                 .map(Completion::charge)
                 .sum::<usize>()
+    }
+    // Moves the owner's total by this socket's change since it last settled.
+    // Call after every change to the socket's timestamp or completion storage.
+    pub(super) fn settle_timestamp_charge(&mut self, total: &mut usize) {
+        let charge = self.timestamp_charge();
+        debug_assert_eq!(charge, self.recount_timestamp_charge());
+        *total = *total - self.timestamp_charged + charge;
+        self.timestamp_charged = charge;
+    }
+    pub(super) fn push_completion(&mut self, completion: Completion) {
+        self.completion_charge += completion.charge();
+        self.completions.push_back(completion);
+    }
+    pub(super) fn pop_completion(&mut self) {
+        if let Some(completion) = self.completions.pop_front() {
+            self.completion_charge -= completion.charge();
+        }
     }
 }
 pub(super) fn realtime() -> u64 {
@@ -188,8 +242,34 @@ impl Owner {
                 (sw || p.software, hw || p.hardware)
             })
     }
+    // Kept as sockets settle, never summed per operation.
     pub(super) fn timestamp_charge(&self) -> usize {
-        self.sockets.values().map(Socket::timestamp_charge).sum()
+        debug_assert_eq!(
+            self.timestamp_total,
+            self.sockets
+                .values()
+                .map(Socket::recount_timestamp_charge)
+                .sum::<usize>()
+        );
+        self.timestamp_total
+    }
+    pub(super) fn settle_timestamp_charge(&mut self, id: u64) {
+        if let Some(s) = self.sockets.get_mut(&id) {
+            s.settle_timestamp_charge(&mut self.timestamp_total);
+        }
+    }
+    pub(super) fn remove_socket(&mut self, id: u64) -> Option<Socket> {
+        let s = self.sockets.remove(&id)?;
+        self.timestamp_total -= s.timestamp_charged;
+        Some(s)
+    }
+    // For tests that replace a socket's storage outright.
+    #[cfg(test)]
+    pub(super) fn recount_timestamp_charge(&mut self, id: u64) {
+        let s = self.sockets.get_mut(&id).unwrap();
+        s.timestamps.pending_charge = s.timestamps.pending.iter().map(Pending::charge).sum();
+        s.completion_charge = s.completions.iter().map(Completion::charge).sum();
+        s.settle_timestamp_charge(&mut self.timestamp_total);
     }
     pub(super) fn timestamp_options(&mut self, id: u64, name: i32, flags: u32) -> Result<()> {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
@@ -324,15 +404,14 @@ impl Owner {
             return Err(ENOBUFS);
         }
         let s = self.sockets.get_mut(&id).unwrap();
-        if phases != 0 {
-            s.timestamps
-                .pending
-                .try_reserve_exact(1)
-                .map_err(|_| ENOBUFS)?;
+        let reserved = if phases != 0 {
+            s.timestamps.pending.try_reserve_exact(1)
+        } else {
+            Ok(())
         }
-        s.completions
-            .try_reserve_exact(additional)
-            .map_err(|_| ENOBUFS)?;
+        .and_then(|()| s.completions.try_reserve_exact(additional));
+        s.settle_timestamp_charge(&mut self.timestamp_total);
+        reserved.map_err(|_| ENOBUFS)?;
         Ok(completion)
     }
     #[cfg(test)]
@@ -450,7 +529,7 @@ impl Owner {
         }
         if n != 0 && phases != 0 {
             let s = self.sockets.get_mut(&id).unwrap();
-            s.timestamps.pending.push(Pending {
+            s.timestamps.push(Pending {
                 cookie: self.timestamp_cookie,
                 target: progress.queued_end + n as u64 - 1,
                 sequence: progress.next_write_sequence.wrapping_add(n as u32 - 1),
@@ -460,6 +539,7 @@ impl Owner {
                 payload: payload.unwrap(),
                 observed: None,
             });
+            s.settle_timestamp_charge(&mut self.timestamp_total);
             self.timestamp_cookie += 1;
         }
         Ok(n)
@@ -477,7 +557,8 @@ impl Owner {
             .filter(|s| matches!(s.handle, Handle::Connection(cid) if cid == token.connection()))
         {
             let mut charge = s.timestamp_charge();
-            for pending in &mut s.timestamps.pending {
+            for index in 0..s.timestamps.pending.len() {
+                let pending = &s.timestamps.pending[index];
                 if !pending.payload.is_empty()
                     || !(range.start..range.end).contains(&pending.target)
                 {
@@ -488,20 +569,27 @@ impl Owner {
                 if charge + bytes.len() <= s.receive_capacity
                     && global + bytes.len() <= RUNTIME_BYTES
                 {
-                    if let Some(packet) = &retained {
-                        pending.payload = packet.clone();
-                    } else {
-                        let packet = Arc::get_mut(pending.payload.0.as_mut().unwrap()).unwrap();
-                        if packet.try_reserve_exact(bytes.len()).is_err() {
-                            continue;
+                    let stored = s.timestamps.update(index, |pending| {
+                        if let Some(packet) = &retained {
+                            pending.payload = packet.clone();
+                        } else {
+                            let packet = Arc::get_mut(pending.payload.0.as_mut().unwrap()).unwrap();
+                            if packet.try_reserve_exact(bytes.len()).is_err() {
+                                return false;
+                            }
+                            packet.extend_from_slice(bytes);
+                            retained = Some(pending.payload.clone());
                         }
-                        packet.extend_from_slice(bytes);
-                        retained = Some(pending.payload.clone());
+                        true
+                    });
+                    if !stored {
+                        continue;
                     }
                     charge += bytes.len();
                     global += bytes.len();
                 }
             }
+            s.settle_timestamp_charge(&mut self.timestamp_total);
         }
     }
     pub(super) fn drain_timestamps(&mut self, pair: ClockPair) {
@@ -510,11 +598,16 @@ impl Owner {
             let Handle::Connection(cid) = s.handle else {
                 continue;
             };
+            let mut drained = false;
             for _ in 0..PHASES {
                 let Ok(Some(event)) = self.endpoint.next_tx_timestamp(cid) else {
                     break;
                 };
                 Self::timestamp_event(s, event, pair, None, &mut global);
+                drained = true;
+            }
+            if drained {
+                s.settle_timestamp_charge(&mut self.timestamp_total);
             }
         }
     }
@@ -533,16 +626,22 @@ impl Owner {
         else {
             return;
         };
-        let pending = &mut s.timestamps.pending[index];
-        if event.stage == Stage::Transmit {
-            match event.source {
-                Source::Software => pending.software = false,
-                Source::Hardware => pending.hardware = false,
+        let current = (s.timestamps.options, s.timestamps.base);
+        let deferred = s.timestamps.update(index, |pending| {
+            if event.stage == Stage::Transmit {
+                match event.source {
+                    Source::Software => pending.software = false,
+                    Source::Hardware => pending.hardware = false,
+                }
             }
-        }
-        if let Some(observed) = &mut pending.observed {
+            let Some(observed) = &mut pending.observed else {
+                return false;
+            };
             debug_assert!(observed.len() < 4);
-            observed.push((event, pair, s.timestamps.options, s.timestamps.base));
+            observed.push((event, pair, current.0, current.1));
+            true
+        });
+        if deferred {
             return;
         }
         let (options, base) = options.unwrap_or((s.timestamps.options, s.timestamps.base));
@@ -568,7 +667,7 @@ impl Owner {
                 Stage::Transmit => 0,
                 Stage::Acknowledged => 2,
             };
-            s.completions.push_back(Completion::Timestamp {
+            let completion = Completion::Timestamp {
                 stamp: timestamps(sw, hw),
                 error: extended_error(stage, options.completion_id(pending.sequence, base)),
                 payload: if tsonly {
@@ -576,32 +675,45 @@ impl Owner {
                 } else {
                     pending.payload.clone()
                 },
-            });
+            };
+            s.push_completion(completion);
             *global += payload_charge;
             s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
         } else {
             *global = global.saturating_sub(RECORD);
         }
-        let pending = &mut s.timestamps.pending[index];
-        pending.phases -= 1;
-        if pending.phases == 0 {
-            *global = global.saturating_sub(pending.payload.charge());
-            s.timestamps.pending.swap_remove(index);
+        let finished = s.timestamps.update(index, |pending| {
+            pending.phases -= 1;
+            pending.phases == 0
+        });
+        if finished {
+            *global = global.saturating_sub(s.timestamps.pending[index].payload.charge());
+            s.timestamps.remove(index);
         }
     }
+    fn pending_index(s: &Socket, cookie: u64) -> Option<usize> {
+        s.timestamps.pending.iter().position(|p| p.cookie == cookie)
+    }
     pub(super) fn defer_timestamp(&mut self, id: u64, cookie: u64, observed: Vec<Observation>) {
-        if let Some(p) = self
-            .sockets
-            .get_mut(&id)
-            .and_then(|s| s.timestamps.pending.iter_mut().find(|p| p.cookie == cookie))
+        if let Some(s) = self.sockets.get_mut(&id)
+            && let Some(index) = Self::pending_index(s, cookie)
         {
-            p.observed = Some(observed);
+            s.timestamps.update(index, |p| p.observed = Some(observed));
+            s.settle_timestamp_charge(&mut self.timestamp_total);
         }
     }
     pub(super) fn discard_timestamp(&mut self, id: u64, cid: ConnectionId, cookie: u64) {
         let _ = self.endpoint.discard_tx_timestamp_request(cid, cookie);
         if let Some(s) = self.sockets.get_mut(&id) {
-            s.timestamps.pending.retain(|p| p.cookie != cookie);
+            let state = &mut s.timestamps;
+            state.pending.retain(|p| {
+                let keep = p.cookie != cookie;
+                if !keep {
+                    state.pending_charge -= p.charge();
+                }
+                keep
+            });
+            s.settle_timestamp_charge(&mut self.timestamp_total);
         }
     }
     pub(super) fn finish_timestamp(&mut self, id: u64, cookie: u64) {
@@ -609,13 +721,17 @@ impl Owner {
         let Some(s) = self.sockets.get_mut(&id) else {
             return;
         };
-        let Some(p) = s.timestamps.pending.iter_mut().find(|p| p.cookie == cookie) else {
+        let Some(index) = Self::pending_index(s, cookie) else {
             return;
         };
-        let observed = p.observed.take().unwrap_or_default();
+        let observed = s
+            .timestamps
+            .update(index, |p| p.observed.take())
+            .unwrap_or_default();
         for (event, pair, options, base) in observed {
             Self::timestamp_event(s, event, pair, Some((options, base)), &mut global);
         }
+        s.settle_timestamp_charge(&mut self.timestamp_total);
     }
     pub(super) fn software_transmitted(
         &mut self,
