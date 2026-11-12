@@ -925,9 +925,12 @@ impl Endpoint {
             return Err(Error::TimeWentBackwards.into());
         }
         let granularity = self.config.connection.timestamp_granularity;
-        if self.timestamp_clock_required()
-            && granularity.tick_in(now, self.config.connection.timebase)
-                - granularity.tick_in(self.now, self.config.connection.timebase)
+        let timebase = self.config.connection.timebase;
+        // Fewer than 2^31 - 1 periods cannot advance the tick by 2^31.
+        let period = timebase.ticks_from_us(granularity.tick_us());
+        if now - self.now >= ((1 << 31) - 1u64).saturating_mul(period)
+            && self.timestamp_clock_required()
+            && granularity.tick_in(now, timebase) - granularity.tick_in(self.now, timebase)
                 >= 1 << 31
         {
             return Err(Error::AmbiguousTimeJump.into());

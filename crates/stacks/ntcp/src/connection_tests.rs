@@ -18709,6 +18709,28 @@ fn timestamp_partial_credit_syn_fin_retransmit_and_zero_window_wakeup() {
 }
 
 #[test]
+fn timestamp_staleness_is_exact_at_the_half_range_tick_boundary() {
+    let cfg = ConnectionConfig {
+        timestamps: true,
+        timestamp_granularity: TimestampGranularity::Milliseconds,
+        ..config(256, 64)
+    };
+    let (mut a, _) = pair(cfg, 100);
+    a.write(b"old").unwrap();
+    // Sent in the last microsecond of tick 1: 2^31 - 1 whole periods later
+    // the tick has advanced by 2^31 - 1, one microsecond more by 2^31.
+    packet(&mut a, 1_999);
+    let sample = a.sample;
+    assert!(sample.is_some());
+    let boundary = 1_999 + ((1u64 << 31) - 1) * 1_000;
+    a.update_time(boundary).unwrap();
+    assert_eq!(a.sample, sample);
+    a.update_time(boundary + 1).unwrap();
+    assert_eq!(a.sample, None);
+    assert_eq!(a.last_timestamp_sent_at, None);
+}
+
+#[test]
 fn timestamp_stale_rtt_echo_cannot_alias_after_clock_recycle() {
     for granularity in [
         TimestampGranularity::Milliseconds,

@@ -4033,11 +4033,16 @@ impl Connection {
         } else {
             TimestampGranularity::Milliseconds
         };
+        // Ticks of one period differ by less than 2^31 while fewer than
+        // 2^31 - 1 periods separate the samples, so only an older sample
+        // needs its ticks divided out.
+        let period = self.config.timebase.ticks_from_us(granularity.tick_us());
         let stale = |sent: Instant| {
-            granularity
-                .tick_in(now, self.config.timebase)
-                .saturating_sub(granularity.tick_in(sent, self.config.timebase))
-                >= 1 << 31
+            now.saturating_sub(sent) >= ((1 << 31) - 1u64).saturating_mul(period)
+                && granularity
+                    .tick_in(now, self.config.timebase)
+                    .saturating_sub(granularity.tick_in(sent, self.config.timebase))
+                    >= 1 << 31
         };
         if self.sample.is_some_and(|(_, sent)| stale(sent))
             || self.last_timestamp_sent_at.is_some_and(stale)
@@ -4117,11 +4122,16 @@ impl Connection {
     //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
     //# It MUST tick at least once for each 2^31 bytes sent.
     fn timestamp_value(&self, now: Instant) -> u32 {
-        (self
-            .config
-            .timestamp_granularity
-            .tick_in(now, self.config.timebase) as u32)
-            .wrapping_add(self.timestamp_offset)
+        self.timestamp_value_at(
+            self.config
+                .timestamp_granularity
+                .tick_in(now, self.config.timebase),
+        )
+    }
+
+    // TSval at timestamp clock tick `tick`.
+    fn timestamp_value_at(&self, tick: u64) -> u32 {
+        (tick as u32).wrapping_add(self.timestamp_offset)
     }
 
     // Classic RFC 3168 only: setup offers remain binding for receive feedback even
@@ -8366,6 +8376,12 @@ impl Connection {
         //# where MMS_R is the maximum size for a transport-layer message that
         //# can be received (and reassembled at the IP layer) (MUST-67).
         let mss = self.receive_mss().to_be_bytes();
+        // The timestamp clock's tick at `now`: TSval, this tick's TS-bearing
+        // credit and its commit all read it, so it is divided out once.
+        let tick = self
+            .config
+            .timestamp_granularity
+            .tick_in(now, self.config.timebase);
         let mut options = [0; 40];
         options[..4].copy_from_slice(&[2, 4, mss[0], mss[1]]);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
@@ -8447,7 +8463,7 @@ impl Connection {
             self.reset_echo.map(|echo| (0, echo))
         } else if self.timestamps || syn && self.state == State::SynSent && self.config.timestamps {
             Some((
-                self.timestamp_value(now),
+                self.timestamp_value_at(tick),
                 if reset.map_or(self.state != State::SynSent, |(_, with_ack)| with_ack) {
                     self.ts_recent
                 } else {
@@ -8623,12 +8639,7 @@ impl Connection {
                 option_len += sack_option_len;
             }
         }
-        let tick_bytes = if self
-            .config
-            .timestamp_granularity
-            .tick_in(now, self.config.timebase)
-            == self.timestamp_tick
-        {
+        let tick_bytes = if tick == self.timestamp_tick {
             self.timestamp_bytes
         } else {
             0
@@ -10231,10 +10242,7 @@ impl Connection {
             }
         }
         if timestamp.is_some() {
-            self.timestamp_tick = self
-                .config
-                .timestamp_granularity
-                .tick_in(now, self.config.timebase);
+            self.timestamp_tick = tick;
             self.timestamp_bytes = tick_bytes + timestamp_cost;
         }
         if !challenge {
@@ -10760,12 +10768,12 @@ impl Connection {
         // A successfully filled tick can leave stream/control output queued.
         // Derive its wakeup from committed credit: failed encodes do not arm a
         // timer, and timeout advancing to the next tick removes this deadline.
-        let timestamp_wakeup = (self.timestamp_tick
-            == self
-                .config
-                .timestamp_granularity
-                .tick_in(self.now, self.config.timebase)
-            && self.timestamp_bytes >= self.config.timestamp_bytes_per_tick
+        let timestamp_wakeup = (self.timestamp_bytes >= self.config.timestamp_bytes_per_tick
+            && self.timestamp_tick
+                == self
+                    .config
+                    .timestamp_granularity
+                    .tick_in(self.now, self.config.timebase)
             && (self.syn_pending
                 || self.retx_pending
                 || self.fast_open_retry.is_some()
