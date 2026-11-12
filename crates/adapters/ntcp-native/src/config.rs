@@ -79,12 +79,21 @@ pub struct NetworkConfig {
     pub reassembly_datagrams: usize,
 }
 impl NetworkConfig {
-    /// The `tcp.max_buffer_bytes` a Network with this configuration on
-    /// backend `io` needs to hold `connections` connections at once: its
-    /// output reservations, one per connection slot and one for stateless
-    /// replies, each holding the TCP packet of one IP packet of the MTU,
-    /// and each connection's buffers and timestamp records. None if it
-    /// overflows.
+    /// The smallest `tcp.max_buffer_bytes` with which a Network with this
+    /// configuration on backend `io` admits `connections` connections at
+    /// once: its output reservations, one per connection slot and one for
+    /// stateless replies, each holding the TCP packet of one IP packet of
+    /// the MTU, and each connection's charge at open
+    /// (`EndpointConfig::connection_charge`), its receive ring, scratch
+    /// segment, first ledger entries and timestamp records. None if it
+    /// overflows. `buffer_budget(0, io)` is the reservations alone.
+    ///
+    /// It is a floor for the cap, not a cap to use: it leaves no room to
+    /// write. A connection is charged what it allocates, so its first write
+    /// adds a send ring of 2 bytes per byte of `send_capacity`, and its RACK
+    /// and SACK ledgers grow with the bytes it holds queued (68 bytes per
+    /// byte until they are kept per segment). A write the cap refuses fails
+    /// with Error::NoMemory.
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the

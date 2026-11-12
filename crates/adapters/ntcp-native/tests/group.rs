@@ -1053,7 +1053,9 @@ fn idle_connections_give_no_events() {
 }
 
 // The budget for n connections admits n connections, their timestamp
-// capacities included, and one octet less admits one fewer.
+// capacities included, and one octet less admits one fewer. An open the
+// budget refuses fails with NoMemory (ENOMEM); one with no slot left fails
+// with Capacity (EMFILE).
 #[test]
 fn the_buffer_budget_admits_exactly_its_connections() {
     let address = "10.73.0.1".parse().unwrap();
@@ -1079,10 +1081,19 @@ fn the_buffer_budget_admits_exactly_its_connections() {
         config.tcp.max_buffer_bytes = budget;
         let (wire, _) = wires(PacketLayer::Ip);
         let mut network = Network::new(config, wire, [1; 32], 0).unwrap();
-        (0..8).take_while(|_| network.connect(peer).is_ok()).count()
+        let count = (0..9).take_while(|_| network.connect(peer).is_ok()).count();
+        let refusal = network.connect(peer).unwrap_err();
+        (count, refusal)
     };
-    assert_eq!(admitted(budget), 3);
-    assert_eq!(admitted(budget - 1), 2);
+    let (count, refusal) = admitted(budget);
+    assert_eq!(count, 3);
+    assert!(matches!(refusal, Error::NoMemory), "{refusal:?}");
+    let (count, refusal) = admitted(budget - 1);
+    assert_eq!(count, 2);
+    assert!(matches!(refusal, Error::NoMemory), "{refusal:?}");
+    let (count, refusal) = admitted(usize::MAX);
+    assert_eq!(count, 8);
+    assert!(matches!(refusal, Error::Capacity), "{refusal:?}");
 }
 
 // Applications that read, write and accept only when an event says so

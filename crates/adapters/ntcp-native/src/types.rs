@@ -34,7 +34,13 @@ pub enum BlockReason {
 pub enum Error {
     InvalidConfig(&'static str),
     InvalidHandle,
+    // No connection slot, listener slot or ephemeral port is free, or a
+    // table of fixed size is full.
     Capacity,
+    // The buffer budget (`tcp.max_buffer_bytes`) or the allocator refused
+    // memory: an open whose buffers do not fit, or growth of a connection's
+    // buffers. Linux's ENOMEM.
+    NoMemory,
     TimeWentBackwards,
     WouldBlock(BlockReason),
     Unsupported(&'static str),
@@ -55,6 +61,7 @@ impl fmt::Display for Error {
             Self::InvalidConfig(s) => write!(f, "invalid native network configuration: {s}"),
             Self::InvalidHandle => f.write_str("handle belongs to another instance or generation"),
             Self::Capacity => f.write_str("native network capacity exhausted"),
+            Self::NoMemory => f.write_str("native network buffer memory exhausted"),
             Self::TimeWentBackwards => f.write_str("network time went backwards"),
             Self::WouldBlock(reason) => write!(f, "operation would block: {reason:?}"),
             Self::Unsupported(s) => write!(f, "unsupported native operation: {s}"),
@@ -77,6 +84,7 @@ impl From<ntcp::EndpointError> for Error {
         match e {
             ntcp::EndpointError::InvalidHandle => Self::InvalidHandle,
             ntcp::EndpointError::LimitReached => Self::Capacity,
+            ntcp::EndpointError::Connection(ntcp::Error::NoMemory) => Self::NoMemory,
             ntcp::EndpointError::OutputReserved => Self::WouldBlock(BlockReason::OutputReserved),
             ntcp::EndpointError::Connection(ntcp::Error::TimeWentBackwards) => {
                 Self::TimeWentBackwards
@@ -276,8 +284,9 @@ pub struct Counters {
     // and SYNs refused for want of a connection slot or buffer budget,
     // whose connection could not be allocated or that had no path to answer
     // on: Linux's ListenDrops (`Endpoint::listen_drops`). Each such packet
-    // is also in discarded. An active open refused for the same reasons, or
-    // for want of an ephemeral port, fails with Error::Capacity instead.
+    // is also in discarded. An active open refused for want of a slot or an
+    // ephemeral port fails with Error::Capacity instead, and one whose
+    // buffers the budget or the allocator refused with Error::NoMemory.
     pub listen_drops: u64,
     // Connections in TIME-WAIT now, released or not: Linux's sockstat `tw`
     // (`Endpoint::time_wait_connections`).
