@@ -113,6 +113,25 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
             ));
             assert_eq!(ntcp_test_available(), 1023);
             io.tso.as_mut().unwrap().room = 128;
+            // PSH and FIN only where the driver keeps them on the last
+            // segment (mlx5); the shim hands their header to the PMD as given.
+            packet[14 + l3 + 13] = 0x19;
+            assert!(matches!(
+                io.transmit_segmented(&packet, request),
+                Err(TcpSegmentationError::Unsupported)
+            ));
+            io.tso_psh = true;
+            assert!(io.tcp_segmentation_capabilities().unwrap().allow_psh);
+            assert_eq!(
+                io.transmit_segmented(&packet, request).unwrap(),
+                TxOutcome::Submitted
+            );
+            let (mut frame, mut mss) = (vec![0; packet.len()], 0);
+            let len = ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss);
+            assert_eq!((len as usize, mss), (packet.len(), 100));
+            assert_eq!(frame[14 + l3 + 13], 0x19);
+            assert_eq!(ntcp_test_available(), 1023);
+            io.tso_psh = false;
         }
         io.tso = None;
         let clock = ClockDescriptor {

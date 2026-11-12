@@ -686,3 +686,86 @@ fn timestamped_writes_leave_in_aggregates() {
         }
     }
 }
+
+// A DPDK port on mlx5, whose device keeps PSH and FIN on the last segment.
+fn mlx5() -> TcpSegmentationCapabilities {
+    TcpSegmentationCapabilities {
+        allow_psh: true,
+        ..dpdk()
+    }
+}
+
+// A 16 KiB response written whole on a warm NODELAY connection (as an HTTP
+// server writes it), alone or followed by shutdown: where the backend places PSH and FIN on the last segment it
+// leaves as one aggregate of 12 segments, the pushed short tail (and FIN) the
+// last of them, with nothing scalar beside it. Where it does not, the 11 full
+// segments form the aggregate and the tail leaves alone, as before. (With
+// Nagle the tail waits for the aggregate's ACK either way.)
+#[test]
+fn a_pushed_tail_and_fin_join_the_aggregate_where_the_backend_places_them() {
+    for close in [false, true] {
+        for capabilities in [dpdk(), mlx5()] {
+            let mut pair = Pair::new(false, true, Some(capabilities));
+            pair.a.set_nodelay(pair.client, true).unwrap();
+            let layer = pair.wire.layer;
+            let warm = data(200_000);
+            assert_eq!(pair.transfer(&warm), warm);
+            for _ in 0..10 {
+                pair.step();
+            }
+            let aggregates = pair.wire.aggregates.borrow().len();
+            let (sent, cut) = (pair.wire.sent.borrow().len(), pair.wire.cut.get());
+            let response = data(16 * 1024);
+            let receipt = pair
+                .a
+                .try_write(pair.client, &response, WriteOptions::default())
+                .unwrap();
+            assert_eq!(receipt.accepted, response.len());
+            if close {
+                pair.a.shutdown_write(pair.client).unwrap();
+            }
+            for _ in 0..5 {
+                pair.step();
+            }
+            let new = pair.wire.aggregates.borrow()[aggregates..].to_vec();
+            assert_eq!(new.len(), 1, "close={close} {capabilities:?}");
+            let (_, tcp, payload) = layout(&new[0].frame, layer);
+            assert_eq!(new[0].segment_payload_len, 1448);
+            let bytes = new[0].frame.len() - payload;
+            let flags = new[0].frame[tcp + 13];
+            let scalar = pair.wire.sent.borrow().len() - sent - (pair.wire.cut.get() - cut);
+            if capabilities.allow_psh {
+                assert_eq!(bytes, response.len());
+                assert_eq!(flags, 0x18 | u8::from(close), "close={close}");
+                assert_eq!(scalar, 0, "close={close}");
+            } else {
+                assert_eq!(bytes, 11 * 1448);
+                assert_eq!(flags, 0x10);
+                assert_eq!(scalar, 1, "close={close}");
+            }
+            let (mut received, mut out, mut eof) = (Vec::new(), vec![0; 65536], false);
+            for _ in 0..100 {
+                pair.step();
+                loop {
+                    match pair.b.try_read(pair.server, &mut out) {
+                        Ok(ReadOutcome::Data { len, .. }) => {
+                            received.extend_from_slice(&out[..len])
+                        }
+                        Ok(ReadOutcome::Eof) => {
+                            eof = true;
+                            break;
+                        }
+                        Err(error) if error.is_would_block() => break,
+                        other => panic!("read: {other:?}"),
+                    }
+                }
+                if received.len() == response.len() && eof == close {
+                    break;
+                }
+            }
+            assert_eq!(received, response);
+            assert_eq!(eof, close);
+            assert_eq!(pair.wire.retransmitted(), 0);
+        }
+    }
+}

@@ -3,8 +3,11 @@ use ntcp_io::{TcpSegmentationCapabilities, TcpSegmentationError as Error};
 // TSO repeats l2_len + l3_len + l4_len header bytes, TCP options included, in
 // every segment, as Linux hardware TSO does. The generic API does not say how
 // a device spreads PSH, FIN or CWR over the segments (Linux keeps PSH/FIN on
-// the last, CWR on the first), so this PMD-independent subset admits only ACK
-// and reports allow_psh/allow_cwr false. Returns (l3_len, l4_len).
+// the last, CWR on the first), so the PMD-independent subset admits only ACK.
+// PSH and FIN together are admitted where caps.allow_psh says the driver
+// keeps them on the last segment (psh_on_last_segment). CWR never is: no
+// driver here is known to clear it after the first segment, so allow_cwr is
+// never reported. Returns (l3_len, l4_len).
 pub(crate) fn validate(
     p: &[u8],
     mss: usize,
@@ -43,7 +46,9 @@ pub(crate) fn validate(
     if l4 < 20 || tcp + l4 >= p.len() || word(tcp + 16) != 0 {
         return Err(Error::InvalidInput);
     }
-    if p[tcp + 12] & 0x0f != 0 || p[tcp + 13] != 0x10 || word(tcp + 18) != 0 {
+    let flags = p[tcp + 13];
+    let allowed = ACK | if caps.allow_psh { PSH | FIN } else { 0 };
+    if p[tcp + 12] & 0x0f != 0 || flags & ACK == 0 || flags & !allowed != 0 || word(tcp + 18) != 0 {
         return Err(Error::Unsupported);
     }
     options(&p[tcp + 20..tcp + l4])?;
@@ -65,6 +70,20 @@ pub(crate) fn validate(
     }
     // Sequence space is modulo 2^32; the bounded payload cannot cover it twice.
     Ok((l3 as u16, l4 as u16))
+}
+
+const FIN: u8 = 0x01;
+const PSH: u8 = 0x08;
+const ACK: u8 = 0x10;
+
+// Whether the ethdev driver (rte_eth_dev_info driver_name) keeps PSH and FIN
+// on the last segment of a TSO mbuf only, as Linux tcp_gso_segment does: the
+// mlx5 PMD, under its PCI and auxiliary (SF) bus drivers' names in DPDK 26.03
+// (drivers/common/mlx5/mlx5_common.h:30-31; rte_eth_dev_info_get copies the
+// bus driver's name, lib/ethdev/rte_ethdev.c:4137). The evidence is at
+// Dpdk::tcp_segmentation_capabilities.
+pub(crate) fn psh_on_last_segment(driver: &str) -> bool {
+    matches!(driver, "mlx5_pci" | "mlx5_auxiliary")
 }
 
 // Copied options must stay valid in every segment: timestamps and SACK do (one
@@ -215,6 +234,84 @@ mod tests {
             let mut wrap = p.clone();
             wrap[tcp + 4..tcp + 8].fill(255);
             assert!(validate(&wrap, 1400, caps).is_ok());
+        }
+    }
+
+    // PSH and FIN, alone or together beside ACK, pass only where the driver
+    // keeps them on the last segment. CWR, ECE, URG, RST, SYN and a missing
+    // ACK never do, nor CWR when a caller claims allow_cwr.
+    #[test]
+    fn psh_and_fin_follow_the_capability() {
+        let psh = TcpSegmentationCapabilities {
+            allow_psh: true,
+            ..CAPS
+        };
+        let cwr = TcpSegmentationCapabilities {
+            allow_cwr: true,
+            ..psh
+        };
+        for v6 in [false, true] {
+            let tcp = if v6 { 54 } else { 34 };
+            let mut p = with_options(v6, &TIMESTAMPS, 3000);
+            for (flags, allowed) in [
+                (0x10, true),
+                (0x18, true),
+                (0x11, true),
+                (0x19, true),
+                (0x00, false),
+                (0x01, false),
+                (0x08, false),
+                (0x09, false),
+                (0x12, false),
+                (0x14, false),
+                (0x1b, false),
+                (0x30, false),
+                (0x50, false),
+                (0x90, false),
+                (0x99, false),
+            ] {
+                p[tcp + 13] = flags;
+                assert_eq!(
+                    validate(&p, 1400, CAPS).is_ok(),
+                    flags == 0x10,
+                    "{flags:#x}"
+                );
+                for caps in [psh, cwr] {
+                    match validate(&p, 1400, caps) {
+                        Ok(lengths) => {
+                            assert!(allowed, "{flags:#x}");
+                            assert_eq!(lengths, (if v6 { 40 } else { 20 }, 32));
+                        }
+                        Err(Error::Unsupported) => assert!(!allowed, "{flags:#x}"),
+                        Err(error) => panic!("{flags:#x}: {error:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_mlx5_keeps_psh_and_fin_on_the_last_segment() {
+        for name in ["mlx5_pci", "mlx5_auxiliary"] {
+            assert!(psh_on_last_segment(name), "{name}");
+        }
+        for name in [
+            "net_mlx5",
+            "mlx5",
+            "mlx5_pci ",
+            "MLX5_PCI",
+            "mlx4_pci",
+            "net_mlx4",
+            "net_ring",
+            "net_null",
+            "net_tap",
+            "net_ice",
+            "net_i40e",
+            "net_ixgbe",
+            "net_virtio",
+            "",
+        ] {
+            assert!(!psh_on_last_segment(name), "{name}");
         }
     }
 

@@ -5,7 +5,7 @@ use ntcp_io::{
     TxSchedulingCapabilities, TxTimestampRequest,
 };
 use std::{
-    ffi::c_void,
+    ffi::{CStr, c_char, c_void},
     io,
     marker::PhantomData,
     ptr::{self, NonNull},
@@ -47,6 +47,7 @@ unsafe extern "C" {
         config: *const TsoConfig,
     ) -> i32;
     fn ntcp_dpdk_get_mtu(port: u16, mtu: *mut u16) -> i32;
+    fn ntcp_dpdk_port_driver(port: u16, name: *mut c_char, capacity: usize) -> i32;
     fn ntcp_dpdk_tx_scheduling_check(port: u16, queue: u16) -> i32;
     fn ntcp_dpdk_tx_timestamp_lookup(offset: *mut i32, flag: *mut u64) -> i32;
     fn ntcp_dpdk_valid_port(port: u16) -> i32;
@@ -110,6 +111,9 @@ pub struct Dpdk {
     rx_next: usize,
     rx_count: usize,
     tso: Option<TsoConfig>,
+    // The driver keeps PSH and FIN on an aggregate's last segment only
+    // (segmentation::psh_on_last_segment), read with `tso`.
+    tso_psh: bool,
     shared_limit: Option<u16>,
     rx_timestamp: Option<TimestampConfig>,
     tx_scheduling: Option<TimestampConfig>,
@@ -129,6 +133,21 @@ pub(crate) unsafe fn tso_check(port: u16, queue: u16, pool: *mut c_void) -> io::
         return Err(io::Error::from_raw_os_error(-result));
     }
     Ok(config)
+}
+
+// The ethdev driver serving `port` (rte_eth_dev_info driver_name), or the
+// negative errno of rte_eth_dev_info_get. The caller guarantees that EAL is
+// initialized and the port is valid.
+pub(crate) unsafe fn driver_name(port: u16) -> Result<String, i32> {
+    let mut name = [0; 64];
+    // SAFETY: as the caller guarantees; buffer capacity is passed.
+    let result = unsafe { ntcp_dpdk_port_driver(port, name.as_mut_ptr(), name.len()) };
+    if result < 0 {
+        return Err(result);
+    }
+    // SAFETY: the shim NUL-terminates within capacity (snprintf).
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+    Ok(name.to_string_lossy().into_owned())
 }
 
 impl Dpdk {
@@ -174,6 +193,7 @@ impl Dpdk {
             rx_next: 0,
             rx_count: 0,
             tso: None,
+            tso_psh: false,
             shared_limit: None,
             rx_timestamp: None,
             tx_scheduling: None,
@@ -219,7 +239,12 @@ impl Dpdk {
     // remain unchanged, as required by from_borrowed. No per-packet query.
     pub fn enable_tcp_segmentation(&mut self) -> io::Result<()> {
         // SAFETY: the host keeps the port, queue and pool live and unchanged.
-        self.tso = Some(unsafe { tso_check(self.port, self.tx_queue, self.pool.as_ptr()) }?);
+        let config = unsafe { tso_check(self.port, self.tx_queue, self.pool.as_ptr()) }?;
+        // SAFETY: EAL is live and the port valid, as from_borrowed requires.
+        let driver =
+            unsafe { driver_name(self.port) }.map_err(|r| io::Error::from_raw_os_error(-r))?;
+        self.tso_psh = segmentation::psh_on_last_segment(&driver);
+        self.tso = Some(config);
         Ok(())
     }
 
@@ -328,7 +353,32 @@ impl PacketIo for Dpdk {
             // 63 more copies of the largest header: Ethernet, IPv6, 60-byte TCP.
             max_wire_bytes: MAX_PACKET_LEN + 63 * 114,
             local_ip_mtu: u32::from(c.mtu),
-            allow_psh: false,
+            // mlx5 only (psh_on_last_segment). The evidence is inferred from
+            // software, not from the device's documentation:
+            // - FIN, high confidence: Linux ORs FIN onto the unsent tail
+            //   (tcp_send_fin, net/ipv4/tcp_output.c:3880), which can be a
+            //   multi-segment GSO skb, and the mlx5 kernel driver hands that
+            //   skb to one LSO WQE without touching its flags
+            //   (drivers/net/ethernet/mellanox/mlx5/core/en_tx.c:270-281).
+            //   A FIN copied into every segment would end Linux's streams
+            //   early on every ConnectX, so the device keeps it on the last.
+            // - PSH, medium: Linux forces PSH onto every multi-segment skb
+            //   "to expedite GRO flush at receiver" (__tcp_transmit_skb,
+            //   tcp_output.c:1639-1648) through the same WQE. Copied into
+            //   every segment it would flush receivers' GRO at each one, a
+            //   loss of performance but of nothing else, so less certain.
+            // - The DPDK 26.03 mlx5 PMD builds the same TSO WQE from the
+            //   mbuf's header bytes, flags untouched (drivers/net/mlx5/
+            //   mlx5_tx.h:2401-2408, mlx5_tx_packet_multi_tso), and the shim
+            //   copies the header as given (ntcp_dpdk_tso_transmit).
+            // Linux's tcp_gso_segment clears the two together
+            // (net/ipv4/tcp_offload.c:209), so one capability covers both.
+            // CWR is unknown and stays refused: mlx5 does not advertise
+            // NETIF_F_TSO_ECN (en_main.c, mlx5e_build_nic_netdev), so Linux
+            // splits CWR skbs in software and never tells how the device
+            // places CWR. A pcap of a ConnectX port's aggregates, taken at a
+            // peer with GRO and LRO off, is the confirmation.
+            allow_psh: self.tso_psh,
             allow_cwr: false,
         })
     }

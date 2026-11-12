@@ -4,7 +4,7 @@
 //! Teardown order is structural: flows and queues hold the port, so the port
 //! is stopped and closed, and its pools freed, only after all of them drop.
 
-use crate::native::{Dpdk, tso_check};
+use crate::native::{Dpdk, driver_name, tso_check};
 use ntcp_io::{
     ClockDescriptor, ClockDomain, OwnedPacket, PacketIo, PacketLayer, Payload, ReceivedPacket,
     TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
@@ -77,7 +77,6 @@ unsafe extern "C" {
     fn ntcp_dpdk_port_release(port: u16, owner: u64, started: i32);
     fn ntcp_dpdk_read_clock(port: u16, clock: *mut u64) -> i32;
     fn ntcp_dpdk_port_mac(port: u16, mac: *mut u8) -> i32;
-    fn ntcp_dpdk_port_driver(port: u16, name: *mut c_char, capacity: usize) -> i32;
     fn ntcp_dpdk_flow_ipv4(
         port: u16,
         dst: u32,
@@ -547,16 +546,9 @@ impl Port {
     /// `net_ring`. Behaviour rte_flow leaves to the PMD, such as the order
     /// of overlapping rules (`steer_tcp_port`), is known only per driver.
     pub fn driver_name(&self) -> io::Result<String> {
-        let mut name = [0; 64];
-        // SAFETY: valid port; buffer capacity is passed.
-        let result =
-            unsafe { ntcp_dpdk_port_driver(self.inner.port, name.as_mut_ptr(), name.len()) };
-        if result < 0 {
-            return Err(dpdk_error("rte_eth_dev_info_get", result));
-        }
-        // SAFETY: the shim NUL-terminates within capacity (snprintf).
-        let name = unsafe { CStr::from_ptr(name.as_ptr()) };
-        Ok(name.to_string_lossy().into_owned())
+        // SAFETY: EAL is live and the port valid while the Port exists.
+        unsafe { driver_name(self.inner.port) }
+            .map_err(|result| dpdk_error("rte_eth_dev_info_get", result))
     }
 
     /// Steer IPv4 packets with destination `dst` to `queue` (ETH / IPV4 dst →
