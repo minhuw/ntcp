@@ -89,6 +89,30 @@ impl Payload {
             release: self.release.clone(),
         })
     }
+    /// One reference to `self` followed by `next`, when `next` starts where
+    /// `self` ends in the same storage and holds the same release lease (or
+    /// neither holds one), as Linux merges a zerocopy fragment into the one
+    /// before it (zerocopy_fill_skb_from_iter). Otherwise None: the joined
+    /// reference would have to cover bytes outside both, or end one lease
+    /// together with another.
+    pub fn join(&self, next: &Self) -> Option<Self> {
+        let same_lease = match (&self.release, &next.release) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if !Arc::ptr_eq(&self.storage, &next.storage)
+            || !same_lease
+            || self.range.end != next.range.start
+        {
+            return None;
+        }
+        Some(Self {
+            storage: self.storage.clone(),
+            range: self.range.start..next.range.end,
+            release: self.release.clone(),
+        })
+    }
     /// Called after the last clone/slice of this lease is released. The callback
     /// can run in ACK processing or a backend reclaim context: it must be bounded,
     /// nonblocking, nonpanicking and must not reenter the owning TCP endpoint.
@@ -128,6 +152,42 @@ mod tests {
         std::thread::spawn(move || drop(backend)).join().unwrap();
         assert_eq!(released.load(Ordering::SeqCst), 1);
         assert_eq!(base.as_slice(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn join_merges_only_contiguous_ranges_of_one_storage_and_lease() {
+        let base = Payload::from_vec(vec![1, 2, 3, 4, 5, 6]);
+        let pointer = base.as_slice().as_ptr();
+        let first = base.slice(0..2).unwrap();
+        let joined = first.join(&base.slice(2..5).unwrap()).unwrap();
+        assert_eq!(joined.as_slice(), &[1, 2, 3, 4, 5]);
+        assert_eq!(joined.as_slice().as_ptr(), pointer);
+        assert_eq!(joined.offset(), 0);
+        assert_eq!(first.join(&base.slice(2..2).unwrap()).unwrap().len(), 2);
+        // A gap, an overlap, the wrong order, other storage.
+        assert!(first.join(&base.slice(3..5).unwrap()).is_none());
+        assert!(first.join(&base.slice(1..5).unwrap()).is_none());
+        assert!(base.slice(2..5).unwrap().join(&first).is_none());
+        let other = Payload::from_vec(vec![1, 2, 3, 4, 5, 6]);
+        assert!(first.join(&other.slice(2..5).unwrap()).is_none());
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let state = released.clone();
+        let lease = base.clone().with_release(move || {
+            state.fetch_add(1, Ordering::SeqCst);
+        });
+        let leased = lease.slice(0..2).unwrap();
+        // A lease never joins an unleased range or another lease.
+        assert!(leased.join(&base.slice(2..4).unwrap()).is_none());
+        assert!(first.join(&lease.slice(2..4).unwrap()).is_none());
+        let other_lease = base.clone().with_release(|| {});
+        assert!(leased.join(&other_lease.slice(2..4).unwrap()).is_none());
+        let joined = leased.join(&lease.slice(2..6).unwrap()).unwrap();
+        assert_eq!(joined.as_slice(), &[1, 2, 3, 4, 5, 6]);
+        drop((lease, leased));
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(joined);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 
     #[test]

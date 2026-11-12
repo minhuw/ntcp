@@ -281,8 +281,8 @@ fn resize_with_unchanged_mss_recomputes_c_and_reports_b() {
     assert_eq!((info.send_capacity, info.send_space), (6000, 5840));
     assert!(a.take_events().writable);
     // Shared payload takes the same admission as copied bytes.
-    a.prepare_shared_storage(usize::MAX).unwrap();
     let shared = crate::Payload::from_vec(vec![3; 9000]);
+    a.prepare_shared_storage(&shared, usize::MAX).unwrap();
     assert_eq!(a.write_shared(shared, false, false, None).unwrap(), 1460);
     assert_eq!(a.send_admission_room(None), 0);
 }
@@ -669,8 +669,8 @@ fn reserved_gso_and_shared_totals_stay_within_c() {
             cfg.send_capacity = 6 * Q;
         });
         if shared {
-            a.prepare_shared_storage(usize::MAX).unwrap();
             let data = crate::Payload::from_vec(vec![5; 6 * Q]);
+            a.prepare_shared_storage(&data, usize::MAX).unwrap();
             assert_eq!(a.write_shared(data, false, false, None).unwrap(), 6 * Q);
         } else {
             assert_eq!(a.write(&[5; 6 * Q]).unwrap(), 6 * Q);

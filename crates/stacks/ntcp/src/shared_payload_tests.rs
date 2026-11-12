@@ -142,16 +142,18 @@ fn shared_ranges_can_be_copied_by_legacy_output_without_corruption() {
 fn shared_metadata_partial_ack_resize_and_fragment_limits_preserve_bytes() {
     use crate::buffer::SendBuffer;
     let mut buffer = SendBuffer::new(128).unwrap();
-    buffer.prepare_shared(4096).unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let state = count.clone();
     let base = Payload::from_vec(vec![2; 13]);
-    buffer.write_shared(base.clone().with_release(move || {
+    let leased = base.clone().with_release(move || {
         state.fetch_add(1, Ordering::SeqCst);
-    }));
+    });
+    buffer.prepare_shared(&leased, 4096).unwrap();
+    buffer.write_shared(leased);
     buffer.write(&[3; 7]);
-    buffer.prepare_shared(4096).unwrap();
-    buffer.write_shared(Payload::from_vec(vec![4; 11]));
+    let next = Payload::from_vec(vec![4; 11]);
+    buffer.prepare_shared(&next, 4096).unwrap();
+    buffer.write_shared(next);
     buffer.mark_end_of_record();
     buffer.acknowledge(5).unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -171,4 +173,90 @@ fn shared_metadata_partial_ack_resize_and_fragment_limits_preserve_bytes() {
     buffer.set_shared_output(None);
     assert_eq!(buffer.copy(0, &mut out), 10);
     assert_eq!(&out[..10], &[3, 3, 3, 3, 3, 3, 3, 4, 4, 4]);
+}
+
+#[test]
+fn adjacent_shared_writes_coalesce_into_one_span() {
+    let (mut a, mut b, client, server) = connected();
+    let data: Vec<u8> = (0..64).collect();
+    let pointer = data.as_ptr();
+    let done = Arc::new(AtomicUsize::new(0));
+    let state = done.clone();
+    let lease = Payload::from_vec(data).with_release(move || {
+        state.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(
+        a.write_shared(client, lease.slice(0..1).unwrap(), true, false, None),
+        Ok(1)
+    );
+    let charge = a.buffer_bytes();
+    for n in 1..64 {
+        assert_eq!(
+            a.write_shared(client, lease.slice(n..n + 1).unwrap(), true, false, None),
+            Ok(1)
+        );
+    }
+    // 64 one-byte writes hold one span: the span storage did not grow.
+    assert_eq!(a.buffer_bytes(), charge);
+    drop(lease);
+    // One reference carries the whole segment (MSS 64), where 64 spans
+    // would have stopped it at the 8 references a packet may carry.
+    let (packet, token, header, payload) = loan(&mut a, client, 101);
+    assert_eq!(payload.len(), 1);
+    assert_eq!(payload[0].as_slice().as_ptr(), pointer);
+    assert_eq!(payload[0].len(), 64);
+    let bytes = wire_bytes(&header, &payload);
+    a.accept_transmit(101, token).unwrap();
+    b.input(101, packet.ip, &bytes).unwrap();
+    drop(payload);
+    b.on_timeout(210_101, 32).unwrap();
+    deliver(&mut a, 210_101, packets(&mut b, 210_101));
+    assert_eq!(a.acknowledged(client), Ok(64));
+    assert_eq!(done.load(Ordering::SeqCst), 1);
+    let mut result = [0; 64];
+    assert_eq!(b.read(server, &mut result), Ok(64));
+    assert!(result.iter().copied().eq(0..64));
+}
+
+#[test]
+fn shared_writes_join_only_contiguous_ranges_of_one_lease() {
+    use crate::buffer::SendBuffer;
+    let mut buffer = SendBuffer::new(128).unwrap();
+    let base = Payload::from_vec((0..32).collect());
+    let lease = base.clone().with_release(|| {});
+    let write = |buffer: &mut SendBuffer, payload: Payload| {
+        buffer.prepare_shared(&payload, 4096).unwrap();
+        assert_eq!(buffer.write_shared(payload.clone()), payload.len());
+    };
+    write(&mut buffer, lease.slice(0..4).unwrap());
+    write(&mut buffer, lease.slice(4..8).unwrap());
+    assert_eq!(buffer.shared_spans(), 1);
+    // Same storage, another lease (or none).
+    write(&mut buffer, base.slice(8..12).unwrap());
+    assert_eq!(buffer.shared_spans(), 2);
+    // A gap in the storage.
+    write(&mut buffer, base.slice(13..16).unwrap());
+    assert_eq!(buffer.shared_spans(), 3);
+    write(&mut buffer, base.slice(16..20).unwrap());
+    assert_eq!(buffer.shared_spans(), 3);
+    // Copied bytes between: the next range is contiguous in storage only.
+    buffer.write(&[0xff; 2]);
+    write(&mut buffer, base.slice(20..24).unwrap());
+    assert_eq!(buffer.shared_spans(), 4);
+    // A span cut by truncate continues from its new end.
+    buffer.truncate(buffer.len() - 2);
+    write(&mut buffer, base.slice(22..26).unwrap());
+    assert_eq!(buffer.shared_spans(), 4);
+    let mut out = [0; 27];
+    assert_eq!(buffer.copy(0, &mut out), 27);
+    let expected: Vec<u8> = (0..12)
+        .chain(13..20)
+        .chain([0xff, 0xff])
+        .chain(20..26)
+        .collect();
+    assert_eq!(&out[..], &expected[..]);
+    // Partial ACKs slice the joined front span.
+    buffer.acknowledge(6).unwrap();
+    buffer.set_shared_output(Some(1));
+    assert_eq!(buffer.copy(0, &mut out), 2);
 }

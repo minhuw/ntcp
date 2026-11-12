@@ -407,12 +407,17 @@ impl SendBuffer {
         count
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_spans(&self) -> usize {
+        self.shared.len()
+    }
+
     pub(crate) fn shared_storage_bytes(&self) -> usize {
         self.shared.capacity() * core::mem::size_of::<SharedSpan>()
     }
 
-    pub(crate) fn prepare_shared(&mut self, peak_room: usize) -> Result<(), ()> {
-        if self.shared.len() < self.shared.capacity() {
+    pub(crate) fn prepare_shared(&mut self, payload: &Payload, peak_room: usize) -> Result<(), ()> {
+        if self.shared.len() < self.shared.capacity() || self.joined(payload).is_some() {
             return Ok(());
         }
         let needed = self.shared.len().checked_add(1).ok_or(())?;
@@ -439,17 +444,32 @@ impl SendBuffer {
         if count == 0 {
             return 0;
         }
-        assert!(self.shared.len() < self.shared.capacity());
-        let start = self.head.wrapping_add(self.data.len() as u64);
-        self.shared.push_back(SharedSpan {
-            start,
-            payload: payload.slice(0..count).unwrap(),
-        });
+        let payload = payload.slice(0..count).unwrap();
+        if let Some(joined) = self.joined(&payload) {
+            self.shared.back_mut().unwrap().payload = joined;
+        } else {
+            assert!(self.shared.len() < self.shared.capacity());
+            let start = self.head.wrapping_add(self.data.len() as u64);
+            self.shared.push_back(SharedSpan { start, payload });
+        }
         // Only PUSH/EOR bookkeeping is initialized. Payload remains in its
         // original immutable allocation and is never read/copied here.
         self.data.resize(self.data.len() + count, 0);
         self.marks.resize(self.data.len(), 0);
         count
+    }
+
+    // The last span extended by `payload` when it ends where the queue does
+    // and `payload` continues it in the same storage and lease, as Linux
+    // coalesces adjacent zerocopy fragments: contiguous writes then cost one
+    // span, not one per write.
+    fn joined(&self, payload: &Payload) -> Option<Payload> {
+        let span = self.shared.back()?;
+        let end = span.start.wrapping_add(span.payload.len() as u64);
+        if end != self.head.wrapping_add(self.data.len() as u64) {
+            return None;
+        }
+        span.payload.join(payload)
     }
 
     pub(crate) fn set_shared_output(&mut self, segments: Option<usize>) {

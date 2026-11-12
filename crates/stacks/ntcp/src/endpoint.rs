@@ -4012,7 +4012,9 @@ impl Endpoint {
         if !payload.is_empty() {
             let room = self.buffer_room();
             let before = self.slot(id)?.connection.buffer_charge();
-            self.slot_mut(id)?.connection.prepare_shared_storage(room)?;
+            self.slot_mut(id)?
+                .connection
+                .prepare_shared_storage(&payload, room)?;
             let after = self.slot(id)?.connection.buffer_charge();
             self.buffer_bytes += after - before;
         }
