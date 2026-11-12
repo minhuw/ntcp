@@ -25,11 +25,30 @@ const RETRANSMITTED: u8 = 1 << 3;
 // HighRxt term did not count it when it was committed.
 const PTB_COPY: u8 = 1 << 4;
 
+// Up to `count` positions from `offset` of a ring of `len` whose first
+// slice holds `split`, as ranges of its first and second slice.
+fn ring_ranges(
+    split: usize,
+    len: usize,
+    offset: usize,
+    count: usize,
+) -> [core::ops::Range<usize>; 2] {
+    let start = offset.min(len);
+    let end = start + count.min(len - start);
+    [
+        start.min(split)..end.min(split),
+        start.max(split) - split..end.max(split) - split,
+    ]
+}
+
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
-    // Bounded PUSH/EOR and PTB-pending/retransmitted bits per byte.
-    // ACK, truncation, and resize move metadata with the data.
-    data: VecDeque<(u8, u8)>,
+    // The queued bytes and, at the same positions, their bounded PUSH/EOR
+    // and PTB-pending/retransmitted bits. ACK, truncation, and resize move
+    // metadata with the data. Kept apart so a segment's payload copies as
+    // whole slices and its metadata scans as plain bytes.
+    data: VecDeque<u8>,
+    marks: VecDeque<u8>,
     capacity: usize,
     head: u64,
     shared: VecDeque<SharedSpan>,
@@ -40,8 +59,11 @@ impl SendBuffer {
     pub(crate) fn new(capacity: usize) -> Result<Self, ()> {
         let mut data = VecDeque::new();
         data.try_reserve_exact(capacity).map_err(|_| ())?;
+        let mut marks = VecDeque::new();
+        marks.try_reserve_exact(capacity).map_err(|_| ())?;
         Ok(Self {
             data,
+            marks,
             capacity,
             head: 0,
             shared: VecDeque::new(),
@@ -50,7 +72,7 @@ impl SendBuffer {
     }
 
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.data.capacity() * core::mem::size_of::<(u8, u8)>() + self.shared_storage_bytes()
+        self.data.capacity() + self.marks.capacity() + self.shared_storage_bytes()
     }
 
     pub(crate) fn allocation_capacity(&self) -> usize {
@@ -59,7 +81,8 @@ impl SendBuffer {
 
     pub(crate) fn resized(&self, capacity: usize) -> Result<Self, ()> {
         let mut result = Self::new(capacity.max(self.data.capacity()))?;
-        result.data.extend(self.data.iter().copied());
+        result.data.extend(self.data.iter());
+        result.marks.extend(self.marks.iter());
         result
             .shared
             .try_reserve_exact(self.shared.capacity())
@@ -96,43 +119,74 @@ impl SendBuffer {
 
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
-        self.data
-            .extend(input[..count].iter().map(|&byte| (byte, 0)));
+        self.data.extend(&input[..count]);
+        self.marks.resize(self.data.len(), 0);
         count
     }
 
+    fn mark_slices(&self, offset: usize, count: usize) -> [&[u8]; 2] {
+        let (front, back) = self.marks.as_slices();
+        let [first, second] = ring_ranges(front.len(), self.marks.len(), offset, count);
+        [&front[first], &back[second]]
+    }
+
+    fn mark_slices_mut(&mut self, offset: usize, count: usize) -> [&mut [u8]; 2] {
+        let len = self.marks.len();
+        let (front, back) = self.marks.as_mut_slices();
+        let [first, second] = ring_ranges(front.len(), len, offset, count);
+        [&mut front[first], &mut back[second]]
+    }
+
+    // Offset within the marks of up to `count` bytes from `offset` of the
+    // first carrying `flag`. Each block is first tested whole, which needs
+    // no early exit and so runs many marks per instruction.
+    fn first_flagged(&self, flag: u8, offset: usize, count: usize) -> Option<usize> {
+        let mut at = 0;
+        for part in self.mark_slices(offset, count) {
+            for block in part.chunks(64) {
+                if block.iter().fold(0, |any, mark| any | mark) & flag != 0 {
+                    return block
+                        .iter()
+                        .position(|mark| mark & flag != 0)
+                        .map(|n| at + n);
+                }
+                at += block.len();
+            }
+        }
+        None
+    }
+
     pub(crate) fn mark_push(&mut self) {
-        if let Some(last) = self.data.back_mut() {
-            last.1 |= 1;
+        if let Some(last) = self.marks.back_mut() {
+            *last |= 1;
         }
     }
 
     pub(crate) fn pushed(&self, offset: usize, count: usize) -> bool {
-        self.data
-            .iter()
-            .skip(offset)
-            .take(count)
-            .any(|byte| byte.1 & 1 != 0)
+        let [front, back] = self.mark_slices(offset, count);
+        front.iter().chain(back).fold(0, |any, mark| any | mark) & 1 != 0
     }
 
     pub(crate) fn collapse_push(&mut self, offset: usize, count: usize) {
-        for byte in self.data.iter_mut().skip(offset).take(count) {
-            byte.1 &= !1;
+        for part in self.mark_slices_mut(offset, count) {
+            for mark in part {
+                *mark &= !1;
+            }
         }
-        if let Some(last) = self.data.get_mut(offset + count - 1) {
-            last.1 |= 1;
+        if let Some(last) = self.marks.get_mut(offset + count - 1) {
+            *last |= 1;
         }
     }
 
     pub(crate) fn finish_send(&mut self, offset: usize, push: bool, end_of_record: bool) {
-        if let Some(byte) = self.data.get_mut(offset) {
-            byte.1 |= u8::from(push) | (u8::from(end_of_record) << 1);
+        if let Some(mark) = self.marks.get_mut(offset) {
+            *mark |= u8::from(push) | (u8::from(end_of_record) << 1);
         }
     }
 
     pub(crate) fn mark_end_of_record(&mut self) {
-        if let Some(last) = self.data.back_mut() {
-            last.1 |= 2;
+        if let Some(last) = self.marks.back_mut() {
+            *last |= 2;
         }
     }
 
@@ -140,11 +194,7 @@ impl SendBuffer {
     // guarantee (RFC 9293 section 3.7.1). PUSH may collapse; EOR never does.
     pub(crate) fn record_len(&self, offset: usize, limit: usize) -> usize {
         let limit = limit.min(self.len().saturating_sub(offset));
-        self.data
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .position(|byte| byte.1 & 2 != 0)
+        self.first_flagged(2, offset, limit)
             .map_or(limit, |n| n + 1)
     }
 
@@ -152,11 +202,11 @@ impl SendBuffer {
     // last intervening EOR, rather than clipping a prefix and losing the tail.
     pub(crate) fn tail_record_offset(&self, offset: usize, count: usize) -> usize {
         let count = count.min(self.len().saturating_sub(offset));
-        self.data
+        self.marks
             .iter()
             .skip(offset)
             .take(count.saturating_sub(1))
-            .rposition(|byte| byte.1 & 2 != 0)
+            .rposition(|mark| mark & 2 != 0)
             .map_or(offset, |n| offset + n + 1)
     }
 
@@ -164,9 +214,9 @@ impl SendBuffer {
     // range as PTB repair work; returns how many became pending.
     pub(crate) fn mark_ptb(&mut self, offset: usize, count: usize) -> usize {
         let mut marked = 0;
-        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
-            if byte.1 & (PTB_PENDING | RETRANSMITTED) == 0 {
-                byte.1 |= PTB_PENDING;
+        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
+            if *mark & (PTB_PENDING | RETRANSMITTED) == 0 {
+                *mark |= PTB_PENDING;
                 marked += 1;
             }
         }
@@ -177,10 +227,10 @@ impl SendBuffer {
     // outstanding PTB copies. Returns (pending, copies) cleared.
     pub(crate) fn release_ptb(&mut self, offset: usize, count: usize) -> (usize, usize) {
         let (mut pending, mut copies) = (0, 0);
-        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
-            pending += usize::from(byte.1 & PTB_PENDING != 0);
-            copies += usize::from(byte.1 & PTB_COPY != 0);
-            byte.1 &= !(PTB_PENDING | PTB_COPY);
+        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
+            pending += usize::from(*mark & PTB_PENDING != 0);
+            copies += usize::from(*mark & PTB_COPY != 0);
+            *mark &= !(PTB_PENDING | PTB_COPY);
         }
         (pending, copies)
     }
@@ -189,9 +239,9 @@ impl SendBuffer {
     // newly marked.
     pub(crate) fn mark_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
         let mut marked = 0;
-        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
-            marked += usize::from(byte.1 & PTB_COPY == 0);
-            byte.1 |= PTB_COPY;
+        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
+            marked += usize::from(*mark & PTB_COPY == 0);
+            *mark |= PTB_COPY;
         }
         marked
     }
@@ -200,9 +250,9 @@ impl SendBuffer {
     // its outstanding PTB copies. Returns how many marks were cleared.
     pub(crate) fn clear_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
         let mut cleared = 0;
-        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
-            cleared += usize::from(byte.1 & PTB_COPY != 0);
-            byte.1 &= !PTB_COPY;
+        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
+            cleared += usize::from(*mark & PTB_COPY != 0);
+            *mark &= !PTB_COPY;
         }
         cleared
     }
@@ -212,9 +262,9 @@ impl SendBuffer {
     // withdrew.
     pub(crate) fn mark_retransmitted(&mut self, offset: usize, count: usize) -> usize {
         let mut cleared = 0;
-        for byte in self.data.range_mut(offset.min(self.data.len())..).take(count) {
-            cleared += usize::from(byte.1 & PTB_PENDING != 0);
-            byte.1 = (byte.1 & !PTB_PENDING) | RETRANSMITTED;
+        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
+            cleared += usize::from(*mark & PTB_PENDING != 0);
+            *mark = (*mark & !PTB_PENDING) | RETRANSMITTED;
         }
         cleared
     }
@@ -230,42 +280,49 @@ impl SendBuffer {
     }
 
     fn next_flagged(&self, flag: u8, offset: usize, end: usize) -> Option<(usize, usize)> {
-        let end = end.min(self.data.len());
-        let start = (offset..end).find(|&i| self.data[i].1 & flag != 0)?;
+        let end = end.min(self.marks.len());
+        let start = (offset..end).find(|&i| self.marks[i] & flag != 0)?;
         let len = self
-            .data
+            .marks
             .range(start..end)
-            .take_while(|byte| byte.1 & flag != 0)
+            .take_while(|&byte| byte & flag != 0)
             .count();
         Some((start, len))
     }
 
     // Bytes of one range that carry PTB work.
     pub(crate) fn count_ptb(&self, offset: usize, count: usize) -> usize {
-        self.data
-            .range(offset.min(self.data.len())..)
+        self.marks
+            .range(offset.min(self.marks.len())..)
             .take(count)
-            .filter(|byte| byte.1 & PTB_PENDING != 0)
+            .filter(|&byte| byte & PTB_PENDING != 0)
             .count()
     }
 
     #[cfg(test)]
     pub(crate) fn ptb_pending(&self, offset: usize) -> bool {
-        self.data.get(offset).is_some_and(|byte| byte.1 & PTB_PENDING != 0)
+        self.marks
+            .get(offset)
+            .is_some_and(|&byte| byte & PTB_PENDING != 0)
     }
 
     #[cfg(test)]
     pub(crate) fn ptb_copy(&self, offset: usize) -> bool {
-        self.data.get(offset).is_some_and(|byte| byte.1 & PTB_COPY != 0)
+        self.marks
+            .get(offset)
+            .is_some_and(|&byte| byte & PTB_COPY != 0)
     }
 
     #[cfg(test)]
     pub(crate) fn retransmitted(&self, offset: usize) -> bool {
-        self.data.get(offset).is_some_and(|byte| byte.1 & RETRANSMITTED != 0)
+        self.marks
+            .get(offset)
+            .is_some_and(|&byte| byte & RETRANSMITTED != 0)
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
         self.data.truncate(len);
+        self.marks.truncate(len);
         while self
             .shared
             .back()
@@ -291,6 +348,7 @@ impl SendBuffer {
             return Err(());
         }
         self.data.drain(..count);
+        self.marks.drain(..count);
         self.head = self.head.wrapping_add(count as u64);
         while let Some(span) = self.shared.front_mut() {
             let consumed = self.head.wrapping_sub(span.start) as usize;
@@ -316,9 +374,11 @@ impl SendBuffer {
         {
             return count;
         }
-        for (dst, src) in out[..count].iter_mut().zip(self.data.iter().skip(offset)) {
-            *dst = src.0;
-        }
+        let (front, back) = self.data.as_slices();
+        let [first, second] = ring_ranges(front.len(), self.data.len(), offset, count);
+        let split = first.len();
+        out[..split].copy_from_slice(&front[first]);
+        out[split..count].copy_from_slice(&back[second]);
         for span in &self.shared {
             let start = span.start.wrapping_sub(self.head) as usize;
             let left = start.max(offset);
@@ -371,7 +431,8 @@ impl SendBuffer {
         });
         // Only PUSH/EOR bookkeeping is initialized. Payload remains in its
         // original immutable allocation and is never read/copied here.
-        self.data.extend((0..count).map(|_| (0, 0)));
+        self.data.resize(self.data.len() + count, 0);
+        self.marks.resize(self.data.len(), 0);
         count
     }
 
@@ -2409,6 +2470,81 @@ mod tests {
         assert!(recv.eof());
         assert_eq!(recv.read(&mut [0; 8]), 6);
     }
+    #[test]
+    fn send_payload_and_marks_match_a_byte_model_across_wrap() {
+        // Payload and marks live in separate rings: their slices, the
+        // block scans and the clamping must agree with one (byte, mark)
+        // sequence while the rings wrap.
+        let mut send = SendBuffer::new(300).unwrap();
+        let mut model: VecDeque<(u8, u8)> = VecDeque::new();
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        let mut out = [0; 400];
+        for step in 0..4000 {
+            match next(6) {
+                0 | 1 => {
+                    let len = next(200);
+                    let input: Vec<u8> = (0..len).map(|i| (step + i) as u8).collect();
+                    let count = send.write(&input);
+                    assert_eq!(count, len.min(300 - model.len()));
+                    model.extend(input[..count].iter().map(|&b| (b, 0)));
+                }
+                2 => {
+                    send.mark_push();
+                    send.mark_end_of_record();
+                    if let Some(last) = model.back_mut() {
+                        last.1 |= 3;
+                    }
+                }
+                3 => {
+                    let count = next(model.len() + 1);
+                    send.acknowledge(count).unwrap();
+                    model.drain(..count);
+                }
+                4 if !model.is_empty() => {
+                    let offset = next(model.len());
+                    let count = 1 + next(model.len() - offset);
+                    send.collapse_push(offset, count);
+                    for mark in model.range_mut(offset..offset + count) {
+                        mark.1 &= !1;
+                    }
+                    model[offset + count - 1].1 |= 1;
+                }
+                _ => {
+                    let offset = next(model.len() + 1);
+                    let (push, end_of_record) = (next(2) == 0, next(4) == 0);
+                    send.finish_send(offset, push, end_of_record);
+                    if let Some(mark) = model.get_mut(offset) {
+                        mark.1 |= u8::from(push) | u8::from(end_of_record) << 1;
+                    }
+                }
+            }
+            let offset = next(model.len() + 2);
+            let limit = next(out.len() + 1);
+            let tail: Vec<(u8, u8)> = model.iter().skip(offset).take(limit).copied().collect();
+            let record = tail
+                .iter()
+                .position(|byte| byte.1 & 2 != 0)
+                .map_or(tail.len(), |n| n + 1);
+            assert_eq!(send.record_len(offset, limit), record);
+            assert_eq!(
+                send.pushed(offset, limit),
+                tail.iter().any(|byte| byte.1 & 1 != 0)
+            );
+            assert_eq!(send.copy(offset, &mut out[..limit]), record);
+            assert!(
+                out[..record]
+                    .iter()
+                    .eq(tail[..record].iter().map(|byte| &byte.0))
+            );
+        }
+    }
+
     #[test]
     fn eor_survives_push_collapse_resize_ack_and_truncate_without_growth() {
         let mut send = SendBuffer::new(8).unwrap();
