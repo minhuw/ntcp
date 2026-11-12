@@ -18,6 +18,7 @@ fn setup() -> (
             paths: 2,
             clients: 2,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(1), 1500).unwrap();
@@ -264,4 +265,209 @@ fn vector_capacity_overflow_is_a_fallible_allocation_error() {
         Table::<LinkInfo>::new(usize::MAX),
         Err(Error::Allocation)
     ));
+}
+
+// Whether the index lists every cached path on its flow's chain, the idle
+// paths and the lowest free slot, as full scans find them.
+fn index_holds(service: &PathService) -> bool {
+    let first_free = service.paths.slots.iter().position(|s| s.value.is_none());
+    service.index.lists_chains(|slot| {
+        let path = service.paths.slots[slot].value.as_ref()?;
+        Some(service.index.bucket(&path.snapshot.key))
+    }) && service.index.lists_idle(|slot| {
+        service.paths.slots[slot]
+            .value
+            .as_ref()
+            .is_some_and(CachedPath::idle)
+    }) && service.index.free() == first_free
+}
+
+// A seeded sequence of acquisitions, rebinds, releases, decreases, route
+// changes, Redirects (installed and ended) and exact-path policy through a
+// gateway route, against a full table: after every step the index matches
+// the scans it replaced, and every flow's cache lookup chooses the slot the
+// scan chooses, with distinct buckets and with every flow on one chain.
+#[test]
+fn index_matches_the_scans_under_random_operations() {
+    let address = |text: &str| ScopedAddress::new(text.parse().unwrap(), None).unwrap();
+    for collide in [false, true] {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize % bound
+        };
+        let mut service = PathService::new(
+            ContextId::new(3),
+            Limits {
+                links: 1,
+                sources: 1,
+                source_owners: 1,
+                routes: 2,
+                paths: 6,
+                clients: 8,
+            },
+            [9; 16],
+        )
+        .unwrap();
+        if collide {
+            service.index.collide();
+        }
+        let link = service.register_link(InterfaceKey(1), 1500).unwrap();
+        let source = service
+            .register_source(address("192.0.2.10"), link)
+            .unwrap();
+        let gateway = Route {
+            destination: IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap(),
+            source: None,
+            dscp: None,
+            link,
+            next_hop: NextHop::Gateway(address("192.0.2.1")),
+            metric: 0,
+        };
+        let mut default = service.add_route(gateway).unwrap();
+        let shadow = Route {
+            destination: IpPrefix::new("198.51.100.0".parse().unwrap(), 30).unwrap(),
+            next_hop: NextHop::Gateway(address("192.0.2.3")),
+            ..gateway
+        };
+        let mut shadowing = None;
+        let request = |n: usize| PathRequest {
+            source,
+            destination: address(&alloc::format!("198.51.100.{}", n % 5 + 1)),
+            dscp: Dscp::new(if n >= 5 { 46 } else { 0 }).unwrap(),
+        };
+        let mut clients: Vec<ClientId> = Vec::new();
+        for step in 0..4000 {
+            let pick = next(clients.len().max(1));
+            match next(10) {
+                0..=2 => {
+                    if let Ok((client, _)) = service.acquire(request(next(10))) {
+                        clients.push(client);
+                    }
+                }
+                3 if !clients.is_empty() => {
+                    service.release(clients.swap_remove(pick)).unwrap();
+                }
+                4 if !clients.is_empty() => {
+                    if let Ok((client, _)) = service.rebind(clients[pick], request(next(10))) {
+                        clients[pick] = client;
+                    }
+                }
+                5 if !clients.is_empty() => {
+                    let path = service.snapshot(clients[pick]).unwrap().path();
+                    let _ = service.trusted_decrease(path, 1200 + next(200) as u32);
+                }
+                6 => match shadowing.take() {
+                    Some(id) => service.remove_route(id).unwrap(),
+                    None => shadowing = Some(service.add_route(shadow).unwrap()),
+                },
+                7 if !clients.is_empty() => {
+                    let snapshot = service.snapshot(clients[pick]).unwrap();
+                    let target = address(["192.0.2.1", "192.0.2.2", "192.0.2.4"][next(3)]);
+                    if let ResolvedNextHop::Address(sender) = snapshot.key().next_hop() {
+                        let _ = service.redirect(snapshot.key(), sender, target, next(2) == 0);
+                    }
+                }
+                8 => {
+                    let neighbor = address(["192.0.2.2", "192.0.2.4"][next(2)]);
+                    service
+                        .end_redirects(link, neighbor, NeighborLoss::Unreachable)
+                        .unwrap();
+                }
+                9 => {
+                    // Any cached path, idle ones included.
+                    let paths: Vec<_> = service.path_administrations().collect();
+                    if let Some(admin) = paths.get(next(paths.len().max(1))) {
+                        let path = admin.snapshot.path();
+                        let policy = AdminPolicy {
+                            discovery_disabled: next(2) == 0,
+                            estimate: None,
+                        };
+                        let change = AdminChange {
+                            target: AdminTarget::Path(path),
+                            expected: admin.generation,
+                            policy,
+                        };
+                        if let Ok(plan) = service.prepare_admin(change, step as u64, 600) {
+                            service.commit_admin(plan).unwrap();
+                        }
+                    }
+                }
+                _ if step % 97 == 0 => {
+                    // A replacement invalidates every path through the route.
+                    default = service.replace_route(default, gateway).unwrap();
+                }
+                _ => {}
+            }
+            assert!(index_holds(&service), "step {step}, collide {collide}");
+            for n in 0..10 {
+                if let Ok(resolved) = service.resolve(request(n)) {
+                    assert_eq!(
+                        service.path_slot(resolved.key()),
+                        service.scan_path_slot(resolved.key()),
+                        "step {step}, collide {collide}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// With every slot occupied, a new flow takes the lowest-index idle slot,
+// whichever order paths became idle in, and Capacity when none is idle.
+#[test]
+fn a_full_cache_evicts_the_lowest_index_idle_path() {
+    let address = |text: &str| ScopedAddress::new(text.parse().unwrap(), None).unwrap();
+    let mut service = PathService::new(
+        ContextId::new(4),
+        Limits {
+            links: 1,
+            sources: 1,
+            source_owners: 1,
+            routes: 1,
+            paths: 130,
+            clients: 130,
+        },
+        [5; 16],
+    )
+    .unwrap();
+    let link = service.register_link(InterfaceKey(1), 1500).unwrap();
+    let source = service
+        .register_source(address("192.0.2.10"), link)
+        .unwrap();
+    service
+        .add_route(Route {
+            destination: IpPrefix::new("0.0.0.0".parse().unwrap(), 0).unwrap(),
+            source: None,
+            dscp: None,
+            link,
+            next_hop: NextHop::OnLink,
+            metric: 0,
+        })
+        .unwrap();
+    let request = |n: usize| PathRequest {
+        source,
+        destination: address(&alloc::format!("198.51.{}.{}", n / 200, n % 200 + 1)),
+        dscp: Dscp::new(0).unwrap(),
+    };
+    let mut clients: Vec<_> = (0..130)
+        .map(|n| {
+            let (client, snapshot) = service.acquire(request(n)).unwrap();
+            assert_eq!(snapshot.path().0.slot, n);
+            Some(client)
+        })
+        .collect();
+    assert_eq!(service.acquire(request(130)), Err(Error::Capacity));
+    // Idle in descending order, across the idle bitmap's words.
+    for slot in [129, 70, 64, 3] {
+        service.release(clients[slot].take().unwrap()).unwrap();
+    }
+    for (n, slot) in [3, 64, 70, 129].into_iter().enumerate() {
+        let (_, snapshot) = service.acquire(request(200 + n)).unwrap();
+        assert_eq!(snapshot.path().0.slot, slot);
+        assert!(index_holds(&service));
+    }
+    assert_eq!(service.acquire(request(300)), Err(Error::Capacity));
 }

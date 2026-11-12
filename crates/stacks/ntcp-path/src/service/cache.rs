@@ -11,6 +11,8 @@ const IPV4_OFF_LINK_SEND_LIMIT: u32 = 576;
 mod tests;
 mod admin;
 pub use admin::*;
+mod index;
+pub(super) use index::PathIndex;
 
 handle!(PathId);
 handle!(ClientId);
@@ -426,6 +428,7 @@ impl PathService {
             if path.snapshot != old {
                 path.snapshot.stamp.version = revision;
                 self.paths.slots[index].value = Some(path);
+                self.refresh_idle(index);
                 self.mark_dirty(old.path());
             }
         }
@@ -459,8 +462,35 @@ impl PathService {
     /// after invalidation. Eviction is resource reclamation, never delivery or
     /// permission to grow a live estimate.
     fn path_slot(&self, key: PathKey) -> Result<(usize, bool), Error> {
+        let matching = self.index.chain(self.index.bucket(&key)).find(|&index| {
+            self.paths.slots[index]
+                .value
+                .as_ref()
+                .is_some_and(|p| p.snapshot.key == key && p.snapshot.status == PathStatus::Valid)
+        });
+        let slot = match matching {
+            Some(index) => Ok((index, false)),
+            None => self
+                .index
+                .free()
+                .or_else(|| self.index.lowest_idle())
+                .map(|index| (index, true))
+                .ok_or(Error::Capacity),
+        };
+        debug_assert!(self.index.lists_idle(|index| {
+            self.paths.slots[index]
+                .value
+                .as_ref()
+                .is_some_and(CachedPath::idle)
+        }));
+        debug_assert_eq!(slot, self.scan_path_slot(key));
+        slot
+    }
+    // `path_slot` by a pass over every path slot, for debug assertions.
+    fn scan_path_slot(&self, key: PathKey) -> Result<(usize, bool), Error> {
         if let Some(index) = self.paths.slots.iter().position(|s| {
             s.value
+                .as_ref()
                 .is_some_and(|p| p.snapshot.key == key && p.snapshot.status == PathStatus::Valid)
         }) {
             return Ok((index, false));
@@ -469,10 +499,29 @@ impl PathService {
             self.paths
                 .slots
                 .iter()
-                .position(|s| s.value.is_some_and(|p| p.idle()))
+                .position(|s| s.value.as_ref().is_some_and(CachedPath::idle))
                 .ok_or(Error::Capacity)
         })?;
         Ok((index, true))
+    }
+    // The incarnation in occupied path slot `index`, borrowed: a cached
+    // path is large.
+    fn slot_path(&self, index: usize) -> PathId {
+        self.paths.slots[index]
+            .value
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .path()
+    }
+    // Every change to a path's pins, exact-path policy or status goes
+    // through here, keeping the idle bitmap the paths `idle()` holds for.
+    fn refresh_idle(&mut self, index: usize) {
+        let idle = self.paths.slots[index]
+            .value
+            .as_ref()
+            .is_some_and(CachedPath::idle);
+        self.index.set_idle(index, idle);
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
@@ -537,9 +586,11 @@ impl PathService {
         // The same flow's exact-path policy, carried across a forwarding
         // transition, restricts this incarnation as it did the last one,
         // with that incarnation's hold.
-        let admin = match self.carried_admin(resolved.key) {
+        let bucket = self.index.bucket(&resolved.key);
+        let admin = match self.carried_admin(resolved.key, bucket) {
             Some((slot, carried, previous)) => {
                 self.paths.slots[slot].value.as_mut().unwrap().admin = PathAdmin::default();
+                self.refresh_idle(slot);
                 let effective = EffectivePolicy::of(route.policy, carried.policy);
                 snapshot.admin_estimate = effective.estimate.map(|e| e.value);
                 if effective.discovery_disabled.is_some() {
@@ -553,6 +604,11 @@ impl PathService {
             }
             None => PathAdmin::default(),
         };
+        // An evicted incarnation leaves its flow's chain.
+        if let Some(evicted) = self.paths.slots[index].value.as_ref() {
+            let old = self.index.bucket(&evicted.snapshot.key);
+            self.index.unlink(index, old);
+        }
         self.paths.insert(
             self.context,
             index,
@@ -565,28 +621,51 @@ impl PathService {
                 application_mtu: None,
             },
         );
+        self.index.occupy(index);
+        self.index.link(index, bucket);
+        self.refresh_idle(index);
         id
     }
 
     // The exact-path policy an invalidated incarnation of `key`'s flow
     // kept across a forwarding transition: its slot, policy and snapshot.
-    fn carried_admin(&self, key: PathKey) -> Option<(usize, PathAdmin, PathSnapshot)> {
-        self.paths.slots.iter().enumerate().find_map(|(slot, record)| {
-            let path = record.value?;
-            (path.snapshot.status == PathStatus::Invalidated(InvalidationReason::SelectionChanged)
+    // `bucket` is the flow's. At most one incarnation keeps it: the next
+    // one installed takes it.
+    fn carried_admin(
+        &self,
+        key: PathKey,
+        bucket: usize,
+    ) -> Option<(usize, PathAdmin, PathSnapshot)> {
+        let carries = |path: &CachedPath| {
+            path.snapshot.status == PathStatus::Invalidated(InvalidationReason::SelectionChanged)
                 && !path.admin.policy.is_empty()
-                && super::redirect::same_flow(path.snapshot.key, key))
-            .then_some((slot, path.admin, path.snapshot))
-        })
+                && super::redirect::same_flow(path.snapshot.key, key)
+        };
+        let carried = self.index.chain(bucket).find_map(|slot| {
+            let path = self.paths.slots[slot].value.as_ref()?;
+            carries(path).then_some((slot, path.admin, path.snapshot))
+        });
+        debug_assert!(
+            self.paths
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.value.as_ref().is_some_and(carries))
+                .map(|(slot, _)| slot)
+                .eq(carried.map(|(slot, ..)| slot))
+        );
+        carried
     }
 
     fn pin(&mut self, path: PathId) {
         // Every client occupies one preallocated slot; this count was checked
         // before mutation, and cannot exceed the checked client allocation.
         self.paths.slots[path.0.slot].value.as_mut().unwrap().pins += 1;
+        self.refresh_idle(path.0.slot);
     }
     fn unpin(&mut self, path: PathId) {
         self.paths.slots[path.0.slot].value.as_mut().unwrap().pins -= 1;
+        self.refresh_idle(path.0.slot);
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
@@ -612,7 +691,7 @@ impl PathService {
         let path = if new {
             self.install_path(index, generation - 1, resolved, revision)
         } else {
-            self.paths.slots[index].value.unwrap().snapshot.path()
+            self.slot_path(index)
         };
         self.pin(path);
         self.free_clients.pop();
@@ -650,7 +729,7 @@ impl PathService {
         let old = self.clients.get(self.context, client.0)?;
         let resolved = self.resolve_via(request, forwarding_destination)?;
         let (index, new) = self.path_slot(resolved.key)?;
-        if !new && self.paths.slots[index].value.unwrap().snapshot.path() == old.path {
+        if !new && self.slot_path(index) == old.path {
             return Ok((client, self.snapshot(client)?));
         }
         let generation = self
@@ -665,7 +744,7 @@ impl PathService {
         let path = if new {
             self.install_path(index, generation - 1, resolved, revision)
         } else {
-            self.paths.slots[index].value.unwrap().snapshot.path()
+            self.slot_path(index)
         };
         self.unpin(old.path);
         self.pin(path);

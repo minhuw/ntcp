@@ -29,7 +29,8 @@ fn setup(
     ipv6: bool,
     mtu: u32,
 ) -> (PathService, LinkId, RouteId, PathRequest) {
-    let mut service = PathService::new(ContextId::new(100), limits(paths, clients)).unwrap();
+    let mut service =
+        PathService::new(ContextId::new(100), limits(paths, clients), [1; 16]).unwrap();
     let link = service.register_link(InterfaceKey(1), mtu).unwrap();
     let source = service
         .register_source(
@@ -821,7 +822,7 @@ fn zero_and_overflowing_path_client_capacities_are_checked() {
     }
     for (paths, clients) in [(usize::MAX, 0), (0, usize::MAX)] {
         assert!(matches!(
-            PathService::new(ContextId::new(1), limits(paths, clients)),
+            PathService::new(ContextId::new(1), limits(paths, clients), [1; 16]),
             Err(Error::Capacity)
         ));
     }
@@ -896,7 +897,7 @@ fn complete_header_budgets_mms_s_and_query_caps_have_independent_expected_values
 
 #[test]
 fn scoped_paths_foreign_context_and_binding_acknowledgements_stay_isolated() {
-    let mut service = PathService::new(ContextId::new(200), limits(4, 4)).unwrap();
+    let mut service = PathService::new(ContextId::new(200), limits(4, 4), [1; 16]).unwrap();
     let mut clients = Vec::new();
     for i in 1..=2 {
         let link = service.register_link(InterfaceKey(i), 1500).unwrap();

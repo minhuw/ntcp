@@ -80,7 +80,14 @@ fn side_with(
     let cfg = config();
     let (paths, limits) = ntcp_host::managed_limits(&cfg, 1, 1, 1, 4, 1).unwrap();
     let (paths, limits) = adjust(paths, limits);
-    let mut host = Host::new(ContextId::new(77), paths, limits, cfg.connection.timebase).unwrap();
+    let mut host = Host::new(
+        ContextId::new(77),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [1; 16],
+    )
+    .unwrap();
     let context = host
         .register_link(
             InterfaceKey(1),

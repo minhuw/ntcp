@@ -22,7 +22,7 @@ fn fixture(ipv6: bool) -> Fixture {
         paths: 4,
         clients: 4,
     };
-    let mut service = PathService::new(ContextId::new(700), limits).unwrap();
+    let mut service = PathService::new(ContextId::new(700), limits, [1; 16]).unwrap();
     let link = service.register_link(InterfaceKey(1), 9000).unwrap();
     let source = service
         .register_source(

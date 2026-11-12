@@ -15,6 +15,8 @@ ntcp-ip = { path = "../../stacks/ntcp-ip", version = "0.0.1" }
 ntcp-ip6 = { path = "../../stacks/ntcp-ip6", version = "0.0.1" }
 ntcp-ethernet = { path = "../../stacks/ntcp-ethernet", version = "0.0.1" }
 ntcp-arp = { path = "../../stacks/ntcp-arp", version = "0.0.1" }
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 ntcp-io-tun = { path = "../../io/ntcp-io-tun", version = "0.0.1" }

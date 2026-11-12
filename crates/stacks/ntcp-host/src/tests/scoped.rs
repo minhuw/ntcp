@@ -42,6 +42,7 @@ fn scoped_side_with(
         paths,
         limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     let address: SocketAddr = address.parse().unwrap();

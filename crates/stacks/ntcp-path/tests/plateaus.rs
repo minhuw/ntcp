@@ -118,6 +118,7 @@ fn live_service_selects_and_replaces_bounded_policy_without_forwarding_changes()
             paths: 2,
             clients: 2,
         },
+        [1; 16],
     )
     .unwrap();
     assert_eq!(service.ipv4_plateaus(), Ipv4Plateaus::CONTEMPORARY);

@@ -112,6 +112,8 @@ impl Network {
     ) -> io::Result<Self> {
         let mut identity = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut identity)?;
+        let mut lookup_key = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut lookup_key)?;
         let (paths, limits) =
             ntcp_host::managed_limits(config, 1, 1, 1, 1, 1).map_err(host_error)?;
         let mut host = Host::new(
@@ -119,6 +121,7 @@ impl Network {
             paths,
             limits,
             endpoint.caller_timebase(),
+            lookup_key,
         )
         .map_err(host_error)?;
         let forwarder = path::ForwarderId(1);

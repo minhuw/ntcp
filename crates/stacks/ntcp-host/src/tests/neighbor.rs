@@ -22,6 +22,7 @@ fn link() -> LinkId {
             paths: 1,
             clients: 1,
         },
+        [1; 16],
     )
     .unwrap();
     paths.register_link(InterfaceKey(1), 1500).unwrap()
@@ -217,6 +218,7 @@ fn one_ports_blocked_control_output_never_holds_back_another() {
             paths: 1,
             clients: 1,
         },
+        [1; 16],
     )
     .unwrap();
     let a = paths.register_link(InterfaceKey(1), 1500).unwrap();

@@ -55,6 +55,7 @@ fn gateway_side(identity: u64, cfg: &EndpointConfig, gso: bool) -> Side {
         paths,
         limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     let context = host
@@ -568,6 +569,7 @@ fn nd_side_with(identity: u64, cfg: &EndpointConfig, output: IcmpOutputLimits) -
         paths,
         limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     host.set_entropy(Box::new(|out: &mut [u8]| {
@@ -1168,7 +1170,14 @@ fn ipv6_redirect_destination_is_the_segment_route_forwarding_destination() {
         answers: 2,
     };
     let (paths, limits) = managed_udp_limits(paths, limits, UDP).unwrap();
-    let mut host = Host::new(ContextId::new(740), paths, limits, cfg.connection.timebase).unwrap();
+    let mut host = Host::new(
+        ContextId::new(740),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [1; 16],
+    )
+    .unwrap();
     host.set_entropy(Box::new(|out: &mut [u8]| {
         out.fill(0);
         out[0] = 0x80;

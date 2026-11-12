@@ -44,7 +44,14 @@ fn entropy() -> Entropy {
 fn arp_host(cfg: &EndpointConfig, ipv4: NeighborLimits) -> Host {
     let (paths, mut limits) = managed_limits(cfg, 1, 1, 1, 2, 0).unwrap();
     limits.ipv4_neighbors = ipv4;
-    let mut host = Host::new(ContextId::new(51), paths, limits, cfg.connection.timebase).unwrap();
+    let mut host = Host::new(
+        ContextId::new(51),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [1; 16],
+    )
+    .unwrap();
     host.set_entropy(entropy());
     host
 }
@@ -307,7 +314,14 @@ fn ipv4_resolution_needs_its_own_storage() {
         entries: 1,
         ..ipv4_limits()
     };
-    let mut host = Host::new(ContextId::new(52), paths, limits, cfg.connection.timebase).unwrap();
+    let mut host = Host::new(
+        ContextId::new(52),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [1; 16],
+    )
+    .unwrap();
     host.set_entropy(entropy());
     let context = host
         .register_neighbor_port(InterfaceKey(1), 1500, receive(), NdPort::new(OWN))

@@ -30,6 +30,7 @@ fn fixture() -> Fixture {
             paths: 4,
             clients: 4,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(1), 1500).unwrap();

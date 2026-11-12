@@ -236,6 +236,8 @@ impl Network {
         let ipv4 = local.is_ipv4();
         let mut identity = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut identity)?;
+        let mut lookup_key = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut lookup_key)?;
         let (paths, mut limits) =
             ntcp_host::managed_limits(config, 1, 1, 1, 2, 1).map_err(host_error)?;
         let (largest, header) = if ipv4 {
@@ -307,6 +309,7 @@ impl Network {
             paths,
             limits,
             endpoint.caller_timebase(),
+            lookup_key,
         )
         .map_err(host_error)?;
         host.set_entropy(Box::new(|bytes: &mut [u8]| {

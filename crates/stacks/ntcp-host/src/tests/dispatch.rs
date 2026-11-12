@@ -532,6 +532,7 @@ fn two_links(v6: bool, identity: u64, cfg: &EndpointConfig) -> (Side, IngressCon
         paths,
         limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     let capabilities = ReceiveCapabilities {

@@ -1003,6 +1003,7 @@ mod tests {
             paths,
             limits,
             cfg.connection.timebase,
+            [1; 16],
         )
         .unwrap();
         let mut endpoint = Endpoint::new(cfg.clone(), [3; 32], 0, |_| true).unwrap();

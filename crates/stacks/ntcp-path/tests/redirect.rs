@@ -27,6 +27,7 @@ fn fixture(paths: usize) -> Fixture {
             paths,
             clients: paths,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(1), 1500).unwrap();
@@ -610,6 +611,7 @@ fn redirect_target_ownership_is_scoped_to_the_link() {
             paths: 4,
             clients: 4,
         },
+        [1; 16],
     )
     .unwrap();
     let a = service.register_link(InterfaceKey(1), 1500).unwrap();

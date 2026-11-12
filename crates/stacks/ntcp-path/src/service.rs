@@ -516,10 +516,15 @@ pub struct PathService {
     // Counts the changes that may have made a client dirty (`dirtied`).
     dirtied: u64,
     plateaus: Ipv4Plateaus,
+    // Each flow's cached incarnations, the free and the idle path slots.
+    index: cache::PathIndex,
 }
 
 impl PathService {
-    pub fn new(context: ContextId, limits: Limits) -> Result<Self, Error> {
+    /// The caller must supply a confidential, unpredictable `lookup_key`
+    /// from an initialized CSPRNG: it keys the hash that finds a flow's
+    /// cached paths, whose destinations peers choose.
+    pub fn new(context: ContextId, limits: Limits, lookup_key: [u8; 16]) -> Result<Self, Error> {
         // Validate total accounting before attempting any allocation, including
         // Vec's isize bound. Later operations only fill already reserved slots.
         let mut bytes = 0usize;
@@ -537,7 +542,10 @@ impl PathService {
             (limits.routes, size_of::<Box<[Ipv6Addr]>>()),
             (limits.paths, size_of::<Option<redirect::Redirect>>()),
             (limits.paths, size_of::<usize>()),
-        ] {
+        ]
+        .into_iter()
+        .chain(cache::PathIndex::accounting(limits.paths)?)
+        {
             bytes = bytes
                 .checked_add(count.checked_mul(size).ok_or(Error::Capacity)?)
                 .filter(|v| *v <= isize::MAX as usize)
@@ -612,6 +620,7 @@ impl PathService {
             admin_revision: 0,
             dirtied: 0,
             plateaus: Ipv4Plateaus::CONTEMPORARY,
+            index: cache::PathIndex::new(limits.paths, lookup_key)?,
         })
     }
 
@@ -1211,6 +1220,7 @@ mod tests {
                 paths: 2,
                 clients: 2,
             },
+            [1; 16],
         )
         .unwrap()
     }

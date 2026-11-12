@@ -15,6 +15,7 @@ fn authority(tuple: Tuple, timebase: CallerTimebase) -> (PathService, crate::Pre
             paths: 3,
             clients: 3,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(1), 1500).unwrap();

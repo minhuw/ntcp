@@ -93,6 +93,7 @@ fn isolating_side(local: SocketAddr, identity: u64, cfg: &EndpointConfig) -> Sid
         paths,
         limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     let capabilities = ReceiveCapabilities {

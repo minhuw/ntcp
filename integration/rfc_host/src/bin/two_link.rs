@@ -147,6 +147,8 @@ impl Network {
     ) -> io::Result<Self> {
         let mut identity = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut identity)?;
+        let mut lookup_key = [0u8; 16];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut lookup_key)?;
         let (paths, mut limits) =
             ntcp_host::managed_limits(config, 2, 1, 1, 1, 1).map_err(host_error)?;
         // One read pass's worth of concurrent datagrams, one largest
@@ -165,6 +167,7 @@ impl Network {
             paths,
             limits,
             endpoint.caller_timebase(),
+            lookup_key,
         )
         .map_err(host_error)?;
         let [(small, small_mtu), (large, large_mtu)] = tuns;

@@ -39,7 +39,14 @@ fn nd_host_with(port: NdPort) -> (Host, LinkId) {
         addresses: 2,
         answers: 2,
     };
-    let mut host = Host::new(ContextId::new(41), paths, limits, cfg.connection.timebase).unwrap();
+    let mut host = Host::new(
+        ContextId::new(41),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [1; 16],
+    )
+    .unwrap();
     // ReachableTime and DAD delays need entropy.
     assert_eq!(
         host.register_neighbor_port(InterfaceKey(1), 1500, receive(), port)
@@ -390,7 +397,14 @@ fn on_link_side_with(cfg: &EndpointConfig, local: SocketAddr, output: IcmpOutput
         addresses: 1,
         answers: 1,
     };
-    let mut host = Host::new(ContextId::new(43), paths, limits, cfg.connection.timebase).unwrap();
+    let mut host = Host::new(
+        ContextId::new(43),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [1; 16],
+    )
+    .unwrap();
     host.set_entropy(Box::new(|out: &mut [u8]| {
         out.fill(0);
         out[0] = 0x80;

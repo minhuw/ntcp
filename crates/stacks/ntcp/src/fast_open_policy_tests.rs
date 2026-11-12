@@ -1119,6 +1119,7 @@ pub(crate) fn zones() -> [ntcp_path::LinkId; 3] {
             paths: 1,
             clients: 1,
         },
+        [1; 16],
     )
     .unwrap();
     let first = service.register_link(InterfaceKey(1), 1500).unwrap();
@@ -1185,6 +1186,7 @@ impl ScopedPaths {
                 paths: 4,
                 clients: 4,
             },
+            [1; 16],
         )
         .unwrap();
         let link = service.register_link(InterfaceKey(1), 1500).unwrap();

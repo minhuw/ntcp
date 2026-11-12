@@ -488,6 +488,7 @@ fn managed_native_live_class_capacity_failure_preserves_socket_core_client_and_d
         paths,
         limits,
         owner.endpoint.caller_timebase(),
+        [1; 16],
     )
     .unwrap();
     let ingress = host

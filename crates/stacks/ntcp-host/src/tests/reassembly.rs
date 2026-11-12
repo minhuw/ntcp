@@ -40,6 +40,7 @@ fn fixture() -> Fixture {
             paths: 1,
             clients: 1,
         },
+        [1; 16],
     )
     .unwrap();
     let link = paths.register_link(InterfaceKey(1), 1500).unwrap();
@@ -308,6 +309,7 @@ fn host_states_capacity_per_family_and_rejects_invalid_configuration() {
         paths,
         host_limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     assert_eq!(host.reassembly_capacity(false), None);
@@ -325,6 +327,7 @@ fn host_states_capacity_per_family_and_rejects_invalid_configuration() {
         paths,
         host_limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     assert_eq!(
@@ -349,7 +352,8 @@ fn host_states_capacity_per_family_and_rejects_invalid_configuration() {
             ContextId::new(5),
             paths,
             host_limits,
-            cfg.connection.timebase
+            cfg.connection.timebase,
+            [1; 16],
         ),
         Err(Error::Capacity)
     ));

@@ -699,11 +699,15 @@ fn table<T: Clone>(count: usize, value: T) -> Result<Vec<T>, Error> {
 }
 
 impl Host {
+    /// The caller must supply a confidential, unpredictable `lookup_key`
+    /// from an initialized CSPRNG: it keys the path cache's hash
+    /// (`PathService::new`).
     pub fn new(
         context: ContextId,
         path_limits: path::Limits,
         limits: Limits,
         timebase: ntcp::CallerTimebase,
+        lookup_key: [u8; 16],
     ) -> Result<Self, Error> {
         if limits
             .bindings
@@ -722,7 +726,7 @@ impl Host {
         if limits.datagrams.adjunct.paths != 0 && limits.icmp_output.messages == 0 {
             return Err(Error::Capacity);
         }
-        let paths = PathService::new(context, path_limits)?;
+        let paths = PathService::new(context, path_limits, lookup_key)?;
         Ok(Self {
             instance: admin::next_instance()?,
             search_aging: None,

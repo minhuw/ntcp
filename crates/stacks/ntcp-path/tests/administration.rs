@@ -37,6 +37,7 @@ fn setup_in(context: ContextId, ipv6: bool, paths: usize) -> Fixture {
             paths,
             clients: 4,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(1), 1500).unwrap();
@@ -237,6 +238,7 @@ fn foreign_and_stale_targets_are_rejected() {
             paths: 1,
             clients: 1,
         },
+        [1; 16],
     )
     .unwrap();
     assert_eq!(

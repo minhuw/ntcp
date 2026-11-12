@@ -21,6 +21,7 @@ fn service() -> (
             paths: 2,
             clients: 2,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(1), 9001).unwrap();
@@ -146,6 +147,7 @@ fn source_owner_claim_capacity_preserves_an_active_global_source() {
             paths: 1,
             clients: 1,
         },
+        [1; 16],
     )
     .unwrap();
     let a = service.register_link(InterfaceKey(1), 1500).unwrap();

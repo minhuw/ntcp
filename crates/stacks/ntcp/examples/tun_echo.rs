@@ -498,11 +498,15 @@ mod linux {
             )
             .map_err(host_error)?;
             limits.reassembly = reassembly;
+            // The path cache's hash key, confidential like the TCP secret.
+            let mut lookup_key = [0; 16];
+            os_entropy(&mut lookup_key)?;
             let mut host = Host::new(
                 path::ContextId::new(u64::from_ne_bytes(identity[..8].try_into().unwrap())),
                 paths,
                 limits,
                 endpoint.caller_timebase(),
+                lookup_key,
             )
             .map_err(host_error)?;
             // Unpredictable identifiers from the same OS CSPRNG acquisition

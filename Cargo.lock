@@ -239,6 +239,7 @@ dependencies = [
 name = "ntcp-native"
 version = "0.0.1"
 dependencies = [
+ "hmac",
  "libc",
  "ntcp",
  "ntcp-arp",
@@ -249,6 +250,7 @@ dependencies = [
  "ntcp-io-tun",
  "ntcp-ip",
  "ntcp-ip6",
+ "sha2",
 ]
 
 [[package]]
@@ -264,6 +266,9 @@ dependencies = [
 [[package]]
 name = "ntcp-path"
 version = "0.0.1"
+dependencies = [
+ "siphasher",
+]
 
 [[package]]
 name = "ntcp-path-control"

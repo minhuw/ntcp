@@ -620,11 +620,16 @@ impl Owner {
             self.defaults.max_connections,
         );
         let message_bytes = limits.icmp_output.message_bytes;
+        // The path cache's hash key, from the blocking kernel CSPRNG as the
+        // TCP secret is.
+        let mut lookup_key = [0; 16];
+        ports::fill(&mut lookup_key)?;
         let mut host = ntcp_host::Host::new(
             path::ContextId::new(u64::from_ne_bytes(identity)),
             paths,
             limits,
             self.endpoint.caller_timebase(),
+            lookup_key,
         )
         .map_err(host_error)?;
         // Unpredictable identifiers draw on the same blocking kernel CSPRNG

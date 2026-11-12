@@ -731,7 +731,13 @@ fn adjunct_state_is_bounded() {
         let (paths, mut l) = managed_limits(&config(2), 1, 1, 1, 4, 1).unwrap();
         l.datagrams = limits(1);
         assert!(matches!(
-            Host::new(ContextId::new(9), paths, l, config(2).connection.timebase),
+            Host::new(
+                ContextId::new(9),
+                paths,
+                l,
+                config(2).connection.timebase,
+                [1; 16]
+            ),
             Err(Error::Capacity)
         ));
         // RFC 4821 7.3: the restart timer is at least 5 minutes.

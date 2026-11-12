@@ -17,6 +17,7 @@ fn service(context: u64) -> PathService {
             paths: 8,
             clients: 12,
         },
+        [1; 16],
     )
     .unwrap()
 }
@@ -560,6 +561,7 @@ fn capacity_failures_are_transactional_and_slots_are_reusable() {
             paths: 2,
             clients: 2,
         },
+        [1; 16],
     )
     .unwrap();
     let a = service.register_link(InterfaceKey(1), 1500).unwrap();
@@ -633,6 +635,7 @@ fn source_and_owner_limits_are_independent_without_partial_claims() {
             paths: 2,
             clients: 2,
         },
+        [1; 16],
     )
     .unwrap();
     let a = service.register_link(InterfaceKey(1), 1500).unwrap();
@@ -661,6 +664,7 @@ fn source_and_owner_limits_are_independent_without_partial_claims() {
             paths: 2,
             clients: 2,
         },
+        [1; 16],
     )
     .unwrap();
     let link = no_sources.register_link(InterfaceKey(1), 1500).unwrap();
@@ -706,7 +710,7 @@ fn source_and_owner_limits_are_independent_without_partial_claims() {
         },
     ] {
         assert!(matches!(
-            PathService::new(ContextId::new(15), limits),
+            PathService::new(ContextId::new(15), limits, [1; 16]),
             Err(Error::Capacity)
         ));
     }

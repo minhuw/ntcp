@@ -157,6 +157,7 @@ fn managed_limited(
         paths,
         limits,
         cfg.connection.timebase,
+        [1; 16],
     )
     .unwrap();
     let context = host

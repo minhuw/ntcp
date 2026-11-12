@@ -189,6 +189,7 @@ fn folded_link_local_history_denies_only_its_own_zone() {
             paths: 1,
             clients: 1,
         },
+        [1; 16],
     )
     .unwrap();
     let a = paths.register_link(InterfaceKey(1), 1500).unwrap();

@@ -286,6 +286,15 @@ fn bytes(capacity: usize) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+// The key of the Host's path cache hash: the TCP secret under its own
+// label, as the Endpoint derives its connection-table key from it.
+fn path_lookup_key(secret: &[u8; 32]) -> [u8; 16] {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
+    mac.update(b"ntcp path lookup key");
+    mac.finalize().into_bytes()[..16].try_into().unwrap()
+}
+
 // ARP draws each ReachableTime at random so that stations do not probe in
 // step. The draws are a keyed SipHash of a counter under std's per-process
 // random keys: unpredictable without a system call per draw, of which TCP
@@ -525,6 +534,7 @@ impl<P: PacketIo> Network<P> {
             path_limits,
             limits,
             config.tcp.connection.timebase,
+            path_lookup_key(&secret),
         )?;
         let shared_neighbors = member.is_some();
         if let Some(member) = member {

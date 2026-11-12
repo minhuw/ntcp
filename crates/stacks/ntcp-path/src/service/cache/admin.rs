@@ -507,6 +507,7 @@ impl PathService {
                     policy,
                     generation: plan.generation,
                 };
+                self.refresh_idle(path.0.slot);
             }
         }
         self.admin_revision = plan.generation;

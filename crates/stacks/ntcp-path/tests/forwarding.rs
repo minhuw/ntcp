@@ -16,6 +16,7 @@ fn opaque_forwarder_is_explicit_canonical_link_authority() {
             paths: 3,
             clients: 3,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(9), 1500).unwrap();
@@ -68,6 +69,7 @@ fn source_route_first_hop_and_final_peer_both_qualify_the_same_canonical_path() 
             paths: 4,
             clients: 4,
         },
+        [1; 16],
     )
     .unwrap();
     let link = service.register_link(InterfaceKey(9), 1500).unwrap();
