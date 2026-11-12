@@ -1374,6 +1374,14 @@ impl Rack {
 pub(crate) mod tests;
 
 #[cfg(test)]
+#[path = "rack_reference.rs"]
+mod reference;
+
+#[cfg(test)]
+#[path = "rack_equivalence_tests.rs"]
+mod equivalence_tests;
+
+#[cfg(test)]
 mod diagnostic_packetization_tests {
     use super::*;
     #[test]
