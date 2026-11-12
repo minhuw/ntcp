@@ -536,12 +536,7 @@ impl Rack {
         }
         let hull = self.hull(i, i + 1);
         let before = self.contribution(hull);
-        let mut right = self.intervals[i];
-        right.start = edge;
-        // Pieces of a Some interval stay inside its noted range.
-        self.intervals[i].end = edge;
-        self.intervals[i].set_stats_flag(DELIVERY_END, false);
-        self.intervals.insert(i + 1, right);
+        self.divide(i, edge);
         // Both pieces keep the packet and delivery unit of the original.
         let after = self.contribution(Hull {
             items: (i, i + 2),
@@ -550,6 +545,17 @@ impl Rack {
         });
         self.tally.apply(before, after);
         true
+    }
+
+    // Splits interval i at edge, strictly inside it, leaving the tally to
+    // the caller.
+    fn divide(&mut self, i: usize, edge: Seq) {
+        let mut right = self.intervals[i];
+        right.start = edge;
+        // Pieces of a Some interval stay inside its noted range.
+        self.intervals[i].end = edge;
+        self.intervals[i].set_stats_flag(DELIVERY_END, false);
+        self.intervals.insert(i + 1, right);
     }
 
     // Index of the first interval ending after seq: the one holding seq, or
@@ -1062,26 +1068,7 @@ impl Rack {
             }
             for r in s.intervals.range_mut(first, last) {
                 if !start.after(r.start) && !r.end.after(end) {
-                    r.set_stats_flag(DELIVERY_END, r.end == end);
-                    if selection.retransmit {
-                        r.set_stats_flag(SYN_PAYLOAD, false);
-                    }
-                    r.set_stats_flag(DIAGNOSTIC_RETRY, selection.retransmit);
-                    r.set_stats_flag(DIAGNOSTIC_LOST, false);
-                    if !r.stats_flag(PACKET_DELIVERED) {
-                        r.set_stats_flag(PACKET_INCLUDES_FIN, false);
-                    }
-                    r.sent = now;
-                    // Even a sub-TS-tick delay separates encoding from departure.
-                    r.timestamp_eligible &= now == selection.selected;
-                    r.transmission_start = start;
-                    r.transmission_end = end;
-                    r.departure_committed = true;
-                    if !selection.retransmit {
-                        r.original_wire_start = start;
-                        r.original_wire_end = end;
-                        r.original_sent = now;
-                    }
+                    Self::depart(r, selection, start, end, now);
                 }
             }
         });
@@ -1094,6 +1081,102 @@ impl Rack {
             .next()
             .map_or(end, |r| r.end);
         self.mark_dirty(dirty_start, dirty_end);
+        self.verify();
+    }
+
+    // Records r, inside the departure [start, end), as departed at now.
+    fn depart(r: &mut Interval, selection: DepartureSelection, start: Seq, end: Seq, now: u64) {
+        r.set_stats_flag(DELIVERY_END, r.end == end);
+        if selection.retransmit {
+            r.set_stats_flag(SYN_PAYLOAD, false);
+        }
+        r.set_stats_flag(DIAGNOSTIC_RETRY, selection.retransmit);
+        r.set_stats_flag(DIAGNOSTIC_LOST, false);
+        if !r.stats_flag(PACKET_DELIVERED) {
+            r.set_stats_flag(PACKET_INCLUDES_FIN, false);
+        }
+        r.sent = now;
+        // Even a sub-TS-tick delay separates encoding from departure.
+        r.timestamp_eligible &= now == selection.selected;
+        r.transmission_start = start;
+        r.transmission_end = end;
+        r.departure_committed = true;
+        if !selection.retransmit {
+            r.original_wire_start = start;
+            r.original_wire_end = end;
+            r.original_sent = now;
+        }
+    }
+
+    // `commit_validated_departure` of each departure of a group
+    // `validate_departure_group` accepted, in order, with the intervals
+    // unchanged since: the same splits, interval fields, dirty ranges and
+    // storage moves, in one pass and with one tally change for the whole
+    // group instead of a split, overlap search and retally per segment.
+    pub(crate) fn commit_validated_group(
+        &mut self,
+        selection: DepartureSelection,
+        start: Seq,
+        size: u32,
+        bytes: usize,
+        now: u64,
+    ) {
+        debug_assert!(self.validate_departure_group(selection, start, size, bytes, now));
+        let end = start.wrapping_add(bytes as u32);
+        let edge = |k: usize| start.wrapping_add((k * size as usize).min(bytes) as u32);
+        // Everything the commits change lies in [from, last) and its
+        // pieces; the hull's packet and unit edges are unchanged intervals,
+        // which the splits only shift.
+        let (mut first, last) = self.overlapping(start, end);
+        let from = first
+            .checked_sub(1)
+            .filter(|&i| self.intervals[i].end == start)
+            .unwrap_or(first);
+        let hull = self.hull(from, last);
+        let before = self.contribution(hull);
+        let len = self.intervals.len();
+        if start.after(self.intervals[first].start) {
+            self.divide(first, start);
+            first += 1;
+        }
+        // The first commit's previous unit ends at start.
+        let mut previous = first
+            .checked_sub(1)
+            .filter(|&i| self.intervals[i].end == start);
+        if let Some(previous) = previous {
+            self.intervals[previous].set_stats_flag(DELIVERY_END, true);
+        }
+        let mut i = first;
+        for k in 0..bytes.div_ceil(size as usize) {
+            let (a, b) = (edge(k), edge(k + 1));
+            // Segment k's commit splits only at b: a is the last one's end.
+            let dirty_start = self.intervals[previous.unwrap_or(i)].start;
+            while i < self.intervals.len() && !self.intervals[i].end.after(b) {
+                Self::depart(&mut self.intervals[i], selection, a, b, now);
+                i += 1;
+            }
+            if i < self.intervals.len() && b.after(self.intervals[i].start) {
+                self.divide(i, b);
+                Self::depart(&mut self.intervals[i], selection, a, b, now);
+                i += 1;
+            }
+            // As that commit marks: through the interval after the segment,
+            // which later segments' splits have not divided yet.
+            let dirty_end = self
+                .intervals
+                .range(i, self.intervals.len())
+                .next()
+                .map_or(b, |r| r.end);
+            self.mark_dirty(dirty_start, dirty_end);
+            previous = Some(i - 1);
+        }
+        let added = self.intervals.len() - len;
+        let after = self.contribution(Hull {
+            items: (from, last + added),
+            packets: (hull.packets.0, hull.packets.1 + added),
+            units: (hull.units.0, hull.units.1 + added),
+        });
+        self.tally.apply(before, after);
         self.verify();
     }
 

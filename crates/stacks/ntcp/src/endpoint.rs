@@ -5667,27 +5667,12 @@ impl Endpoint {
         let r = self.reservations[index].current.as_ref().unwrap();
         let group = r.group.unwrap();
         let mut departure = r.departure.unwrap();
-        let size = departure.segmentation.unwrap().segment_payload_len;
         let (offset, id) = (r.offset, r.packet.connection.unwrap());
         let finished = offset + group.bytes == departure.payload;
         // Checked above.
         self.clock(now)?;
         let owner = &mut self.retained_slot_mut(id)?.connection;
-        for n in 0..group.segments {
-            // The group preflight covers every segment, and nothing else
-            // runs between these acceptances.
-            let withdrawn = owner
-                .accept_reserved_output(
-                    now,
-                    &mut departure,
-                    offset + n * size,
-                    size.min(group.bytes - n * size),
-                    finished && n + 1 == group.segments,
-                )
-                .expect("preflighted group departure");
-            // Only PTB repairs withdraw a suffix; GSO selects fresh data.
-            debug_assert!(!withdrawn);
-        }
+        owner.accept_reserved_group(now, &mut departure, offset, group.bytes, finished);
         let r = self.reservations[index].current.as_mut().unwrap();
         r.emitted_bytes = group.bytes;
         r.emitted_sacks = 0;

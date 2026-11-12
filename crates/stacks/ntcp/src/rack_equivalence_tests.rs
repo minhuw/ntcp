@@ -378,12 +378,38 @@ impl Model {
             let bytes = rest.min(segments * self.mss) as usize;
             let segment = self.mss;
             self.note(format!("group {start:?} +{bytes} by {segment} @{now}"));
+            let valid = self
+                .rack
+                .validate_departure_group(p.selection, start, segment, bytes, now);
             assert_eq!(
-                self.rack
-                    .validate_departure_group(p.selection, start, segment, bytes, now),
+                valid,
                 self.reference
                     .validate_departure_group(p.selection, start, segment, bytes, now)
             );
+            if valid && self.rng.chance(50) {
+                // Accepted whole: what committing each segment in turn leaves,
+                // dirty ranges and storage layout included.
+                self.note(format!("commit group @{now}"));
+                let mut whole = self.rack.grown(self.rack.capacity - 2).unwrap();
+                let mut each = self.rack.grown(self.rack.capacity - 2).unwrap();
+                for k in 0..bytes.div_ceil(segment as usize) {
+                    let a = start.wrapping_add(k as u32 * segment);
+                    let b = start.wrapping_add(((k + 1) * segment as usize).min(bytes) as u32);
+                    each.commit_validated_departure(p.selection, a, b, now);
+                    self.reference
+                        .commit_validated_departure(p.selection, a, b, now);
+                }
+                whole.commit_validated_group(p.selection, start, segment, bytes, now);
+                self.rack
+                    .commit_validated_group(p.selection, start, segment, bytes, now);
+                let (a, b) = (format!("{whole:?}"), format!("{each:?}"));
+                assert_eq!(a, b, "{}", self.context());
+                p.offset += bytes as u32;
+                if p.offset < total {
+                    self.pending = Some(p);
+                }
+                return;
+            }
         }
         let end = start.wrapping_add(piece);
         self.note(format!("depart {start:?}..{end:?} @{now}"));

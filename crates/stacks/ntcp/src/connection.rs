@@ -3048,6 +3048,79 @@ impl Connection {
         finished: bool,
     ) -> Result<bool, Error> {
         self.validate_reserved_output(now, d, offset, count)?;
+        if d.stream
+            && count != 0
+            && let Some(selection) = self.reserved_ledger
+        {
+            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
+            // Validated above; nothing since changed the intervals.
+            self.rack.commit_validated_departure(
+                selection,
+                start,
+                start.wrapping_add(count as u32),
+                now,
+            );
+        }
+        self.accept_departed_output(now, d, offset, count, finished)
+    }
+
+    /// `accept_reserved_output` of each segment of a GSO reservation that
+    /// covers `bytes` from `offset`, in turn at `now`, after
+    /// `validate_reserved_group` held. RACK records the whole group at once:
+    /// what the rest of each acceptance reads of it (packet counts, short
+    /// transmissions, its timer) is overwritten by the last segment's, which
+    /// sees every segment committed either way. Fresh data only; SYN,
+    /// retransmission and PTB repair acceptances, which record more in RACK,
+    /// take each segment alone.
+    pub(crate) fn accept_reserved_group(
+        &mut self,
+        now: Instant,
+        d: &mut Departure,
+        offset: usize,
+        bytes: usize,
+        finished: bool,
+    ) {
+        let size = d.segmentation.unwrap().segment_payload_len;
+        let segments = bytes.div_ceil(size);
+        let whole = !(d.syn || d.retransmission || d.ptb_repair);
+        debug_assert!(self.validate_reserved_group(now, d, offset, bytes).is_ok());
+        if whole
+            && d.stream
+            && let Some(selection) = self.reserved_ledger
+        {
+            self.rack.commit_validated_group(
+                selection,
+                Seq(d.start).wrapping_add(offset as u32),
+                size as u32,
+                bytes,
+                now,
+            );
+        }
+        for n in 0..segments {
+            let (at, count) = (offset + n * size, size.min(bytes - n * size));
+            let last = finished && n + 1 == segments;
+            // The group preflight covers every segment, and nothing else
+            // runs between these acceptances.
+            let withdrawn = if whole {
+                self.accept_departed_output(now, d, at, count, last)
+            } else {
+                self.accept_reserved_output(now, d, at, count, last)
+            }
+            .expect("preflighted group departure");
+            // Only PTB repairs withdraw a suffix; GSO selects fresh data.
+            debug_assert!(!withdrawn);
+        }
+    }
+
+    // The rest of `accept_reserved_output`, once RACK has the departure.
+    fn accept_departed_output(
+        &mut self,
+        now: Instant,
+        d: &mut Departure,
+        offset: usize,
+        count: usize,
+        finished: bool,
+    ) -> Result<bool, Error> {
         self.control_undo = None;
         if count != 0 {
             if let Some(resource) = self.local_resource.take() {
@@ -3062,19 +3135,6 @@ impl Connection {
                 d.payload,
             );
             d.defer_push = false;
-        }
-        if d.stream
-            && count != 0
-            && let Some(selection) = self.reserved_ledger
-        {
-            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
-            // Validated above; nothing since changed the intervals.
-            self.rack.commit_validated_departure(
-                selection,
-                start,
-                start.wrapping_add(count as u32),
-                now,
-            );
         }
         if count != 0
             && (d.segmentation.is_some() || d.deferred_fresh)
