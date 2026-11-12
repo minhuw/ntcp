@@ -63,6 +63,7 @@ pub(crate) fn transport_option_prefix(
     put(80, (info.cwnd / info.mss) as u64);
     put(84, u64::from(info.advertised_mss));
     put(88, info.reordering as u64);
+    put(100, info.total_retrans);
     for (offset, value) in [
         (168, info.busy_time_us),
         (176, info.rwnd_limited_us),
@@ -357,6 +358,99 @@ mod tests {
     }
 
     #[test]
+    fn linux_info_total_retrans_counts_sent_retransmissions() {
+        use ntcp::wire::{self, ACK, FIN, SYN};
+        use ntcp::{ConnectionConfig, Endpoint, EndpointConfig};
+
+        let config = EndpointConfig {
+            connection: ConnectionConfig {
+                mss: 1000,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                "192.0.2.1:1000".parse().unwrap(),
+                "192.0.2.2:2000".parse().unwrap(),
+            )
+            .unwrap();
+        let mut out = [0; 2048];
+        // The sequence space of every segment sent at `now`: (sequence,
+        // payload length, SYN/FIN flags).
+        let mut drain = |endpoint: &mut Endpoint, now| {
+            let mut sent = Vec::new();
+            while let Some(tx) = endpoint.poll_transmit(now, &mut out, 16).unwrap().packet {
+                let segment = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+                sent.push((
+                    segment.header.sequence,
+                    segment.payload.len(),
+                    segment.header.flags & (SYN | FIN),
+                ));
+            }
+            sent
+        };
+        let total = |endpoint: &Endpoint| {
+            let bytes = transport_option(endpoint.transport_info(id).unwrap(), 1).unwrap();
+            u32::from_ne_bytes(bytes[100..104].try_into().unwrap())
+        };
+        let syn = drain(&mut endpoint, 0);
+        assert_eq!(syn.len(), 1);
+        assert_eq!(syn[0].2, SYN);
+        // The SYN is lost; its timeout resends it.
+        let deadline = endpoint.transport_info(id).unwrap().rto_us;
+        endpoint.on_timeout(deadline, 16).unwrap();
+        assert_eq!(drain(&mut endpoint, deadline), syn);
+        let base = syn[0].0.wrapping_add(1);
+        let ip = ntcp::IpMetadata {
+            source: "192.0.2.2".parse().unwrap(),
+            destination: "192.0.2.1".parse().unwrap(),
+        };
+        let mut header = wire::Header {
+            source_port: 2000,
+            destination_port: 1000,
+            sequence: 100,
+            acknowledgment: base,
+            flags: SYN | ACK,
+            window: 32_000,
+            urgent_pointer: 0,
+        };
+        let mut input = [0; 64];
+        let len = wire::encode(ip, header, &[2, 4, 3, 232], &[], &mut input).unwrap();
+        let now = deadline + 10;
+        endpoint.input(now, ip, &input[..len]).unwrap();
+        drain(&mut endpoint, now);
+        assert_eq!(total(&endpoint), 1); // The resent SYN; the handshake ACK is not one.
+
+        // The lost SYN leaves a one-segment window (RFC 5681 section 3.1).
+        endpoint.write(id, &[7; 3000]).unwrap();
+        let first = drain(&mut endpoint, now);
+        assert_eq!(first, [(base, 1000, 0)]);
+        // Its ACK opens the window to two new segments, both lost.
+        header.sequence = 101;
+        header.acknowledgment = base.wrapping_add(1000);
+        header.flags = ACK;
+        let len = wire::encode(ip, header, &[], &[], &mut input).unwrap();
+        endpoint.input(now + 10, ip, &input[..len]).unwrap();
+        let original = drain(&mut endpoint, now + 10);
+        assert_eq!(original.len(), 2);
+        assert_eq!(total(&endpoint), 1); // New data is not a retransmission.
+        let deadline = now + 10 + endpoint.transport_info(id).unwrap().rto_us;
+        endpoint.on_timeout(deadline, 16).unwrap();
+        let resent = drain(&mut endpoint, deadline);
+        assert_eq!(resent, original[..1]);
+        assert_eq!(total(&endpoint), 2);
+        // Acknowledging the repair sends the other lost segment again.
+        header.acknowledgment = base.wrapping_add(2000);
+        let len = wire::encode(ip, header, &[], &[], &mut input).unwrap();
+        endpoint.input(deadline + 10, ip, &input[..len]).unwrap();
+        assert_eq!(drain(&mut endpoint, deadline + 10), original[1..]);
+        assert_eq!(total(&endpoint), 3);
+    }
+
+    #[test]
     fn linux_info_metrics_offsets_preserve_existing_fields() {
         let info = ntcp::TransportInfo {
             state: State::Established,
@@ -378,7 +472,7 @@ mod tests {
             sacked: 1,
             lost: 1,
             retransmitted: 2,
-            total_retrans: 0,
+            total_retrans: 0x0bad_cafe,
             reordering: 3,
             reordering_events: 0xabcdef01,
             resource_probes: 0,
@@ -461,6 +555,7 @@ mod tests {
             (68, 12000),
             (80, 10),
             (84, 1200),
+            (100, 0x0bad_cafe),
             (144, 4000),
             (148, 10000),
             (192, 0x12345678),
@@ -486,6 +581,7 @@ mod tests {
             52..56,
             68..88,
             88..92,
+            100..104,
             144..152,
             168..196,
             220..224,
@@ -548,6 +644,18 @@ mod tests {
             assert_eq!(transport_option(single, 1).unwrap()[5], bit);
         }
         for count in [0, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            let metrics = transport_option(
+                ntcp::TransportInfo {
+                    total_retrans: count,
+                    ..info
+                },
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                &metrics[100..104],
+                &(count.min(u32::MAX as u64) as u32).to_ne_bytes()
+            );
             sample.delivered_segments = count;
             assert_eq!(
                 &transport_option(sample, 1).unwrap()[192..196],
