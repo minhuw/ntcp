@@ -452,9 +452,13 @@ impl OutputReservation {
         r.finished = finished;
         // A cancelled backend observation must not masquerade as a retry's actual
         // submit timestamp. Scheduled/ACK observations remain owned by the stream.
+        // A GSO segment carries the token of its own bytes, as when selected
+        // alone: its range holds no pending Transmit phase to cancel.
         let packet = Transmit {
             len,
-            tx_timestamp: None,
+            tx_timestamp: segmentation
+                .and(r.packet.tx_timestamp)
+                .map(|token| token.part(r.offset, count)),
             ecn: if count == 0 { 0 } else { r.packet.ecn },
             ..r.packet
         };

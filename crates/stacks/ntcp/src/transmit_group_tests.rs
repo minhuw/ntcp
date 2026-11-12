@@ -1149,3 +1149,69 @@ fn groups_form_while_plpmtud_searches() {
     let segments = total.div_ceil(1448);
     assert!(grouped > segments / 2, "{grouped} of {segments}");
 }
+
+// A backend completing the Transmit phases (both sources) of a packet's
+// token when it submits the packet at `now`. A group's view has none.
+fn complete(e: &mut Endpoint, token: Option<crate::TxTimestampToken>, now: Instant) {
+    let Some(token) = token else {
+        return;
+    };
+    for source in [
+        crate::TxTimestampSource::Software,
+        crate::TxTimestampSource::Hardware,
+    ] {
+        e.report_tx_timestamp(
+            token,
+            source,
+            1_000 + now,
+            crate::TxTimestampClock::RealtimeNanoseconds,
+        )
+        .unwrap();
+    }
+}
+
+// `scalar` with `complete` for every packet; also the stream range each
+// packet's token names.
+fn scalar_completed(
+    e: &mut Endpoint,
+    id: ConnectionId,
+    now: Instant,
+) -> (Vec<Vec<u8>>, Vec<Option<crate::TxStreamRange>>) {
+    let mut out = [0; 2048];
+    let (mut packets, mut ranges) = (Vec::new(), Vec::new());
+    loop {
+        let (poll, attempt) = e.poll_reserved_transmit_for(now, id, &mut out, 16).unwrap();
+        let Some(p) = poll.packet else {
+            return (packets, ranges);
+        };
+        let attempt = attempt.unwrap();
+        assert_eq!(e.transmit_attempt_packet(attempt), Some(p));
+        assert!(e.accept_transmit(now, attempt).unwrap());
+        complete(e, p.tx_timestamp, now);
+        packets.push(out[..p.len].to_vec());
+        ranges.push(p.tx_timestamp.map(|token| token.stream_range()));
+    }
+}
+
+// A GSO reservation polled one segment at a time gives each segment the
+// timestamp token of its own bytes, the one it has when selected alone.
+#[test]
+fn scalar_segments_of_a_gso_reservation_name_their_own_bytes() {
+    let (mut a, _, id, _) = pair(false, true, 16_384);
+    let (mut c, _, cid, _) = connected(false, true, 16_384);
+    c.enable_output_reservations().unwrap();
+    a.write(id, &[3; 7000]).unwrap();
+    c.write(cid, &[3; 7000]).unwrap();
+    let mut out = [0; 2048];
+    let (poll, attempt) = a.poll_reserved_transmit_for(2, id, &mut out, 1).unwrap();
+    let (p, attempt) = (poll.packet.unwrap(), attempt.unwrap());
+    assert!(a.transmit_segmentation(attempt).is_some());
+    assert_eq!(a.transmit_attempt_packet(attempt), Some(p));
+    assert!(a.accept_transmit(2, attempt).unwrap());
+    let (mut wire, mut ranges) = scalar_completed(&mut a, id, 2);
+    wire.insert(0, out[..p.len].to_vec());
+    ranges.insert(0, p.tx_timestamp.map(|token| token.stream_range()));
+    assert_eq!(ranges.len(), 8);
+    assert!(ranges.iter().all(Option::is_some));
+    assert_eq!((wire, ranges), scalar_completed(&mut c, cid, 2));
+}

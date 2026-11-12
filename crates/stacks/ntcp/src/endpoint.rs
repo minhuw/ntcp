@@ -5744,7 +5744,7 @@ impl Endpoint {
             reply,
         );
         self.reservations[index].payload = payload;
-        let (output, mut zone) = output?;
+        let (mut output, mut zone) = output?;
         if let Some(packet) = output.packet {
             if let Some(parts) = shared.filter(|p| !p.is_empty()) {
                 self.reservations[index].capture_shared(packet, out, parts, attempt)?;
@@ -5767,6 +5767,15 @@ impl Endpoint {
                     r.repaired = true;
                     r.finished = false;
                     r.emitted_bytes = s.segment_payload_len;
+                    // The first segment's own token; the reservation keeps
+                    // the whole range's.
+                    let first = packet
+                        .tx_timestamp
+                        .map(|token| token.part(0, s.segment_payload_len));
+                    r.emitted_packet.tx_timestamp = first;
+                    if let Some(p) = &mut output.packet {
+                        p.tx_timestamp = first;
+                    }
                 }
                 self.refresh(id.slot);
             }

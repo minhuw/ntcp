@@ -77,6 +77,19 @@ impl TxTimestampToken {
     pub(crate) fn new(connection: ConnectionId, range: TxStreamRange) -> Self {
         Self { connection, range }
     }
+
+    // The token of the `len` bytes from `offset` in this one's range: a
+    // GSO segment's, cut from its reservation's.
+    pub(crate) fn part(self, offset: usize, len: usize) -> Self {
+        let start = self.range.start + offset as u64;
+        Self::new(
+            self.connection,
+            TxStreamRange {
+                start,
+                end: start + len as u64,
+            },
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
