@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 struct SharedState {
     block: bool,
     packet_limit: usize,
+    segments: usize,
     held: Vec<OwnedPacket>,
     sent: Vec<Vec<u8>>,
 }
@@ -30,9 +31,10 @@ impl PacketIo for AsyncShared {
         Ok(TxOutcome::Submitted)
     }
     fn zero_copy_capabilities(&self) -> Option<ZeroCopyCapabilities> {
+        let state = self.0.lock().unwrap();
         Some(ZeroCopyCapabilities {
-            max_payload_segments: 4,
-            max_packet_len: self.0.lock().unwrap().packet_limit,
+            max_payload_segments: state.segments,
+            max_packet_len: state.packet_limit,
         })
     }
     fn zero_copy_payload_supported(&self, payload: &Payload) -> bool {
@@ -56,8 +58,16 @@ fn attach(owner: &mut Owner) -> Arc<Mutex<SharedState>> {
     attach_limit(owner, 2048)
 }
 fn attach_limit(owner: &mut Owner, packet_limit: usize) -> Arc<Mutex<SharedState>> {
+    attach_segments(owner, packet_limit, 4)
+}
+fn attach_segments(
+    owner: &mut Owner,
+    packet_limit: usize,
+    segments: usize,
+) -> Arc<Mutex<SharedState>> {
     let state = Arc::new(Mutex::new(SharedState {
         packet_limit,
+        segments,
         ..Default::default()
     }));
     owner.ports[0].ethernet = Some(EthernetBackend {
@@ -85,6 +95,9 @@ fn drain_wire(state: &Arc<Mutex<SharedState>>, to: &mut Owner) {
     }
 }
 fn send_registered(a: &mut Owner, id: u64, sources: Vec<(usize, usize)>) -> i32 {
+    try_send_registered(a, id, sources).unwrap()
+}
+fn try_send_registered(a: &mut Owner, id: u64, sources: Vec<(usize, usize)>) -> Result<i32> {
     let (reply, result) = mpsc::sync_channel(1);
     let mut request = Request {
         id,
@@ -94,9 +107,10 @@ fn send_registered(a: &mut Owner, id: u64, sources: Vec<(usize, usize)>) -> i32 
         send: None,
         closing: None,
     };
-    for _ in 0..BUDGET {
+    // A send ends within BUDGET batch turns, plus its final one.
+    for _ in 0..2 * BUDGET {
         if a.service(&mut request) {
-            return result.recv().unwrap().unwrap().value;
+            return result.recv().unwrap().map(|reply| reply.value);
         }
     }
     panic!("bounded send did not finish");
@@ -473,4 +487,36 @@ fn shared_backend_packet_bound_clips_selection_before_submission() {
         }
     }
     assert_eq!(offset, 1000);
+}
+#[test]
+fn registered_iovecs_take_at_most_iov_max_spans() {
+    let (mut a, _, client, _, _) = pair();
+    // More references than IOV_MAX per packet: output takes 1024.
+    let _state = attach_segments(&mut a, 2048, 4096);
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    let max = ntcp::Endpoint::MAX_SHARED_SEGMENTS;
+    let registration =
+        crate::RegisteredPayload::register(Payload::from_vec(vec![9; 2 * max + 4])).unwrap();
+    let address = registration.as_slice().as_ptr() as usize;
+    // Each iovec of a zerocopy send holds its own span until ACKed.
+    let mut queued = 0;
+    while queued < max {
+        let iovecs = (queued..max).map(|n| (address + 2 * n, 1)).collect();
+        let n = send_registered(&mut a, client, iovecs);
+        assert!(n > 0);
+        queued += n as usize;
+    }
+    assert_eq!(queued, max);
+    // As Linux refuses more than UIO_MAXIOV buffers.
+    assert_eq!(
+        try_send_registered(&mut a, client, vec![(address + 2 * max, 1)]),
+        Err(EINVAL)
+    );
+    // Copied (unregistered) bytes take no span.
+    let copied = [5u8; 3];
+    assert_eq!(
+        send_registered(&mut a, client, vec![(copied.as_ptr() as usize, 3)]),
+        3
+    );
 }

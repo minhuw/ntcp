@@ -128,12 +128,17 @@ impl Pair {
         Self::with_addresses(ip_a, ip_b, ethernet)
     }
     fn with_addresses(ip_a: IpAddr, ip_b: IpAddr, ethernet: bool) -> Self {
+        Self::with_send_capacity(ip_a, ip_b, ethernet, 256)
+    }
+    fn with_send_capacity(ip_a: IpAddr, ip_b: IpAddr, ethernet: bool, send: usize) -> Self {
         let (a, b) = wires(if ethernet {
             PacketLayer::Ethernet
         } else {
             PacketLayer::Ip
         });
-        let mut a = Network::new(config(ip_a, ethernet, 1), a, [1; 32], 0).unwrap();
+        let mut config_a = config(ip_a, ethernet, 1);
+        config_a.tcp.connection.send_capacity = send;
+        let mut a = Network::new(config_a, a, [1; 32], 0).unwrap();
         let mut b = Network::new(config(ip_b, ethernet, 2), b, [2; 32], 0).unwrap();
         let listener = b.listen(9000, 4).unwrap();
         let client = a.connect(SocketAddr::new(ip_b, 9000)).unwrap();
@@ -515,6 +520,32 @@ fn shared_admission_advances_the_payload_and_keeps_storage_until_ack() {
     }
     assert_eq!(received, original[..receipt.accepted]);
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn shared_admission_refuses_spans_past_iov_max() {
+    let (ip_a, ip_b) = ("10.73.0.1".parse().unwrap(), "10.73.0.2".parse().unwrap());
+    let mut pair = Pair::with_send_capacity(ip_a, ip_b, false, 4096);
+    let max = ntcp::Endpoint::MAX_SHARED_SEGMENTS;
+    let base = Payload::from_vec(vec![3; 2 * max + 2]);
+    // Writes that do not continue one another each hold a span until ACKed.
+    for n in 0..max {
+        let mut payload = base.slice(2 * n..2 * n + 1).unwrap();
+        let receipt = pair.a.try_write_shared(pair.client, &mut payload).unwrap();
+        assert_eq!(receipt.accepted, 1);
+    }
+    let mut payload = base.slice(2 * max..2 * max + 1).unwrap();
+    assert!(matches!(
+        pair.a.try_write_shared(pair.client, &mut payload),
+        Err(Error::Tcp(ntcp::EndpointError::Connection(
+            ntcp::Error::InvalidArgument
+        )))
+    ));
+    assert_eq!(payload.len(), 1);
+    // One continuing the last span joins it.
+    let mut payload = base.slice(2 * max - 1..2 * max).unwrap();
+    let receipt = pair.a.try_write_shared(pair.client, &mut payload).unwrap();
+    assert_eq!(receipt.accepted, 1);
 }
 
 #[test]

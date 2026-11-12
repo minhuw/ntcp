@@ -252,9 +252,11 @@ impl Owner {
             self.defaults.max_connections,
         )?;
         if let Some(caps) = zero_copy {
+            // At most IOV_MAX payload references per packet.
             let segments = caps
                 .max_payload_segments
-                .min(self.defaults.connection.send_capacity);
+                .min(self.defaults.connection.send_capacity)
+                .min(ntcp::Endpoint::MAX_SHARED_SEGMENTS);
             if segments == 0 || caps.max_packet_len < 60 {
                 return Err(EINVAL);
             }

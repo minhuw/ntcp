@@ -260,3 +260,80 @@ fn shared_writes_join_only_contiguous_ranges_of_one_lease() {
     buffer.set_shared_output(Some(1));
     assert_eq!(buffer.copy(0, &mut out), 2);
 }
+
+#[test]
+fn separate_shared_spans_stop_at_iov_max() {
+    let mut cfg = config();
+    cfg.connection.send_capacity = 4096;
+    cfg.connection.receive_capacity = 4096;
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 100);
+    let server = b.accept(listener).unwrap();
+    // A packet's reference limit does not bound the spans a connection holds.
+    a.enable_output_reservations().unwrap();
+    a.enable_shared_output(8).unwrap();
+    let max = Endpoint::MAX_SHARED_SEGMENTS;
+    let base = Payload::from_vec((0..2 * max + 4).map(|n| n as u8).collect());
+    let one = |n: usize| base.slice(n..n + 1).unwrap();
+    // Writes that do not continue one another each take a span.
+    for n in 0..max {
+        assert_eq!(a.write_shared(client, one(2 * n), true, false, None), Ok(1));
+    }
+    let charge = a.buffer_bytes();
+    let refused = Err(EndpointError::Connection(Error::InvalidArgument));
+    assert_eq!(
+        a.write_shared(client, one(2 * max), true, false, None),
+        refused
+    );
+    assert_eq!(
+        a.write_shared(client, Payload::from_vec(vec![1]), true, false, None),
+        refused
+    );
+    assert_eq!(a.buffer_bytes(), charge);
+    // One continuing the last span joins it; copied bytes take no span.
+    assert_eq!(
+        a.write_shared(client, one(2 * max - 1), true, false, None),
+        Ok(1)
+    );
+    assert_eq!(a.write(client, &[0xff]), Ok(1));
+    assert_eq!(
+        a.write_shared(client, one(2 * max), true, false, None),
+        refused
+    );
+    // Spans freed by ACKs admit separate writes again.
+    let mut now = 200;
+    let mut expected: Vec<u8> = (0..max).map(|n| (2 * n) as u8).collect();
+    expected.push((2 * max - 1) as u8);
+    expected.push(0xff);
+    while a.acknowledged(client) != Ok(expected.len() as u64) {
+        assert!(now < 100_000_000, "transfer did not finish");
+        pump(&mut a, &mut b, now);
+        now += 210_000;
+        a.on_timeout(now, 64).unwrap();
+        b.on_timeout(now, 64).unwrap();
+    }
+    assert_eq!(
+        a.write_shared(client, one(2 * max + 2), true, false, None),
+        Ok(1)
+    );
+    expected.push((2 * max + 2) as u8);
+    while a.acknowledged(client) != Ok(expected.len() as u64) {
+        assert!(now < 200_000_000, "transfer did not finish");
+        pump(&mut a, &mut b, now);
+        now += 210_000;
+        a.on_timeout(now, 64).unwrap();
+        b.on_timeout(now, 64).unwrap();
+    }
+    let mut result = vec![0; expected.len()];
+    assert_eq!(b.read(server, &mut result), Ok(expected.len()));
+    assert_eq!(result, expected);
+    assert_eq!(
+        a.enable_shared_output(max + 1),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    assert_eq!(a.enable_shared_output(max), Ok(()));
+}

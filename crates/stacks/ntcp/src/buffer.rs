@@ -412,6 +412,12 @@ impl SendBuffer {
         self.shared.len()
     }
 
+    // Whether `payload` fits beside at most `max_spans` spans: it joins the
+    // last one or fewer are held.
+    pub(crate) fn shared_room(&self, payload: &Payload, max_spans: usize) -> bool {
+        self.shared.len() < max_spans || self.joined(payload).is_some()
+    }
+
     pub(crate) fn shared_storage_bytes(&self) -> usize {
         self.shared.capacity() * core::mem::size_of::<SharedSpan>()
     }

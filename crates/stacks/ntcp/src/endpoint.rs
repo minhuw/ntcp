@@ -662,6 +662,11 @@ fn valid_address(address: IpAddr) -> bool {
 }
 
 impl Endpoint {
+    /// The most payload references a shared-output packet carries, and the
+    /// most spans a connection's shared payload holds apart: Linux's IOV_MAX
+    /// (UIO_MAXIOV), the most buffers one writev/sendmsg takes.
+    pub const MAX_SHARED_SEGMENTS: usize = 1024;
+
     // The caller must supply a confidential, unpredictable 32-byte key from an
     // initialized CSPRNG. The required callback captures authoritative network
     // context for this endpoint; the endpoint cannot prove the caller's policy true.
@@ -4000,6 +4005,11 @@ impl Endpoint {
     /// owns the backing allocation's budget; the endpoint charges its bounded
     /// queued-byte and range metadata. Partial ACKs retain the unacknowledged
     /// range. Backend clones can outlive ACK or connection termination.
+    /// A payload that continues the last one queued (`Payload::join`) extends
+    /// its span. Any other takes a span of its own, and is refused with
+    /// `InvalidArgument` while the connection holds MAX_SHARED_SEGMENTS, as
+    /// Linux refuses more than UIO_MAXIOV buffers with EINVAL; ACKs free
+    /// spans.
     pub fn write_shared(
         &mut self,
         id: ConnectionId,
@@ -4012,9 +4022,11 @@ impl Endpoint {
         if !payload.is_empty() {
             let room = self.buffer_room();
             let before = self.slot(id)?.connection.buffer_charge();
-            self.slot_mut(id)?
-                .connection
-                .prepare_shared_storage(&payload, room)?;
+            self.slot_mut(id)?.connection.prepare_shared_storage(
+                &payload,
+                Self::MAX_SHARED_SEGMENTS,
+                room,
+            )?;
             let after = self.slot(id)?.connection.buffer_charge();
             self.buffer_bytes += after - before;
         }
@@ -5199,9 +5211,11 @@ impl Endpoint {
 
     /// Allocate reusable payload-reference descriptors before packet service.
     /// The existing reservation pool must be enabled first and contain no held
-    /// output. `max_segments` is a caller/backend resource bound, not a TCP MSS.
+    /// output. `max_segments` is a caller/backend resource bound, not a TCP MSS,
+    /// at most MAX_SHARED_SEGMENTS.
     pub fn enable_shared_output(&mut self, max_segments: usize) -> Result<(), EndpointError> {
         if max_segments == 0
+            || max_segments > Self::MAX_SHARED_SEGMENTS
             || max_segments > self.config.connection.send_capacity
             || self.reservations.is_empty()
         {

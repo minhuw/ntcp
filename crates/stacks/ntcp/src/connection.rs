@@ -5162,8 +5162,12 @@ impl Connection {
     pub(crate) fn prepare_shared_storage(
         &mut self,
         payload: &crate::Payload,
+        max_spans: usize,
         peak_room: usize,
     ) -> Result<(), Error> {
+        if !self.send.shared_room(payload, max_spans) {
+            return Err(Error::InvalidArgument);
+        }
         self.send
             .prepare_shared(payload, peak_room)
             .map_err(|_| Error::NoMemory)
