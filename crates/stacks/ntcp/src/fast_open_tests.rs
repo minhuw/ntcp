@@ -740,6 +740,11 @@ fn fast_open_fallible_setup_is_transactional() {
             a.connect_fast_open(100, local, remote, b"copied before publish")
         });
         if let Ok((_, n)) = result {
+            // Storage refused for the data leaves a plain SYN, as Linux's
+            // tcp_send_syn_data falls back.
+            if n == 0 {
+                continue;
+            }
             assert_eq!(n, 21);
             successful = true;
             break;
@@ -888,9 +893,6 @@ fn fast_open_explicit_capacity_admission_failure_preserves_tuple_and_budget() {
             (65535 << 14) + 1,
             EndpointError::Connection(Error::InvalidArgument),
         ),
-        // Admitted at open, which charges no send ring; the SYN data's write
-        // then needs a 1 GiB ring for the 512 MiB limit.
-        (1 << 29, 257, EndpointError::Connection(Error::NoMemory)),
     ] {
         let (mut a, _, _) = warm(false);
         let (local, remote) = addresses(false, 40001);
@@ -914,6 +916,19 @@ fn fast_open_explicit_capacity_admission_failure_preserves_tuple_and_budget() {
         assert_eq!(accepted, 31);
         assert_eq!(a.buffer_capacities(id).unwrap(), (31, 257));
     }
+    // Admitted at open, which charges no send ring: the SYN data would need
+    // a 1 GiB ring for the 512 MiB limit, and the budget refuses it. As
+    // Linux's tcp_send_syn_data falls back, the open sends a plain SYN.
+    let (mut a, _, _) = warm(false);
+    let (local, remote) = addresses(false, 40001);
+    let (id, accepted) = a
+        .connect_fast_open_with_buffer_capacities(100, local, remote, &[7; 128], 1 << 29, 257)
+        .unwrap();
+    assert_eq!(accepted, 0);
+    assert_eq!(a.buffer_capacities(id).unwrap(), (1 << 29, 257));
+    let (ip, syn) = packet(&mut a, 100);
+    let syn = wire::parse(ip, &syn).unwrap();
+    assert!(syn.payload.is_empty());
 }
 
 #[test]
@@ -975,8 +990,12 @@ fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
             a.connect_fast_open_with_buffer_capacities(100, local, remote, &[7; 128], 31, 257)
         });
         if let Ok((id, accepted)) = result {
-            assert_eq!(accepted, 31);
             assert_eq!(a.buffer_capacities(id).unwrap(), (31, 257));
+            // Storage refused for the data leaves a plain SYN.
+            if accepted == 0 {
+                continue;
+            }
+            assert_eq!(accepted, 31);
             completed = true;
             break;
         }

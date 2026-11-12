@@ -973,6 +973,13 @@ pub(crate) struct Connection {
     // Caller ticks retain sub-microsecond fractions across state transitions.
     transport_ticks: [u64; 3],
     send_backpressured: bool,
+    // The bytes a write's storage growth needed when the buffer budget or
+    // the allocator refused it, as Linux's tcp_sendmsg finds
+    // sk_wmem_schedule fail and waits in sk_stream_wait_memory. Until memory
+    // comes back (`memory_released`) or a later write's growth succeeds,
+    // writes take only what the allocated storage holds, and the connection
+    // is not writable beyond it.
+    send_memory_wanted: Option<usize>,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1329,6 +1336,7 @@ impl Connection {
             last_data_received: now,
             transport_ticks: [0; 3],
             send_backpressured: false,
+            send_memory_wanted: None,
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -1678,7 +1686,13 @@ impl Connection {
         }
         // Defer the internal automatic PUSH; explicit application marks still
         // apply to SYN data and are never suppressed by the output path.
-        self.prepare_send_metadata(count, None, max_charge, None)?;
+        // Storage refused for the data leaves a plain SYN, as Linux's
+        // tcp_send_syn_data falls back when it cannot allocate syn_data.
+        if self.prepare_send_metadata(count, None, max_charge, None)? {
+            self.send_memory_wanted = None;
+            self.send_backpressured = false;
+            return Ok(0);
+        }
         let count = self.write_with_push(&initial[..count], false)?;
         self.fast_open_initial = count;
         self.deferred_tfo_push = true;
@@ -4938,6 +4952,27 @@ impl Connection {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, Error> {
+        self.check_admission(lowat, request, self.send_space_remaining())
+    }
+
+    // As check_write_admission, but for a write that tries its storage
+    // growth again, as each tcp_sendmsg call retries sk_wmem_schedule: the
+    // room a write would take with memory to grow.
+    pub(crate) fn check_write_retry(
+        &self,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+    ) -> Result<usize, Error> {
+        let space = self.send_space().saturating_sub(self.send.len());
+        self.check_admission(lowat, request, space)
+    }
+
+    fn check_admission(
+        &self,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+        space: usize,
+    ) -> Result<usize, Error> {
         if self.shutdown
             || !matches!(
                 self.state,
@@ -4947,7 +4982,7 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         self.tx_timestamps.admit(request)?;
-        let room = self.send_admission_room(lowat);
+        let room = self.admission_room(lowat, space);
         if room == 0 {
             Err(Error::WouldBlock)
         } else {
@@ -4956,13 +4991,53 @@ impl Connection {
     }
 
     pub(crate) fn send_admission_room(&self, lowat: Option<u32>) -> usize {
+        self.admission_room(lowat, self.send_space_remaining())
+    }
+
+    // The admission room with `space` of send space left.
+    fn admission_room(&self, lowat: Option<u32>, space: usize) -> usize {
         // Keep the u64 TCP-stream position representable, including output's
         // exclusive end. Never wrap offsets or admit bytes we cannot identify.
         let cursor_room = u64::MAX - self.acknowledged - self.send.len() as u64;
         self.send
             .admission_room(self.notsent_bytes(), lowat)
-            .min(self.send_space_remaining())
+            .min(space)
             .min(usize::try_from(cursor_room).unwrap_or(usize::MAX))
+    }
+
+    // Bytes the send ring and both sender ledgers, as allocated, hold beyond
+    // those queued.
+    fn allocated_send_room(&self) -> usize {
+        self.send
+            .allocation_capacity()
+            .min(self.rack.admitted_bytes())
+            .min(self.scoreboard.admitted_bytes())
+            .saturating_sub(self.send.len())
+    }
+
+    pub(crate) fn send_memory_throttled(&self) -> bool {
+        self.send_memory_wanted.is_some()
+    }
+
+    pub(crate) fn send_memory_wanted(&self) -> Option<usize> {
+        self.send_memory_wanted
+    }
+
+    // Memory came back to the buffer budget: the next write may grow the
+    // storage again, and the connection is writable if it has room
+    // (sk_stream_write_space).
+    pub(crate) fn memory_released(&mut self) {
+        if self.send_memory_wanted.take().is_some() && self.send_space_remaining() != 0 {
+            self.send_backpressured = false;
+            self.events.writable |=
+                !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
+        }
+    }
+
+    // A write found its storage growth refused for `wanted` bytes.
+    pub(crate) fn throttle_send(&mut self, wanted: usize) {
+        self.send_memory_wanted = Some(wanted);
+        self.send_backpressured = true;
     }
 
     // The ordinary effective data-segment size Q under the current PMTU:
@@ -5002,8 +5077,15 @@ impl Connection {
 
     // Bytes admitted above a smaller new C stay queued; room reopens only
     // once ordinary ACK progress drains below it.
+    // While a write's storage growth stays refused, only what the allocated
+    // storage holds: Linux's sk_stream_memory_free.
     fn send_space_remaining(&self) -> usize {
-        self.send_space().saturating_sub(self.send.len())
+        let room = self.send_space().saturating_sub(self.send.len());
+        if self.send_memory_wanted.is_some() {
+            room.min(self.allocated_send_room())
+        } else {
+            room
+        }
     }
 
     // Fresh payload a managed connection may newly transmit: C less the
@@ -5026,13 +5108,20 @@ impl Connection {
     // follow admitted live bytes, with geometric growth. Nothing allocates
     // from ACK, output, SACK or timeout processing. A ring that grew before
     // the other failed keeps its storage, which buffer_charge counts.
+    //
+    // Growth the budget or the allocator refuses fails no write: as Linux's
+    // tcp_sendmsg copies what fits and then waits for memory
+    // (sk_wmem_schedule, sk_stream_wait_memory), the write takes what the
+    // allocated storage holds, as a partial write or WouldBlock, and the
+    // connection is not writable beyond it until memory comes back. Returns
+    // whether growth was refused.
     pub(crate) fn prepare_send_metadata(
         &mut self,
         bytes: usize,
         lowat: Option<u32>,
         max_charge: usize,
         timestamp: Option<TxTimestampRequest>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         if self.shutdown
             || !matches!(
                 self.state,
@@ -5042,20 +5131,81 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         if bytes == 0 {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(request) = timestamp {
             self.tx_timestamps.admit(request)?;
         }
-        let accepted = bytes.min(self.send_admission_room(lowat));
+        // What the write would take with memory to grow: a refused write
+        // tries again.
+        let space = self.send_space().saturating_sub(self.send.len());
+        let accepted = bytes.min(self.admission_room(lowat, space));
         if accepted == 0 {
-            return Ok(());
+            return Ok(false);
         }
-        let live = self
-            .send
-            .len()
-            .checked_add(accepted)
-            .ok_or(Error::NoMemory)?;
+        let live = self.send.len().saturating_add(accepted);
+        let Err(wanted) = self.grow_send_storage(live, max_charge) else {
+            self.send_memory_wanted = None;
+            return Ok(false);
+        };
+        // As tcp_sendmsg copies skb by skb until sk_wmem_schedule refuses,
+        // grow for the longest prefix the budget takes, halving the bytes
+        // asked for (costs only, until one fits); the write takes that.
+        let held = self.send.len() + self.allocated_send_room();
+        let mut part = accepted / 2;
+        while self.send.len() + part > held {
+            let prefix = self.send.len() + part;
+            if self
+                .send_growth_cost(prefix)
+                .is_some_and(|cost| self.buffer_charge().saturating_add(cost) <= max_charge)
+            {
+                // The allocator may still refuse it; the write then takes
+                // what the storage held before.
+                let _ = self.grow_send_storage(prefix, max_charge);
+                break;
+            }
+            part /= 2;
+        }
+        // What waking it needs is the smallest growth that takes one more
+        // byte, not the whole write: as sk_stream_memory_free, any room lets
+        // the writer make progress.
+        let held = self.send.len() + self.allocated_send_room();
+        let next = self.send_growth_cost(held + 1).unwrap_or(wanted);
+        self.throttle_send(next.min(wanted));
+        Ok(true)
+    }
+
+    // The peak bytes growing the send ring and both ledgers to hold `live`
+    // queued bytes adds to the charge, or None if it overflows.
+    fn send_growth_cost(&self, live: usize) -> Option<usize> {
+        let grow_ring = live > self.send.allocation_capacity();
+        let limit = if grow_ring {
+            self.send.capacity()
+        } else {
+            self.send.allocation_capacity()
+        };
+        let target = live.checked_next_power_of_two().unwrap_or(limit).min(limit);
+        let ring = if grow_ring {
+            self.send.growth_bytes(limit)
+        } else {
+            0
+        };
+        let rack = if self.rack.admits_bytes(live) {
+            0
+        } else {
+            self.rack.growth_bytes(target)?
+        };
+        let scoreboard = if self.scoreboard.admits_bytes(live) {
+            0
+        } else {
+            Scoreboard::allocation_bytes(target)?
+        };
+        ring.checked_add(rack)?.checked_add(scoreboard)
+    }
+
+    // Grow the send ring and the ledgers to hold `live` queued bytes, or
+    // leave them as they were and give the bytes the growth needed.
+    fn grow_send_storage(&mut self, live: usize, max_charge: usize) -> Result<(), usize> {
         let grow_ring = live > self.send.allocation_capacity();
         let grow_rack = !self.rack.admits_bytes(live);
         let grow_scoreboard = !self.scoreboard.admits_bytes(live);
@@ -5069,45 +5219,29 @@ impl Connection {
             self.send.allocation_capacity()
         };
         debug_assert!(live <= limit);
-        let ring = if grow_ring {
-            self.send.growth_bytes(limit)
-        } else {
-            0
-        };
         let target = live.checked_next_power_of_two().unwrap_or(limit).min(limit);
         let existing = self.buffer_charge();
-        let staged = if grow_rack {
-            self.rack.growth_bytes(target).ok_or(Error::NoMemory)?
-        } else {
-            0
-        };
-        let staged = staged
-            .checked_add(if grow_scoreboard {
-                Scoreboard::allocation_bytes(target).ok_or(Error::NoMemory)?
-            } else {
-                0
-            })
-            .and_then(|staged| staged.checked_add(ring))
-            .ok_or(Error::NoMemory)?;
+        let staged = self.send_growth_cost(live).ok_or(usize::MAX)?;
         if existing
             .checked_add(staged)
             .is_none_or(|peak| peak > max_charge)
         {
-            return Err(Error::NoMemory);
+            return Err(staged);
         }
         let rack = if grow_rack {
-            Some(
-                self.rack
-                    .prepare_growth(target)
-                    .map_err(|_| Error::NoMemory)?,
-            )
+            Some(self.rack.prepare_growth(target).map_err(|_| staged)?)
         } else {
             None
         };
         let scoreboard = if grow_scoreboard {
-            Some(self.scoreboard.grown(target).map_err(|_| Error::NoMemory)?)
+            Some(self.scoreboard.grown(target).map_err(|_| staged)?)
         } else {
             None
+        };
+        let ring = if grow_ring {
+            self.send.growth_bytes(limit)
+        } else {
+            0
         };
         let actual = rack.as_ref().map_or(0, |growth| growth.allocation_bytes())
             + scoreboard.as_ref().map_or(0, Scoreboard::storage_bytes)
@@ -5116,12 +5250,12 @@ impl Connection {
             .checked_add(actual)
             .is_none_or(|peak| peak > max_charge)
         {
-            return Err(Error::NoMemory);
+            return Err(actual);
         }
         // The ring grows in place, last: a failure leaves the ledgers staged
         // aside to drop, and the queued bytes as they were.
         if grow_ring {
-            self.send.grow(limit).map_err(|_| Error::NoMemory)?;
+            self.send.grow(limit).map_err(|_| staged)?;
         }
         if let Some(rack) = rack {
             self.rack.commit_growth(rack, target);
@@ -5130,6 +5264,10 @@ impl Connection {
             self.scoreboard = scoreboard;
         }
         Ok(())
+    }
+
+    pub(crate) fn admits_shared(&self, payload: &crate::Payload, max_spans: usize) -> bool {
+        self.send.shared_room(payload, max_spans)
     }
 
     pub(crate) fn prepare_shared_storage(
@@ -5192,7 +5330,11 @@ impl Connection {
             }
             return Ok(0);
         }
-        self.prepare_send_metadata(input_len, lowat, usize::MAX, None)?;
+        // A write the endpoint found short of memory takes what the storage
+        // holds; it grows nothing here.
+        if self.send_memory_wanted.is_none() {
+            self.prepare_send_metadata(input_len, lowat, usize::MAX, None)?;
+        }
         let application_idle = !self.application_timer_needed();
         let idle = !self.user_timer_needed();
         let room = self.send_admission_room(lowat);

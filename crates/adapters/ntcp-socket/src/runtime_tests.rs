@@ -66,9 +66,13 @@ fn sender_metadata_failure_does_not_consume_external_producer() {
         consumed = true;
         Ok(vec![1; room])
     });
-    assert_eq!(result, Err(ENOMEM));
+    // The send ring does not fit the budget: a nonblocking send waits for
+    // memory, as Linux's sk_stream_wait_memory returns EAGAIN, and the
+    // producer gives nothing.
+    assert_eq!(result, Err(EAGAIN));
     assert!(!consumed);
     assert_eq!(a.endpoint.send_progress(cid).unwrap(), before);
+    assert_eq!(a.endpoint.memory_throttled_writes(), 1);
 }
 
 fn owner(last: u8) -> Owner {

@@ -2385,6 +2385,9 @@ impl Owner {
                     || ((matches!(state, State::Established | State::CloseWait)
                         || state == State::SynReceived && s.connected)
                         && info.send_used < info.send_space
+                        // Not while a write waits for memory beyond what its
+                        // storage holds (sk_stream_memory_free).
+                        && self.endpoint.send_admission_room(cid, None) != Ok(0)
                         && notsent_writable(
                             info.notsent_bytes,
                             effective_notsent_lowat(

@@ -848,6 +848,7 @@ impl<P: PacketIo> Network<P> {
             sack_recoveries: loss.sack_recoveries,
             reno_recoveries: loss.reno_recoveries,
             dsack_received: loss.dsack_received,
+            memory_throttled_writes: self.endpoint.memory_throttled_writes(),
             ..self.counters
         }
     }

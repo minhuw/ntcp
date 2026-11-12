@@ -65,6 +65,11 @@ impl Scoreboard {
         bytes.div_ceil(2) <= self.capacity
     }
 
+    // The most live bytes the allocated ranges admit.
+    pub(crate) fn admitted_bytes(&self) -> usize {
+        self.capacity.saturating_mul(2)
+    }
+
     pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
         let mut result = Self::with_capacity(send_capacity)?;
         result.ranges[..self.len].copy_from_slice(&self.ranges[..self.len]);

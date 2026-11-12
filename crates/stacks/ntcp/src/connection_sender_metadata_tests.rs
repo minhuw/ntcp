@@ -1,19 +1,26 @@
 use super::*;
 use alloc::format;
 
-fn snapshot(a: &Connection) -> alloc::string::String {
+// What a refused growth must leave as it was: the queued bytes, both
+// ledgers and the send boundaries.
+fn storage(a: &Connection) -> alloc::string::String {
     format!(
-        "{:?} {:?} {:?} {:?} {:?} {:?} {} {} {:?}",
+        "{:?} {:?} {:?} {:?}",
         a.send,
         a.rack,
         a.scoreboard,
-        a.events,
-        a.loss_timer,
-        a.state,
-        a.send_issued,
-        a.send_backpressured,
         a.send_progress()
     )
+}
+
+// The bytes queued, from the first unacknowledged one.
+fn queued(a: &Connection) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec![0; a.send.len()];
+    let mut at = 0;
+    while at < out.len() {
+        at += a.send.copy(at, &mut out[at..]);
+    }
+    out
 }
 
 fn metadata_bytes(a: &Connection) -> usize {
@@ -48,39 +55,48 @@ fn idle_sender_backing_is_independent_of_configured_payload_limit() {
     }
 }
 
+// A write whose storage growth fails takes what the storage it could
+// grow holds, as Linux's tcp_sendmsg copies until sk_wmem_schedule
+// refuses: a partial write or WouldBlock, never an error. The connection
+// then takes no more until memory comes back.
 #[test]
-fn failed_growth_never_accepts_bytes_or_changes_send_boundaries() {
+fn failed_growth_takes_what_the_storage_holds() {
     for failed in 0..3 {
         let (mut a, _) = pair(config(128, 8), u32::MAX - 20);
         a.write_with_options(b"abcdefgh", true, false).unwrap();
-        let before = snapshot(&a);
+        let taken = match crate::allocation_tests::fail_after(failed, || {
+            a.write_with_options(b"ijklmnopq", false, true)
+        }) {
+            Ok(n) => n,
+            Err(Error::WouldBlock) => 0,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(a.send.len(), 8 + taken);
+        if taken < 9 {
+            assert!(a.send_memory_throttled());
+            a.memory_released();
+        }
         assert_eq!(
-            crate::allocation_tests::fail_after(failed, || a.write_with_options(
-                b"ijklmnopq",
-                false,
-                true
-            )),
-            Err(Error::NoMemory)
+            a.write_with_options(&b"ijklmnopq"[taken..], false, true),
+            Ok(9 - taken)
         );
-        assert_eq!(snapshot(&a), before);
-        assert_eq!(a.write_with_options(b"ijklmnopq", false, true), Ok(9));
-        assert_eq!(a.send.len(), 17);
+        assert_eq!(queued(&a), b"abcdefghijklmnopq");
     }
 }
 
 #[test]
 fn metadata_peak_rejection_happens_before_allocating_or_consuming() {
     let (mut a, _) = pair(config(128, 8), 100);
-    let before = snapshot(&a);
+    let before = storage(&a);
     let rejected_without_allocation = crate::allocation_tests::fail_after(0, || {
-        assert_eq!(
-            a.prepare_send_metadata(64, None, 0, None),
-            Err(Error::NoMemory)
-        );
+        assert_eq!(a.prepare_send_metadata(64, None, 0, None), Ok(true));
         SendBuffer::new(1).is_err()
     });
     assert!(rejected_without_allocation);
-    assert_eq!(snapshot(&a), before);
+    assert_eq!(storage(&a), before);
+    // Nothing is held: the write takes nothing.
+    assert!(a.send_memory_throttled());
+    assert_eq!(a.write(&[1; 64]), Err(Error::WouldBlock));
 }
 
 #[test]
@@ -181,29 +197,35 @@ fn empty_and_backpressured_writes_do_not_allocate_metadata() {
 }
 
 #[test]
-fn timestamp_request_is_not_consumed_when_metadata_growth_fails() {
-    let (mut a, _) = pair(config(128, 8), 100);
-    a.tx_timestamps.resize(1, usize::MAX).unwrap();
+fn timestamp_request_is_consumed_only_by_the_bytes_a_refused_growth_takes() {
     let request = TxTimestampRequest {
         cookie: 9,
         scheduled: true,
         ..Default::default()
     };
     for failed in 0..3 {
-        assert_eq!(
-            crate::allocation_tests::fail_after(failed, || a
-                .write_with_timestamp(&[3; 64], false, true, None, request)),
-            Err(Error::NoMemory)
-        );
-        assert!(a.tx_timestamps.is_empty());
-        assert_eq!(a.send.len(), 0);
-        assert_eq!(a.tx_timestamps.admit(request), Ok(()));
+        let (mut a, _) = pair(config(128, 8), 100);
+        a.tx_timestamps.resize(1, usize::MAX).unwrap();
+        match crate::allocation_tests::fail_after(failed, || {
+            a.write_with_timestamp(&[3; 64], false, true, None, request)
+        }) {
+            Ok(n) => {
+                assert_eq!(a.send.len(), n);
+                assert!(!a.tx_timestamps.is_empty());
+            }
+            Err(Error::WouldBlock) => {
+                assert!(a.tx_timestamps.is_empty());
+                assert_eq!(a.send.len(), 0);
+                a.memory_released();
+                assert_eq!(
+                    a.write_with_timestamp(&[3; 64], false, true, None, request),
+                    Ok(64)
+                );
+                assert!(!a.tx_timestamps.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
     }
-    assert_eq!(
-        a.write_with_timestamp(&[3; 64], false, true, None, request),
-        Ok(64)
-    );
-    assert!(!a.tx_timestamps.is_empty());
 }
 
 #[test]
@@ -225,7 +247,10 @@ fn fast_open_reserves_metadata_before_accepting_syn_payload() {
                 a.prepare_fast_open_with_budget(cached, &[4; 64], usize::MAX)
             }),
         };
-        assert_eq!(result, Err(Error::NoMemory));
+        // Storage refused for the data leaves a plain SYN, as Linux's
+        // tcp_send_syn_data falls back when it cannot allocate the data.
+        assert_eq!(result, Ok(0));
+        assert!(!a.send_memory_throttled());
         assert_eq!(a.send.len(), 0);
         assert_eq!(a.fast_open_initial, 0);
         assert_eq!(a.snd_nxt, a.iss);
@@ -266,13 +291,19 @@ fn failure_at_any_multiblock_growth_allocation_preserves_live_history() {
         let (mut a, _) = pair(config(8192, 1024), 100);
         a.write(&[1; 1024]).unwrap();
         packet(&mut a, 40);
-        let before = snapshot(&a);
+        let before = queued(&a);
         let data = [2; 3072];
-        assert_eq!(
-            crate::allocation_tests::fail_after(failed, || a.write(&data)),
-            Err(Error::NoMemory)
-        );
-        assert_eq!(snapshot(&a), before);
-        assert_eq!(a.write(&data), Ok(3072));
+        let taken = match crate::allocation_tests::fail_after(failed, || a.write(&data)) {
+            Ok(n) => n,
+            Err(Error::WouldBlock) => 0,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(queued(&a)[..1024], before[..]);
+        assert_eq!(a.send.len(), 1024 + taken);
+        if taken < 3072 {
+            a.memory_released();
+        }
+        assert_eq!(a.write(&data[taken..]), Ok(3072 - taken));
+        assert_eq!(a.send.len(), 4096);
     }
 }

@@ -92,8 +92,11 @@ impl NetworkConfig {
     /// write. A connection is charged what it allocates, so its first write
     /// adds a send ring of 2 bytes per byte of `send_capacity`, and its RACK
     /// and SACK ledgers grow with the bytes it holds queued (68 bytes per
-    /// byte until they are kept per segment). A write the cap refuses fails
-    /// with Error::NoMemory.
+    /// byte until they are kept per segment). A write whose storage the cap
+    /// refuses takes what the connection's storage holds and then waits for
+    /// memory, as Linux's: a partial write or `Error::WouldBlock`, the
+    /// connection writable again once memory comes back
+    /// (`Counters::memory_throttled_writes`).
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the

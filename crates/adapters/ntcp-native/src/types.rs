@@ -41,8 +41,8 @@ pub enum Error {
     // this destination: Linux's EADDRNOTAVAIL (__inet_hash_connect).
     AddressNotAvailable,
     // The buffer budget (`tcp.max_buffer_bytes`) or the allocator refused
-    // memory: an open whose buffers do not fit, or growth of a connection's
-    // buffers. Linux's ENOMEM.
+    // memory to an open whose buffers do not fit, or to a setter: Linux's
+    // ENOMEM. A write refused memory waits instead (WouldBlock).
     NoMemory,
     TimeWentBackwards,
     WouldBlock(BlockReason),
@@ -328,4 +328,11 @@ pub struct Counters {
     pub reno_recoveries: u64,
     // ACKs carrying a D-SACK: Linux's TCPDSACKRecv plus TCPDSACKOfoRecv.
     pub dsack_received: u64,
+    // Writes that took fewer octets than offered, or none (WouldBlock),
+    // because the buffer budget (tcp.max_buffer_bytes) or the allocator
+    // refused their send storage, not because the send buffer was full:
+    // where Linux's tcp_sendmsg waits in sk_stream_wait_memory, which no
+    // MIB counts (`Endpoint::memory_throttled_writes`). The connection is
+    // writable again once memory comes back to the budget.
+    pub memory_throttled_writes: u64,
 }

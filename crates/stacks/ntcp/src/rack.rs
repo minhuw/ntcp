@@ -246,6 +246,11 @@ impl Rack {
             .is_some_and(|needed| needed <= self.capacity)
     }
 
+    // The most live bytes the allocated intervals admit.
+    pub(crate) fn admitted_bytes(&self) -> usize {
+        self.capacity.saturating_sub(2)
+    }
+
     #[cfg(test)]
     pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
         let capacity = send_capacity.checked_add(2).ok_or(())?;
