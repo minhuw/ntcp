@@ -3030,7 +3030,11 @@ impl Owner {
                 if terminal && !s.connected && available == 0 {
                     return Err(ENOTCONN);
                 }
-                out.bytes.resize(capacity.min(BYTES), 0);
+                // Size to what the read can copy, as tcp_recvmsg copies at most
+                // what is queued. Core reads take initialized slices; one byte
+                // keeps an empty read's would-block/EOF/error result.
+                out.bytes
+                    .resize(capacity.min(BYTES).min(available.max(1)), 0);
                 let n = if available == 0 && s.read_shutdown {
                     out.bytes.clear();
                     if let Op::ReadTo(_, _, _, copies) = &op {
