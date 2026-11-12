@@ -788,8 +788,10 @@ fn time_wait_reuse_stays_within_its_scoped_identity() {
     assert_eq!(server.1.scoped_connection_id(zoned(&server, 0)), Some(old));
     // A new SYN on link 0 replaces the TIME-WAIT record of that zone and
     // continues its timestamp clock (RFC 6191 4: the peer's PAWS sees no
-    // jump).
-    clients[0] = client(7613);
+    // jump). It comes from the same client, whose secret and link are the
+    // first one's: its tuple's TSval offset is the first incarnation's, so
+    // the SYN's timestamp is newer than any the TIME-WAIT saw.
+    clients[0] = client(7610);
     now += 1_000_000;
     let mut sent = Vec::new();
     pump_recorded(&mut server, &mut clients, &mut now, &mut sent);

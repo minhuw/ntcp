@@ -87,15 +87,6 @@ fn address(side: u8) -> IpAddr {
 }
 
 fn side(n: u8, incoming: &Queue, outgoing: &Queue) -> (Network<Wire>, Wire) {
-    side_with(n, incoming, outgoing, |_| {})
-}
-
-fn side_with(
-    n: u8,
-    incoming: &Queue,
-    outgoing: &Queue,
-    edit: impl FnOnce(&mut NetworkConfig),
-) -> (Network<Wire>, Wire) {
     let make = || Wire {
         incoming: incoming.clone(),
         outgoing: outgoing.clone(),
@@ -111,7 +102,6 @@ fn side_with(
     let mut config = NetworkConfig::new(address(n), 1500);
     config.tcp.max_connections = 4;
     config.tcp.max_buffer_bytes = config.buffer_budget(4, &wire).unwrap();
-    edit(&mut config);
     (Network::new(config, wire, [n; 32], 0).unwrap(), probe)
 }
 
@@ -264,11 +254,11 @@ fn the_syn_offers_sack_and_timestamps_without_ecn_and_a_lost_tail_returns_near_2
 fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
     const CLIENT_PORT: u16 = 40000;
     let (a, b) = (Queue::default(), Queue::default());
-    // The client offers no timestamps, so the server judges each SYN by its
-    // sequence number alone (RFC 6191): ntcp draws a connection's TSval
-    // offset per incarnation, and a later incarnation's SYN may carry a
-    // TSval below the one the TIME-WAIT last saw.
-    let (mut client, client_wire) = side_with(1, &a, &b, |c| c.tcp.connection.timestamps = false);
+    // Both sides use timestamps, so the server judges each SYN by its TSval
+    // first (RFC 6191). The client's TSval offset is its tuple's, as Linux's
+    // (secure_tcp_seq_and_ts_off), so its next incarnation's SYN carries a
+    // TSval newer than any the TIME-WAIT saw, whatever its sequence number.
+    let (mut client, client_wire) = side(1, &a, &b);
     let (mut server, server_wire) = side(2, &b, &a);
     let listener = server.listen(PORT, 4).unwrap();
     let peer = SocketAddr::new(address(2), PORT);
@@ -283,6 +273,7 @@ fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
     };
     let old_syn = client_wire.sent.borrow()[0].clone();
     assert_eq!(tcp(&old_syn)[13], 0x02);
+    assert!(has_option(&old_syn, 8));
     server.close(accepted).unwrap();
     loop {
         step(&mut now, &mut client, &mut server);
@@ -331,11 +322,13 @@ fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
         assert!(now < 2_000 * MS, "the tuple did not reopen");
     };
     // The first SYN reopened it, without a retransmission.
-    let client_syns = client_wire.sent.borrow()[syns..]
+    let client_syns: Vec<_> = client_wire.sent.borrow()[syns..]
         .iter()
         .filter(|packet| tcp(packet)[13] & 0x02 != 0)
-        .count();
-    assert_eq!(client_syns, 1);
+        .cloned()
+        .collect();
+    assert_eq!(client_syns.len(), 1);
+    assert!(has_option(&client_syns[0], 8));
     // The new connection took the tuple and ended the TIME-WAIT.
     assert_eq!(server.counters().time_wait_connections, 0);
     let receipt = client

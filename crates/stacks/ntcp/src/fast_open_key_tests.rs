@@ -254,10 +254,7 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
         let scoped = crate::ScopedTuple::unscoped(tuple);
         let identity = endpoint.digest(b"ntcp initial sequence", scoped);
         let hash = endpoint.hash(scoped);
-        let mut domain = *b"ntcp timestamp offset\0\0\0\0";
-        let len = domain.len();
-        domain[len - 4..].copy_from_slice(&123u32.to_be_bytes());
-        let timestamp = endpoint.digest(&domain, scoped);
+        let timestamp = endpoint.timestamp_offset(scoped);
         let isn = endpoint.isn(scoped);
         let before = endpoint.buffer_bytes();
         endpoint.try_set_fast_open_hmac_key([9; 32]).unwrap();
@@ -288,7 +285,7 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
         assert_eq!(endpoint.secret, [42; 32]);
         assert_eq!(endpoint.digest(b"ntcp initial sequence", scoped), identity);
         assert_eq!(endpoint.hash(scoped), hash);
-        assert_eq!(endpoint.digest(&domain, scoped), timestamp);
+        assert_eq!(endpoint.timestamp_offset(scoped), timestamp);
         assert_eq!(endpoint.isn(scoped), isn.wrapping_add(1));
         #[cfg(feature = "tfo-linux-cookie")]
         {

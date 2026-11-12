@@ -5348,13 +5348,13 @@ fn endpoint_rejects_zero_challenge_budget_configuration() {
 //# SEG.TSval SHOULD be set to zero.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
 //= type=test
-//= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+//= reason=Endpoint derives offset using HMAC-SHA256 of the secret and the tuple alone in the separate ntcp timestamp offset domain before first output, the ISN's PRF under another domain (section 5.4) with Linux's inputs (secure_tcp_seq_and_ts_off: addresses and ports). Every incarnation of a tuple shares it, so peer PAWS and TIME-WAIT see no random jump; other tuples' offsets stay unpredictable. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, reincarnation, echo/RTT/wrap and reuse rollback tests cover the policy.
 //# It is therefore RECOMMENDED to generate a random, per-
 //# connection offset to be used with the clock source when generating
 //# the Timestamps option value (see Section 5.4).
 //= https://www.rfc-editor.org/rfc/rfc7323#section-7
 //= type=test
-//= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+//= reason=Endpoint derives offset using HMAC-SHA256 of the secret and the tuple alone in the separate ntcp timestamp offset domain before first output, the ISN's PRF under another domain (section 5.4) with Linux's inputs (secure_tcp_seq_and_ts_off: addresses and ports). Every incarnation of a tuple shares it, so peer PAWS and TIME-WAIT see no random jump; other tuples' offsets stay unpredictable. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, reincarnation, echo/RTT/wrap and reuse rollback tests cover the policy.
 //# It is therefore
 //# RECOMMENDED to generate a random, per-connection offset to be used
 //# with the clock source when generating the Timestamps option value
@@ -5507,6 +5507,108 @@ fn timestamp_offset_time_wait_reuse_keeps_virtual_clock() {
         );
         assert_eq!(b.state(old), Ok(State::Closed));
     }
+}
+
+// The TSval offset is a keyed function of the tuple alone, as Linux's
+// secure_tcp_seq_and_ts_off: a later incarnation of a tuple, active or
+// passive, continues its predecessor's timestamp clock, and another tuple,
+// by port or by address, has another offset.
+#[test]
+fn incarnations_of_a_tuple_share_its_timestamp_offset_and_other_tuples_do_not() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.connection.timestamp_granularity = crate::TimestampGranularity::Milliseconds;
+    let tsval = |packet: &(IpMetadata, Vec<u8>)| {
+        wire::parse(packet.0, &packet.1)
+            .unwrap()
+            .options
+            .timestamps
+            .unwrap()
+            .0
+    };
+    // 100 ms, 100 ticks, pass between the first and the later opens.
+    let (first, later) = (1_000, 101_000);
+    let mut other_port = local;
+    other_port.set_port(local.port() + 1);
+    let other_address: core::net::SocketAddr = "192.0.2.3:8080".parse().unwrap();
+
+    // Active opens: the peer refuses the first SYN with a RST.
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let id = a.connect(first, local, remote).unwrap();
+    let syn = packets(&mut a, first).pop().unwrap();
+    let v0 = tsval(&syn);
+    let h = wire::parse(syn.0, &syn.1).unwrap().header;
+    let reply_ip = IpMetadata {
+        source: remote.ip(),
+        destination: local.ip(),
+    };
+    let refusal = tw_segment(
+        reply_ip,
+        h,
+        0,
+        h.sequence.wrapping_add(1),
+        wire::RST | wire::ACK,
+        None,
+    );
+    a.input(first, reply_ip, &refusal).unwrap();
+    assert_eq!(a.state(id), Ok(State::Closed));
+    a.release(id).unwrap();
+    a.connect(later, local, remote).unwrap();
+    assert_eq!(
+        tsval(&packets(&mut a, later).pop().unwrap()),
+        v0.wrapping_add(100)
+    );
+    a.connect(later, other_port, remote).unwrap();
+    let port = tsval(&packets(&mut a, later).pop().unwrap());
+    a.connect(later, local, other_address).unwrap();
+    let address = tsval(&packets(&mut a, later).pop().unwrap());
+    assert_ne!(port, v0.wrapping_add(100));
+    assert_ne!(address, v0.wrapping_add(100));
+    assert_ne!(port, address);
+
+    // Passive opens: the client resets the first SYN-ACK.
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    b.listen(remote, 4).unwrap();
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let to_server = wire::Header {
+        source_port: remote.port(),
+        destination_port: local.port(),
+        sequence: 0,
+        acknowledgment: 0,
+        flags: 0,
+        window: 1024,
+        urgent_pointer: 0,
+    };
+    let syn = tw_segment(ip, to_server, 1_000, 0, wire::SYN, Some((7, 0)));
+    b.input(first, ip, &syn).unwrap();
+    let s0 = tsval(&packets(&mut b, first).pop().unwrap());
+    let reset = tw_segment(ip, to_server, 1_001, 0, wire::RST, None);
+    b.input(first, ip, &reset).unwrap();
+    assert_eq!(
+        b.connection_id(Tuple {
+            local: remote,
+            remote: local
+        }),
+        None
+    );
+    let syn = tw_segment(ip, to_server, 5_000, 0, wire::SYN, Some((9, 0)));
+    b.input(later, ip, &syn).unwrap();
+    assert_eq!(
+        tsval(&packets(&mut b, later).pop().unwrap()),
+        s0.wrapping_add(100)
+    );
+    let mut header = to_server;
+    header.destination_port = other_port.port();
+    let syn = tw_segment(ip, header, 5_000, 0, wire::SYN, Some((9, 0)));
+    b.input(later, ip, &syn).unwrap();
+    assert_ne!(
+        tsval(&packets(&mut b, later).pop().unwrap()),
+        s0.wrapping_add(100)
+    );
 }
 
 #[test]

@@ -1029,6 +1029,16 @@ impl Endpoint {
         self.last_isn_time = self.now;
         u32::from_be_bytes(tag[..4].try_into().unwrap()).wrapping_add(self.isn_clock)
     }
+    // A connection's TSval offset: a keyed function of its tuple alone, the
+    // ISN's PRF under another domain (RFC 7323 section 5.4), as Linux draws
+    // it from the addresses and ports under net_secret
+    // (secure_tcp_seq_and_ts_off). Every incarnation of a tuple shares it,
+    // so a peer's TIME-WAIT and PAWS see one timestamp clock across them,
+    // while an off-path host learns nothing of another tuple's offset.
+    fn timestamp_offset(&self, tuple: ScopedTuple) -> u32 {
+        let tag = self.digest(b"ntcp timestamp offset", tuple);
+        u32::from_be_bytes(tag[..4].try_into().unwrap())
+    }
     fn id(&self, slot: usize) -> ConnectionId {
         ConnectionId {
             slot,
@@ -1424,12 +1434,12 @@ impl Endpoint {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
-    //= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+    //= reason=Endpoint derives offset using HMAC-SHA256 of the secret and the tuple alone in the separate ntcp timestamp offset domain before first output, the ISN's PRF under another domain (section 5.4) with Linux's inputs (secure_tcp_seq_and_ts_off: addresses and ports). Every incarnation of a tuple shares it, so peer PAWS and TIME-WAIT see no random jump; other tuples' offsets stay unpredictable. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, reincarnation, echo/RTT/wrap and reuse rollback tests cover the policy.
     //# It is therefore RECOMMENDED to generate a random, per-
     //# connection offset to be used with the clock source when generating
     //# the Timestamps option value (see Section 5.4).
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7
-    //= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+    //= reason=Endpoint derives offset using HMAC-SHA256 of the secret and the tuple alone in the separate ntcp timestamp offset domain before first output, the ISN's PRF under another domain (section 5.4) with Linux's inputs (secure_tcp_seq_and_ts_off: addresses and ports). Every incarnation of a tuple shares it, so peer PAWS and TIME-WAIT see no random jump; other tuples' offsets stay unpredictable. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, reincarnation, echo/RTT/wrap and reuse rollback tests cover the policy.
     //# It is therefore
     //# RECOMMENDED to generate a random, per-connection offset to be used
     //# with the clock source when generating the Timestamps option value
@@ -1677,11 +1687,7 @@ impl Endpoint {
         if let Ok(connection) = &mut result {
             connection.set_zone(scoped.zone);
             connection.passive_fast_open(fast_open_response, early);
-            let mut domain = *b"ntcp timestamp offset\0\0\0\0";
-            let len = domain.len();
-            domain[len - 4..].copy_from_slice(&iss.to_be_bytes());
-            let tag = self.digest(&domain, scoped);
-            connection.set_timestamp_offset(u32::from_be_bytes(tag[..4].try_into().unwrap()));
+            connection.set_timestamp_offset(self.timestamp_offset(scoped));
         }
         if let Some(receive) = receive {
             self.receive_pool.push(receive);
