@@ -354,6 +354,11 @@ impl Scoreboard {
                 } else {
                     0
                 };
+                // This and every later range start at or past the span: only
+                // the final hole up to high_data remains.
+                if start == span {
+                    break;
+                }
                 let end = right.distance_from(ack).min(span);
                 let old = cursor;
                 cursor = cursor.max(end);
@@ -873,6 +878,99 @@ mod tests {
         assert!(!out.overflow);
         assert_eq!(out.newly_sacked, 77);
         assert_eq!(s.len, 60);
+    }
+
+    // holes() before it stopped at the first range past the span: every
+    // range ending above the query's ack is visited.
+    fn holes_walking(s: &Scoreboard, ack: Seq, high_data: Seq) -> Vec<(Seq, Seq)> {
+        let span = high_data.distance_from(ack);
+        let mut cursor = 0;
+        let mut index = if ack.distance_from(s.ack) < HALF_SPACE {
+            s.ranges[..s.len].partition_point(|&(_, right)| {
+                right.distance_from(s.ack) <= ack.distance_from(s.ack)
+            })
+        } else {
+            0
+        };
+        let mut holes = Vec::new();
+        if span >= HALF_SPACE {
+            return holes;
+        }
+        while index < s.len {
+            let (left, right) = s.ranges[index];
+            index += 1;
+            if !right.after(ack) {
+                continue;
+            }
+            let start = if left.after(ack) {
+                left.distance_from(ack).min(span)
+            } else {
+                0
+            };
+            let end = right.distance_from(ack).min(span);
+            let old = cursor;
+            cursor = cursor.max(end);
+            if old < start {
+                holes.push((ack.wrapping_add(old), ack.wrapping_add(start)));
+            }
+        }
+        if cursor < span {
+            holes.push((ack.wrapping_add(cursor), high_data));
+        }
+        holes
+    }
+
+    #[test]
+    fn holes_stop_past_the_span_as_the_walk_yields() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u32| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % u64::from(n)) as u32
+        };
+        for round in 0..400 {
+            let base = Seq([0, u32::MAX - 5000, HALF_SPACE - 3000, next(u32::MAX)][round % 4]);
+            let seq = |offset: u32| base.wrapping_add(offset);
+            let mut s = Scoreboard::new();
+            let ack = next(200);
+            s.update(seq(ack), seq(8000), &[None; 4]);
+            for _ in 0..next(40) {
+                let mut blocks = [None; 4];
+                for block in blocks.iter_mut().take(1 + next(4) as usize) {
+                    let left = ack + next(7000);
+                    *block = Some((seq(left).0, seq(left + 1 + next(400)).0));
+                }
+                s.update(seq(ack), seq(8000), &blocks);
+            }
+            let mut queries = Vec::new();
+            for _ in 0..60 {
+                let from = match next(4) {
+                    0 => next(u32::MAX),
+                    1 => (ack + HALF_SPACE).wrapping_add(next(400)).wrapping_sub(200),
+                    _ => next(9000).wrapping_sub(500),
+                };
+                let len = [
+                    next(50),
+                    next(9000),
+                    HALF_SPACE - 1,
+                    HALF_SPACE,
+                    next(u32::MAX),
+                ][next(5) as usize];
+                queries.push((seq(from), seq(from).wrapping_add(len)));
+            }
+            for &(a, b) in &s.ranges[..s.len] {
+                queries.extend([(a, b), (b, a), (a, a), (b, b), (seq(ack), a), (seq(ack), b)]);
+            }
+            for (from, to) in queries {
+                assert_eq!(
+                    s.holes(from, to).collect::<Vec<_>>(),
+                    holes_walking(&s, from, to),
+                    "round={round} ranges={:?} query={from:?}..{to:?}",
+                    &s.ranges[..s.len]
+                );
+            }
+        }
     }
 
     #[test]
