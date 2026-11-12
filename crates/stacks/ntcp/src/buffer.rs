@@ -58,6 +58,9 @@ pub(crate) struct SendBuffer {
     // rest of the queue holds one needs no pass over it, as Linux keeps PSH
     // on the skb.
     last_push: u64,
+    // The same for EOR: a selection past it needs no pass over its marks to
+    // find its record's end, as Linux keeps EOR on the skb.
+    last_eor: u64,
 }
 
 impl SendBuffer {
@@ -76,6 +79,7 @@ impl SendBuffer {
             shared: VecDeque::new(),
             shared_output: None,
             last_push: u64::MAX,
+            last_eor: u64::MAX,
         })
     }
 
@@ -91,6 +95,7 @@ impl SendBuffer {
             shared: VecDeque::new(),
             shared_output: None,
             last_push: u64::MAX,
+            last_eor: u64::MAX,
         }
     }
 
@@ -265,19 +270,49 @@ impl SendBuffer {
             if push {
                 self.note_push(offset);
             }
+            if end_of_record {
+                self.note_end_of_record(offset);
+            }
         }
     }
 
     pub(crate) fn mark_end_of_record(&mut self) {
         if let Some(last) = self.marks.back_mut() {
             *last |= 2;
+            self.last_eor = self.head.wrapping_add(self.marks.len() as u64 - 1);
         }
+    }
+
+    // Offset of the last queued byte carrying EOR.
+    fn eor_offset(&self) -> Option<usize> {
+        Some(self.last_eor)
+            .filter(|&position| position != u64::MAX)
+            .map(|position| position.wrapping_sub(self.head) as usize)
+            .filter(|&offset| offset < self.marks.len())
+    }
+
+    // Records an EOR mark at `offset`, where none is past the last one.
+    // EOR marks are never cleared, so the last one moves only forward here
+    // and back only when its byte goes.
+    fn note_end_of_record(&mut self, offset: usize) {
+        if self.eor_offset().is_none_or(|last| last < offset) {
+            self.last_eor = self.head.wrapping_add(offset as u64);
+        }
+    }
+
+    // Whether a byte at or past `offset` carries EOR.
+    fn record_ends_after(&self, offset: usize) -> bool {
+        self.eor_offset().is_some_and(|last| last >= offset)
     }
 
     // EOR is a local coalescing boundary, not a TCP wire flag or framing
     // guarantee (RFC 9293 section 3.7.1). PUSH may collapse; EOR never does.
+    // Only a selection reaching the last EOR scans its marks.
     pub(crate) fn record_len(&self, offset: usize, limit: usize) -> usize {
         let limit = limit.min(self.len().saturating_sub(offset));
+        if !self.record_ends_after(offset) {
+            return limit;
+        }
         self.first_flagged(2, offset, limit)
             .map_or(limit, |n| n + 1)
     }
@@ -286,6 +321,9 @@ impl SendBuffer {
     // last intervening EOR, rather than clipping a prefix and losing the tail.
     pub(crate) fn tail_record_offset(&self, offset: usize, count: usize) -> usize {
         let count = count.min(self.len().saturating_sub(offset));
+        if !self.record_ends_after(offset) {
+            return offset;
+        }
         self.marks
             .iter()
             .skip(offset)
@@ -425,6 +463,13 @@ impl SendBuffer {
         if self.last_push != u64::MAX && self.push_offset().is_none() {
             self.find_last_push();
         }
+        if self.last_eor != u64::MAX && self.eor_offset().is_none() {
+            self.last_eor = self
+                .marks
+                .iter()
+                .rposition(|mark| mark & 2 != 0)
+                .map_or(u64::MAX, |offset| self.head.wrapping_add(offset as u64));
+        }
         while self
             .shared
             .back()
@@ -454,6 +499,9 @@ impl SendBuffer {
         self.head = self.head.wrapping_add(count as u64);
         if self.push_offset().is_none() {
             self.last_push = u64::MAX;
+        }
+        if self.eor_offset().is_none() {
+            self.last_eor = u64::MAX;
         }
         while let Some(span) = self.shared.front_mut() {
             let consumed = self.head.wrapping_sub(span.start) as usize;
@@ -3314,6 +3362,69 @@ mod tests {
                 out[..record]
                     .iter()
                     .eq(tail[..record].iter().map(|byte| &byte.0))
+            );
+        }
+    }
+
+    #[test]
+    fn record_ends_follow_the_last_eor_across_ack_truncate_and_wrap() {
+        // record_len and tail_record_offset skip their scan past the last
+        // EOR: both must agree with a byte model of the EOR marks whatever
+        // writes, marks, ACKs and truncations moved it.
+        let mut send = SendBuffer::new(300).unwrap();
+        let mut model: VecDeque<bool> = VecDeque::new();
+        let mut state = 0x2545_f491_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        for _ in 0..4000 {
+            match next(6) {
+                0 | 1 => {
+                    let count = send.write(&[7; 64][..next(65)]);
+                    model.extend(core::iter::repeat_n(false, count));
+                }
+                2 => {
+                    send.mark_end_of_record();
+                    if let Some(last) = model.back_mut() {
+                        *last = true;
+                    }
+                }
+                3 => {
+                    let count = next(model.len() + 1);
+                    send.acknowledge(count).unwrap();
+                    model.drain(..count);
+                }
+                4 => {
+                    let len = next(model.len() + 1);
+                    send.truncate(len);
+                    model.truncate(len);
+                }
+                _ => {
+                    let offset = next(model.len() + 1);
+                    send.finish_send(offset, false, true);
+                    if let Some(mark) = model.get_mut(offset) {
+                        *mark = true;
+                    }
+                }
+            }
+            let offset = next(model.len() + 2);
+            let limit = next(400);
+            let tail: Vec<bool> = model.iter().skip(offset).take(limit).copied().collect();
+            assert_eq!(
+                send.record_len(offset, limit),
+                tail.iter()
+                    .position(|&eor| eor)
+                    .map_or(tail.len(), |n| n + 1)
+            );
+            assert_eq!(
+                send.tail_record_offset(offset, limit),
+                tail.iter()
+                    .take(tail.len().saturating_sub(1))
+                    .rposition(|&eor| eor)
+                    .map_or(offset, |n| offset + n + 1)
             );
         }
     }
