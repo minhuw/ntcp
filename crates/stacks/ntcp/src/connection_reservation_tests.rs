@@ -636,8 +636,9 @@ fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
 fn gso_conservative_fallbacks_keep_scalar_paths() {
     // A queued FIN (former case 0), recovery's PRR credit (former cases 5
     // and 11) and timeout recovery (former case 9) admit groups:
-    // transmit_group_tests.
-    for case in (1..11).filter(|&case| ![5, 8, 9].contains(&case)) {
+    // transmit_group_tests. So do outstanding TX timestamp requests (case
+    // 10, below).
+    for case in (1..8).filter(|&case| case != 5) {
         let cfg = ConnectionConfig {
             initial_window: InitialWindow::Iw10,
             congestion_algorithm: CongestionAlgorithm::Reno,
@@ -655,17 +656,6 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
                 a.config.prr = true;
                 a.config.prr_pacing = true;
             }
-            10 => {
-                a.tx_timestamps.resize(1, usize::MAX).unwrap();
-                a.tx_timestamps.insert(
-                    crate::TxTimestampRequest {
-                        cookie: 1,
-                        software_transmit: true,
-                        ..Default::default()
-                    },
-                    999,
-                );
-            }
             _ => unreachable!(),
         }
         let mut payload = [0; 1000];
@@ -674,6 +664,43 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
             assert_eq!(a.last_departure.unwrap().segmentation, None, "case {case}");
             assert!(a.last_departure.unwrap().payload <= 100, "case {case}");
         }
+    }
+    // A pending Transmit timestamp ends the range before the segment
+    // holding its target, which then leaves alone.
+    let cfg = ConnectionConfig {
+        initial_window: InitialWindow::Iw10,
+        congestion_algorithm: CongestionAlgorithm::Reno,
+        ..config(4096, 100)
+    };
+    for target in [999, 450, 50] {
+        let (mut a, _) = pair(cfg.clone(), 0);
+        a.write(&[1; 1000]).unwrap();
+        a.tx_timestamps.resize(1, usize::MAX).unwrap();
+        a.tx_timestamps.insert(
+            crate::TxTimestampRequest {
+                cookie: 1,
+                software_transmit: true,
+                ..Default::default()
+            },
+            target,
+        );
+        let mut payload = [0; 1000];
+        let segment = target / 100 * 100;
+        let mut groups = 0;
+        loop {
+            gso_select(&mut a, 40, &mut payload, &mut [0; 2048]).unwrap();
+            let departure = a.last_departure.unwrap();
+            let range = a.last_output_range.unwrap();
+            if range.end <= segment {
+                groups += usize::from(departure.segmentation.is_some());
+                continue;
+            }
+            assert_eq!(departure.segmentation, None, "target {target}");
+            assert_eq!(departure.payload, 100);
+            assert_eq!(range.start, segment);
+            break;
+        }
+        assert_eq!(groups != 0, segment >= 200, "target {target}");
     }
     // Fresh writes with earlier application PUSH marks must not move those marks.
     let (mut a, _) = pair(config(4096, 100), 0);

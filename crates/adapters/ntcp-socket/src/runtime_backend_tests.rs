@@ -2704,6 +2704,9 @@ fn software_gso_midrange_mtu_shrink_preserves_suffix_and_original_deadline() {
     }
 }
 
+// Pacing keeps software GSO scalar. A TX timestamp request keeps only the
+// segment holding its byte scalar: the range before it is one selection,
+// and the backend gets one request, for that segment.
 #[test]
 fn software_gso_pacing_and_timestamp_requests_fall_back_to_scalar() {
     for timestamp in [false, true] {
@@ -2723,7 +2726,14 @@ fn software_gso_pacing_and_timestamp_requests_fall_back_to_scalar() {
         a.service_egress().unwrap();
         let cid = connection(&a, client);
         assert!(a.endpoint.is_output_reserved(cid));
-        assert_eq!(held_segmentation(&a, cid), None);
+        if timestamp {
+            let held = held_segmentation(&a, cid).unwrap();
+            let size = held.segment_payload_len;
+            assert!(held.payload_len >= 2 * size);
+            assert!(held.payload_len <= 25999 / size * size, "{held:?}");
+        } else {
+            assert_eq!(held_segmentation(&a, cid), None);
+        }
         assert!(state.lock().unwrap().requests.is_empty());
         state.lock().unwrap().block = false;
         advance(&mut a, 1000);

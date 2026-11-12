@@ -9413,6 +9413,22 @@ impl Connection {
             // reservation/undo policy.
             // Keep protocol scratch/MTU unchanged: only the first segment is
             // encoded here; separately reserved storage retains the whole range.
+            // TX timestamp requests stay with their target bytes. Scheduled
+            // is recorded at this selection over the whole range, as for its
+            // segments selected one by one now, and Acknowledged by the ACK
+            // covering the target. A Transmit phase is completed by the
+            // backend for the packet whose token names its target, and the
+            // aggregate interface carries none (Linux's tcp_gso_tstamp moves
+            // the request to the one segment holding the byte instead), so
+            // a group ends before that segment, which leaves scalar.
+            let position = self.acknowledged + offset as u64;
+            let stamp_room = match self.tx_timestamps.pending_transmit_from(position) {
+                Some(target) => {
+                    let before = usize::try_from(target - position).unwrap_or(usize::MAX);
+                    before / wire_mss.max(1) * wire_mss
+                }
+                None => usize::MAX,
+            };
             let group_eligible = count == wire_mss
                 && count != 0
                 && packet_mss == wire_mss
@@ -9425,7 +9441,7 @@ impl Connection {
                 && self.rack.valid()
                 && !self.limited_pending
                 && !self.pacing_enabled()
-                && self.tx_timestamps.is_empty()
+                && stamp_room != 0
                 //= https://www.rfc-editor.org/rfc/rfc2883#section-4
                 //# (2) Each duplicate contiguous sequence of data received is reported
                 //# in at most one D-SACK block.
@@ -9440,7 +9456,8 @@ impl Connection {
                     .min(usable)
                     .min(timestamp_credit as usize)
                     .min(buffer.limits.max_bytes)
-                    .min(buffer.payload.len());
+                    .min(buffer.payload.len())
+                    .min(stamp_room);
                 let group_limit = if self.config.output_group_flush {
                     // Aim for at most 1ms of estimated send work per group.
                     // Rate estimation sizes batches even when pacing is off;

@@ -1170,6 +1170,31 @@ fn complete(e: &mut Endpoint, token: Option<crate::TxTimestampToken>, now: Insta
     }
 }
 
+// `drain` with `complete` for every scalar packet.
+fn drain_completed(e: &mut Endpoint, id: ConnectionId, now: Instant) -> (Vec<Vec<u8>>, Vec<usize>) {
+    let mut out = [0; 2048];
+    let (mut wire, mut groups) = (Vec::new(), Vec::new());
+    loop {
+        let (poll, attempt) = e.poll_reserved_transmit_for(now, id, &mut out, 16).unwrap();
+        let Some(p) = poll.packet else {
+            return (wire, groups);
+        };
+        let attempt = attempt.unwrap();
+        if let Some(group) = e.prepare_transmit_group(attempt, limits()).unwrap() {
+            let view = e.transmit_group(group).unwrap();
+            assert!(view.packet.tx_timestamp.is_none());
+            let segments = cut(&view);
+            groups.push(segments.len());
+            wire.extend(segments);
+            assert!(e.accept_transmit_group(now, group).unwrap());
+        } else {
+            wire.push(out[..p.len].to_vec());
+            assert!(e.accept_transmit(now, attempt).unwrap());
+            complete(e, p.tx_timestamp, now);
+        }
+    }
+}
+
 // `scalar` with `complete` for every packet; also the stream range each
 // packet's token names.
 fn scalar_completed(
@@ -1214,4 +1239,137 @@ fn scalar_segments_of_a_gso_reservation_name_their_own_bytes() {
     assert_eq!(ranges.len(), 8);
     assert!(ranges.iter().all(Option::is_some));
     assert_eq!((wire, ranges), scalar_completed(&mut c, cid, 2));
+}
+
+fn observations(e: &mut Endpoint, id: ConnectionId) -> Vec<crate::TxTimestampEvent> {
+    core::iter::from_fn(|| e.next_tx_timestamp(id).unwrap()).collect()
+}
+
+// Outstanding TX timestamp requests of every stage: groups form around
+// them, and each request is reported once per phase, for its target byte,
+// as scalar output reports it. Scheduled and Acknowledged requests leave
+// the groups whole; the segment holding a Transmit request's target
+// leaves scalar, carrying the token its completion names, and groups
+// form before and after it.
+#[test]
+fn timestamp_requests_are_reported_for_grouped_segments_as_for_scalar_ones() {
+    use crate::{TxTimestampOutcome, TxTimestampRequest, TxTimestampStage};
+    let none = TxTimestampRequest::default();
+    let requests = [
+        TxTimestampRequest {
+            scheduled: true,
+            ..none
+        },
+        TxTimestampRequest {
+            software_transmit: true,
+            ..none
+        },
+        TxTimestampRequest {
+            hardware_transmit: true,
+            ..none
+        },
+        TxTimestampRequest {
+            acknowledged: true,
+            ..none
+        },
+        TxTimestampRequest {
+            scheduled: true,
+            software_transmit: true,
+            hardware_transmit: true,
+            acknowledged: true,
+            ..none
+        },
+    ];
+    for request in requests {
+        let gso = |(mut e, peer, id, server): (Endpoint, Endpoint, ConnectionId, ConnectionId)| {
+            e.enable_output_reservations_with_gso(
+                1,
+                crate::GsoLimits {
+                    max_bytes: 8000,
+                    max_segments: 8,
+                },
+            )
+            .unwrap();
+            (e, peer, id, server)
+        };
+        // Groups; the same GSO reservations polled scalar; no GSO.
+        let (mut a, mut peer, id, server) = gso(connected(false, true, 16_384));
+        let (mut b, _, bid, _) = gso(connected(false, true, 16_384));
+        let (mut c, _, cid, _) = connected(false, true, 16_384);
+        c.enable_output_reservations().unwrap();
+        let data: Vec<u8> = (0..7000).map(|i| (i * 5) as u8).collect();
+        // Three writes, unpushed but for the last; targets 2499, 5499 and
+        // 6999 lie in the 3rd, 6th and 8th 988-byte segments.
+        for (e, id) in [(&mut a, id), (&mut b, bid), (&mut c, cid)] {
+            e.set_tx_timestamp_capacity(id, 12).unwrap();
+            for (cookie, range) in [(0, 0..2500), (1, 2500..5500), (2, 5500..7000)] {
+                let request = TxTimestampRequest { cookie, ..request };
+                let more = cookie != 2;
+                let n = e
+                    .write_with_timestamp(id, &data[range.clone()], more, false, None, request)
+                    .unwrap();
+                assert_eq!(n, range.len());
+            }
+        }
+        let (wire, groups) = drain_completed(&mut a, id, 2);
+        let transmit = request.software_transmit || request.hardware_transmit;
+        assert_eq!(
+            groups,
+            if transmit { &[2, 2][..] } else { &[8] },
+            "{request:?}"
+        );
+        // The segments of a GSO reservation polled scalar name their own
+        // bytes, as segments selected alone do.
+        let scalar = scalar_completed(&mut b, bid, 2);
+        assert_eq!(wire, scalar.0);
+        assert_eq!(scalar, scalar_completed(&mut c, cid, 2));
+        assert_eq!(scalar.1.len(), 8);
+        assert!(scalar.1.iter().all(Option::is_some));
+        assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+        let mut now = 3;
+        let mut acks = deliver(&mut peer, &wire, now);
+        while a.send_progress(id).unwrap().acknowledged != data.len() as u64 {
+            if acks.is_empty() {
+                now = peer.next_deadline().unwrap();
+                peer.on_timeout(now, 16).unwrap();
+                acks = sent(&mut peer, now);
+            }
+            now += 1;
+            for (ip, ack) in acks.drain(..) {
+                for e in [&mut a, &mut b, &mut c] {
+                    e.input(now, ip, &ack).unwrap();
+                }
+            }
+            assert_eq!(snapshot(&a, id), snapshot(&b, bid));
+        }
+        let reported = observations(&mut a, id);
+        assert_eq!(reported, observations(&mut b, bid), "{request:?}");
+        assert_eq!(reported, observations(&mut c, cid), "{request:?}");
+        // Once per phase of every request, recorded at its target.
+        let phases = [
+            request.scheduled,
+            request.software_transmit,
+            request.hardware_transmit,
+            request.acknowledged,
+        ]
+        .iter()
+        .filter(|&&phase| phase)
+        .count();
+        assert_eq!(reported.len(), 3 * phases, "{reported:?}");
+        for event in &reported {
+            assert_eq!(event.target, [2499, 5499, 6999][event.cookie as usize]);
+            let TxTimestampOutcome::Recorded { value, .. } = event.outcome else {
+                panic!("{event:?}");
+            };
+            match event.stage {
+                TxTimestampStage::Scheduled => assert_eq!(value, 2),
+                TxTimestampStage::Transmit => assert_eq!(value, 1_002),
+                // The first ACKs arrive at 4.
+                TxTimestampStage::Acknowledged => assert!(value >= 4, "{event:?}"),
+            }
+        }
+        let mut received = [0; 7000];
+        assert_eq!(peer.read(server, &mut received).unwrap(), 7000);
+        assert_eq!(received[..], data[..]);
+    }
 }

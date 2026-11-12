@@ -5762,8 +5762,11 @@ impl Endpoint {
                 r.departure = departure;
                 if let Some(s) = departure.and_then(|d| d.segmentation) {
                     // Use the same exact-prefix acceptance path as MTU repair.
-                    // GSO has no selected PMTU packet or timestamp observation
-                    // to cancel on rejection; physical evidence commits at accept.
+                    // GSO has no selected PMTU packet, and selection ends it
+                    // before any pending Transmit timestamp target, so there
+                    // is no observation to cancel on rejection (Scheduled
+                    // stands, as for scalar output); physical evidence
+                    // commits at accept.
                     r.repaired = true;
                     r.finished = false;
                     r.emitted_bytes = s.segment_payload_len;

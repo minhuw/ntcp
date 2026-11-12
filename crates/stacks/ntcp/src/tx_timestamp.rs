@@ -209,6 +209,21 @@ impl TxTimestamps {
         }
     }
 
+    // The lowest target at or after `start` whose Transmit phase (either
+    // source) is pending: a backend completion names a whole transmitted
+    // packet, so the segment holding it must leave as one.
+    pub(crate) fn pending_transmit_from(&self, start: u64) -> Option<u64> {
+        self.records
+            .iter()
+            .filter(|record| {
+                !record.ready
+                    && record.event.stage == TxTimestampStage::Transmit
+                    && record.event.target >= start
+            })
+            .map(|record| record.event.target)
+            .min()
+    }
+
     pub(crate) fn cancel_transmit(&mut self, range: TxStreamRange, source: TxTimestampSource) {
         for record in &mut self.records {
             if !record.ready
