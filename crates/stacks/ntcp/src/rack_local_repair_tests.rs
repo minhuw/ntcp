@@ -12,6 +12,7 @@ fn local_repair_rack_cancel_preserves_split_loss_and_wrap_and_invalidates_token(
         // A real detector's lost state, split at existing byte-ledger edges.
         rack.intervals[0].needs_retransmit = true;
         rack.intervals[0].original_lost = true;
+        rack.recount();
         rack.split(base.wrapping_add(333));
         let undo = rack.retry_undo(base, end).unwrap();
         let prior: Vec<_> = rack.intervals.iter().copied().collect();
@@ -39,5 +40,6 @@ fn local_repair_rack_declines_mixed_transmission_history() {
     rack.intervals[0].needs_retransmit = true;
     rack.intervals[1].needs_retransmit = true;
     rack.intervals[1].sent = 11;
+    rack.recount();
     assert!(rack.retry_undo(Seq(1), Seq(1001)).is_none());
 }

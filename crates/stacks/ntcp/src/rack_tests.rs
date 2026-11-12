@@ -306,6 +306,7 @@ fn departure_retry_preserves_history_and_one_shot_delivery() {
         r.needs_retransmit = true;
         r.set_stats_flag(DIAGNOSTIC_LOST, true);
         let before = *r;
+        rack.recount();
         let counts = rack.counts();
         let pipe = rack.pipe();
         let original = original_packet(&rack, seq(4));
@@ -504,6 +505,7 @@ fn departure_rejects_stale_duplicate_invalid_and_exhausted_tokens() {
     assert_eq!(alloc::format!("{rack:?}"), before);
     // A removed byte cannot be silently covered by a departure commit.
     rack.intervals[1].start = Seq(9);
+    rack.recount();
     let before = alloc::format!("{rack:?}");
     assert!(!rack.commit_departure(token, Seq(8), Seq(24), 20));
     assert_eq!(alloc::format!("{rack:?}"), before);

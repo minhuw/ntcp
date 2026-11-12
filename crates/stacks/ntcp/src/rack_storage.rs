@@ -9,9 +9,15 @@ use core::{
 // stay in place across growth; descriptor overhead is below 0.04% per record.
 const BLOCK: usize = 64 * 1024 / size_of::<Interval>();
 
+// The live intervals occupy slots [head, head + len). Removing a prefix
+// (cumulative ACK) only advances head; a push at the last slot first moves
+// the live intervals back to slot 0, so with far fewer intervals than slots
+// that copy is rare. Slots below the blocks' lengths are initialized; the
+// rest are reserved but untouched.
 #[derive(Debug)]
 pub(super) struct Intervals {
     blocks: Vec<Vec<Interval>>,
+    head: usize,
     len: usize,
     capacity: usize,
     // blocks_allocation_bytes(&blocks), which changes only with growth:
@@ -40,6 +46,7 @@ impl Intervals {
     pub(super) fn new(capacity: usize) -> Result<Self, ()> {
         let mut result = Self {
             blocks: Vec::new(),
+            head: 0,
             len: 0,
             capacity: 0,
             allocation: 0,
@@ -121,14 +128,10 @@ impl Intervals {
             .map_or(core::ptr::null(), |b| b.as_ptr())
     }
     pub(super) fn iter(&self) -> impl DoubleEndedIterator<Item = &Interval> {
-        self.blocks[..self.len.div_ceil(BLOCK)]
-            .iter()
-            .flat_map(|b| b.iter())
+        self.range(0, self.len)
     }
     pub(super) fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Interval> {
-        self.blocks[..self.len.div_ceil(BLOCK)]
-            .iter_mut()
-            .flat_map(|b| b.iter_mut())
+        self.range_mut(0, self.len)
     }
     pub(super) fn range(
         &self,
@@ -136,6 +139,7 @@ impl Intervals {
         end: usize,
     ) -> impl DoubleEndedIterator<Item = &Interval> {
         assert!(start <= end && end <= self.len);
+        let (start, end) = (self.head + start, self.head + end);
         let first = start / BLOCK;
         self.blocks[first..end.div_ceil(BLOCK)]
             .iter()
@@ -151,6 +155,7 @@ impl Intervals {
         end: usize,
     ) -> impl DoubleEndedIterator<Item = &mut Interval> {
         assert!(start <= end && end <= self.len);
+        let (start, end) = (self.head + start, self.head + end);
         let first = start / BLOCK;
         self.blocks[first..end.div_ceil(BLOCK)]
             .iter_mut()
@@ -167,68 +172,78 @@ impl Intervals {
     pub(super) fn last(&self) -> Option<&Interval> {
         self.len.checked_sub(1).map(|i| &self[i])
     }
+    fn slot(&self, slot: usize) -> Interval {
+        self.blocks[slot / BLOCK][slot % BLOCK]
+    }
+    // Writing the first never-initialized slot extends its block.
+    fn set_slot(&mut self, slot: usize, value: Interval) {
+        let block = &mut self.blocks[slot / BLOCK];
+        if slot % BLOCK == block.len() {
+            block.push(value);
+        } else {
+            block[slot % BLOCK] = value;
+        }
+    }
+    fn compact(&mut self) {
+        for i in 0..self.len {
+            let value = self.slot(self.head + i);
+            self.set_slot(i, value);
+        }
+        self.head = 0;
+    }
     pub(super) fn push(&mut self, value: Interval) {
         assert!(self.len < self.capacity);
-        let i = self.len / BLOCK;
-        self.blocks[i].push(value);
+        if self.head + self.len == self.capacity {
+            self.compact();
+        }
+        self.set_slot(self.head + self.len, value);
         self.len += 1;
     }
+    // Moves the shorter side: an edge near either end of the flight costs
+    // only the intervals between it and that end.
     pub(super) fn insert(&mut self, index: usize, value: Interval) {
-        assert!(index <= self.len);
-        self.push(value);
-        for i in (index + 1..self.len).rev() {
-            self[i] = self[i - 1];
-        }
-        self[index] = value;
-    }
-    pub(super) fn retain(&mut self, mut keep: impl FnMut(&Interval) -> bool) {
-        self.retain_mut(|r| keep(r));
-    }
-    pub(super) fn retain_mut(&mut self, mut keep: impl FnMut(&mut Interval) -> bool) {
-        let mut write = 0;
-        for read in 0..self.len {
-            if keep(&mut self[read]) {
-                if write != read {
-                    self[write] = self[read];
-                }
-                write += 1;
+        assert!(index <= self.len && self.len < self.capacity);
+        let room_after = self.head + self.len < self.capacity;
+        if self.head > 0 && (index < self.len - index || !room_after) {
+            for slot in self.head..self.head + index {
+                let moved = self.slot(slot);
+                self.set_slot(slot - 1, moved);
+            }
+            self.head -= 1;
+        } else {
+            if !room_after {
+                self.compact();
+            }
+            for slot in (self.head + index..self.head + self.len).rev() {
+                let moved = self.slot(slot);
+                self.set_slot(slot + 1, moved);
             }
         }
-        self.len = write;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            block.truncate(write.saturating_sub(i * BLOCK).min(BLOCK));
-        }
+        self.len += 1;
+        self.set_slot(self.head + index, value);
+    }
+    pub(super) fn remove_prefix(&mut self, count: usize) {
+        assert!(count <= self.len);
+        self.len -= count;
+        self.head = if self.len == 0 { 0 } else { self.head + count };
     }
     pub(super) fn clear(&mut self) {
+        self.head = 0;
         self.len = 0;
-        for block in &mut self.blocks {
-            block.clear();
-        }
     }
 }
 impl Index<usize> for Intervals {
     type Output = Interval;
     fn index(&self, index: usize) -> &Interval {
         assert!(index < self.len);
-        &self.blocks[index / BLOCK][index % BLOCK]
+        let slot = self.head + index;
+        &self.blocks[slot / BLOCK][slot % BLOCK]
     }
 }
 impl IndexMut<usize> for Intervals {
     fn index_mut(&mut self, index: usize) -> &mut Interval {
         assert!(index < self.len);
-        &mut self.blocks[index / BLOCK][index % BLOCK]
-    }
-}
-impl<'a> IntoIterator for &'a mut Intervals {
-    type Item = &'a mut Interval;
-    type IntoIter = core::iter::FlatMap<
-        core::slice::IterMut<'a, Vec<Interval>>,
-        core::slice::IterMut<'a, Interval>,
-        fn(&'a mut Vec<Interval>) -> core::slice::IterMut<'a, Interval>,
-    >;
-    fn into_iter(self) -> Self::IntoIter {
-        self.blocks[..self.len.div_ceil(BLOCK)]
-            .iter_mut()
-            .flat_map(|b| b.iter_mut())
+        let slot = self.head + index;
+        &mut self.blocks[slot / BLOCK][slot % BLOCK]
     }
 }
