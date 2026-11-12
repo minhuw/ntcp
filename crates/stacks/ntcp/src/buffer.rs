@@ -929,6 +929,14 @@ impl ReceiveBuffer {
         self.dsack.is_some()
     }
 
+    // Whether sack_blocks reports any block: a pending duplicate, or a byte
+    // retained beyond the contiguous prefix (occupied counts every present
+    // slot, and the prefix is all present), as Linux tests its out-of-order
+    // queue for emptiness.
+    pub(crate) fn has_sack_blocks(&self) -> bool {
+        self.dsack.is_some() || self.occupied > self.contiguous_len
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc2018#section-4
     //= reason=Ordinary SACK selects newest contiguous retained union first, except arrivals advancing the cumulative frontier. RFC 2883 DSACK is a separate first-block extension, not asserted as ordinary RFC 2018 behavior.
     //# * The first SACK block (i.e., the one immediately following the kind and
@@ -1792,6 +1800,7 @@ mod tests {
             );
         }
         assert_eq!(recv.occupied, occupied_data(recv).iter().flatten().count());
+        assert_eq!(recv.has_sack_blocks(), recv.sack_blocks(1)[0].is_some());
     }
 
     #[test]

@@ -7840,7 +7840,7 @@ impl Connection {
             //# window edge (MAY-13).
             if seq != next
                 || outcome.out_of_order
-                || self.receive.sack_blocks(1)[0].is_some()
+                || self.receive.has_sack_blocks()
                 || !outcome.advanced
                 || advanced.saturating_sub(u32::from(outcome.fin)) as usize > count
                 || (flags & FIN != 0 && !fin_awaits_reply)
