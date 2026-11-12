@@ -988,6 +988,7 @@ mod linux {
                 dscp,
                 ecn,
                 ipv4_options: ntcp::OutgoingIpv4Options::default(),
+                mark: 0,
             },
             &mut Sample(0),
         )
@@ -3342,6 +3343,7 @@ mod linux {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: ntcp::OutgoingIpv4Options::default(),
+                mark: 0,
             }
         }
 
@@ -4803,6 +4805,7 @@ mod linux {
                     record_route_slots: Some(2),
                     timestamp: Some(TimestampRequest::Times(4)),
                 },
+                mark: 0,
             };
             let len = build_ipv4_options(&mut bytes, transmit, &mut Sample(1)).unwrap();
             assert_eq!(len, MTU);

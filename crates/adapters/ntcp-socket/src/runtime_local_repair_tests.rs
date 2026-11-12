@@ -72,6 +72,7 @@ fn local_repair_packet_seq(
             len: n,
             hop_limit: 64,
             dscp: 0,
+            mark: 0,
         },
         0,
     )

@@ -54,6 +54,7 @@ fn pmtud_peer_reply(a: &mut Owner, packet: &[u8], syn: bool) {
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp[..n],
     );

@@ -441,6 +441,7 @@ fn syn_with_options(sequence: u32, destination_port: u16, options: &[u8]) -> Vec
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp[..n],
     )
@@ -466,6 +467,7 @@ fn input_packet(owner: &mut Owner, ip: IpMetadata, header: ntcp::wire::Header, o
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp[..len],
     )
@@ -819,6 +821,7 @@ fn window8_acks_third_2000_byte_packet_before_application_read() {
                     dscp: 0,
                     ecn: 0,
                     ipv4_options: Default::default(),
+                    mark: 0,
                 },
                 &tcp[..len],
             )
@@ -1226,6 +1229,7 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &out[..n],
         )
@@ -2141,6 +2145,7 @@ fn owner_loop_emits_pure_handshake_ack_before_pending_send_data() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..len],
         )
@@ -2258,6 +2263,7 @@ fn owner_loop_coalesces_queued_reads_with_immediate_ack_window_credit() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..len],
         )
@@ -2447,6 +2453,7 @@ fn owner_loop_profiles_preserve_terminal_push_without_frozen_batch_clock() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..len],
         )
@@ -3145,6 +3152,7 @@ fn owner_loop_preserves_pending_send_read_fifo_on_refused_handshake() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..len],
         )

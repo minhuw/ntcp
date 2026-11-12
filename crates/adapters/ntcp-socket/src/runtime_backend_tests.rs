@@ -2865,6 +2865,7 @@ fn retained_native_receive_preserves_original_segment_size_through_reservation()
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp,
     );

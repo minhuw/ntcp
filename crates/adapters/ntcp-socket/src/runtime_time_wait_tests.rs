@@ -228,7 +228,7 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     assert_eq!(b.endpoint.state(old), Ok(State::Closed));
     assert_eq!(b.connection_options.len(), LIMIT);
     let snapshot = b.connection_options.iter().find(|p| p.0 == child).unwrap();
-    assert_eq!((snapshot.1, snapshot.5), (44, tuple.local));
+    assert_eq!((snapshot.1, snapshot.4), (44, tuple.local));
     let snapshot = b.child_timeouts.iter().find(|p| p.0 == child).unwrap();
     assert_eq!(snapshot.2, 123_000);
     assert_eq!(b.endpoint.rx_timestamp_status(child).unwrap().capacity, 3);

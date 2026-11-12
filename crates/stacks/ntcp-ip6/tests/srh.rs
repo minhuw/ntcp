@@ -225,6 +225,7 @@ fn routed_tcp_places_the_segment_after_the_srh() {
         dscp: 10,
         ecn: 0,
         ipv4_options: ntcp::OutgoingIpv4Options::default(),
+        mark: 0,
     };
     let mut packet = vec![0; h + tcp_len];
     packet[h..].copy_from_slice(&tcp[..tcp_len]);

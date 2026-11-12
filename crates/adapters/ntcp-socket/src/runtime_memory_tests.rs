@@ -633,6 +633,7 @@ fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..size],
         );
@@ -757,6 +758,7 @@ fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..size],
         );

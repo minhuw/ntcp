@@ -52,6 +52,7 @@ fn adaptive_peer(a: &mut Owner, packet: &[u8], syn: bool, mss: u16, payload: &[u
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp[..n],
     );
@@ -511,6 +512,7 @@ fn upstream_inq_server_read_window_ack_and_fin_schedules() {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..len],
         );

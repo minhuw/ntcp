@@ -28,6 +28,7 @@ fn hostile_option_frame(
             len: n,
             hop_limit: 64,
             dscp: 0,
+            mark: 0,
         },
         &tcp,
     )

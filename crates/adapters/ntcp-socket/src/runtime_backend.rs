@@ -1040,11 +1040,6 @@ impl Owner {
         }
         Ok(())
     }
-    pub(super) fn output_mark(&self, owner: Option<ConnectionId>) -> u32 {
-        owner
-            .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
-            .map_or(0, |p| p.4)
-    }
     // Each rejected frame consumes one iteration, just like an accepted frame.
     pub(super) fn receive_batch(&mut self, input: &mut [u8]) -> std::io::Result<()> {
         if self.egress.is_some() {

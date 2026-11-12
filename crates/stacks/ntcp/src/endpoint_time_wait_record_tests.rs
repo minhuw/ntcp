@@ -1,9 +1,9 @@
 use super::*;
 
-// Everything a reply can differ in: addresses, bytes, hop limit, DSCP, ECN
-// and IPv4 options. Not the owner: a record's ACK leaves on the stateless
-// lane.
-type Sent = (IpMetadata, Vec<u8>, u8, u8, u8, OutgoingIpv4Options);
+// Everything a reply can differ in: addresses, bytes, hop limit, DSCP, ECN,
+// IPv4 options and mark. Not the owner: a record's ACK leaves on the
+// stateless lane.
+type Sent = (IpMetadata, Vec<u8>, u8, u8, u8, OutgoingIpv4Options, u32);
 
 // Sequence, acknowledgment, flags, TSval and payload of a segment from the
 // peer.
@@ -22,6 +22,7 @@ fn sent(endpoint: &mut Endpoint, now: u64) -> Vec<Sent> {
                 p.dscp,
                 p.ecn,
                 p.ipv4_options,
+                p.mark,
             ));
         }
         if !output.more_work {
@@ -39,20 +40,27 @@ fn tuple() -> Tuple {
 }
 
 // Two identical endpoints whose connection `b` closed first is in
-// TIME-WAIT: the first's application still holds it (the whole connection
-// stays), the second's released it (a TIME-WAIT record stays).
+// TIME-WAIT, marked `MARK`: the first's application still holds it (the
+// whole connection stays), the second's released it (a TIME-WAIT record
+// stays).
 struct Twins {
     held: Endpoint,
     record: Endpoint,
+    // The connection `record` released.
+    released: ConnectionId,
     listener: ListenerId,
     ip: IpMetadata,
     h: wire::Header,
     ts: u32,
 }
 
+const MARK: u32 = 0x5a5a;
+
 fn twins(cfg: &EndpointConfig, reuse: bool) -> Twins {
-    let (held, listener, _, ip, h, ts) = time_wait_endpoint_with(cfg.clone(), reuse);
+    let (mut held, listener, kept, ip, h, ts) = time_wait_endpoint_with(cfg.clone(), reuse);
     let (mut record, _, old, ..) = time_wait_endpoint_with(cfg.clone(), reuse);
+    held.set_mark(kept, MARK).unwrap();
+    record.set_mark(old, MARK).unwrap();
     let charge = record.buffer_bytes();
     record.release(old).unwrap();
     assert!(!record.connection_exists(old));
@@ -62,6 +70,7 @@ fn twins(cfg: &EndpointConfig, reuse: bool) -> Twins {
     Twins {
         held,
         record,
+        released: old,
         listener,
         ip,
         h,
@@ -222,6 +231,59 @@ fn a_time_wait_record_keeps_the_challenge_ack_budget() {
     let interval = cfg.connection.challenge_ack_interval_us;
     let syn = twins.segment(rcv + 100, 0, wire::SYN, Some(twins.ts + 1), b"");
     assert_eq!(twins.input(4_000 + interval, &syn).len(), 1);
+}
+
+// A record keeps its connection's mark (Linux's tw_mark), not that of the
+// connection taking its slot next; a reply for no connection carries none,
+// as Linux's control socket answers without a socket.
+#[test]
+fn a_time_wait_record_keeps_its_connections_mark() {
+    let mut twins = twins(&config(), false);
+    let rcv = twins.h.acknowledgment;
+    let snd = twins.h.sequence;
+    let later = core::net::SocketAddr::new(addresses().1.ip(), 40_001);
+    let peer = core::net::SocketAddr::new(addresses().0.ip(), 9_000);
+    let id = twins.record.connect(4_000, later, peer).unwrap();
+    assert_eq!(id.index(), twins.released.index());
+    twins.record.set_mark(id, 11).unwrap();
+    assert_eq!(twins.record.mark(id), Ok(11));
+    let syn = sent(&mut twins.record, 4_000);
+    assert_eq!(syn.len(), 1);
+    assert_eq!(syn[0].6, 11);
+    let fin = twins.segment(rcv - 1, snd, wire::FIN | wire::ACK, Some(twins.ts + 1), b"");
+    twins.record.input(5_000, twins.ip, &fin).unwrap();
+    let ack = sent(&mut twins.record, 5_000);
+    assert_eq!(ack.len(), 1);
+    assert_eq!(
+        wire::parse(ack[0].0, &ack[0].1).unwrap().header.flags,
+        wire::ACK
+    );
+    assert_eq!(ack[0].6, MARK);
+    let mut stray = [0; 64];
+    let len = wire::encode(
+        twins.ip,
+        wire::Header {
+            source_port: addresses().0.port(),
+            destination_port: 9_001,
+            sequence: 1,
+            acknowledgment: 1,
+            flags: wire::ACK,
+            window: 1024,
+            urgent_pointer: 0,
+        },
+        &[],
+        &[],
+        &mut stray,
+    )
+    .unwrap();
+    twins.record.input(6_000, twins.ip, &stray[..len]).unwrap();
+    let reset = sent(&mut twins.record, 6_000);
+    assert_eq!(reset.len(), 1);
+    assert_eq!(
+        wire::parse(reset[0].0, &reset[0].1).unwrap().header.flags,
+        wire::RST
+    );
+    assert_eq!(reset[0].6, 0);
 }
 
 // A fresh SYN reopens a record's tuple as it reopens a connection's (RFC

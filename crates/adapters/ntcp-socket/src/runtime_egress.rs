@@ -593,7 +593,7 @@ impl Owner {
                 deadline: None,
                 not_before: now,
                 waiting_mtu: false,
-                mark: self.output_mark(owner),
+                mark: tx.mark,
                 context,
                 ip_len,
                 blocked,

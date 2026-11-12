@@ -681,7 +681,7 @@ struct Owner {
     pending: VecDeque<Request>,
     child_timeouts: Vec<ChildOptionsSnapshot>,
     // Local tuple survives descriptor close and Endpoint::release until GC.
-    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>, u32, SocketAddr)>,
+    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>, SocketAddr)>,
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
 }
@@ -1907,8 +1907,9 @@ impl Owner {
                 && let Some((tos, discover, _, mark)) = listener_options
             {
                 self.endpoint.set_dscp(cid, tos >> 2)?;
+                self.endpoint.set_mark(cid, mark)?;
                 self.connection_options
-                    .push((cid, tos, discover, None, mark, tuple.local));
+                    .push((cid, tos, discover, None, tuple.local));
             }
             // Snapshot at accept eligibility, before the adapter publishes the
             // child. Only authenticated TFO data is readable in SynReceived;
@@ -2030,7 +2031,7 @@ impl Owner {
             && !self
                 .connection_options
                 .iter()
-                .any(|p| p.5.port() == port && self.endpoint.connection_exists(p.0))
+                .any(|p| p.4.port() == port && self.endpoint.connection_exists(p.0))
             // A released connection's TIME-WAIT keeps its port.
             && !self.endpoint.time_wait_holds_port(port)
     }
@@ -2051,6 +2052,7 @@ impl Owner {
         self.endpoint
             .set_dscp(cid, s.wire_tos(self.local) >> 2)
             .map_err(engine)?;
+        self.endpoint.set_mark(cid, s.mark).map_err(engine)?;
         self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
         self.endpoint.set_cork(cid, s.cork).map_err(engine)?;
         if s.timestamps.options.flags != 0 {
@@ -2708,10 +2710,10 @@ impl Owner {
                     .application_timeout(cid)
                     .map_err(engine)?
                     .map_or(0, |us| (us / 1000) as i32);
+                child.mark = self.endpoint.mark(cid).map_err(engine)?;
                 if let Some(p) = self.connection_options.iter().find(|p| p.0 == cid) {
                     child.set_wire_ip_policy(self.local, p.1, p.2);
                     child.zerocopy = p.3.unwrap_or(false);
-                    child.mark = p.4;
                 }
                 if let Some(index) = self.child_timestamps.iter().position(|p| p.0 == cid) {
                     child.timestamps.options = self.child_timestamps.swap_remove(index).1;
@@ -3358,6 +3360,9 @@ impl Owner {
                             .endpoint
                             .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
                             .map_err(engine)?,
+                        (SOL_SOCKET, SO_MARK) => {
+                            self.endpoint.set_mark(cid, s.mark).map_err(engine)?
+                        }
                         //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
                         //# There are cases where the kernel needs to control the
                         //# traffic class value and conflicts with the user-specified
@@ -3389,7 +3394,6 @@ impl Owner {
                 {
                     p.1 = s.wire_tos(self.local);
                     p.2 = s.wire_discover(self.local);
-                    p.4 = s.mark;
                 }
                 if let Handle::Listener(listener) = s.handle {
                     self.endpoint

@@ -40,6 +40,8 @@ pub(crate) struct Record {
     pub(crate) challenge_pending: bool,
     pub(crate) hop_limit: u8,
     pub(crate) dscp: u8,
+    // The connection's mark when it entered TIME-WAIT (Linux's tw_mark).
+    pub(crate) mark: u32,
     pub(crate) ipv4_options: OutgoingIpv4Options,
     // The complete IP header length of the path a managed reply leaves on,
     // as a managed input stated it (see the Endpoint's control replies).

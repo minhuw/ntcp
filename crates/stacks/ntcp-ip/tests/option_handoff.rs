@@ -120,6 +120,7 @@ fn opaque_options_on_non_tcp_packets_and_malformed_frame_lengths() {
         dscp: 0,
         ecn: 0,
         ipv4_options: OutgoingIpv4Options::default(),
+        mark: 0,
     };
     encode(&mut frame, tx, 0).unwrap();
     with_options(&mut frame, &[30, 2, 158, 3, 0, 1, 0, 255]);

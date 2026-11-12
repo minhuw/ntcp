@@ -242,6 +242,7 @@ mod packets {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             0,
         )
@@ -356,6 +357,7 @@ mod packets {
                         dscp: 0,
                         ecn: 0,
                         ipv4_options: Default::default(),
+                        mark: 0,
                     },
                     0,
                 )

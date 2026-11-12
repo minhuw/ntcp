@@ -36,6 +36,7 @@ fn datagram(ip: IpMetadata) -> Vec<u8> {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             };
             ntcp_ip::encode_udp(&mut b, t.into(), 4000, 53, 16, 0).unwrap()
         }

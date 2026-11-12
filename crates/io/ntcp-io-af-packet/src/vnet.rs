@@ -119,6 +119,7 @@ mod tests {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             0,
         )

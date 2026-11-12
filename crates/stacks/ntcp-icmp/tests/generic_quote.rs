@@ -34,6 +34,7 @@ fn transmit(v6: bool, len: usize, options: OutgoingIpv4Options) -> Transmit {
         dscp: 0,
         ecn: 0,
         ipv4_options: options,
+        mark: 0,
     }
 }
 

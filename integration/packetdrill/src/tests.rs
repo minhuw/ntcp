@@ -175,6 +175,7 @@ fn syn_with_options(sequence: u32, destination_port: u16, options: &[u8]) -> Vec
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp[..n],
     )
@@ -236,6 +237,7 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &bytes[..len],
     )
@@ -274,6 +276,7 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &bytes[..len],
     )
@@ -658,6 +661,7 @@ fn inject(ip: IpMetadata, header: ntcp::wire::Header, payload: &[u8]) {
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp[..len],
     )
@@ -1511,6 +1515,7 @@ fn profile_cookie_response(profile: Profile, linux: bool) {
                 dscp: 0,
                 ecn: 0,
                 ipv4_options: Default::default(),
+                mark: 0,
             },
             &tcp[..n],
         )
@@ -2211,6 +2216,7 @@ fn segmented_receive_abi_preserves_observed_size_and_rejects_invalid_metadata() 
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         &tcp,
     )

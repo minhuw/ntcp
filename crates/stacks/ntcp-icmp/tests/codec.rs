@@ -17,6 +17,7 @@ fn tx(v6: bool, len: usize) -> Transmit {
         dscp: 37,
         ecn: 3,
         ipv4_options: OutgoingIpv4Options::default(),
+        mark: 0,
     }
 }
 fn seal(b: &mut [u8]) {

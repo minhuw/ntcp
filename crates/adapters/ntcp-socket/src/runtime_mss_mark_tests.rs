@@ -176,3 +176,141 @@ fn backend_without_marks_rejects_nonzero_without_committing() {
         0
     );
 }
+
+// Submits `from`'s output to its backend and delivers every accepted packet
+// to `to`: each packet's TCP header and the mark it left with.
+#[cfg(feature = "packet-test")]
+fn exchange(from: &mut Owner, to: &mut Owner) -> Vec<(ntcp::wire::Header, u32, Vec<u8>)> {
+    from.service_egress().unwrap();
+    let mut result = Vec::new();
+    for (reply, mark) in from.packets.as_mut().unwrap().output.drain(..) {
+        let p = crate::ip::parse(&reply.bytes).unwrap();
+        let header = ntcp::wire::parse(p.ip, p.payload).unwrap().header;
+        result.push((header, mark, reply.bytes));
+    }
+    for (_, _, bytes) in &result {
+        to.packets.as_mut().unwrap().inject(bytes.clone()).unwrap();
+    }
+    to.receive_batch(&mut vec![0; 65535]).unwrap();
+    result
+}
+
+// A connection's packets carry its socket's SO_MARK, a child's inherited
+// from its listener; once released into TIME-WAIT, its record's ACKs keep
+// the mark the connection had (Linux's tw_mark, tcp_time_wait), whatever
+// marks later sockets set; a reply for no socket carries none (Linux's
+// control socket, tcp_v4_send_reset without a socket).
+#[cfg(feature = "packet-test")]
+#[test]
+fn time_wait_record_acks_keep_the_connections_mark() {
+    use crate::packet_profile::Profile;
+    use ntcp::wire::{ACK, FIN, RST, SYN};
+    let mut a = Owner::packet((Ipv4Addr::new(192, 0, 2, 1), Profile::Baseline)).unwrap();
+    let mut b = Owner::packet((Ipv4Addr::new(192, 0, 2, 2), Profile::Baseline)).unwrap();
+    let listener = new(&mut b, SOCK_NONBLOCK);
+    b.execute(listener, Op::Set(SOL_SOCKET, SO_MARK, 7))
+        .unwrap();
+    b.execute(listener, Op::Bind("192.0.2.2:8080".parse().unwrap()))
+        .unwrap();
+    b.execute(listener, Op::Listen(4)).unwrap();
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    exchange(&mut a, &mut b);
+    let synack = exchange(&mut b, &mut a);
+    assert_eq!(
+        synack.iter().map(|p| (p.0.flags, p.1)).collect::<Vec<_>>(),
+        [(SYN | ACK, 7)]
+    );
+    exchange(&mut a, &mut b);
+    let server = b
+        .execute(listener, Op::Accept(SOCK_NONBLOCK))
+        .unwrap()
+        .value as u64;
+    assert_eq!(
+        b.execute(server, Op::Get(SOL_SOCKET, SO_MARK))
+            .unwrap()
+            .value,
+        7
+    );
+    let Handle::Connection(cid) = b.sockets[&server].handle else {
+        panic!()
+    };
+    // The server closes first, under a mark set on the connection.
+    b.execute(server, Op::Set(SOL_SOCKET, SO_MARK, 9)).unwrap();
+    b.execute(server, Op::Close).unwrap();
+    let fin = exchange(&mut b, &mut a);
+    assert_eq!(
+        fin.iter()
+            .map(|p| (p.0.flags & FIN, p.1))
+            .collect::<Vec<_>>(),
+        [(FIN, 9)]
+    );
+    exchange(&mut a, &mut b);
+    a.execute(client, Op::Close).unwrap();
+    let peer_fin = exchange(&mut a, &mut b);
+    assert_eq!(peer_fin.len(), 1);
+    assert_ne!(peer_fin[0].0.flags & FIN, 0);
+    let last_ack = exchange(&mut b, &mut a);
+    assert_eq!(
+        last_ack
+            .iter()
+            .map(|p| (p.0.flags, p.1))
+            .collect::<Vec<_>>(),
+        [(ACK, 9)]
+    );
+    // The owner loop releases the closed descriptor's connection; only its
+    // TIME-WAIT record remains.
+    assert_eq!(b.endpoint.state(cid), Ok(State::TimeWait));
+    b.endpoint.release(cid).unwrap();
+    assert!(!b.endpoint.connection_exists(cid));
+    assert_eq!(b.endpoint.time_wait_connections(), 1);
+    // A later socket's mark is its own and leaves the record's alone.
+    let later = new(&mut b, SOCK_NONBLOCK);
+    b.execute(later, Op::Set(SOL_SOCKET, SO_MARK, 11)).unwrap();
+    assert_eq!(
+        b.execute(later, Op::Connect("192.0.2.1:9000".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    let syn = exchange(&mut b, &mut a);
+    assert_eq!(
+        syn.iter().map(|p| (p.0.flags, p.1)).collect::<Vec<_>>(),
+        [(SYN, 11)]
+    );
+    // The repeated FIN reaches the record, which ACKs it on the stateless
+    // lane with the connection's mark.
+    b.packets
+        .as_mut()
+        .unwrap()
+        .inject(peer_fin[0].2.clone())
+        .unwrap();
+    b.receive_batch(&mut vec![0; 65535]).unwrap();
+    let record_ack = exchange(&mut b, &mut a);
+    assert_eq!(
+        record_ack
+            .iter()
+            .map(|p| (p.0.flags, p.0.destination_port, p.1))
+            .collect::<Vec<_>>(),
+        [(ACK, peer_fin[0].0.source_port, 9)]
+    );
+    // A reset for no socket leaves unmarked.
+    let stray = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(stray, Op::Connect("192.0.2.2:9001".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    exchange(&mut a, &mut b);
+    let reset = exchange(&mut b, &mut a);
+    assert_eq!(
+        reset
+            .iter()
+            .map(|p| (p.0.flags & RST, p.1))
+            .collect::<Vec<_>>(),
+        [(RST, 0)]
+    );
+}

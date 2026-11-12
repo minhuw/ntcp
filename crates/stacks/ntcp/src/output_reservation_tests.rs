@@ -261,6 +261,7 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
         len,
         hop_limit: 64,
         dscp: 0,
+        mark: 0,
     };
     let token = a.reservations[0].token().unwrap();
     a.reservations[0].capture(packet, &bytes, token);
@@ -352,6 +353,7 @@ fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
         len,
         hop_limit: 64,
         dscp: 0,
+        mark: 0,
     };
     let token = a.reservations[0].token().unwrap();
     a.reservations[0].capture(packet, &bytes, token);
@@ -412,6 +414,7 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
             len,
             hop_limit: 64,
             dscp: 0,
+            mark: 0,
         },
         &bytes,
         token,

@@ -290,6 +290,10 @@ pub struct Transmit {
     pub len: usize,
     pub hop_limit: u8,
     pub dscp: u8,
+    // The packet mark (Linux's SO_MARK) for the backend to tag it with:
+    // the connection's, kept by its TIME-WAIT record, and 0 for a reply
+    // without one, as Linux's control socket has.
+    pub mark: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PollTransmit {
@@ -405,6 +409,7 @@ struct Slot {
     time_wait: bool,
     hop_limit: u8,
     dscp: u8,
+    mark: u32,
     received_dscp: Option<u8>,
     ipv4_options: OutgoingIpv4Options,
     explicit_route: bool,
@@ -1777,6 +1782,7 @@ impl Endpoint {
             time_wait: false,
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
+            mark: 0,
             received_dscp: None,
             ipv4_options: OutgoingIpv4Options::default(),
             explicit_route: false,
@@ -2853,10 +2859,12 @@ impl Endpoint {
     // tcp_max_tw_buckets. False if it is not ready to.
     fn enter_time_wait(&mut self, index: usize) -> bool {
         let slot = self.slots[index].as_ref().unwrap();
-        let Some(record) =
-            slot.connection
-                .time_wait_record(slot.hop_limit, slot.dscp, slot.ipv4_options)
-        else {
+        let Some(record) = slot.connection.time_wait_record(
+            slot.hop_limit,
+            slot.dscp,
+            slot.mark,
+            slot.ipv4_options,
+        ) else {
             return false;
         };
         // A connection whose tuple went to a reopened one left TIME-WAIT then.
@@ -4698,6 +4706,17 @@ impl Endpoint {
         self.slot_mut(id)?.dscp = dscp;
         Ok(())
     }
+    // The mark the connection's packets carry from now on (Linux's
+    // SO_MARK), its TIME-WAIT record's ACKs included, as Linux's timewait
+    // socket keeps tw_mark. A packet already reserved keeps the mark it
+    // was built with, so a reservation does not refuse the change.
+    pub fn set_mark(&mut self, id: ConnectionId, mark: u32) -> Result<(), EndpointError> {
+        self.slot_mut(id)?.mark = mark;
+        Ok(())
+    }
+    pub fn mark(&self, id: ConnectionId) -> Result<u32, EndpointError> {
+        Ok(self.slot(id)?.mark)
+    }
     pub fn close_reason(
         &self,
         id: ConnectionId,
@@ -6156,7 +6175,12 @@ impl Endpoint {
             destination: tuple.tuple.remote.ip(),
         };
         let (header, options, option_len) = record.ack(now, &self.config.connection);
-        let (ipv4_options, hop_limit, dscp) = (record.ipv4_options, record.hop_limit, record.dscp);
+        let (ipv4_options, hop_limit, dscp, mark) = (
+            record.ipv4_options,
+            record.hop_limit,
+            record.dscp,
+            record.mark,
+        );
         let mut path_header = record.reply_header;
         if ip.destination.is_ipv6()
             && let Some(resize) = reply
@@ -6204,6 +6228,7 @@ impl Endpoint {
                     len,
                     hop_limit,
                     dscp,
+                    mark,
                 }),
                 more_work: self.has_pending_output(),
             },
@@ -6313,6 +6338,7 @@ impl Endpoint {
                             len,
                             hop_limit: self.config.hop_limit,
                             dscp: self.config.dscp,
+                            mark: 0,
                         }),
                         more_work: self.has_pending_output(),
                     },
@@ -6368,6 +6394,7 @@ impl Endpoint {
                     slot.closed_output_drained = slot.connection.state() == State::Closed;
                     let hop_limit = slot.hop_limit;
                     let dscp = slot.dscp;
+                    let mark = slot.mark;
                     let ecn = slot.connection.last_output_ecn();
                     let ipv4_options = slot.ipv4_options;
                     let tx_timestamp = slot
@@ -6405,6 +6432,7 @@ impl Endpoint {
                                 //# (SHLD-22).
                                 hop_limit,
                                 dscp,
+                                mark,
                             }),
                             more_work: self.has_pending_output(),
                         },

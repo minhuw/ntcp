@@ -40,6 +40,7 @@ fn inject(h: ntcp::wire::Header, options: &[u8], payload: &[u8]) {
             dscp: 0,
             ecn: 0,
             ipv4_options: Default::default(),
+            mark: 0,
         },
         0,
     )
