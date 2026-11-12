@@ -180,14 +180,20 @@ impl EndpointConfig {
     }
 
     /// The share of `max_buffer_bytes` taken by `count` output reservations
-    /// (`enable_output_reservations_with_capacity`, or `_with_gso` with
-    /// `gso`). None if it overflows.
+    /// (`enable_output_reservations_with_packet_bytes` with the same
+    /// arguments). Each holds one TCP packet of up to `packet_bytes`, at
+    /// most `send_ip_payload_limit`, and with `gso` the payload of one
+    /// aggregate. `enable_output_reservations_with_capacity`, or `_with_gso`
+    /// with `gso`, charges `packet_bytes` of `usize::MAX`: a packet of the
+    /// send limit. None if it overflows.
     pub fn output_reservations_charge(
         &self,
         count: usize,
+        packet_bytes: usize,
         gso: Option<crate::GsoLimits>,
     ) -> Option<usize> {
-        (self.connection.send_ip_payload_limit as usize)
+        packet_bytes
+            .min(self.connection.send_ip_payload_limit as usize)
             .checked_add(gso.map_or(0, |limits| limits.max_bytes))?
             .checked_add(core::mem::size_of::<
                 crate::output_reservation::OutputReservation,
@@ -5295,7 +5301,7 @@ impl Endpoint {
         &mut self,
         count: usize,
     ) -> Result<(), EndpointError> {
-        self.enable_output_pool(count, None)
+        self.enable_output_reservations_with_packet_bytes(count, usize::MAX, None)
     }
 
     pub fn enable_output_reservations_with_gso(
@@ -5303,39 +5309,52 @@ impl Endpoint {
         count: usize,
         limits: crate::GsoLimits,
     ) -> Result<(), EndpointError> {
-        if limits.max_bytes == 0
-            || limits.max_bytes > u32::MAX as usize / 2
-            || limits.max_segments < 2
-            || limits.max_segments > limits.max_bytes
+        self.enable_output_reservations_with_packet_bytes(count, usize::MAX, Some(limits))
+    }
+
+    /// `count` output reservations, each holding one TCP packet of up to
+    /// `packet_bytes`, at most `send_ip_payload_limit`, and with `gso` the
+    /// payload of one aggregate. A poll encodes into no more of `out` than
+    /// this, as if `out` were no longer, and a packet that does not fit is
+    /// `OutputTooSmall`: an embedding that always polls with `out` of one
+    /// size passes that size and is charged no room it never uses.
+    /// `packet_bytes` below what a SYN with its options needs is refused.
+    pub fn enable_output_reservations_with_packet_bytes(
+        &mut self,
+        count: usize,
+        packet_bytes: usize,
+        gso: Option<crate::GsoLimits>,
+    ) -> Result<(), EndpointError> {
+        if gso.is_some_and(|limits| {
+            limits.max_bytes == 0
+                || limits.max_bytes > u32::MAX as usize / 2
+                || limits.max_segments < 2
+                || limits.max_segments > limits.max_bytes
+        }) || packet_bytes < usize::from(self.config.connection.minimum_send_budget())
         {
             return Err(Error::InvalidArgument.into());
         }
-        self.enable_output_pool(count, Some(limits))
-    }
-
-    fn enable_output_pool(
-        &mut self,
-        count: usize,
-        gso: Option<crate::GsoLimits>,
-    ) -> Result<(), EndpointError> {
         if self.reservations.iter().any(|slot| slot.current.is_some()) {
             return Err(EndpointError::OutputReserved);
         }
         if count == 0 || count > self.config.max_connections.saturating_add(1) {
             return Err(Error::InvalidArgument.into());
         }
+        let size = packet_bytes.min(self.config.connection.send_ip_payload_limit as usize);
         if !self.reservations.is_empty() {
-            return if count == self.reservations.len() && self.reservations[0].gso == gso {
+            return if count == self.reservations.len()
+                && self.reservations[0].gso == gso
+                && self.reservations[0].bytes.len() == size
+            {
                 Ok(())
             } else {
                 Err(Error::InvalidArgument.into())
             };
         }
-        let size = self.config.connection.send_ip_payload_limit as usize;
         let payload_size = gso.map_or(0, |limits| limits.max_bytes);
         let charge = self
             .config
-            .output_reservations_charge(count, gso)
+            .output_reservations_charge(count, packet_bytes, gso)
             .ok_or(Error::NoMemory)?;
         if charge > self.buffer_room() {
             return Err(Error::NoMemory.into());

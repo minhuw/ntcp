@@ -1092,6 +1092,62 @@ fn pool_allocation_budget_and_failure_are_atomic() {
     assert_eq!(a.buffer_bytes(), before + charge);
 }
 
+// Reservations sized for the packets an embedding polls are charged that
+// size, and hold every packet of the path: full segments of the MSS go out
+// whole while `out` offers more.
+#[test]
+fn pool_packet_bytes_bound_the_charge_and_every_encoded_packet() {
+    let (_, mut b, _, server) = pair();
+    let before = b.buffer_bytes();
+    let charge = 2 * (1100 + core::mem::size_of::<crate::output_reservation::OutputReservation>());
+    assert_eq!(
+        b.config.output_reservations_charge(2, 1100, None),
+        Some(charge)
+    );
+    // Never more than a packet of the send limit.
+    assert_eq!(
+        b.config.output_reservations_charge(2, usize::MAX, None),
+        b.config.output_reservations_charge(
+            2,
+            b.config.connection.send_ip_payload_limit as usize,
+            None
+        )
+    );
+    let minimum = usize::from(b.config.connection.minimum_send_budget());
+    assert_eq!(
+        b.enable_output_reservations_with_packet_bytes(2, minimum - 1, None),
+        Err(Error::InvalidArgument.into())
+    );
+    b.enable_output_reservations_with_packet_bytes(2, 1100, None)
+        .unwrap();
+    assert_eq!(b.buffer_bytes(), before + charge);
+    b.enable_output_reservations_with_packet_bytes(2, 1100, None)
+        .unwrap();
+    assert_eq!(b.buffer_bytes(), before + charge);
+    for other in [1099, usize::MAX] {
+        assert_eq!(
+            b.enable_output_reservations_with_packet_bytes(2, other, None),
+            Err(Error::InvalidArgument.into())
+        );
+    }
+    assert_eq!(
+        b.enable_output_reservations_with_capacity(2),
+        Err(Error::InvalidArgument.into())
+    );
+    b.write(server, &[7; 3000]).unwrap();
+    let mut bytes = [0; 2048];
+    let (mut sent, mut full) = (0, false);
+    while let (poll, Some(attempt)) = b.poll_reserved_transmit(2, &mut bytes, 1).unwrap() {
+        let packet = poll.packet.unwrap();
+        assert!(packet.len <= 1100);
+        let segment = wire::parse(packet.ip, &bytes[..packet.len]).unwrap();
+        full |= segment.payload.len() == 1000;
+        sent += segment.payload.len();
+        assert!(b.accept_transmit(2, attempt).unwrap());
+    }
+    assert!(full && sent == 3000);
+}
+
 #[test]
 fn pool_held_old_timer_is_removed_and_restored_without_blocking_other_due_timer() {
     let (mut a, _, [held, other], _) = two_flows();

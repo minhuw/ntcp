@@ -1061,6 +1061,19 @@ fn the_buffer_budget_admits_exactly_its_connections() {
     let budget = config(address, false, 1)
         .buffer_budget(3, &wires(PacketLayer::Ip).0)
         .unwrap();
+    // Nine output reservations, eight connection slots and the stateless
+    // lane, each charged the TCP packet of one IP packet of the MTU rather
+    // than one of the largest IPv4 packet.
+    let plain = config(address, false, 1);
+    let reservations = plain.buffer_budget(0, &wires(PacketLayer::Ip).0);
+    assert_eq!(
+        reservations,
+        plain.tcp.output_reservations_charge(9, 1480, None)
+    );
+    assert_eq!(
+        plain.tcp.output_reservations_charge(9, usize::MAX, None),
+        reservations.map(|n| n + 9 * (65535 - 1480))
+    );
     let admitted = |budget: usize| {
         let mut config = config(address, false, 1);
         config.tcp.max_buffer_bytes = budget;

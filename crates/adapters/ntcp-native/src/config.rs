@@ -82,8 +82,9 @@ impl NetworkConfig {
     /// The `tcp.max_buffer_bytes` a Network with this configuration on
     /// backend `io` needs to hold `connections` connections at once: its
     /// output reservations, one per connection slot and one for stateless
-    /// replies, and each connection's buffers and timestamp records. None
-    /// if it overflows.
+    /// replies, each holding the TCP packet of one IP packet of the MTU,
+    /// and each connection's buffers and timestamp records. None if it
+    /// overflows.
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the
@@ -95,10 +96,18 @@ impl NetworkConfig {
         self.tcp
             .connection_charge(self.tx_timestamp_phases, self.rx_timestamp_ranges)?
             .checked_mul(connections)?
-            .checked_add(
-                self.tcp
-                    .output_reservations_charge(reservations, self.gso(io))?,
-            )
+            .checked_add(self.tcp.output_reservations_charge(
+                reservations,
+                self.reservation_packet_bytes(),
+                self.gso(io),
+            )?)
+    }
+    // The TCP packet an output reservation holds: the driver polls each
+    // into its frame after the link and IP headers, so no packet it
+    // encodes, the first segment of an aggregate included, is larger. An
+    // aggregate's further payload has its own room (`gso`).
+    pub(crate) fn reservation_packet_bytes(&self) -> usize {
+        self.mtu as usize - if self.local_address.is_ipv4() { 20 } else { 40 }
     }
     // The output reservations of a backend that segments TCP aggregates, as
     // Linux hands a TSO device skbs of many segments whenever the device

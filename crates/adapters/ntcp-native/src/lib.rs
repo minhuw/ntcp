@@ -642,10 +642,11 @@ impl<P: PacketIo> Network<P> {
             )?;
         host.attach(&mut endpoint)?;
         let gso = config.gso(&io);
-        match gso {
-            Some(gso) => endpoint.enable_output_reservations_with_gso(owners, gso)?,
-            None => endpoint.enable_output_reservations_with_capacity(owners)?,
-        }
+        endpoint.enable_output_reservations_with_packet_bytes(
+            owners,
+            config.reservation_packet_bytes(),
+            gso,
+        )?;
         let segmentation = gso.and(io.tcp_segmentation_capabilities());
         // The largest frame an aggregate fills: the backend's, within the
         // largest IP packet of the local family.
