@@ -591,6 +591,23 @@ pub(crate) struct ReceiveOutcome {
     pub out_of_order: bool,
 }
 
+// `len` zeroed elements, allocated as zeroed memory: their pages are not
+// touched until used.
+//
+// SAFETY: the all-zero bit pattern must be a valid `T`.
+unsafe fn zeroed_vec<T>(len: usize) -> Result<Vec<T>, ()> {
+    let layout = Layout::array::<T>(len).map_err(|_| ())?;
+    if layout.size() == 0 {
+        return Ok(Vec::new());
+    }
+    let pointer = unsafe { alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err(());
+    }
+    // Zeroed elements are valid (caller); the allocation uses Vec's exact layout.
+    Ok(unsafe { Vec::from_raw_parts(pointer.cast(), len, len) })
+}
+
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
     // A set presence bit implies the payload byte in that slot was initialized.
@@ -637,21 +654,9 @@ impl ReceiveBuffer {
         data.try_reserve_exact(capacity).map_err(|_| ())?;
         // MaybeUninit elements need no initialization, and capacity was reserved.
         unsafe { data.set_len(capacity) };
-        let metadata_len = capacity.div_ceil(4);
-        let metadata_layout = Layout::array::<u8>(metadata_len).map_err(|_| ())?;
-        let metadata = unsafe {
-            let pointer = alloc_zeroed(metadata_layout);
-            if pointer.is_null() {
-                return Err(());
-            }
-            // Zeroed bytes clear every bit; the allocation uses Vec's exact layout.
-            Vec::from_raw_parts(pointer, metadata_len, metadata_len)
-        };
-        let mut report_pending = Vec::new();
-        report_pending
-            .try_reserve_exact(capacity.div_ceil(8))
-            .map_err(|_| ())?;
-        report_pending.resize(capacity.div_ceil(8), 0);
+        // Zeroed bytes clear every bit. SAFETY: zero is a valid u8.
+        let metadata = unsafe { zeroed_vec(capacity.div_ceil(4))? };
+        let report_pending = unsafe { zeroed_vec(capacity.div_ceil(8))? };
         Ok(Self {
             data,
             pushed: false,
