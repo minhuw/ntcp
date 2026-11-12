@@ -1,8 +1,10 @@
-// The local ports a Network's opens take: an explicit port, or one of the
-// ephemeral range, is refused while a connection or listener uses it, and
-// taken again once the slot that used it is freed; an open finds no slot
-// in a full table until one is freed. Two Networks over an in-memory IP
-// wire.
+// The local ports a Network's opens take. An ephemeral port is shared by
+// active opens to distinct destinations, each 4-tuple once among the
+// connections and TIME-WAIT records, as Linux's __inet_hash_connect shares
+// it; a port a listener or an explicit open took is no ephemeral open's,
+// and an explicit port is refused while anything uses it. Ports run out per
+// destination; an open finds no slot in a full table until one is freed.
+// Two Networks over an in-memory IP wire.
 use ntcp::EndpointError;
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use ntcp_native::*;
@@ -55,21 +57,35 @@ fn network(
     ports: RangeInclusive<u16>,
     max_time_wait: Option<usize>,
 ) -> Network<Wire> {
+    built(side, incoming, outgoing, [side; 32], |config| {
+        if let Some(records) = max_time_wait {
+            config.tcp.max_time_wait = records;
+        }
+        config.ephemeral_ports = ports;
+    })
+}
+
+// A Network of `side` with `secret`, its configuration adjusted.
+fn built(
+    side: u8,
+    incoming: &Queue,
+    outgoing: &Queue,
+    secret: [u8; 32],
+    adjust: impl FnOnce(&mut NetworkConfig),
+) -> Network<Wire> {
     let mut config = NetworkConfig::new(address(side), 1500);
-    if let Some(records) = max_time_wait {
-        config.tcp.max_time_wait = records;
-    }
     config.tcp.max_connections = 8;
     config.tcp.max_listeners = 2;
     config.tcp.connection.send_capacity = 2048;
     config.tcp.connection.receive_capacity = 8192;
-    config.ephemeral_ports = ports;
+    adjust(&mut config);
     let wire = Wire {
         incoming: incoming.clone(),
         outgoing: outgoing.clone(),
     };
-    config.tcp.max_buffer_bytes = config.buffer_budget(8, &wire).unwrap();
-    Network::new(config, wire, [side; 32], 0).unwrap()
+    let connections = config.tcp.max_connections;
+    config.tcp.max_buffer_bytes = config.buffer_budget(connections, &wire).unwrap();
+    Network::new(config, wire, secret, 0).unwrap()
 }
 
 struct Pair {
@@ -112,9 +128,12 @@ impl Pair {
         }
     }
     fn accepted(&mut self) -> ConnId {
+        self.accepted_from(self.listener)
+    }
+    fn accepted_from(&mut self, listener: ListenerId) -> ConnId {
         for _ in 0..100 {
             self.step();
-            if let Ok(server) = self.server.accept(self.listener) {
+            if let Ok(server) = self.server.accept(listener) {
                 return server;
             }
         }
@@ -157,11 +176,14 @@ fn exhausted<T: std::fmt::Debug>(result: Result<T>) -> bool {
     matches!(result, Err(Error::Capacity))
 }
 
-// A closed connection's port stays taken through TIME-WAIT, after its
+// A closed connection's tuple stays taken through TIME-WAIT, after its
 // released slot was freed into the endpoint's TIME-WAIT record, and is free
-// after.
+// after: no open to its destination takes the port, an explicit one none,
+// while an ephemeral open to another destination does. A TIME-WAIT record
+// is never reused by an active open, as Linux's tcp_tw_reuse allows only
+// over loopback by default.
 #[test]
-fn a_closed_connections_port_is_taken_until_its_time_wait_ends() {
+fn a_closed_connections_tuple_is_taken_until_its_time_wait_ends() {
     let mut pair = Pair::new(40000..=40000, 50000..=50000);
     let server_address = SocketAddr::new(address(2), PORT);
     let client = pair.client.connect(server_address).unwrap();
@@ -191,6 +213,13 @@ fn a_closed_connections_port_is_taken_until_its_time_wait_ends() {
         pair.client.connect_from(server_address, Some(40000))
     ));
     assert!(exhausted(pair.client.connect(server_address)));
+    let other = SocketAddr::new(address(2), PORT + 1);
+    let second = pair.server.listen(PORT + 1, 8).unwrap();
+    let elsewhere = pair.client.connect(other).unwrap();
+    assert_eq!(local_port(&pair.client, elsewhere), 40000);
+    pair.accepted_from(second);
+    pair.client.abort(elsewhere).unwrap();
+    pair.steps(4);
     pair.reclaim(client);
     assert_eq!(pair.client.counters().time_wait_connections, 0);
     let next = pair.client.connect(server_address).unwrap();
@@ -198,38 +227,59 @@ fn a_closed_connections_port_is_taken_until_its_time_wait_ends() {
     pair.accepted();
 }
 
-// An aborted connection's port, the first of a wrapping ephemeral range,
-// is the one the next open takes once it is reclaimed.
+// Ports run out per destination: one destination takes each port of the
+// range once and then none, while another destination takes them all
+// again; an aborted connection's port is its destination's again once it
+// is reclaimed.
 #[test]
-fn an_exhausted_ephemeral_range_gives_back_reclaimed_ports_in_turn() {
+fn an_ephemeral_range_runs_out_per_destination() {
     let mut pair = Pair::new(40000..=40003, 50000..=50000);
-    let server_address = SocketAddr::new(address(2), PORT);
+    let second = pair.server.listen(PORT + 1, 8).unwrap();
     let mut opened = Vec::new();
-    for port in 40000..=40003 {
-        let id = pair.client.connect(server_address).unwrap();
-        assert_eq!(local_port(&pair.client, id), port);
-        opened.push(id);
+    for to in [PORT, PORT + 1] {
+        let server_address = SocketAddr::new(address(2), to);
+        let mut ports: Vec<u16> = (0..4)
+            .map(|_| {
+                let id = pair.client.connect(server_address).unwrap();
+                opened.push(id);
+                local_port(&pair.client, id)
+            })
+            .collect();
+        // Slots remain; this destination's ports do not.
+        assert!(exhausted(pair.client.connect(server_address)));
+        ports.sort_unstable();
+        assert_eq!(ports, [40000, 40001, 40002, 40003]);
     }
-    // Slots remain; ports do not.
-    assert!(exhausted(pair.client.connect(server_address)));
     pair.steps(4);
+    assert!(pair.server.accept(pair.listener).is_ok());
+    assert!(pair.server.accept(second).is_ok());
+    let first = SocketAddr::new(address(2), PORT);
+    let freed = local_port(&pair.client, opened[1]);
     pair.client.abort(opened[1]).unwrap();
     pair.steps(4);
-    assert!(exhausted(pair.client.connect(server_address)));
+    assert!(exhausted(pair.client.connect(first)));
     pair.reclaim(opened[1]);
-    let next = pair.client.connect(server_address).unwrap();
-    assert_eq!(local_port(&pair.client, next), 40001);
-    assert!(exhausted(pair.client.connect(server_address)));
+    let next = pair.client.connect(first).unwrap();
+    assert_eq!(local_port(&pair.client, next), freed);
+    assert!(exhausted(pair.client.connect(first)));
+    assert!(exhausted(
+        pair.client.connect(SocketAddr::new(address(2), PORT + 1))
+    ));
 }
 
-// A listener's port is skipped by ephemeral opens and refused to explicit
-// ones until the listener's slot is freed, as is a port an explicit open
-// took, whatever the peer.
+// The bind conflict rules, as Linux's bind bucket keeps them. A port a
+// listener or an explicit open took (bind(), fastreuse >= 0) is no
+// ephemeral open's, for any peer, and is refused to explicit opens. A port
+// an ephemeral open took is shared by ephemeral opens to other
+// destinations and refused to explicit ones, a bind() without
+// SO_REUSEADDR, which the native API has not. A closing listener holds its
+// port until a drive frees its slot.
 #[test]
 fn listeners_and_explicit_opens_take_their_ports() {
     let mut pair = Pair::new(40000..=40000, PORT..=PORT + 2);
     let client_address = SocketAddr::new(address(1), 7000);
     let other_client = SocketAddr::new(address(1), 7001);
+    let third_client = SocketAddr::new(address(1), 7002);
     assert!(in_use(pair.server.connect_from(client_address, Some(PORT))));
     assert!(matches!(
         pair.server.connect_from(client_address, Some(0)),
@@ -243,14 +293,22 @@ fn listeners_and_explicit_opens_take_their_ports() {
     assert!(in_use(
         pair.server.connect_from(other_client, Some(PORT + 1))
     ));
-    let ephemeral = pair.server.connect(client_address).unwrap();
-    assert_eq!(local_port(&pair.server, ephemeral), PORT + 2);
-    assert!(exhausted(pair.server.connect(other_client)));
-    // A closing listener holds its port until a drive frees its slot.
+    // Neither the listener's port nor the explicit one is ephemeral; the
+    // third is, for each destination once.
+    for peer in [client_address, other_client, third_client] {
+        let ephemeral = pair.server.connect(peer).unwrap();
+        assert_eq!(local_port(&pair.server, ephemeral), PORT + 2);
+        assert!(exhausted(pair.server.connect(peer)));
+    }
+    assert!(in_use(pair.server.connect_from(
+        SocketAddr::new(address(1), 7003),
+        Some(PORT + 2)
+    )));
     pair.server.close_listener(pair.listener).unwrap();
     assert!(in_use(pair.server.connect_from(client_address, Some(PORT))));
+    assert!(exhausted(pair.server.connect(client_address)));
     pair.step();
-    let reused = pair.server.connect(other_client).unwrap();
+    let reused = pair.server.connect(client_address).unwrap();
     assert_eq!(local_port(&pair.server, reused), PORT);
 }
 
@@ -325,7 +383,9 @@ fn a_full_table_takes_again_only_the_slots_freed() {
 // complete within one TIME-WAIT period.
 #[test]
 fn server_closed_connections_beyond_the_slots_within_one_time_wait() {
-    let mut pair = Pair::new(40000..=40100, 50000..=50000);
+    // Ports enough that the client takes no tuple in the server's
+    // TIME-WAIT, which would reopen it.
+    let mut pair = Pair::new(40000..=50000, 50000..=50000);
     let server_address = SocketAddr::new(address(2), PORT);
     for n in 1..=32 {
         let client = pair.client.connect(server_address).unwrap();
@@ -394,4 +454,124 @@ fn server_closed_connections_past_the_records_overflow() {
             "{n}"
         );
     }
+}
+
+// Each destination starts at an offset of its own, RFC 6056 Algorithm 4's
+// keyed hash of the addresses and the remote port, under a key the
+// Network derives from its secret: 16 destinations take ports of the
+// default range (Linux's ip_local_port_range) in no one sequence, the same
+// for the same secret and others for another.
+#[test]
+fn each_destination_starts_at_its_own_secret_offset() {
+    let firsts = |secret: u8| -> Vec<u16> {
+        let (a, b) = (Queue::default(), Queue::default());
+        let mut client = built(1, &a, &b, [secret; 32], |config| {
+            config.tcp.max_connections = 16;
+        });
+        assert_eq!(client.config().ephemeral_ports, 32768..=60999);
+        (0..16)
+            .map(|k| {
+                let id = client
+                    .connect(SocketAddr::new(address(2), PORT + k))
+                    .unwrap();
+                local_port(&client, id)
+            })
+            .collect()
+    };
+    let ports = firsts(1);
+    assert!(ports.iter().all(|port| (32768..=60999).contains(port)));
+    assert!(ports.windows(2).any(|w| w[0] != w[1]));
+    // Not one counter's run either, as a global next_ephemeral gives.
+    assert!(!ports.windows(2).all(|w| w[1].wrapping_sub(w[0]) <= 16));
+    assert_eq!(ports, firsts(1));
+    let other = firsts(2);
+    assert!(
+        ports.iter().zip(&other).filter(|(a, b)| a == b).count() < 4,
+        "{ports:?} {other:?}"
+    );
+}
+
+// The proxy case: a client that opens and closes connections to 16
+// destinations from the default range keeps connecting while 17024 of its
+// connections are in TIME-WAIT, past the 16384 NetworkConfig::new's former
+// range held when a port was exclusive whatever the peer. The records
+// share ports across destinations: fewer ports than records.
+#[test]
+fn a_proxy_keeps_connecting_with_17k_connections_in_time_wait() {
+    const DESTINATIONS: u16 = 16;
+    const BATCH: usize = 64;
+    const RECORDS: usize = 17_024;
+    let (a, b) = (Queue::default(), Queue::default());
+    let mut client = built(1, &a, &b, [1; 32], |config| {
+        config.tcp.max_connections = 2 * BATCH;
+        config.tcp.max_time_wait = 2 * RECORDS;
+    });
+    let mut server = built(2, &b, &a, [2; 32], |config| {
+        config.tcp.max_connections = 2 * BATCH;
+        config.tcp.max_listeners = usize::from(DESTINATIONS);
+    });
+    let listeners: Vec<ListenerId> = (0..DESTINATIONS)
+        .map(|k| server.listen(PORT + k, BATCH).unwrap())
+        .collect();
+    let mut now = 0;
+    let mut step = |client: &mut Network<Wire>, server: &mut Network<Wire>| {
+        now += 200;
+        client.drive(now, BUDGET).unwrap();
+        server.drive(now, BUDGET).unwrap();
+        drain(client);
+        drain(server);
+    };
+    let mut ports = std::collections::HashSet::new();
+    let mut opened = 0;
+    while opened < RECORDS {
+        let clients: Vec<ConnId> = (0..BATCH)
+            .map(|i| {
+                let k = (opened + i) as u16 % DESTINATIONS;
+                let id = client
+                    .connect(SocketAddr::new(address(2), PORT + k))
+                    .unwrap_or_else(|e| panic!("connect {}: {e:?}", opened + i));
+                ports.insert(local_port(&client, id));
+                id
+            })
+            .collect();
+        let mut servers = Vec::new();
+        for _ in 0..200 {
+            step(&mut client, &mut server);
+            for &listener in &listeners {
+                while let Ok(id) = server.accept(listener) {
+                    servers.push(id);
+                }
+            }
+            if servers.len() == BATCH {
+                break;
+            }
+        }
+        assert_eq!(servers.len(), BATCH);
+        for &id in &clients {
+            client.close(id).unwrap();
+        }
+        let mut closed = [false; BATCH];
+        for _ in 0..200 {
+            step(&mut client, &mut server);
+            for (i, &id) in servers.iter().enumerate() {
+                if !closed[i] && matches!(server.try_read(id, &mut [0; 8]), Ok(ReadOutcome::Eof)) {
+                    server.close(id).unwrap();
+                    closed[i] = true;
+                }
+            }
+            if client.counters().time_wait_connections == opened + BATCH
+                && clients
+                    .iter()
+                    .all(|&id| matches!(client.connection_info(id), Err(Error::InvalidHandle)))
+            {
+                break;
+            }
+        }
+        opened += BATCH;
+        assert_eq!(client.counters().time_wait_connections, opened);
+    }
+    // All within one TIME-WAIT, none reopened or expired.
+    assert!(now < client.config().tcp.connection.time_wait_us);
+    assert_eq!(client.counters().time_wait_overflows, 0);
+    assert!(ports.len() < RECORDS, "{} ports", ports.len());
 }

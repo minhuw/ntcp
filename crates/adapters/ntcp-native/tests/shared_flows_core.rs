@@ -455,6 +455,64 @@ fn active_opens_avoid_every_members_listening_ports() {
     ));
 }
 
+// A member's ephemeral ports are shared across destinations as a single
+// Network's are, within its own flows: to each destination it takes
+// exactly the ports of the range whose flow to it the member owns, but no
+// port another member listens on, each once; so its opens to several
+// destinations outnumber the range.
+#[test]
+fn a_members_ports_are_shared_across_destinations_within_its_flows() {
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: vec![0, 1],
+    };
+    let flows = SharedFlows::new(ownership, limits(2)).unwrap();
+    // Room for every connection's output held on a resolution.
+    let limits = SharedNeighborLimits {
+        members: 2,
+        entries: 8,
+        held: 2 * 65,
+        replies: 4,
+    };
+    let table = SharedNeighbors::new(PORT_MAC, SECOND, limits).unwrap();
+    let range = 50000..=50015;
+    let build = |k: usize, connections: usize| {
+        let range = range.clone();
+        Station::new(|port| {
+            let mut config = config(SHARED, PORT_MAC);
+            config.ephemeral_ports = range;
+            config.tcp.max_connections = connections;
+            config.tcp.max_buffer_bytes = config.buffer_budget(connections, &port).unwrap();
+            Network::with_shared_flows(config, port, [7; 32], 0, Some(&table), &flows, k).unwrap()
+        })
+    };
+    let mut listening = build(1, 4);
+    let mut opening = build(0, 64);
+    let listened = 50003;
+    listening.network.listen(listened, 1).unwrap();
+    let mut opened = 0;
+    for d in 0..4 {
+        let remote = SocketAddrV4::new(PEER, PEER_SERVICE + d);
+        let owned: Vec<u16> = range
+            .clone()
+            .filter(|&p| p != listened)
+            .filter(|&p| flows.owner(SocketAddrV4::new(SHARED, p), remote) == Some(0))
+            .collect();
+        let mut taken = Vec::new();
+        loop {
+            match opening.network.connect(SocketAddr::V4(remote)) {
+                Ok(id) => taken.push(opening.network.connection_info(id).unwrap().local.port()),
+                Err(Error::Capacity) => break,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        taken.sort_unstable();
+        assert_eq!(taken, owned, "destination {d}");
+        opened += taken.len();
+    }
+    assert!(opened > range.len(), "{opened}");
+}
+
 fn port() -> Port {
     Port {
         incoming: Queue::default(),

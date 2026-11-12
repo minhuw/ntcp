@@ -1467,7 +1467,7 @@ fn control_networks_sharing_an_address_without_flows_reset_each_others_segments(
 // take its own tagged ports, and the port's rule for the member steers the
 // replies to its queue; every other flow is hashed as RSS hashes it.
 
-// The IANA dynamic range, the default ephemeral ports.
+// The IANA dynamic range, 49152-65535.
 const TAG: u16 = 0xc000;
 
 fn tagged_flows(members: usize) -> SharedFlows {
@@ -2257,11 +2257,11 @@ fn a_group_of_one_opens_and_accepts_as_a_lone_network() {
     let n = 16;
     let mut lan = lone();
     let (lone_ports, lone_segments) = both_ways(&mut lan, n);
-    let first = *NetworkConfig::new(IpAddr::V4(ADDRESS), 1500)
-        .ephemeral_ports
-        .start();
-    let expected: Vec<u16> = (first..).take(n).collect();
-    assert_eq!(lone_ports, expected);
+    // Ports of the range, one destination's each once.
+    let range = NetworkConfig::new(IpAddr::V4(ADDRESS), 1500).ephemeral_ports;
+    assert!(lone_ports.iter().all(|port| range.contains(port)));
+    let distinct: std::collections::HashSet<_> = lone_ports.iter().collect();
+    assert_eq!(distinct.len(), n);
     let mut lan = group_of_one();
     let (ports, segments) = both_ways(&mut lan, n);
     assert_eq!(ports, lone_ports);

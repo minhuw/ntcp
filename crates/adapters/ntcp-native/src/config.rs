@@ -37,6 +37,10 @@ pub struct NetworkConfig {
     pub mtu: u32,
     pub tcp: EndpointConfig,
     pub link: Link,
+    /// The local ports active opens without one choose from (Linux's
+    /// ip_local_port_range). A port is shared by opens to distinct
+    /// destinations, so the range bounds the connections, TIME-WAIT
+    /// included, to each destination, not their number.
     pub ephemeral_ports: RangeInclusive<u16>,
     pub tx_timestamp_phases: usize,
     pub rx_timestamp_ranges: usize,
@@ -133,7 +137,8 @@ impl NetworkConfig {
     ///   (`tcp.reuse_time_wait`), as Linux always lets it
     ///   (tcp_timewait_state_process, TCP_TW_SYN). An active open still
     ///   never takes a tuple in TIME-WAIT, as Linux's tcp_tw_reuse allows
-    ///   only over loopback by default.
+    ///   only over loopback by default;
+    /// - ephemeral ports 32768 to 60999 (ip_local_port_range).
     ///
     /// Each remains a field of `tcp` or `tcp.connection` to change.
     pub fn new(local_address: IpAddr, mtu: u32) -> Self {
@@ -163,8 +168,9 @@ impl NetworkConfig {
             mtu,
             tcp,
             link: Link::Ip,
-            // IANA's dynamic/private port range; callers partition it per worker.
-            ephemeral_ports: 49152..=65535,
+            // Linux's ip_local_port_range, not RFC 6056's 1024-65535 (an
+            // exception in duvet/rfc6056-todos.toml).
+            ephemeral_ports: 32768..=60999,
             tx_timestamp_phases: 0,
             rx_timestamp_ranges: 0,
             timestamp_clock_capacity: 2,

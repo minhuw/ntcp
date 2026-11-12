@@ -28,6 +28,8 @@ static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 struct Connection {
     core: ntcp::ConnectionId,
     local: SocketAddr,
+    // How the connection's local port was taken (`PortUsers`).
+    binding: Binding,
     peer: SocketAddr,
     state: State,
     reason: Option<CloseReason>,
@@ -67,7 +69,11 @@ pub struct Network<P: PacketIo> {
     host: Host,
     ingress: IngressContext,
     now: Instant,
-    next_port: u16,
+    // The order active opens try ephemeral ports in (RFC 6056 Algorithm 4),
+    // and for a member of tagged flows its own tagged ports of
+    // `ephemeral_ports`, ascending, the only ones it tries.
+    ephemeral: ntcp::EphemeralPorts,
+    tagged_ports: Vec<u16>,
     // The local port of every occupied slot of `connections` and
     // `listeners`: a port counts from install or listen until its slot is
     // freed, a released connection's until the endpoint reclaims it, so
@@ -245,15 +251,27 @@ impl SlotQueue {
         self.order.is_empty()
     }
 }
-// The number of slots using each local port, as Linux's bind hash keeps a
-// bucket per port with its owners: an open finds whether a port is taken
-// without a pass over the slots. A counter per port, not a set of ports,
-// because the connections a listener accepts share its port. Indexed by
-// the port, not hashed: every port has its counter, allocated whole when
-// the network is built (256 KiB), so taking one never allocates or
-// rehashes.
+// How a slot came by its local port, as Linux's bind bucket tells the
+// owners bind() gave a port (fastreuse >= 0) from the connections connect()
+// chose it for (fastreuse -1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Binding {
+    // A listener, a connection it accepted, or an open from an explicit
+    // local port: no other open takes the port while it is there.
+    Bound,
+    // An active open given an ephemeral port: other active opens share the
+    // port, to other destinations.
+    Ephemeral,
+}
+// The number of slots using each local port, by binding, as Linux's bind
+// hash keeps a bucket per port with its owners: an open finds whether a
+// port is taken without a pass over the slots. A counter per port, not a
+// set of ports, because the connections a listener accepts share its port,
+// as do active opens to distinct destinations. Indexed by the port, not
+// hashed: every port has its counters, allocated whole when the network is
+// built (512 KiB), so taking one never allocates or rehashes.
 struct PortUsers {
-    users: Vec<u32>,
+    users: Vec<[u32; 2]>,
 }
 impl PortUsers {
     // Room for `slots` users of one port.
@@ -264,17 +282,17 @@ impl PortUsers {
         users
             .try_reserve_exact(ports)
             .map_err(|_| Error::Capacity)?;
-        users.resize(ports, 0);
+        users.resize(ports, [0; 2]);
         Ok(Self { users })
     }
-    fn take(&mut self, port: u16) {
-        self.users[usize::from(port)] += 1;
+    fn take(&mut self, port: u16, binding: Binding) {
+        self.users[usize::from(port)][binding as usize] += 1;
     }
-    fn give(&mut self, port: u16) {
-        self.users[usize::from(port)] -= 1;
+    fn give(&mut self, port: u16, binding: Binding) {
+        self.users[usize::from(port)][binding as usize] -= 1;
     }
-    fn users(&self, port: u16) -> u32 {
-        self.users[usize::from(port)]
+    fn users(&self, port: u16, binding: Binding) -> u32 {
+        self.users[usize::from(port)][binding as usize]
     }
 }
 fn bytes(capacity: usize) -> Result<Vec<u8>> {
@@ -284,6 +302,14 @@ fn bytes(capacity: usize) -> Result<Vec<u8>> {
         .map_err(|_| Error::Capacity)?;
     result.resize(capacity, 0);
     Ok(result)
+}
+
+// `tuple` on the network's one link when an address is link-local.
+fn scoped_tuple(tuple: Tuple, link: path::LinkId) -> ntcp::ScopedTuple {
+    let link_local = [tuple.local.ip(), tuple.remote.ip()]
+        .into_iter()
+        .any(|ip| matches!(ip, std::net::IpAddr::V6(a) if a.is_unicast_link_local()));
+    ntcp::ScopedTuple::new(tuple, link_local.then_some(link)).expect("single-port tuple scope")
 }
 
 // The key of the Host's path cache hash: the TCP secret under its own
@@ -693,7 +719,17 @@ impl<P: PacketIo> Network<P> {
         let ports = PortUsers::new(slots)?;
         let (ready, maintain) = (SlotQueue::new(slots)?, SlotQueue::new(slots)?);
         let stamped = SlotQueue::new(config.tcp.max_connections)?;
-        let next_port = *config.ephemeral_ports.start();
+        let ephemeral = endpoint.ephemeral_ports()?;
+        let mut tagged_ports = Vec::new();
+        if let Some(tagged) = flows.as_ref().and_then(flows::Member::tagged) {
+            let last = *config.ephemeral_ports.end();
+            let mut next = tagged.first_in(config.ephemeral_ports.clone());
+            while let Some(port) = next {
+                tagged_ports.try_reserve(1).map_err(|_| Error::Capacity)?;
+                tagged_ports.push(port);
+                next = port.checked_add(1).and_then(|p| tagged.first_in(p..=last));
+            }
+        }
         Ok(Self {
             config,
             instance,
@@ -702,7 +738,8 @@ impl<P: PacketIo> Network<P> {
             host,
             ingress,
             now,
-            next_port,
+            ephemeral,
+            tagged_ports,
             ports,
             connections,
             connection_map,
@@ -968,13 +1005,19 @@ impl<P: PacketIo> Network<P> {
     fn free_connection_slot(&self) -> Result<usize> {
         self.free_connections.last().copied().ok_or(Error::Capacity)
     }
-    fn install(&mut self, slot: usize, core: ntcp::ConnectionId) -> Result<ConnId> {
+    fn install(
+        &mut self,
+        slot: usize,
+        core: ntcp::ConnectionId,
+        binding: Binding,
+    ) -> Result<ConnId> {
         let tuple = self.endpoint.tuple(core)?;
         let state = self.endpoint.state(core)?;
         self.connections[slot].generation += 1;
         self.connections[slot].value = Some(Connection {
             core,
             local: tuple.local,
+            binding,
             peer: tuple.remote,
             state,
             reason: None,
@@ -993,7 +1036,7 @@ impl<P: PacketIo> Network<P> {
         let taken = self.free_connections.pop();
         debug_assert_eq!(taken, Some(slot));
         occupy(&mut self.live_connections, slot);
-        self.ports.take(tuple.local.port());
+        self.ports.take(tuple.local.port(), binding);
         self.connection_map.insert(core, slot);
         self.touch(slot);
         self.check_live();
@@ -1011,87 +1054,101 @@ impl<P: PacketIo> Network<P> {
             self.maintain.push(slot);
         }
     }
-    fn port_in_use(&self, port: u16) -> bool {
-        // The full-scan form of `ports`, for debug builds.
-        debug_assert_eq!(
-            self.ports.users(port) as usize,
-            self.connections
-                .iter()
-                .filter_map(|s| s.value.as_ref())
-                .filter(|c| c.local.port() == port)
-                .count()
-                + self
-                    .listeners
+    // The full-scan form of `ports`, for debug builds.
+    fn check_port(&self, port: u16) {
+        for binding in [Binding::Bound, Binding::Ephemeral] {
+            debug_assert_eq!(
+                self.ports.users(port, binding) as usize,
+                self.connections
                     .iter()
                     .filter_map(|s| s.value.as_ref())
-                    .filter(|l| l.port == port)
+                    .filter(|c| c.local.port() == port && c.binding == binding)
                     .count()
-        );
-        // A closed connection's slot is freed once its TIME-WAIT is a record
-        // of the endpoint's; the port stays taken until that ends.
-        self.ports.users(port) != 0 || self.endpoint.time_wait_holds_port(port)
+                    + if binding == Binding::Bound {
+                        self.listeners
+                            .iter()
+                            .filter_map(|s| s.value.as_ref())
+                            .filter(|l| l.port == port)
+                            .count()
+                    } else {
+                        0
+                    }
+            );
+        }
+    }
+    // Whether an open from explicit local `port` is refused: any slot uses
+    // the port, or a TIME-WAIT record. A closed connection's slot is freed
+    // once its TIME-WAIT is a record of the endpoint's; the port stays taken
+    // until that ends. So Linux refuses a bind() without SO_REUSEADDR to a
+    // port of its bind bucket's owners, timewait sockets included
+    // (inet_csk_bind_conflict); the native API has no SO_REUSEADDR.
+    fn port_in_use(&self, port: u16) -> bool {
+        self.check_port(port);
+        self.ports.users(port, Binding::Bound) != 0
+            || self.ports.users(port, Binding::Ephemeral) != 0
+            || self.endpoint.time_wait_holds_port(port)
     }
     fn scoped(&self, tuple: Tuple) -> ntcp::ScopedTuple {
-        let link_local = [tuple.local.ip(), tuple.remote.ip()]
-            .into_iter()
-            .any(|ip| matches!(ip, std::net::IpAddr::V6(a) if a.is_unicast_link_local()));
-        ntcp::ScopedTuple::new(tuple, link_local.then_some(self.ingress.link()))
-            .expect("single-port tuple scope")
+        scoped_tuple(tuple, self.ingress.link())
     }
+    //= https://www.rfc-editor.org/rfc/rfc6056#section-3.3.4
+    //# The array "table[]" assures that successive transport-protocol
+    //# instances with the same remote endpoint will use increasing ephemeral
+    //# port numbers.
+    // An ephemeral port for an open to `peer`, in the order RFC 6056
+    // Algorithm 4 tries them (`EphemeralPorts::select`), as Linux's
+    // __inet_hash_connect does: a port is shared by the active opens of
+    // distinct destinations, the 4-tuple unique among connections and
+    // TIME-WAIT records alike (`Endpoint::tuple_in_use`, Linux's
+    // __inet_check_established), and skipped while a listener, a connection
+    // it accepted or an open from an explicit port uses it (a bucket bind()
+    // made, fastreuse >= 0). A TIME-WAIT record of the tuple is not
+    // reused: Linux reuses one only with tcp_tw_reuse, by default for
+    // loopback alone, and these are no loopback opens. Ports run out per
+    // destination, not for the network.
     fn allocate_port(&mut self, peer: SocketAddr) -> Result<u16> {
-        if let Some(tagged) = self.flows.as_ref().and_then(|f| f.tagged()) {
-            return self.allocate_tagged(tagged);
-        }
-        let start = self.next_port;
-        loop {
-            let candidate = self.next_port;
-            self.next_port = if candidate == *self.config.ephemeral_ports.end() {
-                *self.config.ephemeral_ports.start()
-            } else {
-                candidate + 1
-            };
-            // A member of shared flows takes a port whose flow to the peer
-            // it owns, about one candidate in as many as there are members,
-            // and none another member listens on.
-            if self
-                .flows
-                .as_ref()
-                .is_none_or(|f| f.owns(candidate, peer) && !f.listened(candidate))
-                && !self.port_in_use(candidate)
-            {
-                return Ok(candidate);
-            }
-            if self.next_port == start {
-                return Err(Error::Capacity);
-            }
-        }
-    }
-    // A member of tagged flows takes its own tagged ports only, each a port
-    // whose flows it owns, stepping from one to the next by their bits: it
-    // tries no other port of the range. No other member listens on them
-    // (`listen` refuses), so the ports in use here, its own listeners
-    // included, are the only ones it skips.
-    fn allocate_tagged(&mut self, tagged: flows::PortRule) -> Result<u16> {
-        let last = *self.config.ephemeral_ports.end();
-        let first = tagged
-            .first_in(self.config.ephemeral_ports.clone())
-            .ok_or(Error::Capacity)?;
-        let start = tagged.first_in(self.next_port..=last).unwrap_or(first);
-        let mut candidate = start;
-        loop {
-            let next = candidate
-                .checked_add(1)
-                .and_then(|p| tagged.first_in(p..=last))
-                .unwrap_or(first);
-            if !self.port_in_use(candidate) {
-                self.next_port = next;
-                return Ok(candidate);
-            }
-            if next == start {
-                return Err(Error::Capacity);
-            }
-            candidate = next;
-        }
+        self.check_port(*self.config.ephemeral_ports.start());
+        let (local, link) = (self.config.local_address, self.ingress.link());
+        let (endpoint, ports, flows) = (&self.endpoint, &self.ports, &self.flows);
+        let unique = |candidate| {
+            ports.users(candidate, Binding::Bound) == 0
+                && !endpoint.tuple_in_use(scoped_tuple(
+                    Tuple {
+                        local: SocketAddr::new(local, candidate),
+                        remote: peer,
+                    },
+                    link,
+                ))
+        };
+        let selected = if self.tagged_ports.is_empty() {
+            self.ephemeral.select(
+                self.now,
+                local,
+                peer,
+                self.config.ephemeral_ports.clone(),
+                |candidate| {
+                    // A member of shared flows takes a port whose flow to the
+                    // peer it owns, about one candidate in as many as there
+                    // are members, and none another member listens on.
+                    flows
+                        .as_ref()
+                        .is_none_or(|f| f.owns(candidate, peer) && !f.listened(candidate))
+                        && unique(candidate)
+                },
+            )
+        } else {
+            // A member of tagged flows takes its own tagged ports only, each
+            // a port whose flows it owns, in the order Algorithm 4 gives
+            // their indices: it tries no other port of the range. No other
+            // member listens on them (`listen` refuses).
+            let tagged = &self.tagged_ports;
+            self.ephemeral
+                .select_among(self.now, local, peer, tagged.len(), |index| {
+                    unique(tagged[index])
+                })
+                .map(|index| tagged[index])
+        };
+        selected.ok_or(Error::Capacity)
     }
     pub fn connect(&mut self, peer: SocketAddr) -> Result<ConnId> {
         self.connect_from(peer, None)
@@ -1104,7 +1161,7 @@ impl<P: PacketIo> Network<P> {
             ));
         }
         let slot = self.free_connection_slot()?;
-        let port = match local_port {
+        let (port, binding) = match local_port {
             Some(0) => return Err(Error::InvalidConfig("zero local port")),
             Some(p) if self.flows.as_ref().is_some_and(|f| !f.owns(p, peer)) => {
                 return Err(Error::InvalidConfig(
@@ -1112,8 +1169,8 @@ impl<P: PacketIo> Network<P> {
                 ));
             }
             Some(p) if self.port_in_use(p) => return Err(Error::Tcp(EndpointError::AddressInUse)),
-            Some(p) => p,
-            None => self.allocate_port(peer)?,
+            Some(p) => (p, Binding::Bound),
+            None => (self.allocate_port(peer)?, Binding::Ephemeral),
         };
         let local = SocketAddr::new(self.config.local_address, port);
         let options = ntcp::ManagedOpenOptions {
@@ -1146,7 +1203,7 @@ impl<P: PacketIo> Network<P> {
             self.host.collect(&self.endpoint)?;
             return Err(e.into());
         }
-        self.install(slot, core)
+        self.install(slot, core, binding)
     }
     pub fn listen(&mut self, port: u16, backlog: usize) -> Result<ListenerId> {
         self.running()?;
@@ -1179,7 +1236,7 @@ impl<P: PacketIo> Network<P> {
         let taken = self.free_listeners.pop();
         debug_assert_eq!(taken, Some(slot));
         occupy(&mut self.live_listeners, slot);
-        self.ports.take(port);
+        self.ports.take(port, Binding::Bound);
         self.listener_map.insert(core, slot);
         if let Some(flows) = &mut self.flows {
             flows.listen(port);
@@ -1223,7 +1280,7 @@ impl<P: PacketIo> Network<P> {
         if acceptable {
             self.ready.push(self.connections.len() + listener.slot);
         }
-        let id = self.install(slot, core)?;
+        let id = self.install(slot, core, Binding::Bound)?;
         self.refresh_connection(slot);
         Ok(id)
     }

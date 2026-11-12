@@ -1407,7 +1407,7 @@ impl<P: PacketIo> Network<P> {
                         self.listeners[index].value = None;
                         vacate(&mut self.live_listeners, index);
                         give_back(&mut self.free_listeners, &self.listeners, index);
-                        self.ports.give(port);
+                        self.ports.give(port, Binding::Bound);
                         if let Some(flows) = &mut self.flows {
                             flows.unlisten(port);
                         }
@@ -1515,7 +1515,7 @@ impl<P: PacketIo> Network<P> {
                     debug_assert!(c.released);
                     vacate(&mut self.live_connections, index);
                     give_back(&mut self.free_connections, &self.connections, index);
-                    self.ports.give(c.local.port());
+                    self.ports.give(c.local.port(), c.binding);
                 }
             }
         } else {
@@ -1523,7 +1523,7 @@ impl<P: PacketIo> Network<P> {
             while let Some(index) = next_live(&self.live_connections, next) {
                 next = index + 1;
                 let c = self.connections[index].value.as_ref().unwrap();
-                let (core, port) = (c.core, c.local.port());
+                let (core, port, binding) = (c.core, c.local.port(), c.binding);
                 if !c.released || self.endpoint.connection_exists(core) {
                     continue;
                 }
@@ -1531,7 +1531,7 @@ impl<P: PacketIo> Network<P> {
                 self.connections[index].value = None;
                 vacate(&mut self.live_connections, index);
                 give_back(&mut self.free_connections, &self.connections, index);
-                self.ports.give(port);
+                self.ports.give(port, binding);
             }
             if self.holding != 0 {
                 for entry in &mut self.held_flows {
