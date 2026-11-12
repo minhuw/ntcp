@@ -121,7 +121,10 @@
 //   device, which also fills their checksums (`PORT ... tso=`, `METRIC
 //   t<k>_tso`). Elsewhere every segment leaves on its own, as before. Only a
 //   write of more than a segment forms an aggregate: requests of 16 octets
-//   never do, `--request-size 65536` does. The echo checks each request's
+//   never do, `--request-size 65536` does. On mlx5 (`METRIC t<k>_tso_psh`)
+//   the request's pushed short last segment joins its aggregate; elsewhere
+//   it leaves on its own after it, so a request of 2000 octets (two
+//   segments) forms an aggregate on mlx5 only. The echo checks each request's
 //   octets end to end, so a wrongly cut or checksummed aggregate shows as a
 //   differing echo, or as a segment the peer drops and ntcp retransmits.
 
@@ -403,8 +406,10 @@ struct Report {
     handed_off: u64,
     handoffs_received: u64,
     handoffs_dropped: u64,
-    // The queue's largest TCP aggregate, None without TCP segmentation.
-    tso: Option<usize>,
+    // The queue's largest TCP aggregate and whether its aggregates may carry
+    // PSH and FIN (on the last segment: mlx5 only), None without TCP
+    // segmentation.
+    tso: Option<(usize, bool)>,
     // Network::counters at the end.
     counters: ntcp_native::Counters,
     clock: Option<String>,
@@ -977,8 +982,9 @@ fn summarize(reports: &[Report], neighbors: &SharedNeighbors, steering: Option<S
         // and its Network's counters.
         let c = &report.counters;
         println!("METRIC t{index}_tso={}", u8::from(report.tso.is_some()));
-        if let Some(len) = report.tso {
+        if let Some((len, psh)) = report.tso {
             println!("METRIC t{index}_tso_max_aggregate_len={len}");
+            println!("METRIC t{index}_tso_psh={}", u8::from(psh));
         }
         println!("METRIC t{index}_connections={}", report.connections);
         println!("METRIC t{index}_requests={}", report.requests);
@@ -1038,7 +1044,7 @@ fn serve_into(
     // Read once, as the Network reads it when it is built.
     report.tso = queue
         .tcp_segmentation_capabilities()
-        .map(|c| c.max_aggregate_len);
+        .map(|c| (c.max_aggregate_len, c.allow_psh));
     let mut calibration = ClockCalibration::new(CALIBRATION_WINDOW).unwrap();
     let calibrate = match queue.read_clock() {
         Ok(_) => true,

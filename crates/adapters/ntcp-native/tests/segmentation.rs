@@ -695,16 +695,19 @@ fn mlx5() -> TcpSegmentationCapabilities {
     }
 }
 
-// A 16 KiB response written whole on a warm NODELAY connection (as an HTTP
-// server writes it), alone or followed by shutdown: where the backend places PSH and FIN on the last segment it
-// leaves as one aggregate of 12 segments, the pushed short tail (and FIN) the
-// last of them, with nothing scalar beside it. Where it does not, the 11 full
-// segments form the aggregate and the tail leaves alone, as before. (With
-// Nagle the tail waits for the aggregate's ACK either way.)
+// A response written whole on a warm NODELAY connection (as an HTTP server
+// writes it), alone or followed by shutdown. Where the backend places PSH and
+// FIN on the last segment, a 16 KiB response leaves as one aggregate of 12
+// segments, the pushed short tail (and FIN) the last of them, and one of 2000
+// octets as an aggregate of 2, with nothing scalar beside them. Where it does
+// not, the full segments alone form the aggregate (11, or none of a single
+// segment) and the tail leaves on its own, as before. (With Nagle the tail
+// waits for the full segments' ACK either way.)
 #[test]
 fn a_pushed_tail_and_fin_join_the_aggregate_where_the_backend_places_them() {
-    for close in [false, true] {
+    for (size, close) in [(16 * 1024, false), (16 * 1024, true), (2000, false)] {
         for capabilities in [dpdk(), mlx5()] {
+            let case = format!("size={size} close={close} psh={}", capabilities.allow_psh);
             let mut pair = Pair::new(false, true, Some(capabilities));
             pair.a.set_nodelay(pair.client, true).unwrap();
             let layer = pair.wire.layer;
@@ -715,7 +718,7 @@ fn a_pushed_tail_and_fin_join_the_aggregate_where_the_backend_places_them() {
             }
             let aggregates = pair.wire.aggregates.borrow().len();
             let (sent, cut) = (pair.wire.sent.borrow().len(), pair.wire.cut.get());
-            let response = data(16 * 1024);
+            let response = data(size);
             let receipt = pair
                 .a
                 .try_write(pair.client, &response, WriteOptions::default())
@@ -728,20 +731,23 @@ fn a_pushed_tail_and_fin_join_the_aggregate_where_the_backend_places_them() {
                 pair.step();
             }
             let new = pair.wire.aggregates.borrow()[aggregates..].to_vec();
-            assert_eq!(new.len(), 1, "close={close} {capabilities:?}");
-            let (_, tcp, payload) = layout(&new[0].frame, layer);
-            assert_eq!(new[0].segment_payload_len, 1448);
-            let bytes = new[0].frame.len() - payload;
-            let flags = new[0].frame[tcp + 13];
             let scalar = pair.wire.sent.borrow().len() - sent - (pair.wire.cut.get() - cut);
-            if capabilities.allow_psh {
-                assert_eq!(bytes, response.len());
-                assert_eq!(flags, 0x18 | u8::from(close), "close={close}");
-                assert_eq!(scalar, 0, "close={close}");
+            let full = size / 1448;
+            let (bytes, flags, tail) = if capabilities.allow_psh {
+                (size, 0x18 | u8::from(close), 0)
             } else {
-                assert_eq!(bytes, 11 * 1448);
-                assert_eq!(flags, 0x10);
-                assert_eq!(scalar, 1, "close={close}");
+                (full * 1448, 0x10, 1)
+            };
+            if full < 2 && !capabilities.allow_psh {
+                assert!(new.is_empty(), "{case}");
+                assert_eq!(scalar, full + 1, "{case}");
+            } else {
+                assert_eq!(new.len(), 1, "{case}");
+                let (_, tcp, payload) = layout(&new[0].frame, layer);
+                assert_eq!(new[0].segment_payload_len, 1448, "{case}");
+                assert_eq!(new[0].frame.len() - payload, bytes, "{case}");
+                assert_eq!(new[0].frame[tcp + 13], flags, "{case}");
+                assert_eq!(scalar, tail, "{case}");
             }
             let (mut received, mut out, mut eof) = (Vec::new(), vec![0; 65536], false);
             for _ in 0..100 {
