@@ -10052,7 +10052,10 @@ impl Connection {
         // A sequence-bearing control without payload (SYN, SYN-ACK, FIN)
         // keeps its selection-time state, so a held attempt whose next hop
         // never resolves can be withdrawn without a departure.
-        self.control_undo = (reserve
+        // Cleared in place: most outputs keep none, and an empty one built
+        // aside would still be copied in whole.
+        self.control_undo = None;
+        if reserve
             && self.repair_undo.is_none()
             && count == 0
             && flags & (SYN | FIN) != 0
@@ -10062,8 +10065,10 @@ impl Connection {
             && !probe
             && !tlp
             && !keepalive
-            && pmtu_probe.is_none())
-        .then(|| ControlUndo::capture(self));
+            && pmtu_probe.is_none()
+        {
+            self.control_undo = Some(ControlUndo::capture(self));
+        }
         let deferred_fresh = self.repair_undo.as_ref().is_some_and(|u| u.is_fresh());
         self.reserved_retransmit_counts =
             (reserve && (retransmitted || deferred_fresh) && !syn && !probe && !keepalive)
