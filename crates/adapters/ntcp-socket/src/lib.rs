@@ -1933,6 +1933,15 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
         {
             return Err(EINVAL);
         }
+        if (level, name) == (SOL_SOCKET, SO_LINGER) {
+            // Linux checks optlen against struct linger before copying it.
+            if len < 8 {
+                return Err(EINVAL);
+            }
+            let [onoff, linger] = load(p.cast::<[i32; 2]>())?;
+            call(id, Op::SetLinger(onoff, linger))?;
+            return Ok(0);
+        }
         if p.is_null() {
             return Err(EFAULT);
         }
@@ -2014,12 +2023,17 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
             store(len, &(n as u32))?;
             return Ok(0);
         }
-        if level == SOL_SOCKET && matches!(name, 37 | 65) {
+        if level == SOL_SOCKET && matches!(name, 37 | 65 | SO_LINGER) {
             let requested = load(len)?;
             if (requested as i32) < 0 {
                 return Err(EINVAL);
             }
-            let bytes = call(id, Op::Get(level, name))?.bytes;
+            let op = if name == SO_LINGER {
+                Op::GetLinger
+            } else {
+                Op::Get(level, name)
+            };
+            let bytes = call(id, op)?.bytes;
             let n = (requested as usize).min(bytes.len());
             copy_out(p.cast(), &bytes[..n])?;
             store(len, &(n as u32))?;
@@ -2327,6 +2341,83 @@ pub unsafe extern "C" fn ntcp_managed_dup3(fd: i32, new: i32, flags: i32) -> i32
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn so_linger_abi_round_trip_lengths_and_faults() {
+        const CHILD: &str = "NTCP_TEST_LINGER_ABI_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::so_linger_abi_round_trip_lengths_and_faults",
+                        "--test-threads=1"
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
+        let id = call(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
+        let (fd, token) = token(SOCK_CLOEXEC).unwrap();
+        install(fd, token, id).unwrap();
+        let get = |requested: socklen_t| {
+            let mut bytes = [0xa5u8; 16];
+            let mut len = requested;
+            let result = unsafe {
+                ntcp_managed_getsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_LINGER,
+                    bytes.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            };
+            (result, len, bytes)
+        };
+        let set = |value: [i32; 2], len: socklen_t| unsafe {
+            ntcp_managed_setsockopt(fd, SOL_SOCKET, SO_LINGER, value.as_ptr().cast(), len)
+        };
+        let linger = |bytes: [u8; 16]| {
+            [
+                i32::from_ne_bytes(bytes[..4].try_into().unwrap()),
+                i32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+            ]
+        };
+        let (result, len, bytes) = get(8);
+        assert_eq!((result, len, linger(bytes)), (0, 8, [0, 0]));
+        assert_eq!(set([1, 5], 8), 0);
+        // Linux copies min(len, sizeof(struct linger)).
+        let (result, len, bytes) = get(16);
+        assert_eq!((result, len, linger(bytes)), (0, 8, [1, 5]));
+        assert_eq!(bytes[8..], [0xa5; 8]);
+        let (result, len, bytes) = get(4);
+        assert_eq!((result, len), (0, 4));
+        assert_eq!(bytes[..4], 1i32.to_ne_bytes());
+        assert_eq!(bytes[4..], [0xa5; 12]);
+        let (result, len, _) = get(u32::MAX);
+        assert_eq!((result, len, errno()), (-1, u32::MAX, EINVAL));
+        // A short struct is refused before it is read, and changes nothing.
+        assert_eq!(set([0, 9], 7), -1);
+        assert_eq!(errno(), EINVAL);
+        assert_eq!(
+            unsafe { ntcp_managed_setsockopt(fd, SOL_SOCKET, SO_LINGER, ptr::null(), 8) },
+            -1
+        );
+        assert_eq!(errno(), EFAULT);
+        assert_eq!(linger(get(8).2), [1, 5]);
+        // Clearing l_onoff keeps the time; a larger optlen is accepted.
+        assert_eq!(set([0, 9], 12), 0);
+        assert_eq!(linger(get(8).2), [0, 5]);
+        assert_eq!(set([1, -1], 8), 0);
+        assert_eq!(linger(get(8).2), [1, (i64::MAX / 1000) as i32]);
+        assert_eq!(set([1, 0], 8), 0);
+        assert_eq!(linger(get(8).2), [1, 0]);
+        assert_eq!(unsafe { close(fd) }, 0);
+    }
+
     #[cfg(feature = "linux")]
     #[test]
     fn tcp_info_prefix_abi_lengths_and_faults() {

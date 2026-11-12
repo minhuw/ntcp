@@ -2497,7 +2497,7 @@ fn scheduled_last_close_waits_for_its_fin_submission_not_other_owners() {
     };
     assert!(!a.service(&mut close));
     assert!(!a.sockets.contains_key(&clients[0]));
-    assert_eq!(close.closing, Some(cid));
+    assert_eq!(close.closing, Some((cid, LingerWait::Off)));
     a.service_egress().unwrap();
     assert!(a.endpoint.is_output_reserved(cid));
     assert!(!a.service(&mut close));
@@ -2519,6 +2519,197 @@ fn scheduled_last_close_waits_for_its_fin_submission_not_other_owners() {
     assert_eq!(response.recv().unwrap().unwrap().value, 0);
     deliver_scheduled(&mut a, &mut b, &state);
     assert_eq!(b.execute(servers[0], Op::Read(1)).unwrap().value, 0);
+}
+
+// Flags and payload length of each TCP segment handed to the backend and
+// not yet delivered.
+fn sent_segments(state: &Arc<Mutex<State>>) -> Vec<(u8, usize)> {
+    state
+        .lock()
+        .unwrap()
+        .sent
+        .iter()
+        .map(|frame| {
+            let ip = ntcp_ip::parse(datagram(frame), false).unwrap();
+            let tcp = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
+            (tcp.header.flags, tcp.payload.len())
+        })
+        .collect()
+}
+fn close_request(id: u64) -> (Request, mpsc::Receiver<Result<Reply>>) {
+    let (reply, response) = mpsc::sync_channel(1);
+    let request = Request {
+        id,
+        op: Op::Close,
+        reply,
+        deadline: None,
+        send: None,
+        closing: None,
+    };
+    (request, response)
+}
+fn linger_bytes(value: [i32; 2]) -> Vec<u8> {
+    value.iter().flat_map(|v| v.to_ne_bytes()).collect()
+}
+
+#[test]
+fn zero_linger_close_resets_and_discards_unsent_data() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(2);
+    let cid = connection(&a, clients[0]);
+    a.execute(clients[0], Op::SetLinger(1, 0)).unwrap();
+    a.execute(clients[0], Op::Write(vec![5; 20])).unwrap();
+    let (mut close, response) = close_request(clients[0]);
+    assert!(!a.service(&mut close));
+    assert_eq!(close.closing, Some((cid, LingerWait::Off)));
+    assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::Closed));
+    a.service_egress().unwrap();
+    assert!(a.service(&mut close));
+    assert_eq!(response.recv().unwrap().unwrap().value, 0);
+    // The RST alone: the 20 queued bytes and the FIN are never sent.
+    let segments = sent_segments(&state);
+    assert_eq!(segments.len(), 1);
+    assert_ne!(segments[0].0 & ntcp::wire::RST, 0);
+    assert_eq!(segments[0].1, 0);
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(b.execute(servers[0], Op::Read(20)).unwrap_err(), ECONNRESET);
+    assert_eq!(a.endpoint.time_wait_connections(), 0);
+}
+
+#[test]
+fn zero_linger_after_shutdown_resets_but_time_wait_stays() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(2);
+    let cids = clients.map(|id| connection(&a, id));
+    for id in clients {
+        a.execute(id, Op::SetLinger(1, 0)).unwrap();
+        a.execute(id, Op::Shutdown(SHUT_WR)).unwrap();
+    }
+    b.execute(servers[1], Op::Shutdown(SHUT_WR)).unwrap();
+    a.service_egress().unwrap();
+    deliver_scheduled(&mut a, &mut b, &state);
+    a.service_egress().unwrap();
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(a.endpoint.state(cids[0]), Ok(ntcp::State::FinWait2));
+    assert_eq!(a.endpoint.state(cids[1]), Ok(ntcp::State::TimeWait));
+    assert!(state.lock().unwrap().sent.is_empty());
+    let mut responses = Vec::new();
+    for id in clients {
+        let (mut close, response) = close_request(id);
+        assert!(!a.service(&mut close));
+        a.service_egress().unwrap();
+        assert!(a.service(&mut close));
+        responses.push(response);
+    }
+    for response in responses {
+        assert_eq!(response.recv().unwrap().unwrap().value, 0);
+    }
+    // Linux tcp_disconnect resets FIN-WAIT-2; a TIME-WAIT socket is already
+    // CLOSE to tcp_close, so its TIME-WAIT is kept and it sends nothing.
+    let segments = sent_segments(&state);
+    assert_eq!(segments.len(), 1);
+    assert_ne!(segments[0].0 & ntcp::wire::RST, 0);
+    assert_eq!(a.endpoint.state(cids[0]), Ok(ntcp::State::Closed));
+    assert_eq!(a.endpoint.state(cids[1]), Ok(ntcp::State::TimeWait));
+}
+
+#[test]
+fn lingering_close_returns_once_its_fin_is_acknowledged_even_nonblocking() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(2);
+    let cid = connection(&a, clients[0]);
+    assert_ne!(a.sockets[&clients[0]].flags & SOCK_NONBLOCK, 0);
+    a.execute(clients[0], Op::SetLinger(1, 30)).unwrap();
+    a.execute(clients[0], Op::Write(vec![5; 20])).unwrap();
+    let (mut close, response) = close_request(clients[0]);
+    assert!(!a.service(&mut close));
+    assert!(matches!(close.closing, Some((id, LingerWait::Until(_))) if id == cid));
+    a.service_egress().unwrap();
+    assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::FinWait1));
+    assert!(!a.service(&mut close));
+    assert!(response.try_recv().is_err());
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::FinWait2));
+    assert!(a.service(&mut close));
+    assert_eq!(response.recv().unwrap().unwrap().value, 0);
+    assert_eq!(
+        b.execute(servers[0], Op::Read(20)).unwrap().bytes,
+        vec![5; 20]
+    );
+}
+
+#[test]
+fn lingering_close_returns_at_its_time_and_the_close_continues() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(2);
+    let cids = clients.map(|id| connection(&a, id));
+    a.execute(clients[0], Op::SetLinger(1, 30)).unwrap();
+    // Clearing l_onoff turns lingering off whatever time remains.
+    a.execute(clients[1], Op::SetLinger(1, 30)).unwrap();
+    a.execute(clients[1], Op::SetLinger(0, 0)).unwrap();
+    assert_eq!(
+        a.execute(clients[1], Op::GetLinger).unwrap().bytes,
+        linger_bytes([0, 30])
+    );
+    let mut closes = Vec::new();
+    for id in clients {
+        a.execute(id, Op::Write(vec![5; 20])).unwrap();
+        let (mut close, response) = close_request(id);
+        assert!(!a.service(&mut close));
+        closes.push((close, response));
+    }
+    a.service_egress().unwrap();
+    assert_eq!(closes[1].0.closing, Some((cids[1], LingerWait::Off)));
+    assert!(a.service(&mut closes[1].0));
+    assert_eq!(a.endpoint.state(cids[1]), Ok(ntcp::State::FinWait1));
+    assert!(!a.service(&mut closes[0].0));
+    // The linger time runs out before the peer acknowledges the FIN.
+    closes[0].0.closing = Some((cids[0], LingerWait::Until(Instant::now())));
+    assert!(a.service(&mut closes[0].0));
+    for (_, response) in &closes {
+        assert_eq!(response.recv().unwrap().unwrap().value, 0);
+    }
+    // Linux returns from close without aborting: no RST, the FIN stands.
+    assert_eq!(a.endpoint.state(cids[0]), Ok(ntcp::State::FinWait1));
+    assert!(
+        sent_segments(&state)
+            .iter()
+            .all(|&(flags, _)| flags & ntcp::wire::RST == 0)
+    );
+    deliver_scheduled(&mut a, &mut b, &state);
+    for (id, cid) in servers.into_iter().zip(cids) {
+        assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::FinWait2));
+        assert_eq!(b.execute(id, Op::Read(20)).unwrap().bytes, vec![5; 20]);
+        assert_eq!(b.execute(id, Op::Read(20)).unwrap().value, 0);
+    }
+}
+
+#[test]
+fn accepted_socket_inherits_the_listener_linger_it_was_created_with() {
+    let (mut a, _) = pmtud_owner(2, 9000, None, None);
+    let (mut b, _) = pmtud_owner(3, 9000, None, None);
+    let listen = new(&mut b, SOCK_NONBLOCK);
+    b.execute(listen, Op::Bind("10.73.0.3:16379".parse().unwrap()))
+        .unwrap();
+    b.execute(listen, Op::Listen(16)).unwrap();
+    b.execute(listen, Op::SetLinger(1, 7)).unwrap();
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    pump(&mut a, &mut b);
+    // Linux sk_clone_lock copies the listener once the handshake completes;
+    // a later change to the listener is not the child's.
+    b.execute(listen, Op::SetLinger(0, 9)).unwrap();
+    let server = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
+    for (id, expected) in [(server, [1, 7]), (listen, [0, 7])] {
+        assert_eq!(
+            b.execute(id, Op::GetLinger).unwrap().bytes,
+            linger_bytes(expected)
+        );
+    }
+    assert_eq!(
+        a.execute(client, Op::GetLinger).unwrap().bytes,
+        linger_bytes([0, 0])
+    );
 }
 
 const SOFTWARE_GSO: ntcp::GsoLimits = ntcp::GsoLimits {

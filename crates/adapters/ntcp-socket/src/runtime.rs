@@ -13,7 +13,7 @@ mod ports;
 mod send;
 #[path = "runtime_timestamping.rs"]
 mod timestamps;
-use crate::socket_options::{effective_notsent_lowat, notsent_writable};
+use crate::socket_options::{Linger, effective_notsent_lowat, notsent_writable};
 use crate::*;
 use ntcp::{
     AddressValidation, CloseReason, ConnectionId, Endpoint, EndpointConfig, EndpointError, Error,
@@ -108,6 +108,9 @@ pub enum Op {
     Shutdown(i32),
     Flags(i32, i32),
     Set(i32, i32, i32),
+    // SO_LINGER's struct linger: l_onoff, l_linger.
+    SetLinger(i32, i32),
+    GetLinger,
     #[cfg(feature = "tfo-linux-cookie")]
     SetFastOpenKey(LinuxSipHash24Key),
     Get(i32, i32),
@@ -132,7 +135,33 @@ struct Request {
     reply: SyncSender<Result<Reply>>,
     deadline: Option<Instant>,
     send: Option<LogicalSend>,
-    closing: Option<ConnectionId>,
+    closing: Option<(ConnectionId, LingerWait)>,
+}
+// How long a last close waits, after its FIN is submitted, for the FIN to be
+// acknowledged: Linux sk_stream_wait_close with SO_LINGER's time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LingerWait {
+    Off,
+    Until(Instant),
+    Unbounded,
+}
+impl LingerWait {
+    fn new(linger: Linger) -> Self {
+        match linger.seconds {
+            _ if !linger.on || linger.aborts() => Self::Off,
+            Some(seconds) => Instant::now()
+                .checked_add(std::time::Duration::from_secs(seconds.into()))
+                .map_or(Self::Unbounded, Self::Until),
+            None => Self::Unbounded,
+        }
+    }
+    fn waiting(self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Until(deadline) => Instant::now() < deadline,
+            Self::Unbounded => true,
+        }
+    }
 }
 pub struct Runtime {
     tx: SyncSender<Request>,
@@ -430,6 +459,7 @@ struct Socket {
     notsent_lowat: u32,
     user_mss: Option<u16>,
     mark: u32,
+    linger: Linger,
     send_batch: Option<send::SendBatch>,
     send_finish: Option<send::SendFinish>,
     fast_open_limit: i32,
@@ -517,6 +547,7 @@ impl Socket {
             notsent_lowat: 0,
             user_mss: None,
             mark: 0,
+            linger: Linger::DEFAULT,
             send_batch: None,
             send_finish: None,
             fast_open_limit: 0,
@@ -609,7 +640,7 @@ type ChildOptionsSnapshot = (
     u64,
     u64,
     u64,
-    (bool, bool, bool, u32, bool, u8, i32),
+    (bool, bool, bool, u32, bool, u8, i32, Linger),
 );
 
 struct ManagedFastOpenKeys {
@@ -1435,9 +1466,25 @@ impl Owner {
         // Last-close must give its already-queued FIN/RST a submission turn
         // before waking a caller that may immediately exit the process. This
         // retained generation survives socket removal; other requests progress.
-        if let Some(cid) = request.closing {
+        if let Some((cid, linger)) = request.closing {
             if self.endpoint.is_output_reserved(cid)
                 || self.endpoint.ready_connections().any(|id| id == cid)
+            {
+                return false;
+            }
+            // Linux sk_stream_wait_close: wait while the FIN is unacknowledged
+            // (FIN-WAIT-1, CLOSING, LAST-ACK, entered at close), at most the
+            // linger time. Its end returns; the close itself continues.
+            if linger.waiting()
+                && matches!(
+                    self.endpoint.state(cid),
+                    Ok(State::SynReceived
+                        | State::Established
+                        | State::CloseWait
+                        | State::FinWait1
+                        | State::Closing
+                        | State::LastAck)
+                )
             {
                 return false;
             }
@@ -1488,9 +1535,11 @@ impl Owner {
             }
             return self.service_send(request, wait);
         }
+        // Linux inet_release lingers whatever O_NONBLOCK says, and a
+        // listener's close never waits.
         let closing = if self.egress.is_some() && matches!(op, Op::Close) {
             self.sockets.get(&request.id).and_then(|s| match s.handle {
-                Handle::Connection(cid) => Some(cid),
+                Handle::Connection(cid) => Some((cid, LingerWait::new(s.linger))),
                 _ => None,
             })
         } else {
@@ -1881,6 +1930,8 @@ impl Owner {
                     s.freebind,
                     s.other_ip_policy(self.local).0,
                     s.other_ip_policy(self.local).1,
+                    // Linux sk_clone_lock copies SOCK_LINGER and sk_lingertime.
+                    s.linger,
                 ),
             ));
         }
@@ -2657,6 +2708,7 @@ impl Owner {
                 child.interval = s.interval;
                 child.probes = s.probes;
                 child.user_timeout_ms = s.user_timeout_ms;
+                child.linger = s.linger;
                 let accepted = self.endpoint.accept(listener);
                 if matches!(
                     accepted,
@@ -2682,7 +2734,7 @@ impl Owner {
                         _,
                         receive,
                         send,
-                        (nodelay, cork, inq, lowat, freebind, other_tos, other_discover),
+                        (nodelay, cork, inq, lowat, freebind, other_tos, other_discover, linger),
                     ) = self.child_timeouts.swap_remove(index);
                     child.receive_timeout_us = receive;
                     child.send_timeout_us = send;
@@ -2691,6 +2743,7 @@ impl Owner {
                     child.inq = inq;
                     child.notsent_lowat = lowat;
                     child.freebind = freebind;
+                    child.linger = linger;
                     child.set_other_ip_policy(self.local, other_tos, other_discover);
                 }
                 let tuple = match self.endpoint.tuple(cid).map_err(engine) {
@@ -3035,11 +3088,24 @@ impl Owner {
                         let _ = self.endpoint.cancel_tx_timestamps(cid);
                         while matches!(self.endpoint.next_tx_timestamp(cid), Ok(Some(_))) {}
                         let _ = self.endpoint.set_tx_timestamp_capacity(cid, 0);
+                        // Linux tcp_close: a socket already reset or in
+                        // TIME-WAIT sends nothing, whatever SO_LINGER says.
                         if !matches!(
                             self.endpoint.state(cid),
                             Ok(State::Closed | State::TimeWait)
                         ) {
-                            let _ = self.endpoint.close(cid);
+                            // Linux tcp_close checks a zero linger time after
+                            // unread data (which Endpoint::close resets for
+                            // too) and disconnects: RFC 9293 ABORT.
+                            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.6
+                            //# This command causes all pending SENDs and RECEIVES to be aborted, the
+                            //# TCB to be removed, and a special RST message to be sent to the remote
+                            //# TCP peer of the connection.
+                            if s.linger.aborts() {
+                                let _ = self.endpoint.abort(cid);
+                            } else {
+                                let _ = self.endpoint.close(cid);
+                            }
                         }
                         debug_assert!(self.detached.len() < LIMIT);
                         self.detached.push(cid);
@@ -3130,6 +3196,19 @@ impl Owner {
                 } else {
                     s.receive_timeout_us
                 };
+            }
+            // Adapter state read at close; a listener's passes to its children.
+            Op::SetLinger(onoff, linger) => {
+                let s = self.sockets.get_mut(&id).unwrap();
+                s.linger = s.linger.set(onoff, linger);
+            }
+            Op::GetLinger => {
+                out.bytes = s
+                    .linger
+                    .get()
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect();
             }
             Op::Set(SOL_SOCKET, name @ (37 | 65), value) => {
                 self.timestamp_options(id, name, value as u32)?;

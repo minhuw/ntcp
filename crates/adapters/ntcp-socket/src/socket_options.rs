@@ -26,6 +26,45 @@ pub(crate) fn edge_changed(ready: u32, seen: Option<[u64; 5]>, observed: [u64; 5
         })
 }
 
+// Linux net/core/sock.c SO_LINGER. SOCK_LINGER and sk_lingertime are kept
+// apart: clearing l_onoff leaves the time getsockopt still reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Linger {
+    pub(crate) on: bool,
+    // Whole seconds; None is MAX_SCHEDULE_TIMEOUT, an unbounded wait.
+    pub(crate) seconds: Option<u32>,
+}
+impl Linger {
+    pub(crate) const DEFAULT: Self = Self {
+        on: false,
+        seconds: Some(0),
+    };
+    pub(crate) fn set(self, onoff: i32, linger: i32) -> Self {
+        if onoff == 0 {
+            return Self { on: false, ..self };
+        }
+        // `unsigned long t_sec = ling.l_linger`: on the supported 64-bit ABIs
+        // only a negative int reaches MAX_SCHEDULE_TIMEOUT / HZ.
+        Self {
+            on: true,
+            seconds: u32::try_from(linger).ok(),
+        }
+    }
+    // struct linger as Linux reports it: sk_lingertime / HZ into an int. An
+    // unbounded time is LONG_MAX / HZ truncated, here for CONFIG_HZ=1000.
+    pub(crate) fn get(self) -> [i32; 2] {
+        const UNBOUNDED: i32 = (i64::MAX / 1000) as i32;
+        [
+            i32::from(self.on),
+            self.seconds.map_or(UNBOUNDED, |seconds| seconds as i32),
+        ]
+    }
+    // tcp_close's `sock_flag(sk, SOCK_LINGER) && !sk->sk_lingertime`: ABORT.
+    pub(crate) fn aborts(self) -> bool {
+        self.on && self.seconds == Some(0)
+    }
+}
+
 // Linux v6.12 net/core/scm.c put_cmsg. The supported 64-bit ABIs use a
 // size_t followed by two ints, size_t alignment, and SOL_TCP/TCP_CM_INQ=6/36.
 // Padding is reported but not written, just as in Linux.
@@ -90,6 +129,28 @@ mod tests {
         assert!(edge_changed(5, None, observed));
         assert!(edge_changed(1, Some([u64::MAX; 5]), [0; 5]));
         assert!(!edge_changed(1, Some([2; 5]), [1; 5]));
+    }
+    #[test]
+    fn linger_keeps_time_when_cleared_and_saturates_negative_seconds() {
+        let linger = Linger::DEFAULT;
+        assert_eq!(linger.get(), [0, 0]);
+        assert!(!linger.aborts());
+        let linger = linger.set(1, 0);
+        assert_eq!(linger.get(), [1, 0]);
+        assert!(linger.aborts());
+        let linger = linger.set(7, 5);
+        assert_eq!(linger.get(), [1, 5]);
+        assert!(!linger.aborts());
+        let linger = linger.set(0, 9);
+        assert_eq!(linger.get(), [0, 5]);
+        assert!(!linger.aborts());
+        assert_eq!(linger.set(1, i32::MAX).get(), [1, i32::MAX]);
+        let unbounded = linger.set(1, -1);
+        assert_eq!(unbounded.seconds, None);
+        // 9223372036854775 = 0x0020_C49B_A5E3_53F7.
+        assert_eq!(unbounded.get(), [1, 0xA5E3_53F7u32 as i32]);
+        assert_eq!(unbounded.set(0, 3).get(), [0, 0xA5E3_53F7u32 as i32]);
+        assert!(!unbounded.aborts());
     }
     #[test]
     fn inq_cmsg_lengths_alignment_and_truncation() {
