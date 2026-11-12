@@ -93,6 +93,22 @@ impl SendBuffer {
         Ok(result)
     }
 
+    // Grows the payload and mark rings in place to hold `capacity` queued
+    // bytes; the limit stays as it is. Each ring reallocates at most once and
+    // moves only the shorter side of its wrap. On failure the queued bytes,
+    // their marks and the limit are as they were: a ring that grew before the
+    // other failed keeps its storage, which storage_bytes counts and the next
+    // growth reuses.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "buffer autotuning will grow rings at write")
+    )]
+    pub(crate) fn grow(&mut self, capacity: usize) -> Result<(), ()> {
+        let additional = capacity.saturating_sub(self.data.len());
+        self.data.try_reserve_exact(additional).map_err(|_| ())?;
+        self.marks.try_reserve_exact(additional).map_err(|_| ())
+    }
+
     pub(crate) fn set_limit(&mut self, capacity: usize) {
         self.capacity = capacity;
     }
@@ -658,6 +674,62 @@ impl ReceiveBuffer {
             head: 0,
             ..*self
         })
+    }
+
+    // Grows the ring in place to `capacity` slots, rounded up to a multiple
+    // of 8 so that a slot keeps its position within a byte of either bitmap
+    // and the bitmaps move as whole bytes. A capacity no larger than the
+    // ring's changes nothing. The payload and both bitmaps are reserved
+    // before anything changes; then, as VecDeque does, the shorter side of
+    // the wrap moves: the wrapped prefix to just past the old end, or the
+    // rest to the new end, moving `head`. Sequence and reporting state counts
+    // from read_base and stays as it is; a ReceiveOutputUndo, which names a
+    // bitmap byte, must not span a growth (reservations exclude reads). On
+    // failure every slot and all state are as they were: a bitmap or payload
+    // that grew before another failed keeps its storage, which storage_bytes
+    // counts and the next growth reuses.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "buffer autotuning will grow rings at read")
+    )]
+    pub(crate) fn grow(&mut self, capacity: usize) -> Result<(), ()> {
+        let old = self.data.len();
+        if capacity <= old {
+            return Ok(());
+        }
+        let new = capacity.next_multiple_of(8);
+        if new >= 1usize << 31 {
+            return Err(());
+        }
+        let (metadata_len, pending_len) = (new / 4, new / 8);
+        self.data.try_reserve_exact(new - old).map_err(|_| ())?;
+        self.metadata
+            .try_reserve_exact(metadata_len - self.metadata.len())
+            .map_err(|_| ())?;
+        self.report_pending
+            .try_reserve_exact(pending_len - self.report_pending.len())
+            .map_err(|_| ())?;
+        // MaybeUninit elements need no initialization, and capacity was reserved.
+        unsafe { self.data.set_len(new) };
+        // Slots past the old end are empty: their bits in a shared last byte
+        // were never set.
+        self.metadata.resize(metadata_len, 0);
+        self.report_pending.resize(pending_len, 0);
+        let (head, added) = (self.head, new - old);
+        if head == 0 {
+            return Ok(());
+        }
+        let (from, to, count) = if head <= added && head <= old - head {
+            (0, old, head)
+        } else {
+            self.head = head + added;
+            (head, head + added, old - head)
+        };
+        // Unset slots are copied only as MaybeUninit, as in `grown`.
+        self.data.copy_within(from..from + count, to);
+        move_fields(&mut self.metadata, 2, from, to, count);
+        move_fields(&mut self.report_pending, 1, from, to, count);
+        Ok(())
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1406,6 +1478,59 @@ impl ReceiveBuffer {
             }
         }
         outcome
+    }
+}
+
+// The `width`-bit field of `slot` in a bitmap of 8 / `width` slots per byte.
+fn field(map: &[u8], width: usize, slot: usize) -> u8 {
+    let per_byte = 8 / width;
+    (map[slot / per_byte] >> (width * (slot % per_byte))) & ((1 << width) - 1)
+}
+
+fn set_field(map: &mut [u8], width: usize, slot: usize, value: u8) {
+    let per_byte = 8 / width;
+    let shift = width * (slot % per_byte);
+    let byte = &mut map[slot / per_byte];
+    *byte = (*byte & !(((1 << width) - 1) << shift)) | (value << shift);
+}
+
+// Moves the fields of slots [from, from + count) up to [to, to + count),
+// to > from, overlapping as memmove may, then clears the source slots left
+// behind. A distance of whole bytes moves the inner bytes as bytes.
+fn move_fields(map: &mut [u8], width: usize, from: usize, to: usize, count: usize) {
+    let per_byte = 8 / width;
+    let distance = to - from;
+    let end = from + count;
+    // Highest slot first, so no source is overwritten before it moves.
+    let mut slot = end;
+    if distance.is_multiple_of(per_byte) {
+        while slot > from && !slot.is_multiple_of(per_byte) {
+            slot -= 1;
+            set_field(map, width, slot + distance, field(map, width, slot));
+        }
+        let first = from.next_multiple_of(per_byte);
+        if slot > first {
+            map.copy_within(
+                first / per_byte..slot / per_byte,
+                (first + distance) / per_byte,
+            );
+            slot = first;
+        }
+    }
+    while slot > from {
+        slot -= 1;
+        set_field(map, width, slot + distance, field(map, width, slot));
+    }
+    let cleared = from..end.min(to);
+    let mut slot = cleared.start;
+    while slot < cleared.end && !slot.is_multiple_of(per_byte) {
+        set_field(map, width, slot, 0);
+        slot += 1;
+    }
+    let whole = cleared.end.saturating_sub(slot) / per_byte * per_byte;
+    map[slot / per_byte..(slot + whole) / per_byte].fill(0);
+    for slot in slot + whole..cleared.end {
+        set_field(map, width, slot, 0);
     }
 }
 
@@ -2632,5 +2757,255 @@ mod tests {
         assert_eq!(send.admission_room(5, Some(10)), 0);
         send.acknowledge(5).unwrap();
         assert_eq!(send.admission_room(0, Some(10)), 4);
+    }
+
+    // Everything a receive ring holds, by offset from read_base: two rings
+    // that agree here behave alike whatever their physical layout.
+    fn logical(recv: &ReceiveBuffer) -> alloc::string::String {
+        let slots: Vec<_> = (0..recv.capacity())
+            .map(|offset| {
+                let index = recv.index(offset);
+                (
+                    // Only occupied slots have initialized bytes.
+                    recv.is_present(index)
+                        .then(|| unsafe { recv.data[index].assume_init() }),
+                    recv.is_push(index),
+                    recv.report_pending[index / 8] & (1 << (index % 8)) != 0,
+                )
+            })
+            .collect();
+        alloc::format!(
+            "{:?}",
+            (
+                (recv.capacity(), recv.next(), recv.readable(), recv.occupied),
+                (recv.fin_sequence, recv.eof, recv.pushed, recv.deferred_syn),
+                (
+                    recv.latest,
+                    recv.reported,
+                    recv.report_debt,
+                    recv.pending_first
+                ),
+                (recv.dsack, recv.sack_blocks(4), slots),
+            )
+        )
+    }
+
+    #[test]
+    fn receive_growth_in_place_matches_a_copied_ring_across_wraps() {
+        let byte = |seq: Seq| (seq.0 as u8) ^ 0x5a;
+        let mut state = 0x2545_f491_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        // Growths that kept head where it was (the wrapped prefix moved past
+        // the old end) and that moved it (the rest moved to the new end).
+        let (mut kept, mut moved) = (0, 0);
+        for initial in [9, 13, 24, 64, 100] {
+            let start = Seq(u32::MAX - 50);
+            let mut recv = ReceiveBuffer::new(start, initial).unwrap();
+            let mut reference = ReceiveBuffer::new(start, initial).unwrap();
+            for _ in 0..2000 {
+                let capacity = recv.capacity();
+                match next(10) {
+                    0..=4 => {
+                        let sequence = recv
+                            .next()
+                            .wrapping_add((next(capacity + 24) as u32).wrapping_sub(8));
+                        let payload: Vec<u8> = (0..next(40))
+                            .map(|i| byte(sequence.wrapping_add(i as u32)))
+                            .collect();
+                        let (fin, push) = (next(60) == 0, next(3) == 0);
+                        for buffer in [&mut recv, &mut reference] {
+                            buffer.record_duplicate(sequence, payload.len());
+                        }
+                        let outcome = recv.insert_with_push(sequence, &payload, fin, push);
+                        let expected = reference.insert_with_push(sequence, &payload, fin, push);
+                        assert_eq!(
+                            alloc::format!("{outcome:?}"),
+                            alloc::format!("{expected:?}")
+                        );
+                    }
+                    5 | 6 => {
+                        let base = recv.read_base;
+                        let mut out = alloc::vec![0; next(capacity + 1)];
+                        let mut expected = out.clone();
+                        let count = recv.read(&mut out);
+                        assert_eq!(reference.read(&mut expected), count);
+                        assert_eq!(out, expected);
+                        for (offset, &value) in out[..count].iter().enumerate() {
+                            assert_eq!(value, byte(base.wrapping_add(offset as u32)));
+                        }
+                    }
+                    7 => {
+                        for buffer in [&mut recv, &mut reference] {
+                            if let Some(first) = buffer.sack_blocks(4)[0] {
+                                buffer.commit_sack(first);
+                            }
+                            buffer.commit_report();
+                        }
+                    }
+                    _ if capacity >= 1024 => {
+                        // Start over small, so that growth keeps being tried.
+                        let start = recv.next();
+                        recv = ReceiveBuffer::new(start, initial).unwrap();
+                        reference = ReceiveBuffer::new(start, initial).unwrap();
+                    }
+                    _ => {
+                        // Small steps leave too little room past the old end
+                        // for the wrapped prefix; large ones take it whole.
+                        let step = if next(2) == 0 { 8 } else { 2 * capacity };
+                        let target = capacity + 1 + next(step);
+                        let head = recv.head;
+                        recv.grow(target).unwrap();
+                        let rounded = target.next_multiple_of(8);
+                        assert_eq!(recv.capacity(), rounded);
+                        reference = reference.grown(rounded).unwrap();
+                        if head != 0 && recv.head == head {
+                            kept += 1;
+                        } else if head != 0 {
+                            moved += 1;
+                        }
+                    }
+                }
+                if recv.eof() {
+                    let next = recv.next();
+                    for buffer in [&mut recv, &mut reference] {
+                        buffer.clear();
+                        buffer.reset_start(next).unwrap();
+                    }
+                }
+                assert_eq!(logical(&recv), logical(&reference));
+                assert_ranges(&recv);
+            }
+        }
+        assert!(kept > 50 && moved > 50, "{kept} {moved}");
+    }
+
+    #[test]
+    fn send_growth_in_place_keeps_bytes_and_marks_across_wraps() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        let mut send = SendBuffer::new(32).unwrap();
+        let mut model: VecDeque<(u8, u8)> = VecDeque::new();
+        let mut wrapped = 0;
+        for step in 0..4000 {
+            match next(5) {
+                0 | 1 => {
+                    let input: Vec<u8> = (0..next(100)).map(|i| (step + i) as u8).collect();
+                    let count = send.write(&input);
+                    assert_eq!(count, input.len().min(send.capacity() - model.len()));
+                    model.extend(input[..count].iter().map(|&b| (b, 0)));
+                }
+                2 => {
+                    let count = next(model.len() + 1);
+                    send.acknowledge(count).unwrap();
+                    model.drain(..count);
+                }
+                3 if !model.is_empty() => {
+                    let offset = next(model.len());
+                    let (push, end_of_record) = (next(2) == 0, next(3) == 0);
+                    send.finish_send(offset, push, end_of_record);
+                    model[offset].1 |= u8::from(push) | u8::from(end_of_record) << 1;
+                    let count = 1 + next(model.len() - offset);
+                    send.mark_ptb(offset, count);
+                    for mark in model.range_mut(offset..offset + count) {
+                        if mark.1 & (PTB_PENDING | RETRANSMITTED) == 0 {
+                            mark.1 |= PTB_PENDING;
+                        }
+                    }
+                }
+                4 if next(4) == 0 && send.capacity() < 2048 => {
+                    wrapped += usize::from(!send.data.as_slices().1.is_empty());
+                    let capacity = send.capacity() + 1 + next(16);
+                    send.grow(capacity).unwrap();
+                    assert!(send.allocation_capacity() >= capacity);
+                    assert!(send.marks.capacity() >= capacity);
+                    send.set_limit(capacity);
+                }
+                _ => {}
+            }
+            assert!(send.data.iter().copied().eq(model.iter().map(|b| b.0)));
+            assert!(send.marks.iter().copied().eq(model.iter().map(|b| b.1)));
+        }
+        assert!(wrapped > 20, "{wrapped}");
+    }
+
+    #[test]
+    fn failed_growth_leaves_rings_unchanged_and_retry_reuses_storage() {
+        use crate::allocation_tests::fail_after;
+        // A wrapped receive ring with a hole, PUSH, a pending FIN and
+        // pending reports.
+        let start = Seq(u32::MAX - 5);
+        let mut recv = ReceiveBuffer::new(start, 21).unwrap();
+        recv.insert(start, &[1; 15], false);
+        assert_eq!(recv.read(&mut [0; 15]), 15);
+        let base = recv.next();
+        recv.insert_with_push(base, b"abc", false, true);
+        recv.insert_with_push(base.wrapping_add(8), b"defghij", true, true);
+        recv.record_duplicate(base.wrapping_add(9), 2);
+        let before = logical(&recv);
+        let storage = recv.storage_bytes();
+        // Each attempt fails at the payload, the presence bitmap or the
+        // report bitmap, the later ones after earlier reservations held.
+        for allocation in [0, 1, 1, 0] {
+            assert_eq!(fail_after(allocation, || recv.grow(100)), Err(()));
+            assert_eq!(logical(&recv), before);
+            assert_ranges(&recv);
+        }
+        assert!(recv.storage_bytes() > storage);
+        // Neither a ring already as large nor one too large to address
+        // allocates: the first allocation after them still fails.
+        assert!(fail_after(0, || recv.grow(21) == Ok(())
+            && recv.grow((1 << 31) - 1) == Err(())
+            && SendBuffer::new(1).is_err()));
+        let reference = recv.grown(104).unwrap();
+        // Only the report bitmap is left to reserve.
+        assert_eq!(fail_after(1, || recv.grow(100)), Ok(()));
+        assert_eq!(recv.capacity(), 104);
+        assert_eq!(logical(&recv), logical(&reference));
+        recv.insert(base.wrapping_add(3), b"12345", false);
+        assert!(recv.eof());
+        let mut out = [0; 32];
+        assert_eq!(recv.read(&mut out), 15);
+        assert_eq!(&out[..15], b"abc12345defghij");
+        assert!(recv.take_push());
+
+        let mut send = SendBuffer::new(16).unwrap();
+        send.write(&[1; 12]);
+        send.acknowledge(8).unwrap();
+        send.write(b"abcdefghij");
+        send.mark_push();
+        assert!(!send.data.as_slices().1.is_empty());
+        let before = (send.data.clone(), send.marks.clone(), send.capacity());
+        let storage = send.storage_bytes();
+        assert_eq!(fail_after(0, || send.grow(64)), Err(()));
+        assert_eq!(send.storage_bytes(), storage);
+        assert_eq!(fail_after(1, || send.grow(64)), Err(()));
+        assert_eq!(
+            (send.data.clone(), send.marks.clone(), send.capacity()),
+            before
+        );
+        assert!(send.storage_bytes() >= storage + 48);
+        assert!(fail_after(0, || send.grow(16) == Ok(()) && SendBuffer::new(1).is_err()));
+        // Only the marks are left to reserve.
+        assert_eq!(fail_after(1, || send.grow(64)), Ok(()));
+        assert_eq!(
+            (send.data.clone(), send.marks.clone(), send.capacity()),
+            before
+        );
+        send.set_limit(64);
+        assert_eq!(send.write(&[2; 60]), 50);
+        let mut out = [0; 64];
+        assert_eq!(send.copy(0, &mut out), 64);
+        assert_eq!(&out[..14], b"\x01\x01\x01\x01abcdefghij");
+        assert!(send.pushed(13, 1) && !send.pushed(0, 13));
     }
 }
