@@ -864,6 +864,8 @@ pub(crate) struct Connection {
     pub(crate) tx_timestamps: TxTimestamps,
     pub(crate) last_output_range: Option<TxStreamRange>,
     pub(crate) last_departure: Option<Departure>,
+    // The intent of the PLPMTUD probe `last_departure` sends, if it is one.
+    pub(crate) last_discovery: Option<crate::DiscoveryIntent>,
     // Optional timing evidence, separate from the retained output obligation.
     reserved_ledger: Option<crate::rack::DepartureSelection>,
     repair_undo: Option<RepairUndo>,
@@ -1230,6 +1232,7 @@ impl Connection {
             tx_timestamps: TxTimestamps::default(),
             last_output_range: None,
             last_departure: None,
+            last_discovery: None,
             reserved_ledger: None,
             repair_undo: None,
             control_undo: None,
@@ -10085,12 +10088,16 @@ impl Connection {
             && pmtu_probe.is_none()
             && self.initial_pacing_room() >= count as u32;
         let timeout_recovery = self.sack_post_rto.is_some() || self.consecutive_timeouts != 0;
+        self.last_discovery = pmtu_probe
+            .filter(|_| reserve)
+            .and_then(|(size, _, _)| {
+                self.managed_path.map(|binding| crate::DiscoveryIntent {
+                    binding,
+                    ip_packet_len: size,
+                    selected_at: now,
+                })
+            });
         self.last_departure = reserve.then_some(Departure {
-            discovery: pmtu_probe.and_then(|(size, _, _)| self.managed_path.map(|binding| crate::DiscoveryIntent {
-                binding,
-                ip_packet_len: size,
-                selected_at: now,
-            })),
             initial_burst,
             data_ack,
             defer_push: self.repair_undo.is_some()

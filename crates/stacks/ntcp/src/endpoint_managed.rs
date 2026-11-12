@@ -277,9 +277,9 @@ impl Endpoint {
         attempt: crate::TransmitAttempt,
         receipt: PhysicalReceipt,
     ) -> Result<bool, EndpointError> {
-        let probe = self.transmit_discovery_intent(attempt).and_then(|intent| {
+        let probe = self.discovery_intent(attempt).and_then(|intent| {
             let r = self.reservations[attempt.reservation].current.as_ref()?;
-            (r.offset == 0).then_some((r.packet.connection?, r.departure?.start, intent))
+            (r.offset == 0).then_some((r.packet.connection?, r.departure?.start, *intent))
         });
         // The exact physical packet this attempt submits, read before
         // acceptance advances or clears the reservation.
@@ -985,6 +985,11 @@ impl Endpoint {
         &self,
         attempt: crate::TransmitAttempt,
     ) -> Option<crate::DiscoveryIntent> {
+        self.discovery_intent(attempt).copied()
+    }
+
+    // The intent in place: only a probe's is copied out.
+    fn discovery_intent(&self, attempt: crate::TransmitAttempt) -> Option<&crate::DiscoveryIntent> {
         let r = self
             .reservations
             .get(attempt.reservation)?
@@ -993,6 +998,7 @@ impl Endpoint {
         if r.attempt != Some(attempt) || r.repaired {
             return None;
         }
-        r.departure?.discovery
+        r.departure.as_ref()?;
+        r.discovery.as_ref()
     }
 }

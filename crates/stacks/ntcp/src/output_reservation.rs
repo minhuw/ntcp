@@ -5,7 +5,6 @@ use crate::{EndpointError, Error, Instant, Transmit, wire};
 // Only physical-departure work; sequence, recovery and PRR charges stay selected.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Departure {
-    pub discovery: Option<crate::DiscoveryIntent>,
     pub data_ack: bool,
     pub defer_push: bool,
     pub fresh_data: bool,
@@ -152,6 +151,9 @@ pub(crate) struct ReservedOutput {
     pub finished: bool,
     pub repaired: bool,
     pub departure: Option<Departure>,
+    // A PLPMTUD probe's intent, kept beside its departure: copied only
+    // for a probe, while every output copies its departure.
+    pub discovery: Option<crate::DiscoveryIntent>,
     // The link scoping the packet (`Endpoint::transmit_attempt_zone`).
     pub zone: Option<ntcp_path::LinkId>,
     // A stateless reply already counted as undeliverable.
@@ -239,6 +241,7 @@ impl OutputReservation {
             finished: true,
             repaired: false,
             departure: None,
+            discovery: None,
             zone: None,
             undeliverable: false,
         });
@@ -329,6 +332,7 @@ impl OutputReservation {
             finished: true,
             repaired: false,
             departure: None,
+            discovery: None,
             zone: None,
             undeliverable: false,
         });

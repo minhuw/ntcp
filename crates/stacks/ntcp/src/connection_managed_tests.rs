@@ -362,7 +362,7 @@ fn shared_holdoff_real_probe_and_stale_ack_do_not_escape_ordinary_budget() {
                 .transmit_selected(hold - 1, &mut bytes, true)
                 .unwrap()
                 .unwrap();
-            assert!(a.last_departure.unwrap().discovery.is_none());
+            assert!(a.last_discovery.is_none());
             test_support::commit_reserved(&mut a, hold - 1);
             b.input(hold - 1, &wire::parse(ip(a.tuple), &bytes[..n]).unwrap())
                 .unwrap();
@@ -374,11 +374,7 @@ fn shared_holdoff_real_probe_and_stale_ack_do_not_escape_ordinary_budget() {
                 .transmit_selected(hold + 1, &mut bytes, true)
                 .unwrap()
                 .unwrap();
-            let intent = a
-                .last_departure
-                .unwrap()
-                .discovery
-                .expect("actual eligible upward probe");
+            let intent = a.last_discovery.expect("actual eligible upward probe");
             assert!(intent.ip_packet_len() > mtu);
             assert_eq!(
                 intent.ip_packet_len(),
@@ -403,20 +399,14 @@ fn shared_holdoff_real_probe_and_stale_ack_do_not_escape_ordinary_budget() {
                 .transmit_selected(hold + 4, &mut bytes, true)
                 .unwrap()
                 .unwrap();
-            if a.last_departure.unwrap().discovery.is_none() {
-                assert!(n as u32 + if ipv4 { 20 } else { 40 } <= next_mtu);
-            } else {
+            if let Some(intent) = a.last_discovery {
                 assert!(!ipv4); // IPv4 has a newer negative hold; IPv6 may probe again.
                 assert_eq!(
-                    a.last_departure
-                        .unwrap()
-                        .discovery
-                        .unwrap()
-                        .binding()
-                        .snapshot
-                        .negative_revision(),
+                    intent.binding().snapshot.negative_revision(),
                     first.snapshot.negative_revision()
                 );
+            } else {
+                assert!(n as u32 + if ipv4 { 20 } else { 40 } <= next_mtu);
             }
         }
     }
@@ -698,7 +688,7 @@ fn submitted_probe(
     let mut bytes = vec![0; 2048];
     let n = a.transmit_selected(hold + 1, &mut bytes, true).unwrap().unwrap();
     bytes.truncate(n);
-    let intent = a.last_departure.unwrap().discovery.expect("eligible upward probe");
+    let intent = a.last_discovery.expect("eligible upward probe");
     assert!(intent.ip_packet_len() > mtu);
     (bytes, intent, hold + 1)
 }
@@ -885,7 +875,7 @@ fn administrative_cap_arrives_through_budget_and_targets_the_first_probe_on_the_
         a.write(&[8; 20000]).unwrap();
         let mut out = vec![0; 2048];
         let n = a.transmit_selected(ADMIN_HOLD, &mut out, true).unwrap().unwrap();
-        let intent = a.last_departure.unwrap().discovery.expect("targeted probe");
+        let intent = a.last_discovery.expect("targeted probe");
         assert_eq!(n + header, 1450, "ipv4={ipv4}");
         assert_eq!(intent.ip_packet_len(), 1450);
         assert_eq!(
@@ -960,7 +950,7 @@ fn administrative_target_clipped_by_user_or_peer_mss_reports_transport() {
             a.write(&[8; 20000]).unwrap();
             let mut out = vec![0; 2048];
             let n = a.transmit_selected(ADMIN_HOLD, &mut out, true).unwrap().unwrap();
-            assert!(a.last_departure.unwrap().discovery.is_some());
+            assert!(a.last_discovery.is_some());
             assert_eq!(n as u32 + header, expected, "ipv4={ipv4} user={user}");
             assert_eq!(
                 a.administrative_search(),

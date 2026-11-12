@@ -273,6 +273,7 @@ impl Connection {
         self.control_undo = None;
         self.reserved_retransmit_counts = None;
         self.last_departure = None;
+        self.last_discovery = None;
         self.reserved_ledger = None;
         self.last_output_range = None;
         // A never-departed copy times nothing (RFC 6298 section 3, Karn).
@@ -345,6 +346,7 @@ impl Connection {
         self.fin_sent_at = undo.fin_sent_at;
         self.reserved_retransmit_counts = None;
         self.last_departure = None;
+        self.last_discovery = None;
         self.reserved_ledger = None;
         self.last_output_range = None;
         self.resolve_probe_response();
@@ -375,6 +377,7 @@ impl Connection {
         self.restore_selection(undo);
         self.reserved_retransmit_counts = None;
         self.last_departure = None;
+        self.last_discovery = None;
         self.reserved_ledger = None;
         self.last_output_range = None;
         // Withdrawing the PMTU attempt cancels its classification. Restoring

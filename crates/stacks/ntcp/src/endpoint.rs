@@ -5786,7 +5786,12 @@ impl Endpoint {
             }
             self.reservations[index].current.as_mut().unwrap().zone = zone;
             if let Some(id) = packet.connection {
-                let departure = self.retained_slot(id)?.connection.last_departure;
+                let connection = &self.retained_slot(id)?.connection;
+                let departure = connection.last_departure;
+                // Captured without one; only a probe's intent is copied.
+                if let Some(intent) = connection.last_discovery {
+                    self.reservations[index].current.as_mut().unwrap().discovery = Some(intent);
+                }
                 let r = self.reservations[index].current.as_mut().unwrap();
                 r.departure = departure;
                 if let Some(s) = departure.and_then(|d| d.segmentation) {
