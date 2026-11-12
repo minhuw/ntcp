@@ -20,17 +20,23 @@ pub enum Error {
     Quote,
 }
 
-// Folding each word avoids overflow even for caller-provided large slices.
+// Two words at a time go into a 64-bit sum, which cannot overflow for any
+// slice, folded once at the end: a carry out of a word's position is the
+// end-around carry (2^16 is congruent to 1 modulo 2^16 - 1), and a nonzero
+// sum never folds to zero. An odd final octet is padded with zero.
 //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
 //# The checksum field is the 16 bit one's complement of the one's complement
 //# sum of all 16 bit words in the header. For purposes of computing the
 //# checksum, the value of the checksum field is zero.
 pub fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for pair in bytes.chunks(2) {
-        sum += (u32::from(pair[0]) << 8) | u32::from(*pair.get(1).unwrap_or(&0));
-        sum = (sum & 0xffff) + (sum >> 16);
+    let mut sum = 0u64;
+    let (pairs, rest) = bytes.as_chunks::<4>();
+    for &pair in pairs {
+        sum += u64::from(u32::from_be_bytes(pair));
     }
+    let mut last = [0; 4];
+    last[..rest.len()].copy_from_slice(rest);
+    sum += u64::from(u32::from_be_bytes(last));
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -157,4 +163,43 @@ pub fn parse_udp(source: IpAddr, destination: IpAddr, payload: &[u8]) -> Result<
         checksum,
         payload: &datagram[UDP_HEADER..],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checksum;
+
+    // RFC 1071's sum of 16-bit words, folded after every word.
+    fn reference(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for pair in bytes.chunks(2) {
+            sum += (u32::from(pair[0]) << 8) | u32::from(*pair.get(1).unwrap_or(&0));
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn wide_sum_matches_the_word_reference() {
+        let mut state = 0x2545_f491_u32;
+        let mut bytes = [0; 1600];
+        for byte in &mut bytes {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        for start in 0..4 {
+            for len in (0..300).chain([1459, 1460, 1461, 1595]) {
+                let slice = &bytes[start..start + len];
+                assert_eq!(checksum(slice), reference(slice));
+            }
+        }
+        // All-ones words carry on every addition; zeros never fold to zero.
+        for len in [0, 1, 2, 3, 20, 65535, 65536] {
+            let ones = [0xff; 65536];
+            assert_eq!(checksum(&ones[..len]), reference(&ones[..len]));
+            assert_eq!(checksum(&[0; 64][..len.min(64)]), 0xffff);
+        }
+    }
 }
