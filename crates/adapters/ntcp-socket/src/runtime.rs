@@ -906,7 +906,16 @@ struct Owner {
     ephemeral: ntcp::EphemeralPorts,
     ephemeral_ports: std::ops::RangeInclusive<u16>,
     next_id: u64,
+    // Connections whose last descriptor closed, released once CLOSED or in
+    // TIME-WAIT with no output held. `detached` are checked at the next
+    // owner pass: those just closed, those released by an event, and those
+    // whose held output has no event to announce its release (at most one
+    // per egress slot). The rest wait in `detached_waiting` for the
+    // terminal event every way into CLOSED or TIME-WAIT reports
+    // (`ConnectionEvents::closed`), as Linux's orphaned socket is
+    // destroyed by its own last state change.
     detached: Vec<ConnectionId>,
+    detached_waiting: HashSet<ConnectionId>,
     egress: Option<egress::Egress>,
     reservation_timeout_us: u64,
     timestamp_cookie: u64,
@@ -1338,6 +1347,7 @@ impl Owner {
             ephemeral_ports: ports::RANGE,
             next_id: 1,
             detached: Vec::new(),
+            detached_waiting: HashSet::new(),
             egress: None,
             reservation_timeout_us: 1_000_000,
             timestamp_cookie: 1,
@@ -1871,16 +1881,7 @@ impl Owner {
                 }
             }
             self.collect_connection_options();
-            self.detached.retain(|&id| {
-                if !self.endpoint.is_output_reserved(id)
-                    && matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait))
-                {
-                    let _ = self.endpoint.release(id);
-                    false
-                } else {
-                    true
-                }
-            });
+            self.release_detached();
             if self.collect_paths().is_err() {
                 break 'run;
             }
@@ -2254,6 +2255,12 @@ impl Owner {
                 Event::Connection(cid, _) => self.connection_socket(*cid),
                 Event::RouteAdvice(_) => None,
             };
+            if let Event::Connection(cid, e) = &event
+                && e.closed.is_some()
+                && self.detached_waiting.remove(cid)
+            {
+                self.detached.push(*cid);
+            }
             if let Some(id) = holder {
                 self.touch(id);
                 if matches!(&event, Event::Connection(_, e) if e.tx_timestamps) {
@@ -2326,6 +2333,23 @@ impl Owner {
                 }
             }
         }
+    }
+    // Releases the detached connections now CLOSED or in TIME-WAIT with no
+    // output held; one still short of either waits for its terminal event.
+    fn release_detached(&mut self) {
+        let (endpoint, waiting) = (&mut self.endpoint, &mut self.detached_waiting);
+        self.detached.retain(|&id| {
+            let terminal = matches!(endpoint.state(id), Ok(State::Closed | State::TimeWait));
+            if terminal && !endpoint.is_output_reserved(id) {
+                let _ = endpoint.release(id);
+                false
+            } else if terminal || endpoint.state(id).is_err() {
+                true
+            } else {
+                waiting.insert(id);
+                false
+            }
+        });
     }
     // Queues the sockets of connections with output to send or held by
     // egress: at most the connections egress is serving.
@@ -3730,7 +3754,6 @@ impl Owner {
                                 let _ = self.endpoint.close(cid);
                             }
                         }
-                        debug_assert!(self.detached.len() < LIMIT);
                         self.detached.push(cid);
                     }
                 }

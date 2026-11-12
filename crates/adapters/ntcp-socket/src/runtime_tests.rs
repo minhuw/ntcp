@@ -1239,3 +1239,27 @@ fn send_buffer_backpressure_and_short_write() {
     assert_eq!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
     pump(&mut a, &mut b);
 }
+
+#[test]
+fn detached_connection_waits_for_its_terminal_event() {
+    let (mut a, mut b, client, server, _) = pair();
+    let Handle::Connection(cid) = b.sockets[&server].handle else {
+        panic!()
+    };
+    b.execute(server, Op::Close).unwrap();
+    pump(&mut a, &mut b);
+    assert_eq!(b.endpoint.state(cid), Ok(State::FinWait2));
+    // Short of TIME-WAIT, it leaves the sweep and waits for its event.
+    b.release_detached();
+    assert!(b.detached.is_empty());
+    assert!(b.detached_waiting.contains(&cid));
+    a.execute(client, Op::Close).unwrap();
+    pump(&mut a, &mut b);
+    assert_eq!(b.endpoint.state(cid), Ok(State::TimeWait));
+    // The event TIME-WAIT reports brought it back; the sweep releases it.
+    assert!(b.detached_waiting.is_empty());
+    assert_eq!(b.detached, [cid]);
+    b.release_detached();
+    assert!(b.detached.is_empty());
+    assert!(!b.endpoint.connection_exists(cid));
+}
