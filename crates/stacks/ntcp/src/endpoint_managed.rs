@@ -684,8 +684,9 @@ impl Endpoint {
             .flatten();
         let queued = self.control.len();
         let result = if let Some(id) = listener
-            // A full backlog/Endpoint or stale TIME-WAIT reuse is dropped by
-            // the ordinary factory below without any path transaction.
+            // A full backlog/Endpoint is dropped, and a stale TIME-WAIT reuse
+            // answered by its TIME-WAIT, by the ordinary input below without
+            // any path transaction.
             && self.passive_room(now, target.filter(|_| replacement), id, scoped, &segment)
         {
             let request = PathFactoryRequest {

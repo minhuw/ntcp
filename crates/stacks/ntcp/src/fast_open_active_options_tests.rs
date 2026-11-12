@@ -381,13 +381,16 @@ fn packet_test_timestamp_default_controls_time_wait_reuse_without_changing_old_s
         server.packet_test_timestamp_default(false);
         assert_eq!(
             server.input(300, first_syn.0, &syn),
-            Ok(InputDisposition::Dropped)
+            Ok(InputDisposition::Processed)
         );
-        // The record is untouched: still in TIME-WAIT, its timer unchanged,
-        // nothing sent and no connection opened.
+        // The record answers the SYN with its ACK, as a Linux timewait
+        // socket does (TCP_TW_ACK_OOW), and is otherwise untouched: still in
+        // TIME-WAIT, its timer unchanged and no connection opened.
         assert_eq!(server.time_wait_connections(), 1);
         assert_eq!(server.connection_id(tuple), None);
-        assert_eq!(server.next_deadline(), old_expiry);
+        let ack = packet(&mut server, 300);
+        let ack = wire::parse(ack.0, &ack.1).unwrap();
+        assert_eq!(ack.header.flags, wire::ACK);
         assert!(
             server
                 .poll_transmit(300, &mut [0; 2000], 8)
@@ -395,6 +398,7 @@ fn packet_test_timestamp_default_controls_time_wait_reuse_without_changing_old_s
                 .packet
                 .is_none()
         );
+        assert_eq!(server.next_deadline(), old_expiry);
         server.packet_test_timestamp_default(true);
         assert_eq!(
             server.input(301, first_syn.0, &syn),

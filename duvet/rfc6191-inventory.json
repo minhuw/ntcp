@@ -97,13 +97,9 @@
       "id": "6191-otherwise-drop",
       "section": "2",
       "quote": "* Otherwise, silently drop the incoming SYN segment, thus leaving the previous incarnation of the connection in the TIME-WAIT state.",
-      "status": "covered",
-      "reason": "Rejected freshness leaves the old TIME-WAIT owner and metadata untouched and emits no output, including for payload-bearing requests.",
+      "status": "exception",
+      "reason": "Deliberate Linux-compatible deviation: with EndpointConfig::reuse_time_wait, a SYN that fails these checks is not dropped silently. It is the TIME-WAIT's to answer, as any SYN is without reuse: a TIME-WAIT record or a held connection sends its challenge ACK (SND.NXT, RCV.NXT) within the RFC 5961 challenge-ACK budget, takes none of its data and stays in TIME-WAIT with its timer unchanged. Linux's tcp_timewait_state_process returns TCP_TW_ACK_OOW for such a SYN, and tcp_v4_rcv sends the timewait ACK. A SYN that passes the checks but finds no listener is answered the same way, as Linux's TCP_TW_SYN falls through to that ACK.",
       "target": "https://www.rfc-editor.org/rfc/rfc6191#section-2",
-      "evidence": [
-        "crates/stacks/ntcp/src/endpoint.rs::fn reopen_time_wait(",
-        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization()"
-      ],
       "occurrences": 2,
       "branches": [
         "old-timestamps-otherwise",
@@ -190,13 +186,9 @@
       "id": "6191-stale-ts-fallback",
       "section": "3",
       "quote": "In the worst-case scenario, an incoming SYN corresponding to a new incarnation of a connection in the TIME-WAIT contains a timestamp that is smaller than the last timestamp seen on the previous incarnation of the connection, the heuristics fail, and the result is no worse than the current state of affairs. That is, the SYN segment is ignored (as specified in [RFC1337]), and thus the connection request times out, or is accepted after future retransmissions of the SYN.",
-      "status": "covered",
-      "reason": "Stale timestamps silently reject the entire SYN request; a later fresh retransmission can still create a child from the unchanged old record.",
-      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-3",
-      "evidence": [
-        "crates/stacks/ntcp/src/endpoint.rs::fn reopen_time_wait(",
-        "crates/stacks/ntcp/src/endpoint_tests.rs::fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization()"
-      ]
+      "status": "exception",
+      "reason": "Deliberate Linux-compatible deviation: with EndpointConfig::reuse_time_wait, a SYN whose timestamp is older than the previous incarnation's is not ignored. The TIME-WAIT answers it with its challenge ACK within the RFC 5961 challenge-ACK budget, as it answers any SYN without reuse and as Linux's timewait socket does (a PAWS rejection, TCP_TW_ACK_OOW). The previous incarnation stays in TIME-WAIT, and the connection request opens once the client's RST to that ACK has ended the TIME-WAIT, or a retransmission carries a newer timestamp.",
+      "target": "https://www.rfc-editor.org/rfc/rfc6191#section-3"
     },
     {
       "id": "6191-3-context-2",

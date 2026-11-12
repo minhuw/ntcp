@@ -85,11 +85,11 @@ class TimeWaitPersistInventories(unittest.TestCase):
         rows = {r["id"].removeprefix("6191-"): r for r in ledger(6191)["paragraphs"]}
         expected = {
             "old-ts-newer-ts": "covered", "old-ts-equal-ts": "covered",
-            "old-ts-no-new-ts": "covered", "otherwise-drop": "covered",
+            "old-ts-no-new-ts": "covered", "otherwise-drop": "exception",
             "no-old-ts-new-ts": "covered", "no-old-ts-no-new-ts": "covered",
             "bilateral-definition": "covered", "fin-definition": "covered",
             "paws-monotonic": "covered", "processing-boundary": "covered",
-            "stale-ts-fallback": "covered", "isn-independence": "covered",
+            "stale-ts-fallback": "exception", "isn-independence": "covered",
             "boot-quiet-time": "exception",
         }
         self.assertEqual({key: r["status"] for key, r in rows.items() if r["status"] != "context"}, expected)
@@ -97,8 +97,7 @@ class TimeWaitPersistInventories(unittest.TestCase):
                          ["old-timestamps-otherwise", "no-old-timestamps-otherwise"])
         self.assertEqual(rows["otherwise-drop"]["occurrences"], 2)
         branches = ("old-ts-newer-ts", "old-ts-equal-ts", "old-ts-no-new-ts",
-                    "otherwise-drop", "no-old-ts-new-ts", "no-old-ts-no-new-ts",
-                    "stale-ts-fallback", "isn-independence")
+                    "no-old-ts-new-ts", "no-old-ts-no-new-ts", "isn-independence")
         for key in branches:
             with self.subTest(clause=key):
                 self.assertEqual(rows[key]["evidence"][1],
@@ -136,6 +135,21 @@ class TimeWaitPersistInventories(unittest.TestCase):
         for path in (ROOT / "crates").rglob("*.rs"):
             for annotation in audit.source_annotations(path.read_text()):
                 self.assertNotEqual(audit.clause_key(annotation), audit.clause_key(quiet), str(path))
+        # A SYN that may not reopen its tuple is answered with the TIME-WAIT's
+        # challenge ACK, as Linux's timewait socket answers it, not dropped
+        # silently or ignored: both clauses are deviations no annotation cites.
+        refused = {key: rows[key] for key in ("otherwise-drop", "stale-ts-fallback")}
+        for key, row in refused.items():
+            with self.subTest(clause=key):
+                self.assertNotIn("evidence", row)
+                for fact in ("Linux-compatible", "EndpointConfig::reuse_time_wait",
+                             "challenge ACK", "RFC 5961 challenge-ACK budget", "TCP_TW_ACK_OOW"):
+                    self.assertIn(fact, row["reason"])
+        self.assertIn("finds no listener", refused["otherwise-drop"]["reason"])
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                for row in refused.values():
+                    self.assertNotEqual(audit.clause_key(annotation), audit.clause_key(row), str(path))
         # Monotonicity also has the provider's own decreasing-sample tests.
         for path, anchor, key in (
             ("crates/adapters/ntcp-clock/src/transport_tests.rs",

@@ -255,10 +255,11 @@ fn the_syn_offers_sack_and_timestamps_without_ecn_and_a_lost_tail_returns_near_2
 }
 
 // The server closes first, so its side of the tuple is in TIME-WAIT. A
-// replayed SYN of the old incarnation opens nothing and leaves it there; the
-// client's next SYN from the same port reopens the tuple at once, as a Linux
-// listener takes it (tcp_timewait_state_process, TCP_TW_SYN), rather than
-// after the 60 s.
+// replayed SYN of the old incarnation opens nothing and leaves it there,
+// answered with the TIME-WAIT's ACK as a Linux timewait socket answers it
+// (TCP_TW_ACK_OOW); the client's next SYN from the same port reopens the
+// tuple at once, as a Linux listener takes it (tcp_timewait_state_process,
+// TCP_TW_SYN), rather than after the 60 s.
 #[test]
 fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
     const CLIENT_PORT: u16 = 40000;
@@ -304,8 +305,8 @@ fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
     assert_eq!(server.counters().time_wait_connections, 1);
     assert_eq!(client.counters().time_wait_connections, 0);
     // The old incarnation's SYN: its sequence number is below the FIN the
-    // TIME-WAIT acknowledged. Only the server takes it in, and whatever it
-    // answers stays off the wire: a client's RST to an ACK would end the
+    // TIME-WAIT acknowledged. Only the server takes it in, and its answer
+    // stays off the wire: a client's RST to that ACK would end the
     // TIME-WAIT (Linux's tcp_rfc1337=0 does the same).
     let sent = server_wire.sent.borrow().len();
     b.borrow_mut().push_back(old_syn);
@@ -314,11 +315,10 @@ fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
         server.drive(now, BUDGET).unwrap();
     }
     a.borrow_mut().clear();
-    assert!(
-        server_wire.sent.borrow()[sent..]
-            .iter()
-            .all(|packet| tcp(packet)[13] & 0x02 == 0)
-    );
+    let answers = server_wire.sent.borrow()[sent..].to_vec();
+    assert_eq!(answers.len(), 1);
+    assert_eq!(tcp(&answers[0])[13], 0x10);
+    assert_eq!(tcp_payload(&answers[0]), 0);
     assert!(!server.acceptable(listener).unwrap());
     assert_eq!(server.counters().time_wait_connections, 1);
     let syns = client_wire.sent.borrow().len();

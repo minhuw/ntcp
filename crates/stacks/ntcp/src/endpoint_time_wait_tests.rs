@@ -141,14 +141,15 @@ fn reopened_syn_data_keeps_ordinary_tfo_authorization_window_and_first_receive_m
                         &stale,
                         stamps(99)
                     ),
-                    Ok(InputDisposition::Dropped)
+                    Ok(InputDisposition::Processed)
                 );
                 assert_eq!(b.connection_id(tuple), Some(old));
                 assert_eq!(b.buffer_bytes(), baseline);
-                assert_eq!(b.next_deadline(), deadline);
                 assert_eq!(b.received_ipv4_options(old).unwrap(), old_options);
                 assert_eq!(b.rx_timestamp_status(old).unwrap(), old_stamps);
-                assert!(packets(&mut b, 4_000).is_empty());
+                // The TIME-WAIT answers the stale SYN with its ACK.
+                assert_time_wait_ack(&packets(&mut b, 4_000), h);
+                assert_eq!(b.next_deadline(), deadline);
                 b.input_with_timestamps(5_000, ip, 0, Ipv4Options::default(), &syn, stamps(111))
                     .unwrap();
                 let child = b.connection_id(tuple).unwrap();

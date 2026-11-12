@@ -2854,6 +2854,21 @@ fn tw_segment_with_payload(
     bytes
 }
 
+// `output` is the one ACK a TIME-WAIT whose last ACK was `old` answers a SYN
+// with that may not reopen its tuple: SND.NXT, RCV.NXT, no data. A Linux
+// timewait socket sends the same (TCP_TW_ACK_OOW, or the timewait ACK of a
+// TCP_TW_SYN that found no listener).
+fn assert_time_wait_ack(output: &[(IpMetadata, Vec<u8>)], old: wire::Header) {
+    assert_eq!(output.len(), 1);
+    let ack = wire::parse(output[0].0, &output[0].1).unwrap();
+    assert_eq!(ack.header.flags, wire::ACK);
+    assert_eq!(
+        (ack.header.sequence, ack.header.acknowledgment),
+        (old.sequence, old.acknowledgment)
+    );
+    assert!(ack.payload.is_empty());
+}
+
 // The fixture exchanges real endpoint SYN/data-control/FIN packets, not synthetic
 // state changes; reopening packets below isolate the RFC freshness boundaries.
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
@@ -2885,14 +2900,10 @@ fn time_wait_reuse_timestamp_and_sequence_freshness() {
             let disposition = b.input(4_000, ip, &syn).unwrap();
             assert_eq!(
                 disposition,
-                if expected {
-                    InputDisposition::Processed
-                } else {
-                    InputDisposition::Dropped
-                },
+                InputDisposition::Processed,
                 "old_ts={old_ts} case={case}"
             );
-            // A stale SYN is the TIME-WAIT connection's to drop, not the
+            // A stale SYN is the TIME-WAIT connection's to answer, not the
             // listener's; a fresh one ends the old incarnation's TIME-WAIT.
             assert_eq!(
                 b.state(old),
@@ -2909,8 +2920,10 @@ fn time_wait_reuse_timestamp_and_sequence_freshness() {
                 Err(EndpointError::Connection(Error::WouldBlock))
             );
             let output = packets(&mut b, 4_000);
-            assert_eq!(output.len(), usize::from(expected));
-            if expected {
+            if !expected {
+                assert_time_wait_ack(&output, h);
+            } else {
+                assert_eq!(output.len(), 1);
                 let synack = wire::parse(output[0].0, &output[0].1).unwrap();
                 assert_eq!(
                     crate::seq::Seq(synack.header.sequence).serial_cmp(crate::seq::Seq(h.sequence)),
@@ -3033,11 +3046,6 @@ fn short_time_wait_ends_at_its_configured_deadline() {
 //# connection request (creating a connection in the SYN-RECEIVED state).
 //= https://www.rfc-editor.org/rfc/rfc6191#section-2
 //= type=test
-//= reason=Rejected freshness leaves the old TIME-WAIT owner and metadata untouched and emits no output, including for payload-bearing requests.
-//# * Otherwise, silently drop the incoming SYN segment, thus leaving the
-//# previous incarnation of the connection in the TIME-WAIT state.
-//= https://www.rfc-editor.org/rfc/rfc6191#section-2
-//= type=test
 //= reason=New bilateral timestamps admit the request independently of sequence when the old incarnation did not negotiate timestamps.
 //# * If TCP Timestamps would be enabled for the new incarnation of the
 //# connection, honor the incoming connection request (creating a connection
@@ -3051,16 +3059,6 @@ fn short_time_wait_ends_at_its_configured_deadline() {
 //# response to it would also contain a Timestamps option (i.e., the server
 //# has enabled TCP Timestamps). In such a scenario, TCP Timestamps would be
 //# enabled for the new incarnation of the connection.
-//= https://www.rfc-editor.org/rfc/rfc6191#section-3
-//= type=test
-//= reason=Stale timestamps silently reject the entire SYN request; a later fresh retransmission can still create a child from the unchanged old record.
-//# In the worst-case scenario, an incoming SYN corresponding to a new
-//# incarnation of a connection in the TIME-WAIT contains a timestamp that
-//# is smaller than the last timestamp seen on the previous incarnation of
-//# the connection, the heuristics fail, and the result is no worse than the
-//# current state of affairs. That is, the SYN segment is ignored (as
-//# specified in [RFC1337]), and thus the connection request times out, or
-//# is accepted after future retransmissions of the SYN.
 //= https://www.rfc-editor.org/rfc/rfc6191#section-4
 //= type=test
 //= reason=Newer bilateral timestamps admit older ISNs for empty and data-bearing requests; equal timestamps still require a sequence strictly after the peer FIN.
@@ -3114,11 +3112,7 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
                         );
                         assert_eq!(
                             b.input(4_000, ip, &syn).unwrap(),
-                            if expected {
-                                InputDisposition::Processed
-                            } else {
-                                InputDisposition::Dropped
-                            },
+                            InputDisposition::Processed,
                             "old={old_timestamps} server={server_timestamps} client={client_timestamps} ts_delta={timestamp_delta} seq_delta={sequence_delta}"
                         );
                         // A reopening SYN ends the old TIME-WAIT at once, as
@@ -3144,8 +3138,8 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
                             })
                             .unwrap();
                         let output = packets(&mut b, 4_000);
-                        assert_eq!(output.len(), usize::from(expected));
                         if expected {
+                            assert_eq!(output.len(), 1);
                             assert_ne!(current, old);
                             assert_eq!(b.state(current), Ok(State::SynReceived));
                             let synack = wire::parse(output[0].0, &output[0].1).unwrap();
@@ -3160,11 +3154,14 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
                                     .after(crate::seq::Seq(h.sequence))
                             );
                         } else {
+                            // The TIME-WAIT answers a SYN that may not reopen it
+                            // with its ACK, as Linux's does (TCP_TW_ACK_OOW).
+                            assert_time_wait_ack(&output, h);
                             assert_eq!(current, old);
                             assert_eq!(b.buffer_bytes(), baseline);
                             assert_eq!(b.next_deadline(), deadline);
                             // A later retransmission with a fresh timestamp can reuse
-                            // the same old record after the silent rejection.
+                            // the same old record after the refusal.
                             if old_timestamps && enabled && timestamp_delta == u32::MAX {
                                 let retry = tw_segment(
                                     ip,
@@ -3225,10 +3222,6 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
 //# state).
 //= https://www.rfc-editor.org/rfc/rfc6191#section-2
 //= type=test
-//# * Otherwise, silently drop the incoming SYN segment, thus leaving the
-//# previous incarnation of the connection in the TIME-WAIT state.
-//= https://www.rfc-editor.org/rfc/rfc6191#section-2
-//= type=test
 //# * If TCP Timestamps would be enabled for the new incarnation of the
 //# connection, honor the incoming connection request (creating a connection
 //# in the SYN-RECEIVED state).
@@ -3240,15 +3233,6 @@ fn rfc6191_reuse_all_timestamp_sequence_branches() {
 //# of the connection (for the same direction of the data transfer), honor
 //# the incoming connection request (creating a connection in the
 //# SYN-RECEIVED state).
-//= https://www.rfc-editor.org/rfc/rfc6191#section-3
-//= type=test
-//# In the worst-case scenario, an incoming SYN corresponding to a new
-//# incarnation of a connection in the TIME-WAIT contains a timestamp that
-//# is smaller than the last timestamp seen on the previous incarnation of
-//# the connection, the heuristics fail, and the result is no worse than the
-//# current state of affairs. That is, the SYN segment is ignored (as
-//# specified in [RFC1337]), and thus the connection request times out, or
-//# is accepted after future retransmissions of the SYN.
 //= https://www.rfc-editor.org/rfc/rfc6191#section-4
 //= type=test
 //# An implementation of the mechanism proposed in this document would
@@ -3316,11 +3300,7 @@ fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization() {
                             assert_eq!(wire::parse(ip, &syn).unwrap().payload, b"data");
                             assert_eq!(
                                 b.input(4_000, ip, &syn).unwrap(),
-                                if expected {
-                                    InputDisposition::Processed
-                                } else {
-                                    InputDisposition::Dropped
-                                },
+                                InputDisposition::Processed,
                                 "old={old_timestamps} local={server_timestamps} peer={client_timestamps} ts={timestamp_delta} seq={sequence_delta} flags={auxiliary}"
                             );
                             // An accepted SYN ends the old TIME-WAIT at once
@@ -3339,7 +3319,7 @@ fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization() {
                             assert_eq!(b.readable_bytes(old), Ok(0));
                             let current = b.connection_id(tuple).unwrap();
                             let output = packets(&mut b, 4_000);
-                            assert_eq!(output.len(), usize::from(expected));
+                            assert_eq!(output.len(), 1);
                             assert_eq!(
                                 b.accept(listener),
                                 Err(EndpointError::Connection(Error::WouldBlock))
@@ -3388,6 +3368,9 @@ fn rfc6191_data_bearing_syn_uses_freshness_and_passive_authorization() {
                                 assert_eq!(&read, b"data");
                                 assert_eq!(b.readable_bytes(current), Ok(0));
                             } else {
+                                // The TIME-WAIT ACKs the refused SYN and takes
+                                // none of its data.
+                                assert_time_wait_ack(&output, h);
                                 assert_eq!(current, old);
                                 assert_eq!(b.buffer_bytes(), baseline);
                                 assert_eq!(b.next_deadline(), deadline);
@@ -3520,11 +3503,7 @@ fn rfc6191_sequence_reuse_uses_peer_fin_serial_frontier() {
                         );
                         assert_eq!(
                             b.input(4_000, ip, &syn).unwrap(),
-                            if accepted {
-                                InputDisposition::Processed
-                            } else {
-                                InputDisposition::Dropped
-                            },
+                            InputDisposition::Processed,
                             "fin={fin} offset={offset} old_ts={old_timestamps} incoming_ts={incoming_timestamps}"
                         );
                         assert_eq!(
@@ -3536,8 +3515,8 @@ fn rfc6191_sequence_reuse_uses_peer_fin_serial_frontier() {
                             })
                         );
                         let output = packets(&mut b, 4_000);
-                        assert_eq!(output.len(), usize::from(accepted));
                         if accepted {
+                            assert_eq!(output.len(), 1);
                             let synack = wire::parse(output[0].0, &output[0].1).unwrap();
                             assert_eq!(
                                 synack.header.acknowledgment,
@@ -3557,6 +3536,7 @@ fn rfc6191_sequence_reuse_uses_peer_fin_serial_frontier() {
                             assert_eq!(b.state(child), Ok(State::SynReceived));
                             assert_eq!(b.readable_bytes(child), Ok(0));
                         } else {
+                            assert_time_wait_ack(&output, h);
                             assert_eq!(
                                 b.connection_id(Tuple {
                                     local: remote,
@@ -3760,12 +3740,27 @@ fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
             Some((ts + 1, 0)),
             payload,
         );
-        assert_eq!(b.input(4_000, ip, &syn).unwrap(), InputDisposition::Dropped);
+        // A fresh SYN the listener has no room for is its drop. One that
+        // finds no listener is the TIME-WAIT's to answer, as Linux's
+        // TCP_TW_SYN falls through to the timewait ACK.
+        assert_eq!(
+            b.input(4_000, ip, &syn).unwrap(),
+            if pressure == 2 {
+                InputDisposition::Processed
+            } else {
+                InputDisposition::Dropped
+            }
+        );
         assert_eq!(b.buffer_bytes(), bytes);
         assert_eq!(b.state(old), Ok(State::TimeWait));
-        assert!(packets(&mut b, 4_000).is_empty());
-        // A fresh SYN the listener has no room for is its drop, at a full
-        // backlog also an overflow; a closed listener took none.
+        let output = packets(&mut b, 4_000);
+        if pressure == 2 {
+            assert_time_wait_ack(&output, h);
+        } else {
+            assert!(output.is_empty());
+        }
+        // At a full backlog the drop is also an overflow; a closed listener
+        // took none.
         let counted = match pressure {
             0 | 1 => (0, 1),
             2 => (0, 0),
@@ -3773,6 +3768,74 @@ fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
         };
         assert_eq!((b.listen_overflows(), b.listen_drops()), counted);
         assert_eq!(b.time_wait_connections(), 1);
+    }
+}
+
+// With reuse_time_wait, a SYN that may not reopen its tuple, stale or with
+// no listener to take it, is the TIME-WAIT's to answer, as it answers any
+// SYN without reuse: a challenge ACK within the challenge-ACK budget,
+// carrying the connection's mark (Linux's tw_mark), its timer and the listen
+// counters unchanged. A Linux timewait socket ACKs both
+// (tcp_timewait_state_process returns TCP_TW_ACK_OOW for the first, and
+// tcp_v4_rcv's TCP_TW_SYN falls through to the timewait ACK for the
+// second). A record and a held connection answer alike.
+#[test]
+fn a_time_wait_answers_a_syn_that_may_not_reopen_it_as_without_reuse() {
+    for released in [false, true] {
+        for no_listener in [false, true] {
+            let mut answers = Vec::new();
+            for reuse in [false, true] {
+                let mut cfg = config();
+                cfg.connection.timestamps = true;
+                cfg.connection.challenge_ack_limit = 2;
+                let (mut b, listener, old, ip, h, ts) = time_wait_endpoint_with(cfg, reuse);
+                b.set_mark(old, 0x2a).unwrap();
+                if released {
+                    b.release(old).unwrap();
+                }
+                if no_listener {
+                    b.close_listener(listener).unwrap();
+                }
+                packets(&mut b, 3_000);
+                let deadline = b.next_deadline();
+                // Without a listener even a fresh SYN cannot reopen the tuple.
+                let value = if no_listener {
+                    ts.wrapping_add(1)
+                } else {
+                    ts.wrapping_sub(1)
+                };
+                let syn = tw_segment(
+                    ip,
+                    h,
+                    h.acknowledgment.wrapping_add(100),
+                    0,
+                    wire::SYN,
+                    Some((value, 0)),
+                );
+                let mut output = Vec::new();
+                for now in [4_000, 4_001, 4_002] {
+                    assert_eq!(b.input(now, ip, &syn), Ok(InputDisposition::Processed));
+                    let mut answer = Vec::new();
+                    let mut bytes = [0; 2048];
+                    while let Some(packet) = b.poll_transmit(now, &mut bytes, 16).unwrap().packet {
+                        assert_eq!(packet.mark, 0x2a);
+                        answer.push((packet.ip, bytes[..packet.len].to_vec()));
+                    }
+                    output.push(answer);
+                }
+                let case =
+                    alloc::format!("released={released} no_listener={no_listener} reuse={reuse}");
+                assert_time_wait_ack(&output[0], h);
+                assert_time_wait_ack(&output[1], h);
+                assert!(output[2].is_empty(), "{case}");
+                assert_eq!(b.time_wait_connections(), 1, "{case}");
+                assert_eq!(b.connection_exists(old), !released, "{case}");
+                assert_eq!((b.listen_overflows(), b.listen_drops()), (0, 0), "{case}");
+                assert_eq!(b.next_deadline(), deadline, "{case}");
+                answers.push(output);
+            }
+            assert_eq!(answers[0], answers[1]);
+        }
     }
 }
 

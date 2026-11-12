@@ -3416,15 +3416,18 @@ impl Endpoint {
             //# the ISN (Initial Sequence Number) and the Timestamps option (if present)
             //# of the incoming SYN segment are included in the heuristics performed for
             //# allowing a high connection-establishment rate.
-            if self.config.reuse_time_wait && segment.header.flags & (SYN | ACK | RST) == SYN {
-                return self.reopen_time_wait(
+            if self.config.reuse_time_wait
+                && segment.header.flags & (SYN | ACK | RST) == SYN
+                && let Some(disposition) = self.reopen_time_wait(
                     Target::TimeWait(index),
                     tuple,
                     traffic_class,
                     options,
                     segment,
                     timestamps,
-                );
+                )?
+            {
+                return Ok(disposition);
             }
             let record = self.time_wait.record_mut(index);
             let deadline = record.deadline;
@@ -3455,16 +3458,18 @@ impl Endpoint {
             if self.config.reuse_time_wait
                 && slot.connection.state() == State::TimeWait
                 && segment.header.flags & (SYN | ACK | RST) == SYN
-            {
-                return self.reopen_time_wait(
+                && let Some(disposition) = self.reopen_time_wait(
                     Target::Connection(index),
                     tuple,
                     traffic_class,
                     options,
                     segment,
                     timestamps,
-                );
+                )?
+            {
+                return Ok(disposition);
             }
+            let slot = self.slots[index].as_ref().unwrap();
             let authority = slot.receive_authority.filter(|_| {
                 slot.connection.state() == State::SynSent
                     && segment.header.flags & (SYN | ACK | RST) == SYN
@@ -3652,7 +3657,7 @@ impl Endpoint {
     }
 
     // Why `passive_room` refuses a SYN. A SYN that may not reopen its
-    // TIME-WAIT connection is that connection's to drop and never reaches
+    // TIME-WAIT connection is that connection's to answer and never reaches
     // the listener's queue, as in Linux, so it is told apart first.
     fn passive_refusal(
         &self,
@@ -3708,6 +3713,13 @@ impl Endpoint {
     // incarnation's ISN follows the old one's (reuse_iss), but the old
     // TIME-WAIT ends when the new connection takes the tuple, as in Linux,
     // and nothing returns to it if the SYN was an old duplicate.
+    //
+    // `None` leaves the SYN to the TIME-WAIT, which answers it as it does
+    // any SYN, with its challenge ACK: a SYN that is not fresh, or finds no
+    // listener. Linux does the same (tcp_timewait_state_process returns
+    // TCP_TW_ACK_OOW for the first, and tcp_v4_rcv's TCP_TW_SYN falls through
+    // to the timewait ACK for the second), where RFC 6191 drops the SYN
+    // silently; duvet/rfc6191-todos.toml records that exception.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
     //# This algorithm for reducing TIME-WAIT is a Best
     //# Current Practice that SHOULD be implemented since Timestamp Options
@@ -3721,23 +3733,10 @@ impl Endpoint {
     //# connection (for that direction of the data transfer), honor the
     //# connection request (creating a connection in the SYN-RECEIVED state).
     //= https://www.rfc-editor.org/rfc/rfc6191#section-2
-    //= reason=Rejected freshness leaves the old TIME-WAIT owner and metadata untouched and emits no output, including for payload-bearing requests.
-    //# * Otherwise, silently drop the incoming SYN segment, thus leaving the
-    //# previous incarnation of the connection in the TIME-WAIT state.
-    //= https://www.rfc-editor.org/rfc/rfc6191#section-2
     //= reason=New bilateral timestamps admit the request independently of sequence when the old incarnation did not negotiate timestamps.
     //# * If TCP Timestamps would be enabled for the new incarnation of the
     //# connection, honor the incoming connection request (creating a connection
     //# in the SYN-RECEIVED state).
-    //= https://www.rfc-editor.org/rfc/rfc6191#section-3
-    //= reason=Stale timestamps silently reject the entire SYN request; a later fresh retransmission can still create a child from the unchanged old record.
-    //# In the worst-case scenario, an incoming SYN corresponding to a new
-    //# incarnation of a connection in the TIME-WAIT contains a timestamp that
-    //# is smaller than the last timestamp seen on the previous incarnation of
-    //# the connection, the heuristics fail, and the result is no worse than the
-    //# current state of affairs. That is, the SYN segment is ignored (as
-    //# specified in [RFC1337]), and thus the connection request times out, or
-    //# is accepted after future retransmissions of the SYN.
     //= https://www.rfc-editor.org/rfc/rfc6191#section-4
     //= reason=Newer bilateral timestamps admit older ISNs for empty and data-bearing requests; equal timestamps still require a sequence strictly after the peer FIN.
     //# An implementation of the mechanism proposed in this document would
@@ -3754,16 +3753,18 @@ impl Endpoint {
         options: Ipv4Options,
         syn: &wire::Segment<'_>,
         timestamps: RxPacketTimestamps,
-    ) -> Result<InputDisposition, EndpointError> {
+    ) -> Result<Option<InputDisposition>, EndpointError> {
         let tuple = scoped.tuple;
         let Some(listener) = self.match_listener(tuple.local, scoped.zone) else {
-            return Ok(InputDisposition::Dropped);
+            return Ok(None);
         };
-        if let Some(refusal) = self.passive_refusal(self.now, Some(target), listener, scoped, syn) {
-            if refusal != PassiveRefusal::TimeWait {
+        match self.passive_refusal(self.now, Some(target), listener, scoped, syn) {
+            Some(PassiveRefusal::TimeWait) => return Ok(None),
+            Some(refusal) => {
                 self.count_listen_drop(refusal == PassiveRefusal::Backlog);
+                return Ok(Some(InputDisposition::Dropped));
             }
-            return Ok(InputDisposition::Dropped);
+            None => {}
         }
         let record = self.listeners[listener.slot].as_ref().unwrap();
         let application_timeout = record.application_timeout_us;
@@ -3794,7 +3795,7 @@ impl Endpoint {
             Ok(connection) => connection,
             Err(Error::NoMemory) => {
                 self.count_listen_drop(false);
-                return Ok(InputDisposition::Dropped);
+                return Ok(Some(InputDisposition::Dropped));
             }
             Err(error) => return Err(error.into()),
         };
@@ -3815,7 +3816,7 @@ impl Endpoint {
             _ => None,
         };
         Self::save_ipv4_options(slot, options, route);
-        Ok(InputDisposition::Processed)
+        Ok(Some(InputDisposition::Processed))
     }
 
     fn prepare_write_metadata(
