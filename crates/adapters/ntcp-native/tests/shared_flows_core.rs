@@ -92,6 +92,7 @@ fn limits(members: usize) -> SharedFlowLimits {
         members,
         inbox_packets: 64,
         packet_bytes: 1500,
+        redirected_flows: 64,
     }
 }
 fn neighbors(members: usize) -> SharedNeighbors {

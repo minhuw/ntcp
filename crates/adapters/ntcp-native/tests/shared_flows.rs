@@ -136,6 +136,7 @@ fn limits(members: usize, inbox_packets: usize) -> SharedFlowLimits {
         members,
         inbox_packets,
         packet_bytes: 1500,
+        redirected_flows: MEMBER_CONNECTIONS,
     }
 }
 fn hash_flows(members: usize, inbox_packets: usize) -> SharedFlows {
@@ -2266,4 +2267,376 @@ fn a_group_of_one_opens_and_accepts_as_a_lone_network() {
     assert_eq!(ports, lone_ports);
     assert_eq!(segments, lone_segments);
     assert_eq!(lan.handoffs(), (0, 0, 0));
+}
+
+// 7. Members that do not listen.
+//
+// Linux hands a SYN for a port some sockets of a SO_REUSEPORT group listen
+// on to one of those, chosen by the flow's hash (reuseport_select_sock),
+// whichever socket's CPU the NIC steered it to: no SYN is reset for want of
+// a listener while the group's members start, or while one restarts its
+// listener. Under `FlowOwnership::Hash` a member that does not listen on the
+// port hands such a SYN to one that does, and the flow stays with it.
+
+// `count` ports of the peer's from 20 000 up whose flows to LISTEN on
+// ADDRESS member `k` owns.
+fn peer_ports_of(flows: &SharedFlows, k: usize, count: usize) -> Vec<u16> {
+    let local = SocketAddrV4::new(ADDRESS, LISTEN);
+    (20_000..)
+        .filter(|&p| flows.owner(local, SocketAddrV4::new(PEER, p)) == Some(k))
+        .take(count)
+        .collect()
+}
+// The peer's connection to LISTEN from `port`, sending `len` octets.
+fn open_from(lan: &mut Lan, port: u16, id: usize, len: usize) -> Client {
+    let to = SocketAddr::new(ADDRESS.into(), LISTEN);
+    let connection = lan.peer.network.connect_from(to, Some(port)).unwrap();
+    Client::new(connection, payload(id, len))
+}
+// Runs `lan` with the echo servers of the members that have one until every
+// client has its payload back, within `limit`.
+fn echo_all(lan: &mut Lan, servers: &mut [Option<Echo>], clients: &mut [Client], limit: u64) {
+    let limit = lan.now + limit;
+    let done = lan.run(limit, |lan| {
+        for (k, server) in servers.iter_mut().enumerate() {
+            if let (Some(server), Some(member)) = (server, &mut lan.members[k]) {
+                server.serve(&mut member.network);
+            }
+        }
+        for client in clients.iter_mut() {
+            client.pump(&mut lan.peer.network);
+        }
+        clients.iter().all(Client::done)
+    });
+    let finished = clients.iter().filter(|c| c.done()).count();
+    assert!(done, "{finished} of {} finished", clients.len());
+    assert_echoed(clients);
+}
+// The member whose echo server accepted the connection from peer `port`.
+fn holder(lan: &Lan, servers: &[Option<Echo>], port: u16) -> Option<usize> {
+    (0..servers.len()).find(|&k| {
+        servers[k].as_ref().is_some_and(|server| {
+            let network = &lan.members[k].as_ref().unwrap().network;
+            server.connections.iter().any(|&(c, _)| {
+                network
+                    .connection_info(c)
+                    .is_ok_and(|info| info.peer.port() == port)
+            })
+        })
+    })
+}
+
+// Of n members only the even ones listen, as when the odd ones have yet
+// to start: the peer's SYNs whose flows odd members own are answered by
+// listening members, and their connections complete there without a
+// reset, wherever the NIC puts their segments. Once the odd members listen
+// they accept their own flows' connections, and the earlier ones carry on
+// where they are.
+#[test]
+fn syns_for_members_that_do_not_listen_yet_go_to_members_that_do() {
+    for n in [2, 4] {
+        for dispatch in [Dispatch::rss(n), Dispatch::Queue0, Dispatch::Scatter(7)] {
+            let mut lan = hash_lan(n, dispatch.clone(), INBOX);
+            let flows = lan.flows.clone().unwrap();
+            let mut servers: Vec<Option<Echo>> = (0..n)
+                .map(|k| (k % 2 == 0).then(|| Echo::new(lan.network(k))))
+                .collect();
+            // Four flows of each member's for now, four for later.
+            let owned: Vec<Vec<u16>> = (0..n).map(|k| peer_ports_of(&flows, k, 8)).collect();
+            let ports: Vec<u16> = owned.iter().flat_map(|p| p[..4].to_vec()).collect();
+            let later: Vec<u16> = owned.iter().flat_map(|p| p[4..].to_vec()).collect();
+            let mut clients: Vec<Client> = ports
+                .iter()
+                .enumerate()
+                .map(|(i, &port)| open_from(&mut lan, port, i, 4 * MSS))
+                .collect();
+            echo_all(&mut lan, &mut servers, &mut clients, 5 * SECOND);
+            lan.assert_no_resets();
+            // Each odd member handed its four SYNs to even ones, which hold
+            // their flows.
+            for k in (1..n).step_by(2) {
+                assert_eq!(lan.network(k).counters().redirected, 4, "{n} {dispatch:?}");
+                assert_eq!(flows.redirected(k), 4);
+            }
+            assert_eq!(flows.redirected(0), 0);
+            let local = SocketAddrV4::new(ADDRESS, LISTEN);
+            for &port in &ports {
+                let held = holder(&lan, &servers, port);
+                let held = held.unwrap_or_else(|| panic!("{n} {dispatch:?}: port {port}"));
+                assert_eq!(held % 2, 0);
+                // The flow is its holder's now.
+                assert_eq!(
+                    flows.owner(local, SocketAddrV4::new(PEER, port)),
+                    Some(held)
+                );
+            }
+            // The odd members start: new flows of theirs are their own, and
+            // the earlier connections echo again.
+            for k in (1..n).step_by(2) {
+                servers[k] = Some(Echo::new(lan.network(k)));
+            }
+            let mut again: Vec<Client> = clients
+                .iter()
+                .enumerate()
+                .map(|(i, c)| Client::new(c.connection, payload(100 + i, 2 * MSS)))
+                .chain(
+                    later
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &port)| open_from(&mut lan, port, 200 + i, 2 * MSS)),
+                )
+                .collect();
+            echo_all(&mut lan, &mut servers, &mut again, 5 * SECOND);
+            lan.assert_no_resets();
+            for &port in &later {
+                let owner = flows.owner(local, SocketAddrV4::new(PEER, port));
+                assert_eq!(holder(&lan, &servers, port), owner, "{n} {dispatch:?}");
+            }
+        }
+    }
+}
+
+fn drain(network: &mut Network<Port>) {
+    let mut events = [Event::NetworkStopped; 64];
+    while network.drain_events(&mut events).more {}
+}
+
+// Every member listens and has connections when member 1 closes its
+// listener: SYNs of its flows go to the others, as SYNs reach the sockets
+// left in a reuseport group, while its accepted connections carry on, as
+// a Linux listener's close leaves them. Once it listens again its new flows
+// are its own.
+#[test]
+fn syns_for_a_member_that_stops_listening_go_to_members_still_listening() {
+    for n in [2, 4] {
+        let mut lan = hash_lan(n, Dispatch::rss(n), INBOX);
+        let flows = lan.flows.clone().unwrap();
+        let mut servers: Vec<Option<Echo>> =
+            (0..n).map(|k| Some(Echo::new(lan.network(k)))).collect();
+        let owned = peer_ports_of(&flows, 1, 12);
+        let mut first: Vec<Client> = owned[..4]
+            .iter()
+            .enumerate()
+            .map(|(i, &port)| open_from(&mut lan, port, i, 2 * MSS))
+            .collect();
+        echo_all(&mut lan, &mut servers, &mut first, 5 * SECOND);
+        for &port in &owned[..4] {
+            assert_eq!(holder(&lan, &servers, port), Some(1));
+        }
+        let listener = servers[1].as_ref().unwrap().listener;
+        lan.network(1).close_listener(listener).unwrap();
+        let until = lan.now + 10_000;
+        lan.run(until, |_| false);
+        // The listener's accepted connections stay served; its accepts
+        // fail.
+        let mut servers_then = servers;
+        let mut again: Vec<Client> = first
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Client::new(c.connection, payload(100 + i, MSS)))
+            .chain(
+                owned[4..8]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &port)| open_from(&mut lan, port, 200 + i, 2 * MSS)),
+            )
+            .collect();
+        echo_all(&mut lan, &mut servers_then, &mut again, 5 * SECOND);
+        lan.assert_no_resets();
+        assert_eq!(lan.network(1).counters().redirected, 4, "{n}");
+        assert_eq!(flows.redirected(1), 4);
+        for &port in &owned[4..8] {
+            let held = holder(&lan, &servers_then, port).unwrap();
+            assert_ne!(held, 1, "{n}: port {port}");
+        }
+        // Listening again, member 1 takes its new flows itself.
+        servers_then[1].as_mut().unwrap().listener = lan.network(1).listen(LISTEN, 64).unwrap();
+        let mut last: Vec<Client> = owned[8..]
+            .iter()
+            .enumerate()
+            .map(|(i, &port)| open_from(&mut lan, port, 300 + i, 2 * MSS))
+            .collect();
+        echo_all(&mut lan, &mut servers_then, &mut last, 5 * SECOND);
+        lan.assert_no_resets();
+        for &port in &owned[8..] {
+            assert_eq!(holder(&lan, &servers_then, port), Some(1));
+        }
+        assert_eq!(lan.network(1).counters().redirected, 4);
+    }
+}
+
+// A held flow is its owner's again once the holder's connection is
+// reclaimed: after both ends close, whichever closes first, and when the
+// holder's listener closes with the connection never accepted. A SYN of the
+// flow then reaches its owner, which accepts it.
+#[test]
+fn a_held_flow_returns_to_its_owner_when_its_connection_ends() {
+    let n = 2;
+    for holder_closes_first in [false, true] {
+        let mut lan = hash_lan(n, Dispatch::Queue0, INBOX);
+        let flows = lan.flows.clone().unwrap();
+        let mut servers: Vec<Option<Echo>> = vec![Some(Echo::new(lan.network(0))), None];
+        let owned = peer_ports_of(&flows, 1, 4);
+        let mut clients: Vec<Client> = owned
+            .iter()
+            .enumerate()
+            .map(|(i, &port)| open_from(&mut lan, port, i, 2 * MSS))
+            .collect();
+        echo_all(&mut lan, &mut servers, &mut clients, 5 * SECOND);
+        assert_eq!(flows.redirected(1), 4);
+        let accepted: Vec<ConnId> = servers[0]
+            .as_ref()
+            .unwrap()
+            .connections
+            .iter()
+            .map(|&(c, _)| c)
+            .collect();
+        let (first, second): (Vec<_>, Vec<_>) = if holder_closes_first {
+            (
+                accepted.clone(),
+                clients.iter().map(|c| c.connection).collect(),
+            )
+        } else {
+            (
+                clients.iter().map(|c| c.connection).collect(),
+                accepted.clone(),
+            )
+        };
+        let (first_on_peer, second_on_peer) = (!holder_closes_first, holder_closes_first);
+        for &c in &first {
+            if first_on_peer {
+                lan.peer.network.close(c).unwrap()
+            } else {
+                lan.network(0).close(c).unwrap()
+            }
+        }
+        let until = lan.now + 100_000;
+        lan.run(until, |lan| {
+            drain(lan.network(0));
+            drain(&mut lan.peer.network);
+            false
+        });
+        assert_eq!(flows.redirected(1), 4, "the connections are not over yet");
+        for &c in &second {
+            if second_on_peer {
+                lan.peer.network.close(c).unwrap()
+            } else {
+                lan.network(0).close(c).unwrap()
+            }
+        }
+        let done = lan.run(lan.now + 2 * SECOND, |lan| {
+            drain(lan.network(0));
+            drain(&mut lan.peer.network);
+            flows.redirected(1) == 0
+        });
+        assert!(done, "{} held", flows.redirected(1));
+        lan.assert_no_resets();
+        for &port in &owned {
+            let local = SocketAddrV4::new(ADDRESS, LISTEN);
+            assert_eq!(flows.owner(local, SocketAddrV4::new(PEER, port)), Some(1));
+        }
+    }
+    // Never accepted: the holder's listener closes over them, resetting
+    // them as a Linux listener resets the connections in its queue.
+    let mut lan = hash_lan(n, Dispatch::Queue0, INBOX);
+    let flows = lan.flows.clone().unwrap();
+    let listener = lan.network(0).listen(LISTEN, 64).unwrap();
+    let owned = peer_ports_of(&flows, 1, 4);
+    let clients: Vec<Client> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, &port)| open_from(&mut lan, port, i, 0))
+        .collect();
+    let done = lan.run(SECOND, |lan| {
+        clients.iter().all(|c| {
+            lan.peer
+                .network
+                .connection_info(c.connection)
+                .is_ok_and(|i| i.state == State::Established)
+        })
+    });
+    assert!(done);
+    assert_eq!(flows.redirected(1), 4);
+    lan.network(0).close_listener(listener).unwrap();
+    for c in &clients {
+        let _ = lan.peer.network.close(c.connection);
+    }
+    // The reset connections keep their tuples through the reset's
+    // TIME-WAIT (`time_wait_us`), held as long, then are reclaimed.
+    let quarantine = lan.network(0).config().tcp.connection.time_wait_us;
+    let until = lan.now + quarantine - SECOND;
+    lan.run(until, |lan| {
+        drain(lan.network(0));
+        drain(&mut lan.peer.network);
+        false
+    });
+    assert_eq!(flows.redirected(1), 4);
+    let done = lan.run(lan.now + 2 * SECOND, |lan| {
+        drain(lan.network(0));
+        drain(&mut lan.peer.network);
+        flows.redirected(1) == 0
+    });
+    assert!(done, "{} held", flows.redirected(1));
+    assert_eq!(lan.resets, vec![4, 0]);
+    // Member 1, listening, takes a SYN of a flow it got back.
+    let mut servers: Vec<Option<Echo>> = vec![None, Some(Echo::new(lan.network(1)))];
+    let mut again = vec![open_from(&mut lan, owned[0], 9, MSS)];
+    echo_all(&mut lan, &mut servers, &mut again, 2 * SECOND);
+    assert_eq!(holder(&lan, &servers, owned[0]), Some(1));
+    assert_eq!(lan.resets, vec![4, 0]);
+}
+
+// Of a share's flows at most `redirected_flows` are held elsewhere at once:
+// a SYN beyond that is dropped, not reset, and sent again by its peer
+// reaches the owner, listening by then.
+#[test]
+fn syns_beyond_the_held_flows_bound_are_dropped_and_taken_when_sent_again() {
+    let n = 2;
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: round_robin(n, TABLE),
+    };
+    let limits = SharedFlowLimits {
+        redirected_flows: 2,
+        ..limits(n, INBOX)
+    };
+    let flows = SharedFlows::new(ownership, limits).unwrap();
+    let table = neighbors(n);
+    let stations = (0..n)
+        .map(|k| {
+            join(
+                &flows,
+                &table,
+                k,
+                config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS),
+            )
+        })
+        .collect();
+    let mut lan = Lan::new(stations, Dispatch::rss(n), Some(flows.clone()));
+    let mut servers: Vec<Option<Echo>> = vec![Some(Echo::new(lan.network(0))), None];
+    let owned = peer_ports_of(&flows, 1, 4);
+    let mut clients: Vec<Client> = owned
+        .iter()
+        .enumerate()
+        .map(|(i, &port)| open_from(&mut lan, port, i, MSS))
+        .collect();
+    let until = lan.now + 200_000;
+    lan.run(until, |lan| {
+        servers[0].as_mut().unwrap().serve(lan.network(0));
+        false
+    });
+    assert_eq!(flows.redirected(1), 2);
+    let counters = lan.network(1).counters();
+    assert_eq!((counters.redirected, counters.redirects_dropped), (2, 2));
+    assert_eq!(counters.discarded, 2);
+    servers[1] = Some(Echo::new(lan.network(1)));
+    echo_all(&mut lan, &mut servers, &mut clients, 5 * SECOND);
+    lan.assert_no_resets();
+    assert_eq!(flows.redirected(1), 2);
+    let held: Vec<_> = owned
+        .iter()
+        .map(|&p| holder(&lan, &servers, p).unwrap())
+        .collect();
+    assert_eq!(held.iter().filter(|&&k| k == 0).count(), 2, "{held:?}");
+    assert_eq!(held.iter().filter(|&&k| k == 1).count(), 2, "{held:?}");
 }

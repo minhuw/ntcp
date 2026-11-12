@@ -584,6 +584,9 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 inbox_packets: usize::from(config.rx_desc),
                 // The port's largest IP packet.
                 packet_bytes: usize::from(config.mtu),
+                // The members only open connections, from ports whose flows
+                // they own: none takes another's SYN.
+                redirected_flows: 0,
             };
             Some(steer(&port, &args, limits)?)
         }

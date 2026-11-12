@@ -377,6 +377,7 @@ impl Bench {
                     members,
                     inbox_packets: INBOX,
                     packet_bytes: 1500,
+                    redirected_flows: 0,
                 };
                 let flows = SharedFlows::new(ownership, limits).unwrap();
                 (0..members)
@@ -1196,6 +1197,7 @@ mod threaded {
                 members,
                 inbox_packets: INBOX,
                 packet_bytes: 1500,
+                redirected_flows: 0,
             };
             let flows = SharedFlows::new(ownership, limits).map_err(|e| format!("{e:?}"))?;
             for (k, wire) in member_wires.into_iter().enumerate() {

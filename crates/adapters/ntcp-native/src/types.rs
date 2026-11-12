@@ -257,6 +257,13 @@ pub struct Counters {
     pub handed_off: u64,
     pub handoffs_received: u64,
     pub handoffs_dropped: u64,
+    // A member of shared flows: SYNs of its own flows that it handed to a
+    // member listening on their port, not listening there itself (also in
+    // handed_off), and those it dropped instead because its share already
+    // had `SharedFlowLimits::redirected_flows` flows held elsewhere (also
+    // in discarded).
+    pub redirected: u64,
+    pub redirects_dropped: u64,
     // SYNs a listener dropped because its backlog (its unaccepted
     // connections, half-open and established) was full: Linux's
     // ListenOverflows (`Endpoint::listen_overflows`).

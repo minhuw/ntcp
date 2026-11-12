@@ -14,16 +14,27 @@
 // opens choose local ports whose flows they own, so a segment for which the
 // owner has no connection is one no member has. The members' listening
 // ports are counted here so that no member's active open takes one.
+//
+// The one exception is a SYN that would find no listener at its owner on a
+// port another member listens on, as while a group starts or one member
+// restarts its listener. A SO_REUSEPORT group on Linux hands such a SYN to
+// one of the sockets that listen (reuseport_select_sock), and the owner
+// does likewise: it hands it to a listening member and records the flow as
+// that member's in its share's table of redirected flows, which every
+// member consults, while the table holds any, for the segments of its
+// flows. The holder removes the record once the connection is reclaimed.
 use crate::{Error, Result, inbox::Inbox, toeplitz::Toeplitz};
 use std::{
+    collections::hash_map::RandomState,
     fs::File,
+    hash::BuildHasher,
     io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroU16,
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering, fence},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
     },
 };
 
@@ -87,6 +98,14 @@ pub struct SharedFlowLimits {
     /// (`Network::with_shared_flows` refuses a member otherwise). Only a
     /// packet beyond that, which the owner's Host refuses, allocates.
     pub packet_bytes: usize,
+    /// Flows of each member's share that other members may hold at once,
+    /// having taken their SYNs when it did not listen on their port (unless
+    /// ownership is `FlowOwnership::ByAddress`, where every member listens
+    /// on its own address). A SYN beyond that is dropped, as a listener
+    /// with a full queue drops one, rather than reset by a member that
+    /// does not listen (`Counters::redirects_dropped`), and its peer sends
+    /// it again.
+    pub redirected_flows: usize,
 }
 
 /// The divided flows of one port, shared by the Networks built on it with
@@ -102,6 +121,10 @@ struct Shared {
     limits: SharedFlowLimits,
     slots: Box<[Slot]>,
     registry: Mutex<Registry>,
+    // Bit `p` is set while some member listens on local port `p`: written
+    // under the registry's lock, read without it for a SYN its owner has
+    // no listener for, which then takes no lock unless a member listens.
+    listened: Box<[AtomicU64]>,
 }
 
 enum Ownership {
@@ -229,8 +252,137 @@ struct Slot {
     // has the slot. Changed under the registry's lock; read without it by
     // the members that hand off and by `SharedFlows::owner`.
     address: AtomicU64,
+    // The flows in `redirected`, written under its lock and read without
+    // it on every segment of the share's flows: while it is 0, as when
+    // every member listens, nothing is looked up.
+    held: AtomicUsize,
+    redirected: Mutex<Redirected>,
     inbox: Inbox<Handoff>,
     wake: Wake,
+}
+
+// The flows of one member's share whose SYNs it handed to a listening
+// member, keyed by remote address, remote port and local port (`flow_key`),
+// with the member that holds each. Open addressing with linear probing
+// over at least twice the bound, so that a probe ends at an empty entry
+// within a few; a keyed SipHash, so that peers, who choose their addresses
+// and ports, cannot choose colliding keys; and removal by backward shift,
+// which leaves no tombstones to lengthen later probes.
+struct Redirected {
+    keys: RandomState,
+    entries: Box<[(u64, usize)]>,
+    len: usize,
+    bound: usize,
+}
+
+// An entry's member while it is empty.
+const EMPTY: usize = usize::MAX;
+
+impl Redirected {
+    fn new(bound: usize) -> Result<Self> {
+        let len = match bound {
+            0 => 0,
+            _ => bound
+                .checked_mul(2)
+                .and_then(usize::checked_next_power_of_two)
+                .ok_or(Error::Capacity)?,
+        };
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(len)
+            .map_err(|_| Error::Capacity)?;
+        entries.resize(len, (0, EMPTY));
+        Ok(Self {
+            keys: RandomState::new(),
+            entries: entries.into_boxed_slice(),
+            len: 0,
+            bound,
+        })
+    }
+    fn home(&self, key: u64) -> usize {
+        self.keys.hash_one(key) as usize & (self.entries.len() - 1)
+    }
+    // The entry of `key`, or the empty entry its probe ends at.
+    fn find(&self, key: u64) -> usize {
+        let mask = self.entries.len() - 1;
+        let mut at = self.home(key);
+        while self.entries[at].1 != EMPTY && self.entries[at].0 != key {
+            at = (at + 1) & mask;
+        }
+        at
+    }
+    fn get(&self, key: u64) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let (_, member) = self.entries[self.find(key)];
+        (member != EMPTY).then_some(member)
+    }
+    // Records `key` as `member`'s, unless it is already some member's,
+    // which is returned, or the table is full.
+    fn insert(&mut self, key: u64, member: usize) -> Result<usize> {
+        if let Some(holder) = self.get(key) {
+            return Ok(holder);
+        }
+        if self.len == self.bound {
+            return Err(Error::Capacity);
+        }
+        let at = self.find(key);
+        self.entries[at] = (key, member);
+        self.len += 1;
+        Ok(member)
+    }
+    // Removes `key` if `member` holds it.
+    fn remove(&mut self, key: u64, member: usize) -> bool {
+        if self.get(key) != Some(member) {
+            return false;
+        }
+        self.remove_at(self.find(key));
+        true
+    }
+    // Removes every flow `member` holds. Removal shifts later entries of a
+    // probe back, never one not yet visited before the one at hand: a pass
+    // that looks at an entry again once it removed one visits them all.
+    fn purge(&mut self, member: usize) {
+        let mut at = 0;
+        while at < self.entries.len() {
+            if self.entries[at].1 == member {
+                self.remove_at(at);
+            } else {
+                at += 1;
+            }
+        }
+    }
+    fn remove_at(&mut self, at: usize) {
+        let mask = self.entries.len() - 1;
+        let mut hole = at;
+        let mut next = hole;
+        loop {
+            next = (next + 1) & mask;
+            let (key, member) = self.entries[next];
+            if member == EMPTY {
+                break;
+            }
+            // An entry whose home lies cyclically after the hole and up to
+            // its own place stays; any other moves into the hole, whose
+            // probe would otherwise end before it.
+            let home = self.home(key);
+            if (next.wrapping_sub(home) & mask) >= (next.wrapping_sub(hole) & mask) {
+                self.entries[hole] = (key, member);
+                hole = next;
+            }
+        }
+        self.entries[hole] = (0, EMPTY);
+        self.len -= 1;
+    }
+}
+
+// The key of the flow between `local` and `remote` in a `Redirected`: the
+// local address is every member's.
+fn flow_key(local: SocketAddrV4, remote: SocketAddrV4) -> u64 {
+    u64::from(u32::from(*remote.ip())) << 32
+        | u64::from(remote.port()) << 16
+        | u64::from(local.port())
 }
 
 // How a handoff wakes a member that blocks, on lines of its own: the
@@ -263,9 +415,10 @@ struct Wake {
 }
 
 struct Registry {
-    // The local ports members listen on, ascending, each with the number of
-    // members listening; room for every member's listeners is reserved
-    // when it joins.
+    // The local ports members listen on, ascending, each with a member
+    // that listens on it, once per listener: the sockets of a port's
+    // reuseport group. Room for every member's listeners is reserved when
+    // it joins.
     listening: Vec<(u16, usize)>,
     reserved: usize,
     // Per member, once it declared it (`Member::reassemble`), the IPv4
@@ -274,11 +427,23 @@ struct Registry {
 }
 
 impl Registry {
-    fn unlisten(&mut self, port: u16) {
-        if let Ok(at) = self.listening.binary_search_by_key(&port, |&(p, _)| p) {
-            self.listening[at].1 -= 1;
-            if self.listening[at].1 == 0 {
-                self.listening.remove(at);
+    // The entries of the members listening on `port`.
+    fn listeners(&self, port: u16) -> Range<usize> {
+        let start = self.listening.partition_point(|&(p, _)| p < port);
+        start..self.listening.partition_point(|&(p, _)| p <= port)
+    }
+    fn listen(&mut self, port: u16, member: usize, listened: &[AtomicU64]) {
+        let at = self
+            .listening
+            .partition_point(|&entry| entry < (port, member));
+        self.listening.insert(at, (port, member));
+        listened[usize::from(port) / 64].fetch_or(1 << (port % 64), Ordering::Release);
+    }
+    fn unlisten(&mut self, port: u16, member: usize, listened: &[AtomicU64]) {
+        if let Ok(at) = self.listening.binary_search(&(port, member)) {
+            self.listening.remove(at);
+            if self.listeners(port).is_empty() {
+                listened[usize::from(port) / 64].fetch_and(!(1 << (port % 64)), Ordering::Release);
             }
         }
     }
@@ -329,6 +494,8 @@ impl SharedFlows {
         for _ in 0..limits.members {
             slots.push(Slot {
                 address: AtomicU64::new(0),
+                held: AtomicUsize::new(0),
+                redirected: Mutex::new(Redirected::new(limits.redirected_flows)?),
                 inbox: Inbox::new(limits.inbox_packets, limits.packet_bytes)?,
                 wake: Wake {
                     woken: AtomicBool::new(false),
@@ -347,12 +514,18 @@ impl SharedFlows {
             reserved: 0,
             reassembly,
         };
+        let mut listened = Vec::new();
+        listened
+            .try_reserve_exact(1 << 10)
+            .map_err(|_| Error::Capacity)?;
+        listened.resize_with(1 << 10, AtomicU64::default);
         Ok(Self {
             shared: Arc::new(Shared {
                 ownership,
                 limits,
                 slots: slots.into_boxed_slice(),
                 registry: Mutex::new(registry),
+                listened: listened.into_boxed_slice(),
             }),
         })
     }
@@ -364,12 +537,23 @@ impl SharedFlows {
     /// The member that owns the TCP flow between `local` and `remote`. Under
     /// `FlowOwnership::ByAddress`, None unless a member serves `local`'s
     /// address; under `FlowOwnership::Hash` and `FlowOwnership::TaggedPorts`,
-    /// None unless the members' address is `local`'s.
+    /// None unless the members' address is `local`'s. A flow whose SYN its
+    /// owner handed to a listening member, not listening on its port
+    /// itself, is that member's until its connection is gone.
     pub fn owner(&self, local: SocketAddrV4, remote: SocketAddrV4) -> Option<usize> {
         self.shared
-            .route(*local.ip(), None, Some(local.port()), |hash| {
-                hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
-            })
+            .flow(local, remote, None)
+            .map(|(member, _)| member)
+    }
+
+    /// The flows of member `member`'s share that other members hold, their
+    /// SYNs having come while it did not listen on their port, of at most
+    /// `SharedFlowLimits::redirected_flows`.
+    pub fn redirected(&self, member: usize) -> usize {
+        self.shared
+            .slots
+            .get(member)
+            .map_or(0, |slot| slot.held.load(Ordering::Acquire))
     }
 
     /// The member that reassembles a fragment from `source` to
@@ -483,6 +667,27 @@ impl SharedFlows {
 }
 
 impl Shared {
+    // The member that takes in the TCP flow between `local` and `remote`,
+    // and whether it holds the flow for its owner, which handed it the
+    // flow's SYN (`Redirected`).
+    fn flow(
+        &self,
+        local: SocketAddrV4,
+        remote: SocketAddrV4,
+        me: Option<(usize, Ipv4Addr)>,
+    ) -> Option<(usize, bool)> {
+        let owner = self.route(*local.ip(), me, Some(local.port()), |hash| {
+            hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
+        })?;
+        let slot = &self.slots[owner];
+        if slot.held.load(Ordering::Acquire) == 0 {
+            return Some((owner, false));
+        }
+        Some(match lock(&slot.redirected).get(flow_key(local, remote)) {
+            Some(holder) => (holder, true),
+            None => (owner, false),
+        })
+    }
     // The member that owns what `hash` selects among the flows of local
     // address `address`, or the flows of tagged local port `port`. `me`, a
     // member and its own address, answers for that address without reading
@@ -554,15 +759,47 @@ pub(crate) enum Key {
         destination: Ipv4Addr,
     },
     /// A segment of, or an ICMP error about, the TCP flow between `local`
-    /// and `remote`.
+    /// and `remote`; `syn` for a segment that may open a connection, with
+    /// SYN set and neither ACK nor RST.
     Flow {
         local: SocketAddrV4,
         remote: SocketAddrV4,
+        syn: bool,
     },
+}
+
+/// Where a packet goes (`Member::elsewhere`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Route {
+    pub(crate) to: Option<usize>,
+    pub(crate) held: bool,
+}
+
+/// What becomes of a SYN its owner does not listen for (`Member::redirect`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Redirect {
+    /// Handed to this member, which holds its flow.
+    To(usize),
+    /// Dropped: the owner's share already has as many flows held elsewhere
+    /// as `SharedFlowLimits::redirected_flows`.
+    Full,
+    /// No member listens on its port: the owner answers it.
+    Nobody,
+}
+
+/// A flow of another member's share that a member holds, having taken its
+/// SYN (`Member::held`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Held {
+    owner: usize,
+    key: u64,
 }
 
 const ICMP: u8 = 1;
 const TCP: u8 = 6;
+// SYN, and SYN with ACK or RST, of a TCP header's flags.
+const SYN: u8 = 0x02;
+const SYN_ACK_RST: u8 = 0x16;
 // More Fragments, and the fragment offset.
 const MORE: u16 = 0x2000;
 const OFFSET: u16 = 0x1fff;
@@ -626,6 +863,7 @@ pub(crate) fn key(packet: &[u8]) -> Key {
             Some((source, destination)) => Key::Flow {
                 local: SocketAddrV4::new(header.destination, destination),
                 remote: SocketAddrV4::new(header.source, source),
+                syn: payload.get(13).is_some_and(|f| f & SYN_ACK_RST == SYN),
             },
             None => Key::Local,
         },
@@ -653,6 +891,7 @@ fn quoted(message: &[u8]) -> Option<Key> {
     Some(Key::Flow {
         local: SocketAddrV4::new(header.source, source),
         remote: SocketAddrV4::new(header.destination, destination),
+        syn: false,
     })
 }
 
@@ -660,13 +899,16 @@ fn quoted(message: &[u8]) -> Option<Key> {
 /// backend reported it, which the owner reads against its own clocks;
 /// whether it is a fragment, whose datagram the receiver keys once it
 /// completes it; and for a datagram the sender reassembled its envelope
-/// (`Host::adopt_datagram`).
+/// (`Host::adopt_datagram`). `syn` and `held` are the packet's `Key::Flow`
+/// SYN and `Route` held, which spare the receiver keying it again.
 #[derive(Clone, Copy)]
 pub(crate) struct Handoff {
     pub(crate) timestamps: ntcp_io::PacketTimestamps,
     pub(crate) tcp_segment_size: Option<NonZeroU16>,
     pub(crate) fragment: bool,
     pub(crate) reassembled: Option<ntcp_host::Envelope>,
+    pub(crate) syn: bool,
+    pub(crate) held: bool,
 }
 
 /// One Network's membership in shared flows. Dropping it leaves them: its
@@ -712,27 +954,31 @@ impl Member {
     fn me(&self) -> Option<(usize, Ipv4Addr)> {
         Some((self.index, self.address))
     }
-    fn flow(&self, local: SocketAddrV4, remote: SocketAddrV4) -> Option<usize> {
-        self.shared
-            .route(*local.ip(), self.me(), Some(local.port()), |hash| {
-                hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
-            })
-    }
-    /// The other member that takes in a packet of `key`. None for this
-    /// member's own, and for one of an address no member serves, which this
-    /// member's Host decides.
-    pub(crate) fn elsewhere(&self, key: Key) -> Option<usize> {
-        let owner = match key {
-            Key::Local => None,
+    /// The member that takes in a packet of `key`: `to`, None for this
+    /// member's own and for one of an address no member serves, which this
+    /// member's Host decides; and `held`, that the flow's owner handed its
+    /// SYN to that member (`Member::redirect`).
+    pub(crate) fn elsewhere(&self, key: Key) -> Route {
+        let (to, held) = match key {
+            Key::Local => (None, false),
             Key::Fragment {
                 source,
                 destination,
-            } => self.shared.route(destination, self.me(), None, |hash| {
-                hash.ipv4(source, destination)
-            }),
-            Key::Flow { local, remote } => self.flow(local, remote),
+            } => {
+                let to = self.shared.route(destination, self.me(), None, |hash| {
+                    hash.ipv4(source, destination)
+                });
+                (to, false)
+            }
+            Key::Flow { local, remote, .. } => match self.shared.flow(local, remote, self.me()) {
+                Some((to, held)) => (Some(to), held),
+                None => (None, false),
+            },
         };
-        owner.filter(|&m| m != self.index)
+        Route {
+            to: to.filter(|&m| m != self.index),
+            held,
+        }
     }
     /// Whether the flow from this member's local `port` to `peer` is its
     /// own. An IPv6 peer is no flow of the members; the endpoint refuses it.
@@ -740,8 +986,71 @@ impl Member {
         let SocketAddr::V4(peer) = peer else {
             return true;
         };
-        self.flow(SocketAddrV4::new(self.address, port), peer)
-            .is_none_or(|m| m == self.index)
+        self.shared
+            .flow(SocketAddrV4::new(self.address, port), peer, self.me())
+            .is_none_or(|(m, _)| m == self.index)
+    }
+    /// Whether a SYN for local `port` that this member owns and has no
+    /// connection for is another member's to answer: this member does not
+    /// listen on the port, and some other member does.
+    pub(crate) fn unheard(&self, port: u16) -> bool {
+        !self.listening.contains(&port) && self.listened(port)
+    }
+    /// The listening member that takes the SYN of the flow between `local`
+    /// and `remote`, one this member owns but that is `unheard`, and holds
+    /// the flow until its connection is gone (`release`). Among the
+    /// listeners on the port, a member once per listener, the flow's hash
+    /// picks one as Linux's reuseport_select_sock does (`reciprocal_scale`
+    /// over the group's sockets), so that each takes a like share. A flow
+    /// already redirected stays with its holder, a SYN sent again for it
+    /// included.
+    pub(crate) fn redirect(&self, local: SocketAddrV4, remote: SocketAddrV4) -> Redirect {
+        let shared = &*self.shared;
+        let registry = lock(&shared.registry);
+        let listeners = &registry.listening[registry.listeners(local.port())];
+        if listeners.is_empty() {
+            return Redirect::Nobody;
+        }
+        let hash = match &shared.ownership {
+            Ownership::Hash { hash, .. } | Ownership::TaggedPorts { hash, .. } => {
+                hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
+            }
+            Ownership::ByAddress => return Redirect::Nobody,
+        };
+        let pick = ((u64::from(hash) * listeners.len() as u64) >> 32) as usize;
+        let (_, listener) = listeners[pick];
+        debug_assert_ne!(listener, self.index);
+        let slot = &shared.slots[self.index];
+        let mut redirected = lock(&slot.redirected);
+        match redirected.insert(flow_key(local, remote), listener) {
+            Ok(holder) => {
+                slot.held.store(redirected.len, Ordering::Release);
+                Redirect::To(holder)
+            }
+            Err(_) => Redirect::Full,
+        }
+    }
+    /// The flow between `local` and `remote`, which this member took in,
+    /// if it holds it for its owner.
+    pub(crate) fn held(&self, local: SocketAddrV4, remote: SocketAddrV4) -> Option<Held> {
+        let owner = self
+            .shared
+            .route(*local.ip(), self.me(), Some(local.port()), |hash| {
+                hash.ipv4_ports(*remote.ip(), *local.ip(), remote.port(), local.port())
+            })?;
+        (owner != self.index).then(|| Held {
+            owner,
+            key: flow_key(local, remote),
+        })
+    }
+    /// This member no longer holds `held`: its later segments are its
+    /// owner's again.
+    pub(crate) fn release(&self, held: Held) {
+        let slot = &self.shared.slots[held.owner];
+        let mut redirected = lock(&slot.redirected);
+        if redirected.remove(held.key, self.index) {
+            slot.held.store(redirected.len, Ordering::Release);
+        }
     }
     /// Under `FlowOwnership::TaggedPorts`, this member's tagged ports: the
     /// only ports its active opens take.
@@ -781,6 +1090,11 @@ impl Member {
         }
         true
     }
+    /// Whether this member may hand SYNs to listening members and hold
+    /// flows of other members' shares: unless ownership is by address.
+    pub(crate) fn redirects(&self) -> bool {
+        self.shared.registers()
+    }
     pub(crate) fn inlet(&self) -> Inlet {
         Inlet {
             shared: self.shared.clone(),
@@ -816,11 +1130,7 @@ impl Member {
     }
     /// Some member on this member's address listens on local `port`.
     pub(crate) fn listened(&self, port: u16) -> bool {
-        self.shared.registers()
-            && lock(&self.shared.registry)
-                .listening
-                .binary_search_by_key(&port, |&(p, _)| p)
-                .is_ok()
+        self.shared.listened[usize::from(port) / 64].load(Ordering::Acquire) & 1 << (port % 64) != 0
     }
     /// This member listens on `port` (once more), within the listeners it
     /// joined with.
@@ -829,11 +1139,7 @@ impl Member {
             return;
         }
         debug_assert!(self.listening.len() < self.listeners);
-        let mut registry = lock(&self.shared.registry);
-        match registry.listening.binary_search_by_key(&port, |&(p, _)| p) {
-            Ok(at) => registry.listening[at].1 += 1,
-            Err(at) => registry.listening.insert(at, (port, 1)),
-        }
+        lock(&self.shared.registry).listen(port, self.index, &self.shared.listened);
         self.listening.push(port);
     }
     /// One of this member's listeners on `port` is gone.
@@ -842,7 +1148,7 @@ impl Member {
             return;
         };
         self.listening.swap_remove(at);
-        lock(&self.shared.registry).unlisten(port);
+        lock(&self.shared.registry).unlisten(port, self.index, &self.shared.listened);
     }
 }
 
@@ -851,7 +1157,17 @@ impl Drop for Member {
         let slot = &self.shared.slots[self.index];
         let mut registry = lock(&self.shared.registry);
         for &port in &self.listening {
-            registry.unlisten(port);
+            registry.unlisten(port, self.index, &self.shared.listened);
+        }
+        // The flows this member held end with its connections: their later
+        // segments are their owners' again, whose answer is a restarted
+        // host's. A pass over every share's table, as a member leaves.
+        for other in &self.shared.slots {
+            let mut redirected = lock(&other.redirected);
+            if other.held.load(Ordering::Relaxed) != 0 {
+                redirected.purge(self.index);
+                other.held.store(redirected.len, Ordering::Release);
+            }
         }
         registry.reserved -= self.listeners;
         registry.reassembly[self.index] = None;
@@ -921,6 +1237,13 @@ mod tests {
         Key::Flow {
             local: SocketAddrV4::new(local.0, local.1),
             remote: SocketAddrV4::new(remote.0, remote.1),
+            syn: false,
+        }
+    }
+    impl Member {
+        // The other member that takes in a packet of `key`.
+        fn to(&self, key: Key) -> Option<usize> {
+            self.elsewhere(key).to
         }
     }
 
@@ -1034,6 +1357,7 @@ mod tests {
             members,
             inbox_packets: 2,
             packet_bytes: MTU,
+            redirected_flows: 2,
         }
     }
     fn hashed(members: usize, table: Vec<usize>) -> SharedFlows {
@@ -1049,6 +1373,8 @@ mod tests {
             tcp_segment_size: None,
             fragment: false,
             reassembled: None,
+            syn: false,
+            held: false,
         }
     }
 
@@ -1072,21 +1398,22 @@ mod tests {
         for member in [&a, &b] {
             let elsewhere = (owner != member.index).then_some(owner);
             assert_eq!(
-                member.elsewhere(key(&packet(0, TCP, &tcp(40000, 80, 20)))),
+                member.to(key(&packet(0, TCP, &tcp(40000, 80, 20)))),
                 elsewhere
             );
             let fragment = (reassembler != member.index).then_some(reassembler);
-            assert_eq!(member.elsewhere(key(&packet(MORE, TCP, &[0; 8]))), fragment);
+            assert_eq!(member.to(key(&packet(MORE, TCP, &[0; 8]))), fragment);
             assert_eq!(member.owns(80, remote.into()), owner == member.index);
-            assert_eq!(member.elsewhere(Key::Local), None);
+            assert_eq!(member.to(Key::Local), None);
         }
         // Another address is no member's.
         let other = SocketAddrV4::new(ROUTER, 80);
         assert_eq!(flows.owner(other, remote), None);
         assert_eq!(
-            a.elsewhere(Key::Flow {
+            a.to(Key::Flow {
                 local: other,
-                remote
+                remote,
+                syn: false,
             }),
             None
         );
@@ -1123,13 +1450,13 @@ mod tests {
                         segment
                     };
                     assert_eq!(one.owner(local, remote), Some(0), "{local} {remote}");
-                    assert_eq!(a.elsewhere(key(&segment)), None);
+                    assert_eq!(a.to(key(&segment)), None);
                     assert!(a.owns(port, remote.into()));
                     let owner = tag.unwrap_or(0);
                     assert_eq!(two.owner(local, remote), Some(owner), "{local} {remote}");
                     for member in [&b, &c] {
                         let elsewhere = (owner != member.index).then_some(owner);
-                        assert_eq!(member.elsewhere(key(&segment)), elsewhere);
+                        assert_eq!(member.to(key(&segment)), elsewhere);
                         assert_eq!(member.owns(port, remote.into()), owner == member.index);
                     }
                 }
@@ -1137,12 +1464,9 @@ mod tests {
             // Fragments too.
             let fragment = key(&packet(MORE, TCP, &[0; 8]));
             assert_eq!(one.reassembler(REMOTE, LOCAL), Some(0));
-            assert_eq!(a.elsewhere(fragment), None);
+            assert_eq!(a.to(fragment), None);
             assert_eq!(two.reassembler(REMOTE, LOCAL), Some(0));
-            assert_eq!(
-                (b.elsewhere(fragment), c.elsewhere(fragment)),
-                (None, Some(0))
-            );
+            assert_eq!((b.to(fragment), c.to(fragment)), (None, Some(0)));
         }
     }
 
@@ -1156,11 +1480,8 @@ mod tests {
         assert_eq!(flows.owner(SocketAddrV4::new(ROUTER, 80), remote), Some(2));
         assert_eq!(flows.reassembler(REMOTE, ROUTER), Some(2));
         assert_eq!(flows.reassembler(LOCAL, REMOTE), None);
-        assert_eq!(
-            b.elsewhere(key(&packet(0, TCP, &tcp(1234, 80, 20)))),
-            Some(0)
-        );
-        assert_eq!(a.elsewhere(key(&packet(MORE, TCP, &[0; 8]))), None);
+        assert_eq!(b.to(key(&packet(0, TCP, &tcp(1234, 80, 20)))), Some(0));
+        assert_eq!(a.to(key(&packet(MORE, TCP, &[0; 8]))), None);
         assert!(a.owns(1, remote.into()) && b.owns(1, remote.into()));
         // Distinct addresses; IPv6 is not supported; one member per slot.
         assert!(matches!(
@@ -1183,7 +1504,7 @@ mod tests {
         drop(b);
         assert_eq!(flows.owner(SocketAddrV4::new(ROUTER, 80), remote), None);
         assert_eq!(
-            a.elsewhere(key(&icmp(3, &{
+            a.to(key(&icmp(3, &{
                 let mut quote = ipv4(20, 40, 0, TCP, ROUTER, REMOTE);
                 quote.extend_from_slice(&tcp(80, 1234, 8));
                 quote
@@ -1248,6 +1569,118 @@ mod tests {
         let mut written = Vec::new();
         reader.read_to_end(&mut written).unwrap();
         assert_eq!(written.len(), 16);
+    }
+
+    // The table of redirected flows against a map, under insertions and
+    // removals that cluster its probes and wrap them around its end.
+    #[test]
+    fn redirected_flows_keep_their_holders_through_removals() {
+        let mut table = Redirected::new(48).unwrap();
+        assert_eq!(table.entries.len(), 128);
+        let mut model = std::collections::HashMap::new();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for round in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Few keys, so that most operations find one present.
+            let key = state % 80;
+            let member = (state >> 8) as usize % 3;
+            match (state >> 16) % 4 {
+                0 if member == 2 => {
+                    table.purge(1);
+                    model.retain(|_, &mut m| m != 1);
+                }
+                0 | 1 => {
+                    let removed = table.remove(key, member);
+                    assert_eq!(removed, model.get(&key) == Some(&member), "{round}");
+                    if removed {
+                        model.remove(&key);
+                    }
+                }
+                _ => match table.insert(key, member) {
+                    Ok(holder) => assert_eq!(holder, *model.entry(key).or_insert(member)),
+                    Err(_) => assert!(model.len() == 48 && !model.contains_key(&key)),
+                },
+            }
+            assert_eq!(table.len, model.len());
+            for key in 0..80 {
+                assert_eq!(table.get(key), model.get(&key).copied(), "{round} {key}");
+            }
+        }
+        // A bound of none holds nothing.
+        let mut none = Redirected::new(0).unwrap();
+        assert!(none.insert(1, 0).is_err());
+        assert_eq!(none.get(1), None);
+        assert!(!none.remove(1, 0));
+        none.purge(0);
+    }
+
+    // A SYN its owner does not listen for goes to a listener of its port
+    // and stays there, its flow the holder's until it is released; a full
+    // share drops the next.
+    #[test]
+    fn a_syn_no_owner_listens_for_is_held_by_a_listening_member() {
+        let flows = hashed(3, vec![0, 1, 2, 0]);
+        let mut members: Vec<Member> = (0..3)
+            .map(|k| flows.join(k, LOCAL.into(), MTU, 2).unwrap())
+            .collect();
+        let local = SocketAddrV4::new(LOCAL, 80);
+        let remotes: Vec<SocketAddrV4> = (40000..)
+            .map(|p| SocketAddrV4::new(REMOTE, p))
+            .filter(|&r| flows.owner(local, r) == Some(0))
+            .take(3)
+            .collect();
+        // No member listens: the owner answers.
+        assert!(!members[0].unheard(80));
+        assert_eq!(members[0].redirect(local, remotes[0]), Redirect::Nobody);
+        members[1].listen(80);
+        members[2].listen(80);
+        assert!(members[0].unheard(80) && !members[1].unheard(80));
+        let toeplitz = Toeplitz::new(&DEFAULT_FLOW_KEY).unwrap();
+        let mut holders = Vec::new();
+        for &remote in &remotes[..2] {
+            let hash = toeplitz.ipv4_ports(REMOTE, LOCAL, remote.port(), 80);
+            let expected = 1 + ((u64::from(hash) * 2) >> 32) as usize;
+            assert_eq!(members[0].redirect(local, remote), Redirect::To(expected));
+            // Again, as for a SYN sent again, after either stops listening.
+            members[3 - expected].unlisten(80);
+            assert_eq!(members[0].redirect(local, remote), Redirect::To(expected));
+            members[3 - expected].listen(80);
+            assert_eq!(flows.owner(local, remote), Some(expected));
+            let route = members[0].elsewhere(Key::Flow {
+                local,
+                remote,
+                syn: false,
+            });
+            assert_eq!(
+                route,
+                Route {
+                    to: Some(expected),
+                    held: true
+                }
+            );
+            assert!(
+                members[expected].owns(80, remote.into()) && !members[0].owns(80, remote.into())
+            );
+            holders.push(expected);
+        }
+        assert_eq!(flows.redirected(0), 2);
+        assert_eq!(members[0].redirect(local, remotes[2]), Redirect::Full);
+        // The holder releases one; the other member's release changes
+        // nothing.
+        let held = members[holders[0]].held(local, remotes[0]).unwrap();
+        members[3 - holders[0]].release(held);
+        assert_eq!(flows.redirected(0), 2);
+        members[holders[0]].release(held);
+        assert_eq!(flows.redirected(0), 1);
+        assert_eq!(flows.owner(local, remotes[0]), Some(0));
+        assert_eq!(members[0].held(local, remotes[0]), None);
+        // A holder that leaves takes its flows' records with it.
+        let holder = holders[1];
+        drop(members.remove(holder));
+        assert_eq!(flows.redirected(0), 0);
+        assert_eq!(flows.owner(local, remotes[1]), Some(0));
     }
 
     #[test]
@@ -1373,7 +1806,7 @@ mod tests {
                             segment.extend_from_slice(&tcp(remote.port(), port, 20));
                             segment
                         };
-                        assert_eq!(member.elsewhere(key(&segment)), elsewhere);
+                        assert_eq!(member.to(key(&segment)), elsewhere);
                         assert_eq!(member.owns(port, remote.into()), owner == member.index);
                     }
                 }
@@ -1508,7 +1941,7 @@ mod tests {
                 assert_eq!(key(&error), flow((LOCAL, port), (REMOTE, 80)));
                 for member in &members {
                     let elsewhere = (member.index != tag).then_some(tag);
-                    assert_eq!(member.elsewhere(key(&error)), elsewhere, "type {kind}");
+                    assert_eq!(member.to(key(&error)), elsewhere, "type {kind}");
                 }
             }
             let local = SocketAddrV4::new(LOCAL, port);

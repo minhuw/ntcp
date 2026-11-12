@@ -28,6 +28,15 @@ pub(super) struct TxSlot {
     pub bytes: Vec<u8>,
     pub pending: Option<PendingFrame>,
 }
+// A SYN a member takes in itself (`take_syn`): its flow, whether the member
+// holds that for its owner, and what a handoff of it carries.
+struct Syn {
+    local: SocketAddrV4,
+    remote: SocketAddrV4,
+    held: bool,
+    packet: ReceivedPacket,
+    reassembled: Option<ntcp_host::Envelope>,
+}
 pub(super) struct RetainedInput {
     bytes: Vec<u8>,
     len: usize,
@@ -216,21 +225,48 @@ impl<P: PacketIo> Network<P> {
             // flow, or a fragment another member reassembles, to it as it
             // arrived.
             let mut fragment = false;
+            let mut syn = None;
             if let Some(flows) = &self.flows {
                 let key = flows::key(frame);
                 fragment = matches!(key, flows::Key::Fragment { .. });
-                if let Some(owner) = flows.elsewhere(key) {
+                let route = flows.elsewhere(key);
+                if let Some(owner) = route.to {
                     let handoff = flows::Handoff {
                         timestamps: packet.timestamps,
                         tcp_segment_size: packet.tcp_segment_size,
                         fragment,
                         reassembled: None,
+                        syn: matches!(key, flows::Key::Flow { syn: true, .. }),
+                        held: route.held,
                     };
                     self.hand_off(owner, frame, handoff);
                     continue;
                 }
+                if let flows::Key::Flow {
+                    local,
+                    remote,
+                    syn: true,
+                } = key
+                {
+                    syn = Some((local, remote, route.held));
+                }
             }
-            if self.input(frame, packet, fragment, completed).is_err() {
+            let result = match syn {
+                Some((local, remote, held)) => {
+                    let syn = Syn {
+                        local,
+                        remote,
+                        held,
+                        packet,
+                        reassembled: None,
+                    };
+                    self.take_syn(syn, frame, |network| {
+                        network.input(frame, packet, false, completed)
+                    })
+                }
+                None => self.input(frame, packet, fragment, completed),
+            };
+            if result.is_err() {
                 report.discarded += 1;
             }
         }
@@ -664,20 +700,112 @@ impl<P: PacketIo> Network<P> {
         // A member of shared flows that completes a datagram on a fragment
         // hands it to the member that owns its flow. Its fragments were
         // keyed by their addresses alone; it is keyed once, here.
-        if fragment
-            && let Some(flows) = &self.flows
-            && let Some(owner) = flows.elsewhere(flows::key(datagram.bytes()))
-        {
-            let handoff = flows::Handoff {
-                timestamps: packet.timestamps,
-                tcp_segment_size: packet.tcp_segment_size,
-                fragment: false,
-                reassembled: Some(datagram.envelope()),
-            };
-            self.hand_off(owner, datagram.bytes(), handoff);
-            return Ok(());
+        if fragment && let Some(flows) = &self.flows {
+            let key = flows::key(datagram.bytes());
+            let route = flows.elsewhere(key);
+            if let Some(owner) = route.to {
+                let handoff = flows::Handoff {
+                    timestamps: packet.timestamps,
+                    tcp_segment_size: packet.tcp_segment_size,
+                    fragment: false,
+                    reassembled: Some(datagram.envelope()),
+                    syn: matches!(key, flows::Key::Flow { syn: true, .. }),
+                    held: route.held,
+                };
+                self.hand_off(owner, datagram.bytes(), handoff);
+                return Ok(());
+            }
+            if let flows::Key::Flow {
+                local,
+                remote,
+                syn: true,
+            } = key
+            {
+                let syn = Syn {
+                    local,
+                    remote,
+                    held: route.held,
+                    packet,
+                    reassembled: Some(datagram.envelope()),
+                };
+                return self.take_syn(syn, datagram.bytes(), |network| {
+                    network.dispatch(datagram, metadata)
+                });
+            }
         }
         self.dispatch(datagram, metadata)
+    }
+    // A SYN of a flow this member takes in, `bytes` as it arrived (or the
+    // datagram reassembled), which `take` takes in. A member of shared flows hands one it
+    // owns, whose port it does not listen on while another member does, to
+    // a listening member (`Member::redirect`) unless it has a connection
+    // for it, which then takes it as any segment of its own: Linux's
+    // reuseport group gives a SYN only to a socket that listens, and its
+    // established table goes first. The member that takes a SYN of a flow
+    // it holds for its owner keeps track of a connection it opens, so that
+    // the flow is its owner's again once the connection is reclaimed, or at
+    // once if none opened (`maintain_connections`).
+    fn take_syn(
+        &mut self,
+        syn: Syn,
+        bytes: &[u8],
+        take: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let Syn { local, remote, .. } = syn;
+        let flows = self.flows.as_ref().expect("a member of shared flows");
+        if !syn.held && !flows.unheard(local.port()) {
+            return take(self);
+        }
+        let tuple = self.scoped(Tuple {
+            local: local.into(),
+            remote: remote.into(),
+        });
+        if !syn.held {
+            if self.endpoint.scoped_connection_id(tuple).is_some() {
+                return take(self);
+            }
+            return match flows.redirect(local, remote) {
+                flows::Redirect::To(member) => {
+                    let handoff = flows::Handoff {
+                        timestamps: syn.packet.timestamps,
+                        tcp_segment_size: syn.packet.tcp_segment_size,
+                        fragment: false,
+                        reassembled: syn.reassembled,
+                        syn: true,
+                        held: true,
+                    };
+                    self.counters.redirected += 1;
+                    self.hand_off(member, bytes, handoff);
+                    Ok(())
+                }
+                flows::Redirect::Full => {
+                    self.counters.redirects_dropped += 1;
+                    Err(Error::Capacity)
+                }
+                flows::Redirect::Nobody => take(self),
+            };
+        }
+        let before = self.endpoint.scoped_connection_id(tuple);
+        let result = take(self);
+        let after = self.endpoint.scoped_connection_id(tuple);
+        let flows = self.flows.as_ref().expect("a member of shared flows");
+        if let Some(held) = flows.held(local, remote) {
+            match (before, after) {
+                (None, Some(core)) => {
+                    // An earlier connection of the endpoint's slot, reclaimed
+                    // in this drive, is not yet looked at.
+                    if let Some((_, earlier)) = self.held_flows[core.index()].replace((core, held))
+                    {
+                        flows.release(earlier);
+                    } else {
+                        self.holding += 1;
+                    }
+                }
+                (_, None) => flows.release(held),
+                _ => {}
+            }
+        }
+        result
     }
     // A packet another member of shared flows handed over, taken in as one
     // this queue received: as it arrived, through `input` (a fragment is
@@ -695,15 +823,34 @@ impl<P: PacketIo> Network<P> {
             timestamps: handoff.timestamps,
             tcp_segment_size: handoff.tcp_segment_size,
         };
+        let syn = match handoff.syn.then(|| flows::key(bytes)) {
+            Some(flows::Key::Flow { local, remote, .. }) => Some((local, remote)),
+            _ => None,
+        };
+        let syn = syn.map(|(local, remote)| Syn {
+            local,
+            remote,
+            held: handoff.held,
+            packet,
+            reassembled: handoff.reassembled,
+        });
         let Some(envelope) = handoff.reassembled else {
-            return self.input(bytes, packet, handoff.fragment, completed);
+            return match syn {
+                Some(syn) => self.take_syn(syn, bytes, |network| {
+                    network.input(bytes, packet, false, completed)
+                }),
+                None => self.input(bytes, packet, handoff.fragment, completed),
+            };
         };
         let metadata = self.receive_metadata(packet);
         let datagram = envelope.datagram(bytes).ok_or(Error::Unsupported(
             "a handed-over datagram of another length",
         ))?;
         let datagram = self.host.adopt_datagram(self.ingress, datagram)?;
-        self.dispatch(datagram, metadata)
+        match syn {
+            Some(syn) => self.take_syn(syn, bytes, |network| network.dispatch(datagram, metadata)),
+            None => self.dispatch(datagram, metadata),
+        }
     }
     // Up to `limit` packets from this member's inbox, no more than there are
     // receive buffers free to retain them; returns how many it took, and
@@ -1342,10 +1489,20 @@ impl<P: PacketIo> Network<P> {
             }
         }
         // The released connections the endpoint reclaimed since the last
-        // pass or, past what it keeps of them, every one gone.
+        // pass or, past what it keeps of them, every one gone. A flow held
+        // for another member's share is its owner's again once its
+        // connection is reclaimed, accepted or not.
         let reclaimed = self.endpoint.reclaimed();
         if let Some(gone) = self.endpoint.reclaimed_since(self.reclaimed) {
             for core in gone {
+                if self.holding != 0
+                    && let Some(entry) = self.held_flows.get_mut(core.index())
+                    && entry.is_some_and(|(id, _)| id == core)
+                {
+                    let (_, held) = entry.take().unwrap();
+                    self.flows.as_ref().unwrap().release(held);
+                    self.holding -= 1;
+                }
                 if let Some(index) = self.connection_map.remove(&core) {
                     let c = self.connections[index].value.take().unwrap();
                     debug_assert!(c.released);
@@ -1368,6 +1525,15 @@ impl<P: PacketIo> Network<P> {
                 vacate(&mut self.live_connections, index);
                 give_back(&mut self.free_connections, &self.connections, index);
                 self.ports.give(port);
+            }
+            if self.holding != 0 {
+                for entry in &mut self.held_flows {
+                    if entry.is_some_and(|(id, _)| !self.endpoint.connection_exists(id)) {
+                        let (_, held) = entry.take().unwrap();
+                        self.flows.as_ref().unwrap().release(held);
+                        self.holding -= 1;
+                    }
+                }
             }
         }
         self.reclaimed = reclaimed;

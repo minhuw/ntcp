@@ -19,7 +19,7 @@ use ntcp_io::PacketIo;
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    net::SocketAddr,
+    net::{SocketAddr, SocketAddrV4},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -118,6 +118,12 @@ pub struct Network<P: PacketIo> {
     // inbox.
     flows: Option<flows::Member>,
     inlet: Option<flows::Inlet>,
+    // Per endpoint connection slot, a connection of a flow this member
+    // holds for another member's share (`Member::redirect`), until it is
+    // reclaimed; and how many there are. Empty unless the members register
+    // their listeners.
+    held_flows: Vec<Option<(ntcp::ConnectionId, flows::Held)>>,
+    holding: usize,
     tx_cursor: usize,
     // The backend's TCP segmentation, when reservations are sized for it
     // (`NetworkConfig::gso`), and the frame of the aggregate being
@@ -357,7 +363,22 @@ impl<P: PacketIo> Network<P> {
     /// state left with it, out of new ones.
     ///
     /// A member's flows are its own for the life of `flows`: the ownership
-    /// function never changes, and no other member takes them over.
+    /// function never changes, and no other member takes them over, but
+    /// for the SYNs of a port it does not listen on while another member
+    /// does, as before every member has called `listen` or while one
+    /// listens anew. Unless ownership is `FlowOwnership::ByAddress`, such a
+    /// SYN, of a flow it has no connection for, goes to a member listening
+    /// on the port, chosen among them by the flow's hash as Linux's
+    /// SO_REUSEPORT group chooses among its listening sockets, rather than
+    /// being reset. That member holds the flow, every member handing it
+    /// its segments, until its connection is reclaimed (after a reset's
+    /// TIME-WAIT, if it sent one, but not after the TIME-WAIT of a close,
+    /// whose stray segments the owner answers as a host that kept none);
+    /// one that leaves releases all it held. A member's share has at most
+    /// `SharedFlowLimits::redirected_flows` flows held at once: a SYN
+    /// beyond that is dropped (`Counters::redirects_dropped`), as a full
+    /// listen queue drops one, and comes again from its peer. Only when
+    /// no member listens on the port does the owner reset it.
     /// Dropping the Network leaves the flows, and its connections end with
     /// it unannounced. Until a member joins its number again the others
     /// drop what they receive of its flows (`Counters::handoffs_dropped`;
@@ -442,6 +463,13 @@ impl<P: PacketIo> Network<P> {
             None => None,
         };
         let inlet = flows.as_ref().map(flows::Member::inlet);
+        let mut held_flows = Vec::new();
+        if flows.as_ref().is_some_and(flows::Member::redirects) {
+            held_flows
+                .try_reserve_exact(config.tcp.max_connections)
+                .map_err(|_| Error::Capacity)?;
+            held_flows.resize(config.tcp.max_connections, None);
+        }
         let instance = NEXT_INSTANCE
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Error::Capacity)?;
@@ -690,6 +718,8 @@ impl<P: PacketIo> Network<P> {
             shared_neighbors,
             flows,
             inlet,
+            held_flows,
+            holding: 0,
             tx_cursor: 0,
             segmentation,
             aggregate,
