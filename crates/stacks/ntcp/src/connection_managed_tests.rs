@@ -93,7 +93,7 @@ fn managed_pair_with_peer(
     };
     configure(&mut cfg);
     let (service, prepared, route) = authority(tuple, cfg.timebase);
-    let mut a = Connection::active_with_receive_path(
+    let mut a = *Connection::active_with_receive_path(
         tuple,
         cfg.clone(),
         u32::MAX - 1000,

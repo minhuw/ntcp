@@ -1,7 +1,7 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
-use core::{net::SocketAddr, num::NonZeroU8};
+use alloc::{boxed::Box, vec::Vec};
+use core::{mem::MaybeUninit, net::SocketAddr, num::NonZeroU8};
 
 use crate::{
     RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
@@ -1011,6 +1011,7 @@ impl Connection {
         receive: &mut Option<ReceiveBuffer>,
     ) -> Result<Self, Error> {
         Self::active_with_receive_path(tuple, config, iss, now, receive, None, None, None)
+            .map(|connection| *connection)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1023,7 +1024,7 @@ impl Connection {
         managed_path: Option<crate::PreparedPath>,
         receive_capability: Option<crate::ReceiveIpCapability>,
         initial_ip_header_len: Option<u16>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Box<Self>, Error> {
         config.validate(tuple.local.is_ipv4())?;
         if tuple.local.is_ipv4() != tuple.remote.is_ipv4() {
             return Err(Error::InvalidArgument);
@@ -1123,6 +1124,7 @@ impl Connection {
         let rtt = RttEstimator::with_timebase(config.rto_min_us, config.timebase);
         let rack = Rack::with_timebase(2, config.timebase).map_err(|_| Error::NoMemory)?;
         let scoreboard = Scoreboard::with_capacity(0).map_err(|_| Error::NoMemory)?;
+        let storage = Self::storage()?;
         // Take pooled storage only after every fallible allocation has succeeded.
         let receive = match receive.take() {
             Some(receive) => receive,
@@ -1132,7 +1134,7 @@ impl Connection {
         };
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
         let ack_ato = config.ack_timeout_floor();
-        Ok(Self {
+        let connection = Self {
             managed_path,
             managed_results: crate::endpoint::ManagedResults::default(),
             tuple,
@@ -1331,7 +1333,25 @@ impl Connection {
             retransmit_burst: None,
             keepalive_deadline: None,
             keepalive_probes: 0,
-        })
+        };
+        Ok(Box::write(storage, connection))
+    }
+
+    // A connection's heap home. The ~10 KB value is copied into it once, and
+    // from then on only the pointer moves: through the endpoint's
+    // constructors into its slot and out at reclaim. Fallible, as every
+    // other allocation of a connection is: Box::new aborts when memory runs
+    // out.
+    fn storage() -> Result<Box<MaybeUninit<Self>>, Error> {
+        let layout = core::alloc::Layout::new::<Self>();
+        // SAFETY: a Connection is not zero-sized.
+        let pointer = unsafe { alloc::alloc::alloc(layout) }.cast::<MaybeUninit<Self>>();
+        if pointer.is_null() {
+            return Err(Error::NoMemory);
+        }
+        // SAFETY: allocated by the global allocator with the layout Box uses
+        // for this type; a MaybeUninit needs no initialization.
+        Ok(unsafe { Box::from_raw(pointer) })
     }
 
     #[cfg(test)]
@@ -1375,8 +1395,21 @@ impl Connection {
         rx_timestamps: RxTimestamps,
         timestamps: RxPacketTimestamps,
     ) -> Result<Self, Error> {
-        Self::passive_with_receive_path(tuple, config, iss, now, syn, early_authorized,
-            receive, rx_timestamps, timestamps, None, None, None)
+        Self::passive_with_receive_path(
+            tuple,
+            config,
+            iss,
+            now,
+            syn,
+            early_authorized,
+            receive,
+            rx_timestamps,
+            timestamps,
+            None,
+            None,
+            None,
+        )
+        .map(|connection| *connection)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1393,7 +1426,7 @@ impl Connection {
         managed_path: Option<crate::PreparedPath>,
         receive_capability: Option<crate::ReceiveIpCapability>,
         initial_ip_header_len: Option<u16>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Box<Self>, Error> {
         if syn.header.flags & (SYN | ACK | RST) != SYN {
             return Err(Error::InvalidArgument);
         }
@@ -1583,7 +1616,7 @@ impl Connection {
         Ok(())
     }
 
-    pub(crate) fn into_receive(self) -> ReceiveBuffer {
+    pub(crate) fn into_receive(self: Box<Self>) -> ReceiveBuffer {
         self.receive
     }
 

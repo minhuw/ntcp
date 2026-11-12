@@ -388,7 +388,10 @@ impl TupleTable {
 }
 
 struct Slot {
-    connection: Connection,
+    // Boxed, so a table of `max_connections` slots holds pointers rather
+    // than ~10 KB connections, and a connection moves into and out of its
+    // slot by pointer.
+    connection: Box<Connection>,
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5
     //# Note that a TCP implementation MUST keep track of whether a
     //# connection has reached SYN-RECEIVED state as the result of a passive
@@ -1493,7 +1496,7 @@ impl Endpoint {
         tuple: Tuple,
         iss: u32,
         syn: Option<&wire::Segment<'_>>,
-    ) -> Result<Connection, Error> {
+    ) -> Result<Box<Connection>, Error> {
         self.new_connection_with_buffers(
             tuple,
             iss,
@@ -1515,7 +1518,7 @@ impl Endpoint {
         capacities: (usize, usize),
         rx_ranges: usize,
         timestamps: RxPacketTimestamps,
-    ) -> Result<Connection, Error> {
+    ) -> Result<Box<Connection>, Error> {
         self.new_connection_with_options(
             tuple,
             iss,
@@ -1575,7 +1578,7 @@ impl Endpoint {
         rx_ranges: usize,
         timestamps: RxPacketTimestamps,
         receive_authority: Option<ListenerId>,
-    ) -> Result<Connection, Error> {
+    ) -> Result<Box<Connection>, Error> {
         options.validate()?;
         // Managed mode requires a live provisional path before allocation,
         // TFO authorization or controller/initial PMTU construction.
@@ -1739,7 +1742,7 @@ impl Endpoint {
         result
     }
 
-    fn recycle_connection(&mut self, connection: Connection) {
+    fn recycle_connection(&mut self, connection: Box<Connection>) {
         let charge = connection.buffer_charge();
         self.buffer_bytes -= charge;
         if self.receive_pool.len() < self.config.preallocate_connections
@@ -1760,7 +1763,7 @@ impl Endpoint {
     // TCP_TW_SYN).
     fn insert(
         &mut self,
-        connection: Connection,
+        connection: Box<Connection>,
         listener: Option<ListenerId>,
         replaces: Option<Target>,
     ) -> Result<ConnectionId, EndpointError> {
