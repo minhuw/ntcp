@@ -448,9 +448,12 @@ struct Socket {
     // storage or a retained connection. Err preserves an unavailable snapshot.
     terminal_transport: Option<Result<ntcp::TransportInfo>>,
     local: Option<SocketAddr>,
+    // How `local`'s port was taken, while there is one (`Owner::set_local`).
+    binding: ports::Binding,
     flags: i32,
-    // Adapter bind policy: mutual REUSEADDR permits live connection-port reuse;
-    // no kernel bind table or Linux TIME-WAIT option emulation.
+    // Adapter bind policy: mutual REUSEADDR permits live connection-port
+    // reuse, and a bind to the port of a TIME-WAIT record or a connection
+    // whose descriptor is closed, when it had REUSEADDR too.
     reuse: bool,
     freebind: bool,
     nodelay: bool,
@@ -538,6 +541,7 @@ impl Socket {
             handle: Handle::Fresh,
             terminal_transport: None,
             local: None,
+            binding: ports::Binding::Bound,
             flags,
             reuse: false,
             freebind: false,
@@ -701,8 +705,11 @@ struct Owner {
     test_clock_failure: bool,
     #[cfg(feature = "packet-test")]
     next_port: u16,
-    #[cfg(test)]
-    port_entropy: Option<VecDeque<Result<[u8; 8]>>>,
+    // The users of each local port, and the order an unbound socket's
+    // connect tries ports in (RFC 6056 Algorithm 4), from `ephemeral_ports`.
+    port_index: ports::PortIndex,
+    ephemeral: ntcp::EphemeralPorts,
+    ephemeral_ports: std::ops::RangeInclusive<u16>,
     next_id: u64,
     detached: Vec<ConnectionId>,
     egress: Option<egress::Egress>,
@@ -711,8 +718,16 @@ struct Owner {
     child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
     pending: VecDeque<Request>,
     child_timeouts: Vec<ChildOptionsSnapshot>,
-    // Local tuple survives descriptor close and Endpoint::release until GC.
-    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>, SocketAddr)>,
+    // Local tuple survives descriptor close and Endpoint::release until GC
+    // (`collect_connection_options`), and holds its port in `port_index`.
+    connection_options: Vec<(
+        ConnectionId,
+        u8,
+        i32,
+        Option<bool>,
+        SocketAddr,
+        ports::Binding,
+    )>,
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
 }
@@ -1079,6 +1094,7 @@ impl Owner {
             AddressValidation::Route { .. } => false,
         })
         .map_err(engine)?;
+        let ephemeral = endpoint.ephemeral_ports().map_err(engine)?;
         Ok(Self {
             fast_open_keys: None,
             #[cfg(feature = "tfo-linux-cookie")]
@@ -1110,8 +1126,9 @@ impl Owner {
             test_clock_failure: false,
             #[cfg(feature = "packet-test")]
             next_port: 40000,
-            #[cfg(test)]
-            port_entropy: None,
+            port_index: ports::PortIndex::new(),
+            ephemeral,
+            ephemeral_ports: ports::RANGE,
             next_id: 1,
             detached: Vec::new(),
             egress: None,
@@ -1639,8 +1656,7 @@ impl Owner {
                     self.pending.push_back(request);
                 }
             }
-            self.connection_options
-                .retain(|p| self.endpoint.connection_exists(p.0));
+            self.collect_connection_options();
             self.detached.retain(|&id| {
                 if !self.endpoint.is_output_reserved(id)
                     && matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait))
@@ -1847,6 +1863,7 @@ impl Owner {
                         s.wire_discover(self.local),
                         s.zerocopy,
                         s.mark,
+                        s.reuse,
                     )
                 })
         });
@@ -1862,8 +1879,7 @@ impl Owner {
                 flags & (ntcp::wire::SYN | ntcp::wire::ACK | ntcp::wire::RST) == ntcp::wire::SYN
             })
         {
-            self.connection_options
-                .retain(|p| self.endpoint.connection_exists(p.0));
+            self.collect_connection_options();
             if self.connection_options.len() == self.socket_limit() {
                 return Err(EndpointError::LimitReached.into());
             }
@@ -1955,12 +1971,19 @@ impl Owner {
                 s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
             }
             if Some(cid) == new_child
-                && let Some((tos, discover, _, mark)) = listener_options
+                && let Some((tos, discover, _, mark, reuse)) = listener_options
             {
                 self.endpoint.set_dscp(cid, tos >> 2)?;
                 self.endpoint.set_mark(cid, mark)?;
-                self.connection_options
-                    .push((cid, tos, discover, None, tuple.local));
+                self.endpoint.set_reuse_address(cid, reuse)?;
+                self.push_connection_options((
+                    cid,
+                    tos,
+                    discover,
+                    None,
+                    tuple.local,
+                    ports::Binding::Bound,
+                ));
             }
             // Snapshot at accept eligibility, before the adapter publishes the
             // child. Only authenticated TFO data is readable in SynReceived;
@@ -2034,6 +2057,9 @@ impl Owner {
         }
         let id = self.next_id;
         self.next_id += 1;
+        if let Some(local) = s.local {
+            self.port_index.socket(local.port(), s.binding, true);
+        }
         self.sockets.insert(id, s);
         Ok(id as i32)
     }
@@ -2041,50 +2067,157 @@ impl Owner {
     //# As discussed in the previous sections, in order to perform any of the attacks described in this document, an attacker would need to guess (or know) the four-tuple that identifies the connection to be attacked. Increasing the port number range used for outgoing TCP connections, and randomizing the port number chosen for each outgoing TCP connection, would make it harder for an attacker to perform any of the attacks discussed in this document.
     //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
     //# [PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.
-    fn port(&mut self) -> Result<u16> {
+    // The local port of an unbound socket's connect from `local` to
+    // `remote`, in the order of RFC 6056 Algorithm 4
+    // (`EphemeralPorts::select`), as Linux's __inet_hash_connect: a port is
+    // shared by the connects of distinct destinations, the 4-tuple unique
+    // among connections, TIME-WAIT records (`Endpoint::tuple_in_use`, as
+    // __inet_check_established) and deferred Fast Open connects, and
+    // skipped while a socket or connection bind() gave it holds it. A
+    // TIME-WAIT record of the tuple is not reused: Linux's tcp_tw_reuse
+    // allows that by default over loopback only. Each candidate is a few
+    // lookups, whatever the number of sockets.
+    fn connect_port(
+        &mut self,
+        local: IpAddr,
+        remote: SocketAddr,
+        zone: Option<address_policy::Zone>,
+    ) -> Result<u16> {
         #[cfg(feature = "packet-test")]
         if self.packets.is_some() {
-            // Explicit synthetic packet profiles retain their sequential ports.
-            // Backend-less and external owners always use native selection.
-            if self.next_port >= 60000 {
-                return Err(EADDRNOTAVAIL);
-            }
-            for _ in 0..20000 {
-                let port = self.next_port;
-                self.next_port = if port == 59999 { 40000 } else { port + 1 };
-                if self.port_available(port) {
-                    return Ok(port);
-                }
-            }
+            return self.sequential_port();
+        }
+        let now = self.clock()?;
+        let (index, endpoint) = (&self.port_index, &self.endpoint);
+        self.ephemeral
+            .select(now, local, remote, self.ephemeral_ports.clone(), |port| {
+                let local = SocketAddr::new(local, port);
+                !index.bound(port)
+                    && !index.deferred((local, remote))
+                    && !ntcp::ScopedTuple::new(ntcp::Tuple { local, remote }, zone.map(|z| z.link))
+                        .is_some_and(|tuple| endpoint.tuple_in_use(tuple))
+            })
+            .ok_or(EADDRNOTAVAIL)
+    }
+    // The local port bind(port 0), or listen on an unbound socket, takes:
+    // one no socket, connection or TIME-WAIT record holds, as Linux's
+    // inet_csk_find_open_port finds one with no owner, starting at random
+    // (RFC 6056 section 3.5, `EphemeralPorts::select_unbound`). None left
+    // is EADDRINUSE, as inet_csk_get_port returns. Connections the endpoint
+    // no longer has hold no port: their options are collected first, once
+    // per call.
+    fn bind_port(&mut self, reuse: bool) -> Result<u16> {
+        self.collect_connection_options();
+        #[cfg(feature = "packet-test")]
+        if self.packets.is_some() {
+            return self.sequential_port();
+        }
+        let (index, endpoint) = (&self.port_index, &self.endpoint);
+        self.ephemeral
+            .select_unbound(self.ephemeral_ports.clone(), reuse, |port| {
+                !index.used(port) && !endpoint.time_wait_holds_port(port)
+            })
+            .ok_or(EADDRINUSE)
+    }
+    // Explicit synthetic packet profiles retain their sequential ports, free
+    // of every user.
+    #[cfg(feature = "packet-test")]
+    fn sequential_port(&mut self) -> Result<u16> {
+        if self.next_port >= 60000 {
             return Err(EADDRNOTAVAIL);
         }
-        #[cfg(test)]
-        if let Some(reads) = self.port_entropy.as_mut() {
-            let read = reads.pop_front().expect("unexpected entropy consumption");
-            return ports::allocate(
-                |bytes| {
-                    ports::fill_with(bytes, |out| {
-                        let entropy = read?;
-                        out.copy_from_slice(&entropy);
-                        Ok(entropy.len())
-                    })
-                },
-                |port| self.port_available(port),
-            );
+        for _ in 0..20000 {
+            let port = self.next_port;
+            self.next_port = if port == 59999 { 40000 } else { port + 1 };
+            if !self.port_index.used(port) && !self.endpoint.time_wait_holds_port(port) {
+                return Ok(port);
+            }
         }
-        ports::allocate(ports::fill, |port| self.port_available(port))
+        Err(EADDRNOTAVAIL)
     }
-    fn port_available(&self, port: u16) -> bool {
-        !self
-            .sockets
-            .values()
-            .any(|s| s.local.is_some_and(|a| a.port() == port))
-            && !self
-                .connection_options
-                .iter()
-                .any(|p| p.4.port() == port && self.endpoint.connection_exists(p.0))
-            // A released connection's TIME-WAIT keeps its port.
-            && !self.endpoint.time_wait_holds_port(port)
+    // Gives socket `id` local address `local`, its port taken by `binding`,
+    // in `port_index` too.
+    fn set_local(&mut self, id: u64, local: SocketAddr, binding: ports::Binding) {
+        let s = self.sockets.get_mut(&id).unwrap();
+        if let Some(old) = s.local.replace(local) {
+            self.port_index.socket(old.port(), s.binding, false);
+        }
+        s.binding = binding;
+        self.port_index.socket(local.port(), binding, true);
+    }
+    fn push_connection_options(
+        &mut self,
+        options: (
+            ConnectionId,
+            u8,
+            i32,
+            Option<bool>,
+            SocketAddr,
+            ports::Binding,
+        ),
+    ) {
+        self.port_index
+            .connection(options.4.port(), options.5, true);
+        self.connection_options.push(options);
+    }
+    // Forgets the options of connections the endpoint no longer has, and the
+    // ports they held.
+    fn collect_connection_options(&mut self) {
+        let (index, endpoint) = (&mut self.port_index, &self.endpoint);
+        self.connection_options.retain(|p| {
+            let exists = endpoint.connection_exists(p.0);
+            if !exists {
+                index.connection(p.4.port(), p.5, false);
+            }
+            exists
+        });
+    }
+    // Whether a TIME-WAIT record, or a connection whose descriptor is
+    // closed and which is not CLOSED (Linux unhashes a closed socket from
+    // its bind bucket), holds a local address a bind to `api` (`wire` on the wire,
+    // `only` for IPV6_V6ONLY, on `zone`) overlaps, and refuses the bind:
+    // unless both it and the bind have SO_REUSEADDR, as Linux's
+    // inet_bind_conflict judges the timewait and orphaned sockets of the
+    // port's bind bucket (sk_reuse && sk2->sk_reuse, tw_reuse for a
+    // timewait socket). Sockets are judged by the caller.
+    fn closed_binding_conflict(
+        &self,
+        api: SocketAddr,
+        wire: SocketAddr,
+        only: bool,
+        zone: Option<address_policy::Zone>,
+        reuse: bool,
+    ) -> bool {
+        let overlaps = |local: SocketAddr, link: Option<ntcp_host::path::LinkId>| {
+            zone.zip(link).is_none_or(|(zone, link)| zone.link == link)
+                && address_policy::binding_scopes(api, wire, only)
+                    .into_iter()
+                    .flatten()
+                    .any(|bound| address_policy::binding_overlap(bound, local))
+        };
+        let held = |cid: ConnectionId| {
+            self.sockets
+                .values()
+                .any(|s| matches!(s.handle, Handle::Connection(id) if id == cid))
+        };
+        self.endpoint
+            .time_wait_binds(wire.port())
+            .any(|(tuple, tw_reuse)| {
+                !(reuse && tw_reuse) && overlaps(tuple.tuple().local, tuple.zone())
+            })
+            || self.connection_options.iter().any(|p| {
+                p.4.port() == wire.port()
+                    && !held(p.0)
+                    && self
+                        .endpoint
+                        .retained_state(p.0)
+                        .is_ok_and(|state| state != State::Closed)
+                    && !(reuse && self.endpoint.reuse_address(p.0) == Ok(true))
+                    && self
+                        .endpoint
+                        .retained_scoped_tuple(p.0)
+                        .is_ok_and(|tuple| overlaps(tuple.tuple().local, tuple.zone()))
+            })
     }
     fn apply_options(&mut self, cid: ConnectionId, s: &Socket) -> Result<()> {
         // Validate the fallible option before changing the infallible one.
@@ -2104,6 +2237,9 @@ impl Owner {
             .set_dscp(cid, s.wire_tos(self.local) >> 2)
             .map_err(engine)?;
         self.endpoint.set_mark(cid, s.mark).map_err(engine)?;
+        self.endpoint
+            .set_reuse_address(cid, s.reuse)
+            .map_err(engine)?;
         self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
         self.endpoint.set_cork(cid, s.cork).map_err(engine)?;
         if s.timestamps.options.flags != 0 {
@@ -2544,18 +2680,19 @@ impl Owner {
                 let reuse = s.reuse;
                 let new_v6only = s.v6only;
                 if addr.port() == 0 {
-                    addr.set_port(self.port()?);
+                    addr.set_port(self.bind_port(reuse)?);
                     local.set_port(addr.port());
                 }
                 if self.sockets.iter().any(|(&other, s)| {
                     other != id
                         && !(reuse && s.reuse && matches!(s.handle, Handle::Connection(_)))
                         && s.conflicts_binding(addr, local, new_v6only, zone)
-                }) {
+                }) || self.closed_binding_conflict(addr, local, new_v6only, zone, reuse)
+                {
                     return Err(EADDRINUSE);
                 }
+                self.set_local(id, local, ports::Binding::Bound);
                 let socket = self.sockets.get_mut(&id).unwrap();
-                socket.local = Some(local);
                 socket.bound_addr = Some(addr);
                 socket.zone = zone;
             }
@@ -2584,7 +2721,7 @@ impl Owner {
                             0,
                         );
                         let mut local = s.normalize_address(api, self.local, true)?;
-                        local.set_port(self.port()?);
+                        local.set_port(self.bind_port(s.reuse)?);
                         local
                     }
                 };
@@ -2679,8 +2816,8 @@ impl Owner {
                         )
                         .map_err(engine)?;
                 }
+                self.set_local(id, local, ports::Binding::Bound);
                 let s = self.sockets.get_mut(&id).unwrap();
-                s.local = Some(local);
                 if s.domain == AF_INET6 && s.bound_addr.is_none() {
                     s.bound_addr = Some(SocketAddr::new(s.api_unspecified(), local.port()));
                 }
@@ -2814,7 +2951,7 @@ impl Owner {
                     return Err(EINVAL);
                 }
                 let zone = self.connect_zone(id, addr)?;
-                let local = self.connect_local(id, remote, zone)?;
+                let (local, binding) = self.connect_local(id, remote, zone)?;
                 if let Some(authority) = self.sockets[&id].receive_authority {
                     self.endpoint
                         .validate_fast_open_receive_authority(authority, local.ip())
@@ -2843,16 +2980,17 @@ impl Owner {
                         .map_err(engine)?;
                     if allowed {
                         // The deferred open keeps the link resolved now.
+                        self.set_local(id, local, binding);
+                        self.port_index.defer((local, remote), true);
                         let s = self.sockets.get_mut(&id).unwrap();
-                        s.local = Some(local);
                         s.deferred_peer = Some(remote);
                         s.deferred_client_policy = Some(policy);
                         s.zone = zone;
                         return Ok(out);
                     }
-                    self.start_connection(id, local, remote, zone, Some(&[]))?;
+                    self.start_connection(id, local, binding, remote, zone, Some(&[]))?;
                 } else {
-                    self.start_connection(id, local, remote, zone, None)?;
+                    self.start_connection(id, local, binding, remote, zone, None)?;
                 }
                 return Err(EINPROGRESS);
             }
@@ -3134,7 +3272,13 @@ impl Owner {
                         true
                     }
                 });
-                self.sockets.remove(&id);
+                let s = self.sockets.remove(&id).unwrap();
+                if let Some(local) = s.local {
+                    self.port_index.socket(local.port(), s.binding, false);
+                    if let Some(peer) = s.deferred_peer {
+                        self.port_index.defer((local, peer), false);
+                    }
+                }
                 self.cancel_unused_backend_timestamps();
             }
             Op::Shutdown(how) => {
@@ -3446,6 +3590,10 @@ impl Owner {
                         (SOL_SOCKET, SO_MARK) => {
                             self.endpoint.set_mark(cid, s.mark).map_err(engine)?
                         }
+                        (SOL_SOCKET, SO_REUSEADDR) => self
+                            .endpoint
+                            .set_reuse_address(cid, s.reuse)
+                            .map_err(engine)?,
                         //= https://www.rfc-editor.org/rfc/rfc3542#section-6.5
                         //# There are cases where the kernel needs to control the
                         //# traffic class value and conflicts with the user-specified

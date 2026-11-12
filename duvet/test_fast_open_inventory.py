@@ -477,7 +477,7 @@ class FastOpenInventory(unittest.TestCase):
         for test_file, test in (
             ("runtime_handshake_error_tests.rs", "paired_handshake_soft_feedback_keeps_completion_and_stream_live"),
             ("runtime_handshake_startup_tests.rs", "startup_capacity_is_real_transactional_admission_not_a_handshake_timeout"),
-            ("runtime_handshake_startup_tests.rs", "startup_entropy_uses_existing_native_port_seam_and_never_falls_back"),
+            ("runtime_handshake_startup_tests.rs", "startup_port_exhaustion_is_transactional_and_never_falls_back"),
             ("runtime_handshake_startup_tests.rs", "handshake_feedback_rejects_forged_checksums_tuples_and_unsubmitted_sequences"),
             ("runtime_handshake_early_tests.rs", "paired_completion_preserves_authorized_terminal_prefix_for_every_start"),
             ("handshake_error_abi_tests.rs", "public_paired_handshake_errors_alias_poll_epoll_and_consumption"),

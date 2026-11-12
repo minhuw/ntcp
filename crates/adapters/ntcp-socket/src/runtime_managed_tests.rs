@@ -440,13 +440,17 @@ fn managed_native_repeated_constructor_and_option_failures_reuse_exact_generatio
     let remote: SocketAddr = "10.73.0.3:8080".parse().unwrap();
     for _ in 0..16 {
         owner.sockets.get_mut(&socket).unwrap().send_capacity = 0;
-        assert!(owner.start_connection(socket, local, remote, None, None).is_err());
+        assert!(
+            owner
+                .start_connection(socket, local, ports::Binding::Bound, remote, None, None)
+                .is_err()
+        );
         assert_eq!(owner.host.as_ref().unwrap().binding_count(), 0);
         assert_eq!(owner.host.as_ref().unwrap().paths().usage().clients, 0);
         owner.sockets.get_mut(&socket).unwrap().send_capacity = 65536;
         owner.sockets.get_mut(&socket).unwrap().user_timeout_ms = -1;
         assert_eq!(
-            owner.start_connection(socket, local, remote, None, None),
+            owner.start_connection(socket, local, ports::Binding::Bound, remote, None, None),
             Err(EINVAL)
         );
         assert_eq!(owner.host.as_ref().unwrap().binding_count(), 0);
@@ -454,13 +458,22 @@ fn managed_native_repeated_constructor_and_option_failures_reuse_exact_generatio
         assert!(matches!(owner.sockets[&socket].handle, Handle::Fresh));
         owner.sockets.get_mut(&socket).unwrap().user_timeout_ms = 0;
     }
-    owner.start_connection(socket, local, remote, None, None).unwrap();
+    owner
+        .start_connection(socket, local, ports::Binding::Bound, remote, None, None)
+        .unwrap();
     let cid = connection(&owner, socket);
     let prepared = owner.host.as_ref().unwrap().binding(cid).unwrap();
     for _ in 0..16 {
         let other = new(&mut owner, SOCK_NONBLOCK);
         assert_eq!(
-            owner.start_connection(other, SocketAddr::new(owner.local, 40001), remote, None, None),
+            owner.start_connection(
+                other,
+                SocketAddr::new(owner.local, 40001),
+                ports::Binding::Bound,
+                remote,
+                None,
+                None
+            ),
             Err(ENOBUFS)
         );
         owner.execute(other, Op::Close).unwrap();
@@ -690,7 +703,8 @@ fn managed_native_time_wait_replacement_capacity_keeps_old_binding_and_cancels_p
         a.test_now = Some(1_001_000);
         b.test_now = Some(1_001_000);
         let next = new(&mut a, SOCK_NONBLOCK);
-        a.start_connection(next, local, remote, None, None).unwrap();
+        a.start_connection(next, local, ports::Binding::Bound, remote, None, None)
+            .unwrap();
         flush(&mut a, &mut b, &wa);
         assert_eq!(b.host.as_ref().unwrap().binding(old).ok(), retained);
         let current = b

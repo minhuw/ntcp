@@ -316,8 +316,8 @@ impl Owner {
             let completion =
                 self.reserve_send_completion(id, count != 0, send.zerocopy, 0, true)?;
             let bytes = send.copy_chunk(count)?;
-            let local = self.connect_local(id, remote, zone)?;
-            let n = self.start_connection(id, local, remote, zone, Some(&bytes))?;
+            let (local, binding) = self.connect_local(id, remote, zone)?;
+            let n = self.start_connection(id, local, binding, remote, zone, Some(&bytes))?;
             send.fast_open_started = true;
             send.advance(n);
             if n != 0 && completion {

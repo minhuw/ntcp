@@ -45,76 +45,6 @@ fn entropy_completion_interrupt_short_failure_and_zero_progress() {
     random_secret().unwrap();
 }
 
-fn at(port: u16) -> [u8; 8] {
-    assert!(port >= FIRST);
-    u64::from(port - FIRST).to_ne_bytes()
-}
-fn controlled(owner: &mut Owner, ports: &[u16]) {
-    owner.port_entropy = Some(ports.iter().map(|&p| Ok(at(p))).collect());
-}
-fn choose(start: u16, available: impl FnMut(u16) -> bool) -> Result<u16> {
-    allocate(
-        |bytes| {
-            bytes.copy_from_slice(&at(start));
-            Ok(())
-        },
-        available,
-    )
-}
-
-#[test]
-fn complete_range_wrap_single_available_and_finite_exhaustion() {
-    for start in [FIRST, 40000, u16::MAX] {
-        for only in [FIRST, 23456, u16::MAX] {
-            let mut visits = vec![false; 65536];
-            assert_eq!(
-                choose(start, |port| {
-                    assert!(port >= FIRST);
-                    assert!(!visits[usize::from(port)], "candidate revisited");
-                    visits[usize::from(port)] = true;
-                    port == only
-                }),
-                Ok(only)
-            );
-            assert!(visits[usize::from(only)]);
-        }
-        let mut visits = vec![0; 65536];
-        assert_eq!(
-            choose(start, |port| {
-                visits[usize::from(port)] += 1;
-                false
-            }),
-            Err(EADDRNOTAVAIL)
-        );
-        assert!(visits[..1024].iter().all(|&n| n == 0));
-        assert!(visits[1024..].iter().all(|&n| n == 1));
-    }
-    let mut visits = Vec::new();
-    assert_eq!(
-        choose(65535, |p| {
-            visits.push(p);
-            p == 1025
-        }),
-        Ok(1025)
-    );
-    assert_eq!(visits, [65535, 1024, 1025]);
-    assert_eq!(
-        allocate(|_| Err(EIO), |_| panic!("scanned after entropy failure")),
-        Err(EIO)
-    );
-    assert!(
-        allocate(
-            |out| {
-                out.fill(255);
-                Ok(())
-            },
-            |p| p >= FIRST
-        )
-        .unwrap()
-            >= FIRST
-    );
-}
-
 #[derive(Default)]
 struct Wire(VecDeque<Vec<u8>>);
 struct Io(Arc<Mutex<Wire>>);
@@ -203,8 +133,88 @@ fn connection(o: &Owner, id: u64) -> ConnectionId {
     cid
 }
 
-// These full Informational recommendations are evidenced by the native OS
-// source above, the exhaustive production-helper tests, and live socket paths.
+// The users `port_index` counts, from a pass over the sockets and the
+// connections' options: what each lookup stands for.
+fn check_index(owner: &Owner) {
+    let mut ports: Vec<u16> = owner
+        .sockets
+        .values()
+        .filter_map(|s| s.local.map(|l| l.port()))
+        .chain(owner.connection_options.iter().map(|p| p.4.port()))
+        .collect();
+    ports.extend([owner.ephemeral_ports.start(), owner.ephemeral_ports.end()].map(|p| *p));
+    for port in ports {
+        let mut users = [0u16; 4];
+        for s in owner.sockets.values() {
+            if s.local.is_some_and(|l| l.port() == port) {
+                users[s.binding as usize] += 1;
+            }
+        }
+        for p in &owner.connection_options {
+            if p.4.port() == port {
+                users[2 + p.5 as usize] += 1;
+            }
+        }
+        assert_eq!(owner.port_index.users(port), users, "port {port}");
+    }
+    let deferred = owner
+        .sockets
+        .values()
+        .filter(|s| s.deferred_peer.is_some())
+        .count();
+    assert_eq!(owner.port_index.deferred_tuples(), deferred);
+}
+fn remote(v6: bool, last: u8, port: u16) -> SocketAddr {
+    SocketAddr::new(
+        if v6 {
+            format!("2001:db8::{last}")
+        } else {
+            format!("10.73.0.{last}")
+        }
+        .parse()
+        .unwrap(),
+        port,
+    )
+}
+fn connect(o: &mut Owner, to: SocketAddr) -> Result<u64> {
+    let id = new(o, SOCK_NONBLOCK);
+    match o.execute(id, Op::Connect(to)) {
+        Err(EINPROGRESS) => Ok(id),
+        Err(e) => {
+            o.execute(id, Op::Close).unwrap();
+            Err(e)
+        }
+        Ok(_) => panic!("a nonblocking connect completed at once"),
+    }
+}
+// A client in TIME-WAIT, its connection a record of the endpoint's, the
+// socket closed: the record holds (local, the server's listener). `reuse`
+// sets the client's SO_REUSEADDR first.
+fn time_wait_record(reuse: bool) -> (Owner, Owner, SocketAddr, SocketAddr) {
+    let (mut a, mut b, client, server, _) = pair();
+    a.test_now = Some(a.now());
+    b.test_now = Some(b.now());
+    a.execute(client, Op::Set(SOL_SOCKET, SO_REUSEADDR, reuse as i32))
+        .unwrap();
+    let cid = connection(&a, client);
+    let local = name(&mut a, client);
+    let peer = a.endpoint.tuple(cid).unwrap().remote;
+    a.execute(client, Op::Close).unwrap();
+    pump(&mut a, &mut b);
+    b.execute(server, Op::Close).unwrap();
+    pump(&mut a, &mut b);
+    assert_eq!(a.endpoint.state(cid), Ok(State::TimeWait));
+    // The owner loop releases a detached connection once in TIME-WAIT.
+    a.endpoint.release(cid).unwrap();
+    a.collect_connection_options();
+    assert!(!a.endpoint.connection_exists(cid));
+    assert!(a.endpoint.time_wait_holds_port(local.port()));
+    check_index(&a);
+    (a, b, local, peer)
+}
+
+// These full Informational recommendations are evidenced by the keyed
+// Algorithm 4 selection (ntcp::EphemeralPorts) and the live socket paths.
 // No distribution test is used as evidence of cryptographic unpredictability.
 //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
 //= type=test
@@ -212,36 +222,40 @@ fn connection(o: &Owner, id: u64) -> ConnectionId {
 //= https://www.rfc-editor.org/rfc/rfc5927#section-4.2
 //= type=test
 //# [PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.
+// bind(0), an implicit listen, connect and a deferred Fast Open connect
+// take ports of Linux's range, on the wire as named; a connect skips the
+// ports bind() took, and the deferred connect holds its tuple before it
+// sends a SYN.
 #[test]
 fn native_auto_ports_bind_listen_connect_and_deferred_fast_open() {
     for v6 in [false, true] {
         let (mut a, wa) = external(v6, 2);
         let (mut b, wb) = external(v6, 3);
-        // Bind(0) and implicit Listen use fresh selection. Distinct controlled
-        // values choose independently of descriptor order or the previous port.
-        controlled(&mut a, &[65535, 1024, 65535, 1024, 50000, 60000]);
         let bound = new(&mut a, SOCK_NONBLOCK);
         let bind_ip = a.local;
         a.execute(bound, Op::Bind(SocketAddr::new(bind_ip, 0)))
             .unwrap();
-        assert_eq!(name(&mut a, bound).port(), 65535);
+        let bound_port = name(&mut a, bound).port();
+        assert!(ports::RANGE.contains(&bound_port));
         let listener_a = new(&mut a, SOCK_NONBLOCK);
         a.execute(listener_a, Op::Listen(4)).unwrap();
-        assert_eq!(name(&mut a, listener_a).port(), 1024);
-        let client = new(&mut a, SOCK_NONBLOCK);
-        controlled(&mut b, &[8080]);
+        let listen_port = name(&mut a, listener_a).port();
+        assert!(ports::RANGE.contains(&listen_port) && listen_port != bound_port);
         let listener_b = new(&mut b, SOCK_NONBLOCK);
         b.execute(listener_b, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 4))
             .unwrap();
         b.execute(listener_b, Op::Listen(4)).unwrap();
         let remote = SocketAddr::new(b.local, name(&mut b, listener_b).port());
-        // Starting at 65535 skips the bound port, wraps, skips the listener.
-        assert_eq!(
-            a.execute(client, Op::Connect(remote)).unwrap_err(),
-            EINPROGRESS
-        );
+        // Neither the bound port nor the listener's is a connect's.
+        for port in [bound_port, listen_port] {
+            a.ephemeral_ports = port..=port;
+            assert_eq!(connect(&mut a, remote), Err(EADDRNOTAVAIL));
+        }
+        a.ephemeral_ports = ports::RANGE;
+        let client = connect(&mut a, remote).unwrap();
         let local = name(&mut a, client);
-        assert_eq!(local.port(), 1025);
+        assert!(ports::RANGE.contains(&local.port()));
+        assert!(![bound_port, listen_port].contains(&local.port()));
         assert_eq!(
             a.endpoint.tuple(connection(&a, client)).unwrap().local,
             local
@@ -265,18 +279,19 @@ fn native_auto_ports_bind_listen_connect_and_deferred_fast_open() {
             b.execute(server, Op::Read(32)).unwrap().bytes,
             b"native request"
         );
-        b.execute(server, Op::Write(b"native response".to_vec()))
-            .unwrap();
-        exchange(&mut a, &mut b, &wa, &wb);
-        assert_eq!(
-            a.execute(client, Op::Read(32)).unwrap().bytes,
-            b"native response"
-        );
-        // The connected socket is skipped as well as bound/listening sockets.
+        // bind(0) skips the connected socket's port, as every used one.
+        a.ephemeral_ports = local.port()..=local.port() + 1;
         let second = new(&mut a, SOCK_NONBLOCK);
         a.execute(second, Op::Bind(SocketAddr::new(bind_ip, 0)))
             .unwrap();
-        assert_eq!(name(&mut a, second).port(), 1026);
+        assert_eq!(name(&mut a, second).port(), local.port() + 1);
+        let third = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(third, Op::Bind(SocketAddr::new(bind_ip, 0)))
+                .unwrap_err(),
+            EADDRINUSE
+        );
+        a.ephemeral_ports = ports::RANGE;
         let warm = new(&mut a, SOCK_NONBLOCK);
         a.execute(warm, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
             .unwrap();
@@ -296,9 +311,18 @@ fn native_auto_ports_bind_listen_connect_and_deferred_fast_open() {
             .unwrap();
         a.execute(deferred, Op::Connect(remote)).unwrap();
         let deferred_local = name(&mut a, deferred);
-        assert_eq!(deferred_local.port(), 60000);
+        assert!(ports::RANGE.contains(&deferred_local.port()));
         assert!(matches!(a.sockets[&deferred].handle, Handle::Fresh));
         assert!(deliver(&mut a, &mut b, &wa).is_empty());
+        check_index(&a);
+        // The deferred connect's tuple is taken: no other connect to the
+        // destination gets its port, though one elsewhere may.
+        a.ephemeral_ports = deferred_local.port()..=deferred_local.port();
+        assert_eq!(connect(&mut a, remote), Err(EADDRNOTAVAIL));
+        let elsewhere = connect(&mut a, SocketAddr::new(b.local, remote.port() + 1)).unwrap();
+        assert_eq!(name(&mut a, elsewhere).port(), deferred_local.port());
+        a.execute(elsewhere, Op::Close).unwrap();
+        a.ephemeral_ports = ports::RANGE;
         let early = b"fast open";
         a.execute(
             deferred,
@@ -314,55 +338,187 @@ fn native_auto_ports_bind_listen_connect_and_deferred_fast_open() {
             .unwrap()
             .value as u64;
         assert_eq!(b.execute(child, Op::Read(32)).unwrap().bytes, b"fast open");
-        assert!(a.port_entropy.as_ref().unwrap().is_empty());
+        check_index(&a);
+        check_index(&b);
     }
 }
 
+// RFC 6056 Algorithm 4 as Linux's __inet_hash_connect: a port is shared by
+// connects to distinct destinations, never twice to one, and runs out per
+// destination only.
+//= https://www.rfc-editor.org/rfc/rfc6056#section-3.3.4
+//= type=test
+//# The array "table[]" assures that successive transport-protocol
+//# instances with the same remote endpoint will use increasing ephemeral
+//# port numbers.
 #[test]
-fn native_entropy_errors_are_transactional_and_explicit_bind_uses_none() {
+fn connects_share_ports_across_destinations_and_exhaust_per_destination() {
     for v6 in [false, true] {
-        for operation in 0..4 {
-            let (mut owner, wire) = external(v6, 2);
-            let id = new(&mut owner, SOCK_NONBLOCK);
-            let local = owner.local;
-            let remote = SocketAddr::new(
-                if v6 { "2001:db8::3" } else { "10.73.0.3" }
-                    .parse()
-                    .unwrap(),
-                8080,
-            );
-            if operation == 3 {
-                owner
-                    .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
-                    .unwrap();
+        let (mut a, _) = external(v6, 2);
+        a.ephemeral_ports = 40000..=40003;
+        let first = remote(v6, 3, 80);
+        let mut taken: Vec<u16> = (0..4)
+            .map(|_| {
+                let id = connect(&mut a, first).unwrap();
+                name(&mut a, id).port()
+            })
+            .collect();
+        // One destination takes each port once, then has none.
+        assert_eq!(connect(&mut a, first), Err(EADDRNOTAVAIL));
+        taken.sort_unstable();
+        assert_eq!(taken, [40000, 40001, 40002, 40003]);
+        // Other destinations, another address or another port, share them.
+        for other in [remote(v6, 4, 80), remote(v6, 3, 81)] {
+            for _ in 0..4 {
+                connect(&mut a, other).unwrap();
             }
-            owner.port_entropy = Some(VecDeque::from([Err(EPERM)]));
-            let options = owner.connection_options.clone();
-            let bytes = owner.endpoint.buffer_bytes();
-            let op = match operation {
-                0 => Op::Bind(SocketAddr::new(local, 0)),
-                1 => Op::Listen(4),
-                _ => Op::Connect(remote),
-            };
-            assert_eq!(owner.execute(id, op).unwrap_err(), EPERM);
-            let socket = &owner.sockets[&id];
-            assert!(matches!(socket.handle, Handle::Fresh));
-            assert!(
-                socket.local.is_none()
-                    && socket.bound_addr.is_none()
-                    && socket.deferred_peer.is_none()
-            );
-            assert_eq!(owner.connection_options, options);
-            assert_eq!(owner.endpoint.buffer_bytes(), bytes);
-            assert!(owner.detached.is_empty());
-            assert!(wire.lock().unwrap().0.is_empty());
-            // Empty seam would panic if a nonzero bind consumed entropy.
-            owner
-                .execute(id, Op::Bind(SocketAddr::new(local, 12345)))
-                .unwrap();
-            assert_eq!(name(&mut owner, id).port(), 12345);
-            owner.execute(id, Op::Listen(1)).unwrap();
+            assert_eq!(connect(&mut a, other), Err(EADDRNOTAVAIL));
         }
+        assert_eq!(a.connection_options.len(), 12);
+        check_index(&a);
+    }
+}
+
+// A connect does not take a port bind() or listen took, for any
+// destination, nor a 4-tuple a connection already has.
+#[test]
+fn connects_skip_bound_and_listening_ports() {
+    let (mut a, _) = external(false, 2);
+    a.ephemeral_ports = 40000..=40001;
+    let bound = new(&mut a, SOCK_NONBLOCK);
+    a.execute(bound, Op::Bind(SocketAddr::new(a.local, 40000)))
+        .unwrap();
+    let listener = new(&mut a, SOCK_NONBLOCK);
+    a.execute(listener, Op::Bind(SocketAddr::new(a.local, 40001)))
+        .unwrap();
+    a.execute(listener, Op::Listen(4)).unwrap();
+    assert_eq!(connect(&mut a, remote(false, 3, 80)), Err(EADDRNOTAVAIL));
+    a.execute(bound, Op::Close).unwrap();
+    let id = connect(&mut a, remote(false, 3, 80)).unwrap();
+    assert_eq!(name(&mut a, id).port(), 40000);
+    assert_eq!(connect(&mut a, remote(false, 3, 80)), Err(EADDRNOTAVAIL));
+    // bind() cannot take a port a connect holds (no SO_REUSEADDR).
+    let rebind = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(rebind, Op::Bind(SocketAddr::new(a.local, 40000)))
+            .unwrap_err(),
+        EADDRINUSE
+    );
+    check_index(&a);
+}
+
+// Each destination starts at an offset of its own, a keyed hash of the
+// endpoint's secret: another secret gives other ports.
+//= https://www.rfc-editor.org/rfc/rfc6056#section-3.3.3
+//= type=test
+//# The function should use both IP addresses, the remote
+//# port, and a secret key value to compute the offset.
+#[test]
+fn each_destination_starts_at_its_own_secret_offset() {
+    let firsts = |secret: u8| -> Vec<u16> {
+        let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;
+        config.max_connections = 64;
+        let mut owner = Owner::with_config(
+            Ipv4Addr::new(10, 73, 0, 2),
+            (Ipv4Addr::new(10, 73, 0, 1), 24),
+            [secret; 32],
+            None,
+            config,
+        )
+        .unwrap();
+        owner.test_now = Some(0);
+        (3..19)
+            .map(|last| {
+                let id = connect(&mut owner, remote(false, last, 80)).unwrap();
+                name(&mut owner, id).port()
+            })
+            .collect()
+    };
+    let a = firsts(1);
+    assert!(a.iter().all(|port| ports::RANGE.contains(port)));
+    // 16 destinations start at no one sequence: neither all on one port
+    // nor each a port after the last, as one global counter would give.
+    assert!(a.windows(2).any(|w| w[0] != w[1]));
+    assert!(!a.windows(2).all(|w| w[1] == w[0] + 2 || w[1] == w[0] + 1));
+    assert_eq!(a, firsts(1));
+    let b = firsts(2);
+    assert!(
+        a.iter().zip(&b).filter(|(x, y)| x == y).count() < 4,
+        "{a:?} {b:?}"
+    );
+}
+
+// A TIME-WAIT record keeps its 4-tuple: a connect to its destination does
+// not take the port while it lasts, one to another destination does.
+// bind(0) takes no port a record holds.
+#[test]
+fn time_wait_records_keep_their_tuple_and_port() {
+    let (mut a, _b, local, peer) = time_wait_record(false);
+    a.ephemeral_ports = local.port()..=local.port();
+    assert_eq!(connect(&mut a, peer), Err(EADDRNOTAVAIL));
+    let id = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(id, Op::Bind(SocketAddr::new(a.local, 0)))
+            .unwrap_err(),
+        EADDRINUSE
+    );
+    a.execute(id, Op::Close).unwrap();
+    let elsewhere = connect(&mut a, SocketAddr::new(peer.ip(), peer.port() + 1)).unwrap();
+    assert_eq!(name(&mut a, elsewhere).port(), local.port());
+    a.test_now = Some(500_000_000);
+    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    assert!(!a.endpoint.time_wait_holds_port(local.port()));
+    let again = connect(&mut a, peer).unwrap();
+    assert_eq!(name(&mut a, again).port(), local.port());
+    check_index(&a);
+}
+
+// bind() to the port of a TIME-WAIT record, or of a connection whose
+// descriptor is closed, is refused unless both it and the bind have
+// SO_REUSEADDR, as Linux's inet_bind_conflict judges a timewait socket's
+// tw_reuse.
+#[test]
+fn bind_to_a_time_wait_port_needs_both_sides_reuse() {
+    for (tw_reuse, reuse) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (mut a, _b, local, _) = time_wait_record(tw_reuse);
+        let id = new(&mut a, SOCK_NONBLOCK);
+        a.execute(id, Op::Set(SOL_SOCKET, SO_REUSEADDR, reuse as i32))
+            .unwrap();
+        let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), local.port());
+        for address in [local, wildcard] {
+            assert_eq!(
+                a.execute(id, Op::Bind(address)).err(),
+                (!(tw_reuse && reuse)).then_some(EADDRINUSE),
+                "{tw_reuse} {reuse} {address}"
+            );
+            if tw_reuse && reuse {
+                break;
+            }
+        }
+        if tw_reuse && reuse {
+            a.execute(id, Op::Listen(4)).unwrap();
+        }
+        // Another port is free whatever the reuse.
+        let other = new(&mut a, SOCK_NONBLOCK);
+        a.execute(other, Op::Bind(SocketAddr::new(a.local, local.port() + 1)))
+            .unwrap();
+        check_index(&a);
+    }
+    // A connection whose descriptor is closed, before its TIME-WAIT.
+    for (old_reuse, reuse) in [(false, true), (true, true)] {
+        let (mut a, _b, client, _, _) = pair();
+        a.execute(client, Op::Set(SOL_SOCKET, SO_REUSEADDR, old_reuse as i32))
+            .unwrap();
+        let local = name(&mut a, client);
+        a.execute(client, Op::Close).unwrap();
+        let id = new(&mut a, SOCK_NONBLOCK);
+        a.execute(id, Op::Set(SOL_SOCKET, SO_REUSEADDR, reuse as i32))
+            .unwrap();
+        assert_eq!(
+            a.execute(id, Op::Bind(local)).err(),
+            (!old_reuse).then_some(EADDRINUSE)
+        );
+        check_index(&a);
     }
 }
 
@@ -374,7 +530,7 @@ fn detached_and_released_time_wait_ports_stay_owned_until_collection() {
     let cid = connection(&a, client);
     let local = name(&mut a, client);
     a.execute(client, Op::Close).unwrap();
-    assert!(!a.port_available(local.port()));
+    assert!(a.port_index.used(local.port()));
     pump(&mut a, &mut b);
     b.execute(server, Op::Close).unwrap();
     pump(&mut a, &mut b);
@@ -384,36 +540,20 @@ fn detached_and_released_time_wait_ports_stay_owned_until_collection() {
     // Released, only its TIME-WAIT record remains, and holds the port.
     assert!(!a.endpoint.connection_exists(cid));
     assert!(a.endpoint.time_wait_holds_port(local.port()));
-    controlled(&mut a, &[local.port(), local.port()]);
-    assert_ne!(a.port().unwrap(), local.port());
+    a.ephemeral_ports = local.port()..=local.port() + 1;
+    assert_eq!(a.bind_port(false), Ok(local.port() + 1));
     a.test_now = Some(500_000_000);
     a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
     pump(&mut a, &mut b);
     assert!(!a.endpoint.connection_exists(cid));
     // Stale generation metadata does not keep a collected port reserved.
-    assert_eq!(a.port().unwrap(), local.port());
+    a.ephemeral_ports = local.port()..=local.port();
+    assert_eq!(a.bind_port(false), Ok(local.port()));
+    check_index(&a);
 }
 
 #[test]
-fn native_choices_follow_fresh_entropy_even_when_descriptor_is_reused() {
-    let (mut owner, _) = external(false, 2);
-    controlled(&mut owner, &[2000, 60000, 3000]);
-    for expected in [2000, 60000, 3000] {
-        owner.next_id = 1; // Reuse the logical descriptor after close.
-        let id = new(&mut owner, SOCK_NONBLOCK);
-        assert_eq!(id, 1);
-        let local = owner.local;
-        owner
-            .execute(id, Op::Bind(SocketAddr::new(local, 0)))
-            .unwrap();
-        assert_eq!(name(&mut owner, id).port(), expected);
-        owner.execute(id, Op::Close).unwrap();
-    }
-    assert!(owner.port_entropy.as_ref().unwrap().is_empty());
-}
-
-#[test]
-fn ordinary_backendless_owner_uses_os_entropy_without_packet_policy() {
+fn ordinary_backendless_owner_takes_ports_of_the_linux_range() {
     let (mut owner, _) = external(false, 2);
     owner.ports[0].ethernet = None;
     for _ in 0..4 {
@@ -422,6 +562,7 @@ fn ordinary_backendless_owner_uses_os_entropy_without_packet_policy() {
         owner
             .execute(id, Op::Bind(SocketAddr::new(local, 0)))
             .unwrap();
-        assert!(name(&mut owner, id).port() >= FIRST);
+        assert!(ports::RANGE.contains(&name(&mut owner, id).port()));
     }
+    check_index(&owner);
 }

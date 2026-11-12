@@ -68,7 +68,7 @@ fn startup_capacity_is_real_transactional_admission_not_a_handshake_timeout() {
 }
 
 #[test]
-fn startup_entropy_uses_existing_native_port_seam_and_never_falls_back() {
+fn startup_port_exhaustion_is_transactional_and_never_falls_back() {
     for v6 in [false, true] {
         for mode in OPENS {
             let (mut a, _b, _, remote) = setup(v6, mode.warm());
@@ -78,9 +78,14 @@ fn startup_entropy_uses_existing_native_port_seam_and_never_falls_back() {
                     .unwrap();
             }
             // Synthetic packet profiles intentionally use sequential test ports.
-            // Select native port allocation while retaining the real warmed core.
+            // Select native port allocation while retaining the real warmed core,
+            // with its one ephemeral port bound by another socket.
             let backend = a.packets.take();
-            a.port_entropy = Some(VecDeque::from([Err(EPERM)]));
+            let holder = new(&mut a, SOCK_NONBLOCK);
+            let local = a.local;
+            a.execute(holder, Op::Bind(SocketAddr::new(local, 33000)))
+                .unwrap();
+            a.ephemeral_ports = 33000..=33000;
             let buffers = a.endpoint.buffer_bytes();
             let options = a.connection_options.clone();
             let terminal = a.execute(client, Op::Transport(1)).unwrap().bytes;
@@ -89,8 +94,7 @@ fn startup_entropy_uses_existing_native_port_seam_and_never_falls_back() {
             } else {
                 mode.op(remote)
             };
-            assert_eq!(a.execute(client, operation).unwrap_err(), EPERM);
-            assert!(a.port_entropy.as_ref().unwrap().is_empty());
+            assert_eq!(a.execute(client, operation).unwrap_err(), EADDRNOTAVAIL);
             assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
             assert!(a.sockets[&client].local.is_none());
             assert!(a.sockets[&client].deferred_peer.is_none());
@@ -113,7 +117,7 @@ fn startup_entropy_uses_existing_native_port_seam_and_never_falls_back() {
                 );
             }
             eprintln!(
-                "T5_ERROR_STARTUP {{\"v6\":{v6},\"open\":\"{mode:?}\",\"cause\":\"port_entropy\",\"errno\":{EPERM},\"wire\":false,\"fallback\":false}}"
+                "T5_ERROR_STARTUP {{\"v6\":{v6},\"open\":\"{mode:?}\",\"cause\":\"ports\",\"errno\":{EADDRNOTAVAIL},\"wire\":false,\"fallback\":false}}"
             );
         }
     }

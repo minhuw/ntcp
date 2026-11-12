@@ -362,8 +362,8 @@
       "section": "4.2",
       "quote": "As discussed in the previous sections, in order to perform any of the attacks described in this document, an attacker would need to guess (or know) the four-tuple that identifies the connection to be attacked. Increasing the port number range used for outgoing TCP connections, and randomizing the port number chosen for each outgoing TCP connection, would make it harder for an attacker to perform any of the attacks discussed in this document.",
       "status": "covered",
-      "reason": "Selected Informational security policy: native automatic binds use fresh kernel getrandom entropy for each allocation over 1024..65535, with a complete bounded wrapped scan excluding socket and retained connection ports. Entropy errors fail closed; exhaustion remains EADDRNOTAVAIL. RFC6056 Algorithm 1 motivates the mechanism, with known occupied-cluster bias, not perfect uniformity or whole-RFC conformance. Explicit packet-test profiles retain synthetic sequential allocation.",
-      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn port(", "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open("],
+      "reason": "Selected Informational security policy: an unbound socket's connect chooses its port by RFC6056 Algorithm 4, as Linux's __inet_hash_connect (ntcp::EphemeralPorts::select): a per-destination offset, a SipHash keyed from the endpoint secret, plus one of 2^16 per-space increments, over Linux's ip_local_port_range 32768..60999, skipping bound ports and 4-tuples in use. bind(port 0) and implicit listen start at a keyed random draw and scan, as Linux's inet_csk_find_open_port. Connect exhaustion is EADDRNOTAVAIL, bind exhaustion EADDRINUSE. Not a claim of uniformity or whole-RFC conformance. Explicit packet-test profiles retain synthetic sequential allocation.",
+      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn connect_port(", "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open("],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
     },
     {
@@ -371,8 +371,8 @@
       "section": "4.2",
       "quote": "[PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.",
       "status": "covered",
-      "reason": "Selected Informational security policy: native automatic binds use fresh kernel getrandom entropy for each allocation over 1024..65535, with a complete bounded wrapped scan excluding socket and retained connection ports. Entropy errors fail closed; exhaustion remains EADDRNOTAVAIL. RFC6056 Algorithm 1 motivates the mechanism, with known occupied-cluster bias, not perfect uniformity or whole-RFC conformance. Explicit packet-test profiles retain synthetic sequential allocation.",
-      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn port(", "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open("],
+      "reason": "Selected Informational security policy: an unbound socket's connect chooses its port by RFC6056 Algorithm 4, as Linux's __inet_hash_connect (ntcp::EphemeralPorts::select): a per-destination offset, a SipHash keyed from the endpoint secret, plus one of 2^16 per-space increments, over Linux's ip_local_port_range 32768..60999, skipping bound ports and 4-tuples in use. bind(port 0) and implicit listen start at a keyed random draw and scan, as Linux's inet_csk_find_open_port. Connect exhaustion is EADDRNOTAVAIL, bind exhaustion EADDRINUSE. Not a claim of uniformity or whole-RFC conformance. Explicit packet-test profiles retain synthetic sequential allocation.",
+      "evidence": ["crates/adapters/ntcp-socket/src/runtime.rs::    fn connect_port(", "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open("],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
     },
     {

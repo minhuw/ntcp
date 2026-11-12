@@ -33,7 +33,11 @@ pub(super) fn binding_overlap(a: SocketAddr, b: SocketAddr) -> bool {
 fn zone_overlap(a: Option<Zone>, b: Option<Zone>) -> bool {
     a.zip(b).is_none_or(|(a, b)| a.link == b.link)
 }
-fn binding_scopes(api: SocketAddr, wire: SocketAddr, only: bool) -> [Option<SocketAddr>; 2] {
+pub(super) fn binding_scopes(
+    api: SocketAddr,
+    wire: SocketAddr,
+    only: bool,
+) -> [Option<SocketAddr>; 2] {
     if api.is_ipv6() && api.ip().is_unspecified() && !only {
         [
             Some(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), api.port())),

@@ -69,22 +69,25 @@ impl Owner {
         id: u64,
         remote: SocketAddr,
         zone: Option<address_policy::Zone>,
-    ) -> Result<SocketAddr> {
+    ) -> Result<(SocketAddr, ports::Binding)> {
         self.collect_paths()?;
-        self.connection_options
-            .retain(|p| self.endpoint.connection_exists(p.0));
+        self.collect_connection_options();
         if self.connection_options.len() == self.socket_limit() {
             return Err(ENOBUFS);
         }
         let source = self.source_for(remote, zone);
-        let mut local = match self.sockets[&id].local {
-            Some(local) => local,
-            None => SocketAddr::new(source, self.port()?),
+        let socket = &self.sockets[&id];
+        let (mut local, binding) = match socket.local {
+            Some(local) => (local, socket.binding),
+            None => (
+                SocketAddr::new(source, self.connect_port(source, remote, zone)?),
+                ports::Binding::Ephemeral,
+            ),
         };
         if local.ip().is_unspecified() {
             local.set_ip(source);
         }
-        Ok(local)
+        Ok((local, binding))
     }
     // The source address of an unbound or wildcard-bound connection to
     // `remote`: the address of the port whose link the connection is scoped
@@ -123,6 +126,7 @@ impl Owner {
         &mut self,
         id: u64,
         local: SocketAddr,
+        binding: ports::Binding,
         remote: SocketAddr,
         zone: Option<address_policy::Zone>,
         initial: Option<&[u8]>,
@@ -210,17 +214,21 @@ impl Owner {
         // Publish the new attempt only after all pre-output options succeeded.
         self.sockets.get_mut(&id).unwrap().terminal_transport = None;
         self.sockets.get_mut(&id).unwrap().soft_error = 0;
-        self.connection_options.push((
+        self.push_connection_options((
             cid,
             options.wire_tos(self.local),
             options.wire_discover(self.local),
             Some(options.zerocopy),
             local,
+            binding,
         ));
+        if let (Some(deferred), Some(peer)) = (options.local, options.deferred_peer) {
+            self.port_index.defer((deferred, peer), false);
+        }
+        self.set_local(id, local, binding);
         let s = self.sockets.get_mut(&id).unwrap();
         s.handle = Handle::Connection(cid);
         s.connect_pending = true;
-        s.local = Some(local);
         s.deferred_peer = None;
         s.deferred_client_policy = None;
         s.zone = zone;

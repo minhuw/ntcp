@@ -137,10 +137,10 @@ class PmtudInventory(unittest.TestCase):
             row = rows[f"5927-{i:03}"]
             self.assertEqual(row["status"], "covered")
             self.assertIn("Selected Informational security policy:", row["reason"])
-            self.assertIn("1024..65535", row["reason"])
-            self.assertIn("occupied-cluster bias", row["reason"])
+            self.assertIn("32768..60999", row["reason"])
+            self.assertIn("Algorithm 4", row["reason"])
             self.assertEqual(row["evidence"], [
-                "crates/adapters/ntcp-socket/src/runtime.rs::    fn port(",
+                "crates/adapters/ntcp-socket/src/runtime.rs::    fn connect_port(",
                 "crates/adapters/ntcp-socket/src/runtime_port_tests.rs::fn native_auto_ports_bind_listen_connect_and_deferred_fast_open(",
             ])
         for i in (103, 104, 106, 108, 109):
