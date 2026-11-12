@@ -511,10 +511,8 @@ struct Socket {
     completion_charge: usize,
     // This socket's share of Owner::timestamp_total at its last settle.
     timestamp_charged: usize,
-    // Links of Owner::changed, the sockets the next event pass refreshes.
-    queued: bool,
-    changed_prev: Option<u64>,
-    changed_next: Option<u64>,
+    // Its links in the socket lists (`Owner::lists`).
+    lists: [Links; LISTS],
 }
 impl Socket {
     fn server_cookie_for(&self, remote: SocketAddr) -> Option<FastOpenCookie> {
@@ -600,9 +598,7 @@ impl Socket {
             timestamps: TimestampState::default(),
             completion_charge: 0,
             timestamp_charged: 0,
-            queued: false,
-            changed_prev: None,
-            changed_next: None,
+            lists: [Links::default(); LISTS],
         }
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
@@ -635,44 +631,60 @@ impl Socket {
         })
     }
 }
-// Links socket `id` at the head of the `changed` list, once.
-fn queue_changed(sockets: &mut BTreeMap<u64, Socket>, changed: &mut Option<u64>, id: u64) {
+// The lists of sockets that passes visit instead of every socket, linked
+// through the sockets as Linux links a socket into a wait queue: joining
+// one never allocates, and a socket leaves one in constant time.
+const LISTS: usize = 4;
+// Readiness may have changed since the last refresh (`Owner::events`).
+const CHANGED: usize = 0;
+// A finish_send deferred while its output is held (`Socket::send_finish`).
+const FINISHING: usize = 1;
+// Zero-copy leases outstanding (`Socket::zc_leases`).
+const LEASED: usize = 2;
+// TX timestamp records at the socket's connection: those its writes
+// requested (`TimestampState::pending`), or any the connection reported
+// ready (`ConnectionEvents::tx_timestamps`).
+const STAMPING: usize = 3;
+#[derive(Clone, Copy, Default)]
+struct Links {
+    member: bool,
+    prev: Option<u64>,
+    next: Option<u64>,
+}
+type Heads = [Option<u64>; LISTS];
+// Links socket `id` at the head of `list`, once.
+fn link(sockets: &mut BTreeMap<u64, Socket>, heads: &mut Heads, list: usize, id: u64) {
     let Some(s) = sockets.get_mut(&id) else {
         return;
     };
-    if s.queued {
+    if s.lists[list].member {
         return;
     }
-    s.queued = true;
-    s.changed_prev = None;
-    s.changed_next = changed.replace(id);
-    if let Some(next) = s.changed_next {
-        sockets.get_mut(&next).unwrap().changed_prev = Some(id);
+    let next = heads[list].replace(id);
+    s.lists[list] = Links {
+        member: true,
+        prev: None,
+        next,
+    };
+    if let Some(next) = next {
+        sockets.get_mut(&next).unwrap().lists[list].prev = Some(id);
     }
 }
-// Links socket `s` (`id`) at the head of `local`, a chain kept by a pass
-// over the sockets that cannot reach the `changed` list's other sockets
-// while it holds this one; `Owner::splice_changed` adds the chain after.
-fn queue_local(s: &mut Socket, id: u64, local: &mut Option<u64>) {
-    if !s.queued {
-        s.queued = true;
-        s.changed_prev = None;
-        s.changed_next = local.replace(id);
-    }
-}
-// Unlinks socket `id` from the `changed` list, before its removal.
-fn unqueue_changed(sockets: &mut BTreeMap<u64, Socket>, changed: &mut Option<u64>, id: u64) {
-    let Some(s) = sockets.get_mut(&id).filter(|s| s.queued) else {
+// Unlinks socket `id` from `list`, if it is on it.
+fn unlink(sockets: &mut BTreeMap<u64, Socket>, heads: &mut Heads, list: usize, id: u64) {
+    let Some(s) = sockets.get_mut(&id) else {
         return;
     };
-    s.queued = false;
-    let (prev, next) = (s.changed_prev.take(), s.changed_next.take());
+    let Links { member, prev, next } = std::mem::take(&mut s.lists[list]);
+    if !member {
+        return;
+    }
     match prev {
-        Some(prev) => sockets.get_mut(&prev).unwrap().changed_next = next,
-        None => *changed = next,
+        Some(prev) => sockets.get_mut(&prev).unwrap().lists[list].next = next,
+        None => heads[list] = next,
     }
     if let Some(next) = next {
-        sockets.get_mut(&next).unwrap().changed_prev = prev;
+        sockets.get_mut(&next).unwrap().lists[list].prev = prev;
     }
 }
 fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
@@ -753,10 +765,11 @@ struct Owner {
     // event or an operation concerned, those with a completion queued,
     // those whose connection may transmit (`Endpoint::ready_connections`
     // at the last pass, which moves the unsent count) and those held by
-    // output (whose release has no event). A list linked through the
-    // sockets, as Linux links a socket into a wait queue: queueing one
-    // never allocates.
-    changed: Option<u64>,
+    // output (whose release has no event). The first of the socket lists
+    // (`CHANGED`), whose heads these are.
+    lists: Heads,
+    // Sockets whose options enable software receive timestamps.
+    rx_software: usize,
     // The `io.*` port's address: the runtime's address family and the
     // source of connections no other port's address is selected for.
     local: IpAddr,
@@ -1190,7 +1203,8 @@ impl Owner {
             sockets: BTreeMap::new(),
             connection_holders: HashMap::new(),
             listener_holders: HashMap::new(),
-            changed: None,
+            lists: [None; LISTS],
+            rx_software: 0,
             local,
             clock,
             started,
@@ -2089,6 +2103,9 @@ impl Owner {
             };
             if let Some(id) = holder {
                 self.touch(id);
+                if matches!(&event, Event::Connection(_, e) if e.tx_timestamps) {
+                    link(&mut self.sockets, &mut self.lists, STAMPING, id);
+                }
             }
             if let Some(s) = holder.and_then(|id| self.sockets.get_mut(&id)) {
                 match (s.handle, &event) {
@@ -2134,12 +2151,11 @@ impl Owner {
         self.queue_transmitting();
         // Detach the list: a socket queued while it is refreshed (one held
         // by output) joins the next pass's.
-        let mut next = self.changed.take();
+        let mut next = self.lists[CHANGED].take();
         while let Some(id) = next {
-            let s = self.sockets.get_mut(&id).expect("queued socket is live");
-            next = s.changed_next.take();
-            s.changed_prev = None;
-            s.queued = false;
+            let links = &mut self.sockets.get_mut(&id).expect("listed socket").lists[CHANGED];
+            next = links.next;
+            *links = Links::default();
             let _ = self.refresh_readiness(id);
         }
         // Their unsent counts move as they transmit before the next pass:
@@ -2161,41 +2177,43 @@ impl Owner {
     // Queues the sockets of connections with output to send or held by
     // egress: at most the connections egress is serving.
     fn queue_transmitting(&mut self) {
-        let (holders, sockets, changed) = (
+        let (holders, sockets, lists) = (
             &self.connection_holders,
             &mut self.sockets,
-            &mut self.changed,
+            &mut self.lists,
         );
         let held = self.egress.iter().flat_map(|e| e.held_owners());
         for cid in self.endpoint.ready_connections().chain(held) {
             if let Some(&id) = holders.get(&cid) {
-                queue_changed(sockets, changed, id);
+                link(sockets, lists, CHANGED, id);
             }
         }
     }
     // Queues socket `id` for the next event pass's readiness refresh.
     fn touch(&mut self, id: u64) {
-        queue_changed(&mut self.sockets, &mut self.changed, id);
+        link(&mut self.sockets, &mut self.lists, CHANGED, id);
     }
-    // Adds a chain `queue_local` built to the `changed` list.
-    fn splice_changed(&mut self, local: Option<u64>) {
-        let Some(first) = local else {
+    // Debug builds check `list`'s links and that every socket `listed`
+    // holds for is on it (`exact`: and no other).
+    fn check_list(&self, list: usize, listed: impl Fn(&Socket) -> bool, exact: bool) {
+        if !cfg!(debug_assertions) {
             return;
-        };
-        let (mut prev, mut tail) = (None, first);
-        loop {
-            let s = self.sockets.get_mut(&tail).unwrap();
-            s.changed_prev = prev;
-            match s.changed_next {
-                Some(next) => (prev, tail) = (Some(tail), next),
-                None => break,
-            }
         }
-        let old = self.changed.replace(first);
-        self.sockets.get_mut(&tail).unwrap().changed_next = old;
-        if let Some(old) = old {
-            self.sockets.get_mut(&old).unwrap().changed_prev = Some(tail);
+        let (mut count, mut prev, mut at) = (0, None, self.lists[list]);
+        while let Some(id) = at {
+            let links = &self.sockets[&id].lists[list];
+            assert!(links.member && links.prev == prev, "list {list} at {id}");
+            (count, prev, at) = (count + 1, Some(id), links.next);
         }
+        for (id, s) in &self.sockets {
+            let (want, member) = (listed(s), s.lists[list].member);
+            assert!(
+                if exact { want == member } else { !want || member },
+                "socket {id}: list {list} membership {member}"
+            );
+        }
+        let members = self.sockets.values().filter(|s| s.lists[list].member);
+        assert_eq!(count, members.count(), "list {list} length");
     }
     // Every socket, after a change of policy all of them read.
     fn touch_all(&mut self) {
@@ -2290,6 +2308,7 @@ impl Owner {
             self.port_index.socket(local.port(), s.binding, true);
         }
         self.hold(id, s.handle, true);
+        self.rx_software += usize::from(s.timestamps.options.flags & crate::timestamping::RX_SOFTWARE != 0);
         self.sockets.insert(id, s);
         self.touch(id);
         self.settle_timestamp_charge(id);
@@ -3911,10 +3930,8 @@ impl Owner {
                             .map_err(engine)?;
                     }
                 }
-                // The queue links are the live socket's, not the copy's.
-                let live = &self.sockets[&id];
-                (candidate.queued, candidate.changed_prev, candidate.changed_next) =
-                    (live.queued, live.changed_prev, live.changed_next);
+                // The list links are the live socket's, not the copy's.
+                candidate.lists = self.sockets[&id].lists;
                 self.sockets.insert(id, candidate);
                 self.settle_timestamp_charge(id);
                 // Linux tcp_setsockopt calls sk_write_space even for a repeated

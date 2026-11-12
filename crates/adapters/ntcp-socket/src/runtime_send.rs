@@ -41,22 +41,29 @@ pub(super) fn batch_goal(info: &ntcp::TransportInfo) -> usize {
 impl Owner {
     // A nonblocking caller may return while output owns an immutable plan.
     // Apply only its boundary metadata once that generation is mutable again.
+    // Visits only the sockets that kept one (`FINISHING`).
     pub(super) fn finish_retained_sends(&mut self) {
-        for socket in self.sockets.values_mut() {
-            if let Some(finish) = socket.send_finish
-                && !self.endpoint.is_output_reserved(finish.connection)
-            {
-                if matches!(socket.handle, Handle::Connection(cid) if cid == finish.connection) {
-                    let _ = self.endpoint.finish_send(
-                        finish.connection,
-                        finish.end,
-                        finish.more,
-                        finish.end_of_record,
-                        finish.force,
-                    );
-                }
-                socket.send_finish = None;
+        self.check_list(FINISHING, |s| s.send_finish.is_some(), true);
+        let mut next = self.lists[FINISHING];
+        while let Some(id) = next {
+            let socket = self.sockets.get_mut(&id).unwrap();
+            next = socket.lists[FINISHING].next;
+            let finish = socket.send_finish.unwrap();
+            if self.endpoint.is_output_reserved(finish.connection) {
+                continue;
             }
+            if matches!(socket.handle, Handle::Connection(cid) if cid == finish.connection) {
+                let _ = self.endpoint.finish_send(
+                    finish.connection,
+                    finish.end,
+                    finish.more,
+                    finish.end_of_record,
+                    finish.force,
+                );
+            }
+            socket.send_finish = None;
+            unlink(&mut self.sockets, &mut self.lists, FINISHING, id);
+            self.touch(id);
         }
     }
 
@@ -232,9 +239,13 @@ impl LogicalSend {
     }
 }
 impl Owner {
+    // Visits only the sockets with leases outstanding (`LEASED`).
     pub(super) fn collect_zero_copy(&mut self) {
-        let mut changed = None;
-        for (&id, socket) in self.sockets.iter_mut() {
+        self.check_list(LEASED, |s| !s.zc_leases.is_empty(), true);
+        let mut next = self.lists[LEASED];
+        while let Some(id) = next {
+            let socket = self.sockets.get_mut(&id).unwrap();
+            next = socket.lists[LEASED].next;
             let mut index = 0;
             let mut collected = false;
             while index < socket.zc_leases.len() {
@@ -260,10 +271,14 @@ impl Owner {
             }
             if collected {
                 socket.settle_timestamp_charge(&mut self.timestamp_total);
-                queue_local(socket, id, &mut changed);
+            }
+            if socket.zc_leases.is_empty() {
+                unlink(&mut self.sockets, &mut self.lists, LEASED, id);
+            }
+            if collected {
+                self.touch(id);
             }
         }
-        self.splice_changed(changed);
     }
     // One bounded copy/admission per service turn. No foreign data survives a
     // turn except bytes already owned by TCP; the cursor advances only on write.
@@ -542,6 +557,9 @@ impl Owner {
                     socket.send_batch = None;
                 }
             }
+            if result == Err(ntcp::EndpointError::OutputReserved) {
+                link(&mut self.sockets, &mut self.lists, FINISHING, id);
+            }
         }
         if let Some(cookie) = send.cookie.take() {
             self.finish_timestamp(id, cookie);
@@ -550,6 +568,7 @@ impl Owner {
         if let Some(state) = &lease {
             state.finish();
         }
+        let mut leased = false;
         if let Some(next) = send.zc.take()
             && let Some(s) = self.sockets.get_mut(&id)
         {
@@ -558,6 +577,7 @@ impl Owner {
                 // submission completion. TCP, held plans and backend all count.
                 s.zc_leases
                     .push_back(crate::zerocopy::Pending { id: next, state });
+                leased = true;
             } else {
                 s.zc_reserved -= 1;
                 if let Some(Completion::ZeroCopy(lo, hi)) = s.completions.back_mut()
@@ -570,6 +590,9 @@ impl Owner {
                 s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
             }
             s.settle_timestamp_charge(&mut self.timestamp_total);
+        }
+        if leased {
+            link(&mut self.sockets, &mut self.lists, LEASED, id);
         }
         self.touch(id);
         self.collect_zero_copy();

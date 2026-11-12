@@ -223,9 +223,14 @@ impl ClockPair {
 }
 impl Owner {
     pub(super) fn software_rx_enabled(&self) -> bool {
-        self.sockets
-            .values()
-            .any(|s| s.timestamps.options.flags & RX_SOFTWARE != 0)
+        debug_assert_eq!(
+            self.rx_software,
+            self.sockets
+                .values()
+                .filter(|s| s.timestamps.options.flags & RX_SOFTWARE != 0)
+                .count()
+        );
+        self.rx_software != 0
             || self
                 .child_timestamps
                 .iter()
@@ -259,8 +264,11 @@ impl Owner {
         }
     }
     pub(super) fn remove_socket(&mut self, id: u64) -> Option<Socket> {
-        unqueue_changed(&mut self.sockets, &mut self.changed, id);
+        for list in 0..LISTS {
+            unlink(&mut self.sockets, &mut self.lists, list, id);
+        }
         let s = self.sockets.remove(&id)?;
+        self.rx_software -= usize::from(s.timestamps.options.flags & RX_SOFTWARE != 0);
         self.hold(id, s.handle, false);
         self.timestamp_total -= s.timestamp_charged;
         Some(s)
@@ -322,6 +330,8 @@ impl Owner {
                 .map_err(engine)?;
         }
         let s = self.sockets.get_mut(&id).unwrap();
+        self.rx_software = self.rx_software + usize::from(next.flags & RX_SOFTWARE != 0)
+            - usize::from(s.timestamps.options.flags & RX_SOFTWARE != 0);
         s.timestamps.options = next;
         s.timestamps.base = base;
         Ok(())
@@ -543,6 +553,7 @@ impl Owner {
                 observed: None,
             });
             s.settle_timestamp_charge(&mut self.timestamp_total);
+            link(&mut self.sockets, &mut self.lists, STAMPING, id);
             self.timestamp_cookie += 1;
         }
         Ok(n)
@@ -595,26 +606,41 @@ impl Owner {
         }
     }
     pub(super) fn drain_timestamps(&mut self, pair: ClockPair) {
+        // Records exist at a connection only for its socket's requests,
+        // or reported ready: only those sockets are visited (`STAMPING`).
+        self.check_list(
+            STAMPING,
+            |s| matches!(s.handle, Handle::Connection(_)) && !s.timestamps.pending.is_empty(),
+            false,
+        );
         let mut global = self.timestamp_charge();
-        let mut changed = None;
-        for (&id, s) in self.sockets.iter_mut() {
-            let Handle::Connection(cid) = s.handle else {
-                continue;
-            };
+        let mut next = self.lists[STAMPING];
+        while let Some(id) = next {
+            let s = self.sockets.get_mut(&id).unwrap();
+            next = s.lists[STAMPING].next;
             let mut drained = false;
-            for _ in 0..PHASES {
-                let Ok(Some(event)) = self.endpoint.next_tx_timestamp(cid) else {
-                    break;
-                };
-                Self::timestamp_event(s, event, pair, None, &mut global);
-                drained = true;
+            let mut exhausted = true;
+            if let Handle::Connection(cid) = s.handle {
+                exhausted = false;
+                for _ in 0..PHASES {
+                    let Ok(Some(event)) = self.endpoint.next_tx_timestamp(cid) else {
+                        exhausted = true;
+                        break;
+                    };
+                    Self::timestamp_event(s, event, pair, None, &mut global);
+                    drained = true;
+                }
             }
             if drained {
                 s.settle_timestamp_charge(&mut self.timestamp_total);
-                queue_local(s, id, &mut changed);
+            }
+            if exhausted && s.timestamps.pending.is_empty() {
+                unlink(&mut self.sockets, &mut self.lists, STAMPING, id);
+            }
+            if drained {
+                self.touch(id);
             }
         }
-        self.splice_changed(changed);
     }
     fn timestamp_event(
         s: &mut Socket,
