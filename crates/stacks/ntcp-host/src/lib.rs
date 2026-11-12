@@ -2525,7 +2525,11 @@ impl Host {
             self.leases[index] = Some(Lease { attempt, prepared });
             prepared
         };
-        self.forwarding(&binding.snapshot)?;
+        // A connection's binding comes from `refresh`, which checked its
+        // forwarding; nothing since changed a path or port.
+        if packet.connection.is_none() {
+            self.forwarding(&binding.snapshot)?;
+        }
         if packet.dscp != binding.snapshot.key().dscp().value()
             || packet.ip.source != binding.snapshot.key().source_address().address()
             || packet.ip.destination != binding.snapshot.key().destination().address()
