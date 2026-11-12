@@ -14,6 +14,9 @@ pub(super) struct Intervals {
     blocks: Vec<Vec<Interval>>,
     len: usize,
     capacity: usize,
+    // blocks_allocation_bytes(&blocks), which changes only with growth:
+    // the connection's charge reads it per packet.
+    allocation: usize,
 }
 
 pub(crate) struct Growth {
@@ -39,6 +42,7 @@ impl Intervals {
             blocks: Vec::new(),
             len: 0,
             capacity: 0,
+            allocation: 0,
         };
         let growth = result.prepare_growth(capacity)?;
         result.commit_growth(growth);
@@ -52,7 +56,8 @@ impl Intervals {
         )
     }
     pub(super) fn allocation_bytes(&self) -> usize {
-        blocks_allocation_bytes(&self.blocks)
+        debug_assert_eq!(self.allocation, blocks_allocation_bytes(&self.blocks));
+        self.allocation
     }
     pub(super) fn growth_bytes(&self, capacity: usize) -> Option<usize> {
         if capacity < self.capacity {
@@ -97,6 +102,7 @@ impl Intervals {
         }
         self.blocks = growth.blocks;
         self.capacity = growth.capacity;
+        self.allocation = blocks_allocation_bytes(&self.blocks);
     }
     pub(super) fn len(&self) -> usize {
         self.len
