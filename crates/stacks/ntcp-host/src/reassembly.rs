@@ -2,17 +2,24 @@
 //! arriving fragments after physical framing and local destination authority
 //! are validated and before protocol demultiplexing.
 //!
-//! All storage is allocated fallibly once, from `ReassemblyLimits`: assembly
-//! slots, fragment descriptors, one shared pool holding fragment data (and
-//! each first fragment's header, retained for quoting), compaction scratch
-//! and the output buffer for one reconstructed datagram. Network input has no
+//! The assembly slots and the output buffer for one reconstructed datagram
+//! are allocated fallibly once, from `ReassemblyLimits`. Everything a
+//! fragment brings is allocated fallibly when it is stored and freed when
+//! its assembly completes or is discarded: its octets (fragment zero's
+//! header, retained for quoting, included) and room for its descriptor in
+//! its assembly's list. Storage so follows the fragments actually held, and
+//! each allocation is charged against `ReassemblyLimits::buffered_bytes`, as
+//! Linux charges every queued fragment's truesize against its
+//! ipfrag_high_thresh (net/ipv4/inet_fragment.c). Network input has no
 //! backpressure, so exhaustion of any bound discards the arriving fragment
-//! and is counted; live assemblies are never evicted for newcomers.
+//! and is counted; live assemblies are never evicted for newcomers. Linux
+//! has evicted none since 4.17 either: past its threshold it drops
+//! fragments, and queues end at their timeout.
 //!
 //! `Host::receive` (module `ingress`) feeds this engine and queues its
 //! errors for the Host ICMP output.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::net::IpAddr;
 use ntcp::Instant;
 use ntcp_path::{LinkId, SourceId};
@@ -31,9 +38,12 @@ pub struct ReassemblyLimits {
     pub assemblies: usize,
     /// Distinct fragments one assembly holds (exact duplicates take none).
     pub fragments: usize,
-    /// Octets buffered across all assemblies: every held fragment's data
-    /// plus the header of each first fragment. One datagram may use all of
-    /// it; physical input limits apply to each fragment separately.
+    /// Octets charged across all assemblies: every held fragment's data,
+    /// the header of each first fragment, and each assembly's descriptor
+    /// list at the capacity it has grown to (2, 4, 8, ... descriptors, at
+    /// most `fragments`). One datagram may use all of it; physical input
+    /// limits apply to each fragment separately. `datagram_charge` states
+    /// what one datagram may need.
     pub buffered_bytes: usize,
     /// Largest reconstructed IPv4 datagram, header included (Total Length,
     /// at most 65535).
@@ -57,49 +67,89 @@ const IPV6_HEADER: usize = 40;
 // non-final fragment: capacity is promised only as far as descriptors cover
 // a datagram split into such fragments.
 const MIN_FRAGMENT: usize = 8;
+// Octets one descriptor takes in its assembly's list.
+pub(crate) const DESCRIPTOR: usize = core::mem::size_of::<Fragment>();
+
+// Capacity of an assembly's descriptor list holding `count` fragments: it
+// starts at 2 and doubles when full, up to the `limit` it may hold.
+fn list_capacity(count: usize, limit: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    count
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .max(2)
+        .min(limit)
+}
 
 impl ReassemblyLimits {
     pub fn enabled(&self) -> bool {
         self.assemblies != 0
     }
 
+    // The family's configured maximum, IP base header and the octets a
+    // stored fragment zero keeps beyond the reconstructed header.
+    fn family(&self, ipv6: bool) -> (usize, usize, usize) {
+        if ipv6 {
+            (self.ipv6_datagram, IPV6_HEADER, ntcp_ip6::FRAGMENT_HEADER)
+        } else {
+            (self.ipv4_datagram, IPV4_HEADER, 0)
+        }
+    }
+
     /// Largest complete IP datagram of the family that every configured
     /// bound admits under the worst conforming fragmentation: the
-    /// reconstructed maximum, the buffered bytes (an IPv6 first fragment
-    /// also stores its 8-octet Fragment header) and the descriptors at 8
-    /// data octets each. None when disabled.
+    /// reconstructed maximum, the descriptors at 8 data octets each and
+    /// the buffered bytes that charge (`datagram_charge`). None when
+    /// disabled.
     pub fn datagram_capacity(&self, ipv6: bool) -> Option<usize> {
         if !self.enabled() {
             return None;
         }
-        let (configured, header, stored_extra) = if ipv6 {
-            (self.ipv6_datagram, IPV6_HEADER, ntcp_ip6::FRAGMENT_HEADER)
-        } else {
-            (self.ipv4_datagram, IPV4_HEADER, 0)
-        };
+        let (configured, header, _) = self.family(ipv6);
         let descriptors = self
             .fragments
             .saturating_mul(MIN_FRAGMENT)
             .saturating_add(header);
-        Some(
-            configured
-                .min(self.buffered_bytes.saturating_sub(stored_extra))
-                .min(descriptors),
-        )
+        // The largest datagram whose charge fits; the charge grows with
+        // the datagram.
+        let fits = |datagram| self.datagram_charge(datagram, ipv6) <= self.buffered_bytes;
+        let (mut low, mut high) = (0, configured.min(descriptors));
+        while low < high {
+            let middle = high - (high - low) / 2;
+            if fits(middle) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        Some(low)
+    }
+
+    /// The most one datagram of `datagram` octets, IP header included,
+    /// charges against `buffered_bytes` under the worst conforming
+    /// fragmentation (8-octet fragments): its octets, fragment zero's
+    /// stored header (an IPv6 one with its 8-octet Fragment header) and
+    /// its assembly's descriptor list grown for that many fragments.
+    pub fn datagram_charge(&self, datagram: usize, ipv6: bool) -> usize {
+        let (_, header, stored_extra) = self.family(ipv6);
+        let count = datagram.saturating_sub(header).div_ceil(MIN_FRAGMENT);
+        datagram
+            .saturating_add(stored_extra)
+            .saturating_add(DESCRIPTOR.saturating_mul(list_capacity(count, self.fragments)))
     }
 
     pub(crate) fn validate(&self) -> Result<(), Error> {
         if !self.enabled() {
             return Ok(());
         }
-        let descriptors = self.assemblies.checked_mul(self.fragments);
         // The IPv4 timeout is the embedding's policy, RFC 1122's range only a
         // recommendation. A zero timeout would expire every assembly on its
         // first fragment; no value overflows, as deadlines saturate.
         if !(576..=65535).contains(&self.ipv4_datagram)
             || !(1500..=65575).contains(&self.ipv6_datagram)
             || self.ipv4_timeout_seconds == 0
-            || descriptors.is_none_or(|n| n > u32::MAX as usize)
             || self.buffered_bytes > u32::MAX as usize
             || self.datagram_capacity(false).is_none_or(|n| n < 576)
             || self.datagram_capacity(true).is_none_or(|n| n < 1500)
@@ -368,32 +418,30 @@ struct Slot {
     // IPv4 copied options of the first fragment that arrived.
     copied: [u8; 40],
     copied_len: Option<u8>,
-    // Descriptors in use, sorted by offset.
-    count: usize,
+    // Octets this assembly charges: its fragments and its descriptor list.
     charged: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Descriptor {
+// One held fragment: its octets, fragment zero's header first.
+#[derive(Clone, Debug)]
+struct Fragment {
     offset: u32,
-    len: u32,
-    // Start of this fragment's region in the pool; fragment zero's region
-    // begins with its header, which an IPv6 unfragmentable part may make
-    // longer than 255 octets.
-    pool: u32,
+    // The header in front of fragment zero's data, which an IPv6
+    // unfragmentable part may make longer than 255 octets.
     header: u32,
     last: bool,
+    bytes: Box<[u8]>,
 }
 
-impl Descriptor {
+impl Fragment {
+    fn len(&self) -> u32 {
+        (self.bytes.len() - self.header as usize) as u32
+    }
     fn end(&self) -> u32 {
-        self.offset + self.len
+        self.offset + self.len()
     }
-    fn region(&self) -> usize {
-        self.header as usize + self.len as usize
-    }
-    fn data(&self) -> usize {
-        self.pool as usize + self.header as usize
+    fn data(&self) -> &[u8] {
+        &self.bytes[self.header as usize..]
     }
 }
 
@@ -402,19 +450,19 @@ pub(crate) struct Reassembly {
     capacity: [usize; 2],
     units_per_second: u64,
     slots: Vec<Option<Slot>>,
-    descriptors: Vec<Descriptor>,
-    pool: Vec<u8>,
-    // Pool octets below `top` are in use or garbage; `charged` counts the
-    // live ones. Compaction moves live regions down when garbage blocks a
-    // charge that fits.
-    top: usize,
+    // Each slot's fragments, sorted by offset; without storage while the
+    // slot is free or a rejection marker.
+    held: Vec<Vec<Fragment>>,
+    // Octets charged against `buffered_bytes`, every assembly's together.
     charged: usize,
     // Slots that hold an assembly or a rejection marker. Every service pass
     // and every deadline query looks at the slots; with none occupied, the
     // common case, they return without walking them.
     occupied: usize,
-    scratch: Vec<u32>,
     output: Vec<u8>,
+    // Fragment zero of the datagram last completed, which `Reassembled`
+    // quotes; freed on the next input. Like `output`, it is not charged.
+    retained: Box<[u8]>,
     counters: ReassemblyCounters,
 }
 
@@ -438,24 +486,16 @@ impl Reassembly {
             limits.datagram_capacity(false).unwrap_or(0),
             limits.datagram_capacity(true).unwrap_or(0),
         ];
-        let descriptors = limits.assemblies * limits.fragments;
-        let pool = if limits.enabled() {
-            limits.buffered_bytes
-        } else {
-            0
-        };
         Ok(Self {
             limits,
             capacity,
             units_per_second,
             slots: storage(limits.assemblies, None)?,
-            descriptors: storage(descriptors, Descriptor::default())?,
-            pool: storage(pool, 0)?,
-            top: 0,
+            held: storage(limits.assemblies, Vec::new())?,
             charged: 0,
             occupied: 0,
-            scratch: storage(descriptors, 0)?,
             output: storage(capacity[0].max(capacity[1]), 0)?,
+            retained: Box::default(),
             counters: ReassemblyCounters::default(),
         })
     }
@@ -473,9 +513,14 @@ impl Reassembly {
         assert_eq!(count, self.occupied);
         count
     }
+    /// Octets of the held fragments, fragment zero's headers included;
+    /// checks that the charge is those and the descriptor lists' capacity.
     #[cfg(test)]
     pub fn buffered(&self) -> usize {
-        self.charged
+        let octets: usize = self.held.iter().flatten().map(|f| f.bytes.len()).sum();
+        let lists: usize = self.held.iter().map(|h| h.capacity() * DESCRIPTOR).sum();
+        assert_eq!(octets + lists, self.charged);
+        octets
     }
 
     fn lifetime(&self, ipv6: bool) -> Instant {
@@ -491,6 +536,7 @@ impl Reassembly {
     /// Host already validated. Nothing is allocated before the source and
     /// the fragment's own fields are validated.
     pub fn input<'s>(&'s mut self, now: Instant, arrival: Arrival, piece: Piece<'_>) -> Input<'s> {
+        self.retained = Box::default();
         let result = self.admit(now, arrival, piece);
         let counters = &mut self.counters;
         match &result {
@@ -527,8 +573,7 @@ impl Reassembly {
             Ok(Admitted::Complete(c)) => Input::Complete(Reassembled {
                 packet: &self.output[..c.len],
                 arrival: c.arrival,
-                // Released regions keep their bytes until the next charge.
-                first_header: &self.pool[c.first_header..][..c.first_header_len],
+                first_header: &self.retained[..c.first_header_len],
                 first_data: c.first_data,
             }),
             Err(discard) => Input::Discarded(discard),
@@ -681,7 +726,6 @@ impl Reassembly {
                     ecn: 0,
                     copied: [0; 40],
                     copied_len: None,
-                    count: 0,
                     charged: 0,
                 });
                 index
@@ -691,7 +735,7 @@ impl Reassembly {
         // A slot created for a fragment that was then refused holds nothing.
         if found.is_none()
             && let Some(slot) = self.slots[index]
-            && slot.count == 0
+            && self.held[index].is_empty()
             && !slot.rejected
         {
             self.slots[index] = None;
@@ -709,8 +753,6 @@ impl Reassembly {
         copied: Option<([u8; 40], u8)>,
     ) -> Result<Admitted, Discard> {
         let ipv6 = p.ipv6_family();
-        let fragments = self.limits.fragments;
-        let base = index * fragments;
         let mut slot = self.slots[index].unwrap();
         // RFC 791 section 3.2:
         //   the options field is copied
@@ -745,15 +787,15 @@ impl Reassembly {
         // duplicate (evaluated before duplicate elimination) or refused for
         // space, so no copy that saw congestion is forgotten.
         slot.ecn |= 1 << p.ecn;
-        let held = &self.descriptors[base..base + slot.count];
-        let max_end = held.iter().map(Descriptor::end).max().unwrap_or(0);
+        let held = &self.held[index];
+        let max_end = held.iter().map(Fragment::end).max().unwrap_or(0);
         let verdict = held
             .iter()
             .filter(|d| d.offset < end && p.offset < d.end())
             .map(|d| {
-                let stored = &self.pool[d.data()..][..d.len as usize];
+                let stored = d.data();
                 if d.offset == p.offset
-                    && d.len as usize == p.data.len()
+                    && stored.len() == p.data.len()
                     && d.last != p.more
                     && stored == p.data
                 {
@@ -847,38 +889,37 @@ impl Reassembly {
             }
             return Err(discard);
         }
-        if slot.count == fragments {
+        let held = &mut self.held[index];
+        let count = held.len();
+        if count == self.limits.fragments {
             self.slots[index] = Some(slot);
             return Err(Discard::Fragments);
         }
-        let charge = header_len + p.data.len();
-        if self.charged + charge > self.limits.buffered_bytes {
+        // The fragment's octets and, when its assembly's descriptor list is
+        // full, the list's growth, charged before either is allocated; an
+        // allocator that refuses is a bound like the configured one.
+        let list = list_capacity(count + 1, self.limits.fragments).max(held.capacity());
+        let charge = header_len + p.data.len() + (list - held.capacity()) * DESCRIPTOR;
+        let stored = (self.charged + charge <= self.limits.buffered_bytes)
+            .then(|| copy(&p.header[..header_len], p.data))
+            .flatten()
+            .filter(|_| held.try_reserve_exact(list - count).is_ok());
+        let Some(bytes) = stored else {
             self.slots[index] = Some(slot);
             return Err(Discard::Bytes);
-        }
-        if self.top + charge > self.pool.len() {
-            self.slots[index] = Some(slot);
-            self.compact();
-            slot = self.slots[index].unwrap();
-        }
-        let at = self.top;
-        self.pool[at..at + header_len].copy_from_slice(&p.header[..header_len]);
-        self.pool[at + header_len..at + charge].copy_from_slice(p.data);
-        self.top += charge;
+        };
+        let position = held.partition_point(|d| d.offset <= p.offset);
+        held.insert(
+            position,
+            Fragment {
+                offset: p.offset,
+                header: header_len as u32,
+                last: !p.more,
+                bytes,
+            },
+        );
         self.charged += charge;
         slot.charged += charge;
-        let descriptor = Descriptor {
-            offset: p.offset,
-            len: p.data.len() as u32,
-            pool: at as u32,
-            header: header_len as u32,
-            last: !p.more,
-        };
-        let held = &mut self.descriptors[base..base + slot.count + 1];
-        let position = held[..slot.count].partition_point(|d| d.offset <= p.offset);
-        held.copy_within(position..slot.count, position + 1);
-        held[position] = descriptor;
-        slot.count += 1;
         if !p.more {
             slot.final_len = Some(end);
         }
@@ -901,8 +942,7 @@ impl Reassembly {
         let (Some(first), Some(final_len)) = (slot.first, slot.final_len) else {
             return Ok(Admitted::Held);
         };
-        let base = index * self.limits.fragments;
-        let held = &self.descriptors[base..base + slot.count];
+        let held = &self.held[index];
         let mut covered = 0;
         for d in held {
             if d.offset > covered {
@@ -918,7 +958,7 @@ impl Reassembly {
             return Err(Discard::Ecn);
         };
         let ipv6 = slot.key.source.is_ipv6();
-        let zero = held[0];
+        let zero = &held[0];
         debug_assert_eq!((zero.offset, zero.header as usize), (0, first.header_len));
         // An IPv6 packet keeps the unfragmentable part, not the Fragment
         // header.
@@ -929,9 +969,9 @@ impl Reassembly {
         };
         let len = header + final_len as usize;
         let out = &mut self.output[..len];
-        out[..header].copy_from_slice(&self.pool[zero.pool as usize..][..header]);
+        out[..header].copy_from_slice(&zero.bytes[..header]);
         for d in held {
-            let data = &self.pool[d.data()..][..d.len as usize];
+            let data = d.data();
             out[header + d.offset as usize..][..data.len()].copy_from_slice(data);
         }
         if ipv6 {
@@ -950,58 +990,31 @@ impl Reassembly {
             let sum = ntcp_ip_common::checksum(&out[..header]);
             out[10..12].copy_from_slice(&sum.to_be_bytes());
         }
-        let first_data = zero.len as usize;
+        let first_data = zero.len() as usize;
+        // Fragment zero outlives its assembly, for quoting.
+        self.retained = core::mem::take(&mut self.held[index]).swap_remove(0).bytes;
         self.release(index);
         Ok(Admitted::Complete(Completion {
             len,
             arrival: first.arrival,
-            first_header: zero.pool as usize,
             first_header_len: first.header_len,
             first_data,
         }))
     }
 
-    // Free an assembly's fragments; the slot itself stays as it is.
+    // Free an assembly's fragments and their descriptor list; a rejection
+    // marker keeps its slot.
     fn release(&mut self, index: usize) {
         let slot = self.slots[index].as_mut().unwrap();
         self.charged -= slot.charged;
         slot.charged = 0;
-        slot.count = 0;
         slot.first = None;
         slot.final_len = None;
-        if self.charged == 0 {
-            self.top = 0;
-        }
+        self.held[index] = Vec::new();
         if !slot.rejected {
             self.slots[index] = None;
             self.occupied -= 1;
         }
-    }
-
-    // Move every live region down to the start of the pool, in pool order.
-    fn compact(&mut self) {
-        let fragments = self.limits.fragments;
-        let mut live = 0;
-        for (index, slot) in self.slots.iter().enumerate() {
-            let Some(slot) = slot else { continue };
-            for d in 0..slot.count {
-                self.scratch[live] = (index * fragments + d) as u32;
-                live += 1;
-            }
-        }
-        let descriptors = &mut self.descriptors;
-        self.scratch[..live].sort_unstable_by_key(|i| descriptors[*i as usize].pool);
-        let mut top = 0;
-        for &i in &self.scratch[..live] {
-            let d = &mut descriptors[i as usize];
-            let region = d.region();
-            self.pool
-                .copy_within(d.pool as usize..d.pool as usize + region, top);
-            d.pool = top as u32;
-            top += region;
-        }
-        debug_assert_eq!(top, self.charged);
-        self.top = top;
     }
 
     /// Discard every assembly whose deadline has passed or whose arrival
@@ -1028,10 +1041,9 @@ impl Reassembly {
             } else if slot.deadline <= now {
                 self.counters.expired += 1;
                 if let Some(first) = slot.first {
-                    let zero = self.descriptors[index * self.limits.fragments];
                     expired(Expired {
                         arrival: first.arrival,
-                        first_fragment: &self.pool[zero.pool as usize..][..zero.region()],
+                        first_fragment: &self.held[index][0].bytes,
                     });
                 }
             } else {
@@ -1062,10 +1074,17 @@ enum Admitted {
 struct Completion {
     len: usize,
     arrival: Arrival,
-    // Fragment zero's header in the pool.
-    first_header: usize,
     first_header_len: usize,
     first_data: usize,
+}
+
+// A fragment's stored octets, allocated fallibly; None if refused.
+fn copy(header: &[u8], data: &[u8]) -> Option<Box<[u8]>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(header.len() + data.len()).ok()?;
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(data);
+    Some(bytes.into_boxed_slice())
 }
 
 // RFC 8200 section 4.5: the Payload Length of a packet reassembled with an

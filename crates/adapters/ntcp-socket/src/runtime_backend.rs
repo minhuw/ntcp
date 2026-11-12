@@ -551,21 +551,24 @@ impl Owner {
         // least each family's required minimum): the size TCP's receive
         // limits derive from, so a segment some narrower path fragmented
         // still arrives, as does an Echo Request of that size. One receive
-        // batch's worth of concurrent datagrams, the bytes of one largest
-        // datagram buffered at a time (an IPv6 first fragment also stores
-        // its Fragment header), and descriptors for it in 8-octet
-        // fragments, the worst conforming fragmentation. The IPv4 timeout
-        // is RFC 1122 section 3.3.2's lower bound.
+        // batch's worth of concurrent datagrams and the charge of one
+        // largest datagram buffered at a time in 8-octet fragments, the
+        // worst conforming fragmentation: its octets (an IPv6 first
+        // fragment also stores its Fragment header) and descriptors. The
+        // IPv4 timeout is RFC 1122 section 3.3.2's lower bound.
         let ipv4_datagram = max_ip_packet.clamp(576, 65535);
         let ipv6_datagram = max_ip_packet.clamp(1500, 65575);
-        let reassembly = ntcp_host::ReassemblyLimits {
+        let mut reassembly = ntcp_host::ReassemblyLimits {
             assemblies: BUDGET,
             fragments: ipv6_datagram.div_ceil(8),
-            buffered_bytes: ipv6_datagram + 8,
+            buffered_bytes: 0,
             ipv4_datagram,
             ipv6_datagram,
             ipv4_timeout_seconds: 60,
         };
+        reassembly.buffered_bytes = reassembly
+            .datagram_charge(ipv6_datagram, true)
+            .max(reassembly.datagram_charge(ipv4_datagram, false));
         let largest = if self.local.is_ipv4() {
             ipv4_datagram - 20
         } else {

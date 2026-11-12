@@ -26,6 +26,7 @@ mod repair;
 mod source_routes;
 mod submission;
 use super::*;
+use crate::reassembly::DESCRIPTOR;
 use core::net::SocketAddr;
 use ntcp::{
     ActiveOpenOptions, ConnectionConfig, FastOpenClientPolicy, FastOpenEarlyDataPolicy,

@@ -65,7 +65,7 @@ fn side_with(local: SocketAddr, identity: u64, datagrams: DatagramLimits) -> Sid
         l.reassembly = ReassemblyLimits {
             assemblies: 4,
             fragments: 600,
-            buffered_bytes: 8192,
+            buffered_bytes: 8192 + 600 * DESCRIPTOR,
             ipv4_datagram: 4096,
             ipv6_datagram: 4136,
             ipv4_timeout_seconds: 60,

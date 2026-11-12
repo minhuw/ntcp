@@ -447,21 +447,24 @@ mod linux {
                 .ok()
                 .and_then(|seconds| seconds.checked_mul(BUDGET))
                 .ok_or_else(|| host_error(ntcp_host::Error::Capacity))?;
-            // Reassembly: one read pass's worth of concurrent datagrams, the
-            // bytes of one largest datagram buffered at a time (the IPv6
-            // first fragment also stores its Fragment header), and enough
-            // descriptors for that datagram in 8-octet fragments, the worst
-            // conforming fragmentation. The IPv4 timeout is RFC 1122
+            // Reassembly: one read pass's worth of concurrent datagrams, and
+            // the charge of one largest datagram buffered at a time in
+            // 8-octet fragments, the worst conforming fragmentation: its
+            // octets (the IPv6 first fragment also stores its Fragment
+            // header) and enough descriptors. The IPv4 timeout is RFC 1122
             // section 3.3.2's lower bound, which loses no conforming
             // datagram and holds incomplete state for the shortest time.
-            let reassembly = ntcp_host::ReassemblyLimits {
+            let mut reassembly = ntcp_host::ReassemblyLimits {
                 assemblies: BUDGET,
                 fragments: IPV4_DATAGRAM.div_ceil(8),
-                buffered_bytes: IPV6_DATAGRAM + 8,
+                buffered_bytes: 0,
                 ipv4_datagram: IPV4_DATAGRAM,
                 ipv6_datagram: IPV6_DATAGRAM,
                 ipv4_timeout_seconds: 60,
             };
+            reassembly.buffered_bytes = reassembly
+                .datagram_charge(IPV6_DATAGRAM, true)
+                .max(reassembly.datagram_charge(IPV4_DATAGRAM, false));
             let datagram = if local.is_ipv4() {
                 IPV4_DATAGRAM - IP_HEADER
             } else {

@@ -32,7 +32,7 @@ const OUTPUT: IcmpOutputLimits = IcmpOutputLimits {
 const REASSEMBLY: ReassemblyLimits = ReassemblyLimits {
     assemblies: 4,
     fragments: 600,
-    buffered_bytes: 16384,
+    buffered_bytes: 16384 + 600 * DESCRIPTOR,
     ipv4_datagram: 4096,
     ipv6_datagram: 8192,
     ipv4_timeout_seconds: 60,

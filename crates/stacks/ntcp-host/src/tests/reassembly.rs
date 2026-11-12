@@ -259,9 +259,10 @@ fn limits_are_validated_and_capacity_is_backed_by_storage() {
             fragments: 182,
             ..good
         },
-        // The first IPv6 fragment also stores its Fragment header.
+        // The first IPv6 fragment also stores its Fragment header, and
+        // 8-octet fragments need a list of 183 descriptors, grown to 200.
         ReassemblyLimits {
-            buffered_bytes: 1507,
+            buffered_bytes: 1507 + 200 * DESCRIPTOR,
             ..good
         },
         ReassemblyLimits {
@@ -281,11 +282,33 @@ fn limits_are_validated_and_capacity_is_backed_by_storage() {
     }
     let minimal = ReassemblyLimits {
         fragments: 183,
-        buffered_bytes: 1508,
+        buffered_bytes: 1508 + 183 * DESCRIPTOR,
         ..good
     };
+    assert_eq!(minimal.datagram_charge(1500, true), minimal.buffered_bytes);
     assert_eq!(minimal.datagram_capacity(true), Some(1500));
     assert_eq!(minimal.datagram_capacity(false), Some(1484));
+    // The stated capacity holds under the worst conforming fragmentation:
+    // each family's largest datagram completes from 8-octet fragments, and
+    // its charge is all the engine holds before the last one.
+    let f = fixture();
+    for (v6, capacity) in [(true, 1500), (false, 1484)] {
+        let mut r = Reassembly::new(minimal, SECOND).unwrap();
+        let len = capacity - if v6 { 40 } else { 20 };
+        let d = data(len, 3);
+        for at in (0..len - 8).step_by(8) {
+            let piece = frag(v6, 9, at as u32, true, &d[at..at + 8]);
+            assert_eq!(feed(&mut r, &f, 0, piece), Out::Held, "{v6} {at}");
+        }
+        let at = (len - 1) / 8 * 8;
+        let Out::Complete(packet) = feed(&mut r, &f, 0, frag(v6, 9, at as u32, false, &d[at..]))
+        else {
+            panic!("{v6}")
+        };
+        check_complete(&packet, v6, &d, 0);
+        assert_eq!((r.assemblies(), r.buffered()), (0, 0));
+        assert_eq!(r.counters().discarded, DiscardCounters::default());
+    }
     // Any nonzero IPv4 timeout is accepted, within RFC 1122 section 3.3.2's
     // recommended range (60 to 120) or not.
     for seconds in [1, 30, 60, 120, 121, u64::MAX] {
@@ -317,7 +340,7 @@ fn host_states_capacity_per_family_and_rejects_invalid_configuration() {
     host_limits.reassembly = ReassemblyLimits {
         assemblies: 8,
         fragments: 8192,
-        buffered_bytes: 1 << 17,
+        buffered_bytes: (1 << 17) + 8192 * DESCRIPTOR,
         ipv4_datagram: 65535,
         ipv6_datagram: 65575,
         ipv4_timeout_seconds: 120,
@@ -1140,66 +1163,76 @@ fn every_bound_drops_the_new_fragment_and_is_counted() {
         Out::Discarded(Discard::Fragments)
     );
     assert_eq!(r.counters().discarded.fragments, 1);
-    // Buffered bytes across assemblies.
+    // Buffered bytes across assemblies, descriptor lists included: 129
+    // 8-octet fragments grow one list to its 200 descriptors, leaving 568
+    // octets for another assembly's fragment and its list of 2.
     let mut r = Reassembly::new(
         ReassemblyLimits {
-            buffered_bytes: 1600,
+            buffered_bytes: 1600 + 200 * DESCRIPTOR,
             ..limits()
         },
         SECOND,
     )
     .unwrap();
+    for i in 1..=129u32 {
+        assert_eq!(
+            feed(&mut r, &f, 0, frag(false, 5, 8 * i, true, &d[..8])),
+            Out::Held
+        );
+    }
+    let room = 568 - 2 * DESCRIPTOR;
     assert_eq!(
-        feed(&mut r, &f, 0, frag(false, 5, 800, true, &d[..600])),
-        Out::Held
-    );
-    assert_eq!(
-        feed(&mut r, &f, 0, frag(true, 5, 600, true, &d[..800])),
-        Out::Held
-    );
-    assert_eq!(
-        feed(&mut r, &f, 0, frag(true, 6, 0, true, &d[..248])),
+        feed(&mut r, &f, 0, frag(true, 6, 8, true, &d[..room + 8])),
         Out::Discarded(Discard::Bytes)
     );
     assert_eq!(
+        feed(&mut r, &f, 0, frag(true, 6, 8, true, &d[..room])),
+        Out::Held
+    );
+    assert_eq!(
         (r.counters().discarded.bytes, r.assemblies(), r.buffered()),
-        (1, 2, 1400)
+        (1, 2, 1032 + room)
     );
 }
 
 #[test]
-fn pool_compaction_preserves_held_fragments() {
+fn completion_returns_its_charge_to_later_fragments() {
     let f = fixture();
     let limits = ReassemblyLimits {
-        buffered_bytes: 1600,
+        buffered_bytes: 1600 + 200 * DESCRIPTOR,
         ..limits()
     };
     let mut r = Reassembly::new(limits, SECOND).unwrap();
-    let a = data(1000, 16);
-    let b = data(1000, 17);
-    // Fill, free the middle by completing one datagram, then add a fragment
-    // that fits only once the remaining regions move down.
+    let a = data(1040, 16);
+    let b = data(400, 17);
+    // 129 8-octet fragments leave 568 octets; one datagram takes part of
+    // them, and a fragment that needs them all fits once it completes.
+    for i in 1..=129usize {
+        let piece = frag(false, 1, 8 * i as u32, true, &a[8 * i..8 * i + 8]);
+        assert_eq!(feed(&mut r, &f, 0, piece), Out::Held);
+    }
     assert_eq!(
-        feed(&mut r, &f, 0, frag(false, 1, 400, false, &a[400..800])),
+        feed(&mut r, &f, 0, frag(false, 2, 0, true, &b[..200])),
         Out::Held
     );
+    let room = 568 - 2 * DESCRIPTOR;
+    let late = data(room, 18);
     assert_eq!(
-        feed(&mut r, &f, 0, frag(false, 2, 0, true, &b[..400])),
-        Out::Held
+        feed(&mut r, &f, 0, frag(true, 3, 8, true, &late)),
+        Out::Discarded(Discard::Bytes)
     );
-    let Out::Complete(packet) = feed(&mut r, &f, 0, frag(false, 2, 400, false, &b[400..800]))
-    else {
+    let Out::Complete(packet) = feed(&mut r, &f, 0, frag(false, 2, 200, false, &b[200..])) else {
         panic!()
     };
-    check_complete(&packet, false, &b[..800], 0);
+    check_complete(&packet, false, &b, 0);
     assert_eq!(
-        feed(&mut r, &f, 0, frag(true, 3, 400, true, &b[..600])),
+        feed(&mut r, &f, 0, frag(true, 3, 8, true, &late)),
         Out::Held
     );
-    let Out::Complete(packet) = feed(&mut r, &f, 0, frag(false, 1, 0, true, &a[..400])) else {
-        panic!()
-    };
-    check_complete(&packet, false, &a[..800], 0);
+    assert_eq!(
+        (r.counters().discarded.bytes, r.buffered()),
+        (1, 1032 + room)
+    );
 }
 
 #[test]

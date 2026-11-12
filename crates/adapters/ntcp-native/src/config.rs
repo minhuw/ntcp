@@ -60,11 +60,15 @@ pub struct NetworkConfig {
     /// family's required minimum (576 octets for IPv4, 1500 for IPv6): the
     /// TCP MSS this Network offers follows the MTU, so a conforming peer
     /// sends nothing larger, and a smaller limit would lower that offer.
-    /// Each costs about four times the larger of the MTU and 1500 octets
-    /// (the Host backs both families' minimums), allocated with the
-    /// Network: its octets and the descriptors of its worst conforming
-    /// fragmentation (8-octet fragments). The default costs about 400 KB
-    /// at an MTU of 1500 and grows with the MTU.
+    /// Storage follows the fragments held: each one's octets and a
+    /// descriptor are allocated when it arrives and freed when its datagram
+    /// completes or is discarded, as Linux queues fragments. Their total is
+    /// bounded by the octets of this many such datagrams (the larger of the
+    /// MTU and 1500 octets: the Host backs both families' minimums) plus
+    /// the descriptors of one cut into 8-octet fragments, the worst
+    /// conforming fragmentation, which reassembly always admits. With the
+    /// default that bound is about 100 KB at an MTU of 1500, 610 KB at 9000
+    /// and 4.5 MB at 65535; a fragment beyond it is discarded.
     ///
     /// Size it for the datagrams whose fragments can arrive interleaved. A
     /// fragment refused for room leaves the rest of its datagram holding a
@@ -182,9 +186,10 @@ impl NetworkConfig {
     }
     // The Host's reassembly of `reassembly_datagrams` datagrams, each up to
     // the larger of the MTU and its family's required minimum, held whole
-    // at once, with
-    // descriptors for 8-octet fragments of the larger family's datagram
-    // (an IPv6 first fragment also stores its Fragment header). The IPv4
+    // at once (an IPv6 first fragment also stores its Fragment header),
+    // one of them in 8-octet fragments of the larger family's datagram:
+    // the charge bound is the octets of the others and that one's whole
+    // charge, descriptors included. The IPv4
     // timeout is Linux's ipfrag_time, 30 seconds, below RFC 1122 section
     // 3.3.2's recommended 60 to 120: a datagram's fragments leave its
     // sender together, so a shorter hold seldom discards one that would
@@ -198,17 +203,22 @@ impl NetworkConfig {
         }
         let mtu = self.mtu as usize;
         let ipv6_datagram = mtu.clamp(1500, 65575);
-        let buffered_bytes = datagrams
-            .checked_mul(ipv6_datagram + 8)
-            .filter(|&n| n <= u32::MAX as usize)?;
-        Some(ntcp_host::ReassemblyLimits {
+        let mut limits = ntcp_host::ReassemblyLimits {
             assemblies: datagrams,
             fragments: ipv6_datagram.div_ceil(8),
-            buffered_bytes,
+            buffered_bytes: 0,
             ipv4_datagram: mtu.clamp(576, 65535),
             ipv6_datagram,
             ipv4_timeout_seconds: 30,
-        })
+        };
+        let worst = limits
+            .datagram_charge(ipv6_datagram, true)
+            .max(limits.datagram_charge(limits.ipv4_datagram, false));
+        limits.buffered_bytes = (datagrams - 1)
+            .checked_mul(ipv6_datagram + 8)
+            .and_then(|n| n.checked_add(worst))
+            .filter(|&n| n <= u32::MAX as usize)?;
+        Some(limits)
     }
     // The largest IP datagram this Network takes in: a packet of the MTU,
     // or a reassembled datagram of the local family.

@@ -23,7 +23,7 @@ const OUTPUT: IcmpOutputLimits = IcmpOutputLimits {
 const REASSEMBLY: ReassemblyLimits = ReassemblyLimits {
     assemblies: 4,
     fragments: 600,
-    buffered_bytes: 16384,
+    buffered_bytes: 16384 + 600 * DESCRIPTOR,
     ipv4_datagram: 4096,
     ipv6_datagram: 8192,
     ipv4_timeout_seconds: 60,
@@ -728,7 +728,7 @@ fn fragment_errors_follow_the_actual_chain() {
         ReassemblyLimits {
             assemblies: 1,
             fragments: 8200,
-            buffered_bytes: 66000,
+            buffered_bytes: 66000 + 8200 * DESCRIPTOR,
             ipv4_datagram: 4096,
             ipv6_datagram: 65575,
             ipv4_timeout_seconds: 60,
@@ -774,7 +774,7 @@ fn later_fragment_limits_use_fragment_zeros_retained_prefix() {
         ReassemblyLimits {
             assemblies: 1,
             fragments: 8200,
-            buffered_bytes: 66000,
+            buffered_bytes: 66000 + 8200 * DESCRIPTOR,
             ipv4_datagram: 4096,
             ipv6_datagram: 65575,
             ipv4_timeout_seconds: 60,

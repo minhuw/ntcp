@@ -25,7 +25,7 @@ fn reassembly(datagram: usize) -> ReassemblyLimits {
     ReassemblyLimits {
         assemblies: 1,
         fragments: 65575usize.div_ceil(8),
-        buffered_bytes: 65575 + 8,
+        buffered_bytes: 65575 + 8 + 65575usize.div_ceil(8) * DESCRIPTOR,
         ipv4_datagram: datagram.min(65535),
         ipv6_datagram: datagram.max(1500),
         ipv4_timeout_seconds: 60,
