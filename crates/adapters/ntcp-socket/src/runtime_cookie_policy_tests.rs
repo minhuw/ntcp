@@ -1010,7 +1010,13 @@ fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows
                 None
             );
             assert_eq!(owner.endpoint.state(live), Ok(State::Established));
-            assert_eq!(owner.endpoint.write(live, b"still live"), Ok(10));
+            // The budget is exactly exhausted, and the live flow's first
+            // write needs its send ring: refused for memory, the flow intact.
+            assert_eq!(
+                owner.endpoint.write(live, b"still live"),
+                Err(ntcp::Error::NoMemory.into())
+            );
+            assert_eq!(owner.endpoint.state(live), Ok(State::Established));
             assert_eq!(owner.endpoint.fast_open_key_registry_usage(), usage);
             assert!(owner.endpoint.buffer_bytes() <= budget);
             // Native administrative failure reports a resource error and leaves

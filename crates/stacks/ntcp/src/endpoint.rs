@@ -157,17 +157,22 @@ impl EndpointConfig {
         Ok(())
     }
 
-    /// The share of `max_buffer_bytes` one connection is charged with the
-    /// configured buffers and MSS, once its TX timestamp phases and RX
-    /// timestamp ranges are set to these capacities: what a budget for a
-    /// number of such connections must allow each. None if it overflows.
+    /// The share of `max_buffer_bytes` one connection with the configured
+    /// buffers and MSS is charged at open, once its TX timestamp phases and
+    /// RX timestamp ranges are set to these capacities: what it allocates
+    /// before its first write, the receive ring (1.375 bytes per byte of
+    /// `receive_capacity`), its MSS-sized scratch segment and its sender
+    /// ledgers' first entries. A budget of N of these admits N connections
+    /// and no more: each is charged what it actually allocates, so its first
+    /// write adds a send ring of 2 bytes per byte of `send_capacity`, and its
+    /// RACK and SACK ledgers grow with the bytes it holds queued, 64 and 4
+    /// bytes per byte. None if it overflows.
     pub fn connection_charge(
         &self,
         tx_timestamp_phases: usize,
         rx_timestamp_ranges: usize,
     ) -> Option<usize> {
-        Connection::allocation_bytes(
-            self.connection.send_capacity,
+        Connection::open_bytes(
             self.connection.receive_capacity,
             usize::from(self.connection.mss),
         )?
@@ -202,11 +207,11 @@ impl EndpointConfig {
     }
 
     fn preallocation_bytes(&self) -> Result<(usize, usize), EndpointError> {
-        // The existing conservative 3*receive charge covers payload, the
-        // 2-bit presence/PUSH map and the new 1-bit pending-report map.
-        // Sender interval storage is a separate additive admission charge.
-        let per_connection_bytes = Connection::allocation_bytes(
-            self.connection.send_capacity,
+        // A pooled connection is a receive ring at the initial size. It is
+        // charged the open charge of the connection that will take it, the
+        // ring plus that connection's scratch segment and first ledger
+        // entries, so a budget that holds the pool admits its connections.
+        let per_connection_bytes = Connection::open_bytes(
             self.connection.receive_capacity,
             usize::from(self.connection.mss),
         )
@@ -1452,21 +1457,22 @@ impl Endpoint {
         //# If there is
         //# no room to create a new connection, return "error: insufficient
         //# resources".
-        if !self.has_capacity(capacities) {
-            return Err(EndpointError::LimitReached);
-        }
-        Ok(())
+        self.room_for(capacities.1)
     }
 
-    fn has_capacity(&self, capacities: (usize, usize)) -> bool {
-        let (_, credit) = self.pooled_receive_credit(capacities.1);
-        !self.free.is_empty()
-            && Connection::allocation_bytes(
-                capacities.0,
-                capacities.1,
-                usize::from(self.config.connection.mss),
-            )
-            .is_some_and(|charge| charge <= self.buffer_room().saturating_add(credit))
+    // Room for a connection with a `receive`-byte ring: a slot
+    // (LimitReached) and its charge at open within the budget (NoMemory).
+    fn room_for(&self, receive: usize) -> Result<(), EndpointError> {
+        if self.free.is_empty() {
+            return Err(EndpointError::LimitReached);
+        }
+        let (_, credit) = self.pooled_receive_credit(receive);
+        if Connection::open_bytes(receive, usize::from(self.config.connection.mss))
+            .is_none_or(|charge| charge > self.buffer_room().saturating_add(credit))
+        {
+            return Err(Error::NoMemory.into());
+        }
+        Ok(())
     }
 
     // Remaining endpoint buffer budget, before any caller-specific credit.
@@ -1615,12 +1621,8 @@ impl Endpoint {
             } else { Some(transaction.prepared.snapshot.ip_header_len() as u16) }
         } else { None };
         let capacities = (options.send_capacity, options.receive_capacity);
-        let charge = Connection::allocation_bytes(
-            capacities.0,
-            capacities.1,
-            usize::from(self.config.connection.mss),
-        )
-        .ok_or(Error::NoMemory)?;
+        let charge = Connection::open_bytes(capacities.1, usize::from(self.config.connection.mss))
+            .ok_or(Error::NoMemory)?;
         let (pool_index, credit) = self.pooled_receive_credit(capacities.1);
         let available = self.buffer_room().saturating_add(credit);
         if charge
@@ -2520,6 +2522,9 @@ impl Endpoint {
         } {
             Ok(count) => count,
             Err(error) => {
+                // A send ring that grew before the other failed is charged
+                // until recycling releases it.
+                self.buffer_bytes = self.buffer_bytes - old_charge + connection.buffer_charge();
                 self.recycle_connection(connection);
                 return Err(error.into());
             }
@@ -2643,7 +2648,7 @@ impl Endpoint {
         let old = connection.buffer_charge();
         // This charge includes the original buffers plus all staged replacements.
         let charge = connection
-            .resize_peak_charge(send, receive)
+            .resize_peak_charge(receive)
             .ok_or(EndpointError::LimitReached)?;
         if charge
             > self
@@ -2687,13 +2692,9 @@ impl Endpoint {
             return Ok(());
         }
         let metadata = RxTimestamps::allocation_bytes(ranges).ok_or(Error::NoMemory)?;
-        let total = Connection::allocation_bytes(
-            capacities.0,
-            capacities.1,
-            usize::from(self.config.connection.mss),
-        )
-        .and_then(|bytes| bytes.checked_add(metadata))
-        .ok_or(Error::NoMemory)?;
+        let total = Connection::open_bytes(capacities.1, usize::from(self.config.connection.mss))
+            .and_then(|bytes| bytes.checked_add(metadata))
+            .ok_or(Error::NoMemory)?;
         if total > self.config.max_buffer_bytes {
             return Err(Error::NoMemory.into());
         }
@@ -3847,12 +3848,15 @@ impl Endpoint {
         match target {
             None => match self.resource_admission(tuple, record.buffer_capacities) {
                 Ok(()) => None,
-                Err(EndpointError::LimitReached) => Some(PassiveRefusal::Resources),
+                Err(EndpointError::LimitReached | EndpointError::Connection(Error::NoMemory)) => {
+                    Some(PassiveRefusal::Resources)
+                }
                 Err(_) => Some(PassiveRefusal::Invalid),
             },
-            Some(_) => {
-                (!self.has_capacity(record.buffer_capacities)).then_some(PassiveRefusal::Resources)
-            }
+            Some(_) => self
+                .room_for(record.buffer_capacities.1)
+                .err()
+                .map(|_| PassiveRefusal::Resources),
         }
     }
 
@@ -3996,14 +4000,15 @@ impl Endpoint {
         self.reject_if_output_reserved(id)?;
         let own_charge = self.slot(id)?.connection.buffer_charge();
         let available = self.buffer_room().saturating_add(own_charge);
-        self.slot_mut(id)?
+        let result = self
+            .slot_mut(id)?
             .connection
-            .prepare_send_metadata(len, lowat, available, timestamp)?;
-        // The conservative reservation normally covers all physical backing;
-        // retain exact accounting if an allocator rounds a block above it.
+            .prepare_send_metadata(len, lowat, available, timestamp);
+        // Charged even on failure: a send ring that grew before the other
+        // failed keeps its storage.
         self.buffer_bytes =
             self.buffer_bytes - own_charge + self.slot(id)?.connection.buffer_charge();
-        Ok(())
+        Ok(result?)
     }
 
     /// Admit an immutable payload prefix without copying its bytes. The caller
@@ -6901,12 +6906,18 @@ mod recovery_observation_tests {
         assert_eq!(result, Err(Error::NoMemory.into()));
         assert_eq!(endpoint.send_progress(id).unwrap().queued_end, 0);
         assert_eq!(endpoint.buffer_bytes(), charged);
-        // The configured worst-case quota reserves final backing. A transient
-        // replacement also needs the previous two control-only ledgers alive.
-        endpoint.config.max_buffer_bytes += 4096;
+        // Admission allocates the send ring and grows the ledgers, charged as
+        // allocated; the write that follows allocates nothing.
+        endpoint.config.max_buffer_bytes = usize::MAX;
         assert_eq!(
             endpoint.prepare_write_admission(id, 128, None, request),
             Ok(128)
+        );
+        let prepared = endpoint.buffer_bytes();
+        assert!(prepared > charged);
+        assert_eq!(
+            prepared,
+            endpoint.slot(id).unwrap().connection.buffer_charge()
         );
         crate::allocation_tests::fail_after(0, || {
             assert_eq!(
@@ -6914,7 +6925,7 @@ mod recovery_observation_tests {
                 Ok(128)
             );
         });
-        assert_eq!(endpoint.buffer_bytes(), charged);
+        assert_eq!(endpoint.buffer_bytes(), prepared);
     }
 
     #[test]
@@ -6922,7 +6933,6 @@ mod recovery_observation_tests {
         for (send, receive) in [(2048, 1), (1024, 2048), (2048, 2048)] {
             let config = EndpointConfig {
                 preallocate_connections: 0,
-                max_buffer_bytes: Connection::allocation_bytes(send, receive, 64).unwrap(),
                 connection: ConnectionConfig {
                     send_capacity: 1024,
                     receive_capacity: 1,
@@ -6940,19 +6950,29 @@ mod recovery_observation_tests {
                 )
                 .unwrap();
             let old = endpoint.buffer_bytes();
-            // The final replacement fits, but its staging alongside originals does not.
-            assert_eq!(
-                endpoint.set_buffer_capacities(id, send, receive),
-                Err(EndpointError::LimitReached)
-            );
-            assert_eq!(endpoint.buffer_capacities(id).unwrap(), (1024, 1));
-            assert_eq!(endpoint.buffer_bytes(), old);
             let peak = endpoint
                 .slot(id)
                 .unwrap()
                 .connection
-                .resize_peak_charge(send, receive)
+                .resize_peak_charge(receive)
                 .unwrap();
+            // A send limit allocates nothing; a receive ring is staged
+            // beside the original.
+            assert_eq!(
+                peak - old,
+                ReceiveBuffer::allocation_bytes(receive).unwrap() * usize::from(receive > 1)
+            );
+            if receive > 1 {
+                // The final replacement fits, but its staging alongside the
+                // original does not.
+                endpoint.config.max_buffer_bytes = peak - 1;
+                assert_eq!(
+                    endpoint.set_buffer_capacities(id, send, receive),
+                    Err(EndpointError::LimitReached)
+                );
+                assert_eq!(endpoint.buffer_capacities(id).unwrap(), (1024, 1));
+                assert_eq!(endpoint.buffer_bytes(), old);
+            }
             endpoint.config.max_buffer_bytes = peak;
             endpoint.set_buffer_capacities(id, send, receive).unwrap();
             assert_eq!(endpoint.buffer_capacities(id).unwrap(), (send, receive));
@@ -6960,7 +6980,7 @@ mod recovery_observation_tests {
                 endpoint.buffer_bytes(),
                 endpoint.slot(id).unwrap().connection.buffer_charge()
             );
-            assert!(endpoint.buffer_bytes() < peak);
+            assert!(endpoint.buffer_bytes() < peak || receive == 1);
             endpoint.config.max_buffer_bytes = endpoint.buffer_bytes();
             endpoint.set_buffer_capacities(id, 1, 1).unwrap();
             assert_eq!(endpoint.buffer_bytes(), endpoint.config.max_buffer_bytes);
@@ -6988,6 +7008,7 @@ mod recovery_observation_tests {
             };
             let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
             let charge = endpoint.per_connection_bytes;
+            assert_eq!(charge, Connection::open_bytes(17, 8).unwrap());
             let pool_capacity = endpoint.receive_pool.capacity();
             // A full bounded probe table can fail insertion after construction.
             let mut occupied = tuple;
@@ -7497,6 +7518,8 @@ mod recovery_observation_tests {
             hardware_transmit: true,
             acknowledged: true,
         };
+        // The first write allocates the send ring.
+        endpoint.config.max_buffer_bytes = usize::MAX;
         endpoint
             .write_with_timestamp(id, b"x", false, false, None, request)
             .unwrap();
@@ -7527,16 +7550,16 @@ mod recovery_observation_tests {
             .slot(id)
             .unwrap()
             .connection
-            .resize_peak_charge(send * 2, receive)
+            .resize_peak_charge(receive * 2)
             .unwrap();
         endpoint.config.max_buffer_bytes = peak - 1;
         assert_eq!(
-            endpoint.set_buffer_capacities(id, send * 2, receive),
+            endpoint.set_buffer_capacities(id, send * 2, receive * 2),
             Err(EndpointError::LimitReached)
         );
         endpoint.config.max_buffer_bytes = peak;
         endpoint
-            .set_buffer_capacities(id, send * 2, receive)
+            .set_buffer_capacities(id, send * 2, receive * 2)
             .unwrap();
         assert_eq!(
             endpoint.buffer_bytes(),
@@ -7632,7 +7655,7 @@ mod recovery_observation_tests {
             .slot(id)
             .unwrap()
             .connection
-            .resize_peak_charge(send, receive * 2)
+            .resize_peak_charge(receive * 2)
             .unwrap();
         endpoint.config.max_buffer_bytes = peak - 1;
         assert_eq!(
@@ -7735,7 +7758,7 @@ mod recovery_observation_tests {
             assert_eq!(endpoint.peek(child, &mut out), Ok(3));
             assert_eq!(&out[..3], b"abc");
         };
-        let base = Connection::allocation_bytes(17, 17, 8).unwrap();
+        let base = Connection::open_bytes(17, 8).unwrap();
         let metadata = RxTimestamps::allocation_bytes(2).unwrap();
         for preallocate in [0, 1] {
             let cfg = EndpointConfig {
@@ -7780,7 +7803,7 @@ mod recovery_observation_tests {
             );
             assert_eq!(endpoint.listener_rx_timestamp_capacity(listener), Ok(2));
             assert_eq!(
-                endpoint.set_listener_buffer_capacities(listener, 34, 17),
+                endpoint.set_listener_buffer_capacities(listener, 17, 18),
                 Err(Error::NoMemory.into())
             );
             assert_eq!(endpoint.listener_buffer_capacities(listener), Ok((17, 17)));

@@ -1049,7 +1049,7 @@ impl Connection {
                 .send_ip_payload_limit
                 .min((min_mtu(false) - 40) as u16);
         }
-        let send = SendBuffer::new(config.send_capacity).map_err(|_| Error::NoMemory)?;
+        let send = SendBuffer::unallocated(config.send_capacity);
         let mut scratch = Vec::new();
         scratch
             .try_reserve_exact(config.mss as usize)
@@ -1459,63 +1459,45 @@ impl Connection {
         Ok(())
     }
 
-    pub(crate) fn allocation_bytes(send: usize, receive: usize, mss: usize) -> Option<usize> {
-        receive
-            .checked_mul(3)?
-            .checked_add(send.checked_mul(2)?)?
-            .checked_add(Scoreboard::allocation_bytes(send)?)?
-            .checked_add(Rack::storage_bytes(send)?)?
-            .checked_add(mss)
+    // What a connection with a `receive`-byte ring and an `mss`-byte scratch
+    // segment allocates at open, its charge until the first write: the
+    // receive ring, which backs every window it advertises, the scratch
+    // segment and the sender ledgers' initial entries (two RACK intervals,
+    // the scoreboard's four spare ranges). The send ring and the ledgers'
+    // growth are allocated, and charged, at write.
+    pub(crate) fn open_bytes(receive: usize, mss: usize) -> Option<usize> {
+        ReceiveBuffer::allocation_bytes(receive)?
+            .checked_add(mss)?
+            .checked_add(Rack::storage_bytes(0)?)?
+            .checked_add(Scoreboard::allocation_bytes(0)?)
     }
 
     pub(crate) fn receive_allocation_capacity(&self) -> usize {
         self.receive.capacity()
     }
 
-    fn retained_charge(
-        send: &SendBuffer,
-        receive: &ReceiveBuffer,
-        scoreboard: &Scoreboard,
-        rack: &Rack,
-        scratch: usize,
-    ) -> usize {
-        // Keep the endpoint's conservative admission charge, but never charge
-        // less than actual retained allocations (including allocator rounding).
-        let actual = send.storage_bytes()
-            + receive.storage_bytes()
-            + scoreboard.storage_bytes()
-            + rack.allocation_bytes()
-            + scratch;
-        Self::allocation_bytes(send.allocation_capacity(), receive.capacity(), scratch)
-            .unwrap()
-            .max(actual)
-    }
-
+    // What the connection's buffers and records hold allocated now: its
+    // share of the endpoint's max_buffer_bytes.
     pub(crate) fn buffer_charge(&self) -> usize {
-        Self::retained_charge(
-            &self.send,
-            &self.receive,
-            &self.scoreboard,
-            &self.rack,
-            self.scratch.capacity(),
-        ) + self.tx_timestamps.storage_bytes()
+        self.send.storage_bytes()
+            + self.receive.storage_bytes()
+            + self.scoreboard.storage_bytes()
+            + self.rack.allocation_bytes()
+            + self.scratch.capacity()
+            + self.tx_timestamps.storage_bytes()
             + self.rx_timestamps.storage_bytes()
     }
 
-    pub(crate) fn resize_peak_charge(&self, send: usize, receive: usize) -> Option<usize> {
-        let sender = if send > self.send.allocation_capacity() {
-            Self::allocation_bytes(send, 0, 0)?.checked_add(self.send.shared_storage_bytes())?
-        } else {
-            0
-        };
+    // The charge at the peak of `set_buffer_capacities(_, receive)`: the
+    // original receive ring stays live while its replacement is filled. A
+    // send limit allocates nothing; the next write grows the send ring.
+    pub(crate) fn resize_peak_charge(&self, receive: usize) -> Option<usize> {
         let receiver = if receive > self.receive.capacity() {
-            receive.checked_mul(3)?
+            ReceiveBuffer::allocation_bytes(receive)?
         } else {
             0
         };
-        self.buffer_charge()
-            .checked_add(sender)?
-            .checked_add(receiver)
+        self.buffer_charge().checked_add(receiver)
     }
 
     pub(crate) fn buffer_capacities(&self) -> (usize, usize) {
@@ -1529,51 +1511,26 @@ impl Connection {
         max_charge: usize,
     ) -> Result<(), Error> {
         Self::validate_buffer_capacities(send, receive)?;
-        // Originals remain live until every replacement has been staged.
+        // The original remains live until its replacement has been staged.
         if self
-            .resize_peak_charge(send, receive)
+            .resize_peak_charge(receive)
             .is_none_or(|peak| peak > max_charge)
         {
             return Err(Error::NoMemory);
         }
         let old_window = self.advertised_window(false);
-        let grow_send = send > self.send.allocation_capacity();
-        // Stage every allocation before changing any quota or live protocol state.
-        let sender = if grow_send {
-            Some(self.send.resized(send).map_err(|_| Error::NoMemory)?)
-        } else {
-            None
-        };
+        // Stage the allocation before changing any quota or live protocol state.
         let receiver = if receive > self.receive.capacity() {
             Some(self.receive.grown(receive).map_err(|_| Error::NoMemory)?)
         } else {
             None
         };
-        let staged_bytes = sender.as_ref().map_or(0, SendBuffer::storage_bytes)
-            + receiver.as_ref().map_or(0, ReceiveBuffer::storage_bytes);
         if self
             .buffer_charge()
-            .checked_add(staged_bytes)
+            .checked_add(receiver.as_ref().map_or(0, ReceiveBuffer::storage_bytes))
             .is_none_or(|peak| peak > max_charge)
         {
             return Err(Error::NoMemory);
-        }
-        // The final retained charge is distinct from the transient peak.
-        let staged_send = sender.as_ref().unwrap_or(&self.send);
-        if Self::retained_charge(
-            staged_send,
-            receiver.as_ref().unwrap_or(&self.receive),
-            &self.scoreboard,
-            &self.rack,
-            self.scratch.capacity(),
-        ) + self.tx_timestamps.storage_bytes()
-            + self.rx_timestamps.storage_bytes()
-            > max_charge
-        {
-            return Err(Error::NoMemory);
-        }
-        if let Some(buffer) = sender {
-            self.send = buffer;
         }
         if let Some(buffer) = receiver {
             self.receive = buffer;
@@ -5062,10 +5019,13 @@ impl Connection {
             .saturating_sub(self.data_flight() as usize)
     }
 
-    // Stage both sender ledgers before accepting any bytes. The existing
-    // conservative connection charge still reserves the configured worst case;
-    // physical backing follows admitted live bytes, with geometric growth and
-    // no allocation from ACK, output, SACK or timeout processing.
+    // Allocate the send ring and stage both sender ledgers before accepting
+    // any bytes, within `max_charge` for the whole connection. The ring
+    // takes the send limit whole once admitted bytes outgrow it: at the
+    // first write, and at the first one after a larger limit. The ledgers
+    // follow admitted live bytes, with geometric growth. Nothing allocates
+    // from ACK, output, SACK or timeout processing. A ring that grew before
+    // the other failed keeps its storage, which buffer_charge counts.
     pub(crate) fn prepare_send_metadata(
         &mut self,
         bytes: usize,
@@ -5096,20 +5056,26 @@ impl Connection {
             .len()
             .checked_add(accepted)
             .ok_or(Error::NoMemory)?;
+        let grow_ring = live > self.send.allocation_capacity();
         let grow_rack = !self.rack.admits_bytes(live);
         let grow_scoreboard = !self.scoreboard.admits_bytes(live);
-        if !grow_rack && !grow_scoreboard {
+        if !grow_ring && !grow_rack && !grow_scoreboard {
             return Ok(());
         }
-        let limit = self.send.allocation_capacity();
+        // Admission keeps live bytes within the limit.
+        let limit = if grow_ring {
+            self.send.capacity()
+        } else {
+            self.send.allocation_capacity()
+        };
+        debug_assert!(live <= limit);
+        let ring = if grow_ring {
+            self.send.growth_bytes(limit)
+        } else {
+            0
+        };
         let target = live.checked_next_power_of_two().unwrap_or(limit).min(limit);
-        let existing = self.send.storage_bytes()
-            + self.receive.storage_bytes()
-            + self.rack.allocation_bytes()
-            + self.scoreboard.storage_bytes()
-            + self.scratch.capacity()
-            + self.tx_timestamps.storage_bytes()
-            + self.rx_timestamps.storage_bytes();
+        let existing = self.buffer_charge();
         let staged = if grow_rack {
             self.rack.growth_bytes(target).ok_or(Error::NoMemory)?
         } else {
@@ -5121,6 +5087,7 @@ impl Connection {
             } else {
                 0
             })
+            .and_then(|staged| staged.checked_add(ring))
             .ok_or(Error::NoMemory)?;
         if existing
             .checked_add(staged)
@@ -5143,12 +5110,18 @@ impl Connection {
             None
         };
         let actual = rack.as_ref().map_or(0, |growth| growth.allocation_bytes())
-            + scoreboard.as_ref().map_or(0, Scoreboard::storage_bytes);
+            + scoreboard.as_ref().map_or(0, Scoreboard::storage_bytes)
+            + ring;
         if existing
             .checked_add(actual)
             .is_none_or(|peak| peak > max_charge)
         {
             return Err(Error::NoMemory);
+        }
+        // The ring grows in place, last: a failure leaves the ledgers staged
+        // aside to drop, and the queued bytes as they were.
+        if grow_ring {
+            self.send.grow(limit).map_err(|_| Error::NoMemory)?;
         }
         if let Some(rack) = rack {
             self.rack.commit_growth(rack, target);

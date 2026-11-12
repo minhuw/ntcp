@@ -1125,7 +1125,6 @@ fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
         }
     }
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;
-    // Budget for actual per-byte ledger storage: admit 2 MiB, but reject later growth.
     config.max_buffer_bytes = 160 * 1024 * 1024;
     let mut a = owner_with_config(2, config);
     let mut b = owner(3);
@@ -1203,21 +1202,18 @@ fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
             BYTES,
         )
         .unwrap();
-    let old = a
-        .execute(client, Op::Get(SOL_SOCKET, SO_SNDBUF))
-        .unwrap()
-        .value;
-    assert_eq!(
-        a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, i32::MAX))
-            .unwrap_err(),
-        ENOBUFS
-    );
+    // A larger send limit allocates nothing, as Linux's SO_SNDBUF never
+    // fails for memory: the next write grows the send ring.
+    let charged = a.endpoint.buffer_bytes();
+    a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, i32::MAX))
+        .unwrap();
     assert_eq!(
         a.execute(client, Op::Get(SOL_SOCKET, SO_SNDBUF))
             .unwrap()
             .value,
-        old
+        socket_buffer_value(SO_SNDBUF, i32::MAX) as i32
     );
+    assert_eq!(a.endpoint.buffer_bytes(), charged);
 }
 
 #[test]

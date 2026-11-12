@@ -888,7 +888,9 @@ fn fast_open_explicit_capacity_admission_failure_preserves_tuple_and_budget() {
             (65535 << 14) + 1,
             EndpointError::Connection(Error::InvalidArgument),
         ),
-        (1 << 29, 257, EndpointError::LimitReached),
+        // Admitted at open, which charges no send ring; the SYN data's write
+        // then needs a 1 GiB ring for the 512 MiB limit.
+        (1 << 29, 257, EndpointError::Connection(Error::NoMemory)),
     ] {
         let (mut a, _, _) = warm(false);
         let (local, remote) = addresses(false, 40001);
@@ -927,8 +929,7 @@ fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
             cfg.connection.mss = 536;
             cfg.preallocate_connections = preallocate;
             // Preserve the exact connection allowance, plus the optional cache.
-            cfg.max_buffer_bytes = crate::connection::Connection::allocation_bytes(64, 257, 536)
-                .unwrap()
+            cfg.max_buffer_bytes = crate::connection::Connection::open_bytes(257, 536).unwrap()
                 + crate::fast_open::FastOpen::allocation_bytes();
             let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
             a.enable_fast_open().unwrap();
@@ -1028,7 +1029,7 @@ fn fast_open_cache_enable_budget_exact_fit_and_idempotence() {
             assert_eq!(a.buffer_bytes(), charge);
             assert_eq!(
                 a.connect(0, local, remote),
-                Err(EndpointError::LimitReached)
+                Err(EndpointError::Connection(Error::NoMemory))
             );
         }
         assert!(
@@ -1073,7 +1074,7 @@ fn fast_open_cache_allocation_failure_does_not_publish_or_charge() {
 #[test]
 fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
     let cache = crate::fast_open::FastOpen::allocation_bytes();
-    let connection = crate::connection::Connection::allocation_bytes(64, 257, 536).unwrap();
+    let connection = crate::connection::Connection::open_bytes(257, 536).unwrap();
     let (local, remote) = addresses(false, 40001);
     for preallocate in [0, 1] {
         for budget in [connection + cache - 1, connection + cache] {
@@ -1101,7 +1102,7 @@ fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
             let result =
                 a.connect_fast_open_with_buffer_capacities(0, local, remote, b"miss", 64, 257);
             if budget < connection + cache {
-                assert_eq!(result, Err(EndpointError::LimitReached));
+                assert_eq!(result, Err(EndpointError::Connection(Error::NoMemory)));
                 assert_eq!(a.buffer_bytes(), cache);
                 assert!(
                     a.poll_transmit(0, &mut [0; 2048], 64)
@@ -1117,7 +1118,7 @@ fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
                 let (other, _) = addresses(false, 40002);
                 assert_eq!(
                     a.connect(0, other, remote),
-                    Err(EndpointError::LimitReached)
+                    Err(EndpointError::Connection(Error::NoMemory))
                 );
                 assert_eq!(a.buffer_bytes(), connection + cache);
             }

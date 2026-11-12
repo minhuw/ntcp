@@ -958,13 +958,27 @@ fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
         .connect(0, SocketAddr::new(local().into(), 40000), remote)
         .unwrap();
     assert_eq!(endpoint.buffer_bytes(), reserved);
-    // With the pool consumed, a second connection uses ordinary admission;
-    // two 8 MiB receive charges do not fit the unchanged 32 MiB budget.
+    // With the pool consumed, later connections use ordinary admission, each
+    // charged its open charge (the 8 MiB receive ring, 1.375 bytes a byte),
+    // until the next does not fit the unchanged 32 MiB budget.
+    endpoint
+        .connect(0, SocketAddr::new(local().into(), 40001), remote)
+        .unwrap();
+    let charge = endpoint.buffer_bytes() - reserved;
+    assert!(charge >= 8 * 1024 * 1024 * 11 / 8);
+    let mut port = 40002;
+    while endpoint.buffer_bytes() + charge <= config.max_buffer_bytes {
+        endpoint
+            .connect(0, SocketAddr::new(local().into(), port), remote)
+            .unwrap();
+        port += 1;
+    }
+    let charged = endpoint.buffer_bytes();
     assert_eq!(
-        endpoint.connect(0, SocketAddr::new(local().into(), 40001), remote),
-        Err(EndpointError::LimitReached)
+        endpoint.connect(0, SocketAddr::new(local().into(), port), remote),
+        Err(EndpointError::Connection(ntcp::Error::NoMemory))
     );
-    assert_eq!(endpoint.buffer_bytes(), reserved);
+    assert_eq!(endpoint.buffer_bytes(), charged);
     let mut insufficient = config;
     insufficient.max_buffer_bytes = reserved - 1;
     assert!(matches!(
@@ -994,9 +1008,16 @@ fn explicit_budget128_allows_200000_sndbuf_growth() {
     assert_eq!(config.connection.send_capacity, 65536);
     assert_eq!(config.connection.receive_capacity, 8 * 1024 * 1024);
     assert_eq!(config.preallocate_connections, 1);
-    for (budget, expected) in [
-        (32 * 1024 * 1024, Err(EndpointError::LimitReached)),
-        (config.max_buffer_bytes, Ok(())),
+    // A send limit allocates nothing, so either budget takes it; the write
+    // that fills it allocates the 800 KB send ring and, until the ledgers
+    // are kept per segment, 68 bytes a byte of RACK and SACK ledger for the
+    // next power of two of the bytes queued: about 36 MB.
+    for (budget, written) in [
+        (
+            32 * 1024 * 1024,
+            Err(EndpointError::Connection(ntcp::Error::NoMemory)),
+        ),
+        (config.max_buffer_bytes, Ok(400000)),
     ] {
         let mut limited = config.clone();
         limited.max_buffer_bytes = budget;
@@ -1009,14 +1030,17 @@ fn explicit_budget128_allows_200000_sndbuf_growth() {
             )
             .unwrap();
         // All three pinned scripts request 200000; SO_SNDBUF doubles it.
+        let charged = endpoint.buffer_bytes();
         assert_eq!(
             endpoint.set_buffer_capacities(id, 400000, config.connection.receive_capacity),
-            expected
+            Ok(())
         );
-        assert_eq!(
-            endpoint.buffer_capacities(id).unwrap().0,
-            if expected.is_ok() { 400000 } else { 65536 }
-        );
+        assert_eq!(endpoint.buffer_capacities(id).unwrap().0, 400000);
+        assert_eq!(endpoint.buffer_bytes(), charged);
+        assert_eq!(endpoint.write(id, &[7; 400000]), written);
+        if written.is_err() {
+            assert_eq!(endpoint.buffer_bytes(), charged);
+        }
         assert!(endpoint.buffer_bytes() <= budget);
     }
 }
@@ -1056,10 +1080,13 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
                 .receive_capacity,
             receive_capacity
         );
+        // A connection is charged its open charge: at least its receive ring
+        // (payload, presence/PUSH and report maps); no send ring before its
+        // first write.
         let per_connection = owner.inner.endpoint.buffer_bytes() - reservation_bytes;
         assert!(
             per_connection
-                >= 3 * receive_capacity + 2 * 65536 + 1460 + 8 * (65536 + 2) + (65536 / 2 + 4) * 8
+                >= receive_capacity + receive_capacity.div_ceil(4) + receive_capacity.div_ceil(8)
         );
         let max_bytes = 32 * 1024 * 1024;
         let count = LIMIT.min((max_bytes - reservation_bytes) / per_connection);
@@ -1082,7 +1109,12 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
                 SocketAddr::new(local().into(), 50000),
                 SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
             ),
-            Err(EndpointError::LimitReached.into())
+            Err(if count == LIMIT {
+                EndpointError::LimitReached
+            } else {
+                EndpointError::Connection(ntcp::Error::NoMemory)
+            }
+            .into())
         );
         assert_eq!(
             owner.inner.endpoint.buffer_bytes(),
@@ -1483,9 +1515,10 @@ fn ip_options_pending_connect_updates_and_engine_owned_ecn() {
     for mode in [IP_PMTUDISC_WANT, IP_PMTUDISC_DONT, IP_PMTUDISC_DO] {
         execute_value(&mut owner, 11, fd, 7, mode).unwrap();
         execute_value(&mut owner, 11, fd, 6, 4).unwrap();
-        let before = owner.inner.endpoint.buffer_bytes();
         let (mut write, _) = request(7, fd, 0, b"data".to_vec(), 0);
         assert_eq!(owner.execute(&mut write).unwrap().unwrap().value, 4);
+        // The first write allocated the send ring; the option allocates nothing.
+        let before = owner.inner.endpoint.buffer_bytes();
         let (_, bytes) = poll_frame(&mut owner).unwrap();
         check_ip(&bytes, 4, mode != IP_PMTUDISC_DONT);
         let header = packet_header(&bytes);

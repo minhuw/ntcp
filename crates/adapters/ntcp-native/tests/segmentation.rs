@@ -241,6 +241,15 @@ fn wires(layer: PacketLayer, capabilities: Option<TcpSegmentationCapabilities>) 
     };
     (make(a.clone(), b.clone()), make(b, a))
 }
+// buffer_budget admits the connections with no room to write: a writer also
+// allocates its send ring (2 bytes a byte of send_capacity) and its RACK and
+// SACK ledgers (68 bytes a byte held queued, and the replaced ones while
+// they grow).
+fn budget(config: &NetworkConfig, connections: usize, io: &impl PacketIo) -> usize {
+    config.buffer_budget(connections, io).unwrap()
+        + connections * (72 * config.tcp.connection.send_capacity + 65536)
+}
+
 fn config(address: IpAddr, ethernet: bool, side: u8) -> NetworkConfig {
     let mut config = NetworkConfig::new(address, 1500);
     config.tcp.max_connections = 4;
@@ -294,8 +303,8 @@ impl Pair {
         let mut cb = config(ip_b, ethernet, 2);
         adjust(&mut ca);
         adjust(&mut cb);
-        ca.tcp.max_buffer_bytes = ca.buffer_budget(4, &wa).unwrap();
-        cb.tcp.max_buffer_bytes = cb.buffer_budget(4, &wb).unwrap();
+        ca.tcp.max_buffer_bytes = budget(&ca, 4, &wa);
+        cb.tcp.max_buffer_bytes = budget(&cb, 4, &wb);
         let mut a = Network::new(ca, wa, [1; 32], 0).unwrap();
         let mut b = Network::new(cb, wb, [2; 32], 0).unwrap();
         let listener = b.listen(9000, 4).unwrap();

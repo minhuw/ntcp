@@ -38,7 +38,9 @@ fn accepted(owner: &mut Owner, port: u16) -> u64 {
 
 #[test]
 fn default_pipeline_large_write_sndbuf_fits_original_budget() {
-    // Explicit 32 retains the old ENOBUFS boundary; user capacities are not clamped.
+    // User egress capacities are not clamped. A send limit allocates nothing,
+    // so even the 32 reservations that fill most of the budget leave room
+    // for it (the worst-case resize charge refused it with ENOBUFS).
     for (options, expected) in [
         (Options::default(), Ok(())),
         (
@@ -53,7 +55,7 @@ fn default_pipeline_large_write_sndbuf_fits_original_budget() {
                 egress_capacity: 32,
                 ..Options::default()
             },
-            Err(ENOBUFS),
+            Ok(()),
         ),
     ] {
         let mut owner = Owner {
@@ -87,9 +89,7 @@ fn default_pipeline_large_write_sndbuf_fits_original_budget() {
             (capacity as usize, 65535)
         );
         assert!(owner.endpoint.buffer_bytes() <= 32 * 1024 * 1024);
-        if expected.is_err() {
-            assert_eq!(owner.endpoint.buffer_bytes(), before);
-        }
+        assert_eq!(owner.endpoint.buffer_bytes(), before);
     }
 }
 

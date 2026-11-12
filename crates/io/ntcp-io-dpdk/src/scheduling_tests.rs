@@ -390,9 +390,14 @@ unsafe fn segmented_network(mut io: Dpdk) {
         config.link = link(side);
         config
     };
+    // buffer_budget admits the connections with no room to write: a writer
+    // also allocates its send ring (2 bytes a byte of send_capacity) and its
+    // RACK and SACK ledgers (68 bytes a byte held queued, and the replaced
+    // ones while they grow).
+    let headroom = |config: &NetworkConfig| 2 * (72 * config.tcp.connection.send_capacity + 65536);
     let mut ca = config("10.74.0.1", 1);
     ca.tx_timestamp_phases = 64;
-    ca.tcp.max_buffer_bytes = ca.buffer_budget(2, &io).unwrap();
+    ca.tcp.max_buffer_bytes = ca.buffer_budget(2, &io).unwrap() + headroom(&ca);
     let incoming = Rc::new(RefCell::new(VecDeque::new()));
     let outgoing = Rc::new(RefCell::new(VecDeque::new()));
     let peer = Peer {
@@ -400,7 +405,7 @@ unsafe fn segmented_network(mut io: Dpdk) {
         outgoing: outgoing.clone(),
     };
     let mut cb = config("10.74.0.2", 2);
-    cb.tcp.max_buffer_bytes = cb.buffer_budget(2, &peer).unwrap();
+    cb.tcp.max_buffer_bytes = cb.buffer_budget(2, &peer).unwrap() + headroom(&cb);
     let mut a = Network::new(ca, io, [1; 32], 0).unwrap();
     let mut b = Network::new(cb, peer, [2; 32], 0).unwrap();
     let listener = b.listen(9000, 1).unwrap();

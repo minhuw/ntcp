@@ -366,12 +366,14 @@ fn disabled_ipv6_full_option_data_and_ack_with_three_sack_blocks() {
 fn disabled_ipv6_live_mss_and_failed_reserved_submission_keep_ceiling() {
     for mode in OUTPUTS {
         let (mut a, mut b, id, peer) = pair(config(true, u16::MAX), mode);
-        let allocation = a.buffer_bytes();
         for (step, (mss, expected)) in [(Some(800), 860), (None, 1280), (Some(6000), 1280)]
             .into_iter()
             .enumerate()
         {
             let now = 10 + step as u64 * 2;
+            // An MSS change allocates nothing; the first write allocates the
+            // send ring.
+            let allocation = a.buffer_bytes();
             a.set_user_mss(id, mss).unwrap();
             assert_eq!(a.buffer_bytes(), allocation);
             a.write(id, &[5; 4000]).unwrap();

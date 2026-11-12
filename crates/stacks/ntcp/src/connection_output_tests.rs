@@ -2374,11 +2374,14 @@ fn lowat_byte_admission_transmission_ack_resize_flush_and_wrap() {
     for iss in [0, u32::MAX - 1999] {
         let (mut a, _) = pair(config(32768, 1000), iss);
         a.set_cork(true);
-        let charge = a.send.storage_bytes();
+        assert_eq!(a.send.storage_bytes(), 0);
         assert_eq!(
             a.write_with_options_and_notsent_lowat(&[1; 3999], true, false, Some(4000)),
             Ok(3999)
         );
+        // The first write allocated the ring for the whole limit.
+        let charge = a.send.storage_bytes();
+        assert_eq!(charge, 2 * 32768);
         assert_eq!(a.send_admission_room(Some(4000)), 1);
         assert_eq!(
             a.write_with_options_and_notsent_lowat(&[2; 9000], true, true, Some(4000)),

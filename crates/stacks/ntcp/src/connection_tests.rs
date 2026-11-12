@@ -1647,9 +1647,19 @@ fn resize_peak_is_checked_before_allocation_and_leaves_syn_offer_unchanged() {
         ..ConnectionConfig::default()
     };
     let mut connection = Connection::active(tuple(), cfg, 100, 0).unwrap();
-    let max_charge = Connection::allocation_bytes(2048, 1, 64).unwrap();
+    // A larger send limit allocates nothing; a receive ring is staged.
+    assert_eq!(
+        crate::allocation_tests::fail_after(0, || {
+            connection.set_buffer_capacities(2048, 1, connection.buffer_charge())
+        }),
+        Ok(())
+    );
+    connection
+        .set_buffer_capacities(1024, 1, usize::MAX)
+        .unwrap();
+    let max_charge = connection.resize_peak_charge(2048).unwrap() - 1;
     let (result, allocation_failed) = crate::allocation_tests::fail_after(0, || {
-        let result = connection.set_buffer_capacities(2048, 1, max_charge);
+        let result = connection.set_buffer_capacities(1024, 2048, max_charge);
         // The failure injection remains armed: admission made no allocation.
         (result, SendBuffer::new(1).is_err())
     });
@@ -1792,7 +1802,9 @@ fn live_buffer_resize_is_atomic_and_preserves_recovery_and_window_promises() {
         ],
     );
     let before_sack = a.scoreboard.ranges().to_vec();
-    for allocation in 0..4 {
+    // Only the receive ring's three parts are staged: the send ring grows at
+    // the next write.
+    for allocation in 0..3 {
         let result = crate::allocation_tests::fail_after(allocation, || {
             a.set_buffer_capacities(256, 256, usize::MAX)
         });
@@ -3483,7 +3495,9 @@ fn syn_received_close_send_history_survives_flush_and_empty_send() {
     assert_eq!(a.state(), State::FinWait1);
 
     let (mut a, _) = opening_for_close(config(64, 8), 100, false);
-    a.send.write(&[0; 64]); // Exhaust storage without a successful application SEND.
+    // Exhaust storage without a successful application SEND.
+    a.send.grow(64).unwrap();
+    a.send.write(&[0; 64]);
     assert_eq!(a.write(b"failed"), Err(Error::WouldBlock));
     assert!(!a.send_issued);
     a.snd_wnd = 0;

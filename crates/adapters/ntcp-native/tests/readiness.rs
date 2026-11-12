@@ -54,7 +54,12 @@ fn network(side: u8, incoming: &Queue, outgoing: &Queue) -> Network<Wire> {
         incoming: incoming.clone(),
         outgoing: outgoing.clone(),
     };
-    config.tcp.max_buffer_bytes = config.buffer_budget(8, &wire).unwrap();
+    // buffer_budget admits the connections with no room to write: a writer
+    // also allocates its send ring (2 bytes a byte of send_capacity) and its
+    // RACK and SACK ledgers (68 bytes a byte held queued, and the replaced
+    // ones while they grow).
+    config.tcp.max_buffer_bytes = config.buffer_budget(8, &wire).unwrap()
+        + 8 * (72 * config.tcp.connection.send_capacity + 65536);
     Network::new(config, wire, [side; 32], 0).unwrap()
 }
 

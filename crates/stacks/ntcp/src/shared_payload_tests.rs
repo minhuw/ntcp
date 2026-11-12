@@ -157,7 +157,8 @@ fn shared_metadata_partial_ack_resize_and_fragment_limits_preserve_bytes() {
     buffer.mark_end_of_record();
     buffer.acknowledge(5).unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    buffer = buffer.resized(256).unwrap();
+    buffer.grow(256).unwrap();
+    buffer.set_limit(256);
     let mut out = [0; 26];
     assert_eq!(buffer.copy(0, &mut out), 26);
     assert_eq!(&out[..8], &[2; 8]);

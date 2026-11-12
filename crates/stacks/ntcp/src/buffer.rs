@@ -56,6 +56,8 @@ pub(crate) struct SendBuffer {
 }
 
 impl SendBuffer {
+    // Rings reserved for `capacity` queued bytes at once.
+    #[cfg(test)]
     pub(crate) fn new(capacity: usize) -> Result<Self, ()> {
         let mut data = VecDeque::new();
         data.try_reserve_exact(capacity).map_err(|_| ())?;
@@ -71,26 +73,35 @@ impl SendBuffer {
         })
     }
 
+    // A limit of `capacity` queued bytes with no ring yet: the rings are
+    // allocated by `grow`, at the first write, as Linux allocates a
+    // socket's skbs in sendmsg and none at socket creation.
+    pub(crate) fn unallocated(capacity: usize) -> Self {
+        Self {
+            data: VecDeque::new(),
+            marks: VecDeque::new(),
+            capacity,
+            head: 0,
+            shared: VecDeque::new(),
+            shared_output: None,
+        }
+    }
+
     pub(crate) fn storage_bytes(&self) -> usize {
         self.data.capacity() + self.marks.capacity() + self.shared_storage_bytes()
     }
 
+    // Queued bytes both rings hold without allocating.
     pub(crate) fn allocation_capacity(&self) -> usize {
-        self.data.capacity()
+        self.data.capacity().min(self.marks.capacity())
     }
 
-    pub(crate) fn resized(&self, capacity: usize) -> Result<Self, ()> {
-        let mut result = Self::new(capacity.max(self.data.capacity()))?;
-        result.data.extend(self.data.iter());
-        result.marks.extend(self.marks.iter());
-        result
-            .shared
-            .try_reserve_exact(self.shared.capacity())
-            .map_err(|_| ())?;
-        result.shared.extend(self.shared.iter().cloned());
-        result.head = self.head;
-        result.capacity = capacity;
-        Ok(result)
+    // The bytes `grow(capacity)` allocates: a ring that reallocates holds
+    // its old storage, which storage_bytes already counts, until the new
+    // one is filled, so this is also what the growth adds at its peak.
+    pub(crate) fn growth_bytes(&self, capacity: usize) -> usize {
+        let ring = |held: usize| if held < capacity { capacity } else { 0 };
+        ring(self.data.capacity()) + ring(self.marks.capacity())
     }
 
     // Grows the payload and mark rings in place to hold `capacity` queued
@@ -99,10 +110,6 @@ impl SendBuffer {
     // their marks and the limit are as they were: a ring that grew before the
     // other failed keeps its storage, which storage_bytes counts and the next
     // growth reuses.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "buffer autotuning will grow rings at write")
-    )]
     pub(crate) fn grow(&mut self, capacity: usize) -> Result<(), ()> {
         let additional = capacity.saturating_sub(self.data.len());
         self.data.try_reserve_exact(additional).map_err(|_| ())?;
@@ -133,8 +140,16 @@ impl SendBuffer {
         remaining.min((lowat as usize).saturating_sub(notsent))
     }
 
+    // The rings hold what the limit admits (`grow`, at write admission):
+    // queueing never allocates.
+    fn assert_reserved(&self, count: usize) {
+        assert!(count <= self.data.capacity() - self.data.len());
+        assert!(count <= self.marks.capacity() - self.marks.len());
+    }
+
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
+        self.assert_reserved(count);
         self.data.extend(&input[..count]);
         self.marks.resize(self.data.len(), 0);
         count
@@ -450,6 +465,7 @@ impl SendBuffer {
         if count == 0 {
             return 0;
         }
+        self.assert_reserved(count);
         let payload = payload.slice(0..count).unwrap();
         if let Some(joined) = self.joined(&payload) {
             self.shared.back_mut().unwrap().payload = joined;
@@ -674,6 +690,15 @@ impl ReceiveBuffer {
 
     pub(crate) fn storage_bytes(&self) -> usize {
         self.data.capacity() + self.metadata.capacity() + self.report_pending.capacity()
+    }
+
+    // What `new(_, capacity)` allocates: storage_bytes of the ring it
+    // returns, 1.375 bytes a slot (payload, 2-bit presence/PUSH, 1-bit
+    // pending report).
+    pub(crate) fn allocation_bytes(capacity: usize) -> Option<usize> {
+        capacity
+            .checked_add(capacity.div_ceil(4))?
+            .checked_add(capacity.div_ceil(8))
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -1625,8 +1650,10 @@ mod tests {
         send.set_limit(2);
         assert_eq!(send.remaining(), 0);
         assert_eq!(send.write(b"!"), 0);
-        assert!(send.resized(usize::MAX).is_err());
-        let mut grown = send.resized(16).unwrap();
+        assert!(send.grow(usize::MAX).is_err());
+        send.grow(16).unwrap();
+        send.set_limit(16);
+        let mut grown = send;
         let mut out = [0; 6];
         assert_eq!(grown.copy(0, &mut out), 6);
         assert_eq!(&out, b"abcdef");
@@ -2741,7 +2768,8 @@ mod tests {
         assert_eq!(send.copy(0, &mut bytes), 3);
         assert_eq!(&bytes[..3], b"abc");
         assert_eq!(send.storage_bytes(), charge);
-        let mut send = send.resized(16).unwrap();
+        send.grow(16).unwrap();
+        send.set_limit(16);
         send.acknowledge(2).unwrap();
         assert_eq!(send.copy(0, &mut bytes), 1);
         assert_eq!(bytes[0], b'c');
@@ -2773,7 +2801,8 @@ mod tests {
         send.mark_end_of_record();
         send.mark_push();
         assert_eq!(send.admission_room(8, Some(10)), 2);
-        let mut send = send.resized(64).unwrap();
+        send.grow(64).unwrap();
+        send.set_limit(64);
         assert_eq!(send.admission_room(8, Some(10)), 2);
         send.truncate(5);
         assert_eq!(send.admission_room(5, Some(10)), 5);

@@ -243,7 +243,7 @@ fn output_failure_stale_handles_and_memory_limits_are_explicit() {
     //# resources".
     assert_eq!(
         endpoint.connect(0, local, remote),
-        Err(EndpointError::LimitReached)
+        Err(EndpointError::Connection(Error::NoMemory))
     );
     assert_eq!(
         a.input(
@@ -2310,7 +2310,7 @@ fn optional_stream_controls_refresh_endpoint_work_and_charge_marker_storage() {
     let (local, remote) = addresses();
     assert_eq!(
         endpoint.connect(0, local, remote),
-        Err(EndpointError::LimitReached)
+        Err(EndpointError::Connection(Error::NoMemory))
     );
 }
 
@@ -4791,12 +4791,28 @@ fn application_timeout_does_not_close_healthy_fin_wait2_receive_half() {
     assert_eq!(a.close_reason(client), Ok(Some(CloseReason::TimedOut)));
 }
 
+// A connection's charge at open, and a pooled one's: its receive ring
+// (payload, 2-bit presence/PUSH and 1-bit report maps), scratch segment and
+// the sender ledgers' first entries (two RACK intervals, four SACK ranges).
 fn connection_charge(cfg: &EndpointConfig) -> usize {
-    3 * cfg.connection.receive_capacity
-        + 2 * cfg.connection.send_capacity
-        + crate::sack::Scoreboard::allocation_bytes(cfg.connection.send_capacity).unwrap()
+    let receive = cfg.connection.receive_capacity;
+    receive
+        + receive.div_ceil(4)
+        + receive.div_ceil(8)
         + usize::from(cfg.connection.mss)
-        + crate::rack::Rack::storage_bytes(cfg.connection.send_capacity).unwrap()
+        + crate::rack::Rack::storage_bytes(0).unwrap()
+        + crate::sack::Scoreboard::allocation_bytes(0).unwrap()
+}
+
+// What a connection's first write, of `live` bytes, adds to its charge: the
+// send ring for its whole limit and the sender ledgers grown to the next
+// power of two of the bytes it holds.
+fn first_write_charge(cfg: &EndpointConfig, live: usize) -> usize {
+    let target = live.next_power_of_two().min(cfg.connection.send_capacity);
+    2 * cfg.connection.send_capacity + crate::rack::Rack::storage_bytes(target).unwrap()
+        - crate::rack::Rack::storage_bytes(0).unwrap()
+        + crate::sack::Scoreboard::allocation_bytes(target).unwrap()
+        - crate::sack::Scoreboard::allocation_bytes(0).unwrap()
 }
 
 #[test]
@@ -4870,11 +4886,17 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.preallocate_connections = 1;
+    // A connection is charged what it holds at open, as a pooled one is,
+    // and its first write adds its send ring and ledgers.
     let charge = connection_charge(&cfg);
-    cfg.max_buffer_bytes = 2 * charge;
+    let written = first_write_charge(&cfg, 9);
+    // While the grown ledgers are filled the first ones are still held.
+    let staging = crate::rack::Rack::storage_bytes(0).unwrap()
+        + crate::sack::Scoreboard::allocation_bytes(0).unwrap();
+    cfg.max_buffer_bytes = 2 * charge + written + staging;
     let time_wait = cfg.connection.time_wait_us;
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
     let first = a.connect(0, local, remote).unwrap();
@@ -4887,11 +4909,13 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     other_local.set_port(local.port() + 1);
     let second = a.connect(0, other_local, remote).unwrap();
     assert_eq!(a.buffer_bytes(), 2 * charge);
+    assert_eq!(a.write(first, b"old bytes"), Ok(9));
+    assert_eq!(a.buffer_bytes(), 2 * charge + written);
     let mut third_local = local;
     third_local.set_port(local.port() + 2);
     assert_eq!(
         a.connect(0, third_local, remote),
-        Err(EndpointError::LimitReached)
+        Err(EndpointError::Connection(Error::NoMemory))
     );
     pump(&mut a, &mut b, 0);
     let servers = [b.accept(listener).unwrap(), b.accept(listener).unwrap()];
@@ -4905,7 +4929,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
         packets(&mut a, 0);
         assert!(a.connection_exists(id));
     }
-    assert_eq!(a.buffer_bytes(), 2 * charge);
+    assert_eq!(a.buffer_bytes(), 2 * charge + written);
     a.on_timeout(time_wait, 2).unwrap();
     assert!(!a.connection_exists(first));
     assert!(!a.connection_exists(second));
@@ -4925,6 +4949,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     assert_ne!(fresh, first);
     assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
     a.write(fresh, b"old bytes").unwrap();
+    assert_eq!(a.buffer_bytes(), charge + written);
     a.shutdown(fresh).unwrap();
     pump(&mut a, &mut b, time_wait);
     assert_eq!(b.state(server), Ok(State::CloseWait));
@@ -4956,7 +4981,10 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     assert_eq!(b.read(server, &mut out), Ok(3));
     assert_eq!(&out[..3], b"new");
     assert_eq!(&out[3..], &[0xaa; 13]);
-    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
+    assert_eq!(
+        (a.buffer_bytes(), b.buffer_bytes()),
+        (charge + first_write_charge(&cfg, 3), charge)
+    );
 }
 
 #[test]
@@ -5143,7 +5171,7 @@ fn reset_quarantine_connection_and_byte_capacity_and_timeout_budgets() {
             if byte_slots == 0 {
                 assert_eq!(
                     a.connect(0, local, remote),
-                    Err(EndpointError::LimitReached)
+                    Err(EndpointError::Connection(Error::NoMemory))
                 );
                 continue;
             }
@@ -5168,9 +5196,14 @@ fn reset_quarantine_connection_and_byte_capacity_and_timeout_budgets() {
                 assert!(a.on_timeout(cfg.connection.time_wait_us, 1).unwrap());
                 assert_eq!(a.buffer_bytes(), charge);
             } else {
+                // Out of slots, or else of buffer budget.
                 assert_eq!(
                     a.connect(0, other, remote),
-                    Err(EndpointError::LimitReached)
+                    Err(if slots == 1 {
+                        EndpointError::LimitReached
+                    } else {
+                        EndpointError::Connection(Error::NoMemory)
+                    })
                 );
             }
             assert!(!a.on_timeout(cfg.connection.time_wait_us, 1).unwrap());
@@ -5969,9 +6002,14 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     let (mut a, mut b, listener, client) = endpoints();
     pump(&mut a, &mut b, 0);
     let server = b.accept(listener).unwrap();
-    let original_charge = a.buffer_bytes();
     let payload = vec![42; 512];
     assert_eq!(a.write(client, &payload), Ok(512));
+    // The first write allocated the send ring and grew the ledgers.
+    let original_charge = a.buffer_bytes();
+    assert_eq!(
+        original_charge,
+        connection_charge(&config()) + first_write_charge(&config(), 512)
+    );
     a.set_buffer_capacities(client, 128, 128).unwrap();
     assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
     assert_eq!(a.buffer_bytes(), original_charge);
@@ -5984,7 +6022,8 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     );
     a.set_buffer_capacities(client, 128, 128).unwrap();
     assert_eq!(a.buffer_bytes(), grown_charge);
-    for allocation in 0..4 {
+    // The receive ring's three parts; the send ring grows at write.
+    for allocation in 0..3 {
         assert_eq!(
             crate::allocation_tests::fail_after(allocation, || a
                 .set_buffer_capacities(client, 4096, 4096)),
@@ -6037,16 +6076,18 @@ fn buffer_capacities_prehandshake_inheritance_and_pool_mismatch() {
     // Incompatible pooled storage is neither reused nor silently enlarged.
     assert_eq!(
         limited.connect_with_buffer_capacities(0, local, remote, 32, 32),
-        Err(EndpointError::LimitReached)
+        Err(Error::NoMemory.into())
     );
     assert_eq!(limited.buffer_bytes(), reserved);
     let id = limited
         .connect_with_buffer_capacities(0, local, remote, 32, 1024)
         .unwrap();
     assert_eq!(limited.buffer_capacities(id), Ok((32, 1024)));
-    assert!(limited.buffer_bytes() < reserved);
+    // No send ring before the first write: the send capacity is not charged.
+    assert_eq!(limited.buffer_bytes(), reserved);
 
-    cfg.max_buffer_bytes = 16 * reserved;
+    // Room for the 256 KiB and 128 KiB receive rings.
+    cfg.max_buffer_bytes = 1 << 20;
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 2).unwrap();
@@ -6100,7 +6141,12 @@ fn endpoint_cork_more_eor_deadline_flush_and_failed_output() {
         b"abc"
     );
     deliver(&mut b, 0, first);
-    assert_eq!(a.buffer_bytes(), charge); // No per-record allocations.
+    // No per-record allocations: only the ledgers grew, from 4 to 8 bytes.
+    let ledgers = |bytes| {
+        crate::rack::Rack::storage_bytes(bytes).unwrap()
+            + crate::sack::Scoreboard::allocation_bytes(bytes).unwrap()
+    };
+    assert_eq!(a.buffer_bytes(), charge + ledgers(8) - ledgers(4));
     a.set_nagle(client, false).unwrap();
     assert_eq!(
         a.poll_transmit(0, &mut [0; 21], 16),
@@ -6153,6 +6199,14 @@ fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
         a.write_with_options_and_notsent_lowat(client, &[1; 40], true, true, Some(24)),
         Ok(24)
     );
+    // Charged what was allocated for the 24 bytes admitted: the send ring
+    // for the 32-byte limit and ledgers grown to 32 bytes.
+    let ledgers = |bytes| {
+        crate::rack::Rack::storage_bytes(bytes).unwrap()
+            + crate::sack::Scoreboard::allocation_bytes(bytes).unwrap()
+    };
+    let charge = charge + 2 * 32 + ledgers(32) - ledgers(0);
+    assert_eq!(a.buffer_bytes(), charge);
     assert_eq!(a.send_admission_room(client, Some(24)), Ok(0));
     assert_eq!(
         a.write_with_options_and_notsent_lowat(client, b"x", true, false, Some(24)),
@@ -6171,7 +6225,11 @@ fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
         a.write_with_options_and_notsent_lowat(client, &[3; 32], true, false, Some(u32::MAX)),
         Ok(24)
     );
-    assert_eq!(a.buffer_bytes(), charge);
+    // The ring grew in place to the 64-byte limit, the ledgers to 64 bytes.
+    assert_eq!(
+        a.buffer_bytes(),
+        charge + 2 * (64 - 32) + ledgers(64) - ledgers(32)
+    );
 }
 
 #[test]
@@ -6344,7 +6402,12 @@ fn tx_timestamp_terminal_cancellation_release_and_reused_generation() {
             }
         }
         a.release(client).unwrap();
-        assert_eq!(a.buffer_bytes(), base_charge); // Release frees even undrained records.
+        // Release frees even undrained records; the quarantined connection
+        // keeps the send ring and ledgers its write allocated.
+        assert_eq!(
+            a.buffer_bytes(),
+            base_charge + first_write_charge(&config(), 3)
+        );
         assert_eq!(
             a.next_tx_timestamp(client),
             Err(EndpointError::InvalidHandle)
@@ -6879,8 +6942,16 @@ fn checked_external_write_admission_covers_bytes_phases_and_shutdown() {
     );
     a.set_tx_timestamp_capacity(client, 3).unwrap();
     a.set_buffer_capacities(client, 32, 32).unwrap();
-    let charged = a.buffer_bytes();
+    let before = a.buffer_bytes();
     assert_eq!(a.prepare_write_admission(client, 32, None, request), Ok(32));
+    // Preparation allocated and charged the send ring and the ledgers; the
+    // write that follows allocates nothing.
+    let charged = a.buffer_bytes();
+    let ledgers = |bytes| {
+        crate::rack::Rack::storage_bytes(bytes).unwrap()
+            + crate::sack::Scoreboard::allocation_bytes(bytes).unwrap()
+    };
+    assert_eq!(charged, before + 2 * 32 + ledgers(32) - ledgers(0));
     crate::allocation_tests::fail_after(0, || {
         assert_eq!(a.check_write_admission(client, None, request), Ok(32));
         assert_eq!(

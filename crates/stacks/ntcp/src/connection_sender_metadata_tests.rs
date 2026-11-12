@@ -30,12 +30,20 @@ fn idle_sender_backing_is_independent_of_configured_payload_limit() {
             Scoreboard::allocation_bytes(0).unwrap()
         );
         let charge = a.buffer_charge();
+        let idle = metadata_bytes(&a);
+        assert_eq!(a.send.storage_bytes(), 0);
         a.write(&[1; 18]).unwrap();
         assert_eq!(
             metadata_bytes(&a),
             Rack::storage_bytes(32).unwrap() + Scoreboard::allocation_bytes(32).unwrap()
         );
-        assert_eq!(a.buffer_charge(), charge);
+        // The first write allocates the ring for the whole limit, and is
+        // charged what it allocates.
+        assert_eq!(a.send.storage_bytes(), 2 * limit);
+        assert_eq!(
+            a.buffer_charge(),
+            charge + 2 * limit + metadata_bytes(&a) - idle
+        );
         assert!(metadata_bytes(&a) < 4096);
     }
 }

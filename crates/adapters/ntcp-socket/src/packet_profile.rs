@@ -749,7 +749,7 @@ mod setup_profile_tests {
         assert_eq!(result.is_ok(), cfg!(feature = "tfo-linux-cookie"));
     }
     #[test]
-    fn fast_open_budget_admits_seven_retained_connections_but_not_eight() {
+    fn fast_open_budget_admits_retained_connections_by_their_open_charge() {
         let config = config(selected(",budget224m,prealloc3"));
         assert_eq!(config.preallocate_connections, 3);
         let preallocate = config.preallocate_connections;
@@ -757,14 +757,15 @@ mod setup_profile_tests {
         let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
         let reserved = endpoint.buffer_bytes();
         let charge = reserved / preallocate;
-        // The smallest 32 MiB budget step that covers the corpus maximum.
-        assert!(7 * charge > budget - 32 * 1024 * 1024);
-        assert!(7 * charge <= budget);
-        assert!(8 * charge > budget);
         endpoint.enable_fast_open().unwrap();
         let cache_charge = endpoint.buffer_bytes() - reserved;
+        // Each connection is charged its open charge, the pooled ones too;
+        // the budget admits as many as it holds beside the cache. (Sized
+        // for the worst-case charge, it held seven, the corpus maximum.)
+        let admitted = (budget - cache_charge) / charge;
+        assert!(admitted >= 7);
         let remote = "192.0.2.2:8080".parse().unwrap();
-        for index in 0..7 {
+        for index in 0..admitted as u16 {
             let local = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
             let (_, accepted) = endpoint.connect_fast_open(0, local, remote, &[]).unwrap();
             assert_eq!(accepted, 0);
@@ -773,11 +774,12 @@ mod setup_profile_tests {
                 (usize::from(index) + 1).max(preallocate) * charge + cache_charge
             );
         }
+        let next = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + admitted as u16);
         assert_eq!(
-            endpoint.connect_fast_open(0, "192.0.2.1:40007".parse().unwrap(), remote, &[]),
-            Err(ntcp::EndpointError::LimitReached)
+            endpoint.connect_fast_open(0, next, remote, &[]),
+            Err(ntcp::EndpointError::Connection(ntcp::Error::NoMemory))
         );
-        assert_eq!(endpoint.buffer_bytes(), 7 * charge + cache_charge);
+        assert_eq!(endpoint.buffer_bytes(), admitted * charge + cache_charge);
     }
 
     #[test]
