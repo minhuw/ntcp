@@ -1268,9 +1268,15 @@ impl ReceiveBuffer {
         // In-order text that fits, with no byte retained beyond the contiguous
         // prefix: every byte is new and extends the prefix, so the per-byte
         // path below reduces to copying the run and marking it present, with
-        // no reporting anchor and PUSH taken at once.
+        // no reporting anchor and PUSH taken at once. A FIN on it follows
+        // every retained byte, so it is kept when it lies within capacity
+        // and none is kept yet, as below.
         let start = self.contiguous_len;
-        if !fin && !outcome.out_of_order && !had_holes && start + payload.len() <= data_limit {
+        if !payload.is_empty()
+            && !outcome.out_of_order
+            && !had_holes
+            && start + payload.len() <= data_limit
+        {
             let mut copied = 0;
             for range in self.ranges(start, payload.len()) {
                 let len = range.len();
@@ -1291,6 +1297,9 @@ impl ReceiveBuffer {
             self.occupied += payload.len();
             self.contiguous_len = end;
             self.pushed |= push;
+            if fin && self.fin_sequence.is_none() && end < capacity {
+                self.fin_sequence = Some(self.read_base.wrapping_add(end as u32));
+            }
             if self.fin_sequence == Some(self.next()) {
                 self.eof = true;
                 outcome.fin = true;
@@ -2174,6 +2183,24 @@ mod tests {
         assert_eq!(recv.next(), Seq(3));
         assert!(recv.eof());
         assert_eq!(recv.reset_start(Seq(100)), Err(()));
+    }
+
+    #[test]
+    fn in_order_text_with_fin_ends_the_stream_across_the_wrap() {
+        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 1), 8).unwrap();
+        recv.insert(Seq(u32::MAX - 1), b"abcde", false);
+        let mut out = [0; 8];
+        assert_eq!(recv.read(&mut out[..5]), 5);
+        let result = recv.insert_with_push(Seq(3), b"fghijk", true, true);
+        assert_eq!(result.new_bytes, 6);
+        assert!(result.fin && result.advanced && !result.out_of_order);
+        assert!(recv.eof() && recv.take_push());
+        assert_eq!(recv.next(), Seq(10));
+        assert_eq!(recv.fin_sequence, Some(Seq(9)));
+        assert!(!recv.insert(Seq(9), b"", true).fin);
+        assert_eq!(recv.read(&mut out), 6);
+        assert_eq!(&out[..6], b"fghijk");
+        assert!(recv.metadata.iter().all(|&byte| byte == 0));
     }
 
     #[test]
