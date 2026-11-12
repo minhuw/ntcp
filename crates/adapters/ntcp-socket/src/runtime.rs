@@ -2588,9 +2588,13 @@ impl Owner {
                         local
                     }
                 };
+                // As Linux's __sys_listen clamps the unsigned backlog to
+                // somaxconn, here the endpoint's connections: a negative
+                // one is the largest, and 0 still queues one connection.
+                let backlog = (backlog as u32).min(self.defaults.max_connections as u32);
                 let listener = self
                     .endpoint
-                    .listen_scoped(local, zone, backlog.clamp(1, LIMIT as i32) as usize)
+                    .listen_scoped(local, zone, backlog as usize)
                     .map_err(engine)?;
                 if let Err(e) = self.endpoint.set_listener_user_mss(listener, user_mss) {
                     let _ = self.endpoint.close_listener(listener);

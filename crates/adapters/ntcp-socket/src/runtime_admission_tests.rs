@@ -124,3 +124,26 @@ fn teardown_and_ordinary_admission_have_independent_bounds() {
     assert!(owner.admission_full(&request(Op::Accept(0))));
     assert!(owner.admission_full(&request(Op::Close)));
 }
+
+// As Linux's __sys_listen, the backlog is clamped as an unsigned value to
+// somaxconn, here the endpoint's connections: a negative one is the
+// largest, and 0 is kept, a SYN queue and an accept queue of one each.
+#[test]
+fn listen_clamps_the_backlog_as_linux_does() {
+    let local = Ipv4Addr::new(10, 73, 0, 2);
+    let config = SocketConfig::new("test", local).tcp;
+    let limit = config.max_connections;
+    for (backlog, expected) in [(0, 0), (5, 5), (-1, limit), (i32::MAX, limit)] {
+        let mut owner =
+            Owner::with_config(local, (local, 32), [2; 32], None, config.clone()).unwrap();
+        let listener = owner.execute(0, Op::New(0)).unwrap().value as u64;
+        owner
+            .execute(listener, Op::Bind(SocketAddr::new(owner.local, 8080)))
+            .unwrap();
+        owner.execute(listener, Op::Listen(backlog)).unwrap();
+        let Handle::Listener(id) = owner.sockets[&listener].handle else {
+            panic!("not listening");
+        };
+        assert_eq!(owner.endpoint.listener_queue_info(id), Ok((0, expected)));
+    }
+}
