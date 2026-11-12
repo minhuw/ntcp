@@ -5368,8 +5368,10 @@ impl Endpoint {
             slot.index = index;
             slot.bytes = reserved_vec(size)?;
             slot.bytes.resize(size, 0);
+            // Written on first use (poll_reserved_selected), so an
+            // aggregate's room costs no page until its reservation selects
+            // one. The pool is taken lowest slot first.
             slot.payload = reserved_vec(payload_size)?;
-            slot.payload.resize(payload_size, 0);
             slot.gso = gso;
             slots.push(slot);
         }
@@ -5934,9 +5936,23 @@ impl Endpoint {
         let gso = self.reservations[index]
             .gso
             .filter(|_| shared.is_none())
-            .map(|limits| crate::output_reservation::GsoBuffer {
-                limits,
-                payload: &mut payload[..],
+            .map(|limits| {
+                if payload.len() != limits.max_bytes {
+                    // Within the capacity reserved when enabled: no
+                    // allocation. One memset in every build, where resize
+                    // writes byte by byte without optimization.
+                    assert!(payload.is_empty() && payload.capacity() >= limits.max_bytes);
+                    // SAFETY: the capacity holds max_bytes, and write_bytes
+                    // initializes all of them before set_len exposes them.
+                    unsafe {
+                        payload.as_mut_ptr().write_bytes(0, limits.max_bytes);
+                        payload.set_len(limits.max_bytes);
+                    }
+                }
+                crate::output_reservation::GsoBuffer {
+                    limits,
+                    payload: &mut payload[..],
+                }
             });
         let output = self.poll_transmit_inner(
             now,
