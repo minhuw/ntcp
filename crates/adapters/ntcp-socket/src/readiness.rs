@@ -66,7 +66,7 @@ impl Epoll {
 }
 impl Drop for Epoll {
     fn drop(&mut self) {
-        EPOLL_FDS[self.slot].store(-1, Ordering::Release);
+        EPOLL_FDS.release(self.slot);
         unsafe {
             syscall(SYS_close, self.retained);
         }
@@ -140,7 +140,7 @@ impl Registry {
         Some(ep)
     }
 }
-static EPOLL_FDS: [AtomicI32; runtime::LIMIT] = [const { AtomicI32::new(-1) }; runtime::LIMIT];
+static EPOLL_FDS: FdTable = FdTable::new();
 static EPOLLS: Mutex<Registry> = Mutex::new(Registry::new());
 pub fn is_epoll(fd: i32) -> Result<bool> {
     if !inherited(&EPOLL_FDS, fd) {
@@ -660,20 +660,13 @@ unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset
     }
 }
 fn any_sockets() -> bool {
-    SOCKET_FDS.iter().any(|fd| fd.load(Ordering::Acquire) >= 0)
+    SOCKET_FDS.any()
 }
 fn select_maybe_virtual(n: i32) -> bool {
-    SOCKET_FDS.iter().any(|fd| {
-        let fd = fd.load(Ordering::Acquire);
-        fd >= 0 && fd < n
-    })
+    SOCKET_FDS.find_below(n, Some).is_some()
 }
 fn large_select_virtual(n: i32, sets: [*const fd_set; 3]) -> Result<bool> {
-    for slot in &SOCKET_FDS {
-        let fd = slot.load(Ordering::Acquire);
-        if fd < 0 || fd >= n {
-            continue;
-        }
+    let selected = |fd: i32| -> Result<bool> {
         for set in sets {
             if set.is_null() {
                 continue;
@@ -683,8 +676,14 @@ fn large_select_virtual(n: i32, sets: [*const fd_set; 3]) -> Result<bool> {
                 return Ok(true);
             }
         }
-    }
-    Ok(false)
+        Ok(false)
+    };
+    SOCKET_FDS
+        .find_below(n, |fd| {
+            selected(fd).map(|hit| hit.then_some(())).transpose()
+        })
+        .transpose()
+        .map(|hit| hit.is_some())
 }
 fn input_set(p: *const fd_set, n: i32) -> Result<fd_set> {
     let mut set: fd_set = unsafe { std::mem::zeroed() };

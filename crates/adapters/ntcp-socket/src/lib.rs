@@ -1,4 +1,14 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+//! Linux socket interposition over ntcp.
+//!
+//! Descriptors: managed sockets, their aliases (dup, dup2, dup3, F_DUPFD)
+//! and the epoll instances that watch them are tracked by fd number, in
+//! tables grown on demand like Linux's fdtable (fs/file.c expand_files), so
+//! any descriptor the kernel hands out below RLIMIT_NOFILE can be managed.
+//! Earlier versions held 512 managed descriptors and failed the next one with
+//! EMFILE. The runtime still holds at most 512 sockets: socket() and accept()
+//! fail with EMFILE beyond that, whatever the descriptor numbers, and at most
+//! 512 epoll instances can watch managed sockets (epoll_ctl fails with ENOSPC).
 #![cfg(target_os = "linux")]
 #![allow(clippy::missing_safety_doc)]
 // Linux preload boundary. Native cancellation points tail-jump through C to
@@ -30,6 +40,7 @@ macro_rules! boundary_entry {
 }
 
 mod config;
+mod fd_table;
 mod ip;
 pub use config::{Backend, IoConfig, PortConfig, SegmentRoute, SocketConfig, SocketPolicy};
 #[cfg(feature = "tfo-linux-cookie")]
@@ -52,6 +63,7 @@ mod socket_options;
 mod stdio;
 mod timestamping;
 mod transport;
+use fd_table::FdTable;
 use runtime::{Op, Reply, Runtime};
 type Result<T> = std::result::Result<T, i32>;
 thread_local! {
@@ -69,17 +81,13 @@ fn set_internal(value: bool) -> bool {
 }
 static PID: AtomicI32 = AtomicI32::new(0);
 static RUNTIME: OnceLock<Result<Runtime>> = OnceLock::new();
-static SOCKET_FDS: [AtomicI32; runtime::LIMIT] = [const { AtomicI32::new(-1) }; runtime::LIMIT];
-fn inherited(fds: &[AtomicI32], fd: i32) -> bool {
-    fd >= 0 && fds.iter().any(|slot| slot.load(Ordering::Acquire) == fd)
+static SOCKET_FDS: FdTable = FdTable::new();
+fn inherited(fds: &FdTable, fd: i32) -> bool {
+    fds.contains(fd)
 }
-fn reserve_fd(fds: &[AtomicI32], fd: i32) -> Result<usize> {
-    fds.iter()
-        .position(|slot| {
-            slot.compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        })
-        .ok_or(EMFILE)
+// Returns the claimed slot, which is the fd number.
+fn reserve_fd(fds: &FdTable, fd: i32) -> Result<usize> {
+    fds.reserve(fd)
 }
 static TOKENS: Mutex<BTreeMap<i32, Token>> = Mutex::new(BTreeMap::new());
 // Native close/dup use an atomic read-side guard, never a registry lock. A
@@ -209,7 +217,7 @@ impl Drop for Retained {
 impl Drop for Token {
     fn drop(&mut self) {
         if let Some(slot) = self.slot {
-            SOCKET_FDS[slot].store(-1, Ordering::Release);
+            SOCKET_FDS.release(slot);
         }
     }
 }
@@ -2275,13 +2283,12 @@ fn duplicate_registered(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Re
             }
         }
         let reused_slot = new.and_then(|n| tokens.get(&n)).and_then(|t| t.slot);
-        let slot = if alias.is_some() {
-            Some(match reused_slot {
-                Some(slot) => slot,
-                None => reserve_fd(&SOCKET_FDS, new.unwrap_or(-2))?,
-            })
-        } else {
-            None
+        // dup2/dup3 claim the known target before the kernel call. dup and
+        // F_DUPFD learn the number from the kernel and claim it after.
+        let slot = match (&alias, reused_slot, new) {
+            (Some(_), Some(slot), _) => Some(slot),
+            (Some(_), None, Some(n)) => Some(reserve_fd(&SOCKET_FDS, n)?),
+            _ => None,
         };
         let result = match raw(kernel()) {
             Ok(n) => n,
@@ -2289,10 +2296,23 @@ fn duplicate_registered(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Re
                 if reused_slot.is_none()
                     && let Some(slot) = slot
                 {
-                    SOCKET_FDS[slot].store(-1, Ordering::Release);
+                    SOCKET_FDS.release(slot);
                 }
                 return Err(e);
             }
+        };
+        let slot = match slot {
+            None if alias.is_some() => match reserve_fd(&SOCKET_FDS, result as i32) {
+                Ok(slot) => Some(slot),
+                Err(e) => {
+                    // No one else knows the fresh number yet.
+                    unsafe {
+                        syscall(SYS_close, result);
+                    }
+                    return Err(e);
+                }
+            },
+            slot => slot,
         };
         #[cfg(test)]
         DUP_AFTER_KERNEL.with(|hook| {
@@ -2309,7 +2329,6 @@ fn duplicate_registered(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Re
         let last = new.and_then(|n| remove_alias(&mut tokens, n));
         if let Some(mut t) = alias {
             t.slot = slot;
-            SOCKET_FDS[slot.unwrap()].store(result as i32, Ordering::Release);
             tokens.insert(result as i32, t);
         }
         if let Some(n) = new {
@@ -2997,6 +3016,47 @@ mod tests {
         let mut tokens = TOKENS.lock().unwrap();
         for fd in [source, native, target] {
             tokens.remove(&fd);
+            unsafe {
+                syscall(SYS_close, fd);
+            }
+        }
+    }
+    #[test]
+    fn managed_descriptors_are_not_capped_at_512() {
+        // Raising the soft limit cannot starve concurrent tests.
+        let mut limit: rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) }, 0);
+        if limit.rlim_cur < 4096 && limit.rlim_max > limit.rlim_cur {
+            limit.rlim_cur = limit.rlim_max.min(4096);
+            assert_eq!(unsafe { setrlimit(RLIMIT_NOFILE, &limit) }, 0);
+        }
+        assert!(limit.rlim_cur >= 2048, "RLIMIT_NOFILE {}", limit.rlim_cur);
+        let (source, t) = token(SOCK_CLOEXEC).unwrap();
+        install(source, t, 996).unwrap();
+        // More aliases than the former 512-entry table held, one numbered
+        // above it by F_DUPFD and one placed there by dup2.
+        let mut aliases: Vec<i32> = (0..600)
+            .map(|_| duplicate(source, None, SYS_dup as i32, 0).unwrap() as i32)
+            .collect();
+        aliases.push(duplicate(source, None, F_DUPFD_CLOEXEC, 1500).unwrap() as i32);
+        assert!(*aliases.last().unwrap() >= 1500);
+        let target = (1600..2048)
+            .find(|&fd| unsafe { syscall(SYS_fcntl, fd, F_GETFD) } < 0)
+            .unwrap();
+        assert!(!inherited(&SOCKET_FDS, target));
+        assert_eq!(
+            duplicate(source, Some(target), SYS_dup2 as i32, 0),
+            Ok(target as i64)
+        );
+        aliases.push(target);
+        for &fd in &aliases {
+            assert!(inherited(&SOCKET_FDS, fd));
+            assert_eq!(owned(fd), Ok(Some(996)));
+        }
+        let mut tokens = TOKENS.lock().unwrap();
+        for fd in aliases.into_iter().chain([source]) {
+            tokens.remove(&fd);
+            assert!(!inherited(&SOCKET_FDS, fd));
             unsafe {
                 syscall(SYS_close, fd);
             }
