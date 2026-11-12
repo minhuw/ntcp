@@ -512,8 +512,12 @@ pub struct Endpoint {
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
-    secret: [u8; 32],
-    // SipHash key of the connection-table hash (`hash`), derived from `secret`.
+    // HMAC-SHA256 keyed with the endpoint's secret, before any input: the
+    // key's inner and outer pad blocks are hashed once here, not again for
+    // every digest (two per connection: its ISN and its TSval offset).
+    keyed: Hmac<Sha256>,
+    // SipHash key of the connection-table hash (`hash`), derived from the
+    // secret.
     lookup_key: [u8; 16],
     now: Instant,
     isn_clock: u32,
@@ -751,7 +755,7 @@ impl Endpoint {
                 .into_bytes()[..16]
                 .try_into()
                 .unwrap(),
-            secret,
+            keyed: Hmac::<Sha256>::new_from_slice(&secret).expect("HMAC accepts a 32-byte key"),
             setup_loss_cache,
             now,
             last_isn_time: now,
@@ -993,7 +997,8 @@ impl Endpoint {
     // same link-local pair on two links (or a recycled link) never shares an
     // ISN, timestamp offset or lookup position.
     fn digest(&self, domain: &[u8], scoped: ScopedTuple) -> [u8; 32] {
-        let mut mac = keyed_mac(&self.secret, domain);
+        let mut mac = self.keyed.clone();
+        mac.update(domain);
         encode_tuple(scoped, |bytes| mac.update(bytes));
         mac.finalize().into_bytes().into()
     }

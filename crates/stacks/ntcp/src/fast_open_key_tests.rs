@@ -282,7 +282,11 @@ fn hmac_cookie_key_is_independent_of_tcp_identity_and_deferred_policy_selection(
         });
         assert_eq!(endpoint.fast_open_key_registry_usage(), usage);
         assert!(endpoint.fast_open.is_none());
-        assert_eq!(endpoint.secret, [42; 32]);
+        // The identity key is still the endpoint's secret.
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[42; 32]).unwrap();
+        mac.update(b"ntcp initial sequence");
+        encode_tuple(scoped, |bytes| mac.update(bytes));
+        assert_eq!(<[u8; 32]>::from(mac.finalize().into_bytes()), identity);
         assert_eq!(endpoint.digest(b"ntcp initial sequence", scoped), identity);
         assert_eq!(endpoint.hash(scoped), hash);
         assert_eq!(endpoint.timestamp_offset(scoped), timestamp);
