@@ -1131,11 +1131,9 @@ impl ReceiveBuffer {
             self.set_present(index, present);
             index += 1;
         }
-        let fill = if present { 0x55 } else { 0 };
-        while index + 4 <= range.end {
-            self.metadata[index / 4] = fill;
-            index += 4;
-        }
+        let whole = (range.end - index) / 4 * 4;
+        self.metadata[index / 4..(index + whole) / 4].fill(if present { 0x55 } else { 0 });
+        index += whole;
         for index in index..range.end {
             self.set_present(index, present);
         }
@@ -1150,12 +1148,16 @@ impl ReceiveBuffer {
             }
             index += 1;
         }
-        while index + 4 <= range.end {
-            if self.metadata[index / 4] & 0x55 != 0x55 {
-                return false;
-            }
-            index += 4;
+        // Folded without an early exit, so many metadata bytes are tested
+        // per instruction.
+        let whole = (range.end - index) / 4 * 4;
+        let all = self.metadata[index / 4..(index + whole) / 4]
+            .iter()
+            .fold(0x55, |all, metadata| all & metadata);
+        if all & 0x55 != 0x55 {
+            return false;
         }
+        index += whole;
         (index..range.end).all(|index| self.is_present(index))
     }
 
@@ -1166,10 +1168,9 @@ impl ReceiveBuffer {
             self.report_pending[index / 8] &= !(1 << (index % 8));
             index += 1;
         }
-        while index + 8 <= range.end {
-            self.report_pending[index / 8] = 0;
-            index += 8;
-        }
+        let whole = (range.end - index) / 8 * 8;
+        self.report_pending[index / 8..(index + whole) / 8].fill(0);
+        index += whole;
         for index in index..range.end {
             self.report_pending[index / 8] &= !(1 << (index % 8));
         }
