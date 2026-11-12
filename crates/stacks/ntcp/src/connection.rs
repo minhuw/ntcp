@@ -9856,7 +9856,10 @@ impl Connection {
             if segmentation.is_none() {
                 count = self.send.copy(offset, &mut self.scratch[..count]);
             } else {
-                self.send.copy(offset, &mut self.scratch[..wire_mss]);
+                // The reservation's payload, whose first segment is encoded
+                // from it below: copied from the send buffer once.
+                let buffer = gso.as_mut().unwrap();
+                self.send.copy(offset, &mut buffer.payload[..count]);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
@@ -10243,7 +10246,10 @@ impl Connection {
                 ip,
                 wire_header,
                 &options[..option_len],
-                &self.scratch[..wire_count],
+                match &gso {
+                    Some(buffer) if segmentation.is_some() => &buffer.payload[..wire_count],
+                    _ => &self.scratch[..wire_count],
+                },
                 out,
             )
         };
@@ -10308,10 +10314,6 @@ impl Connection {
         self.reserved_retransmit_counts =
             (reserve && (retransmitted || deferred_fresh) && !syn && !probe && !keepalive)
                 .then(|| self.rack.diagnostic_packet_counts());
-        if segmentation.is_some() {
-            let buffer = gso.as_mut().unwrap();
-            self.send.copy(offset, &mut buffer.payload[..count]);
-        }
         let received_syn_data_acked = flags & ACK != 0
             && self
                 .received_syn_data_start
