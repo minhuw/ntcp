@@ -344,9 +344,16 @@ fn cut(frame: &[u8], mss: usize) -> Vec<Vec<u8>> {
 // chain each (offload metadata checked by the fixture), which the test cuts
 // as a device would for a software peer; the pool's room for a whole
 // aggregate runs out and blocks it until the ring drains. The stream
-// arrives whole. Real ring mbufs, NOT NIC segmentation.
+// arrives whole. Each write of up to 64 KiB asks for Scheduled and
+// Acknowledged observations, as dpdk_echo's requests do: aggregates still
+// form, and each request's arrive once, for its last byte. Real ring
+// mbufs, NOT NIC segmentation.
 unsafe fn segmented_network(mut io: Dpdk) {
-    use ntcp_native::{EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, WorkBudget};
+    use ntcp_native::{
+        EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, TimestampEvent,
+        TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampSource,
+        TxTimestampStage, WorkBudget, WriteOptions,
+    };
     io.tso = Some(TsoConfig {
         mtu: 1500,
         room: 128,
@@ -365,6 +372,7 @@ unsafe fn segmented_network(mut io: Dpdk) {
         config
     };
     let mut ca = config("10.74.0.1", 1);
+    ca.tx_timestamp_phases = 64;
     ca.tcp.max_buffer_bytes = ca.buffer_budget(2, &io).unwrap();
     let incoming = Rc::new(RefCell::new(VecDeque::new()));
     let outgoing = Rc::new(RefCell::new(VecDeque::new()));
@@ -384,16 +392,44 @@ unsafe fn segmented_network(mut io: Dpdk) {
     let (mut frame, mut out) = (vec![0; MAX_PACKET_LEN], vec![0; 65536]);
     let (mut aggregates, mut blocked) = (0, 0);
     let mut backlog = VecDeque::new();
+    let (mut writes, mut targets, mut events) = (0u64, Vec::new(), Vec::new());
+    let placeholder = TimestampEvent {
+        connection: client,
+        observation: TxTimestampEvent {
+            cookie: u64::MAX,
+            target: 0,
+            stage: TxTimestampStage::Scheduled,
+            source: TxTimestampSource::Software,
+            outcome: TxTimestampOutcome::Cancelled,
+        },
+    };
+    let mut stamps = [placeholder; 16];
     for step in 1..20_000u64 {
         let now = step * 1000;
-        if sent < data.len()
-            && let Ok(receipt) = a.try_write(client, &data[sent..], Default::default())
+        let timestamps = TxTimestampRequest {
+            cookie: writes,
+            scheduled: true,
+            acknowledged: true,
+            ..TxTimestampRequest::default()
+        };
+        let request = &data[sent..(sent + 65536).min(data.len())];
+        if !request.is_empty()
+            && let Ok(receipt) = a.try_write(client, request, WriteOptions { timestamps })
         {
             sent += receipt.accepted;
+            targets.push((writes, receipt.range.end - 1));
+            writes += 1;
         }
         let pressure = a.counters().backend_backpressure;
         a.drive(now, budget).unwrap();
         blocked += usize::from(a.counters().backend_backpressure > pressure);
+        loop {
+            let report = a.drain_timestamps(&mut stamps);
+            events.extend(stamps[..report.written].iter().map(|e| e.observation));
+            if !report.more {
+                break;
+            }
+        }
         loop {
             let mut mss = 0;
             let len = unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) };
@@ -425,11 +461,24 @@ unsafe fn segmented_network(mut io: Dpdk) {
                 received.extend_from_slice(&out[..len]);
             }
         }
-        if received.len() == data.len() {
+        if received.len() == data.len() && events.len() == 2 * targets.len() {
             break;
         }
     }
     assert_eq!(received, data);
+    assert!(targets.len() > 1);
+    assert_eq!(events.len(), 2 * targets.len());
+    for &(cookie, target) in &targets {
+        for stage in [TxTimestampStage::Scheduled, TxTimestampStage::Acknowledged] {
+            let mut matching = events
+                .iter()
+                .filter(|o| o.cookie == cookie && o.stage == stage);
+            let event = matching.next().unwrap();
+            assert!(matching.next().is_none(), "{cookie} {stage:?}");
+            assert_eq!(event.target, target);
+            assert!(matches!(event.outcome, TxTimestampOutcome::Recorded { .. }));
+        }
+    }
     // What is left on the rings goes back to the pool.
     for step in 0..4 {
         a.drive(30_000_000 + step, budget).unwrap();
@@ -439,6 +488,6 @@ unsafe fn segmented_network(mut io: Dpdk) {
     assert!(aggregates > 0);
     assert_eq!(a.counters().segmented, aggregates as u64);
     assert!(blocked > 0, "no aggregate waited for the pool");
-    eprintln!("ring PMD: {aggregates} TSO chains, {blocked} drives blocked");
+    eprintln!("ring PMD: {aggregates} TSO chains, {blocked} drives blocked, {writes} writes");
     drop(a);
 }

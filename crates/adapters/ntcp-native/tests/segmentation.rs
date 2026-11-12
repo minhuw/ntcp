@@ -606,3 +606,83 @@ fn an_abort_withdraws_a_blocked_aggregate() {
         ) || pair.b.connection_info(pair.server).unwrap().state == State::Closed
     );
 }
+
+// Writes timestamped as an application timing its requests does (dpdk_echo
+// asks Scheduled for every 64 KiB request) still leave in aggregates, and
+// every request's Scheduled and Acknowledged observation arrives once, for
+// the last byte the write accepted.
+#[test]
+fn timestamped_writes_leave_in_aggregates() {
+    let mut pair = Pair::with(false, true, Some(dpdk()), |config| {
+        config.tx_timestamp_phases = 64;
+    });
+    let data = data(640 * 1024);
+    let placeholder = TimestampEvent {
+        connection: pair.client,
+        observation: TxTimestampEvent {
+            cookie: u64::MAX,
+            target: 0,
+            stage: TxTimestampStage::Scheduled,
+            source: TxTimestampSource::Software,
+            outcome: TxTimestampOutcome::Cancelled,
+        },
+    };
+    let mut out = [placeholder; 16];
+    let (mut sent, mut received, mut targets, mut events) = (0, 0, Vec::new(), Vec::new());
+    let mut buffer = vec![0; 65536];
+    for _ in 0..20_000 {
+        if sent < data.len() {
+            let end = (sent + 64 * 1024 - sent % (64 * 1024)).min(data.len());
+            let options = WriteOptions {
+                timestamps: TxTimestampRequest {
+                    cookie: targets.len() as u64,
+                    scheduled: true,
+                    acknowledged: true,
+                    ..TxTimestampRequest::default()
+                },
+            };
+            match pair.a.try_write(pair.client, &data[sent..end], options) {
+                Ok(receipt) => {
+                    sent += receipt.accepted;
+                    targets.push(receipt.range.end - 1);
+                }
+                Err(error) if error.is_would_block() => {}
+                Err(error) => panic!("write: {error:?}"),
+            }
+        }
+        pair.step();
+        loop {
+            let report = pair.a.drain_timestamps(&mut out);
+            events.extend_from_slice(&out[..report.written]);
+            if !report.more {
+                break;
+            }
+        }
+        while let Ok(ReadOutcome::Data { len, .. }) = pair.b.try_read(pair.server, &mut buffer) {
+            received += len;
+        }
+        if received == data.len() && events.len() == 2 * targets.len() {
+            break;
+        }
+    }
+    assert_eq!(received, data.len());
+    assert!(targets.len() >= 10, "{}", targets.len());
+    assert!(pair.a.counters().segmented >= 10, "{:?}", pair.a.counters());
+    assert_eq!(events.len(), 2 * targets.len());
+    for (cookie, &target) in targets.iter().enumerate() {
+        for stage in [TxTimestampStage::Scheduled, TxTimestampStage::Acknowledged] {
+            let matching: Vec<_> = events
+                .iter()
+                .map(|e| e.observation)
+                .filter(|o| o.cookie == cookie as u64 && o.stage == stage)
+                .collect();
+            assert_eq!(matching.len(), 1, "{cookie} {stage:?}: {matching:?}");
+            assert_eq!(matching[0].target, target);
+            assert_eq!(matching[0].source, TxTimestampSource::Software);
+            assert!(matches!(
+                matching[0].outcome,
+                TxTimestampOutcome::Recorded { .. }
+            ));
+        }
+    }
+}
