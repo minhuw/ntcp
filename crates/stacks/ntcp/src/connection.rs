@@ -770,6 +770,12 @@ fn window_scale(space: usize) -> u8 {
 // The first write's ledgers (2 * 10 + SPARE entries, 2.2 KB) fit in it.
 pub(crate) const LEDGER_RESERVE: usize = 4096;
 
+// The least send ring storage a write allocates: one page, as Linux
+// charges send memory in whole pages (__sk_mem_schedule, sk_mem_pages).
+// The ring holds a payload byte and a mark byte per queued byte, so this
+// is 2048 queued bytes.
+pub(crate) const SEND_RING_RESERVE: usize = 4096;
+
 fn rounded_send_space(capacity: usize, quantum: usize) -> usize {
     if capacity < quantum {
         capacity
@@ -5528,10 +5534,9 @@ impl Connection {
     }
 
     // Allocate the send ring and stage both sender ledgers before accepting
-    // any bytes, within `max_charge` for the whole connection. The ring
-    // takes the send limit whole once admitted bytes outgrow it: at the
-    // first write, and at the first one after a larger limit. The ledgers
-    // follow admitted live bytes, with geometric growth. Nothing allocates
+    // any bytes, within `max_charge` for the whole connection. Both follow
+    // admitted live bytes, with geometric growth (send_ring_target,
+    // ledger_growth). Nothing allocates
     // from ACK, output, SACK or timeout processing. A ring that grew before
     // the other failed keeps its storage, which buffer_charge counts.
     //
@@ -5618,13 +5623,8 @@ impl Connection {
     // queued bytes adds to the charge, or None if it overflows.
     fn send_growth_cost(&self, live: usize) -> Option<usize> {
         let grow_ring = live > self.send.allocation_capacity();
-        let limit = if grow_ring {
-            self.send.capacity()
-        } else {
-            self.send.allocation_capacity()
-        };
         let ring = if grow_ring {
-            self.send.growth_bytes(limit)
+            self.send.growth_bytes(self.send_ring_target(live))
         } else {
             0
         };
@@ -5640,6 +5640,22 @@ impl Connection {
             Scoreboard::allocation_bytes(target)?
         };
         ring.checked_add(rack)?.checked_add(scoreboard)
+    }
+
+    // The queued bytes the send ring grows to when it must hold `live`:
+    // twice what it holds, and no less than `live` and SEND_RING_RESERVE,
+    // rounded up to a power of two, within the send limit. Linux's
+    // tcp_sendmsg allocates skbs as bytes are written (tcp_stream_alloc_skb
+    // and page frags), not sk_sndbuf at once, so a connection that writes
+    // little holds little; doubling keeps a stream of writes to
+    // logarithmically many in-place growths, each moving at most what is
+    // queued.
+    fn send_ring_target(&self, live: usize) -> usize {
+        live.max(SEND_RING_RESERVE / 2)
+            .max(self.send.allocation_capacity().saturating_mul(2))
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .min(self.send.capacity())
     }
 
     // Grow the send ring and the ledgers to hold `live` queued bytes, or
@@ -5664,7 +5680,7 @@ impl Connection {
         }
         // Admission keeps live bytes within the limit.
         let limit = if grow_ring {
-            self.send.capacity()
+            self.send_ring_target(live)
         } else {
             self.send.allocation_capacity()
         };

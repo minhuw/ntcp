@@ -956,10 +956,21 @@ fn memory_an_open_returns_outside_drive_wakes_another_members_writer() {
         io::Read,
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
     };
-    let (lan, flows, _) = refused_open_lan(None);
+    // Member 1 queues 128 KiB, more than the peer, which never reads,
+    // acknowledges: its send ring grows to hold them and stays grown.
+    let preload = |lan: &mut Lan, id| {
+        let data = vec![4u8; 128 << 10];
+        let receipt = lan.members[1]
+            .network
+            .try_write(id, &data, WriteOptions::default())
+            .unwrap();
+        assert_eq!(receipt.accepted, data.len());
+    };
+    let (mut lan, flows, id) = refused_open_lan(None);
+    preload(&mut lan, id);
     let charged = flows.buffer_memory().unwrap().buffer_bytes();
     drop((lan, flows));
-    // Room for member 0's open, not for member 1's send ring.
+    // Room for member 0's open, not for member 1's ring to double.
     let high = charged + (64 << 10);
     let memory = ntcp::BufferMemory {
         low: high / 2,
@@ -967,6 +978,7 @@ fn memory_an_open_returns_outside_drive_wakes_another_members_writer() {
         high,
     };
     let (mut lan, flows, id) = refused_open_lan(Some(memory));
+    preload(&mut lan, id);
     let memory = flows.buffer_memory().unwrap().clone();
     assert_eq!(memory.buffer_bytes(), charged);
     let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };

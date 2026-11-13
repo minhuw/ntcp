@@ -916,19 +916,21 @@ fn fast_open_explicit_capacity_admission_failure_preserves_tuple_and_budget() {
         assert_eq!(accepted, 31);
         assert_eq!(a.buffer_capacities(id).unwrap(), (31, 257));
     }
-    // Admitted at open, which charges no send ring: the SYN data would need
-    // a 1 GiB ring for the 512 MiB limit, and the budget refuses it. As
-    // Linux's tcp_send_syn_data falls back, the open sends a plain SYN.
+    // Admitted at open, which charges no send ring: the SYN data takes a
+    // page of ring, not the 512 MiB limit, as Linux's tcp_send_syn_data
+    // allocates an skb for the data alone.
     let (mut a, _, _) = warm(false);
     let (local, remote) = addresses(false, 40001);
+    let before = a.buffer_bytes();
     let (id, accepted) = a
         .connect_fast_open_with_buffer_capacities(100, local, remote, &[7; 128], 1 << 29, 257)
         .unwrap();
-    assert_eq!(accepted, 0);
+    assert_eq!(accepted, 128);
     assert_eq!(a.buffer_capacities(id).unwrap(), (1 << 29, 257));
+    assert!(a.buffer_bytes() - before < 1 << 20);
     let (ip, syn) = packet(&mut a, 100);
     let syn = wire::parse(ip, &syn).unwrap();
-    assert!(syn.payload.is_empty());
+    assert_eq!(syn.payload, &[7; 128]);
 }
 
 #[test]
