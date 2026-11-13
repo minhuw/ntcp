@@ -20216,3 +20216,55 @@ fn randomized_exchanges_cross_check_sack_and_tlp_fast_paths() {
     }
     assert!(totals.iter().all(|&n| n > 50), "{totals:?}");
 }
+
+#[test]
+fn timebase_conversions_match_the_dividing_formulas() {
+    // The formulas before the constant-factor match.
+    let ticks_from_us = |units: u64, us: u64| us.saturating_mul(units / 1_000_000);
+    let us_from_ticks = |units: u64, ticks: u64| ticks / (units / 1_000_000);
+    let mut values = vec![
+        0,
+        1,
+        999,
+        1_000,
+        1_001,
+        u64::MAX / 1_000,
+        u64::MAX / 1_000 + 1,
+    ];
+    values.extend([
+        u64::MAX - 1,
+        u64::MAX,
+        u32::MAX as u64,
+        120_000_000,
+        255_000_000,
+    ]);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..100_000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // Every magnitude, not only huge values.
+        values.push(seed >> (seed % 64));
+    }
+    // The supported units, the scaled units the tests build, and others.
+    for units in [
+        1_000_000,
+        1_000_000_000,
+        2_000_000,
+        1_000_000_001,
+        999_999,
+        123,
+        u64::MAX,
+    ] {
+        let timebase = CallerTimebase {
+            units_per_second: units,
+            ..CallerTimebase::default()
+        };
+        for &value in &values {
+            assert_eq!(timebase.ticks_from_us(value), ticks_from_us(units, value));
+            if units >= 1_000_000 {
+                assert_eq!(timebase.us_from_ticks(value), us_from_ticks(units, value));
+            }
+        }
+    }
+}

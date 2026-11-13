@@ -70,12 +70,22 @@ impl Default for CallerTimebase {
 }
 impl CallerTimebase {
     // Config durations are microseconds; internal elapsed times retain caller ticks.
+    // The two supported units convert by constant factors, so neither
+    // direction divides at run time; any other unit keeps the division.
     pub(crate) fn ticks_from_us(self, us: u64) -> u64 {
-        us.saturating_mul(self.units_per_second / 1_000_000)
+        match self.units_per_second {
+            1_000_000 => us,
+            1_000_000_000 => us.saturating_mul(1_000),
+            units => us.saturating_mul(units / 1_000_000),
+        }
     }
 
     pub(crate) fn us_from_ticks(self, ticks: u64) -> u64 {
-        ticks / (self.units_per_second / 1_000_000)
+        match self.units_per_second {
+            1_000_000 => ticks,
+            1_000_000_000 => ticks / 1_000,
+            units => ticks / (units / 1_000_000),
+        }
     }
 
     pub(crate) fn valid(self) -> bool {
