@@ -304,6 +304,24 @@ fn bytes(capacity: usize) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+// A send or receive size a setter takes, within the bounds the endpoint
+// checks (Connection::validate_buffer_capacities): a send limit below
+// 2^30, a receive window up to 65535·2^14, the most window scaling
+// reaches. Refused here, before anything changes, as InvalidConfig, the
+// error of the native API's other bad arguments.
+fn send_size(bytes: usize) -> Result<usize> {
+    if bytes == 0 || bytes >= 1 << 30 {
+        return Err(Error::InvalidConfig("send buffer size out of range"));
+    }
+    Ok(bytes)
+}
+fn receive_size(bytes: usize) -> Result<usize> {
+    if bytes == 0 || bytes > 65535 << 14 {
+        return Err(Error::InvalidConfig("receive buffer size out of range"));
+    }
+    Ok(bytes)
+}
+
 // `tuple` on the network's one link when an address is link-local.
 fn scoped_tuple(tuple: Tuple, link: path::LinkId) -> ntcp::ScopedTuple {
     let link_local = [tuple.local.ip(), tuple.remote.ip()]
@@ -1183,7 +1201,34 @@ impl<P: PacketIo> Network<P> {
         self.connect_from(peer, None)
     }
     pub fn connect_from(&mut self, peer: SocketAddr, local_port: Option<u16>) -> Result<ConnId> {
+        self.connect_with(
+            peer,
+            ConnectOptions {
+                local_port,
+                ..ConnectOptions::default()
+            },
+        )
+    }
+    /// `connect_from` with what a socket sets before connect(2). A send or
+    /// receive size given opens the connection with buffers of that size
+    /// and locks the direction before the SYN leaves, as
+    /// `set_send_buffer` and `set_receive_buffer`, so a locked receive
+    /// size sets the window scale the SYN offers: Linux's tcp_connect_init
+    /// clamps window_clamp to a SOCK_RCVBUF_LOCK'd sk_rcvbuf before
+    /// tcp_select_initial_window picks rcv_wscale. The sizes are bytes of
+    /// window and payload, used as given: the rmem_max/wmem_max clamp and
+    /// the doubling of sock_setsockopt are the caller's. A size out of
+    /// range is refused with `InvalidConfig` before anything opens; an
+    /// open whose buffers do not fit the budget with `NoMemory`.
+    pub fn connect_with(&mut self, peer: SocketAddr, options: ConnectOptions) -> Result<ConnId> {
+        let ConnectOptions {
+            local_port,
+            send_buffer,
+            receive_buffer,
+        } = options;
         self.running()?;
+        let send_buffer = send_buffer.map(send_size).transpose()?;
+        let receive_buffer = receive_buffer.map(receive_size).transpose()?;
         if matches!(peer, SocketAddr::V6(a) if a.scope_id() != 0 || a.flowinfo() != 0) {
             return Err(Error::Unsupported(
                 "OS socket scope IDs and flow labels; native groups select their own link",
@@ -1202,8 +1247,13 @@ impl<P: PacketIo> Network<P> {
             None => (self.allocate_port(peer)?, Binding::Ephemeral),
         };
         let local = SocketAddr::new(self.config.local_address, port);
+        let mut transport = ntcp::ActiveOpenOptions::from(&self.config.tcp.connection);
+        // Open with the rings at the locked sizes, the receive ring charged
+        // at admission, rather than growing them once open.
+        transport.send_capacity = send_buffer.unwrap_or(transport.send_capacity);
+        transport.receive_capacity = receive_buffer.unwrap_or(transport.receive_capacity);
         let options = ntcp::ManagedOpenOptions {
-            transport: ntcp::ActiveOpenOptions::from(&self.config.tcp.connection),
+            transport,
             dscp: self.config.tcp.dscp,
             ipv4_options: Default::default(),
             registration: None,
@@ -1226,8 +1276,17 @@ impl<P: PacketIo> Network<P> {
                 self.endpoint
                     .set_rx_timestamp_capacity(core, self.config.rx_timestamp_ranges)
             })
+            .and_then(|_| match receive_buffer {
+                Some(bytes) => self.endpoint.set_receive_buffer(core, bytes),
+                None => Ok(()),
+            })
+            .and_then(|_| match send_buffer {
+                Some(bytes) => self.endpoint.set_send_buffer(core, bytes),
+                None => Ok(()),
+            })
         {
-            // Its timestamp records refused for memory refuse the open.
+            // Its timestamp records or locked sizes refused for memory
+            // refuse the open.
             self.counters.memory_refused_opens +=
                 u64::from(e == EndpointError::Connection(ntcp::Error::NoMemory));
             let _ = self.endpoint.abort(core);
@@ -1614,6 +1673,108 @@ impl<P: PacketIo> Network<P> {
         self.running()?;
         self.endpoint.set_nagle(self.conn(id)?.core, !enabled)?;
         Ok(())
+    }
+    // The core connection of `id` for a buffer setter or getter: refused,
+    // as a closed socket's descriptor is, once the application closed or
+    // aborted it.
+    fn open_core(&self, id: ConnId) -> Result<ntcp::ConnectionId> {
+        let c = self.conn(id)?;
+        if c.close_requested || c.abort_requested || c.released {
+            return Err(Error::InvalidHandle);
+        }
+        Ok(c.core)
+    }
+    /// Sets the send limit of connection `id` to `bytes` and locks its send
+    /// direction: neither expansion with the congestion window nor memory
+    /// pressure changes it again. Linux's sock_setsockopt SO_SNDBUF, which
+    /// sets sk_sndbuf and SOCK_SNDBUF_LOCK (tcp_should_expand_sndbuf). The
+    /// size is bytes of payload, used as given: the wmem_max clamp and the
+    /// doubling are the caller's. Allocates nothing: the next write grows
+    /// the send ring. 0 < `bytes` < 2^30, else `InvalidConfig`.
+    pub fn set_send_buffer(&mut self, id: ConnId, bytes: usize) -> Result<()> {
+        self.running()?;
+        let core = self.open_core(id)?;
+        let bytes = send_size(bytes)?;
+        let result = self.endpoint.set_send_buffer(core, bytes);
+        // Whatever the setter gave back wakes the group's waiting writers.
+        self.wake_members_for_memory();
+        Ok(result?)
+    }
+    /// Sets the receive window of connection `id` to `bytes` and locks its
+    /// receive direction: DRS no longer grows it. Linux's sock_setsockopt
+    /// SO_RCVBUF, which sets sk_rcvbuf and SOCK_RCVBUF_LOCK
+    /// (tcp_rcvbuf_grow). A larger size grows the ring now, refused with
+    /// `NoMemory` if its peak charge does not fit the budget; a smaller one
+    /// keeps the ring and never retracts the window offered. Called before
+    /// the SYN leaves (after `connect`, before the next `drive`), it also
+    /// sets the window scale the SYN offers, as
+    /// `ConnectOptions::receive_buffer` does. The
+    /// size is bytes of window, used as given: the rmem_max clamp and the
+    /// doubling are the caller's, and where Linux offers tcp_full_space,
+    /// half of sk_rcvbuf at the default scaling ratio, ntcp offers all of
+    /// it. 0 < `bytes` ≤ 65535·2^14, else `InvalidConfig`.
+    pub fn set_receive_buffer(&mut self, id: ConnId, bytes: usize) -> Result<()> {
+        self.running()?;
+        let core = self.open_core(id)?;
+        let bytes = receive_size(bytes)?;
+        let result = self.endpoint.set_receive_buffer(core, bytes);
+        self.wake_members_for_memory();
+        Ok(result?)
+    }
+    /// `set_send_buffer` for the connections `listener` accepts from now
+    /// on: each starts with this send limit, locked, as a Linux child
+    /// inherits its listener's sk_sndbuf and sk_userlocks
+    /// (inet_csk_clone_lock, sk_clone_lock). Connections already opened
+    /// keep theirs.
+    pub fn set_listener_send_buffer(&mut self, listener: ListenerId, bytes: usize) -> Result<()> {
+        self.running()?;
+        let core = self.open_listener_core(listener)?;
+        let bytes = send_size(bytes)?;
+        self.endpoint.set_listener_send_buffer(core, bytes)?;
+        Ok(())
+    }
+    /// `set_receive_buffer` for the connections `listener` accepts from now
+    /// on: each opens with a ring and window of this size, locked, and
+    /// offers the window scale it gives on its SYN-ACK, as a Linux child
+    /// inherits sk_rcvbuf and SOCK_RCVBUF_LOCK (inet_csk_clone_lock) and
+    /// tcp_openreq_init_rwin clamps the window to it. Refused with
+    /// `NoMemory` when the network keeps RX timestamp records
+    /// (`rx_timestamp_ranges`) and one such connection's open charge with
+    /// them exceeds the budget's hard cap; otherwise a child that does not
+    /// fit is refused at its SYN, as any open the budget cannot take.
+    /// Connections already opened keep theirs.
+    pub fn set_listener_receive_buffer(
+        &mut self,
+        listener: ListenerId,
+        bytes: usize,
+    ) -> Result<()> {
+        self.running()?;
+        let core = self.open_listener_core(listener)?;
+        let bytes = receive_size(bytes)?;
+        self.endpoint.set_listener_receive_buffer(core, bytes)?;
+        Ok(())
+    }
+    fn open_listener_core(&self, listener: ListenerId) -> Result<ntcp::ListenerId> {
+        let l = self.listener(listener)?;
+        if l.closing {
+            return Err(Error::InvalidHandle);
+        }
+        Ok(l.core)
+    }
+    /// The live (send, receive) sizes of connection `id`, in bytes: the
+    /// configured initial sizes, as grown by autotuning or moderated by
+    /// memory pressure, or as a setter locked them. What Linux's getsockopt
+    /// SO_SNDBUF and SO_RCVBUF report, sk_sndbuf and sk_rcvbuf, but in
+    /// bytes of payload and window where Linux counts skb memory.
+    pub fn buffer_capacities(&self, id: ConnId) -> Result<(usize, usize)> {
+        Ok(self.endpoint.buffer_capacities(self.open_core(id)?)?)
+    }
+    /// The (send, receive) sizes the connections `listener` accepts start
+    /// with: the configured initial sizes, or those its setters locked.
+    pub fn listener_buffer_capacities(&self, listener: ListenerId) -> Result<(usize, usize)> {
+        Ok(self
+            .endpoint
+            .listener_buffer_capacities(self.open_listener_core(listener)?)?)
     }
     pub fn shutdown_write(&mut self, id: ConnId) -> Result<()> {
         self.running()?;

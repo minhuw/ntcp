@@ -114,6 +114,22 @@ pub struct WriteOptions {
     pub timestamps: TxTimestampRequest,
 }
 
+/// An active open's options (`Network::connect_with`), each what an
+/// application sets on a socket before connect(2).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectOptions {
+    /// The local port, as bind(2) before connect(2); `None` takes an
+    /// ephemeral port (`Network::connect_from`).
+    pub local_port: Option<u16>,
+    /// A send size set and locked before the SYN leaves, as SO_SNDBUF
+    /// before connect(2) (`Network::set_send_buffer`).
+    pub send_buffer: Option<usize>,
+    /// A receive size set and locked before the SYN leaves, as SO_RCVBUF
+    /// before connect(2): the SYN's window scale follows it
+    /// (`Network::set_receive_buffer`).
+    pub receive_buffer: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteReceipt {
     pub accepted: usize,
