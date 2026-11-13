@@ -1029,11 +1029,7 @@ fn option_application_failure_releases_connect_and_accept_records() {
     // The failed child owes a reset: release must retain it until output.
     assert_ne!(b.endpoint.buffer_bytes(), 0);
     pump(&mut a, &mut b);
-    // Local resets retain the released record for the core's TIME-WAIT
-    // quarantine; expiry must reclaim it rather than leak a slot.
-    assert_ne!(b.endpoint.buffer_bytes(), 0);
-    b.advance_clock(ntcp::ConnectionConfig::default().time_wait_us + 1);
-    b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
+    // Its reset sent, the released record is reclaimed rather than leaked.
     assert_eq!(b.endpoint.buffer_bytes(), 0);
     b.execute(listen, Op::Set(IPPROTO_TCP, TCP_KEEPCNT, 2))
         .unwrap();

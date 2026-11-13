@@ -865,14 +865,7 @@ fn passive_repair_terminal_before_accept_retains_only_early_children() {
             for _ in 0..32 {
                 endpoint.poll_transmit(now, &mut bytes, 64).unwrap();
             }
-            // Local abort retains the reset tuple for the configured TIME-WAIT.
-            if terminal == 2 {
-                assert!(endpoint.connection_exists(child));
-                endpoint.on_timeout(now + 400_000_000, 64).unwrap();
-                endpoint
-                    .poll_transmit(now + 400_000_000, &mut bytes, 64)
-                    .unwrap();
-            }
+            // A local abort keeps nothing once its reset is sent.
             assert!(
                 !endpoint.connection_exists(child),
                 "terminal={terminal} cleanup={cleanup}"

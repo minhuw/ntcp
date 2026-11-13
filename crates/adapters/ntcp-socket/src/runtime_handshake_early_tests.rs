@@ -120,14 +120,7 @@ fn paired_completion_preserves_authorized_terminal_prefix_for_every_start() {
                 );
                 a.service_egress().unwrap();
                 while a.execute(0, Op::Capture(65535)).is_ok() {}
-                if cause == "abort" {
-                    // A physically emitted local RST reserves its tuple for the
-                    // TIME-WAIT duration. Drain it before asserting reclaim.
-                    a.test_now = Some(a.now() + a.defaults.connection.time_wait_us);
-                    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
-                    a.service_egress().unwrap();
-                    while a.execute(0, Op::Capture(65535)).is_ok() {}
-                }
+                // A local RST, once emitted, keeps nothing of the connection.
                 assert!(!a.endpoint.connection_exists(id));
                 assert_eq!(a.execute(ca, Op::Transport(1)).unwrap().bytes, terminal);
                 eprintln!(

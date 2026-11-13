@@ -474,7 +474,7 @@ fn reserved_released_reset_owner_and_listener_cleanup_can_repair() {
         0
     );
     assert!(a.accept_transmit(a.now, token.unwrap()).unwrap());
-    assert!(a.connection_exists(id)); // Retained for reset tuple protection.
+    assert!(!a.connection_exists(id)); // Its reset accepted, nothing is retained.
 
     let mut a = endpoint();
     let mut b = endpoint();

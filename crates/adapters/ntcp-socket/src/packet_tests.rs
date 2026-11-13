@@ -2570,23 +2570,10 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
     assert_eq!(tx.connection, Some(child));
     assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
     check_ip(&bytes, 80, false);
-    // The terminal reset retains its original policy and tuple through the
-    // TIME-WAIT duration.
-    owner.execute(&mut incoming).unwrap();
-    assert!(poll_frame(&mut owner).is_none());
-    assert_eq!(owner.inner.endpoint.connection_id(tuple), Some(child));
-    owner.gc_ip_options();
-    assert_eq!(owner.connection_options.len(), 1);
-    let expiry = owner
-        .inner
-        .endpoint
-        .next_deadline()
-        .unwrap()
-        .max(owner.inner.now());
-    owner.inner.endpoint.on_timeout(expiry, BUDGET).unwrap();
-    let elapsed = owner.inner.now();
-    owner.advance_clock(expiry.wrapping_sub(elapsed));
+    // The terminal reset was framed with its original policy; then nothing
+    // of the connection, its tuple or its policy is kept.
     assert!(!owner.inner.endpoint.connection_exists(child));
+    assert_eq!(owner.inner.endpoint.connection_id(tuple), None);
     owner.gc_ip_options();
     assert!(owner.connection_options.is_empty());
     owner.execute(&mut incoming).unwrap();
@@ -2609,18 +2596,6 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
     assert_eq!(tx.connection, Some(child));
     assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
     check_ip(&bytes, 120, true);
-    assert!(owner.inner.endpoint.connection_exists(child));
-    owner.gc_ip_options();
-    assert_eq!(owner.connection_options.len(), 1);
-    let expiry = owner
-        .inner
-        .endpoint
-        .next_deadline()
-        .unwrap()
-        .max(owner.inner.now());
-    owner.inner.endpoint.on_timeout(expiry, BUDGET).unwrap();
-    let elapsed = owner.inner.now();
-    owner.advance_clock(expiry.wrapping_sub(elapsed));
     assert!(!owner.inner.endpoint.connection_exists(child));
     owner.gc_ip_options();
     assert!(owner.connection_options.is_empty());

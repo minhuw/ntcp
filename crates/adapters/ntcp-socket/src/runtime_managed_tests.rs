@@ -772,9 +772,7 @@ fn managed_native_released_final_output_pins_binding_until_exact_owner_disappear
     a.endpoint
         .accept_transmit(a.now(), attempt.unwrap())
         .unwrap();
-    a.endpoint
-        .on_timeout(a.now() + a.defaults.connection.time_wait_us + 1, BUDGET)
-        .unwrap();
+    // The reset accepted, nothing of the connection is retained.
     assert!(!a.endpoint.connection_exists(cid));
     a.collect_paths().unwrap();
     assert_eq!(a.host.as_ref().unwrap().binding_count(), 0);

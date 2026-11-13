@@ -619,21 +619,8 @@ fn abort_retires_a_generation_and_stale_handles_cannot_reach_a_new_connection() 
             break;
         }
     }
-    assert!(pair.a.connection_info(old).unwrap().application_closed);
-    // TCP retains a locally reset tuple for its TIME-WAIT duration. Releasing
-    // the application handle must not make its port or slot reusable during
-    // that interval.
-    let retention = pair.a.config().tcp.connection.time_wait_us;
-    // This fixture's caller clock is in microseconds, matching its durations.
-    pair.now += retention;
-    for _ in 0..10 {
-        pair.step();
-        drain(&mut pair.a);
-        drain(&mut pair.b);
-        if matches!(pair.a.connection_info(old), Err(Error::InvalidHandle)) {
-            break;
-        }
-    }
+    // Its reset sent, nothing of the connection is retained, as Linux's
+    // tcp_close keeps no TIME-WAIT after tcp_send_active_reset.
     assert!(matches!(
         pair.a.connection_info(old),
         Err(Error::InvalidHandle)

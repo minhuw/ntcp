@@ -11,7 +11,7 @@ if the send window is zero, in order to "probe" the window.
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
-reason = "Deliberate Linux-style deviation: TIME-WAIT lasts ConnectionConfig::time_wait_us, 120 s by default, which lingers 2xMSL only for an MSL of 60 s, not the 2 minutes of section 3.4.2 that CallerTimebase::max_segment_lifetime_us keeps. Any positive value may be configured, for example for benchmarks; Linux fixes 60 s (TCP_TIMEWAIT_LEN), and ntcp_native::NetworkConfig::new, which keeps Linux's TCP defaults, and the packetdrill upstream profile configure it; zero is refused because TIME-WAIT must outlive the instant it begins for the ACK of the peer's FIN to be sent. RFC 6191 timestamp-based TIME-WAIT reuse is unchanged, and the same duration bounds the tuple reservation after a locally generated reset (section 3.5.2)."
+reason = "Deliberate Linux-style deviation: TIME-WAIT lasts ConnectionConfig::time_wait_us, 120 s by default, which lingers 2xMSL only for an MSL of 60 s, not the 2 minutes of section 3.4.2 that CallerTimebase::max_segment_lifetime_us keeps. Any positive value may be configured, for example for benchmarks; Linux fixes 60 s (TCP_TIMEWAIT_LEN), and ntcp_native::NetworkConfig::new, which keeps Linux's TCP defaults, and the packetdrill upstream profile configure it; zero is refused because TIME-WAIT must outlive the instant it begins for the ACK of the peer's FIN to be sent. RFC 6191 timestamp-based TIME-WAIT reuse is unchanged."
 quote = '''
 When a connection is closed actively, it MUST linger in the TIME-WAIT
 state for a time 2xMSL (Maximum Segment Lifetime) (MUST-13).
@@ -19,10 +19,19 @@ state for a time 2xMSL (Maximum Segment Lifetime) (MUST-13).
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
-reason = "Deliberate Linux-style deviation: with EndpointConfig::reuse_time_wait, which ntcp_native::NetworkConfig::new, keeping Linux's TCP defaults, and the packetdrill upstream profile enable, a SYN that passes the RFC 6191 timestamp and sequence checks reopens a TIME-WAIT tuple, and its new connection's ISN lies beyond the largest sequence number of the previous incarnation (condition (1)). The previous incarnation's TIME-WAIT ends when the new connection takes the tuple, as Linux deletes its timewait socket before its listener takes the SYN (tcp_v4_rcv, TCP_TW_SYN): a TIME-WAIT record is deleted and a connection the application still holds becomes CLOSED. Condition (2) is not met: if the SYN was an old duplicate and the new connection fails before establishing, nothing returns to TIME-WAIT and the tuple is free. A SYN refused at reopen (stale, quarantined tuple, no listener, or no room at the listener) leaves the TIME-WAIT unchanged; a stale one, or one no listener takes, the TIME-WAIT answers with its challenge ACK, as Linux's timewait socket does."
+reason = "Deliberate Linux-style deviation: with EndpointConfig::reuse_time_wait, which ntcp_native::NetworkConfig::new, keeping Linux's TCP defaults, and the packetdrill upstream profile enable, a SYN that passes the RFC 6191 timestamp and sequence checks reopens a TIME-WAIT tuple, and its new connection's ISN lies beyond the largest sequence number of the previous incarnation (condition (1)). The previous incarnation's TIME-WAIT ends when the new connection takes the tuple, as Linux deletes its timewait socket before its listener takes the SYN (tcp_v4_rcv, TCP_TW_SYN): a TIME-WAIT record is deleted and a connection the application still holds becomes CLOSED. Condition (2) is not met: if the SYN was an old duplicate and the new connection fails before establishing, nothing returns to TIME-WAIT and the tuple is free. A SYN refused at reopen (stale, no listener, or no room at the listener) leaves the TIME-WAIT unchanged; a stale one, or one no listener takes, the TIME-WAIT answers with its challenge ACK, as Linux's timewait socket does."
 quote = '''
 However, it MAY accept a new SYN from the remote TCP endpoint to
 reopen the connection directly from TIME-WAIT state (MAY-2), if it:
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2"
+reason = "Deliberate Linux-style deviation: the side issuing a reset does not enter TIME-WAIT. A connection that sends a terminal reset (ABORT, CLOSE with received data unread, data arriving after CLOSE, a closing listener's unaccepted children) keeps its tuple only until that reset is generated; then it is CLOSED and its tuple unmapped, and a released one is reclaimed. Linux's tcp_close and tcp_disconnect send the reset (tcp_send_active_reset) and move to TCP_CLOSE (tcp_set_state, tcp_done), which unhashes and destroys the socket with no timewait socket. A later SYN for the tuple therefore reaches the listener whatever its ISN and timestamp, and a late segment of the reset connection finds no connection: a listener resets one bearing an ACK and drops the rest (tcp_rcv_state_process in TCP_LISTEN); with no listener, anything but a reset is reset (tcp_v4_rcv, no_tcp_socket, tcp_v4_send_reset). The peer that accepted the reset keeps no TIME-WAIT either, so holding the tuple for time_wait_us protects no FIN exchange and only refuses the peer's next connection request on it."
+quote = '''
+The side of a connection issuing a reset should enter the TIME-WAIT state, as
+this generally helps to reduce the load on busy servers for reasons described
+in [70].
 '''
 
 [[exception]]

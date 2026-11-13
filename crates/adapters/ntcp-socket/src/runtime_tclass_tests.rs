@@ -519,8 +519,7 @@ fn ipv6_tclass_failed_transactions_keep_exact_sticky_and_wire_policy() {
     a.endpoint.abort(connection).unwrap();
     a.endpoint.release(connection).unwrap();
     a.service_egress().unwrap();
-    a.test_now = Some(a.now() + a.defaults.connection.time_wait_us + 1);
-    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    // Its reset sent, the released connection is reclaimed.
     assert!(!a.endpoint.connection_exists(connection));
     assert_eq!(
         a.execute(client, Op::Set(IPPROTO_IPV6, IPV6_TCLASS, -1))

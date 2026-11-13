@@ -658,8 +658,8 @@ fn managed_scheduled_held_reset_across_a_path_change_ends_its_lease() {
         }
         assert_eq!(sender.host.as_ref().unwrap().lease_count(), 0);
         if released {
-            sender.test_now = Some(sender.now() + sender.defaults.connection.time_wait_us + 1);
-            sender.endpoint.on_timeout(sender.now(), BUDGET).unwrap();
+            // Its reset sent, the connection is reclaimed: collect its binding.
+            assert!(!sender.endpoint.connection_exists(cid));
             sender.collect_paths().unwrap();
         }
         assert_eq!(sender.host.as_ref().unwrap().binding_count(), 0);

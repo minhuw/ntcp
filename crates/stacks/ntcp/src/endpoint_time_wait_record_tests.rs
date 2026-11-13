@@ -470,12 +470,9 @@ fn reclaimed_since_lists_every_reclaim_once() {
         pump(&mut a, &mut b, 2_000);
         a.abort(aborted).unwrap();
         a.release(aborted).unwrap();
-        // Its reset holds the slot as long as TIME-WAIT.
+        // Reclaimed once its reset is out.
         packets(&mut a, 2_000);
-        assert!(a.connection_exists(aborted));
-        let end = 2_000 + config().connection.time_wait_us;
-        a.on_timeout(end, 64).unwrap();
-        packets(&mut a, end);
+        let end = 2_000;
         let local = core::net::SocketAddr::new(addresses().0.ip(), 40_011);
         let cancelled = a.connect(end, local, addresses().1).unwrap();
         a.cancel_unsubmitted_open(cancelled).unwrap();

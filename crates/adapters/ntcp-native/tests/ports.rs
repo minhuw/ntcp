@@ -235,8 +235,8 @@ fn a_closed_connections_tuple_is_taken_until_its_time_wait_ends() {
 
 // Ports run out per destination: one destination takes each port of the
 // range once and then none, while another destination takes them all
-// again; an aborted connection's port is its destination's again once it
-// is reclaimed.
+// again; an aborted connection's port is its destination's again once its
+// reset is sent, as Linux's tcp_close frees the port with the socket.
 #[test]
 fn an_ephemeral_range_runs_out_per_destination() {
     // Two ports to each of two destinations hold four of the eight slots.
@@ -264,8 +264,10 @@ fn an_ephemeral_range_runs_out_per_destination() {
     let freed = local_port(&pair.client, opened[1]);
     pair.client.abort(opened[1]).unwrap();
     pair.steps(4);
-    assert!(ports_exhausted(pair.client.connect(first)));
-    pair.reclaim(opened[1]);
+    assert!(matches!(
+        pair.client.connection_info(opened[1]),
+        Err(Error::InvalidHandle)
+    ));
     let next = pair.client.connect(first).unwrap();
     assert_eq!(local_port(&pair.client, next), freed);
     assert!(ports_exhausted(pair.client.connect(first)));
@@ -371,7 +373,7 @@ fn accepted_connections_keep_their_listeners_port() {
 }
 
 // A full table of connections or listeners refuses opens until a slot is
-// freed, an aborted connection's once it is reclaimed and a closed
+// freed, an aborted connection's once its reset is sent and a closed
 // listener's at the next drive, and then gives back that slot only, under a
 // handle its old one cannot reach.
 #[test]
@@ -386,8 +388,6 @@ fn a_full_table_takes_again_only_the_slots_freed() {
     pair.steps(4);
     pair.client.abort(opened[3]).unwrap();
     pair.steps(4);
-    assert!(slots_exhausted(pair.client.connect(server_address)));
-    pair.reclaim(opened[3]);
     let next = pair.client.connect(server_address).unwrap();
     assert!(!opened.contains(&next));
     assert!(matches!(

@@ -241,6 +241,25 @@ class TimeWaitPersistInventories(unittest.TestCase):
             for annotation in audit.source_annotations(path.read_text()):
                 self.assertNotEqual(audit.clause_key(annotation), key, str(path))
 
+    def test_rfc9293_reset_issuer_time_wait_is_a_recorded_exception(self):
+        # The side issuing a reset keeps no TIME-WAIT, as Linux's tcp_close
+        # keeps no timewait socket after tcp_send_active_reset: the added
+        # requirement is closed only by its exception, which no source or
+        # test annotation cites.
+        specs = [r for kind, r in audit.toml_entries(ROOT / "duvet/rfc9293-additions.toml")
+                 if kind == "SPEC" and "issuing a reset" in r["quote"]]
+        self.assertEqual(len(specs), 1)
+        key = audit.clause_key(specs[0])
+        exceptions = [r for kind, r in audit.toml_entries(ROOT / "duvet/rfc9293-todos.toml")
+                      if kind == "EXCEPTION" and audit.clause_key(r) == key]
+        self.assertEqual(len(exceptions), 1)
+        for fact in ("does not enter TIME-WAIT", "tcp_send_active_reset", "TCP_CLOSE",
+                     "reaches the listener", "no_tcp_socket"):
+            self.assertIn(fact, exceptions[0]["reason"])
+        for path in (ROOT / "crates").rglob("*.rs"):
+            for annotation in audit.source_annotations(path.read_text()):
+                self.assertNotEqual(audit.clause_key(annotation), key, str(path))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -515,15 +515,7 @@ fn tcp_quotes_follow_the_send_window_across_sequence_wrap_and_generation_reuse()
     a.1.abort(id).unwrap();
     while emit(&mut a.0, &mut a.1, now).is_some() {}
     a.1.release(id).unwrap();
-    // Bounded reset quarantine retains the old generation until it expires.
-    for _ in 0..1000 {
-        if !a.1.connection_exists(id) {
-            break;
-        }
-        now += 1_000_000;
-        a.1.on_timeout(now, 32).unwrap();
-        while emit(&mut a.0, &mut a.1, now).is_some() {}
-    }
+    // Its reset sent, the old generation is reclaimed at release.
     assert!(!a.1.connection_exists(id));
     a.0.collect(&a.1).unwrap();
     assert_eq!(quoted_span(&a, &lost), None);

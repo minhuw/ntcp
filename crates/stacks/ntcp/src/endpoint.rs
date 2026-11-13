@@ -458,9 +458,6 @@ struct Slot {
     released: bool,
     closed_output_drained: bool,
     mapped: bool,
-    // ponytail: quarantine retains slot/buffers within existing connection/byte bounds;
-    // compact tombstones can reclaim buffer slack if reset churn matters.
-    reset_deadline: Option<Instant>,
     // While the connection waits for memory (`memory_waiters`), when it
     // looks again whether its growth fits (`memory_throttled`).
     memory_retry: Option<Instant>,
@@ -479,11 +476,10 @@ struct Slot {
 }
 
 impl Slot {
-    // The slot's next timer: a reset quarantine's, else the connection's,
-    // or the retry of a wait for memory if that comes first.
+    // The slot's next timer: the connection's, or the retry of a wait for
+    // memory if that comes first.
     fn deadline(&self) -> Option<Instant> {
-        let deadline = self.reset_deadline.or(self.connection.next_deadline());
-        match (deadline, self.memory_retry) {
+        match (self.connection.next_deadline(), self.memory_retry) {
             (Some(deadline), Some(retry)) => Some(deadline.min(retry)),
             (deadline, retry) => deadline.or(retry),
         }
@@ -512,8 +508,8 @@ impl CrossingSynAuthorization {
 // Why passive admission refuses a SYN (`Endpoint::passive_refusal`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PassiveRefusal {
-    // The TIME-WAIT connection of its tuple may not be reopened: reset
-    // pending or quarantined, or the SYN is not fresh (RFC 6191).
+    // The connection of its tuple may not be reopened: it still owes its
+    // reset, or it is in TIME-WAIT and the SYN is not fresh (RFC 6191).
     TimeWait,
     // The listener's SYN queue (its half-open children) is full.
     SynQueue,
@@ -2033,7 +2029,6 @@ impl Endpoint {
             released: false,
             closed_output_drained: false,
             mapped: true,
-            reset_deadline: None,
             memory_retry: None,
             time_wait: false,
             hop_limit: self.config.hop_limit,
@@ -3431,7 +3426,7 @@ impl Endpoint {
         // Explicit release/listener cleanup still abandons that ownership.
         let retained_ready = slot.accepted_ready && !slot.released;
         let failed_child = parent.is_some() && state == State::Closed && !retained_ready;
-        let reset_reserved = slot.connection.reset_pending() || slot.reset_deadline.is_some();
+        let reset_reserved = slot.connection.reset_pending();
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.3
         //# If the receiver was
         //# in SYN-RECEIVED state and had previously been in the LISTEN state,
@@ -3847,7 +3842,11 @@ impl Endpoint {
         }
         if let Some(Target::Connection(index)) = target {
             let slot = self.slots[index].as_ref().unwrap();
-            if slot.connection.reset_pending() || slot.reset_deadline.is_some() {
+            // A connection keeps its tuple only until its terminal reset is
+            // generated (`poll_transmit`), then is unmapped: Linux sends that
+            // reset from tcp_close itself (tcp_send_active_reset) and keeps
+            // nothing of the tuple after it.
+            if slot.connection.reset_pending() {
                 return Ok(InputDisposition::Dropped);
             }
             // Apply freshness to the same connection requests accepted by the
@@ -4099,7 +4098,6 @@ impl Endpoint {
             Some(Target::Connection(index)) => {
                 let slot = self.slots[index].as_ref().unwrap();
                 !slot.connection.reset_pending()
-                    && slot.reset_deadline.is_none()
                     && slot
                         .connection
                         .reuse_syn(now, syn, self.new_connection_timestamps())
@@ -5472,8 +5470,8 @@ impl Endpoint {
             .then(|| (since..self.reclaimed).map(move |n| self.reclaims[(n % count) as usize]))
     }
 
-    // Includes released records retained for final output or a reset's
-    // quarantine; a released connection's TIME-WAIT is a record, not a
+    // Includes released records retained for final output, such as a reset
+    // still to send; a released connection's TIME-WAIT is a record, not a
     // connection.
     pub fn connection_exists(&self, id: ConnectionId) -> bool {
         self.generations.get(id.slot) == Some(&id.generation)
@@ -5815,9 +5813,7 @@ impl Endpoint {
             self.deadlines.set(index, None);
             let slot = self.slots[index].as_mut().unwrap();
             let retry = slot.memory_retry.is_some_and(|deadline| deadline <= now);
-            if slot.reset_deadline.is_some_and(|deadline| deadline <= now) {
-                slot.reset_deadline = None;
-            } else if !retry
+            if !retry
                 || slot
                     .connection
                     .next_deadline()
@@ -7006,7 +7002,6 @@ impl Endpoint {
         if let Some(id) = r.packet.connection {
             let slot = self.retained_slot_mut(id)?;
             slot.connection.abandon_reserved_output();
-            slot.reset_deadline = None;
             slot.closed_output_drained = true;
             self.clear_reservation(index);
             self.refresh(id.slot);
@@ -7214,7 +7209,6 @@ impl Endpoint {
             let connection = self.id(index);
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
-            let terminal_reset = slot.connection.reset_pending();
             let output = if let Some(parts) = shared.as_deref_mut() {
                 slot.connection.transmit_shared_selected(now, out, parts)
             } else if reserve {
@@ -7233,26 +7227,6 @@ impl Endpoint {
             };
             match output {
                 Ok(Some(len)) => {
-                    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2
-                    //= reason=Terminal local reset reserves the tuple for the configured TIME-WAIT duration independently of immediate application CLOSED; only successful RST generation starts the timer.
-                    //# The side of a connection issuing a reset should enter the TIME-WAIT state, as
-                    //# this generally helps to reduce the load on busy servers for reasons described
-                    //# in [70].
-                    if terminal_reset
-                        && out
-                            .get(..len)
-                            .and_then(|bytes| bytes.get(13))
-                            .is_some_and(|flags| flags & RST != 0)
-                    {
-                        slot.reset_deadline = Some(
-                            now.saturating_add(
-                                self.config
-                                    .connection
-                                    .timebase
-                                    .ticks_from_us(self.config.connection.time_wait_us),
-                            ),
-                        );
-                    }
                     slot.closed_output_drained = slot.connection.state() == State::Closed;
                     let hop_limit = slot.hop_limit;
                     let dscp = slot.dscp;
@@ -7305,10 +7279,7 @@ impl Endpoint {
                     self.deadlines.set(index, slot.deadline());
                     if slot.connection.state() == State::Closed {
                         slot.closed_output_drained = true;
-                        if slot.released
-                            && !slot.connection.reset_pending()
-                            && slot.reset_deadline.is_none()
-                        {
+                        if slot.released && !slot.connection.reset_pending() {
                             self.reclaim(index);
                         }
                     }
@@ -7466,14 +7437,9 @@ mod recovery_observation_tests {
                 passive.abort(child).unwrap();
                 let (_, reset_child) = packet(&mut passive, 0);
                 assert_ne!(reset_child[13] & RST, 0);
-                assert_eq!(
-                    passive.slots[child.slot].as_ref().unwrap().reset_deadline,
-                    Some(cfg.connection.time_wait_us * scale)
-                );
-                assert_eq!(
-                    passive.next_deadline(),
-                    Some(cfg.connection.time_wait_us * scale)
-                );
+                // Its reset sent, the child leaves nothing behind.
+                assert!(!passive.connection_exists(child));
+                assert_eq!(passive.next_deadline(), None);
                 // Absolute end-of-clock deadlines saturate, rather than wrapping early.
                 let mut end = Endpoint::new(cfg, [1; 32], u64::MAX - 1, |_| true).unwrap();
                 end.connect(u64::MAX - 1, tuple.local, tuple.remote)
@@ -7696,8 +7662,10 @@ mod recovery_observation_tests {
         }
         let (tx, _) = packet(&mut b, 0);
         assert_eq!(tx.connection, Some(owner));
-        assert_eq!(b.next_deadline(), Some(b.config.connection.time_wait_us));
-        assert!(b.connection_exists(owner));
+        // Its reset sent, the released owner is reclaimed with its tuple.
+        assert_eq!(b.next_deadline(), None);
+        assert!(!b.connection_exists(owner));
+        assert_eq!(b.connection_id(tuple), None);
     }
 
     #[test]
@@ -7790,10 +7758,6 @@ mod recovery_observation_tests {
         let (tx, bytes) = packet(&mut a, 225_000);
         assert_eq!(tx.connection, Some(client));
         assert_ne!(wire::parse(tx.ip, &bytes).unwrap().header.flags & RST, 0);
-        assert_eq!(a.connection_id(tuple), Some(client));
-        assert!(a.connection_exists(client));
-        let expiry = a.next_deadline().unwrap();
-        a.on_timeout(expiry, 1).unwrap();
         assert_eq!(a.connection_id(tuple), None);
         assert!(!a.connection_exists(client));
         assert_eq!(a.transport_info(client), Err(EndpointError::InvalidHandle));
@@ -9020,9 +8984,8 @@ mod memory_wait_tests {
         a.abort(other).unwrap();
         a.release(other).unwrap();
         exchange(&mut a, &mut b, 2);
-        assert!(!writable(&mut a, waiter));
-        let reclaimed = 2 + a.config.connection.time_wait_us;
-        a.on_timeout(reclaimed, 64).unwrap();
+        // Reclaimed once its reset is out.
+        let reclaimed = 2;
         assert!(!a.connection_exists(other));
         assert!(writable(&mut a, waiter));
         assert_eq!(a.write(waiter, &[1; 9]), Ok(9));

@@ -2562,22 +2562,24 @@ fn a_held_flow_returns_to_its_owner_when_its_connection_ends() {
     for c in &clients {
         let _ = lan.peer.network.close(c.connection);
     }
-    // The reset connections keep their tuples through the reset's
-    // TIME-WAIT (`time_wait_us`), held as long, then are reclaimed.
-    let quarantine = lan.network(0).config().tcp.connection.time_wait_us;
-    let until = lan.now + quarantine - SECOND;
-    lan.run(until, |lan| {
-        drain(lan.network(0));
-        drain(&mut lan.peer.network);
-        false
-    });
-    assert_eq!(flows.redirected(1), 4);
+    // The reset connections keep nothing once their resets are sent, as a
+    // Linux listener's queued children go with tcp_send_active_reset, so
+    // their flows return to the owner.
     let done = lan.run(lan.now + 2 * SECOND, |lan| {
         drain(lan.network(0));
         drain(&mut lan.peer.network);
         flows.redirected(1) == 0
     });
     assert!(done, "{} held", flows.redirected(1));
+    // The peer's reset connections are released in turn.
+    let done = lan.run(lan.now + 2 * SECOND, |lan| {
+        drain(lan.network(0));
+        drain(&mut lan.peer.network);
+        clients
+            .iter()
+            .all(|c| lan.peer.network.connection_info(c.connection).is_err())
+    });
+    assert!(done);
     assert_eq!(lan.resets, vec![4, 0]);
     // Member 1, listening, takes a SYN of a flow it got back.
     let mut servers: Vec<Option<Echo>> = vec![None, Some(Echo::new(lan.network(1)))];

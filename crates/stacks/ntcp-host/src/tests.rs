@@ -661,7 +661,7 @@ fn cancelled_and_collected_bindings_are_prepared_again() {
 
 // Collection frees the binding of each connection the endpoint reclaims,
 // however its slot ended (a TIME-WAIT record, a released closed
-// connection, an abort's reset quarantine, a rolled back open), looking at
+// connection, an abort once its reset is sent, a rolled back open), looking at
 // those connections only, not at every live binding. Past what the endpoint
 // keeps of its reclaims it looks at every binding once.
 #[test]
@@ -707,13 +707,10 @@ fn collection_frees_reclaimed_bindings_without_a_pass_over_the_live() {
     assert_eq!(a.1.state(clients[1]).unwrap(), State::Closed);
     a.1.release(clients[1]).unwrap();
     ended(&mut a, clients[1], 4);
-    // An abort, whose reset holds the slot as long as TIME-WAIT.
+    // An abort, reclaimed at release once its reset is out.
     a.1.abort(clients[2]).unwrap();
     pump(&mut a, &mut b, &mut now);
     a.1.release(clients[2]).unwrap();
-    now += cfg.connection.time_wait_us;
-    a.1.on_timeout(now, 64).unwrap();
-    a.1.poll_transmit(now, &mut [0; 2048], 32).unwrap();
     ended(&mut a, clients[2], 3);
     // A rolled back open, its slot taken again before any collection: the
     // later generation's commit frees the earlier one's binding.
