@@ -1644,11 +1644,17 @@ impl<P: PacketIo> Network<P> {
         })
     }
     pub fn try_read(&mut self, id: ConnId, out: &mut [u8]) -> Result<ReadOutcome> {
-        let result = self.read_once(id, out);
+        let mut drained = false;
+        let result = self.read_once(id, out, &mut drained);
         // What the read left to read, or the end of the stream, is queued
         // now, in the order it became ready again. A read that left nothing
         // is queued by the change that next gives it something.
-        if self.conn(id).is_ok() {
+        if drained && self.unchanged_by_read(id.slot) {
+            // Nothing is left to read in ESTABLISHED, as the last refresh
+            // found it, and no event is raised: a refresh would find that
+            // again and only clear `arrived`.
+            self.connections[id.slot].value.as_mut().unwrap().arrived = false;
+        } else if self.conn(id).is_ok() {
             self.refresh_connection(id.slot);
             if self.connection_has_event(id.slot) {
                 self.ready.push(id.slot);
@@ -1656,7 +1662,32 @@ impl<P: PacketIo> Network<P> {
         }
         result
     }
-    fn read_once(&mut self, id: ConnId, out: &mut [u8]) -> Result<ReadOutcome> {
+    // A connection a read that took everything readable in ESTABLISHED
+    // (`read_once`'s `drained`) left as its refresh would: still
+    // ESTABLISHED to the last refresh, with no event raised and no write
+    // waiting. Debug builds check what a refresh would find.
+    fn unchanged_by_read(&self, slot: usize) -> bool {
+        let c = self.connections[slot].value.as_ref().unwrap();
+        let unchanged = c.state == State::Established
+            && !c.connected_event
+            && !c.closed_event
+            && !c.readable_event
+            && c.read_waiting
+            && c.write_waiting.is_none();
+        debug_assert!(
+            !unchanged
+                || !self.stopped
+                    && !c.released
+                    && self.endpoint.state(c.core) == Ok(State::Established)
+                    && self.endpoint.close_reason(c.core) == Ok(c.reason)
+                    && !self.endpoint.is_output_reserved(c.core)
+                    && self.endpoint.readable_bytes(c.core) == Ok(0)
+                    && self.endpoint.terminal_readable_bytes(c.core) == Ok(0)
+        );
+        unchanged
+    }
+    // `drained`: the read took everything readable in ESTABLISHED.
+    fn read_once(&mut self, id: ConnId, out: &mut [u8], drained: &mut bool) -> Result<ReadOutcome> {
         self.running()?;
         let c = self.conn(id)?;
         if c.close_requested || c.abort_requested || c.released {
@@ -1711,6 +1742,7 @@ impl<P: PacketIo> Network<P> {
             return Ok(ReadOutcome::Eof);
         }
         self.conn_mut(id)?.read_cursor += len as u64;
+        *drained = state == State::Established && len == available;
         Ok(ReadOutcome::Data {
             len,
             range: TxStreamRange {
