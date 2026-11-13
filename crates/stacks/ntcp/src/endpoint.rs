@@ -149,6 +149,10 @@ impl EndpointConfig {
             || self.max_listeners == 0
             || self.hop_limit == 0
             || self.dscp > 63
+            || self.connection.send_capacity_min == 0
+            || self.connection.send_capacity_max >= 1 << 30
+            || self.connection.receive_capacity_min == 0
+            || self.connection.receive_capacity_max > (65535usize << 14)
         {
             return Err(Error::InvalidArgument.into());
         }
@@ -181,6 +185,17 @@ impl EndpointConfig {
             self.buffer_pressure_bytes,
             self.buffer_low_bytes,
         )
+    }
+
+    /// The buffer configuration in force, as Linux's tcp_wmem, tcp_rmem and
+    /// tcp_mem sysctls print it: `ConnectionConfig::send_buffer` and
+    /// `receive_buffer`, and `buffer_memory`.
+    pub fn buffers(&self) -> crate::Buffers {
+        crate::Buffers {
+            send: self.connection.send_buffer(),
+            receive: self.connection.receive_buffer(),
+            memory: self.buffer_memory(),
+        }
     }
 
     /// The share of `max_buffer_bytes` one connection with the configured
@@ -1746,11 +1761,16 @@ impl Endpoint {
         let scoped = self.scoped(tuple);
         let mut connection_config = self.config.connection.clone();
         connection_config.timestamps = self.new_connection_timestamps();
-        // A send size given for this open or its listener is locked, as a
-        // size set with SO_SNDBUF before connect() or listen() is
-        // (SOCK_SNDBUF_LOCK): pressure leaves it alone.
+        // A size given for this open or its listener is locked, as a size
+        // set with SO_SNDBUF or SO_RCVBUF before connect() or listen() is
+        // (SOCK_SNDBUF_LOCK, SOCK_RCVBUF_LOCK): neither autotuning nor
+        // pressure changes it, and a locked receive size sets the window
+        // scale.
         if capacities.0 != connection_config.send_capacity {
             connection_config.send_capacity_max = capacities.0;
+        }
+        if capacities.1 != connection_config.receive_capacity {
+            connection_config.receive_capacity_max = capacities.1;
         }
         connection_config.send_capacity = capacities.0;
         connection_config.receive_capacity = capacities.1;
@@ -8583,6 +8603,10 @@ mod output_reservation_tests;
 #[cfg(test)]
 #[path = "transmit_group_tests.rs"]
 mod transmit_group_tests;
+
+#[cfg(test)]
+#[path = "autotune_tests.rs"]
+mod autotune_tests;
 
 #[cfg(test)]
 #[path = "endpoint_ptb_reserved_tests.rs"]

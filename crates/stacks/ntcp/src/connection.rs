@@ -139,17 +139,26 @@ impl Default for PacingConfig {
 
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
+    // The initial send limit and receive ring (and window), Linux's
+    // tcp_wmem[1] and tcp_rmem[1].
     pub send_capacity: usize,
     pub receive_capacity: usize,
-    // The send limit's floor and ceiling, Linux's tcp_wmem[0] and
-    // tcp_wmem[2] (`send_capacity` is tcp_wmem[1]). The direction is tuned
-    // while `send_capacity_max` exceeds `send_capacity` and no setter locked
-    // it (`Endpoint::set_buffer_capacities`, SOCK_SNDBUF_LOCK): memory
-    // pressure refuses its growth and moderates its limit, down to
-    // `send_capacity_min` (or `send_capacity`, the lower). By default max
-    // is `send_capacity`'s default, so that size is not tuned.
+    // Each direction's floor and ceiling, Linux's tcp_wmem[0]/tcp_wmem[2]
+    // and tcp_rmem[0]/tcp_rmem[2] (`send_buffer`, `receive_buffer`). A
+    // direction is tuned while its max exceeds its initial size and no
+    // setter locked it (`Endpoint::set_send_buffer`, SOCK_SNDBUF_LOCK, and
+    // `set_receive_buffer`, SOCK_RCVBUF_LOCK): autotuning grows it up to
+    // max, and memory pressure refuses its growth and moderates its send
+    // limit, down to min. As Linux's tcp_wmem and tcp_rmem sysctls, which
+    // check no order, a min above the initial size acts as the initial size
+    // and a max below it leaves the direction fixed at it; only
+    // `set_send_buffer` and `set_receive_buffer` require the order. By
+    // default min is 4096 and max 0, so neither direction is tuned whatever
+    // its initial size.
     pub send_capacity_min: usize,
     pub send_capacity_max: usize,
+    pub receive_capacity_min: usize,
+    pub receive_capacity_max: usize,
     pub mss: u16,
     // Application maximum segment size; independent of path MTU and storage ceiling.
     pub user_mss: Option<u16>,
@@ -288,6 +297,45 @@ impl Default for KeepaliveConfig {
 }
 
 impl ConnectionConfig {
+    /// The send sizes in force, Linux's tcp_wmem: a min above
+    /// `send_capacity` is `send_capacity`, and so is a max below it.
+    pub fn send_buffer(&self) -> crate::BufferSizes {
+        crate::BufferSizes {
+            min: self.send_capacity_min.min(self.send_capacity),
+            initial: self.send_capacity,
+            max: self.send_capacity_max.max(self.send_capacity),
+        }
+    }
+
+    /// The receive sizes in force, Linux's tcp_rmem, resolved as
+    /// `send_buffer`.
+    pub fn receive_buffer(&self) -> crate::BufferSizes {
+        crate::BufferSizes {
+            min: self.receive_capacity_min.min(self.receive_capacity),
+            initial: self.receive_capacity,
+            max: self.receive_capacity_max.max(self.receive_capacity),
+        }
+    }
+
+    /// Sets the send sizes: 1 ≤ min ≤ initial ≤ max < 2^30.
+    pub fn set_send_buffer(&mut self, sizes: crate::BufferSizes) -> Result<(), Error> {
+        sizes.validate((1 << 30) - 1)?;
+        self.send_capacity_min = sizes.min;
+        self.send_capacity = sizes.initial;
+        self.send_capacity_max = sizes.max;
+        Ok(())
+    }
+
+    /// Sets the receive sizes: 1 ≤ min ≤ initial ≤ max ≤ 65535·2^14, the
+    /// largest window scaling reaches.
+    pub fn set_receive_buffer(&mut self, sizes: crate::BufferSizes) -> Result<(), Error> {
+        sizes.validate(65535 << 14)?;
+        self.receive_capacity_min = sizes.min;
+        self.receive_capacity = sizes.initial;
+        self.receive_capacity_max = sizes.max;
+        Ok(())
+    }
+
     pub fn validate(&self, ipv4: bool) -> Result<(), Error> {
         if let Some(p) = self.pmtud {
             p.policy
@@ -320,6 +368,8 @@ impl ConnectionConfig {
             || self.send_capacity_max >= 1 << 30
             || self.receive_capacity == 0
             || self.receive_capacity > (65535usize << 14)
+            || self.receive_capacity_min == 0
+            || self.receive_capacity_max > (65535usize << 14)
             || self.receive_ip_payload_limit < 21
             || self.send_ip_payload_limit < self.minimum_send_budget()
             || self.user_mss == Some(0)
@@ -422,9 +472,14 @@ impl Default for ConnectionConfig {
         Self {
             send_capacity: 65536,
             receive_capacity: 65536,
-            // Linux's tcp_wmem[0], PAGE_SIZE.
+            // Linux's tcp_wmem[0] and tcp_rmem[0], PAGE_SIZE.
             send_capacity_min: 4096,
-            send_capacity_max: 65536,
+            receive_capacity_min: 4096,
+            // Below any initial size: each direction stays fixed at the
+            // initial size a configuration chooses, so that one which sets
+            // only `send_capacity` or `receive_capacity` is not tuned.
+            send_capacity_max: 0,
+            receive_capacity_max: 0,
             mss: 1460,
             user_mss: None,
             advertised_mss: None,
@@ -699,6 +754,14 @@ fn due(deadline: Option<Instant>, now: Instant) -> bool {
 // A legal buffer below one segment keeps its whole capacity: the literal
 // multiple, zero, would deadlock it, and the peer and congestion windows
 // still bound what is outstanding.
+// The smallest window scale shift whose largest window holds `space` bytes,
+// at most 14 (RFC 7323 section 2.3).
+fn window_scale(space: usize) -> u8 {
+    (0..=14)
+        .find(|&shift| space <= (65535usize << shift))
+        .unwrap_or(14)
+}
+
 fn rounded_send_space(capacity: usize, quantum: usize) -> usize {
     if capacity < quantum {
         capacity
@@ -1076,20 +1139,23 @@ impl Connection {
                 .min((min_mtu(false) - 40) as u16);
         }
         let send = SendBuffer::unallocated(config.send_capacity);
-        let send_tuned = config.send_capacity_max > config.send_capacity;
-        let send_min = config.send_capacity_min.min(config.send_capacity);
+        let (send_sizes, receive_sizes) = (config.send_buffer(), config.receive_buffer());
+        let send_tuned = send_sizes.max > send_sizes.initial;
         let mut scratch = Vec::new();
         scratch
             .try_reserve_exact(config.mss as usize)
             .map_err(|_| Error::NoMemory)?;
         scratch.resize(config.mss as usize, 0);
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
-        //= reason=Capacity-derived exponent is frozen after first successful SYN output; maximum negotiated true window bounded by receive allocation.
+        //= reason=The exponent comes from the largest receive buffer the connection may grow to, receive_capacity_max (Linux's tcp_rmem[2] in tcp_select_initial_window), or from the size a setter locked; it is frozen after the first successful SYN output, and the negotiated true window stays bounded by the allocated ring.
         //# The maximum receive window, and therefore the scale factor, is
         //# determined by the maximum receive buffer space.
-        let local_scale = (0..=14)
-            .find(|&shift| config.receive_capacity <= (65535usize << shift))
-            .unwrap_or(14);
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+        //= reason=R is the shift the receive maximum needs; an untuned connection's maximum is its receive_capacity, so its R is as before.
+        //# o  The Window Scale option MUST be sent with shift.cnt = R, where R
+        //# is the value that the TCP would like to use for its receive
+        //# window.
+        let local_scale = window_scale(receive_sizes.max);
         let syn_window = config.receive_capacity.min(65535) as u16;
         let ip_header_len = initial_ip_header_len.unwrap_or(if tuple.local.is_ipv4() { 20 } else { 40 });
         let pmtud = config
@@ -1359,7 +1425,7 @@ impl Connection {
             send_backpressured: false,
             send_memory_wanted: None,
             send_tuned,
-            send_min,
+            send_min: send_sizes.min,
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -1576,9 +1642,7 @@ impl Connection {
         self.config.receive_capacity = receive;
         if self.handshake_pending() && self.snd_nxt == self.iss {
             // No local SYN has reached the wire, including after failed output.
-            self.local_scale = (0..=14)
-                .find(|&shift| receive <= (65535usize << shift))
-                .unwrap_or(14);
+            self.local_scale = window_scale(receive);
             self.syn_window = if self.receive.eof() {
                 0
             } else {

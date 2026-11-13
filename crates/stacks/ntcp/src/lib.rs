@@ -14,6 +14,8 @@ pub use ntcp_buffer::Payload;
 #[cfg(test)]
 mod allocation_tests;
 mod buffer;
+mod buffer_sizes;
+pub use buffer_sizes::{BufferSizes, Buffers};
 mod connection;
 mod cubic;
 mod endpoint;
