@@ -782,6 +782,31 @@ fn ingress_requires_live_local_owner_and_supported_current_framing() {
     assert_eq!(host.binding_count(), 0);
 }
 
+// The destination found local is kept only while the path revision holds:
+// a change of its source's owners is seen by the very next packet, and the
+// source registered again is local again.
+#[test]
+fn a_kept_local_destination_follows_source_ownership_changes() {
+    for v6 in [false, true] {
+        let cfg = config(2);
+        let (local, remote) = addresses(v6);
+        let (mut host, _endpoint, context) = managed(local, 43, cfg.clone());
+        let (mut peer_host, mut peer, _) = managed(remote, 44, cfg.clone());
+        peer.connect_with_path_provider(0, remote, local, options(&cfg, 0), &mut peer_host)
+            .unwrap();
+        let frame = emit(&mut peer_host, &mut peer, 1).unwrap();
+        for _ in 0..2 {
+            assert!(host.decode_ingress(context, &frame).is_ok());
+        }
+        let address = ScopedAddress::new(local.ip(), None).unwrap();
+        let source = host.paths().local_source(address, context.link()).unwrap();
+        host.remove_source_owner(source, context.link()).unwrap();
+        assert!(host.decode_ingress(context, &frame).is_err());
+        host.register_source(address, context.link()).unwrap();
+        assert!(host.decode_ingress(context, &frame).is_ok());
+    }
+}
+
 #[test]
 fn exact_probe_attempt_and_negative_revision_gate_actual_submission() {
     for v6 in [false, true] {

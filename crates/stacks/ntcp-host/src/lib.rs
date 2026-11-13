@@ -38,7 +38,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use core::net::IpAddr;
+use core::{cell::Cell, net::IpAddr};
 use ntcp::{
     ConnectionId, CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError,
     ExpectedRegistrations, Instant, IpMetadata, Ipv4Options, Ipv4RegistrationPlan, ManagedError,
@@ -584,6 +584,17 @@ struct Port {
     receive: ReceiveCapabilities,
     forwarding: Forwarding,
 }
+// A destination address `owned_on_link` found to be a source owned on
+// `link` at path revision `revision`. Every change of links, sources or
+// their owners moves the revision, so while it holds the lookup finds the
+// same, as Linux's early demux trusts a socket's cached input route while
+// its dst stays valid.
+#[derive(Clone, Copy, PartialEq)]
+struct LocalDestination {
+    link: LinkId,
+    address: IpAddr,
+    revision: u64,
+}
 #[derive(Clone, Copy)]
 struct Binding {
     owner: Option<ConnectionId>,
@@ -706,6 +717,9 @@ pub struct Host {
     search_aging: Option<ntcp::SearchAging>,
     paths: PathService,
     ports: Vec<Option<Port>>,
+    // The destination last found to be a source owned on a link, and the
+    // path revision it was found at (`owned_on_link`).
+    local: Cell<Option<LocalDestination>>,
     bindings: Vec<Option<Binding>>,
     // Occupied `bindings` records: what service and collection passes and
     // owner lookups visit.
@@ -837,6 +851,7 @@ impl Host {
             search_aging: None,
             paths,
             ports: table(path_limits.links, None)?,
+            local: Cell::new(None),
             bindings: table(limits.bindings, None)?,
             live_bindings: Live::new(limits.bindings)?,
             free_bindings: free_slots(limits.bindings)?,
@@ -1918,12 +1933,26 @@ impl Host {
         Ok(packet)
     }
     fn owned_on_link(&self, context: IngressContext, destination: IpAddr) -> Result<(), Error> {
+        let local = LocalDestination {
+            link: context.link,
+            address: destination,
+            revision: self.paths.revision(),
+        };
+        if self.local.get() == Some(local) {
+            debug_assert!(self.local_on_link(context.link, destination).is_ok());
+            return Ok(());
+        }
+        self.local_on_link(context.link, destination)?;
+        self.local.set(Some(local));
+        Ok(())
+    }
+    fn local_on_link(&self, link: LinkId, destination: IpAddr) -> Result<(), Error> {
         let zone = match destination {
-            IpAddr::V6(v) if v.is_unicast_link_local() => Some(context.link),
+            IpAddr::V6(v) if v.is_unicast_link_local() => Some(link),
             _ => None,
         };
         self.paths
-            .local_source(ScopedAddress::new(destination, zone)?, context.link)?;
+            .local_source(ScopedAddress::new(destination, zone)?, link)?;
         Ok(())
     }
     // ICMP errors about our own submissions may return over any registered
@@ -1935,17 +1964,30 @@ impl Host {
         if matches!(destination, IpAddr::V6(v) if v.is_unicast_link_local()) {
             return self.owned_on_link(context, destination);
         }
+        // A source owned on any link is owned in the context.
+        let revision = self.paths.revision();
+        if let Some(local) = self.local.get()
+            && local.address == destination
+            && local.revision == revision
+        {
+            debug_assert!(self.local_on_link(local.link, destination).is_ok());
+            return Ok(());
+        }
         let address = ScopedAddress::new(destination, None)?;
-        if self
+        let Some(port) = self
             .ports
             .iter()
             .flatten()
-            .any(|port| self.paths.local_source(address, port.link).is_ok())
-        {
-            Ok(())
-        } else {
-            Err(path::Error::NoRoute.into())
-        }
+            .find(|port| self.paths.local_source(address, port.link).is_ok())
+        else {
+            return Err(path::Error::NoRoute.into());
+        };
+        self.local.set(Some(LocalDestination {
+            link: port.link,
+            address: destination,
+            revision,
+        }));
+        Ok(())
     }
     fn parse_ingress<'a>(
         &self,

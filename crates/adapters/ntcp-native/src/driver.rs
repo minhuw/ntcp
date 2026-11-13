@@ -928,7 +928,10 @@ impl<P: PacketIo> Network<P> {
     // Destination processing and dispatch of one complete datagram.
     fn dispatch(&mut self, datagram: Datagram<'_>, metadata: ntcp::RxPacketMetadata) -> Result<()> {
         let processed = self.host.process(datagram, None)?;
-        let packet = self.host.decode_datagram(processed)?;
+        // `process` found the destination owned on the Host's one link,
+        // which is what `decode_datagram` would check again.
+        debug_assert!(self.host.decode_datagram(processed).is_ok());
+        let packet = processed.packet();
         if packet.protocol == 1 || packet.protocol == 58 {
             if let IcmpDispatch::Deferred(icmp) =
                 self.host
