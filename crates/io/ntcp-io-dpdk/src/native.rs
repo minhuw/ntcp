@@ -1,8 +1,8 @@
 use ntcp_io::{
     ClockDescriptor, ClockDomain, PacketIo, PacketLayer, PacketTimestamp, PacketTimestamps,
-    ReceivedPacket, TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
-    TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit, TransmitTime, TxOutcome,
-    TxSchedulingCapabilities, TxTimestampRequest,
+    ReceivedPacket, RxChecksum, TcpSegmentationCapabilities, TcpSegmentationError,
+    TcpSegmentationRequest, TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit,
+    TransmitTime, TxOutcome, TxSchedulingCapabilities, TxTimestampRequest,
 };
 use std::{
     ffi::{CStr, c_char, c_void},
@@ -61,6 +61,7 @@ unsafe extern "C" {
     fn ntcp_dpdk_receive_burst(port: u16, queue: u16, packets: *mut *mut c_void, count: u16)
     -> u16;
     fn ntcp_dpdk_packet_free(packet: *mut c_void);
+    fn ntcp_dpdk_rx_checksum_check(port: u16, queue: u16) -> i32;
     fn ntcp_dpdk_receive(
         packet: *mut c_void,
         out: *mut u8,
@@ -70,6 +71,8 @@ unsafe extern "C" {
         timestamp_flag: u64,
         timestamp: *mut u64,
         timestamp_valid: *mut i32,
+        l4_checksum: i32,
+        l4_status: *mut i32,
     ) -> i32;
     fn ntcp_dpdk_transmit(
         port: u16,
@@ -117,6 +120,8 @@ pub struct Dpdk {
     shared_limit: Option<u16>,
     rx_timestamp: Option<TimestampConfig>,
     tx_scheduling: Option<TimestampConfig>,
+    // The device's TCP checksum verdict is read (enable_rx_checksum).
+    rx_checksum: bool,
     _local: PhantomData<Rc<()>>,
 }
 
@@ -133,6 +138,18 @@ pub(crate) unsafe fn tso_check(port: u16, queue: u16, pool: *mut c_void) -> io::
         return Err(io::Error::from_raw_os_error(-result));
     }
     Ok(config)
+}
+
+// enable_rx_checksum's check of RX queue `queue`, also for the host that
+// configured the port (Port::start). The caller guarantees that EAL is
+// initialized and that the port and its configured queue are live.
+pub(crate) unsafe fn rx_checksum_check(port: u16, queue: u16) -> io::Result<()> {
+    // SAFETY: as the caller guarantees.
+    let result = unsafe { ntcp_dpdk_rx_checksum_check(port, queue) };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+    Ok(())
 }
 
 // The ethdev driver serving `port` (rte_eth_dev_info driver_name), or the
@@ -197,6 +214,7 @@ impl Dpdk {
             shared_limit: None,
             rx_timestamp: None,
             tx_scheduling: None,
+            rx_checksum: false,
             _local: PhantomData,
         })
     }
@@ -232,6 +250,17 @@ impl Dpdk {
             offset,
             flag,
         });
+        Ok(())
+    }
+
+    /// Opt into the device's RX TCP checksum verdict
+    /// (`ReceivedPacket::l4_checksum`), when the host enabled
+    /// RTE_ETH_RX_OFFLOAD_TCP_CKSUM on the port or this queue. Read-only;
+    /// nothing is configured. Without it every packet reports Unknown.
+    pub fn enable_rx_checksum(&mut self) -> io::Result<()> {
+        // SAFETY: the borrowed port/queue remain live and unchanged.
+        unsafe { rx_checksum_check(self.port, self.rx_queue) }?;
+        self.rx_checksum = true;
         Ok(())
     }
 
@@ -474,7 +503,7 @@ impl PacketIo for Dpdk {
         }
         let packet = std::mem::replace(&mut self.rx_packets[self.rx_next], ptr::null_mut());
         self.rx_next += 1;
-        let (mut len, mut timestamp, mut valid) = (0, 0, 0);
+        let (mut len, mut timestamp, mut valid, mut l4) = (0, 0, 0, 0);
         let config = self.rx_timestamp;
         // SAFETY: the shim consumes this owned mbuf chain on success or error;
         // slice/outputs are writable, and the cached offset/flag were validated.
@@ -488,11 +517,18 @@ impl PacketIo for Dpdk {
                 config.map_or(0, |c| c.flag),
                 &mut timestamp,
                 &mut valid,
+                i32::from(self.rx_checksum),
+                &mut l4,
             )
         } {
             1 => Ok(Some(ReceivedPacket {
                 len,
                 tcp_segment_size: None,
+                l4_checksum: match l4 {
+                    1 => RxChecksum::Good,
+                    2 => RxChecksum::Bad,
+                    _ => RxChecksum::Unknown,
+                },
                 timestamps: PacketTimestamps {
                     software: None,
                     hardware: config.filter(|_| valid != 0).map(|c| PacketTimestamp {

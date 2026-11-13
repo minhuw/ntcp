@@ -337,6 +337,16 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
 }
 
 pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
+    parse_checked(ip, bytes, true)
+}
+
+/// `parse` of a segment whose checksum needs no verification here: the
+/// receiving device verified it (`RxPacketMetadata::tcp_checksum_verified`).
+pub(crate) fn parse_verified(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
+    parse_checked(ip, bytes, false)
+}
+
+fn parse_checked(ip: IpMetadata, bytes: &[u8], checksum: bool) -> Result<Segment<'_>, WireError> {
     checked_length(ip, bytes.len())?;
     if bytes.len() < 20 {
         return Err(WireError::Truncated);
@@ -351,9 +361,11 @@ pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
     if header_len > bytes.len() {
         return Err(WireError::Truncated);
     }
+    // A device that verified it checked it, as Linux trusts
+    // CHECKSUM_UNNECESSARY.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# and the receiver MUST check it (MUST-3).
-    if checksum(ip, bytes)? != 0 {
+    if checksum && self::checksum(ip, bytes)? != 0 {
         return Err(WireError::InvalidChecksum);
     }
     let raw_options = &bytes[20..header_len];

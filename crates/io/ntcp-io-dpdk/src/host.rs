@@ -4,7 +4,7 @@
 //! Teardown order is structural: flows and queues hold the port, so the port
 //! is stopped and closed, and its pools freed, only after all of them drop.
 
-use crate::native::{Dpdk, driver_name, tso_check};
+use crate::native::{Dpdk, driver_name, rx_checksum_check, tso_check};
 use ntcp_io::{
     ClockDescriptor, ClockDomain, OwnedPacket, PacketIo, PacketLayer, Payload, ReceivedPacket,
     TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
@@ -36,6 +36,7 @@ struct PortSetup {
     rss: u8,
     rss_key_len: u8,
     tcp_segmentation: u8,
+    checksum_offload: u8,
     rss_key: *const u8,
 }
 
@@ -64,6 +65,7 @@ unsafe extern "C" {
         stage: *mut i32,
         key_size: *mut u8,
         tcp_segmentation: *mut u8,
+        checksums: *mut u8,
     ) -> i32;
     fn ntcp_dpdk_port_queue_setup(
         port: u16,
@@ -271,6 +273,13 @@ pub struct PortConfig {
     /// the queue's pool until the device has sent it; a pool short of them
     /// blocks the aggregate (WouldBlock) until the ring drains.
     pub tcp_segmentation: bool,
+    /// TCP checksum offload whenever the device offers it (default on, as
+    /// Linux enables rx checksumming): on RX, RTE_ETH_RX_OFFLOAD_TCP_CKSUM,
+    /// whose verdict every hosted queue reports
+    /// (`Dpdk::enable_rx_checksum`), so that a checksum the device found
+    /// good is not verified again. `Port::rx_checksum` tells whether it is
+    /// in use.
+    pub checksum_offload: bool,
     /// Hash key for `rss`, exactly the device's hash key size (40 octets on
     /// mlx5). None keeps the PMD's key. Its length is checked whenever it is
     /// given, also with a single queue, where it goes unused.
@@ -294,6 +303,7 @@ impl PortConfig {
             rss: false,
             rss_key: None,
             tcp_segmentation: false,
+            checksum_offload: true,
         }
     }
 }
@@ -312,6 +322,7 @@ struct PortInner {
     clock: Option<ClockDescriptor>,
     rss: bool,
     tcp_segmentation: bool,
+    rx_checksum: bool,
     // ethdev keeps a pointer to the configured key; it lives with the port.
     _rss_key: Option<Box<[u8]>>,
 }
@@ -392,6 +403,7 @@ impl Port {
             }),
             rss,
             tcp_segmentation: false,
+            rx_checksum: false,
             _rss_key: rss_key,
         };
         if config.isolate {
@@ -413,13 +425,14 @@ impl Port {
             rss: u8::from(rss),
             rss_key_len,
             tcp_segmentation: u8::from(config.tcp_segmentation),
+            checksum_offload: u8::from(config.checksum_offload),
             rss_key: inner
                 ._rss_key
                 .as_ref()
                 .map_or(std::ptr::null(), |key| key.as_ptr()),
         };
         let (mut rx_desc, mut tx_desc, mut stage, mut key_size) = (0, 0, 0, 0);
-        let mut tcp_segmentation = 0;
+        let (mut tcp_segmentation, mut checksums) = (0, 0);
         // SAFETY: claimed port; all pointers are valid for the call, and the
         // key for as long as the port (it is owned by `inner`).
         let result = unsafe {
@@ -431,6 +444,7 @@ impl Port {
                 &mut stage,
                 &mut key_size,
                 &mut tcp_segmentation,
+                &mut checksums,
             )
         };
         if result < 0 {
@@ -452,6 +466,7 @@ impl Port {
             return Err(dpdk_error(context, result));
         }
         inner.tcp_segmentation = tcp_segmentation != 0;
+        inner.rx_checksum = checksums & 1 != 0;
         if u64::from(config.mbufs_per_queue) <= u64::from(rx_desc) + u64::from(tx_desc) {
             return Err(invalid(&format!(
                 "mbufs_per_queue {} must exceed rx_desc {rx_desc} + tx_desc {tx_desc}",
@@ -499,6 +514,11 @@ impl Port {
             // SAFETY: started port with this queue and its pool configured.
             unsafe { tso_check(port, queue, pool.as_ptr()) }.is_ok()
         });
+        // Likewise the adapter's check (Dpdk::enable_rx_checksum).
+        inner.rx_checksum &= (0..config.queues).all(|queue| {
+            // SAFETY: started port with this queue configured.
+            unsafe { rx_checksum_check(port, queue) }.is_ok()
+        });
         Ok(Port {
             inner: Arc::new(inner),
         })
@@ -525,6 +545,13 @@ impl Port {
     /// takes TCP aggregates.
     pub fn tcp_segmentation(&self) -> bool {
         self.inner.tcp_segmentation
+    }
+
+    /// Whether `checksum_offload` was requested, the device offered RX TCP
+    /// checksum verification and every queue passed the adapter's check:
+    /// every attached queue then reports the device's verdict.
+    pub fn rx_checksum(&self) -> bool {
+        self.inner.rx_checksum
     }
 
     /// Current device clock (rte_eth_read_clock), in the same raw units as
@@ -927,6 +954,9 @@ impl QueueHandle {
         }
         if self.port.tcp_segmentation {
             io.enable_tcp_segmentation()?;
+        }
+        if self.port.rx_checksum {
+            io.enable_rx_checksum()?;
         }
         self.attached = true;
         Ok(HostedQueue {

@@ -97,6 +97,7 @@ impl PacketIo for PacketBackend {
             len: packet.len(),
             timestamps: Default::default(),
             tcp_segment_size,
+            l4_checksum: Default::default(),
         }))
     }
     fn transmit(&mut self, packet: &[u8]) -> std::io::Result<TxOutcome> {

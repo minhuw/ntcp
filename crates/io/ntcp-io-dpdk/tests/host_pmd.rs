@@ -114,6 +114,8 @@ fn port_lifecycle(eal: &'static Eal) {
     assert_eq!(pools(), (4, 4));
     assert_eq!(port.clock(), None);
     assert!(!port.tcp_segmentation()); // Off by default.
+    // Checksum offload is asked for by default; the ring PMD offers none.
+    assert!(config.checksum_offload && !port.rx_checksum());
     assert_eq!(
         port.read_clock().unwrap_err().kind(),
         ErrorKind::Unsupported

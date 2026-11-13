@@ -117,7 +117,8 @@ impl Receiver {
                     &b,
                     RxPacketMetadata {
                         timestamps: Default::default(),
-                        tcp_segment_size: size.and_then(NonZeroU16::new)
+                        tcp_segment_size: size.and_then(NonZeroU16::new),
+                        ..Default::default()
                     }
                 )
                 .unwrap(),
@@ -229,7 +230,8 @@ fn invalid_receive_metadata_and_bad_checksum_do_not_mutate_clock_or_estimate() {
                 &b,
                 RxPacketMetadata {
                     timestamps: Default::default(),
-                    tcp_segment_size: NonZeroU16::new(size)
+                    tcp_segment_size: NonZeroU16::new(size),
+                    ..Default::default()
                 }
             ),
             Err(EndpointError::Connection(Error::InvalidArgument))
@@ -247,7 +249,8 @@ fn invalid_receive_metadata_and_bad_checksum_do_not_mutate_clock_or_estimate() {
             &b,
             RxPacketMetadata {
                 timestamps: Default::default(),
-                tcp_segment_size: NonZeroU16::new(1000)
+                tcp_segment_size: NonZeroU16::new(1000),
+                ..Default::default()
             }
         )
         .unwrap(),

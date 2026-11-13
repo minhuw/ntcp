@@ -14,9 +14,11 @@ struct rte_mbuf;
 uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
                                   struct rte_mbuf **packets, uint16_t count);
 void ntcp_dpdk_packet_free(void *packet);
+int ntcp_dpdk_rx_checksum_check(uint16_t port, uint16_t queue);
 int ntcp_dpdk_receive(void *packet, uint8_t *out,
                       size_t capacity, size_t *length, int timestamp_offset,
-                      uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid);
+                      uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid,
+                      int l4_checksum, int *l4_status);
 int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
                        const uint8_t *packet, size_t length, int timestamp_offset,
                        uint64_t timestamp_flag, uint64_t timestamp);
@@ -57,13 +59,14 @@ void *ntcp_dpdk_pool_create(const char *name, uint32_t count, uint16_t data_size
 int ntcp_dpdk_pool_free(void *pool);
 struct ntcp_port_config {
     uint16_t queues, rx_desc, tx_desc, mtu, mbuf_data_size;
-    uint8_t rx_timestamps, rss, rss_key_len, tcp_segmentation;
+    uint8_t rx_timestamps, rss, rss_key_len, tcp_segmentation, checksum_offload;
     // Must stay valid until the port is closed: ethdev keeps the pointer.
     const uint8_t *rss_key;
 };
 int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *config,
                              uint16_t *rx_desc, uint16_t *tx_desc, int *stage,
-                             uint8_t *key_size, uint8_t *tcp_segmentation);
+                             uint8_t *key_size, uint8_t *tcp_segmentation,
+                             uint8_t *checksums);
 int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
                                uint16_t tx_desc, int socket, void *pool);
 int ntcp_dpdk_port_start(uint16_t port);

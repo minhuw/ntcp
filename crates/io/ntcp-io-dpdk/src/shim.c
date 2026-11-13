@@ -88,13 +88,36 @@ void ntcp_dpdk_packet_free(void *packet) {
     rte_pktmbuf_free(packet);
 }
 
+// Whether TCP checksum offload is enabled on RX queue `queue`: on the port
+// (every queue), or on the queue itself when the PMD reports its
+// configuration. Read-only; a borrowed port is never configured here.
+int ntcp_dpdk_rx_checksum_check(uint16_t port, uint16_t queue) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    if (queue >= info.nb_rx_queues) return -EINVAL;
+    if (!(info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TCP_CKSUM)) return -ENOTSUP;
+    struct rte_eth_conf conf;
+    result = rte_eth_dev_conf_get(port, &conf);
+    if (result < 0) return result;
+    if (conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_TCP_CKSUM) return 0;
+    struct rte_eth_rxq_info qinfo;
+    result = rte_eth_rx_queue_info_get(port, queue, &qinfo);
+    if (result < 0) return result;
+    return (qinfo.conf.offloads & RTE_ETH_RX_OFFLOAD_TCP_CKSUM) ? 0 : -ENOTSUP;
+}
+
+enum { NTCP_L4_UNKNOWN, NTCP_L4_GOOD, NTCP_L4_BAD };
+
 int ntcp_dpdk_receive(void *packet, uint8_t *out,
                       size_t capacity, size_t *length, int timestamp_offset,
-                      uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid) {
+                      uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid,
+                      int l4_checksum, int *l4_status) {
     struct rte_mbuf *m = packet;
     *length = 0;
     *timestamp = 0;
     *timestamp_valid = 0;
+    *l4_status = NTCP_L4_UNKNOWN;
     // PacketIo carries bytes only: stripped tags and coalesced packets cannot
     // be reconstructed from offload metadata without changing its contract.
     int result = -ENOTSUP;
@@ -127,6 +150,16 @@ int ntcp_dpdk_receive(void *packet, uint8_t *out,
     if (timestamp_offset >= 0 && (m->ol_flags & timestamp_flag)) {
         *timestamp = *RTE_MBUF_DYNFIELD(m, timestamp_offset, rte_mbuf_timestamp_t *);
         *timestamp_valid = 1;
+    }
+    // Meaningful only with RX TCP checksum offload enabled. NONE (the
+    // packet's checksum field is not final, its data verified) stays
+    // unknown: the stack verifies the field itself.
+    if (l4_checksum) {
+        switch (m->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_MASK) {
+        case RTE_MBUF_F_RX_L4_CKSUM_GOOD: *l4_status = NTCP_L4_GOOD; break;
+        case RTE_MBUF_F_RX_L4_CKSUM_BAD: *l4_status = NTCP_L4_BAD; break;
+        default: break;
+        }
     }
     *length = total;
     result = 1;
@@ -520,7 +553,8 @@ static const uint64_t ntcp_rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_I
 // frames larger than one mbuf) are enabled on RX; nothing strips or merges.
 int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *config,
                              uint16_t *rx_desc, uint16_t *tx_desc, int *stage,
-                             uint8_t *key_size, uint8_t *tcp_segmentation) {
+                             uint8_t *key_size, uint8_t *tcp_segmentation,
+                             uint8_t *checksums) {
     struct rte_eth_dev_info info;
     *stage = NTCP_STAGE_INFO;
     int result = rte_eth_dev_info_get(port, &info);
@@ -561,6 +595,15 @@ int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *confi
     *tcp_segmentation = config->tcp_segmentation &&
         (info.tx_offload_capa & segmentation) == segmentation;
     if (*tcp_segmentation) tx |= segmentation;
+    // TCP checksum verification on RX whenever the device offers it and the
+    // host asks (checksum_offload): its verdict (RTE_MBUF_F_RX_L4_CKSUM_*)
+    // spares the stack verifying a good checksum, as Linux enables rx
+    // checksumming by default. Bit 0 of *checksums reports it.
+    *checksums = 0;
+    if (config->checksum_offload && (info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TCP_CKSUM)) {
+        rx |= RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
+        *checksums |= 1;
+    }
     // Without RSS a queue receives only what flows steer to it (or queue 0's
     // default traffic), so each worker sees exactly its own connections. With
     // RSS, unsteered traffic is spread by the device's hash and redirection

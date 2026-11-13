@@ -50,6 +50,7 @@ impl PacketIo for Wire {
                 ReceivedPacket {
                     len,
                     tcp_segment_size: None,
+                    l4_checksum: Default::default(),
                     timestamps: PacketTimestamps {
                         software: None,
                         hardware: self.clock.get().map(|clock| PacketTimestamp {

@@ -4,7 +4,7 @@ use ntcp_host::{
     NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
-    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, TcpSegmentationError,
+    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, RxChecksum, TcpSegmentationError,
     TcpSegmentationRequest, TimestampUnit, TxOutcome,
 };
 
@@ -647,9 +647,14 @@ impl<P: PacketIo> Network<P> {
         Ok(())
     }
     fn receive_metadata(&mut self, packet: ReceivedPacket) -> ntcp::RxPacketMetadata {
+        // Only the device's Good is trusted (Linux's CHECKSUM_UNNECESSARY);
+        // Bad and Unknown are verified in software. The Host takes it back
+        // from a datagram that is not the packet as it arrived.
+        let tcp_checksum_verified = packet.l4_checksum == RxChecksum::Good;
         if self.config.rx_timestamp_ranges == 0 {
             return ntcp::RxPacketMetadata {
                 tcp_segment_size: packet.tcp_segment_size,
+                tcp_checksum_verified,
                 ..Default::default()
             };
         }
@@ -665,6 +670,7 @@ impl<P: PacketIo> Network<P> {
                     .and_then(|stamp| self.receive_stamp(stamp)),
             },
             tcp_segment_size: packet.tcp_segment_size,
+            tcp_checksum_verified,
         }
     }
     fn receive_stamp(&mut self, packet: PacketTimestamp) -> Option<ntcp::RxTimestamp> {
@@ -846,10 +852,13 @@ impl<P: PacketIo> Network<P> {
         handoff: flows::Handoff,
         completed: &mut [u8],
     ) -> Result<()> {
+        // The device's checksum verdict stays with the queue that received
+        // the packet: what it hands over is verified here in software.
         let packet = ReceivedPacket {
             len: bytes.len(),
             timestamps: handoff.timestamps,
             tcp_segment_size: handoff.tcp_segment_size,
+            l4_checksum: RxChecksum::Unknown,
         };
         let syn = match handoff.syn.then(|| flows::key(bytes)) {
             Some(flows::Key::Flow { local, remote, .. }) => Some((local, remote)),

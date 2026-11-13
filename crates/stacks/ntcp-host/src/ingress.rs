@@ -1031,6 +1031,14 @@ impl Host {
     ) -> Result<InputDisposition, Error> {
         self.check_endpoint(endpoint)?;
         let packet = self.processed_packet(processed)?;
+        // A device's checksum verdict is about the packet that arrived, not
+        // a datagram reassembled from it or rewritten without its Fragment
+        // header.
+        let metadata = RxPacketMetadata {
+            tcp_checksum_verified: metadata.tcp_checksum_verified
+                && !processed.contained_fragment_header(),
+            ..metadata
+        };
         if crate::is_icmp(&packet) {
             // One dispatcher for every embedding. A reserved owner keeps this
             // entrypoint's established OutputReserved contract, with nothing

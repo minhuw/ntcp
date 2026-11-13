@@ -87,6 +87,7 @@ impl PacketIo for Fixture {
             len,
             timestamps: state.rx_stamps,
             tcp_segment_size: state.rx_segment_size,
+            l4_checksum: Default::default(),
         }))
     }
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<TxOutcome> {

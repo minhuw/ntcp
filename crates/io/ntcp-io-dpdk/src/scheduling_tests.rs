@@ -16,6 +16,41 @@ unsafe extern "C" {
     fn ntcp_test_finish();
     fn ntcp_test_take(out: *mut u8, cap: u32, mss: *mut u32) -> u32;
     fn ntcp_test_inject(frame: *const u8, length: u32) -> i32;
+    fn ntcp_test_l4_checksum(kind: u32);
+}
+
+// The device's RX TCP checksum verdict: reported only once the queue opted
+// in (`enable_rx_checksum`), which the ring PMD's capabilities refuse;
+// GOOD and BAD as such, UNKNOWN and NONE (a checksum field not final) as
+// Unknown. Ring mbufs carry the injected flags, NOT a device's checks.
+unsafe fn rx_checksum_verdicts(io: &mut Dpdk) {
+    let mut out = [0; 64];
+    let mut verdict = |io: &mut Dpdk, kind| {
+        unsafe { ntcp_test_l4_checksum(kind) };
+        let packet = io.receive_with_metadata(&mut out).unwrap().unwrap();
+        assert_eq!((packet.len, out), (64, [0x42; 64]));
+        packet.l4_checksum
+    };
+    for kind in 0..4 {
+        assert_eq!(verdict(io, kind), RxChecksum::Unknown);
+    }
+    assert_eq!(
+        io.enable_rx_checksum().unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    // PRIVATE fixture only: the opt-in the ring PMD cannot grant.
+    io.rx_checksum = true;
+    let expected = [
+        RxChecksum::Unknown,
+        RxChecksum::Good,
+        RxChecksum::Bad,
+        RxChecksum::Unknown,
+    ];
+    for (kind, expected) in expected.into_iter().enumerate() {
+        assert_eq!(verdict(io, kind as u32), expected);
+    }
+    io.rx_checksum = false;
+    assert_eq!(unsafe { ntcp_test_available() }, 1023);
 }
 
 #[test]
@@ -32,6 +67,7 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         let _host = Host;
         let mut io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
         shared::ring_test(&mut io);
+        rx_checksum_verdicts(&mut io);
         ntcp_test_tso_gate();
         assert_eq!(io.tcp_segmentation_capabilities(), None);
         let request = TcpSegmentationRequest {

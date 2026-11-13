@@ -8,6 +8,12 @@ use core::num::NonZeroU16;
 pub struct RxPacketMetadata {
     pub timestamps: RxPacketTimestamps,
     pub tcp_segment_size: Option<NonZeroU16>,
+    /// The receiving device verified the TCP checksum over exactly these
+    /// bytes (Linux's CHECKSUM_UNNECESSARY), so input does not verify it
+    /// again. False, the default: verified in software. Never true for a
+    /// datagram other than the packet as the device received it (one
+    /// reassembled from fragments, or handed over without the verdict).
+    pub tcp_checksum_verified: bool,
 }
 impl RxPacketMetadata {
     pub fn validate_segment(self, segment: &wire::Segment<'_>) -> Result<(), Error> {

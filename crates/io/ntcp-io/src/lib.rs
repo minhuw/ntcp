@@ -155,6 +155,24 @@ pub struct PacketTimestamps {
     pub hardware: Option<PacketTimestamp>,
 }
 
+/// What the receiving device reported about a packet's transport (TCP or
+/// UDP) checksum, as DPDK reports it (RTE_MBUF_F_RX_L4_CKSUM_*). Only Good
+/// lets a consumer skip its own verification, as Linux trusts a driver's
+/// CHECKSUM_UNNECESSARY (skb_checksum_init in tcp_v4_rcv).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RxChecksum {
+    /// Not verified by the device, or not reported: DPDK's UNKNOWN, and its
+    /// NONE (the packet's checksum field is not final).
+    #[default]
+    Unknown,
+    /// The device verified it over exactly the bytes delivered.
+    Good,
+    /// The device found it wrong. A consumer verifies it again, as Linux
+    /// drivers hand such a packet up as CHECKSUM_NONE (ixgbe_rx_checksum,
+    /// mlx5e_handle_csum): the device's verdict alone drops nothing.
+    Bad,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceivedPacket {
     pub len: usize,
@@ -162,6 +180,9 @@ pub struct ReceivedPacket {
     // Original full TCP segment payload size of a checksummed aggregate.
     // None means ordinary raw ingress, never an inferred segmentation hint.
     pub tcp_segment_size: Option<std::num::NonZeroU16>,
+    // The device's verdict on this packet's transport checksum; Unknown
+    // unless the backend reports one.
+    pub l4_checksum: RxChecksum,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,6 +353,7 @@ pub trait PacketIo {
                 len,
                 timestamps: PacketTimestamps::default(),
                 tcp_segment_size: None,
+                l4_checksum: RxChecksum::Unknown,
             })
         })
     }
@@ -441,6 +463,7 @@ mod tests {
                 len: 1,
                 timestamps: PacketTimestamps::default(),
                 tcp_segment_size: None,
+                l4_checksum: RxChecksum::Unknown,
             })
         );
         assert_eq!(out, [7]);

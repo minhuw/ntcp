@@ -3877,6 +3877,33 @@ fn checksum_errors_count_segments_with_a_bad_tcp_checksum() {
     assert_eq!(b.checksum_errors(), 1);
 }
 
+// A segment whose TCP checksum the receiving device verified
+// (`RxPacketMetadata::tcp_checksum_verified`, Linux's CHECKSUM_UNNECESSARY)
+// is not verified again: shown with a corrupt one claimed verified.
+#[test]
+fn a_device_verified_checksum_is_not_verified_again() {
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    b.listen(remote, 4).unwrap();
+    a.connect(0, local, remote).unwrap();
+    let (ip, mut syn) = packets(&mut a, 0).pop().unwrap();
+    syn[16] ^= 1;
+    let verified = RxPacketMetadata {
+        tcp_checksum_verified: true,
+        ..Default::default()
+    };
+    let input = |b: &mut Endpoint, metadata| {
+        b.input_with_metadata(0, ip, 0, Ipv4Options::default(), &syn, metadata)
+    };
+    assert_eq!(
+        input(&mut b, RxPacketMetadata::default()),
+        Ok(InputDisposition::Dropped)
+    );
+    assert_eq!(input(&mut b, verified), Ok(InputDisposition::Processed));
+    assert_eq!(b.checksum_errors(), 1);
+}
+
 #[test]
 fn listen_overflows_and_drops_count_the_syns_a_listener_refuses() {
     // A full SYN queue (backlog 0 holds one), no connection slot, no buffer

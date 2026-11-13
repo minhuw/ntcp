@@ -3732,7 +3732,7 @@ impl Endpoint {
             bytes,
             crate::RxPacketMetadata {
                 timestamps,
-                tcp_segment_size: None,
+                ..Default::default()
             },
         )
     }
@@ -4066,7 +4066,12 @@ impl Endpoint {
         if route.is_some_and(|r| !self.admits_return_route(ip.destination, ip.source, &r)) {
             return Ok(None);
         }
-        let segment = match wire::parse(ip, bytes) {
+        let segment = if metadata.tcp_checksum_verified {
+            wire::parse_verified(ip, bytes)
+        } else {
+            wire::parse(ip, bytes)
+        };
+        let segment = match segment {
             Ok(segment) => segment,
             Err(error) => {
                 self.checksum_errors += u64::from(error == wire::WireError::InvalidChecksum);

@@ -1089,7 +1089,7 @@ fn simultaneous_clipped_prefix_metadata_duplicate_and_window_repair() {
             software: Some(stamp),
             ..Default::default()
         },
-        tcp_segment_size: None,
+        ..Default::default()
     };
     for (e, id, incoming) in [(&mut p.a, a, &sb), (&mut p.b, b, &sa)] {
         let s = wire::parse(incoming.0, &incoming.1).unwrap();

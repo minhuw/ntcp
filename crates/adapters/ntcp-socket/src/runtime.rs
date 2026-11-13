@@ -2249,9 +2249,11 @@ impl Owner {
         // Without time the segment stays unprocessed; the owner loop ends.
         let pair = ClockPair::sample(self)
             .map_err(|_| EndpointError::Connection(Error::AmbiguousTimeJump))?;
+        // AF_PACKET's DATA_VALID is not trusted: the checksum is verified.
         let metadata = ntcp::RxPacketMetadata {
             timestamps: stamps,
             tcp_segment_size: segment_size,
+            tcp_checksum_verified: false,
         };
         let result = if let Some(host) = &mut self.host {
             let arrival = arrival.ok_or(ntcp_host::Error::InvalidContext)?;
@@ -3153,8 +3155,8 @@ impl Owner {
                     let segment =
                         ntcp::wire::parse(packet.ip, packet.payload).map_err(|_| EINVAL)?;
                     ntcp::RxPacketMetadata {
-                        timestamps: Default::default(),
                         tcp_segment_size: Some(size),
+                        ..Default::default()
                     }
                     .validate_segment(&segment)
                     .map_err(|_| EINVAL)?;

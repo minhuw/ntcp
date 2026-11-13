@@ -459,10 +459,13 @@ impl PacketIo for AfPacket {
         if !config.rx_hardware {
             timestamps.hardware = None;
         }
+        // DATA_VALID (TP_STATUS_CSUM_VALID) is not reported: the stack
+        // verifies every checksum (vnet::decode).
         Ok(Some(ReceivedPacket {
             len,
             timestamps,
             tcp_segment_size,
+            l4_checksum: ntcp_io::RxChecksum::Unknown,
         }))
     }
 

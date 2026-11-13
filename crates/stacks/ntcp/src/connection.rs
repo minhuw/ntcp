@@ -2690,7 +2690,7 @@ impl Connection {
             segment,
             crate::RxPacketMetadata {
                 timestamps,
-                tcp_segment_size: None,
+                ..Default::default()
             },
         )
     }

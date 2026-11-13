@@ -111,7 +111,8 @@ fn reopened_syn_data_keeps_ordinary_tfo_authorization_window_and_first_receive_m
                         &syn,
                         RxPacketMetadata {
                             timestamps: stamps(99),
-                            tcp_segment_size: core::num::NonZeroU16::new(2)
+                            tcp_segment_size: core::num::NonZeroU16::new(2),
+                            ..Default::default()
                         }
                     ),
                     Err(EndpointError::Connection(Error::InvalidArgument))

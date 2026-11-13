@@ -82,6 +82,22 @@ void ntcp_test_timestamp(uint64_t value, int valid, int corrupt) {
     if (corrupt) m->pkt_len = 63;
     assert(rte_ring_enqueue(rx, m) == 0);
 }
+// 64 octets of 0x42 on the rx ring with the RX L4 checksum flags of
+// `kind`: 0 UNKNOWN, 1 GOOD, 2 BAD, 3 NONE.
+void ntcp_test_l4_checksum(unsigned kind) {
+    static const uint64_t flags[] = {
+        RTE_MBUF_F_RX_L4_CKSUM_UNKNOWN, RTE_MBUF_F_RX_L4_CKSUM_GOOD,
+        RTE_MBUF_F_RX_L4_CKSUM_BAD, RTE_MBUF_F_RX_L4_CKSUM_NONE,
+    };
+    assert(kind < RTE_DIM(flags));
+    struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+    assert(m);
+    void *bytes = rte_pktmbuf_append(m, 64);
+    assert(bytes);
+    memset(bytes, 0x42, 64);
+    m->ol_flags = flags[kind];
+    assert(rte_ring_enqueue(rx, m) == 0);
+}
 unsigned ntcp_test_tx_count(void) { return rte_ring_count(tx); }
 unsigned ntcp_test_rx_count(void) { return rte_ring_count(rx); }
 void ntcp_test_transformed(unsigned kind) {
