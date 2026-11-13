@@ -476,6 +476,16 @@ struct Slot {
 }
 
 impl Slot {
+    // Neither closed nor in TIME-WAIT, counted as it is, with no listener
+    // handoff or Fast Open owner left: the state part of Endpoint::refresh
+    // has nothing to do.
+    fn steady(&self) -> bool {
+        !matches!(self.connection.state(), State::Closed | State::TimeWait)
+            && !self.time_wait
+            && self.fast_open_owner.is_none()
+            && (self.listener.is_none() || self.accepted_ready)
+    }
+
     // The slot's next timer: the connection's, or the retry of a wait for
     // memory if that comes first.
     fn deadline(&self) -> Option<Instant> {
@@ -3278,6 +3288,75 @@ impl Endpoint {
             .map_err(|_| Error::NoMemory.into())
     }
 
+    // A connection in a steady state (`Slot::steady`) with no rare work
+    // pending (`Connection::refresh_work`) needs only its timer, events,
+    // output and managed progress: the walk would find nothing else to do,
+    // as Linux does that work where it arises, not on every pass.
+    fn refresh(&mut self, index: usize) {
+        if let Some(slot) = self.slots[index].as_ref()
+            && slot.steady()
+            && !slot.connection.refresh_work()
+        {
+            #[cfg(debug_assertions)]
+            self.check_refresh_steady(index);
+            self.refresh_steady(index);
+            return;
+        }
+        self.refresh_walk(index);
+        if let Some(slot) = self.slots[index].as_mut() {
+            slot.connection.settle_refresh_work();
+        }
+    }
+
+    // The part of the walk a steady connection with nothing pending needs.
+    fn refresh_steady(&mut self, index: usize) {
+        if self.managed_context.is_some()
+            && let Some(slot) = &self.slots[index]
+            && (slot.connection.unacknowledged() != self.progress_una[index]
+                || slot.connection.managed_results.unpublished())
+        {
+            self.progress.push(index);
+        }
+        if self.is_output_reserved(self.id(index)) {
+            self.deadlines.set(index, None);
+            return;
+        }
+        let slot = self.slots[index].as_ref().unwrap();
+        self.deadlines.set(index, slot.deadline());
+        if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
+            self.events.push(index);
+        }
+        if slot.mapped && !slot.connection.output_idle() {
+            self.output.push(index);
+        }
+    }
+
+    // Every test of the walk that `refresh_steady` leaves out finds
+    // nothing to do.
+    #[cfg(debug_assertions)]
+    fn check_refresh_steady(&self, index: usize) {
+        let slot = self.slots[index].as_ref().unwrap();
+        let connection = &slot.connection;
+        let state = connection.state();
+        assert!(!connection.send_expand_pending());
+        assert!(!connection.ledgers_reclaimable() && !connection.send_ring_reclaimable());
+        assert_eq!(slot.time_wait, state == State::TimeWait);
+        assert_eq!(connection.loss_events, crate::LossCounters::default());
+        assert_eq!(connection.split_refusals(), 0);
+        assert!(!connection.fast_open_negative);
+        assert!(connection.fast_open_learned.is_none());
+        assert!(!connection.fast_open_peer_reset);
+        assert!(slot.fast_open_owner.is_none());
+        assert!(!connection.iw_setup_loss());
+        assert!(!connection.route_advice_pending());
+        assert!(!(slot.released && state == State::TimeWait));
+        let newly_established = !slot.accepted_ready
+            && (connection.handshake_complete() || connection.fast_open_early)
+            && state != State::Closed;
+        assert!(!(slot.listener.is_some() && newly_established));
+        assert_ne!(state, State::Closed);
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc7413#section-3
     //# 3. The client caches the cookie for future TCP Fast Open connections (see below).
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
@@ -3304,7 +3383,7 @@ impl Endpoint {
     //# timeouts.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
     //# 3. If the SYN-ACK has a Fast Open option with a cookie, the client replaces the cookie and other information as described in the "Client Cookie Handling" section (Section 4.1.3). Otherwise, if the SYN-ACK is first seen and not a (spurious) retransmission, the client MAY remove the server information from the cookie cache. If the SYN-ACK is a spurious retransmission, the client does nothing to the cookie cache for the reasons below.
-    fn refresh(&mut self, index: usize) {
+    fn refresh_walk(&mut self, index: usize) {
         // RFC 7413 §5.1: retain recent remote resets in admission accounting.
         // Sixty seconds and latest-reset batch retention are local policy.
         let reset_cooldown = self.config.connection.timebase.ticks_from_us(60_000_000);

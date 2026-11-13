@@ -1106,6 +1106,11 @@ pub(crate) struct Connection {
     // now raise (Linux's tcp_check_space with SOCK_NOSPACE set).
     send_max: usize,
     send_expand_pending: bool,
+    // Set wherever this connection leaves work for Endpoint::refresh to
+    // take: the flags and counters `refresh_work_held` reads. The refresh
+    // that takes them settles it, so the refresh of a connection with
+    // nothing pending skips the walk over them.
+    refresh_work: bool,
     // The receive direction's limits, as the send direction's: whether it
     // is tuned, the ring below which memory pressure still lets it grow
     // (tcp_rmem[0]) and the ring it may grow to (tcp_rmem[2]).
@@ -1493,6 +1498,7 @@ impl Connection {
             send_min: send_sizes.min,
             send_max: send_sizes.max,
             send_expand_pending: false,
+            refresh_work: false,
             receive_tuned,
             receive_min: receive_sizes.min,
             receive_max: receive_sizes.max,
@@ -2543,6 +2549,7 @@ impl Connection {
             return false;
         }
         self.loss_events.sack_recoveries += 1;
+        self.refresh_work = true;
         self.note_iw_loss(self.snd_una);
         self.reset_tlp();
         self.sack_recovery = Some(SackRecovery {
@@ -2836,6 +2843,11 @@ impl Connection {
         Ok(count)
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn route_advice_pending(&self) -> bool {
+        self.route_advice_pending
+    }
+
     pub(crate) fn take_route_advice(&mut self) -> bool {
         core::mem::take(&mut self.route_advice_pending)
     }
@@ -2909,6 +2921,7 @@ impl Connection {
     fn report_fast_open_failure(&mut self) {
         if self.handshake_pending() && core::mem::take(&mut self.fast_open_attempt) {
             self.fast_open_negative = true;
+            self.refresh_work = true;
         }
     }
 
@@ -3459,6 +3472,7 @@ impl Connection {
         // The probe's first accepted sequence-bearing segment sends it.
         if sequence && d.loss_probe {
             self.loss_events.loss_probes += 1;
+            self.refresh_work = true;
             d.loss_probe = false;
         }
         if d.ptb_repair {
@@ -3540,6 +3554,7 @@ impl Connection {
         self.total_retrans += 1;
         self.loss_events.retransmitted_segments += 1;
         self.loss_events.timeout_retransmitted_segments += u64::from(timeout_recovery);
+        self.refresh_work = true;
     }
 
     pub(crate) fn abandon_reserved_output(&mut self) {
@@ -4518,6 +4533,7 @@ impl Connection {
             // A family default is not an observed MSS. Pure crossing SYNs
             // never reach this path: their credential was issued locally.
             self.fast_open_learned = Some((cookie, segment.options.mss));
+            self.refresh_work = true;
         }
     }
 
@@ -5356,6 +5372,34 @@ impl Connection {
 
     // SACK splits the ledger refused since the last call
     // (MemoryCounters::ledger_split_refusals).
+    // Whether Endpoint::refresh has work to take from this connection:
+    // anything `refresh_work_held` reads, or a drained send ring or ledger
+    // set above its reserve. Both reclaims need an empty send queue, which
+    // a connection with data queued tests in one load.
+    pub(crate) fn refresh_work(&self) -> bool {
+        debug_assert!(self.refresh_work || !self.refresh_work_held());
+        self.refresh_work
+            || self.send.len() == 0 && (self.send_ring_reclaimable() || self.ledgers_reclaimable())
+    }
+
+    // After Endpoint::refresh took what it could: work stays pending only
+    // while something is left, such as advice a reserved connection keeps
+    // for a later refresh, or a setup loss, which every refresh records.
+    pub(crate) fn settle_refresh_work(&mut self) {
+        self.refresh_work = self.refresh_work_held();
+    }
+
+    fn refresh_work_held(&self) -> bool {
+        self.send_expand_pending
+            || self.loss_events != crate::LossCounters::default()
+            || self.rack.split_refusals != 0
+            || self.fast_open_negative
+            || self.fast_open_learned.is_some()
+            || self.fast_open_peer_reset
+            || self.iw_setup_loss
+            || self.route_advice_pending
+    }
+
     pub(crate) fn take_split_refusals(&mut self) -> u64 {
         core::mem::take(&mut self.rack.split_refusals)
     }
@@ -7067,6 +7111,7 @@ impl Connection {
         if h.flags & RST != 0 {
             if seq == next {
                 self.fast_open_peer_reset = self.handshake_pending() && self.fast_open_early;
+                self.refresh_work |= self.fast_open_peer_reset;
                 // Preserve earlier path-failure evidence without adding any for RST.
                 let passive =
                     self.handshake_pending() && self.passive_open && !self.fast_open_early;
@@ -7430,6 +7475,7 @@ impl Connection {
             );
             dsack = update.dsack;
             self.loss_events.dsack_received += u64::from(update.dsack);
+            self.refresh_work |= update.dsack;
             if update.overflow {
                 // SACK advice exhaustion disables inference, never timestamp
                 // retention: normal RTO still needs each latest wire boundary.
@@ -7459,6 +7505,7 @@ impl Connection {
                 update.dsack,
                 bound,
             );
+            self.refresh_work |= self.rack.split_refusals != 0;
             reo_grew = self.rack.reo_grew;
             if update.newly_sacked != 0 {
                 self.ptb_sacked(&ptb_sack);
@@ -7513,6 +7560,7 @@ impl Connection {
         // duplicate-delivery evidence needs the same loss/ECN epoch guards as
         // fast recovery, but no retransmission (the probe repaired the loss).
         self.loss_events.loss_probe_recoveries += u64::from(tlp_repaired);
+        self.refresh_work |= tlp_repaired;
         let tlp_reduced =
             tlp_repaired && self.congestion.on_tlp_repair(ack, tlp_flight, self.snd_nxt);
         if tlp_reduced {
@@ -7727,6 +7775,7 @@ impl Connection {
                 probe,
             ) {
                 self.loss_events.reno_recoveries += 1;
+                self.refresh_work = true;
                 if self.config.prr {
                     self.prr = Some(Prr::new(self.data_flight(), self.mss as u32));
                 }
@@ -8101,6 +8150,7 @@ impl Connection {
                 false,
                 bound,
             );
+            self.refresh_work |= self.rack.split_refusals != 0;
         }
         // Timestamp storage follows cumulative send-buffer reclamation even
         // while SACK inference is suspended below its fallback boundary.
@@ -8140,6 +8190,7 @@ impl Connection {
             // space while SOCK_NOSPACE is set: a writer that found no room
             // lets the endpoint raise a tuned limit (`expand_send`).
             self.send_expand_pending |= self.send_tuned && self.send_backpressured;
+            self.refresh_work |= self.send_expand_pending;
             if self.send_space_remaining() != 0 {
                 self.send_backpressured = false;
             }
@@ -11491,6 +11542,7 @@ impl Connection {
         if tlp && length != 0 {
             if !reserve {
                 self.loss_events.loss_probes += 1;
+                self.refresh_work = true;
             }
             // A probe is not Limited Transmit: it must neither earn its
             // duplicate-ACK credit nor be excluded from congestion FlightSize.
@@ -11723,6 +11775,7 @@ impl Connection {
         {
             epoch.lost = true;
             self.iw_setup_loss = true;
+            self.refresh_work = true;
             if epoch.bytes > 4_096 {
                 self.iw_fallback = true;
             }
@@ -12024,6 +12077,7 @@ impl Connection {
             self.rto_deadline = head_sent.map(|sent| sent.saturating_add(self.rto()));
         } else if expired_loss == Some(LossTimer::Rto) {
             self.loss_events.timeouts += 1;
+            self.refresh_work = true;
             self.growth_dupack_bytes = 0;
             self.congestion.disarm_initial_ack_heuristic();
             // A genuinely transmitted TFO request that reaches RTO trains the
@@ -12091,6 +12145,7 @@ impl Connection {
             if self.consecutive_timeouts == 3 {
                 self.events.retransmission_warning = true;
                 self.route_advice_pending = true;
+                self.refresh_work = true;
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2
             //= reason=Connection wires timeout/backoff and ACKs into the congestion controller in recovery.rs.

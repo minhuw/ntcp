@@ -7295,3 +7295,123 @@ mod accept_reset;
 
 #[path = "shared_payload_tests.rs"]
 mod shared_payload;
+
+// Randomized request/response and bulk exchanges between two endpoints,
+// with loss and reordering. Every refresh that skips the rare-work walk
+// checks in debug builds that the walk had nothing to do, and
+// loss_counters checks that each refresh took what its connection counted.
+#[test]
+fn randomized_exchanges_cross_check_refresh_fast_path() {
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x % n.max(1)
+        }
+    }
+    let mut expirations = 0;
+    let mut retransmitted = 0;
+    for seed in 1..=24u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let loss = [0, 10, 40][seed as usize % 3];
+        let reorder = seed % 2 == 0;
+        let mut cfg = config();
+        cfg.connection = ConnectionConfig {
+            mss: 536,
+            send_capacity: 16_384,
+            receive_capacity: 16_384,
+            sack: true,
+            rack: true,
+            tlp: true,
+            nagle: false,
+            ..ConnectionConfig::default()
+        };
+        let (local, remote) = addresses();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let listener = b.listen(remote, 4).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        let mut now: Instant = 0;
+        let mut server = None;
+        // (arrival, to b, frame)
+        let mut flights: Vec<(Instant, bool, (IpMetadata, Vec<u8>))> = Vec::new();
+        let mut written = [Vec::new(), Vec::new()];
+        let mut read = [Vec::new(), Vec::new()];
+        for step in 0..400u64 {
+            if server.is_none() {
+                server = b.accept(listener).ok();
+            }
+            let ids = [Some(client), server];
+            for (side, endpoint) in [&mut a, &mut b].into_iter().enumerate() {
+                if let Some(id) = ids[side]
+                    && rng.below(3) == 0
+                {
+                    let bulk = rng.below(6) == 0;
+                    let len = 1 + rng.below(if bulk { 9000 } else { 200 });
+                    let data: Vec<u8> = (0..len).map(|i| (i ^ step) as u8).collect();
+                    let n = endpoint.write(id, &data).unwrap_or(0);
+                    written[side].extend_from_slice(&data[..n]);
+                }
+            }
+            for (to_b, endpoint) in [(true, &mut a), (false, &mut b)] {
+                for packet in packets(endpoint, now) {
+                    if rng.below(1000) >= loss {
+                        let delay = 2_000 + if reorder { rng.below(6_000) } else { 0 };
+                        flights.push((now + delay, to_b, packet));
+                    }
+                }
+            }
+            let Some(next) = flights
+                .iter()
+                .map(|f| f.0)
+                .chain(a.next_deadline())
+                .chain(b.next_deadline())
+                .min()
+            else {
+                continue;
+            };
+            now = now.max(next);
+            flights.sort_by_key(|f| f.0);
+            while flights.first().is_some_and(|f| f.0 <= now) {
+                let (_, to_b, (ip, bytes)) = flights.remove(0);
+                let to = if to_b { &mut b } else { &mut a };
+                to.input(now, ip, &bytes).unwrap();
+            }
+            for endpoint in [&mut a, &mut b] {
+                if endpoint
+                    .next_deadline()
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    endpoint.on_timeout(now, 64).unwrap();
+                    expirations += 1;
+                }
+            }
+            for (side, endpoint) in [&mut b, &mut a].into_iter().enumerate() {
+                if let Some(id) = ids[1 - side] {
+                    let mut buf = vec![0; 65536];
+                    let n = endpoint.read(id, &mut buf).unwrap_or(0);
+                    read[side].extend_from_slice(&buf[..n]);
+                }
+                while endpoint.next_event().is_some() {}
+            }
+            retransmitted =
+                a.loss_counters().retransmitted_segments + b.loss_counters().retransmitted_segments;
+        }
+        for side in 0..2 {
+            assert!(!read[side].is_empty(), "seed {seed}");
+            assert_eq!(
+                read[side][..],
+                written[side][..read[side].len()],
+                "seed {seed}"
+            );
+        }
+        if loss != 0 {
+            assert_ne!(retransmitted, 0, "seed {seed}");
+        }
+    }
+    assert!(expirations > 100, "{expirations}");
+}
