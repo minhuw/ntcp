@@ -1218,6 +1218,8 @@ impl<P: PacketIo> Network<P> {
                 u64::from(e == EndpointError::Connection(ntcp::Error::NoMemory));
             let _ = self.endpoint.abort(core);
             let _ = self.endpoint.release(core);
+            // What it took comes back now, not at the next drive.
+            self.wake_members_for_memory();
             self.host.collect(&self.endpoint)?;
             return Err(e.into());
         }
@@ -1287,6 +1289,7 @@ impl<P: PacketIo> Network<P> {
         {
             let _ = self.endpoint.abort(core);
             let _ = self.endpoint.release(core);
+            self.wake_members_for_memory();
             return Err(e.into());
         }
         let acceptable = self.endpoint.listener_queue_info(core_listener)?.0 != 0;

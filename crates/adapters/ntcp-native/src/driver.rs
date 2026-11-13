@@ -97,13 +97,7 @@ impl<P: PacketIo> Network<P> {
         let result = self.drive_inner(now, budget, &mut rx, &mut completed, &mut report);
         self.rx = rx;
         self.completed = completed;
-        // Memory this member returned to the group wakes the members whose
-        // writers wait for it.
-        if self.endpoint.take_memory_returned()
-            && let Some(flows) = &self.flows
-        {
-            flows.wake_memory_waiters();
-        }
+        self.wake_members_for_memory();
         self.counters.received += report.received as u64;
         self.counters.transmitted += report.transmitted as u64;
         self.counters.discarded += report.discarded as u64;
@@ -114,6 +108,16 @@ impl<P: PacketIo> Network<P> {
             });
         }
         Ok(report)
+    }
+    // Memory this member returned to the group since the last look wakes
+    // the members whose writers wait for it: as each drive ends, and as a
+    // call outside drive that returned memory ends.
+    pub(crate) fn wake_members_for_memory(&mut self) {
+        if self.endpoint.take_memory_returned()
+            && let Some(flows) = &self.flows
+        {
+            flows.wake_memory_waiters();
+        }
     }
     fn drive_inner(
         &mut self,

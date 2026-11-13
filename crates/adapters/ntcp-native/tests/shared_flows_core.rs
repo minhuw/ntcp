@@ -802,6 +802,119 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
     assert_eq!(memory.buffer_bytes(), charged(&lan));
 }
 
+// Two members of shared memory at batch 1, with `memory` as the group's
+// thresholds: member 0 keeps receive timestamps for more ranges than any
+// budget holds and has no connection; member 1, whose send ring is 256 KiB,
+// has one to the peer.
+fn refused_open_lan(memory: Option<ntcp::BufferMemory>) -> (Lan, SharedFlows, ConnId) {
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: vec![0, 1],
+    };
+    let limits = SharedFlowLimits {
+        memory_batch_bytes: 1,
+        buffer_memory: memory,
+        ..limits(2)
+    };
+    let flows = SharedFlows::new(ownership, limits).unwrap();
+    let table = neighbors(2);
+    let members = (0..2)
+        .map(|k| {
+            Station::new(|port| {
+                let mut config = config(SHARED, PORT_MAC);
+                if k == 0 {
+                    config.tx_timestamp_phases = 2;
+                    config.rx_timestamp_ranges = 1 << 24;
+                } else {
+                    config.tcp.connection.send_capacity = 1 << 18;
+                }
+                Network::with_shared_flows(config, port, [7; 32], 0, Some(&table), &flows, k)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut lan = lan(members);
+    let listener = lan.peer.network.listen(PEER_SERVICE, 4).unwrap();
+    let to = SocketAddr::new(PEER.into(), PEER_SERVICE);
+    let id = lan.members[1].network.connect(to).unwrap();
+    while lan.members[1].network.connection_info(id).unwrap().state != State::Established {
+        assert!(lan.now < 5 * SECOND, "connection established");
+        lan.step();
+        while lan.peer.network.accept(listener).is_ok() {}
+    }
+    (lan, flows, id)
+}
+
+// A call outside drive that returns memory to the group wakes the members
+// whose writers wait for it as it ends, not at its member's next drive:
+// here an open refused for its receive timestamp records gives back the
+// transmit records it took.
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_an_open_returns_outside_drive_wakes_another_members_writer() {
+    use std::{
+        fs::File,
+        io::Read,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    };
+    let (lan, flows, _) = refused_open_lan(None);
+    let charged = flows.buffer_memory().unwrap().buffer_bytes();
+    drop((lan, flows));
+    // Room for member 0's open, not for member 1's send ring.
+    let high = charged + (64 << 10);
+    let memory = ntcp::BufferMemory {
+        low: high / 2,
+        pressure: high,
+        high,
+    };
+    let (mut lan, flows, id) = refused_open_lan(Some(memory));
+    let memory = flows.buffer_memory().unwrap().clone();
+    assert_eq!(memory.buffer_bytes(), charged);
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let wake = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let dup = unsafe { libc::dup(wake.as_raw_fd()) };
+    lan.members[1]
+        .network
+        .set_neighbor_wake_fd(unsafe { OwnedFd::from_raw_fd(dup) })
+        .unwrap();
+    let signalled = |file: &File| {
+        let mut entry = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut entry, 1, 0) } > 0;
+        if ready {
+            let _ = (&*file).read(&mut [0; 8]);
+        }
+        ready
+    };
+    let data = vec![5u8; 4096];
+    let result = lan.members[1]
+        .network
+        .try_write(id, &data, WriteOptions::default());
+    assert!(matches!(result, Err(Error::WouldBlock(_))), "{result:?}");
+    assert!(memory.waiting(1));
+    lan.step();
+    drained(&mut lan.members[1].network);
+    signalled(&wake);
+    assert!(memory.waiting(1));
+    // Member 0's open takes its connection and transmit records, then its
+    // receive records are refused: the open gives them back.
+    let to = SocketAddr::new(PEER.into(), PEER_SERVICE);
+    let refused = lan.members[0].network.connect(to);
+    assert!(matches!(refused, Err(Error::NoMemory)), "{refused:?}");
+    assert_eq!(lan.members[0].network.counters().memory_refused_opens, 1);
+    assert!(signalled(&wake), "member 1's descriptor was written");
+    assert_eq!(memory.buffer_bytes(), {
+        lan.members
+            .iter()
+            .map(|m| m.network.counters().buffer_bytes)
+            .sum::<usize>()
+    });
+}
+
 // Shared flows share buffer memory by default, in Linux's 1 MiB batches;
 // a batch of 0 leaves each member its own budget, and fixed thresholds
 // must be ordered.
