@@ -4302,7 +4302,37 @@ impl Connection {
 
     pub(crate) fn update_time(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
+        // The instant is processed once, as tcp_mstamp_refresh takes the
+        // clock once: at the same instant no chronograph advances, and
+        // nothing has been sampled since that predates it, so the stale
+        // rule below has nothing new to find.
+        if now == self.now {
+            debug_assert!(!self.timestamps_stale(now));
+            return Ok(());
+        }
         self.transport_ticks = self.transport_ticks_at(now);
+        if self.timestamps_stale(now) {
+            self.sample = None;
+            self.last_timestamp_sent_at = None;
+            self.tlp_fresh_rtt = false;
+            // Discard stale transmission history, not queued bytes or
+            // cleanup/retransmission deadlines; ordinary loss recovery remains.
+            if self.flight() != 0 {
+                self.rack.abandon(self.data_high());
+                // The exact reserved bytes/timers survive, but acceptance must
+                // not require or recreate this discarded timestamp evidence.
+                self.reserved_ledger = None;
+                self.congestion.end_ecn_prr();
+                self.prr = None;
+            }
+        }
+        self.now = now;
+        Ok(())
+    }
+
+    // Whether the RTT sample or the last timestamp sent is too old at `now`
+    // for its timestamp to compare in serial order.
+    fn timestamps_stale(&self, now: Instant) -> bool {
         // Endpoint validates caller clock gaps. A dormant connection may lag
         // that serviced clock by more than the timestamp serial half-range.
         let granularity = if self.config.timestamps {
@@ -4321,25 +4351,8 @@ impl Connection {
                     .saturating_sub(granularity.tick_in(sent, self.config.timebase))
                     >= 1 << 31
         };
-        if self.sample.is_some_and(|(_, sent)| stale(sent))
+        self.sample.is_some_and(|(_, sent)| stale(sent))
             || self.last_timestamp_sent_at.is_some_and(stale)
-        {
-            self.sample = None;
-            self.last_timestamp_sent_at = None;
-            self.tlp_fresh_rtt = false;
-            // Discard stale transmission history, not queued bytes or
-            // cleanup/retransmission deadlines; ordinary loss recovery remains.
-            if self.flight() != 0 {
-                self.rack.abandon(self.data_high());
-                // The exact reserved bytes/timers survive, but acceptance must
-                // not require or recreate this discarded timestamp evidence.
-                self.reserved_ledger = None;
-                self.congestion.end_ecn_prr();
-                self.prr = None;
-            }
-        }
-        self.now = now;
-        Ok(())
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1

@@ -20268,3 +20268,34 @@ fn timebase_conversions_match_the_dividing_formulas() {
         }
     }
 }
+
+#[test]
+fn update_time_processes_each_instant_once() {
+    let cfg = ConnectionConfig {
+        timestamps: true,
+        ..config(256, 64)
+    };
+    let (mut a, _) = pair(cfg, 100);
+    a.write(b"old").unwrap();
+    packet(&mut a, 1_999);
+    let sample = a.sample;
+    let sent = a.last_timestamp_sent_at;
+    assert!(sample.is_some() && sent.is_some());
+    // The send at 1,999 is processed; repeating it changes nothing.
+    let ticks = a.transport_ticks;
+    for _ in 0..3 {
+        a.update_time(1_999).unwrap();
+        assert_eq!((a.now, a.transport_ticks), (1_999, ticks));
+    }
+    let boundary = 1_999 + ((1u64 << 31) - 1) * 1_000;
+    a.update_time(boundary).unwrap();
+    let ticks = a.transport_ticks;
+    assert_ne!(ticks, [0; 3]);
+    a.update_time(boundary).unwrap();
+    assert_eq!((a.sample, a.last_timestamp_sent_at), (sample, sent));
+    assert_eq!(a.transport_ticks, ticks);
+    // The next instant still runs the stale rule.
+    a.update_time(boundary + 1).unwrap();
+    assert_eq!((a.sample, a.last_timestamp_sent_at), (None, None));
+    assert_eq!(a.update_time(boundary), Err(Error::TimeWentBackwards));
+}
