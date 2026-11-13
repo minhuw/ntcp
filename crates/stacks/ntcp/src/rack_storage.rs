@@ -231,6 +231,14 @@ impl Intervals {
         self.head = 0;
         self.len = 0;
     }
+    // Frees every slot of an empty ledger; growth allocates them again.
+    pub(super) fn release(&mut self) {
+        assert!(self.len == 0);
+        self.blocks = Vec::new();
+        self.head = 0;
+        self.capacity = 0;
+        self.allocation = 0;
+    }
 }
 impl Index<usize> for Intervals {
     type Output = Interval;

@@ -765,6 +765,11 @@ fn window_scale(space: usize) -> u8 {
         .unwrap_or(14)
 }
 
+// Ledger storage a drained connection keeps: one page, as Linux's
+// sk_mem_reclaim leaves a socket less than PAGE_SIZE of sk_forward_alloc.
+// The first write's ledgers (2 * 10 + SPARE entries, 2.2 KB) fit in it.
+pub(crate) const LEDGER_RESERVE: usize = 4096;
+
 fn rounded_send_space(capacity: usize, quantum: usize) -> usize {
     if capacity < quantum {
         capacity
@@ -5232,6 +5237,32 @@ impl Connection {
             .admission_room(self.notsent_bytes(), lowat)
             .min(space)
             .min(usize::try_from(cursor_room).unwrap_or(usize::MAX))
+    }
+
+    // Whether the ledgers hold more than LEDGER_RESERVE while nothing is
+    // queued or in flight. Linux frees an emptied retransmission queue's
+    // skbs at ACK (tcp_clean_rtx_queue, sk_wmem_free_skb) and sk_mem_reclaim
+    // returns the memory above less than a page of reserve; the ledgers
+    // likewise free what they grew past a page once drained, and a
+    // connection whose writes never needed more (a request/response one)
+    // reallocates nothing per exchange.
+    pub(crate) fn ledgers_reclaimable(&self) -> bool {
+        self.send.len() == 0
+            && self.rack.len() == 0
+            && self.scoreboard.ranges().is_empty()
+            && self.rack.allocation_bytes() + self.scoreboard.storage_bytes() > LEDGER_RESERVE
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ledger_bytes(&self) -> usize {
+        self.rack.allocation_bytes() + self.scoreboard.storage_bytes()
+    }
+
+    // Frees both ledgers' storage (`ledgers_reclaimable`); nothing
+    // allocates, and the next write grows them again.
+    pub(crate) fn reclaim_ledgers(&mut self) {
+        self.rack.release();
+        self.scoreboard.release();
     }
 
     // What an ACK's SACK splits are held to: the queued payload and

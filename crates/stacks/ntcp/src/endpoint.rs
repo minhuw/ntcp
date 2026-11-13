@@ -3321,6 +3321,18 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             slot.connection.expand_send(allowed);
         }
+        if self.slots[index]
+            .as_ref()
+            .is_some_and(|slot| slot.connection.ledgers_reclaimable())
+        {
+            // Drained ledgers above their reserve return to the budget,
+            // waking writers waiting for memory.
+            let connection = &mut self.slots[index].as_mut().unwrap().connection;
+            let old = connection.buffer_charge();
+            connection.reclaim_ledgers();
+            let new = connection.buffer_charge();
+            self.recharge(old, new);
+        }
         if let Some(slot) = self.slots[index].as_mut() {
             // Every change of a connection's state is followed by its
             // refresh, or ends in its reclaim.
@@ -8940,6 +8952,54 @@ mod memory_wait_tests {
         assert_eq!(out[..9], [1; 9]);
         assert_eq!(out[9..9 + data.len()], data[..]);
         assert!(a.buffer_bytes() <= a.config.max_buffer_bytes);
+    }
+
+    // A connection whose queue and flight drained frees ledgers grown past
+    // a page, as Linux frees an emptied retransmission queue's skbs at ACK
+    // and sk_mem_reclaim returns what exceeds its reserve; the return wakes
+    // a writer waiting for memory. Ledgers within a page stay: the next
+    // small write and its exchange reallocate nothing.
+    #[test]
+    fn drained_ledgers_above_a_page_are_freed_and_wake_a_waiter() {
+        let (mut a, mut b, listener) = endpoints();
+        let (bulk, server) = connect(&mut a, &mut b, listener, 40000);
+        let (waiter, _) = connect(&mut a, &mut b, listener, 40001);
+        let ledgers = |a: &Endpoint| a.slot(bulk).unwrap().connection.ledger_bytes();
+        let data = long_data();
+        assert_eq!(a.write(bulk, &data), Ok(data.len()));
+        let held = ledgers(&a);
+        assert!(held > crate::connection::LEDGER_RESERVE);
+        writable(&mut a, waiter);
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        assert_eq!(a.write(waiter, &[1; 9]), Err(Error::WouldBlock.into()));
+        assert!(!writable(&mut a, waiter));
+        let charged = a.buffer_bytes();
+        let mut read = 0;
+        for now in 1..64 {
+            exchange(&mut a, &mut b, now);
+            read += b.read(server, &mut [0; 1024]).unwrap_or(0);
+            if a.slot(bulk).unwrap().connection.send_progress().queued_end
+                == a.acknowledged(bulk).unwrap()
+            {
+                break;
+            }
+        }
+        assert_eq!(read, data.len());
+        assert_eq!(ledgers(&a), 0);
+        assert_eq!(a.buffer_bytes(), charged - held);
+        assert!(writable(&mut a, waiter));
+        assert_eq!(a.write(waiter, &[1; 9]), Ok(9));
+        // A small write allocates ledgers within the reserve, which stay
+        // once it is acknowledged.
+        a.config.max_buffer_bytes = usize::MAX;
+        assert_eq!(a.write(bulk, &[2; 9]), Ok(9));
+        let small = ledgers(&a);
+        assert!(small > 0 && small <= crate::connection::LEDGER_RESERVE);
+        exchange(&mut a, &mut b, 100);
+        assert_eq!(b.read(server, &mut [0; 16]), Ok(9));
+        let progress = a.slot(bulk).unwrap().connection.send_progress();
+        assert_eq!(progress.queued_end, progress.acknowledged);
+        assert_eq!(ledgers(&a), small);
     }
 
     #[test]

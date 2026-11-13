@@ -97,6 +97,15 @@ impl Scoreboard {
         self.len = 0;
     }
 
+    // Frees the ranges while none is held and nothing is in flight: no
+    // block can then fall inside [ack, high_data), so update records none.
+    // The next write allocates them again.
+    pub(crate) fn release(&mut self) {
+        debug_assert_eq!(self.len, 0);
+        self.ranges = Vec::new();
+        self.capacity = 0;
+    }
+
     // The ranges holding every octet SACKed since the previous call, or None
     // if they did not fit: the caller must then consider all of ranges().
     pub(crate) fn take_fresh(&mut self) -> Option<([(Seq, Seq); FRESH], usize)> {

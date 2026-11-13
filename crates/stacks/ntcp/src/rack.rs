@@ -327,6 +327,14 @@ impl Rack {
         self.capacity
     }
 
+    // Frees every entry of an empty ledger, as Linux frees the skbs of an
+    // emptied retransmission queue; the next write allocates again.
+    pub(crate) fn release(&mut self) {
+        debug_assert!(self.intervals.is_empty());
+        self.intervals.release();
+        self.capacity = 0;
+    }
+
     // Entries fresh output may still take, leaving SPARE; unbounded while
     // the ledger is abandoned, which records no transmission.
     pub(crate) fn fresh_room(&self) -> usize {
