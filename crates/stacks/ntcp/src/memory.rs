@@ -542,15 +542,24 @@ impl Budget {
     }
 }
 
-// A member that goes takes its charge, connections and thresholds out of
-// the group; what it held counts as returned.
-impl Drop for Budget {
-    fn drop(&mut self) {
+impl Budget {
+    // Leave the group at `now`, if a member (`Endpoint::leave_buffer_memory`,
+    // and as the endpoint drops): its reserve is published, so the group's
+    // counter holds its whole charge, and then the charge, its connections
+    // and its thresholds go out of the group. Pressure ends if what the
+    // group holds is now at most its low threshold, as
+    // __sk_mem_reduce_allocated checks after a return, and the return bumps
+    // the group's `returns` for the waiting members to look again. The
+    // endpoint keeps its charge and connections on a budget of its own,
+    // outside pressure until its next change. Whether it was a member.
+    pub(crate) fn leave_group(&mut self, now: Instant) -> bool {
         let Some(share) = self.share.take() else {
-            return;
+            return false;
         };
         let group = &share.group;
-        let published = (self.charged as isize - share.reserve) as usize;
+        // The reserve published (proto_memory_pcpu_drain) and the whole
+        // charge returned, in one step: what this member published goes.
+        let published = self.charged.checked_add_signed(-share.reserve).unwrap();
         group.allocated.fetch_sub(published, Ordering::Relaxed);
         group.sockets.fetch_sub(self.sockets, Ordering::Relaxed);
         if let Some(own) = share.contributed {
@@ -561,6 +570,10 @@ impl Drop for Budget {
         let owner = &group.owners[share.owner];
         owner.waiting.store(false, Ordering::SeqCst);
         owner.taken.store(false, Ordering::Relaxed);
+        if group.allocated.load(Ordering::Relaxed) <= group.low.load(Ordering::Relaxed) {
+            group.leave(now);
+        }
         group.returned();
+        true
     }
 }

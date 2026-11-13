@@ -629,12 +629,21 @@ fn the_inbox_and_the_queue_share_a_drives_receive_budget() {
 // at open beside its reservations plus `extra`, sharing those budgets as
 // one charged in 1-byte batches; each opens one connection to the peer.
 fn shared_memory_lan(extra: usize) -> (Lan, SharedFlows, Vec<ConnId>) {
+    shared_memory_lan_with(extra, None)
+}
+
+// As shared_memory_lan, with `memory` as the group's thresholds.
+fn shared_memory_lan_with(
+    extra: usize,
+    memory: Option<ntcp::BufferMemory>,
+) -> (Lan, SharedFlows, Vec<ConnId>) {
     let ownership = FlowOwnership::Hash {
         key: DEFAULT_FLOW_KEY.to_vec(),
         table: vec![0, 1],
     };
     let limits = SharedFlowLimits {
         memory_batch_bytes: 1,
+        buffer_memory: memory,
         ..limits(2)
     };
     let flows = SharedFlows::new(ownership, limits).unwrap();
@@ -800,6 +809,96 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
     assert_eq!(receipt.accepted, data.len() - taken);
     assert_eq!(lan.members[1].network.counters().memory_throttled_writes, 1);
     assert_eq!(memory.buffer_bytes(), charged(&lan));
+}
+
+// A member that goes takes all it charged out of the group and writes the
+// wake descriptor of every member whose writer waits for memory; that
+// member's next drive finds the room and its writer takes the rest.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_member_that_goes_returns_its_memory_and_wakes_the_others() {
+    use std::{
+        fs::File,
+        io::Read,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    };
+    let data = vec![5u8; 2896];
+    let (mut lan, flows, ids) = shared_memory_lan(1 << 30);
+    let charged = flows.buffer_memory().unwrap().buffer_bytes();
+    lan.members[0]
+        .network
+        .try_write(ids[0], &data, WriteOptions::default())
+        .unwrap();
+    let write = flows.buffer_memory().unwrap().buffer_bytes() - charged;
+    drop((lan, flows));
+    // A fixed cap with room for one such write and a half.
+    let high = charged + write * 3 / 2;
+    let fixed = ntcp::BufferMemory {
+        low: charged / 2,
+        pressure: high,
+        high,
+    };
+    let (mut lan, flows, ids) = shared_memory_lan_with(1 << 30, Some(fixed));
+    let memory = flows.buffer_memory().unwrap().clone();
+    assert_eq!(memory.buffer_bytes(), charged);
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let wake = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let dup = unsafe { libc::dup(wake.as_raw_fd()) };
+    lan.members[1]
+        .network
+        .set_neighbor_wake_fd(unsafe { OwnedFd::from_raw_fd(dup) })
+        .unwrap();
+    let signalled = |file: &File| {
+        let mut entry = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut entry, 1, 0) } > 0;
+        if ready {
+            let _ = (&*file).read(&mut [0; 8]);
+        }
+        ready
+    };
+    let receipt = lan.members[0]
+        .network
+        .try_write(ids[0], &data, WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, data.len());
+    let taken = match lan.members[1]
+        .network
+        .try_write(ids[1], &data, WriteOptions::default())
+    {
+        Ok(receipt) => receipt.accepted,
+        Err(error) => {
+            assert!(matches!(error, Error::WouldBlock(_)), "{error:?}");
+            0
+        }
+    };
+    assert!(taken < data.len());
+    assert!(memory.waiting(1));
+    lan.step();
+    drained(&mut lan.members[1].network);
+    signalled(&wake);
+    // Member 0 goes: no drive of its own wakes member 1, its leaving does.
+    drop(lan.members.remove(0));
+    assert!(signalled(&wake), "member 1's descriptor was written");
+    assert_eq!(memory.connections(), 1);
+    assert_eq!(
+        memory.buffer_bytes(),
+        lan.members[0].network.counters().buffer_bytes
+    );
+    assert!(memory.waiting(1));
+    // Member 1's next drive wakes its writer, which takes the rest.
+    lan.step();
+    assert!(!memory.waiting(1));
+    let receipt = lan.members[0]
+        .network
+        .try_write(ids[1], &data[taken..], WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, data.len() - taken);
+    assert_eq!(lan.members[0].network.counters().memory_throttled_writes, 1);
 }
 
 // Two members of shared memory at batch 1, with `memory` as the group's

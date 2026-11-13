@@ -339,6 +339,19 @@ pub(crate) fn entropy() -> ntcp_host::Entropy {
     })
 }
 
+// A member of shared flows that goes takes what it charged out of the
+// members' buffer memory, which may end their pressure, and wakes the
+// members whose writers wait for memory.
+impl<P: PacketIo> Drop for Network<P> {
+    fn drop(&mut self) {
+        if self.endpoint.leave_buffer_memory()
+            && let Some(flows) = &self.flows
+        {
+            flows.wake_memory_waiters();
+        }
+    }
+}
+
 impl<P: PacketIo> Network<P> {
     // The embedding supplies a confidential CSPRNG-generated TCP secret and
     // monotonic caller ticks in config.tcp.connection.timebase. Device/queue

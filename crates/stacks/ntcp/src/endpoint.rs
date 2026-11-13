@@ -679,6 +679,14 @@ pub struct Endpoint {
     setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
 }
 
+// A member of shared buffer memory that goes leaves its group
+// (`Endpoint::leave_buffer_memory`).
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        self.budget.leave_group(self.now);
+    }
+}
+
 fn keyed_mac(secret: &[u8; 32], domain: &[u8]) -> Hmac<Sha256> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a 32-byte key");
     mac.update(domain);
@@ -5524,9 +5532,9 @@ impl Endpoint {
     /// Join `shared` as its member `owner` (`SharedBufferMemory`): from now
     /// on this endpoint charges the group's budget, in batches, against the
     /// group's thresholds, and is under pressure whenever the group is.
-    /// All it charged and holds open moves into the group; dropping the
-    /// endpoint takes it out again. Once, and `owner` not another
-    /// member's (InvalidArgument).
+    /// All it charged and holds open moves into the group; leaving
+    /// (`leave_buffer_memory`, or dropping the endpoint) takes it out
+    /// again. Once, and `owner` not another member's (InvalidArgument).
     pub fn share_buffer_memory(
         &mut self,
         shared: &crate::SharedBufferMemory,
@@ -5539,6 +5547,23 @@ impl Endpoint {
         }
         self.wake_memory_waiters();
         Ok(())
+    }
+
+    /// For a member of shared buffer memory: leave the group, as dropping
+    /// the endpoint does. Its unpublished reserve is published and then all
+    /// it charged, its connections and, for summed thresholds, its own go
+    /// out of the group; pressure ends if what the group still holds is at
+    /// most its low threshold; the other members find memory returned
+    /// (`poll_shared_memory`), and those `SharedBufferMemory::waiting`
+    /// names should drive. The endpoint goes on with a budget of its own,
+    /// against its configuration's thresholds. False if it was no member.
+    pub fn leave_buffer_memory(&mut self) -> bool {
+        if !self.budget.leave_group(self.now) {
+            return false;
+        }
+        // Its own waiters now wait on its own budget.
+        self.wake_memory_waiters();
+        true
     }
 
     /// For a member of shared buffer memory: wake the writers waiting for
@@ -9301,6 +9326,64 @@ mod memory_wait_tests {
         exchange(&mut a, &mut b, 1);
         assert!(writable(&mut a, writer));
         assert_eq!(a.write(writer, &data[7..]), Ok(57));
+    }
+
+    // A member that leaves publishes its reserve and takes its whole charge
+    // and connections out of the group; the group leaves pressure if what
+    // it holds is then at most low (__sk_mem_reduce_allocated), and the
+    // other members' waiting writers look again. A member dropped leaves
+    // the same way.
+    #[test]
+    fn a_leaving_member_releases_its_reserve_and_wakes_the_others() {
+        let (mut a, mut b, listener) = endpoints();
+        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        writable(&mut a, writer);
+        b.charge(10_000);
+        let (base_a, base_b) = (a.buffer_bytes(), b.buffer_bytes());
+        let memory = crate::BufferMemory {
+            low: base_a + 5000,
+            pressure: base_a + base_b,
+            high: base_a + base_b,
+        };
+        let group = crate::SharedBufferMemory::new(2, Some(memory), 1000).unwrap();
+        a.share_buffer_memory(&group, 0).unwrap();
+        b.share_buffer_memory(&group, 1).unwrap();
+        // Charged and unpublished: b's reserve.
+        b.charge(600);
+        assert_eq!(group.buffer_bytes(), base_a + base_b);
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(a.write(writer, &data), Ok(7));
+        assert!(group.memory_pressure());
+        assert!(group.waiting(0));
+        assert_eq!(group.connections(), 2);
+        assert!(b.leave_buffer_memory());
+        assert!(!b.leave_buffer_memory());
+        // All b charged goes, its reserve included: a's charge is left.
+        assert_eq!(group.buffer_bytes(), base_a);
+        assert_eq!(a.budget.allocated(), a.buffer_bytes());
+        assert_eq!(b.buffer_bytes(), base_b + 600);
+        assert_eq!(group.connections(), 1);
+        assert!(!group.memory_pressure(), "the group holds at most low");
+        assert!(!b.memory_pressure());
+        assert!(!group.waiting(1));
+        assert!(group.waiting(0));
+        // a's writer looks again, and its growth fits.
+        assert!(a.poll_shared_memory());
+        assert!(!group.waiting(0));
+        exchange(&mut a, &mut b, 1);
+        assert!(writable(&mut a, writer));
+        assert_eq!(a.write(writer, &data[7..]), Ok(57));
+        // b's owner number is free again; dropped, b leaves as it did.
+        let before = group.buffer_bytes();
+        b.share_buffer_memory(&group, 1).unwrap();
+        assert_eq!(group.buffer_bytes(), before + base_b + 600);
+        assert_eq!(group.connections(), 2);
+        assert!(!a.poll_shared_memory());
+        drop(b);
+        assert_eq!(a.budget.allocated(), a.buffer_bytes());
+        assert_eq!(group.connections(), 1);
+        assert!(a.poll_shared_memory());
     }
 
     // When a refused writer looks again (`memory_retry`).
