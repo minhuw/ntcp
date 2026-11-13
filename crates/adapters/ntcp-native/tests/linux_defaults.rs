@@ -384,6 +384,79 @@ fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
     }
 }
 
+// The server closes a connection whose request it never read, so it resets
+// the connection (RFC 9293 3.6.1, Linux tcp_close's data_was_unread). As on
+// Linux, the reset leaves nothing of the connection behind: the client's next
+// SYN from the same port reaches the listener and is answered at once.
+#[test]
+fn a_syn_after_a_reset_on_close_reaches_the_listener() {
+    const CLIENT_PORT: u16 = 40001;
+    let (a, b) = (Queue::default(), Queue::default());
+    let (mut client, client_wire) = side(1, &a, &b);
+    let (mut server, server_wire) = side(2, &b, &a);
+    let listener = server.listen(PORT, 4).unwrap();
+    let peer = SocketAddr::new(address(2), PORT);
+    let id = client.connect_from(peer, Some(CLIENT_PORT)).unwrap();
+    let mut now = 0;
+    let accepted = loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(accepted) = server.accept(listener) {
+            break accepted;
+        }
+        assert!(now < 100 * MS, "handshake did not finish");
+    };
+    let receipt = client
+        .try_write(id, &[5; 13], WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, 13);
+    client.close(id).unwrap();
+    for _ in 0..20 {
+        step(&mut now, &mut client, &mut server);
+    }
+    let sent = server_wire.sent.borrow().len();
+    server.close(accepted).unwrap();
+    let mut events = [Event::NetworkStopped; 16];
+    for _ in 0..20 {
+        step(&mut now, &mut client, &mut server);
+        client.drain_events(&mut events);
+        server.drain_events(&mut events);
+    }
+    let resets = server_wire.sent.borrow()[sent..]
+        .iter()
+        .filter(|packet| tcp(packet)[13] & 0x04 != 0)
+        .count();
+    assert_eq!(resets, 1);
+    assert!(client.connection_info(id).is_err());
+    assert_eq!(server.counters().time_wait_connections, 0);
+    let syns = client_wire.sent.borrow().len();
+    let id = client.connect_from(peer, Some(CLIENT_PORT)).unwrap();
+    let accepted = loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(accepted) = server.accept(listener) {
+            break accepted;
+        }
+        assert!(now < 5_000 * MS, "the listener never took the SYN");
+    };
+    let client_syns = client_wire.sent.borrow()[syns..]
+        .iter()
+        .filter(|packet| tcp(packet)[13] & 0x02 != 0)
+        .count();
+    assert_eq!(client_syns, 1);
+    let receipt = client
+        .try_write(id, &[6; 10], WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, 10);
+    let mut out = [0; 16];
+    loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(ReadOutcome::Data { len, .. }) = server.try_read(accepted, &mut out) {
+            assert_eq!(&out[..len], &[6; 10]);
+            break;
+        }
+        assert!(now < 6_000 * MS, "no data on the new connection");
+    }
+}
+
 // The 32 MiB receive maximum sets the window scale both SYNs offer, 10 as
 // Linux's tcp_select_initial_window derives it from tcp_rmem[2], while the
 // SYN window is the 64 KiB initial size, at most 65535. A reader that keeps
