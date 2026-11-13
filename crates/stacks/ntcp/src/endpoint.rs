@@ -446,6 +446,9 @@ struct Slot {
     // ponytail: quarantine retains slot/buffers within existing connection/byte bounds;
     // compact tombstones can reclaim buffer slack if reset churn matters.
     reset_deadline: Option<Instant>,
+    // While the connection waits for memory (`memory_waiters`), when it
+    // looks again whether its growth fits (`memory_throttled`).
+    memory_retry: Option<Instant>,
     // The connection's state was TIME-WAIT at its last refresh: counted in
     // `time_wait_connections`.
     time_wait: bool,
@@ -458,6 +461,18 @@ struct Slot {
     ipv4_options: OutgoingIpv4Options,
     explicit_route: bool,
     received_ipv4_options: Option<Ipv4Options>,
+}
+
+impl Slot {
+    // The slot's next timer: a reset quarantine's, else the connection's,
+    // or the retry of a wait for memory if that comes first.
+    fn deadline(&self) -> Option<Instant> {
+        let deadline = self.reset_deadline.or(self.connection.next_deadline());
+        match (deadline, self.memory_retry) {
+            (Some(deadline), Some(retry)) => Some(deadline.min(retry)),
+            (deadline, retry) => deadline.or(retry),
+        }
+    }
 }
 // What a segment's tuple names: a connection slot or a TIME-WAIT record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -608,6 +623,8 @@ pub struct Endpoint {
     // a link per slot, so a refusal never allocates and a wake visits only
     // the connections it wakes and the first it cannot.
     memory_waiters: ReadyQueue,
+    // Draws for the waiters' random retry delays (`memory_retry_delay`).
+    memory_retry_draws: u64,
     // `memory_counters`.
     memory_throttled_writes: u64,
     memory_refused_opens: u64,
@@ -815,6 +832,7 @@ impl Endpoint {
             cleanup: ReadyQueue::new(listeners_count).map_err(|_| Error::NoMemory)?,
             progress: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             memory_waiters: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
+            memory_retry_draws: 0,
             memory_throttled_writes: 0,
             memory_refused_opens: 0,
             memory_refused_growths: 0,
@@ -1971,6 +1989,7 @@ impl Endpoint {
             closed_output_drained: false,
             mapped: true,
             reset_deadline: None,
+            memory_retry: None,
             time_wait: false,
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
@@ -3017,7 +3036,7 @@ impl Endpoint {
         self.events.remove(index);
         self.advice.remove(index);
         self.progress.remove(index);
-        self.memory_waiters.remove(index);
+        self.stop_memory_wait(index);
         self.deadlines.set(index, None);
         if slot.time_wait {
             self.time_wait_slots -= 1;
@@ -3331,10 +3350,7 @@ impl Endpoint {
             }
         }
         let slot = self.slots[index].as_ref().unwrap();
-        self.deadlines.set(
-            index,
-            slot.reset_deadline.or(slot.connection.next_deadline()),
-        );
+        self.deadlines.set(index, slot.deadline());
         if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
             self.events.push(index);
         }
@@ -4162,7 +4178,7 @@ impl Endpoint {
             }
             self.memory_throttled(id.slot);
         } else if !self.slot(id)?.connection.send_memory_throttled() {
-            self.memory_waiters.remove(id.slot);
+            self.stop_memory_wait(id.slot);
         }
         Ok(())
     }
@@ -4189,10 +4205,24 @@ impl Endpoint {
     }
 
     // A write of the connection at `index` found its storage growth refused.
+    // Besides the wakes that returns bring (`wake_memory_waiters`), it looks
+    // again after a random delay, as Linux's sk_stream_wait_memory sleeps a
+    // writer whose send buffer has room but whose memory was refused at
+    // most vm_wait before it retries: what decides its growth also changes
+    // without a return to wake it (the group's connections and thresholds,
+    // another member's return still held in its reserve), and a wake may
+    // come late. The first refusal arms it; later ones keep that deadline.
     fn memory_throttled(&mut self, index: usize) {
         self.memory_throttled_writes += 1;
         self.memory_refused_growths += 1;
         self.memory_waiters.push(index);
+        if self.slots[index].as_ref().unwrap().memory_retry.is_none() {
+            let retry = self.now.saturating_add(self.memory_retry_delay());
+            let slot = self.slots[index].as_mut().unwrap();
+            slot.memory_retry = Some(retry);
+            // A write refused whole refreshes nothing.
+            self.deadlines.set(index, slot.deadline());
+        }
         // A member of shared buffer memory flags its waiters for the others
         // to wake it, then looks for memory they returned meanwhile.
         self.budget.set_waiting(true);
@@ -4231,10 +4261,56 @@ impl Endpoint {
                 break;
             }
             room -= wanted;
-            let connection = &mut self.slots[index].as_mut().unwrap().connection;
-            connection.memory_released();
+            let slot = self.slots[index].as_mut().unwrap();
+            slot.memory_retry = None;
+            slot.connection.memory_released();
             self.refresh(index);
         }
+    }
+
+    // The waiter at `index` reached its retry (`memory_throttled`): as
+    // sk_stream_wait_memory returns after vm_wait for tcp_sendmsg to try
+    // sk_wmem_schedule again, it is woken if the growth it wanted fits now,
+    // and otherwise waits another random delay. Its caller refreshes it.
+    fn retry_memory(&mut self, index: usize) {
+        let slot = self.slots[index].as_ref().unwrap();
+        let connection = &slot.connection;
+        let wanted = connection.send_memory_wanted().unwrap_or(0);
+        let allowed = self.send_growth_room(connection, connection.buffer_charge());
+        if wanted > allowed {
+            let retry = self.now.saturating_add(self.memory_retry_delay());
+            self.slots[index].as_mut().unwrap().memory_retry = Some(retry);
+            return;
+        }
+        self.stop_memory_wait(index);
+        self.slots[index]
+            .as_mut()
+            .unwrap()
+            .connection
+            .memory_released();
+    }
+
+    // The connection at `index` waits for memory no more.
+    fn stop_memory_wait(&mut self, index: usize) {
+        self.memory_waiters.remove(index);
+        if let Some(slot) = self.slots[index].as_mut() {
+            slot.memory_retry = None;
+        }
+        if self.memory_waiters.is_empty() {
+            self.budget.set_waiting(false);
+        }
+    }
+
+    // Linux's vm_wait, get_random_u32_below(HZ / 5) + 2 jiffies: with HZ
+    // 1000, 2 to 201 ms.
+    fn memory_retry_delay(&mut self) -> Instant {
+        use core::hash::Hasher;
+        self.memory_retry_draws += 1;
+        let mut hash = siphasher::sip::SipHasher13::new_with_key(&self.lookup_key);
+        hash.write(b"ntcp memory retry");
+        hash.write_u64(self.memory_retry_draws);
+        let ms = hash.finish() % 200 + 2;
+        self.config.connection.timebase.ticks_from_us(ms * 1000)
     }
 
     /// Admit an immutable payload prefix without copying its bytes. The caller
@@ -5234,7 +5310,7 @@ impl Endpoint {
         slot.released = true;
         self.events.remove(id.slot);
         // A released connection writes no more.
-        self.memory_waiters.remove(id.slot);
+        self.stop_memory_wait(id.slot);
         self.uncharge(charge);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
         //# Delete the
@@ -5526,10 +5602,19 @@ impl Endpoint {
             };
             self.deadlines.set(index, None);
             let slot = self.slots[index].as_mut().unwrap();
+            let retry = slot.memory_retry.is_some_and(|deadline| deadline <= now);
             if slot.reset_deadline.is_some_and(|deadline| deadline <= now) {
                 slot.reset_deadline = None;
-            } else {
+            } else if !retry
+                || slot
+                    .connection
+                    .next_deadline()
+                    .is_some_and(|deadline| deadline <= now)
+            {
                 slot.connection.timeout(now)?;
+            }
+            if retry {
+                self.retry_memory(index);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
             //# If the time-wait timeout expires on a connection, delete the TCB,
@@ -7005,10 +7090,7 @@ impl Endpoint {
                     ));
                 }
                 Ok(None) => {
-                    self.deadlines.set(
-                        index,
-                        slot.reset_deadline.or(slot.connection.next_deadline()),
-                    );
+                    self.deadlines.set(index, slot.deadline());
                     if slot.connection.state() == State::Closed {
                         slot.closed_output_drained = true;
                         if slot.released
@@ -9219,5 +9301,182 @@ mod memory_wait_tests {
         exchange(&mut a, &mut b, 1);
         assert!(writable(&mut a, writer));
         assert_eq!(a.write(writer, &data[7..]), Ok(57));
+    }
+
+    // When a refused writer looks again (`memory_retry`).
+    fn retry_at(a: &Endpoint, id: ConnectionId) -> Option<Instant> {
+        a.slot(id).unwrap().memory_retry
+    }
+
+    // Linux's vm_wait with HZ 1000: 2 to 201 ms after `from`.
+    fn within_vm_wait(from: Instant, at: Instant) -> bool {
+        (from + 2_000..=from + 201_000).contains(&at)
+    }
+
+    // A member's return smaller than its batch stays in its reserve and
+    // wakes no other member, but what it changes reaches a writer waiting
+    // on another member at that writer's retry, at most vm_wait after its
+    // refusal: here the group's connections, by which the fair share under
+    // pressure divides the cap (__sk_mem_raise_allocated reads
+    // sk_sockets_allocated again when sk_stream_wait_memory's vm_wait
+    // ends and tcp_sendmsg retries).
+    #[test]
+    fn a_writer_retries_within_vm_wait_after_another_members_small_return() {
+        let mut config = tuned();
+        // An aborted connection's slot answers for its reset this long.
+        config.connection.time_wait_us = 10;
+        config.connection.send_capacity_min = 1;
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+        // The writer's large receive ring keeps it above its fair share.
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+        let writer = a
+            .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
+            .unwrap();
+        exchange(&mut a, &mut b, 0);
+        b.accept(listener).unwrap();
+        let (_, idle) = connect(&mut a, &mut b, listener, 40001);
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        drain(&mut a, 1);
+        let writer_charge = a.slot(writer).unwrap().connection.buffer_charge();
+        let base = a.buffer_bytes() + b.buffer_bytes();
+        // Four connections hold the writer to a quarter of the cap, three
+        // would not; the group stays in pressure throughout.
+        let memory = crate::BufferMemory {
+            low: 1,
+            pressure: base - 1,
+            high: 4 * writer_charge,
+        };
+        assert!(base < memory.high);
+        let group = crate::SharedBufferMemory::new(2, Some(memory), 1 << 20).unwrap();
+        a.share_buffer_memory(&group, 0).unwrap();
+        b.share_buffer_memory(&group, 1).unwrap();
+        assert!(group.memory_pressure());
+        assert_eq!(group.connections(), 4);
+        writable(&mut a, writer);
+        // The ledgers hold 16 bytes: the write takes what they hold.
+        assert_eq!(a.write(writer, &[1; 64]), Ok(7));
+        assert_eq!(a.memory_throttled_writes(), 1);
+        let refused = a.now;
+        let retry = retry_at(&a, writer).unwrap();
+        assert!(within_vm_wait(refused, retry), "{refused} {retry}");
+        // b's idle connection goes. Its storage, less than a batch, stays in
+        // b's reserve: nothing comes back to the group to wake a.
+        b.abort(idle).unwrap();
+        b.release(idle).unwrap();
+        drain(&mut b, 2);
+        b.on_timeout(12, 64).unwrap();
+        assert!(!b.connection_exists(idle));
+        assert_eq!(group.connections(), 3);
+        assert!(!b.take_memory_returned());
+        assert!(group.memory_pressure());
+        assert!(!a.poll_shared_memory());
+        let waiting = |a: &Endpoint| a.slot(writer).unwrap().connection.send_memory_throttled();
+        a.on_timeout(retry - 1, 64).unwrap();
+        assert!(waiting(&a));
+        // At its retry the writer fits its fair share again.
+        a.on_timeout(retry, 64).unwrap();
+        assert!(!waiting(&a));
+        assert_eq!(retry_at(&a, writer), None);
+        assert!(!group.waiting(0));
+        // Its moderated limit is full until the peer acknowledges what
+        // `drain` dropped, once the retransmission timer sends it again.
+        assert!(!writable(&mut a, writer));
+        a.on_timeout(5_000_000, 64).unwrap();
+        exchange(&mut a, &mut b, 5_000_000);
+        assert!(writable(&mut a, writer));
+        assert!(taken(a.write(writer, &[1; 64])) > 0);
+        assert_eq!(a.memory_throttled_writes(), 1);
+    }
+
+    // Bytes another member returns stay in its reserve below a batch, and a
+    // retry does not see them, as Linux's sk_memory_allocated reads the
+    // shared counter, not the other CPUs' per_cpu_fw_alloc: the writer
+    // waits another random vm_wait. The return that completes the batch
+    // publishes it and wakes the writer.
+    #[test]
+    fn a_retry_that_finds_no_room_waits_another_vm_wait() {
+        let (mut a, mut b, listener) = endpoints();
+        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        writable(&mut a, writer);
+        b.charge(10_000);
+        let base = a.buffer_bytes() + b.buffer_bytes();
+        let memory = crate::BufferMemory {
+            low: 0,
+            pressure: base,
+            high: base,
+        };
+        let group = crate::SharedBufferMemory::new(2, Some(memory), 10_000).unwrap();
+        a.share_buffer_memory(&group, 0).unwrap();
+        b.share_buffer_memory(&group, 1).unwrap();
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(a.write(writer, &data), Ok(7));
+        let first = retry_at(&a, writer).unwrap();
+        b.uncharge(5_000);
+        assert!(!b.take_memory_returned());
+        assert!(!a.poll_shared_memory());
+        a.on_timeout(first, 64).unwrap();
+        let waiting = |a: &Endpoint| a.slot(writer).unwrap().connection.send_memory_throttled();
+        assert!(waiting(&a));
+        assert!(group.waiting(0));
+        let second = retry_at(&a, writer).unwrap();
+        assert!(within_vm_wait(first, second), "{first} {second}");
+        assert!(!writable(&mut a, writer));
+        b.uncharge(5_000);
+        assert!(b.take_memory_returned());
+        assert!(a.poll_shared_memory());
+        assert!(!waiting(&a));
+        assert_eq!(retry_at(&a, writer), None);
+        exchange(&mut a, &mut b, first);
+        assert!(writable(&mut a, writer));
+        assert_eq!(a.write(writer, &data[7..]), Ok(57));
+    }
+
+    // A lone endpoint's waiter retries too, as every Linux writer short of
+    // memory does: a retry that finds no room changes nothing but when it
+    // next looks, each delay drawn anew within vm_wait, and a return still
+    // wakes it at once.
+    #[test]
+    fn a_lone_waiter_retries_at_random_delays_until_a_return_wakes_it() {
+        let (mut a, mut b, listener) = endpoints();
+        let (waiter, server) = connect(&mut a, &mut b, listener, 40000);
+        let (other, _) = connect(&mut a, &mut b, listener, 40001);
+        assert_eq!(a.write(other, &[2; 9]), Ok(9));
+        exchange(&mut a, &mut b, 1);
+        writable(&mut a, waiter);
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        assert_eq!(a.write(waiter, &[1; 9]), Err(Error::WouldBlock.into()));
+        let charged = a.buffer_bytes();
+        let mut retry = retry_at(&a, waiter).unwrap();
+        assert!(within_vm_wait(1, retry));
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            a.on_timeout(retry, 64).unwrap();
+            assert!(!writable(&mut a, waiter));
+            assert_eq!(a.memory_throttled_writes(), 1);
+            let next = retry_at(&a, waiter).unwrap();
+            assert!(within_vm_wait(retry, next), "{retry} {next}");
+            delays.push(next - retry);
+            retry = next;
+        }
+        assert!(delays.iter().any(|&delay| delay != delays[0]), "{delays:?}");
+        assert_eq!(a.buffer_bytes(), charged);
+        // A later refused write keeps the deadline.
+        assert_eq!(a.write(waiter, &[1; 9]), Err(Error::WouldBlock.into()));
+        assert_eq!(retry_at(&a, waiter), Some(retry));
+        // The other connection's end returns its storage and wakes it.
+        a.abort(other).unwrap();
+        a.release(other).unwrap();
+        exchange(&mut a, &mut b, retry);
+        let reclaimed = retry + a.config.connection.time_wait_us;
+        a.on_timeout(reclaimed, 64).unwrap();
+        assert!(!a.connection_exists(other));
+        assert!(writable(&mut a, waiter));
+        assert_eq!(retry_at(&a, waiter), None);
+        assert_eq!(a.write(waiter, &[1; 9]), Ok(9));
+        exchange(&mut a, &mut b, reclaimed);
+        assert_eq!(b.read(server, &mut [0; 16]), Ok(9));
     }
 }
