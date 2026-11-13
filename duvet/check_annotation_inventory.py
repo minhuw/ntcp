@@ -23,8 +23,10 @@ Legacy book/indented headings are prepared for pinned Duvet with the same text
 retention policy; raw downloads and official publication metadata remain bound
 by hashes. Category-less legacy Internet Standards require validated RFC Editor
 JSON identity, title, publication date, status and source, not an invented header.
---generate always fetches official inputs, deletes the previous report/extracted
-requirements, and invokes pinned Duvet without CI abort. A generator failure is
+--generate always reads the official inputs afresh, deletes the previous
+report/extracted requirements, and invokes pinned Duvet without CI abort. The
+official inputs are the dev shell's NTCP_RFC_TEXTS: Nix fetches each official URL
+by the SHA-256 in rfc-texts.json, so the audit makes no network request. A generator failure is
 never a coverage verdict. Without --generate an input/report hash receipt from a
 successful generation is required; caches alone cannot establish freshness.
 """
@@ -32,7 +34,9 @@ import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -40,7 +44,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from check_rfc_coverage import check
 from rfc_scopes import PREFIX, ROOT, check_registration
@@ -104,7 +108,18 @@ def official_sections(raw):
     return {key: norm("\n".join(lines)) for key, lines in sections.items()}
 
 
-def fetch_official(n, directory, opener=urlopen):
+def store_opener(request, timeout):
+    """Open an official RFC Editor URL as the dev shell's fixed-output Nix fetch of it."""
+    url = request.full_url
+    require(os.environ.get("NTCP_RFC_TEXTS"), "NTCP_RFC_TEXTS is unset: run inside nix develop")
+    require(url.startswith(PREFIX), f"{url}: not an official RFC URL")
+    response = io.BytesIO((Path(os.environ["NTCP_RFC_TEXTS"]) / url.rsplit("/", 1)[1]).read_bytes())
+    response.geturl = lambda: url
+    response.headers = {}
+    return response
+
+
+def fetch_official(n, directory, opener=store_opener):
     url = f"{PREFIX}{n}.txt"
     error = None
     for attempt in range(3):
@@ -694,7 +709,7 @@ def audit(root=ROOT, generate_report=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--generate", action="store_true", help="fetch official texts and generate a fresh report with pinned Duvet 0.4.3")
+    parser.add_argument("--generate", action="store_true", help="read the official texts afresh and generate a fresh report with pinned Duvet 0.4.3")
     args = parser.parse_args()
     try:
         print(json.dumps(audit(generate_report=args.generate), indent=2))

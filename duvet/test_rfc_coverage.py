@@ -130,19 +130,24 @@ class CoverageGate(unittest.TestCase):
             for name in ("rfc-report.sh", "duvet.toml", "check_rfc_coverage.py",
                          "rfc_scopes.py", "rfc-scopes.toml"):
                 shutil.copyfile(Path(__file__).parent / name, tools / name)
-            binaries = root / "workbench/tools/bin"
+            binaries = root / "store/0000-duvet-0.4.3/bin"
             binaries.mkdir(parents=True)
-            cargo = binaries / "cargo"
-            cargo.write_text("#!/bin/sh\nprintf 'duvet v0.4.3:\\n'\n")
-            cargo.chmod(0o755)
+            texts = root / "store/rfc-texts"
+            texts.mkdir()
+            for n in (9293, 793):
+                (texts / f"rfc{n}.txt").write_text(f"official {n}\n")
+                (texts / f"rfc{n}.txt").chmod(0o444)
+            specifications = root / "workbench/duvet/specifications/www.rfc-editor.org/rfc"
+            specifications.mkdir(parents=True)
+            (specifications / "rfc793.txt").write_text("prepared 793\n")
             duvet = binaries / "duvet"
             duvet.write_text(f"#!{sys.executable}\nimport json, pathlib, sys\n"
                              "pathlib.Path('argv.json').write_text(json.dumps(sys.argv[1:]))\n")
             duvet.chmod(0o755)
             report = root / "workbench/duvet/report.json"
-            report.parent.mkdir()
             report.write_text(json.dumps(complete_report()))
-            env = dict(os.environ, PATH=f"{binaries}:{os.environ['PATH']}", CI="0")
+            env = dict(os.environ, PATH=f"{binaries}:{os.environ['PATH']}", CI="0",
+                       NTCP_RFC_TEXTS=str(texts))
             for override in ([], ["--ci", "false"], ["--ci=false"]):
                 with self.subTest(override=override):
                     result = subprocess.run(["sh", str(tools / "rfc-report.sh"), *override],
@@ -153,6 +158,18 @@ class CoverageGate(unittest.TestCase):
                     self.assertEqual(arguments[-len(expected):], expected)
                     self.assertEqual(sum(a == "--ci" or a.startswith("--ci=")
                                          for a in arguments), 1)
+                    # A missing specification gets the pinned download; a present one stays.
+                    self.assertEqual((specifications / "rfc9293.txt").read_text(), "official 9293\n")
+                    self.assertEqual((specifications / "rfc793.txt").read_text(), "prepared 793\n")
+            # Only the dev shell's Duvet 0.4.3 runs.
+            other = root / "other/bin"
+            other.mkdir(parents=True)
+            shutil.copy(duvet, other / "duvet")
+            for broken in (dict(env, PATH=f"{other}:{os.environ['PATH']}"),
+                           {k: v for k, v in env.items() if k != "NTCP_RFC_TEXTS"}):
+                result = subprocess.run(["sh", str(tools / "rfc-report.sh")], env=broken,
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
 
     def test_explicit_exception_and_unresolved_todo(self):
         report = complete_report()

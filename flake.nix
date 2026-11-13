@@ -121,9 +121,58 @@
         dontStrip = true;
         dontPatchELF = true;
       };
+
+      # duvet/rfc-report.sh's pinned Duvet, with the crate's own Cargo.lock as
+      # `cargo install --locked` used it.
+      duvet = pkgs.rustPlatform.buildRustPackage rec {
+        pname = "duvet";
+        version = "0.4.3";
+        src = pkgs.fetchCrate {
+          inherit pname version;
+          hash = "sha256-DUKjNzWKi+IbbyWyjaYxgH92HgcNqR4Lx85AlTlohX4=";
+        };
+        cargoHash = "sha256-bGd1w4q+PqTrvTjcn5+HCX+rjfysdtGJBGzvXr/6tiA=";
+        # openssl-sys, for the specification downloads that rfc-report.sh pre-empts.
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.openssl ];
+        doCheck = false;
+      };
+
+      # The official RFC texts (and RFC Editor metadata of the legacy Internet Standards)
+      # the duvet scripts read, fetched by the hashes in duvet/rfc-texts.json.
+      rfc-texts = pkgs.linkFarm "ntcp-rfc-texts" (
+        pkgs.lib.concatLists (
+          pkgs.lib.mapAttrsToList (
+            n: hashes:
+            [
+              {
+                name = "rfc${n}.txt";
+                path = pkgs.fetchurl {
+                  url = "https://www.rfc-editor.org/rfc/rfc${n}.txt";
+                  sha256 = hashes.text;
+                };
+              }
+            ]
+            ++ pkgs.lib.optional (hashes ? metadata) {
+              name = "rfc${n}.json";
+              path = pkgs.fetchurl {
+                url = "https://www.rfc-editor.org/rfc/rfc${n}.json";
+                sha256 = hashes.metadata;
+              };
+            }
+          ) (builtins.fromJSON (builtins.readFile ./duvet/rfc-texts.json)).rfcs
+        )
+      );
     in
     {
-      packages.${system} = { inherit dpdk-mlx5 packetdrill-runner; };
+      packages.${system} = {
+        inherit
+          dpdk-mlx5
+          packetdrill-runner
+          duvet
+          rfc-texts
+          ;
+      };
 
       # The PMDs exist in both linkages, and libdpdk.pc's static flags link every archive
       # without the C driver's implicit libatomic, as rustc's -nodefaultlibs links do.
@@ -158,6 +207,8 @@
         # integration/packetdrill/run.py's default source and runner.
         NTCP_PACKETDRILL_SOURCE = "${packetdrill}";
         NTCP_PACKETDRILL_RUNNER = "${packetdrill-runner}/gtests/net/packetdrill/packetdrill";
+        # The duvet scripts' RFC texts, read instead of fetching rfc-editor.org.
+        NTCP_RFC_TEXTS = "${rfc-texts}";
         packages = [
           pkgs.pkg-config
           pkgs.rustc
@@ -184,6 +235,8 @@
           pkgs.bpftools
           # ntcp-socket/tests/redis.py runs redis-server and redis-cli over the preload.
           pkgs.redis
+          # duvet/rfc-report.sh.
+          duvet
         ];
         buildInputs = [
           dpdk-mlx5

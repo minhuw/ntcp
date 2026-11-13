@@ -595,6 +595,28 @@ class InventoryAudit(unittest.TestCase):
         with self.assertRaises(json.JSONDecodeError):
             audit.generate(self.root, {}, runner=malformed)
 
+    def test_nix_fetches_exactly_the_registered_rfcs(self):
+        pinned = json.loads((ROOT / "duvet/rfc-texts.json").read_text())["rfcs"]
+        self.assertEqual({int(n) for n in pinned}, set(check_registration(ROOT)))
+        for n, hashes in pinned.items():
+            self.assertLessEqual(set(hashes), {"text", "metadata"})
+            self.assertRegex(hashes["text"], "^[0-9a-f]{64}$")
+
+    def test_official_texts_come_from_the_dev_shell(self):
+        texts = self.root / "texts"
+        texts.mkdir()
+        raw = b"Request for Comments: 7413\nCategory: Experimental\n"
+        (texts / "rfc7413.txt").write_bytes(raw)
+        with patch.dict(os.environ, {"NTCP_RFC_TEXTS": str(texts)}):
+            self.assertEqual(audit.fetch_official(7413, self.root / "official"), (7413, raw))
+            provenance = json.loads((self.root / "official/rfc7413.provenance.json").read_text())
+            self.assertEqual(provenance["sha256"], audit.digest(raw))
+            with self.assertRaisesRegex(ValueError, "after 3 bounded requests"):
+                audit.fetch_official(9293, self.root / "official")
+        with patch.dict(os.environ), self.assertRaisesRegex(ValueError, "NTCP_RFC_TEXTS"):
+            os.environ.pop("NTCP_RFC_TEXTS", None)
+            audit.fetch_official(7413, self.root / "official")
+
     def test_official_fetch_is_bounded_and_rejects_wrong_inputs(self):
         calls = []
         def opener(request, timeout):
