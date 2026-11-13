@@ -134,7 +134,9 @@ fn metadata_peak_rejection_happens_before_allocating_or_consuming() {
 
 #[test]
 fn growing_with_live_sack_and_retry_history_preserves_records() {
-    let mut cfg = config(256, 8);
+    // The 6 entries held for 24 bytes cost 3 * ENTRY_BYTES of send usage
+    // beyond the payload: a 1 KiB limit still admits the 200 bytes below.
+    let mut cfg = config(1024, 8);
     cfg.sack = true;
     cfg.rack = true;
     let (mut a, _) = pair(cfg, u32::MAX - 20);
@@ -344,57 +346,192 @@ fn failure_at_any_multiblock_growth_allocation_preserves_live_history() {
     }
 }
 
-// One-byte NODELAY writes take a ledger entry per segment. Writes grow the
-// ledgers only up to the entries at which SACK splits start being refused
-// (2 * (limit + 128 KiB) of send usage), so they cost at most that much
-// memory: then fresh output waits for ACKs to free entries, as Linux's
-// tcp_write_xmit stops when it cannot allocate the skb it would split off,
-// while further writes queue their bytes, which leave coalesced.
+// Send usage (send_usage) as TransportInfo reports it, and whether a write
+// is admitted, which must agree with it: room below the send space.
+fn usage(a: &Connection) -> usize {
+    let info = a.transport_info();
+    assert_eq!(
+        info.send_used < info.send_space,
+        a.send_admission_room(None) != 0,
+        "{info:?}"
+    );
+    info.send_used
+}
+
+// Data the peer acknowledges up to `ack`, with SACK `blocks`.
+fn acknowledge(a: &mut Connection, now: Instant, ack: Seq, blocks: &[(u32, u32)]) {
+    inject_sack(a, now, a.receive.next(), ack, ACK, 65535, &[], blocks);
+}
+
+// One-byte NODELAY writes, each leaving at once as its own segment (cwnd
+// counts bytes, so its ten segments' worth admits every one) while the
+// peer acknowledges none, so every byte stays queued as its own ledger
+// entry. Send usage is n + ENTRY_BYTES * (n - ceil(n / MSS)) for n such
+// entries, and writes stop once it reaches the limit, as Linux's
+// sk_stream_memory_free stops tcp_sendmsg at sk_sndbuf by sk_wmem_queued
+// (each skb's truesize): at about limit / (1 + ENTRY_BYTES) entries. A write
+// is admitted while any room is left, so the last one may pass the limit
+// by up to its own entry: the bound holds within 2 entries. The ledgers
+// stay far below the entries at which SACK splits are refused.
 #[test]
-fn one_byte_writes_hold_at_most_the_split_bound_in_entries() {
-    let mut cfg = config(16384, 1000);
+fn one_byte_writes_stop_at_the_send_limit_by_usage() {
+    let limit = 16384;
+    let mut cfg = config(limit, 1000);
     cfg.nagle = false;
     cfg.initial_window = crate::InitialWindow::Iw10;
     let (mut a, mut b) = pair(cfg, u32::MAX - 20);
-    let ceiling = crate::rack::SplitBound::entries(16384) + crate::rack::SPARE;
     let mut out = [0; 2048];
     let mut segments = alloc::vec::Vec::new();
-    for _ in 0..10_000 {
-        assert_eq!(a.write(&[5]), Ok(1));
-        while let Some(n) = a.transmit(100, &mut out).unwrap() {
-            segments.push(out[..n].to_vec());
+    loop {
+        let before = usage(&a);
+        match a.write(&[5]) {
+            Ok(1) => assert!(before < limit),
+            Err(Error::WouldBlock) => {
+                assert!(before >= limit);
+                break;
+            }
+            other => panic!("{other:?}"),
         }
-        assert!(a.rack.capacity() <= ceiling);
+        let n = a.transmit(100, &mut out).unwrap().unwrap();
+        assert_eq!(wire::parse(ip(a.tuple()), &out[..n]).unwrap().payload, [5]);
+        segments.push(out[..n].to_vec());
+        assert_eq!(a.transmit(100, &mut out), Ok(None));
     }
-    let sent = segments.len();
-    // Every entry but the spare ones holds a one-byte segment; the rest of
-    // the bytes wait unsent.
-    assert_eq!(a.rack.capacity(), ceiling);
-    assert_eq!(a.rack.len(), ceiling - crate::rack::SPARE);
-    assert_eq!(sent, a.rack.len());
-    assert_eq!(a.send.len(), 10_000);
-    assert_eq!(a.notsent_bytes(), 10_000 - sent);
+    let entries = a.rack.len();
+    let bound = limit / (1 + crate::rack::ENTRY_BYTES);
+    assert!((bound..=bound + 2).contains(&entries), "{entries} {bound}");
+    assert_eq!(entries, segments.len());
+    assert_eq!((a.send.len(), a.notsent_bytes()), (entries, 0));
+    let used = entries + crate::rack::ENTRY_BYTES * (entries - entries.div_ceil(1000));
+    assert_eq!(usage(&a), used);
+    assert!(used < limit + 1 + crate::rack::ENTRY_BYTES);
+    assert!(a.rack.capacity() < crate::rack::SplitBound::entries(limit) / 4);
+    assert!(metadata_bytes(&a) < 64 * 1024);
     assert_eq!(
-        metadata_bytes(&a),
-        Rack::storage_bytes(ceiling).unwrap() + Scoreboard::allocation_bytes(ceiling).unwrap()
+        a.check_write_retry(None, TxTimestampRequest::default()),
+        Err(Error::WouldBlock)
     );
-    // Once the peer acknowledges them, the queued bytes leave in full
-    // segments, with no more allocation.
+    // The peer's ACK frees the room: writable again, and the next write's
+    // bytes leave in a full segment with no more allocation.
     let ack = a.snd_nxt;
     for bytes in &segments {
         b.input(150, &wire::parse(ip(a.tuple()), bytes).unwrap())
             .unwrap();
     }
+    a.take_events();
     while let Some(n) = b.transmit(150, &mut out).unwrap() {
         a.input(200, &wire::parse(ip(b.tuple()), &out[..n]).unwrap())
             .unwrap();
     }
     assert_eq!(a.snd_una, ack);
+    assert_eq!(usage(&a), 0);
+    assert!(a.take_events().writable);
     let charged = metadata_bytes(&a);
-    let n = crate::allocation_tests::fail_after(0, || a.transmit(200, &mut out))
-        .unwrap()
-        .unwrap();
+    let n = crate::allocation_tests::fail_after(0, || {
+        assert_eq!(a.write(&[6; 1000]), Ok(1000));
+        a.transmit(200, &mut out)
+    })
+    .unwrap()
+    .unwrap();
     let segment = wire::parse(ip(a.tuple()), &out[..n]).unwrap();
     assert_eq!(segment.payload.len(), 1000);
     assert_eq!(metadata_bytes(&a), charged);
+}
+
+// Writes in whole segments, sent in full-size segments and acknowledged on
+// segment edges: send usage is the queued payload at every step, so each
+// write takes exactly the payload room (limit - queued) the send limit left
+// before this rule, and the segments are those it sent.
+#[test]
+fn full_size_writes_are_admitted_on_payload_alone() {
+    let limit = 16000;
+    let mut cfg = config(limit, 1000);
+    cfg.nagle = false;
+    cfg.initial_window = crate::InitialWindow::Iw10;
+    let (mut a, _) = pair(cfg, u32::MAX - 20);
+    let base = a.snd_una;
+    let mut out = [0; 2048];
+    let mut sent = 0;
+    let mut write = |a: &mut Connection, now: Instant, sent: &mut u32| {
+        let room = limit - a.send.len();
+        let taken = a.write(&[7; 3000]);
+        let expected = if room == 0 {
+            Err(Error::WouldBlock)
+        } else {
+            Ok(room.min(3000))
+        };
+        assert_eq!(taken, expected);
+        while let Some(n) = a.transmit(now, &mut out).unwrap() {
+            let segment = wire::parse(ip(a.tuple()), &out[..n]).unwrap();
+            assert_eq!(segment.header.sequence, base.wrapping_add(*sent).0);
+            assert_eq!(segment.payload.len(), 1000);
+            *sent += 1000;
+        }
+        assert_eq!(usage(a), a.send.len());
+    };
+    for _ in 0..7 {
+        write(&mut a, 100, &mut sent);
+    }
+    assert_eq!((a.send.len(), sent), (limit, 10_000));
+    acknowledge(&mut a, 110, base.wrapping_add(2000), &[]);
+    assert_eq!(usage(&a), limit - 2000);
+    write(&mut a, 110, &mut sent);
+    acknowledge(&mut a, 120, base.wrapping_add(5000), &[]);
+    assert_eq!(usage(&a), limit - 3000);
+    for _ in 0..2 {
+        write(&mut a, 120, &mut sent);
+    }
+    assert_eq!(a.send.len(), limit);
+    assert!(sent > 10_000);
+}
+
+// Full segments with a short tail. The tail of one write costs nothing
+// while the queued bytes need as many full-size segments as they hold
+// entries; a second such tail costs ENTRY_BYTES. Unsent bytes count an
+// entry per MSS; acknowledging the short segments' run removes the charge.
+#[test]
+fn short_tails_charge_the_entries_beyond_full_size_segments() {
+    let limit = 16384;
+    let mut cfg = config(limit, 1000);
+    cfg.nagle = false;
+    cfg.initial_window = crate::InitialWindow::Iw10;
+    let (mut a, _) = pair(cfg, u32::MAX - 20);
+    let base = a.snd_una;
+    let mut out = [0; 2048];
+    let mut drain = |a: &mut Connection, now: Instant| {
+        let mut sizes = alloc::vec::Vec::new();
+        while let Some(n) = a.transmit(now, &mut out).unwrap() {
+            sizes.push(wire::parse(ip(a.tuple()), &out[..n]).unwrap().payload.len());
+        }
+        sizes
+    };
+    assert_eq!(a.write(&[1; 3100]), Ok(3100));
+    assert_eq!(drain(&mut a, 100), [1000, 1000, 1000, 100]);
+    // 4 entries for 3,100 bytes: ceil(3.1) = 4 full-size segments.
+    assert_eq!(usage(&a), 3100);
+    assert_eq!(a.write(&[2; 3100]), Ok(3100));
+    assert_eq!(drain(&mut a, 100), [1000, 1000, 1000, 100]);
+    // 8 entries for 6,200 bytes, which need 7.
+    let entry = crate::rack::ENTRY_BYTES;
+    assert_eq!(usage(&a), 6200 + entry);
+    assert_eq!(a.send_admission_room(None), limit - 6200 - entry);
+    // 2,000 bytes not yet sent count two entries: 10 for 8,200 bytes, which
+    // need 9.
+    assert_eq!(a.write(&[3; 2000]), Ok(2000));
+    assert_eq!(usage(&a), 8200 + entry);
+    // The first write acknowledged: 6 entries for 5,100 bytes, which need 6.
+    acknowledge(&mut a, 120, base.wrapping_add(3100), &[]);
+    assert_eq!(usage(&a), 5100);
+    assert_eq!(drain(&mut a, 120), [1000, 1000]);
+    assert_eq!(usage(&a), 5100);
+    // The next write takes the room left. Its 11,284 bytes count 12 entries
+    // beside the 6 sent, one more than 16,384 bytes need: a write admitted
+    // on the room left before it may pass the limit by one entry.
+    assert_eq!(a.write(&[4; 16384]), Ok(limit - 5100));
+    assert_eq!(usage(&a), limit + entry);
+    assert_eq!(a.send_admission_room(None), 0);
+    // Three full segments acknowledged: the 100-byte one still queued.
+    acknowledge(&mut a, 130, base.wrapping_add(6100), &[]);
+    assert_eq!(usage(&a), limit - 3000 + entry);
+    assert_eq!(a.send_admission_room(None), 3000 - entry);
 }

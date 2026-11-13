@@ -1835,6 +1835,9 @@ fn more_full_mss_and_later_write_are_distinct_from_no_push() {
 fn cork_nodelay_flush_is_one_queued_prefix_not_a_persistent_override() {
     for iss in [100, u32::MAX - 4] {
         let (mut a, _) = pair(config(64, 8), iss);
+        // Each segment shorter than the MSS costs ENTRY_BYTES of send usage
+        // (send_usage): a 64-byte limit would refuse the third write.
+        a.set_send_buffer(256);
         a.write(b"x").unwrap();
         packet(&mut a, 40); // Outstanding tiny flight would ordinarily Nagle-block.
         a.set_cork(true);
@@ -2302,6 +2305,9 @@ fn more_ack_driven_release_is_not_persistent_cork_and_does_not_invent_push() {
     for socket_cork in [false, true] {
         for nagle in [false, true] {
             let (mut a, _) = pair(config(64, 8), u32::MAX - 4);
+            // Each segment shorter than the MSS costs ENTRY_BYTES of send
+            // usage (send_usage): a 64-byte limit would refuse the last write.
+            a.set_send_buffer(256);
             a.set_nagle(nagle);
             a.set_cork(socket_cork);
             a.write_with_options(b"abcdefghij", true, false).unwrap();

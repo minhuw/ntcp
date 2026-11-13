@@ -10,7 +10,7 @@ use crate::{
     output_reservation::Departure,
     pacing::Pacer,
     pmtud_config::min_mtu,
-    rack::{Rack, SPARE, SplitBound},
+    rack::{ENTRY_BYTES, Rack, SPARE, SplitBound},
     recovery::{
         Congestion, CongestionAlgorithm, InitialWindow, Prr, RecoveryAlgorithm, RttEstimator,
     },
@@ -676,6 +676,10 @@ pub struct TransportInfo {
     pub rwnd_limited_us: u64,
     // Actual byte-buffer backpressure, not Linux skb memory accounting.
     pub sndbuf_limited_us: u64,
+    // Send usage, what writes are admitted against: the queued payload plus
+    // a ledger entry's bytes for each entry it takes beyond
+    // ceil(queued / MSS), the full-size segments it needs (short segments
+    // and splits). Equal to the queued payload for full-size traffic.
     pub send_used: usize,
     pub send_capacity: usize,
     // Ceiling on unacknowledged plus queued payload: send_capacity rounded
@@ -2107,7 +2111,7 @@ impl Connection {
             busy_time_us: self.config.timebase.us_from_ticks(ticks[0]),
             rwnd_limited_us: self.config.timebase.us_from_ticks(ticks[1]),
             sndbuf_limited_us: self.config.timebase.us_from_ticks(ticks[2]),
-            send_used: self.send.len(),
+            send_used: self.send_usage(),
             send_capacity: self.config.send_capacity,
             send_space: self.send_space(),
             receive_used: self.receive_used,
@@ -5205,7 +5209,7 @@ impl Connection {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, Error> {
-        let space = self.send_space().saturating_sub(self.send.len());
+        let space = self.send_space().saturating_sub(self.send_usage());
         self.check_admission(lowat, request, space)
     }
 
@@ -5520,12 +5524,52 @@ impl Connection {
         rounded_send_space(self.config.send_capacity, self.send_quantum())
     }
 
+    // Send usage, what writes are admitted against and what
+    // TransportInfo::send_used reports: the queued (unacknowledged and
+    // unsent) payload plus ENTRY_BYTES for each ledger entry beyond the
+    // ceil(queued / MSS) that full-size segments need. The entries counted
+    // are those covering queued payload: every RACK entry held now (a sent
+    // segment, or a piece an ACK, SACK or retransmission split off) and one
+    // per MSS of the unsent bytes, which fresh output will take
+    // (ledger_entries). Linux charges each skb's truesize to sk_wmem_queued
+    // (tcp_sendmsg, sk_wmem_queued_add) and sk_stream_memory_free stops
+    // writes at sk_sndbuf, which tcp_sndbuf_expand inflates to cover the
+    // per-skb overhead of full-size segments; this counts only the excess
+    // entries short segments and splits take, so that full-size traffic is
+    // admitted on payload alone while one-byte segments stop at about
+    // limit / (1 + ENTRY_BYTES) entries. An abandoned ledger holds no
+    // entries, and entries larger than the MSS (after it fell) charge none.
+    fn send_usage(&self) -> usize {
+        let queued = self.send.len();
+        let entries = self.rack.len();
+        // Nothing sent: the unsent bytes need no more entries than full-size
+        // segments of everything queued.
+        if entries == 0 {
+            return queued;
+        }
+        let unsent = self.notsent_bytes();
+        let sent = queued - unsent;
+        let mss = self.mss.max(1);
+        // No division where there is no excess: the sent entries are all
+        // full-size, or everything is sent in no more than ceil(sent / MSS)
+        // entries (a request/response connection's short segment).
+        if entries.saturating_mul(mss) <= sent
+            || unsent == 0 && (entries - 1).saturating_mul(mss) < sent
+        {
+            return queued;
+        }
+        let excess = entries
+            .saturating_add(unsent.div_ceil(mss))
+            .saturating_sub(queued.div_ceil(mss));
+        queued.saturating_add(excess.saturating_mul(ENTRY_BYTES))
+    }
+
     // Bytes admitted above a smaller new C stay queued; room reopens only
     // once ordinary ACK progress drains below it.
     // While a write's storage growth stays refused, only what the allocated
     // storage holds: Linux's sk_stream_memory_free.
     fn send_space_remaining(&self) -> usize {
-        let room = self.send_space().saturating_sub(self.send.len());
+        let room = self.send_space().saturating_sub(self.send_usage());
         if self.send_memory_wanted.is_some() {
             room.min(self.allocated_send_room())
         } else {
@@ -5607,7 +5651,7 @@ impl Connection {
         }
         // What the write would take with memory to grow: a refused write
         // tries again.
-        let space = self.send_space().saturating_sub(self.send.len());
+        let space = self.send_space().saturating_sub(self.send_usage());
         let accepted = bytes.min(self.admission_room(lowat, space));
         if accepted == 0 {
             return Ok(None);

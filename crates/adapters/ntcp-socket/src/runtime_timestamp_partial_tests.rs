@@ -13,6 +13,11 @@ struct Fixture {
     iss: u32,
 }
 
+// What ntcp core's send usage charges for a ledger entry beyond the
+// full-size segments the queued bytes need: a RACK interval and half a
+// scoreboard range (core rack::ENTRY_BYTES).
+const ENTRY_BYTES: usize = 68;
+
 fn fixture() -> Fixture {
     fixture_with_window(2000)
 }
@@ -167,8 +172,14 @@ fn timestamp_partial_actual_admission_and_first_flight() {
         packets.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
         [(1, 988), (989, 988), (1977, 24)]
     );
+    // The window cut the third segment to 24 bytes: the 3,952 queued bytes
+    // take five ledger entries (three sent, two for the 1,952 unsent), one
+    // more than four full-size segments, so send usage adds an entry's bytes.
     let after = f.owner.endpoint.transport_info(f.cid).unwrap();
-    assert_eq!((after.send_used, after.notsent_bytes), (3952, 1952));
+    assert_eq!(
+        (after.send_used, after.notsent_bytes),
+        (3952 + ENTRY_BYTES, 1952)
+    );
     assert!(timestamp_records(&f.owner, f.id).is_empty());
 }
 
@@ -265,11 +276,13 @@ fn writable_readiness_agrees_with_rounded_admission() {
     assert_eq!(room(&f), 0);
     assert!(!writable(&mut f));
     assert_eq!(send(&mut f), Err(EAGAIN));
-    // A partial ACK drains below C and reopens both together.
+    // A partial ACK drains below C and reopens both together. The 24-byte
+    // segment the window cut keeps an entry beyond the full-size segments
+    // the queued bytes need, which send usage charges.
     ack(&mut f, 20000, 988);
-    assert_eq!(room(&f), 988);
+    assert_eq!(room(&f), 988 - ENTRY_BYTES);
     assert!(writable(&mut f));
-    assert_eq!(send(&mut f).unwrap(), 988);
+    assert_eq!(send(&mut f).unwrap() as usize, 988 - ENTRY_BYTES);
     assert!(!writable(&mut f));
     // A live resize keeps reporting B and moves C with it.
     f.owner

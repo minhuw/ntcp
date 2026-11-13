@@ -326,11 +326,17 @@ fn sack_fallback_partial_ack_refill_preserves_fresh_tail_timer_ledger() {
                 ..config(512, 128)
             };
             let (mut a, _) = pair(cfg, iss);
+            // 512 queued bytes in one-byte segments (the refill below):
+            // 508 entries beyond the 4 full-size segments they need, each
+            // ENTRY_BYTES of send usage. The limit admits exactly them.
+            let bytes: usize = 512;
+            let usage = bytes + crate::rack::ENTRY_BYTES * (bytes - bytes.div_ceil(128));
+            a.set_send_buffer(usage);
             a.set_nagle(false);
             let base = a.snd_una;
             a.write(b"abcd").unwrap();
             packet(&mut a, 100);
-            for _ in 4..a.config.send_capacity {
+            for _ in 4..bytes {
                 a.write(b"x").unwrap();
                 packet(&mut a, 100);
             }
@@ -339,7 +345,7 @@ fn sack_fallback_partial_ack_refill_preserves_fresh_tail_timer_ledger() {
             if exercise_overflow {
                 // Discover exhaustion, rather than assuming a fixed number
                 // of ranges. Capacity-backed scoreboards need not overflow.
-                for offset in (5..a.config.send_capacity as u32).step_by(2) {
+                for offset in (5..bytes as u32).step_by(2) {
                     sack_ack(
                         &mut a,
                         200,
@@ -400,7 +406,9 @@ fn sack_fallback_partial_ack_refill_preserves_fresh_tail_timer_ledger() {
                     Some((start.wrapping_add(1), sent))
                 );
             }
-            assert_eq!(a.send.len(), a.config.send_capacity);
+            assert_eq!(a.send.len(), bytes);
+            assert_eq!(a.transport_info().send_used, usage);
+            assert_eq!(a.write(b"z"), Err(Error::WouldBlock));
             assert_eq!(a.rto_deadline, Some(expiry));
             let tail = a.data_high().wrapping_add(u32::MAX);
             a.timeout(expiry).unwrap();

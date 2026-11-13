@@ -32,8 +32,10 @@ pub(crate) const ENTRY_BYTES: usize =
 // entries in the middle of the flight: 2 * SKB_TRUESIZE(GSO_LEGACY_MAX_SIZE).
 const SPLIT_ALLOWANCE: usize = 128 * 1024;
 
-// Send usage (queued payload plus ENTRY_BYTES per entry) and the send
-// limit an ACK's SACK splits are held to.
+// The queued payload plus ENTRY_BYTES for every entry (Linux's
+// sk_wmem_queued as tcp_fragment reads it), and the send limit an ACK's
+// SACK splits are held to. Write admission charges only the entries beyond
+// full-size segments (Connection::send_usage).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SplitBound {
     pub queued: usize,
@@ -317,7 +319,8 @@ impl Rack {
         self.intervals.allocation_bytes()
     }
 
-    // Entries held now: what send usage charges ENTRY_BYTES for.
+    // Entries held now: what SplitBound charges ENTRY_BYTES for, and send
+    // usage for those beyond full-size segments.
     pub(crate) fn len(&self) -> usize {
         self.intervals.len()
     }
