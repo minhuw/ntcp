@@ -206,7 +206,7 @@ fn pseudo_header_sum(ip: IpMetadata, len: u32) -> Result<u32, WireError> {
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.1
 //= reason=Invalid incoming Kind 34 lengths discard credential metadata; an unframeable suffix stops traversal without guessing boundaries, preserving validated prefix options and DataOffset payload. Non-SYN credentials are ignored. Strict output, checksum/header and unrelated malformed-option rejection remain enforced.
 //# Options with invalid Length values or without the SYN flag set MUST be ignored.
-fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
+fn walk_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
     let mut options = Options::default();
     let mut fast_open_seen = false;
     while let Some(&kind) = bytes.first() {
@@ -334,6 +334,25 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
         }
     }
     Ok(options)
+}
+
+// Established segments carry timestamps alone, aligned behind two NOPs
+// (RFC 7323 Appendix A): read that layout directly, as Linux's
+// tcp_fast_parse_options does (tcp_parse_aligned_timestamp), and walk
+// anything else. The walk reads the same bytes into the same Options.
+fn read_options(bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
+    if let Some((&[1, 1, 8, 10], ts)) = bytes.split_first_chunk::<4>()
+        && let Ok(ts) = <&[u8; 8]>::try_from(ts)
+    {
+        return Ok(Options {
+            timestamps: Some((
+                u32::from_be_bytes(ts[..4].try_into().unwrap()),
+                u32::from_be_bytes(ts[4..].try_into().unwrap()),
+            )),
+            ..Options::default()
+        });
+    }
+    walk_options(bytes, outgoing)
 }
 
 pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
@@ -1282,6 +1301,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The aligned-timestamp fast path reads what the walk reads: every
+    // single-byte change, truncation and extension of the aligned layout,
+    // and random option bytes seeded with it, in both directions.
+    #[test]
+    fn aligned_timestamp_fast_path_matches_the_walk() {
+        let aligned = [1, 1, 8, 10, 0x80, 1, 2, 3, 0xff, 4, 5, 6];
+        let check = |raw: &[u8]| {
+            for outgoing in [false, true] {
+                assert_eq!(
+                    read_options(raw, outgoing),
+                    walk_options(raw, outgoing),
+                    "{raw:?} {outgoing}"
+                );
+            }
+        };
+        let mut fast = 0;
+        for at in 0..aligned.len() {
+            for value in 0..=255u8 {
+                let mut raw = aligned;
+                raw[at] = value;
+                check(&raw);
+                fast += usize::from(raw[..4] == [1, 1, 8, 10]);
+            }
+        }
+        for len in 0..=40 {
+            let mut raw = vec![0; len];
+            for (i, byte) in raw.iter_mut().enumerate() {
+                *byte = *aligned.get(i).unwrap_or(&1);
+            }
+            check(&raw);
+            raw.iter_mut().skip(12).for_each(|byte| *byte = 0);
+            check(&raw);
+        }
+        let mut state = 0x2545_f491_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for _ in 0..200_000 {
+            let seeded = next() % 2 == 0;
+            // Seeded options keep the aligned length half the time.
+            let len = if seeded && next() % 2 == 0 {
+                12
+            } else {
+                next() as usize % 41
+            };
+            let mut raw: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            if seeded {
+                let n = len.min(12);
+                raw[..n].copy_from_slice(&aligned[..n]);
+                // A few bytes changed, often a small option kind or length.
+                for _ in 0..next() % 3 {
+                    let at = next() as usize % len.max(1);
+                    if at < len {
+                        raw[at] = if next() % 2 == 0 {
+                            next() as u8 % 12
+                        } else {
+                            next() as u8
+                        };
+                    }
+                }
+            }
+            check(&raw);
+            fast += usize::from(raw.len() == 12 && raw[..4] == [1, 1, 8, 10]);
+        }
+        assert!(fast > 20_000, "{fast}");
     }
 
     #[test]
