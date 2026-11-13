@@ -239,9 +239,41 @@ void ntcp_test_check_tso(unsigned l3, unsigned l4, unsigned mss, unsigned length
     check_tso(m, l3, l4, mss, length);
     rte_pktmbuf_free(m);
 }
+// A TCP checksum offload request: its metadata, the checksum field holding
+// the pseudo-header sum (rte_ipv4_phdr_cksum / rte_ipv6_phdr_cksum, what
+// PMDs that need it prepare), and then the checksum the device writes,
+// completed in `frame` (the copy of the mbuf's bytes) and checked.
+static unsigned checksummed;
+unsigned ntcp_test_checksummed(void) { return checksummed; }
+static void complete_checksum(const struct rte_mbuf *m, uint8_t *frame) {
+    unsigned l3 = m->l3_len;
+    assert(m->l2_len == 14 && (l3 == 40 || (l3 >= 20 && l3 <= 60 && l3 % 4 == 0)));
+    uint64_t family = l3 == 40 && frame[14] >> 4 == 6 ? RTE_MBUF_F_TX_IPV6 : RTE_MBUF_F_TX_IPV4;
+    assert(m->ol_flags == (RTE_MBUF_F_TX_TCP_CKSUM | family));
+    struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr *)(frame + 14 + l3);
+    unsigned l4;
+    if (family == RTE_MBUF_F_TX_IPV4) {
+        const struct rte_ipv4_hdr *ip = (const struct rte_ipv4_hdr *)(frame + 14);
+        assert(tcp->cksum == rte_ipv4_phdr_cksum(ip, 0));
+        l4 = rte_be_to_cpu_16(ip->total_length) - l3;
+    } else {
+        const struct rte_ipv6_hdr *ip = (const struct rte_ipv6_hdr *)(frame + 14);
+        assert(tcp->cksum == rte_ipv6_phdr_cksum(ip, 0));
+        l4 = rte_be_to_cpu_16(ip->payload_len);
+    }
+    tcp->cksum = (uint16_t)~rte_raw_cksum(tcp, l4);
+    if (family == RTE_MBUF_F_TX_IPV4)
+        assert(rte_ipv4_udptcp_cksum_verify((const struct rte_ipv4_hdr *)(frame + 14), tcp) == 0);
+    else
+        assert(rte_ipv6_udptcp_cksum_verify((const struct rte_ipv6_hdr *)(frame + 14), tcp) == 0);
+    ++checksummed;
+}
+
 // One transmitted frame copied into `out`, its length, or 0 when the tx ring
 // is empty; `*mss` is its TSO segment size, 0 for an ordinary frame. A TSO
-// chain's offload metadata is checked as ntcp_test_check_tso checks it.
+// chain's offload metadata is checked as ntcp_test_check_tso checks it, and
+// a checksum offload request's as complete_checksum does, which fills in
+// the checksum.
 unsigned ntcp_test_take(uint8_t *out, unsigned cap, unsigned *mss) {
     struct rte_mbuf *m;
     if (rte_ring_dequeue(tx, (void **)&m)) return 0;
@@ -255,7 +287,9 @@ unsigned ntcp_test_take(uint8_t *out, unsigned cap, unsigned *mss) {
         check_tso(m, l3, (out[14 + l3 + 12] >> 4) * 4u, m->tso_segsz, length);
         *mss = m->tso_segsz;
     } else {
-        for (struct rte_mbuf *s = m; s; s = s->next) assert(s->ol_flags == 0);
+        if (m->ol_flags & RTE_MBUF_F_TX_TCP_CKSUM) complete_checksum(m, out);
+        else assert(m->ol_flags == 0);
+        for (struct rte_mbuf *s = m->next; s; s = s->next) assert(s->ol_flags == 0);
     }
     rte_pktmbuf_free(m);
     return length;

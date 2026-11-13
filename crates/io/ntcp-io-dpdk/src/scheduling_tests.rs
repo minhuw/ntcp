@@ -17,6 +17,7 @@ unsafe extern "C" {
     fn ntcp_test_take(out: *mut u8, cap: u32, mss: *mut u32) -> u32;
     fn ntcp_test_inject(frame: *const u8, length: u32) -> i32;
     fn ntcp_test_l4_checksum(kind: u32);
+    fn ntcp_test_checksummed() -> u32;
 }
 
 // The device's RX TCP checksum verdict: reported only once the queue opted
@@ -322,6 +323,11 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         io.tx_scheduling = None;
         segmented_network(io);
         assert_eq!(ntcp_test_available(), 1023);
+        for offload in [true, false] {
+            let io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
+            checksummed_network(io, offload);
+            assert_eq!(ntcp_test_available(), 1023);
+        }
     }
 }
 
@@ -549,5 +555,108 @@ unsafe fn segmented_network(mut io: Dpdk) {
     assert_eq!(a.counters().segmented, aggregates as u64);
     assert!(blocked > 0, "no aggregate waited for the pool");
     eprintln!("ring PMD: {aggregates} TSO chains, {blocked} drives blocked, {writes} writes");
+    drop(a);
+}
+
+// ntcp-native over the ring port, its segments' TCP checksums left to the
+// device (`offload`, through the private opt-in the ring PMD cannot grant)
+// or computed in software. The fixture checks each offload request's
+// metadata and pseudo-header sum and completes the checksum as a device
+// would; the software peer verifies every checksum, and the stream
+// arrives whole. Without offload every frame carries no offload flags.
+// Real ring mbufs, NOT a device's checksum engine.
+unsafe fn checksummed_network(mut io: Dpdk, offload: bool) {
+    use ntcp_native::{
+        EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, WorkBudget, WriteOptions,
+    };
+    assert_eq!(
+        io.enable_tx_checksum().unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert!(!io.tcp_checksum_offload());
+    assert_eq!(
+        io.transmit_tcp_checksum_offload(&[0; 64])
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Unsupported
+    );
+    io.tx_checksum = offload;
+    assert_eq!(io.tcp_checksum_offload(), offload);
+    let config = |address: &str, side: u8| {
+        let mut config = NetworkConfig::new(address.parse().unwrap(), 1500);
+        config.tcp.max_connections = 2;
+        config.link = Link::Ethernet {
+            local_mac: [2, 0, 0, 0, 0, side],
+            next_hop: EthernetNextHop::Fixed([2, 0, 0, 0, 0, 3 - side]),
+        };
+        config
+    };
+    let incoming = Rc::new(RefCell::new(VecDeque::new()));
+    let outgoing = Rc::new(RefCell::new(VecDeque::new()));
+    let peer = Peer {
+        incoming: incoming.clone(),
+        outgoing: outgoing.clone(),
+    };
+    let mut a = Network::new(config("10.75.0.1", 1), io, [1; 32], 0).unwrap();
+    let mut b = Network::new(config("10.75.0.2", 2), peer, [2; 32], 0).unwrap();
+    assert_eq!(a.config().tcp.connection.tcp_checksum_offload, offload);
+    let listener = b.listen(9000, 1).unwrap();
+    let client = a.connect("10.75.0.2:9000".parse().unwrap()).unwrap();
+    let data: Vec<u8> = (0..100_000).map(|i| (i * 13 % 251) as u8).collect();
+    let budget = WorkBudget::new(64, 64, 64, 64);
+    let (mut server, mut sent, mut received) = (None, 0, Vec::new());
+    let (mut frame, mut out) = (vec![0; MAX_PACKET_LEN], vec![0; 65536]);
+    let before = unsafe { ntcp_test_checksummed() };
+    let mut frames = 0;
+    for step in 1..20_000u64 {
+        let now = step * 1000;
+        if sent < data.len()
+            && let Ok(receipt) = a.try_write(client, &data[sent..], WriteOptions::default())
+        {
+            sent += receipt.accepted;
+        }
+        a.drive(now, budget).unwrap();
+        loop {
+            let mut mss = 0;
+            let len = unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) };
+            if len == 0 {
+                break;
+            }
+            assert_eq!(mss, 0);
+            frames += 1;
+            incoming
+                .borrow_mut()
+                .push_back(frame[..len as usize].to_vec());
+        }
+        b.drive(now, budget).unwrap();
+        for frame in outgoing.borrow_mut().drain(..) {
+            assert_eq!(
+                unsafe { ntcp_test_inject(frame.as_ptr(), frame.len() as u32) },
+                0
+            );
+        }
+        if server.is_none() {
+            server = b.accept(listener).ok();
+        }
+        if let Some(server) = server {
+            while let Ok(ReadOutcome::Data { len, .. }) = b.try_read(server, &mut out) {
+                received.extend_from_slice(&out[..len]);
+            }
+        }
+        if received.len() == data.len() {
+            break;
+        }
+    }
+    assert_eq!(received, data);
+    assert_eq!(b.counters().tcp_checksum_errors, 0);
+    let checksummed = unsafe { ntcp_test_checksummed() } - before;
+    assert_eq!(checksummed, if offload { frames } else { 0 });
+    assert!(frames > 70);
+    // What is left on the rings goes back to the pool.
+    for step in 0..4 {
+        a.drive(30_000_000 + step, budget).unwrap();
+        let mut mss = 0;
+        while unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) } != 0 {}
+    }
     drop(a);
 }

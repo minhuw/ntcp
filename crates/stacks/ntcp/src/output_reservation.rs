@@ -135,6 +135,9 @@ pub(crate) struct OutputReservation {
     pub gso: Option<GsoLimits>,
     pub current: Option<ReservedOutput>,
     pub ordinal: u64,
+    // Fragments leave their checksum for the device to complete
+    // (`ConnectionConfig::tcp_checksum_offload`).
+    pub checksum_partial: bool,
 }
 
 pub(crate) struct ReservedOutput {
@@ -173,6 +176,7 @@ impl OutputReservation {
             gso: None,
             current: None,
             ordinal: 0,
+            checksum_partial: false,
         }
     }
 
@@ -295,12 +299,13 @@ impl OutputReservation {
                 header.flags &= !wire::URG;
             }
         }
-        let n = wire::encode_shared(
+        let n = wire::encode_shared_with(
             r.packet.ip,
             header,
             &self.shared_options[..self.shared_option_len],
             payload,
             out,
+            self.checksum_partial,
         )
         .map_err(Error::Wire)?;
         r.emitted_bytes = count;
@@ -351,7 +356,7 @@ impl OutputReservation {
         // ponytail: reparsing costs O(original length) per fragment, bounded by
         // one configured packet; cache parsed metadata if repair throughput matters.
         let original =
-            wire::parse(r.packet.ip, &self.bytes[..r.packet.len]).map_err(Error::Wire)?;
+            wire::parse_unchecked(r.packet.ip, &self.bytes[..r.packet.len]).map_err(Error::Wire)?;
         // A SYN is one handshake, not a stream fragment. Splitting TFO data
         // would repeat SYN at the wrong sequence and release ownership before
         // the handshake can acknowledge the retained suffix. Keep it indivisible.
@@ -449,12 +454,13 @@ impl OutputReservation {
                 header.flags &= !wire::URG;
             }
         }
-        let len = wire::encode(
+        let len = wire::encode_with(
             r.packet.ip,
             header,
             &options[..used],
             &payload[r.offset..r.offset + count],
             out,
+            self.checksum_partial,
         )
         .map_err(Error::Wire)?;
         r.emitted_bytes = count;

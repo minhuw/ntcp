@@ -1967,3 +1967,78 @@ fn shared_reservation_mtu_repair_retains_original_payload_and_rejects_stale_atte
     assert_eq!(offset, 301);
     assert_eq!(b.read(peer, &mut [0; 301]), Ok(301));
 }
+
+// The one's complement of the sum of `bytes`: what a device completing a
+// TCP checksum writes over a field holding the pseudo-header sum.
+fn device_checksum(bytes: &[u8]) -> u16 {
+    let mut sum: u32 = bytes
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], c.get(1).copied().unwrap_or(0)])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+// With `tcp_checksum_offload` every segment leaves for the device to
+// complete its checksum, the handshake's, a reservation's and each fragment
+// it is cut into for a smaller MTU alike; completed, each is what software
+// would have sent and the peer takes it in.
+#[test]
+fn offloaded_checksums_are_left_to_the_device_also_in_fragments() {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    a.config.connection.tcp_checksum_offload = true;
+    let local = "192.0.2.1:40000".parse().unwrap();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let id = a.connect(0, local, remote).unwrap();
+    let mut bytes = [0; 2048];
+    let complete = |bytes: &mut [u8], len: usize, ip| {
+        let segment = &mut bytes[..len];
+        assert_eq!(
+            wire::parse(ip, segment).err(),
+            Some(wire::WireError::InvalidChecksum)
+        );
+        let sum = device_checksum(segment);
+        segment[16..18].copy_from_slice(&sum.to_be_bytes());
+        wire::parse(ip, segment).unwrap();
+    };
+    for i in 0..3 {
+        if i == 1 {
+            let p = b.poll_transmit(1, &mut bytes, 16).unwrap().packet.unwrap();
+            a.input(1, p.ip, &bytes[..p.len]).unwrap();
+        } else {
+            let p = a.poll_transmit(1, &mut bytes, 16).unwrap().packet.unwrap();
+            complete(&mut bytes, p.len, p.ip);
+            assert_eq!(
+                b.input(1, p.ip, &bytes[..p.len]),
+                Ok(InputDisposition::Processed)
+            );
+        }
+    }
+    let peer = b.accept(listener).unwrap();
+    a.enable_output_reservations().unwrap();
+    assert!(a.reservations.iter().all(|r| r.checksum_partial));
+    a.write(id, &[7; 300]).unwrap();
+    let (_, attempt) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+    a.set_endpoint_first_hop_mtu(3, 100).unwrap();
+    assert!(a.reject_unsubmitted(attempt.unwrap()).unwrap());
+    let mut fragments = 0;
+    while a.reservations[0].current.is_some() {
+        let (out, token) = a.poll_reserved_transmit(3, &mut bytes, 16).unwrap();
+        let p = out.packet.unwrap();
+        assert!(p.len + 20 <= 100);
+        complete(&mut bytes, p.len, p.ip);
+        assert_eq!(
+            b.input(3, p.ip, &bytes[..p.len]),
+            Ok(InputDisposition::Processed)
+        );
+        assert!(a.accept_transmit(a.now, token.unwrap()).unwrap());
+        fragments += 1;
+    }
+    assert!(fragments > 3);
+    assert_eq!(b.readable_bytes(peer).unwrap(), 300);
+    assert_eq!(b.checksum_errors(), 0);
+}

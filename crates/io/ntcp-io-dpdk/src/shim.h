@@ -19,9 +19,10 @@ int ntcp_dpdk_receive(void *packet, uint8_t *out,
                       size_t capacity, size_t *length, int timestamp_offset,
                       uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid,
                       int l4_checksum, int *l4_status);
+int ntcp_dpdk_tx_checksum_check(uint16_t port, uint16_t queue);
 int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
                        const uint8_t *packet, size_t length, int timestamp_offset,
-                       uint64_t timestamp_flag, uint64_t timestamp);
+                       uint64_t timestamp_flag, uint64_t timestamp, uint16_t l3);
 struct ntcp_tso_config { uint16_t mtu, room, max_descriptors; };
 int ntcp_dpdk_tso_check(uint16_t port, uint16_t queue, void *pool, struct ntcp_tso_config *config);
 int ntcp_dpdk_tso_transmit(uint16_t port, uint16_t queue, void *pool,

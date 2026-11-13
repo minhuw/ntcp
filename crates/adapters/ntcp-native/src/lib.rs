@@ -501,7 +501,7 @@ impl<P: PacketIo> Network<P> {
         Self::build(config, io, secret, now, neighbors, Some((flows, member)))
     }
     fn build(
-        config: NetworkConfig,
+        mut config: NetworkConfig,
         io: P,
         secret: [u8; 32],
         now: Instant,
@@ -509,6 +509,9 @@ impl<P: PacketIo> Network<P> {
         flows: Option<(&SharedFlows, usize)>,
     ) -> Result<Self> {
         config.validate(&io)?;
+        // Every TCP segment leaves through `transmit_tcp_checksum_offload`
+        // when the backend completes its checksum.
+        config.tcp.connection.tcp_checksum_offload = io.tcp_checksum_offload();
         if config.tcp.ipv4_options_enabled {
             return Err(Error::Unsupported(
                 "IPv4 option origination on native fixed-hop ports",

@@ -269,6 +269,14 @@ pub struct ConnectionConfig {
     // timestamp-based reuse applies within whatever duration is configured.
     pub time_wait_us: u64,
     pub keepalive: Option<KeepaliveConfig>,
+    // The embedding hands every TCP segment to a device that computes its
+    // checksum, as Linux leaves a CHECKSUM_PARTIAL skb to a device with
+    // NETIF_F_IP_CSUM or NETIF_F_IPV6_CSUM: segments leave with the
+    // pseudo-header sum in their checksum field, for the device to
+    // complete, and their bytes are not summed. ntcp-native sets it from
+    // its backend (`PacketIo::tcp_checksum_offload`); a segment sent any
+    // other way leaves with a wrong checksum.
+    pub tcp_checksum_offload: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -526,6 +534,7 @@ impl Default for ConnectionConfig {
             //# on or off for each TCP connection (MUST-24), and they MUST default to
             //# off (MUST-25).
             keepalive: None,
+            tcp_checksum_offload: false,
         }
     }
 }
@@ -10901,17 +10910,19 @@ impl Connection {
         } else {
             false
         };
+        let partial = self.config.tcp_checksum_offload;
         let encoded = if shared_payload {
-            wire::encode_shared(
+            wire::encode_shared_with(
                 ip,
                 wire_header,
                 &options[..option_len],
                 shared.as_deref().unwrap(),
                 out,
+                partial,
             )
             .map(|n| n + wire_count)
         } else {
-            wire::encode(
+            wire::encode_with(
                 ip,
                 wire_header,
                 &options[..option_len],
@@ -10920,6 +10931,7 @@ impl Connection {
                     _ => &self.scratch[..wire_count],
                 },
                 out,
+                partial,
             )
         };
         let size = encoded.map_err(|error| {

@@ -20,10 +20,13 @@ const LISTEN: u16 = 80;
 // Packets with the device's verdict on their TCP checksum.
 type Frames = Rc<RefCell<VecDeque<(Vec<u8>, RxChecksum)>>>;
 
-// An L3 link end.
+// An L3 link end, whose device completes TCP checksums when `offload` is
+// set (counting each such frame in `offloaded`).
 struct Wire {
     incoming: Frames,
     outgoing: Frames,
+    offload: bool,
+    offloaded: Rc<RefCell<usize>>,
 }
 impl PacketIo for Wire {
     fn layer(&self) -> PacketLayer {
@@ -52,6 +55,35 @@ impl PacketIo for Wire {
         self.outgoing.borrow_mut().push_back(sent);
         Ok(TxOutcome::Submitted)
     }
+    fn tcp_checksum_offload(&self) -> bool {
+        self.offload
+    }
+    fn transmit_tcp_checksum_offload(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+        assert!(self.offload);
+        *self.offloaded.borrow_mut() += 1;
+        let mut packet = packet.to_vec();
+        complete_checksum(&mut packet);
+        self.outgoing
+            .borrow_mut()
+            .push_back((packet, RxChecksum::Unknown));
+        Ok(TxOutcome::Submitted)
+    }
+}
+
+// What a device does for an IPv4 TCP packet whose checksum field holds the
+// pseudo-header sum: the one's complement of the sum of the segment, that
+// field included, written over it.
+fn complete_checksum(packet: &mut [u8]) {
+    assert_eq!((packet[0] >> 4, packet[9]), (4, 6));
+    let header = usize::from(packet[0] & 15) * 4;
+    let len = packet.len() - header;
+    let mut pseudo = packet[12..20].to_vec();
+    pseudo.extend([0, 6]);
+    pseudo.extend((len as u16).to_be_bytes());
+    let tcp = &mut packet[header..];
+    assert_eq!(tcp[16..18], (!checksum(&pseudo)).to_be_bytes());
+    let sum = checksum(tcp);
+    tcp[16..18].copy_from_slice(&sum.to_be_bytes());
 }
 
 struct Station {
@@ -70,10 +102,15 @@ impl Station {
         Self::build(|wire| Network::new(config(address), wire, [5; 32], 0))
     }
     fn build(make: impl FnOnce(Wire) -> Result<Network<Wire>>) -> Self {
+        Self::build_offload(false, make)
+    }
+    fn build_offload(offload: bool, make: impl FnOnce(Wire) -> Result<Network<Wire>>) -> Self {
         let (incoming, outgoing) = (Frames::default(), Frames::default());
         let wire = Wire {
             incoming: incoming.clone(),
             outgoing: outgoing.clone(),
+            offload,
+            offloaded: Rc::default(),
         };
         Self {
             network: make(wire).unwrap(),
@@ -361,4 +398,73 @@ fn a_handed_over_segment_is_verified_in_software() {
     assert_eq!(sender.handed_off, owner.handoffs_received);
     assert_eq!(owner.tcp_checksum_errors, 1);
     assert_eq!(sender.tcp_checksum_errors, 0);
+}
+
+// Every packet of a connection's life that the Network under test sends,
+// the TCP checksums left to its device when `offload` is set; and how many
+// left that way.
+fn exchange(offload: bool) -> (Vec<Vec<u8>>, usize) {
+    let address = "10.9.0.1".parse().unwrap();
+    let mut a = Station::build_offload(offload, |wire| {
+        Network::new(config(address), wire, [5; 32], 0)
+    });
+    let mut b = Station::new("10.9.0.2".parse().unwrap());
+    assert_eq!(
+        a.network.config().tcp.connection.tcp_checksum_offload,
+        offload
+    );
+    let listener = b.network.listen(LISTEN, 4).unwrap();
+    let client = a
+        .network
+        .connect(SocketAddr::new("10.9.0.2".parse().unwrap(), LISTEN))
+        .unwrap();
+    let (mut now, mut server, mut sent) = (0, None, Vec::new());
+    let data = vec![7; 60_000];
+    let mut written = 0;
+    let mut out = [0; 4096];
+    for round in 0..400 {
+        now += TICK;
+        if written < data.len()
+            && let Ok(receipt) =
+                a.network
+                    .try_write(client, &data[written..], WriteOptions::default())
+        {
+            written += receipt.accepted;
+        }
+        if round == 300 {
+            a.network.close(client).unwrap();
+        }
+        a.network.drive(now, BUDGET).unwrap();
+        let frames = a.sent();
+        sent.extend(frames.iter().cloned());
+        b.incoming
+            .borrow_mut()
+            .extend(frames.into_iter().map(|p| (p, RxChecksum::Unknown)));
+        b.network.drive(now, BUDGET).unwrap();
+        let back = b.sent().into_iter().map(|p| (p, RxChecksum::Unknown));
+        a.incoming.borrow_mut().extend(back);
+        server = server.or_else(|| b.network.accept(listener).ok());
+        if let Some(server) = server {
+            while let Ok(ReadOutcome::Data { .. }) = b.network.try_read(server, &mut out) {}
+        }
+    }
+    assert_eq!(written, data.len());
+    assert_eq!(b.network.counters().tcp_checksum_errors, 0);
+    let offloaded = *a.network.backend().offloaded.borrow();
+    (sent, offloaded)
+}
+
+// A backend that completes TCP checksums is handed every segment with the
+// pseudo-header sum in its checksum field (checked by the device model),
+// and what leaves the device is exactly what a Network computing them in
+// software sends; a backend without the capability gets software
+// checksums through `transmit`.
+#[test]
+fn offloaded_tcp_checksums_leave_as_software_computes_them() {
+    let (software, none) = exchange(false);
+    let (offloaded, count) = exchange(true);
+    assert_eq!(none, 0);
+    assert_eq!(count, offloaded.len());
+    assert!(software.len() > 40, "{}", software.len());
+    assert!(software == offloaded);
 }

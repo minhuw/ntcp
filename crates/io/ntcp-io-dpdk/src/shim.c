@@ -169,9 +169,31 @@ done:
     return result;
 }
 
+// Whether TCP checksum offload is enabled on TX queue `queue`, as
+// ntcp_dpdk_rx_checksum_check reads RX.
+int ntcp_dpdk_tx_checksum_check(uint16_t port, uint16_t queue) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    if (queue >= info.nb_tx_queues) return -EINVAL;
+    if (!(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) return -ENOTSUP;
+    struct rte_eth_conf conf;
+    result = rte_eth_dev_conf_get(port, &conf);
+    if (result < 0) return result;
+    if (conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) return 0;
+    struct rte_eth_txq_info qinfo;
+    result = rte_eth_tx_queue_info_get(port, queue, &qinfo);
+    if (result < 0) return result;
+    return (qinfo.conf.offloads & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) ? 0 : -ENOTSUP;
+}
+
+// `l3`: nonzero for a TCP segment over IPv4 (its header length) or IPv6
+// (40) whose checksum field holds the pseudo-header sum, which the device
+// completes (RTE_MBUF_F_TX_TCP_CKSUM, as Linux hands a device a
+// CHECKSUM_PARTIAL skb). Rust checked the frame.
 int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
                        const uint8_t *packet, size_t length, int timestamp_offset,
-                       uint64_t timestamp_flag, uint64_t timestamp) {
+                       uint64_t timestamp_flag, uint64_t timestamp, uint16_t l3) {
     if (!length)
         return -EINVAL;
     if (length > NTCP_DPDK_MAX_PACKET_LEN)
@@ -208,6 +230,19 @@ int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
     if (timestamp_offset >= 0) {
         *RTE_MBUF_DYNFIELD(head, timestamp_offset, rte_mbuf_timestamp_t *) = timestamp;
         head->ol_flags |= timestamp_flag;
+    }
+    if (l3) {
+        head->l2_len = 14;
+        head->l3_len = l3;
+        head->ol_flags |= RTE_MBUF_F_TX_TCP_CKSUM |
+            (packet[14] >> 4 == 4 ? RTE_MBUF_F_TX_IPV4 : RTE_MBUF_F_TX_IPV6);
+        // As for TSO: a PMD that wants the field prepared differently
+        // prepares it here.
+        if (rte_eth_tx_prepare(port, queue, &head, 1) != 1) {
+            int error = rte_errno ? -rte_errno : -EIO;
+            rte_pktmbuf_free(head);
+            return error;
+        }
     }
     if (rte_eth_tx_burst(port, queue, &head, 1) == 1)
         return 1; // Driver owns it; never free a submitted mbuf here.
@@ -603,6 +638,12 @@ int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *confi
     if (config->checksum_offload && (info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TCP_CKSUM)) {
         rx |= RTE_ETH_RX_OFFLOAD_TCP_CKSUM;
         *checksums |= 1;
+    }
+    // And on TX, bit 1: the device completes the TCP checksum of each
+    // segment that asks for it by its ol_flags (ntcp_dpdk_transmit).
+    if (config->checksum_offload && (info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) {
+        tx |= RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
+        *checksums |= 2;
     }
     // Without RSS a queue receives only what flows steer to it (or queue 0's
     // default traffic), so each worker sees exactly its own connections. With

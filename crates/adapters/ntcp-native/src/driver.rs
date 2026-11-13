@@ -1197,6 +1197,7 @@ impl<P: PacketIo> Network<P> {
         let wire_len = (offset + pending.ip_len).max(if offset == 0 { 0 } else { 60 });
         let wire = &slot.bytes[..wire_len];
         let io = &mut self.io;
+        let offload = self.config.tcp.connection.tcp_checksum_offload;
         let mut failure = None;
         let result = self.host.submit(
             &mut self.endpoint,
@@ -1205,7 +1206,11 @@ impl<P: PacketIo> Network<P> {
             context,
             packet,
             0,
-            |_| match io.transmit(wire) {
+            |_| match if offload {
+                io.transmit_tcp_checksum_offload(wire)
+            } else {
+                io.transmit(wire)
+            } {
                 Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
                 Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => BackendOutcome::WouldBlock,
                 Err(error) => {

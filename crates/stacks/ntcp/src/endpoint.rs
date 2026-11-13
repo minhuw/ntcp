@@ -4067,7 +4067,7 @@ impl Endpoint {
             return Ok(None);
         }
         let segment = if metadata.tcp_checksum_verified {
-            wire::parse_verified(ip, bytes)
+            wire::parse_unchecked(ip, bytes)
         } else {
             wire::parse(ip, bytes)
         };
@@ -6023,6 +6023,7 @@ impl Endpoint {
             // one. The pool is taken lowest slot first.
             slot.payload = reserved_vec(payload_size)?;
             slot.gso = gso;
+            slot.checksum_partial = self.config.connection.tcp_checksum_offload;
             slots.push(slot);
         }
         self.reservations = slots;
@@ -6081,7 +6082,7 @@ impl Endpoint {
         let flags = s.terminal_flags;
         let owner = &self.retained_slot(id)?.connection;
         let original =
-            wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).map_err(Error::Wire)?;
+            wire::parse_unchecked(r.packet.ip, &slot.bytes[..r.packet.len]).map_err(Error::Wire)?;
         // The aggregate must split into exactly the segments scalar polling
         // emits from here: full-sized at the current path limit but for the
         // reservation's short last one, with the same flags and options.
@@ -6143,7 +6144,7 @@ impl Endpoint {
         let r = slot.current.as_ref()?;
         let group = r.group.filter(|g| g.token == token)?;
         let s = r.departure?.segmentation?;
-        let original = wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).ok()?;
+        let original = wire::parse_unchecked(r.packet.ip, &slot.bytes[..r.packet.len]).ok()?;
         // The flags `fragment` gives the group's first segment, except that
         // PSH and FIN stay for the backend to place on the last one.
         let mut header = original.header;
@@ -7089,8 +7090,9 @@ impl Endpoint {
                 return Ok(None);
             }
         }
-        let len =
-            wire::encode(ip, header, &options[..option_len], &[], out).map_err(Error::Wire)?;
+        let partial = self.config.connection.tcp_checksum_offload;
+        let len = wire::encode_with(ip, header, &options[..option_len], &[], out, partial)
+            .map_err(Error::Wire)?;
         self.time_wait
             .record_mut(index)
             .sent(now, &self.config.connection);
@@ -7203,7 +7205,9 @@ impl Endpoint {
                     options[8..].copy_from_slice(&echo.to_be_bytes());
                 }
                 let options = if echo.is_some() { &options[..] } else { &[] };
-                let len = wire::encode(ip, header, options, &[], out).map_err(Error::Wire)?;
+                let partial = self.config.connection.tcp_checksum_offload;
+                let len = wire::encode_with(ip, header, options, &[], out, partial)
+                    .map_err(Error::Wire)?;
                 self.control.pop_front();
                 self.control_turn = false;
                 return Ok((

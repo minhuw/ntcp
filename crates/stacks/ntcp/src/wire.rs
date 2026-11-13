@@ -340,9 +340,11 @@ pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
     parse_checked(ip, bytes, true)
 }
 
-/// `parse` of a segment whose checksum needs no verification here: the
-/// receiving device verified it (`RxPacketMetadata::tcp_checksum_verified`).
-pub(crate) fn parse_verified(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
+/// `parse` of a segment whose checksum is not this call's to verify: the
+/// receiving device verified it (`RxPacketMetadata::tcp_checksum_verified`),
+/// or this Endpoint encoded it, its checksum perhaps left for a device to
+/// complete (`ConnectionConfig::tcp_checksum_offload`).
+pub(crate) fn parse_unchecked(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
     parse_checked(ip, bytes, false)
 }
 
@@ -407,6 +409,22 @@ pub fn encode(
     payload: &[u8],
     out: &mut [u8],
 ) -> Result<usize, WireError> {
+    encode_with(ip, header, options, payload, out, false)
+}
+
+/// `encode`, or with `partial` for a device that completes the checksum
+/// (`ConnectionConfig::tcp_checksum_offload`): the checksum field then
+/// holds the pseudo-header sum, as Linux's __tcp_v4_send_check and
+/// __tcp_v6_send_check leave it for CHECKSUM_PARTIAL, and the segment is
+/// not summed.
+pub(crate) fn encode_with(
+    ip: IpMetadata,
+    header: Header,
+    options: &[u8],
+    payload: &[u8],
+    out: &mut [u8],
+    partial: bool,
+) -> Result<usize, WireError> {
     if options.len() > 40 {
         return Err(WireError::TooLong);
     }
@@ -458,9 +476,20 @@ pub fn encode(
     //# (MUST-2) and the receiver MUST check it (MUST-3).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# While computing the checksum, the checksum field itself is replaced with zeros.
-    let sum = checksum(ip, &out[..len])?;
+    let sum = if partial {
+        partial_checksum(ip, len)?
+    } else {
+        checksum(ip, &out[..len])?
+    };
     out[16..18].copy_from_slice(&sum.to_be_bytes());
     Ok(len)
+}
+
+// The checksum field of a `len`-octet segment whose device completes the
+// checksum: the folded pseudo-header sum, which the device's one's
+// complement sum over the segment, this field included, completes.
+fn partial_checksum(ip: IpMetadata, len: usize) -> Result<u16, WireError> {
+    Ok(pseudo_header_sum(ip, checked_length(ip, len)?)? as u16)
 }
 
 /// Encode a TCP header while checksumming immutable payload slices in place.
@@ -472,6 +501,18 @@ pub fn encode_shared(
     payload: &[crate::Payload],
     out: &mut [u8],
 ) -> Result<usize, WireError> {
+    encode_shared_with(ip, header, options, payload, out, false)
+}
+
+/// `encode_shared`, `partial` as for `encode_with`.
+pub(crate) fn encode_shared_with(
+    ip: IpMetadata,
+    header: Header,
+    options: &[u8],
+    payload: &[crate::Payload],
+    out: &mut [u8],
+    partial: bool,
+) -> Result<usize, WireError> {
     let payload_len = payload.iter().try_fold(0usize, |n, p| {
         n.checked_add(p.len()).ok_or(WireError::TooLong)
     })?;
@@ -480,7 +521,12 @@ pub fn encode_shared(
         .checked_add(payload_len)
         .ok_or(WireError::TooLong)?;
     let len = checked_length(ip, total)?;
-    let n = encode(ip, header, options, &[], out)?;
+    // The header alone, its checksum field set below.
+    let n = encode_with(ip, header, options, &[], out, true)?;
+    if partial {
+        out[16..18].copy_from_slice(&partial_checksum(ip, total)?.to_be_bytes());
+        return Ok(n);
+    }
     out[16..18].fill(0);
     let mut sum = pseudo_header_sum(ip, len)?;
     // A word may straddle two slices: an odd slice's last octet waits for
@@ -554,6 +600,40 @@ mod tests {
                         parse(ip, &shared).unwrap();
                     }
                 }
+            }
+        }
+    }
+
+    // A device completing the checksum of a segment encoded with `partial`
+    // (its field holding the pseudo-header sum) writes exactly what
+    // software computes, contiguous and shared alike; parse refuses the
+    // partial segment, as its checksum is not final.
+    #[test]
+    fn a_device_completing_a_partial_checksum_writes_what_software_computes() {
+        use crate::Payload;
+        for ip in ips() {
+            for len in [0, 1, 2, 31, 1000] {
+                let data: Vec<u8> = (0..len).map(|n| (n * 29 + 3) as u8).collect();
+                let options = [1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9];
+                let mut full = vec![0; 32 + len];
+                encode(ip, header(), &options, &data, &mut full).unwrap();
+                let mut partial = vec![0; 32 + len];
+                encode_with(ip, header(), &options, &data, &mut partial, true).unwrap();
+                let pseudo = pseudo_header_sum(ip, partial.len() as u32).unwrap() as u16;
+                assert_eq!(partial[16..18], pseudo.to_be_bytes());
+                assert_eq!(parse(ip, &partial).err(), Some(WireError::InvalidChecksum));
+                let mut shared = vec![0; 32];
+                let parts = [Payload::from_vec(data.clone())];
+                let n = encode_shared_with(ip, header(), &options, &parts, &mut shared, true);
+                assert_eq!(n, Ok(32));
+                shared.extend_from_slice(&data);
+                assert_eq!(shared, partial);
+                // The device's one's complement sum over the segment, its
+                // checksum field included.
+                let device = !(add_words(0, &partial) as u16);
+                partial[16..18].copy_from_slice(&device.to_be_bytes());
+                assert_eq!(partial, full);
+                parse(ip, &partial).unwrap();
             }
         }
     }

@@ -62,6 +62,7 @@ unsafe extern "C" {
     -> u16;
     fn ntcp_dpdk_packet_free(packet: *mut c_void);
     fn ntcp_dpdk_rx_checksum_check(port: u16, queue: u16) -> i32;
+    fn ntcp_dpdk_tx_checksum_check(port: u16, queue: u16) -> i32;
     fn ntcp_dpdk_receive(
         packet: *mut c_void,
         out: *mut u8,
@@ -83,6 +84,7 @@ unsafe extern "C" {
         timestamp_offset: i32,
         timestamp_flag: u64,
         timestamp: u64,
+        l3: u16,
     ) -> i32;
 }
 
@@ -122,6 +124,8 @@ pub struct Dpdk {
     tx_scheduling: Option<TimestampConfig>,
     // The device's TCP checksum verdict is read (enable_rx_checksum).
     rx_checksum: bool,
+    // The device completes TCP checksums (enable_tx_checksum).
+    tx_checksum: bool,
     _local: PhantomData<Rc<()>>,
 }
 
@@ -150,6 +154,32 @@ pub(crate) unsafe fn rx_checksum_check(port: u16, queue: u16) -> io::Result<()> 
         return Err(io::Error::from_raw_os_error(-result));
     }
     Ok(())
+}
+
+// enable_tx_checksum's check of TX queue `queue`, as rx_checksum_check.
+pub(crate) unsafe fn tx_checksum_check(port: u16, queue: u16) -> io::Result<()> {
+    // SAFETY: as the caller guarantees.
+    let result = unsafe { ntcp_dpdk_tx_checksum_check(port, queue) };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+    Ok(())
+}
+
+// The network header length of an Ethernet frame of one TCP segment that
+// the device can checksum: IPv4 with any header length, or IPv6 whose
+// base header names TCP.
+fn tcp_frame_l3(packet: &[u8]) -> Option<u16> {
+    let ip = packet.get(14..)?;
+    let l3 = match (
+        u16::from_be_bytes([packet[12], packet[13]]),
+        ip.first()? >> 4,
+    ) {
+        (0x0800, 4) if *ip.get(9)? == 6 => u16::from(ip[0] & 15) * 4,
+        (0x86dd, 6) if *ip.get(6)? == 6 => 40,
+        _ => return None,
+    };
+    (l3 >= 20 && ip.len() >= usize::from(l3) + 20).then_some(l3)
 }
 
 // The ethdev driver serving `port` (rte_eth_dev_info driver_name), or the
@@ -215,6 +245,7 @@ impl Dpdk {
             rx_timestamp: None,
             tx_scheduling: None,
             rx_checksum: false,
+            tx_checksum: false,
             _local: PhantomData,
         })
     }
@@ -264,6 +295,16 @@ impl Dpdk {
         Ok(())
     }
 
+    /// Opt into TX TCP checksum offload (`transmit_tcp_checksum_offload`),
+    /// when the host enabled RTE_ETH_TX_OFFLOAD_TCP_CKSUM on the port or
+    /// this queue. Read-only; nothing is configured.
+    pub fn enable_tx_checksum(&mut self) -> io::Result<()> {
+        // SAFETY: the borrowed port/queue remain live and unchanged.
+        unsafe { tx_checksum_check(self.port, self.tx_queue) }?;
+        self.tx_checksum = true;
+        Ok(())
+    }
+
     // Read-only control-plane opt-in. The borrowed MTU/config/pool geometry must
     // remain unchanged, as required by from_borrowed. No per-packet query.
     pub fn enable_tcp_segmentation(&mut self) -> io::Result<()> {
@@ -277,7 +318,14 @@ impl Dpdk {
         Ok(())
     }
 
-    fn submit(&mut self, packet: &[u8], when: Option<TransmitTime>) -> io::Result<TxOutcome> {
+    // `l3`: the network header length of a TCP segment whose checksum the
+    // device completes, 0 for none.
+    fn submit(
+        &mut self,
+        packet: &[u8],
+        when: Option<TransmitTime>,
+        l3: u16,
+    ) -> io::Result<TxOutcome> {
         let config = when.and(self.tx_scheduling);
         // SAFETY: shim copies the readable slice; cached metadata was validated
         // against the registry. Only allocated mbufs transfer to the PMD.
@@ -291,6 +339,7 @@ impl Dpdk {
                 config.map_or(-1, |c| c.offset),
                 config.map_or(0, |c| c.flag),
                 when.map_or(0, |w| w.value),
+                l3,
             )
         } {
             0 => Ok(TxOutcome::WouldBlock),
@@ -575,11 +624,28 @@ impl PacketIo for Dpdk {
                 "DPDK TX clock mismatch",
             ));
         }
-        self.submit(packet, Some(when))
+        self.submit(packet, Some(when), 0)
     }
 
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
-        self.submit(packet, None)
+        self.submit(packet, None, 0)
+    }
+
+    fn tcp_checksum_offload(&self) -> bool {
+        self.tx_checksum
+    }
+
+    fn transmit_tcp_checksum_offload(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+        if !self.tx_checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "DPDK TX TCP checksum offload disabled",
+            ));
+        }
+        let l3 = tcp_frame_l3(packet).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "not an Ethernet TCP frame")
+        })?;
+        self.submit(packet, None, l3)
     }
 }
 

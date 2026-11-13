@@ -303,6 +303,25 @@ pub trait PacketIo {
         None
     }
 
+    // The device computes the TCP checksum of every frame handed to
+    // transmit_tcp_checksum_offload, as a Linux device with NETIF_F_IP_CSUM
+    // and NETIF_F_IPV6_CSUM completes a CHECKSUM_PARTIAL skb.
+    fn tcp_checksum_offload(&self) -> bool {
+        false
+    }
+
+    // `transmit` of one TCP segment over IPv4 (any header length) or IPv6
+    // (base header, Next Header TCP), its IPv4 header checksum complete and
+    // its TCP checksum field holding the pseudo-header sum, which the
+    // device completes. Unsupported certifies no submission; other
+    // outcomes as for transmit.
+    fn transmit_tcp_checksum_offload(&mut self, _packet: &[u8]) -> io::Result<TxOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TCP checksum offload unsupported",
+        ))
+    }
+
     // Contiguous normal-length aggregate headers plus payload, not a wire packet.
     // Backend-specific header/checksum restrictions apply. No scheduling or TX
     // timestamp combination. Submitted transfers the WHOLE aggregate copy;
@@ -442,6 +461,11 @@ mod tests {
         assert_eq!(io.local_ip_mtu().unwrap(), None);
         assert_eq!(io.max_packet_len(), None);
         assert_eq!(io.tcp_segmentation_capabilities(), None);
+        assert!(!io.tcp_checksum_offload());
+        assert_eq!(
+            io.transmit_tcp_checksum_offload(&[1]).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         assert!(matches!(
             io.transmit_segmented(
                 &[],
