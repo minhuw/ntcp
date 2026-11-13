@@ -48,18 +48,20 @@ static void managed_cancel_safety(void) {
     assert(result == PTHREAD_CANCELED && cancelled_cleanup == 1);
     assert(close(fd) == 0);
 }
-static void bounded_cookies(void) {
+// More managed FILEs than the former 512-cookie table held: libc allows
+// as many streams as memory does.
+static void many_cookies(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
-    FILE *streams[512];
-    for (size_t i = 0; i < 512; ++i) {
+    enum { STREAMS = 1200 };
+    static FILE *streams[STREAMS];
+    for (size_t i = 0; i < STREAMS; ++i) {
         streams[i] = fdopen(fd, "r+");
-        assert(streams[i]);
+        assert(streams[i] && fileno(streams[i]) == fd);
     }
-    assert(!fdopen(fd, "r+") && errno == EMFILE);
     assert(fcntl(fd, F_GETFD) >= 0);
     assert(fclose(streams[0]) == 0);
-    for (size_t i = 1; i < 512; ++i)
+    for (size_t i = 1; i < STREAMS; ++i)
         assert(fclose(streams[i]) == EOF && errno == EBADF);
     fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
@@ -113,7 +115,7 @@ int main(int argc, char **argv) {
         assert(fclose(f) == 0);
     }
     if (argc == 3) {
-        bounded_cookies();
+        many_cookies();
         managed_cancel_safety();
     }
     FILE *native = tmpfile();

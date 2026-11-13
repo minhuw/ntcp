@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 extern int ntcp_boundary_fd(int);
@@ -18,14 +19,43 @@ extern ssize_t ntcp_managed_read(int, void *, size_t);
 extern ssize_t ntcp_managed_write(int, const void *, size_t);
 extern int ntcp_managed_close(int);
 
-// ponytail: at most 512 live managed FILEs; raise alongside the socket limit.
 struct cookie {
     _Atomic int used;
     _Atomic(FILE *) stream;
     int fd;
     uint64_t id;
 };
-static struct cookie cookies[512];
+// The live managed FILEs' cookies, in segments grown on demand as the
+// managed fd tables are (fd_table.rs): segment k holds 64 << k cookies, is
+// published once by compare-and-swap and never moves or is freed, so
+// fileno reads it without a lock. As many FILEs as memory allows, as for
+// libc's own streams.
+#define SEGMENTS 26
+static struct cookie *_Atomic segments[SEGMENTS];
+static size_t segment_size(size_t k) { return (size_t)64 << k; }
+// A free cookie, claimed; NULL with errno ENOMEM when none can be added.
+static struct cookie *claim_cookie(void) {
+    for (size_t k = 0; k < SEGMENTS; ++k) {
+        struct cookie *segment = atomic_load(&segments[k]);
+        if (!segment) {
+            struct cookie *fresh = calloc(segment_size(k), sizeof(*fresh));
+            if (!fresh) { errno = ENOMEM; return NULL; }
+            struct cookie *expected = NULL;
+            if (atomic_compare_exchange_strong(&segments[k], &expected, fresh)) {
+                segment = fresh;
+            } else {
+                free(fresh); // Another thread published this segment first.
+                segment = expected;
+            }
+        }
+        for (size_t i = 0; i < segment_size(k); ++i) {
+            int unused = 0;
+            if (atomic_compare_exchange_strong(&segment[i].used, &unused, 1)) return &segment[i];
+        }
+    }
+    errno = ENOMEM;
+    return NULL;
+}
 static FILE *(*_Atomic real_fdopen)(int, const char *);
 static int (*_Atomic real_fileno)(FILE *);
 static int (*_Atomic real_fileno_unlocked)(FILE *);
@@ -113,14 +143,8 @@ FILE *ntcp_c_fdopen(int fd, const char *mode) {
     }
     if (mode[0] == 'a' && !(flags & O_APPEND) &&
         syscall(SYS_fcntl, fd, F_SETFL, flags | O_APPEND) < 0) goto done;
-    for (size_t i = 0; i < sizeof(cookies) / sizeof(cookies[0]); ++i) {
-        int unused = 0;
-        if (atomic_compare_exchange_strong(&cookies[i].used, &unused, 1)) {
-            c = &cookies[i];
-            break;
-        }
-    }
-    if (!c) { errno = EMFILE; goto done; }
+    c = claim_cookie();
+    if (!c) goto done;
     c->fd = fd;
     c->id = id;
     cookie_io_functions_t io = {cookie_read, cookie_write, cookie_seek, cookie_close};
@@ -138,8 +162,12 @@ done:;
 static int cookie_fileno(FILE *stream, int unlocked) {
     ensure_stdio();
     if (!real_fileno || !real_fileno_unlocked) { errno = ENOSYS; return -1; }
-    for (size_t i = 0; i < sizeof(cookies) / sizeof(cookies[0]); ++i)
-        if (stream && atomic_load(&cookies[i].stream) == stream) return cookies[i].fd;
+    for (size_t k = 0; stream && k < SEGMENTS; ++k) {
+        struct cookie *segment = atomic_load(&segments[k]);
+        if (!segment) break;
+        for (size_t i = 0; i < segment_size(k); ++i)
+            if (atomic_load(&segment[i].stream) == stream) return segment[i].fd;
+    }
     return unlocked ? real_fileno_unlocked(stream) : real_fileno(stream);
 }
 int ntcp_c_fileno(FILE *stream) { return cookie_fileno(stream, 0); }
