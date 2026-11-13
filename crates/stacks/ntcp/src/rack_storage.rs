@@ -139,15 +139,11 @@ impl Intervals {
         end: usize,
     ) -> impl DoubleEndedIterator<Item = &Interval> {
         assert!(start <= end && end <= self.len);
-        let (start, end) = (self.head + start, self.head + end);
-        let first = start / BLOCK;
-        self.blocks[first..end.div_ceil(BLOCK)]
-            .iter()
-            .enumerate()
-            .flat_map(move |(i, b)| {
-                let offset = (first + i) * BLOCK;
-                b[start.saturating_sub(offset)..end.saturating_sub(offset).min(b.len())].iter()
-            })
+        Range {
+            blocks: &self.blocks,
+            front: self.head + start,
+            back: self.head + end,
+        }
     }
     pub(super) fn range_mut(
         &mut self,
@@ -238,6 +234,38 @@ impl Intervals {
         self.head = 0;
         self.capacity = 0;
         self.allocation = 0;
+    }
+}
+// The intervals in slots [front, back), one slot lookup each: most ranges
+// hold an interval or two, for which a flattened walk over blocks costs
+// more than the intervals.
+struct Range<'a> {
+    blocks: &'a [Vec<Interval>],
+    front: usize,
+    back: usize,
+}
+impl<'a> Iterator for Range<'a> {
+    type Item = &'a Interval;
+    fn next(&mut self) -> Option<&'a Interval> {
+        if self.front == self.back {
+            return None;
+        }
+        let slot = self.front;
+        self.front += 1;
+        Some(&self.blocks[slot / BLOCK][slot % BLOCK])
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.back - self.front;
+        (len, Some(len))
+    }
+}
+impl DoubleEndedIterator for Range<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        Some(&self.blocks[self.back / BLOCK][self.back % BLOCK])
     }
 }
 impl Index<usize> for Intervals {

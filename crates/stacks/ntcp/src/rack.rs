@@ -702,6 +702,14 @@ impl Rack {
     // Indices of the intervals overlapping [start, end).
     fn overlapping(&self, start: Seq, end: Seq) -> (usize, usize) {
         let first = self.locate(start);
+        // Most ranges end inside the interval holding start: no second
+        // search.
+        if first < self.intervals.len() && !end.after(self.intervals[first].end) {
+            return (
+                first,
+                first + usize::from(end.after(self.intervals[first].start)),
+            );
+        }
         let mut last = self.locate(end);
         if last < self.intervals.len() && end.after(self.intervals[last].start) {
             last += 1;
@@ -1207,14 +1215,24 @@ impl Rack {
         now: u64,
     ) {
         debug_assert!(self.validate_departure(selection, start, end, now));
-        // Nothing allocates; a split that would take a SPARE entry, which
-        // retransmissions and cumulative ACKs need, coalesces.
-        for edge in [start, end] {
-            if self.intervals.len() + SPARE < self.capacity {
-                self.split(edge);
+        // The usual departure is one whole interval, which neither edge
+        // splits.
+        let i = self.locate(start);
+        let (first, last) = if i < self.intervals.len()
+            && self.intervals[i].start == start
+            && self.intervals[i].end == end
+        {
+            (i, i + 1)
+        } else {
+            // Nothing allocates; a split that would take a SPARE entry, which
+            // retransmissions and cumulative ACKs need, coalesces.
+            for edge in [start, end] {
+                if self.intervals.len() + SPARE < self.capacity {
+                    self.split(edge);
+                }
             }
-        }
-        let (first, last) = self.overlapping(start, end);
+            self.overlapping(start, end)
+        };
         let previous = first
             .checked_sub(1)
             .filter(|&i| self.intervals[i].end == start);
