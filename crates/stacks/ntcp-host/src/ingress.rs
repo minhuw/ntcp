@@ -327,16 +327,23 @@ pub struct Envelope {
     // included (RFC 6946), whatever the reconstruction's bytes now hold;
     // Neighbor Discovery refuses such messages (RFC 6980 section 5).
     fragment_header: bool,
+    // From `receive`, which verified the header checksum of each IPv4
+    // packet as it arrived (`ntcp_ip::parse_fragment`); a reassembled
+    // datagram's header is fragment zero's, sealed again by reassembly.
+    // Destination processing then leaves the checksum alone, as Linux
+    // verifies it once, in ip_rcv_core.
+    received: bool,
 }
 
 impl Envelope {
-    // An unfragmented packet as it arrived.
-    pub(crate) const fn physical(context: IngressContext, len: usize) -> Self {
+    // An unfragmented packet as it arrived; `received` as for the field.
+    pub(crate) const fn physical(context: IngressContext, len: usize, received: bool) -> Self {
         Self {
             context,
             len,
             reassembled: false,
             fragment_header: false,
+            received,
         }
     }
     pub const fn context(self) -> IngressContext {
@@ -552,13 +559,15 @@ impl Host {
             return Ok(received);
         }
         let whole = Datagram {
-            envelope: Envelope::physical(context, frame.len()),
+            envelope: Envelope::physical(context, frame.len(), true),
             bytes: frame,
         };
         let piece = match frame.first().ok_or(ntcp_ip::Error::Truncated)? >> 4 {
             4 => {
                 // Source-route admission and completion, per fragment and
-                // before reassembly (RFC 1122 section 3.2.1.8).
+                // before reassembly (RFC 1122 section 3.2.1.8). The header
+                // checksum is verified here, once for each arriving packet
+                // (RFC 1122 section 3.2.1.2, cited at ntcp_ip::ipv4_bounds).
                 let source_routes = capabilities.ipv4.source_routes();
                 let packet =
                     ntcp_ip::parse_fragment(frame, source_routes.ok_or(Error::Unsupported)?)?;
@@ -614,6 +623,7 @@ impl Host {
                         len,
                         reassembled: false,
                         fragment_header: true,
+                        received: true,
                     },
                     bytes: out,
                 }))
@@ -633,6 +643,7 @@ impl Host {
                         len,
                         reassembled: true,
                         fragment_header: true,
+                        received: true,
                     },
                     bytes: out,
                 }))
@@ -701,7 +712,7 @@ impl Host {
         let chain = self.receive_chain(now, arrival, frame, true)?;
         let Some(piece) = Piece::ipv6(frame, &chain) else {
             return Ok(Received::Datagram(Datagram {
-                envelope: Envelope::physical(context, frame.len()),
+                envelope: Envelope::physical(context, frame.len(), true),
                 bytes: frame,
             }));
         };
@@ -751,6 +762,7 @@ impl Host {
                 len,
                 reassembled,
                 fragment_header: true,
+                received: true,
             },
             bytes: out,
         }))
@@ -993,7 +1005,12 @@ impl Host {
         } else {
             None
         };
-        self.parse_ingress_limited(datagram.context(), datagram.bytes, limit)
+        self.parse_ingress_limited(
+            datagram.context(),
+            datagram.bytes,
+            limit,
+            datagram.envelope.received,
+        )
     }
 
     /// Dispatch one processed datagram exactly like an unfragmented packet:

@@ -1883,15 +1883,17 @@ impl Host {
         context: IngressContext,
         frame: &'a [u8],
     ) -> Result<IngressPacket<'a>, Error> {
-        self.parse_ingress_limited(context, frame, None)
+        self.parse_ingress_limited(context, frame, None, false)
     }
     // One complete (never fragmented) datagram: an arriving packet within
     // the link's physical limit, or a reassembled one within `reassembled`.
+    // `received`: from `receive`, which verified its IPv4 header checksum.
     fn parse_ingress_limited<'a>(
         &self,
         context: IngressContext,
         frame: &'a [u8],
         reassembled: Option<usize>,
+        received: bool,
     ) -> Result<IngressPacket<'a>, Error> {
         let capabilities = self.port(context.link)?.receive;
         if frame.len() > reassembled.unwrap_or(capabilities.max_ip_packet) {
@@ -1899,8 +1901,15 @@ impl Host {
         }
         let packet = match frame.first().ok_or(ntcp_ip::Error::Truncated)? >> 4 {
             4 => {
-                let source_routes = capabilities.ipv4.source_routes();
-                let packet = ntcp_ip::parse(frame, source_routes.ok_or(Error::Unsupported)?)?;
+                let source_routes = capabilities
+                    .ipv4
+                    .source_routes()
+                    .ok_or(Error::Unsupported)?;
+                let packet = if received {
+                    ntcp_ip::parse_received(frame, source_routes)?
+                } else {
+                    ntcp_ip::parse(frame, source_routes)?
+                };
                 IngressPacket {
                     ip: packet.ip,
                     traffic_class: packet.traffic_class,
@@ -2080,7 +2089,7 @@ impl Host {
         frame: &[u8],
         timestamps: Option<&mut dyn ntcp::Ipv4TimestampProvider>,
     ) -> Result<IcmpDispatch, Error> {
-        let datagram = Envelope::physical(context, frame.len())
+        let datagram = Envelope::physical(context, frame.len(), false)
             .datagram(frame)
             .ok_or(Error::Obsolete)?;
         let processed = self.process(datagram, timestamps)?;
@@ -2947,8 +2956,10 @@ impl Host {
             return Err(Error::Obsolete);
         }
         let live = context;
+        // The embedding encoded the frame (`ntcp_ip::encode`), checksum
+        // included, which is not verified again.
         let (ip, header, total, protocol) = if packet.ip.source.is_ipv4() {
-            ntcp_ip::quote_header(frame)?
+            ntcp_ip::egress_header(frame)?
         } else {
             ntcp_ip6::quote_header(frame)?
         };

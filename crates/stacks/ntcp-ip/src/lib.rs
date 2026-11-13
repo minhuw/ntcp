@@ -67,7 +67,23 @@ const IP_HEADER: usize = IPV4_HEADER;
 //# an ICMP message). The IP and transport layer MUST each interpret those IP
 //# options that they understand and silently ignore the others.
 pub fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Packet<'_>, Error> {
-    let (header, total) = ipv4_bounds(bytes)?;
+    parse_checked(bytes, source_routes_enabled, true)
+}
+
+/// `parse` of a complete datagram whose header the receiving host already
+/// validated, checksum included, as it arrived (`parse_fragment`): every
+/// check of `parse` but the header checksum, which is verified once per
+/// received packet, as Linux's ip_rcv_core verifies it once.
+pub fn parse_received(bytes: &[u8], source_routes_enabled: bool) -> Result<Packet<'_>, Error> {
+    parse_checked(bytes, source_routes_enabled, false)
+}
+
+fn parse_checked(
+    bytes: &[u8],
+    source_routes_enabled: bool,
+    checksum: bool,
+) -> Result<Packet<'_>, Error> {
+    let (header, total, _) = bounds(bytes, false, checksum)?;
     if total != bytes.len() {
         return Err(Error::Length);
     }
@@ -116,7 +132,7 @@ fn v4(b: &[u8]) -> Ipv4Addr {
 //# A host MUST verify the IP header checksum on every received datagram and
 //# silently discard every datagram that has a bad checksum.
 pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
-    let (header, total, _) = bounds(b, false)?;
+    let (header, total, _) = bounds(b, false, true)?;
     Ok((header, total))
 }
 
@@ -124,12 +140,25 @@ pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
 /// offset): the validated header and total lengths with its fragmentation
 /// fields. Link framing uses it to delimit packets that reassembly accepts.
 pub fn ipv4_fragment_bounds(b: &[u8]) -> Result<(usize, usize, Fragmentation), Error> {
-    bounds(b, true)
+    bounds(b, true, true)
+}
+
+/// `ipv4_fragment_bounds` for the link framing of a received packet that
+/// the IP layer then takes (`parse_fragment`), which verifies the header
+/// checksum: every other check, so that the checksum is verified once.
+pub fn ipv4_received_bounds(b: &[u8]) -> Result<(usize, usize, Fragmentation), Error> {
+    bounds(b, true, false)
 }
 
 // Shared header validation. The atomic entrypoints refuse every flag but DF
-// exactly as before; the fragment API admits MF and offsets.
-fn bounds(b: &[u8], fragments: bool) -> Result<(usize, usize, Fragmentation), Error> {
+// exactly as before; the fragment API admits MF and offsets. `checksum`:
+// verify the header checksum, unless the caller's packet was verified
+// before (received) or encoded here (sent).
+fn bounds(
+    b: &[u8],
+    fragments: bool,
+    checksum: bool,
+) -> Result<(usize, usize, Fragmentation), Error> {
     if b.len() < 20 {
         return Err(Error::Truncated);
     }
@@ -152,7 +181,7 @@ fn bounds(b: &[u8], fragments: bool) -> Result<(usize, usize, Fragmentation), Er
     if flags & 0x8000 != 0 {
         return Err(Error::Invalid);
     }
-    if checksum(&b[..header]) != 0 {
+    if checksum && self::checksum(&b[..header]) != 0 {
         return Err(Error::Checksum);
     }
     // Destination packets and ICMP quotes may both have an expired TTL.
@@ -213,7 +242,7 @@ pub fn parse_fragment(
     bytes: &[u8],
     source_routes_enabled: bool,
 ) -> Result<FragmentPacket<'_>, Error> {
-    let (header, total, fragmentation) = bounds(bytes, true)?;
+    let (header, total, fragmentation) = bounds(bytes, true, true)?;
     if total != bytes.len() {
         return Err(Error::Length);
     }
@@ -652,7 +681,15 @@ fn encode_present(
 // Checked quoted header: returns metadata, header length, original packet
 // length, and protocol. Expired hop limits are valid in error quotes.
 pub fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
-    let (ip, header, total, protocol, _) = quote(b, false)?;
+    let (ip, header, total, protocol, _) = quote(b, false, true)?;
+    Ok((ip, header, total, protocol))
+}
+
+/// `quote_header` of a packet this host encoded for sending (`encode`):
+/// every check but the header checksum, which the encoder computed. As
+/// Linux, the host verifies no outgoing header checksum.
+pub fn egress_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
+    let (ip, header, total, protocol, _) = quote(b, false, false)?;
     Ok((ip, header, total, protocol))
 }
 
@@ -662,7 +699,7 @@ pub fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
 pub fn quote_fragment_header(
     b: &[u8],
 ) -> Result<(IpMetadata, usize, usize, u8, Fragmentation), Error> {
-    quote(b, true)
+    quote(b, true, true)
 }
 
 /// The final destination of an encoded IPv4 packet or fragment, checked as
@@ -673,7 +710,7 @@ pub fn quote_fragment_header(
 /// Identification) as it arrives there, so Identifications are leased for
 /// that address.
 pub fn final_destination(b: &[u8]) -> Result<Ipv4Addr, Error> {
-    match quote(b, true)?.0.destination {
+    match quote(b, true, true)?.0.destination {
         IpAddr::V4(destination) => Ok(destination),
         IpAddr::V6(_) => Err(Error::Version),
     }
@@ -682,8 +719,9 @@ pub fn final_destination(b: &[u8]) -> Result<Ipv4Addr, Error> {
 fn quote(
     b: &[u8],
     fragments: bool,
+    checksum: bool,
 ) -> Result<(IpMetadata, usize, usize, u8, Fragmentation), Error> {
-    let (header, total, fragmentation) = bounds(b, fragments)?;
+    let (header, total, fragmentation) = bounds(b, fragments, checksum)?;
     let mut destination = v4(&b[16..20]);
     // Quotes can catch source-routed datagrams before their final hop. Core
     // options parse intentionally rejects unfinished routes, so validate a

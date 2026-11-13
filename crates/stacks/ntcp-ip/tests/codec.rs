@@ -74,6 +74,70 @@ fn fullwidth_and_malformed_frames() {
     assert_eq!(parse(&b[..len], false).unwrap_err(), Error::Checksum);
 }
 
+// The header checksum is verified once per packet: by `parse`,
+// `parse_fragment`, `ipv4_bounds`, `ipv4_fragment_bounds` and
+// `quote_header`, never by the variants for a packet the receive path
+// verified (`parse_received`, `ipv4_received_bounds`) or this host encoded
+// (`egress_header`), which keep every other check.
+#[test]
+fn received_and_egress_variants_skip_only_the_checksum() {
+    let mut b = [0; 60];
+    let len = encode(&mut b, tx(false, 20), 0).unwrap();
+    let good = b;
+    b[11] ^= 0x40;
+    assert_eq!(parse(&b[..len], false).unwrap_err(), Error::Checksum);
+    assert_eq!(
+        ntcp_ip::parse_fragment(&b[..len], false).unwrap_err(),
+        Error::Checksum
+    );
+    assert_eq!(
+        ntcp_ip::ipv4_fragment_bounds(&b[..len]).unwrap_err(),
+        Error::Checksum
+    );
+    assert_eq!(
+        ntcp_ip::quote_header(&b[..len]).unwrap_err(),
+        Error::Checksum
+    );
+    let p = ntcp_ip::parse_received(&b[..len], false).unwrap();
+    let q = parse(&good[..len], false).unwrap();
+    assert_eq!((p.ip, p.protocol, p.payload), (q.ip, q.protocol, q.payload));
+    assert_eq!(
+        ntcp_ip::ipv4_received_bounds(&b[..len]).unwrap(),
+        ntcp_ip::ipv4_fragment_bounds(&good[..len]).unwrap()
+    );
+    assert_eq!(
+        ntcp_ip::egress_header(&b[..len]).unwrap(),
+        ntcp_ip::quote_header(&good[..len]).unwrap()
+    );
+    // Every other refusal stays.
+    assert_eq!(
+        ntcp_ip::parse_received(&b[..len + 1], false).unwrap_err(),
+        Error::Length
+    );
+    let fragment = Error::FragmentationUnsupported;
+    for (at, value, atomic, received) in [
+        (0, 0x65, Error::Version, Some(Error::Version)),
+        (0, 0x44, Error::Length, Some(Error::Length)),
+        // The reserved flag, and MF, which only the fragment API admits.
+        (6, 0xc0, fragment, Some(Error::Invalid)),
+        (6, 0x20, fragment, None),
+    ] {
+        let mut bad = b;
+        bad[at] = value;
+        assert_eq!(
+            ntcp_ip::parse_received(&bad[..len], false).unwrap_err(),
+            atomic
+        );
+        assert_eq!(ntcp_ip::egress_header(&bad[..len]).unwrap_err(), atomic);
+        assert_eq!(ntcp_ip::ipv4_received_bounds(&bad[..len]).err(), received);
+    }
+    for cut in 0..20 {
+        assert!(ntcp_ip::parse_received(&b[..cut], false).is_err());
+        assert!(ntcp_ip::ipv4_received_bounds(&b[..cut]).is_err());
+        assert!(ntcp_ip::egress_header(&b[..cut]).is_err());
+    }
+}
+
 #[test]
 fn checked_headers_and_wrong_family() {
     let mut bytes = [0; 60];

@@ -294,6 +294,19 @@ fn ethernet_fragment_framing_and_padding() {
             parse_ethernet_fragment(padded).unwrap().payload,
             &packet[..len]
         );
+        // The receiving host's IP layer verifies the IPv4 header checksum,
+        // not its framing; the atomic framing still does.
+        if !v6 {
+            let mut corrupt = frame;
+            corrupt[14 + 10] ^= 0x40;
+            let corrupt = &corrupt[..(14 + len).max(60)];
+            assert_eq!(parse_ethernet_fragment(corrupt).unwrap().payload.len(), len);
+            assert_eq!(
+                ntcp_ip::parse_fragment(parse_ethernet_fragment(corrupt).unwrap().payload, false)
+                    .unwrap_err(),
+                Error::Checksum
+            );
+        }
         // Padding beyond the minimum frame is still a length error.
         assert_eq!(
             parse_ethernet_fragment(&frame[..(14 + len).max(60) + 1]).unwrap_err(),

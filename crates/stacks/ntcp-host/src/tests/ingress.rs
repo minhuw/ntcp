@@ -360,6 +360,50 @@ fn echo_requests_are_answered_exactly_whole_or_reassembled() {
     }
 }
 
+// The IPv4 header checksum is verified once, as each packet arrives
+// (`receive`, Linux's ip_rcv_core): a corrupt packet or fragment is refused
+// there, and destination processing of what `receive` returned does not
+// verify it again. A frame given to `input_icmp` never passed `receive`, so
+// processing verifies it.
+#[test]
+fn ipv4_header_checksums_are_verified_once_on_arrival() {
+    let cfg = config(2);
+    let (local, remote) = addresses(false);
+    let mut a = side(local, 73, &cfg, OUTPUT);
+    let to_us = ip(remote.ip(), local.ip());
+    let request = echo(to_us, 0x55, 1, &[4; 600]);
+    let mut corrupt = request.clone();
+    corrupt[10] ^= 0x20;
+    let mut out = vec![0; 4200];
+    let checksum = Err(Error::Codec(ntcp_ip::Error::Checksum));
+    assert_eq!(
+        a.0.receive(a.2, 1, &corrupt, false, &mut out).map(|_| ()),
+        checksum
+    );
+    assert_eq!(
+        a.0.input_icmp(&mut a.1, a.2, 1, &corrupt, None).map(|_| ()),
+        checksum
+    );
+    for piece in fragments(&request, 51, 304) {
+        let mut piece = piece.clone();
+        piece[10] ^= 0x20;
+        assert_eq!(
+            a.0.receive(a.2, 1, &piece, false, &mut out).map(|_| ()),
+            checksum
+        );
+    }
+    assert_eq!(a.0.reassembly_counters().completed, 0);
+    let Received::Datagram(datagram) = a.0.receive(a.2, 1, &request, false, &mut out).unwrap()
+    else {
+        panic!("an unfragmented request is a datagram");
+    };
+    // Processing takes the received header as verified.
+    let rejoined = datagram.envelope().datagram(&corrupt).unwrap();
+    assert!(a.0.process(rejoined, None).is_ok());
+    assert!(a.0.process(datagram, None).is_ok());
+    assert_eq!(a.0.icmp_output_pending(), 0);
+}
+
 // Insert a Destination Options header (one PadN) directly after the base
 // header of an IPv6 packet.
 fn with_destination_options(packet: &[u8]) -> Vec<u8> {
