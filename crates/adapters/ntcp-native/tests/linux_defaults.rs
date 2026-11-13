@@ -525,3 +525,90 @@ fn the_buffers_start_at_64_kib_with_window_scale_10_and_grow() {
     // The grown ring is charged, 1.375 bytes per byte.
     assert!(server.counters().buffer_bytes > opened);
 }
+
+// After an exchange a connection holds no more send storage than a page of
+// ring and the ledgers' first growth, as Linux frees skbs at ACK
+// (tcp_clean_rtx_queue) and sk_mem_reclaim keeps less than a page: the
+// charge stays near the idle one however large the send limit. A response
+// that grew the ring past its page frees it once acknowledged, and the
+// next small exchange charges what the first did.
+#[test]
+fn an_exchange_leaves_the_send_storage_near_idle() {
+    const N: usize = 64;
+    let (a, b) = (Queue::default(), Queue::default());
+    let more = |config: &mut NetworkConfig, _: &Wire| config.tcp.max_connections = N;
+    let (mut client, _) = side_with(1, &a, &b, more);
+    let (mut server, _) = side_with(2, &b, &a, more);
+    let listener = server.listen(PORT, N).unwrap();
+    let clients: Vec<_> = (0..N)
+        .map(|_| client.connect(SocketAddr::new(address(2), PORT)).unwrap())
+        .collect();
+    let mut accepted = Vec::new();
+    let mut now = 0;
+    while accepted.len() < N {
+        step(&mut now, &mut client, &mut server);
+        while let Ok(id) = server.accept(listener) {
+            accepted.push(id);
+        }
+        assert!(now < 1_000 * MS, "handshakes did not finish");
+    }
+    for _ in 0..50 {
+        step(&mut now, &mut client, &mut server);
+    }
+    let charges = |client: &Network<Wire>, server: &Network<Wire>| {
+        (
+            client.counters().buffer_bytes,
+            server.counters().buffer_bytes,
+        )
+    };
+    let idle = charges(&client, &server);
+    let exchange =
+        |now: &mut u64, client: &mut Network<Wire>, server: &mut Network<Wire>, response: usize| {
+            let mut out = vec![0; 1 << 16];
+            for &id in &clients {
+                let receipt = client
+                    .try_write(id, &[1; 300], WriteOptions::default())
+                    .unwrap();
+                assert_eq!(receipt.accepted, 300);
+            }
+            let (mut requests, mut responses) = (vec![300; N], vec![response; N]);
+            while responses.iter().any(|&left| left != 0) {
+                step(now, client, server);
+                for (i, &id) in accepted.iter().enumerate() {
+                    while let Ok(ReadOutcome::Data { len, .. }) = server.try_read(id, &mut out) {
+                        requests[i] -= len;
+                        if requests[i] == 0 {
+                            let reply = vec![2; response];
+                            let receipt = server
+                                .try_write(id, &reply, WriteOptions::default())
+                                .unwrap();
+                            assert_eq!(receipt.accepted, response);
+                        }
+                    }
+                }
+                for (i, &id) in clients.iter().enumerate() {
+                    while let Ok(ReadOutcome::Data { len, .. }) = client.try_read(id, &mut out) {
+                        responses[i] -= len;
+                    }
+                }
+                assert!(*now < 10_000 * MS, "exchange did not finish");
+            }
+            // The last ACKs reach the server.
+            for _ in 0..50 {
+                step(now, client, server);
+            }
+        };
+    exchange(&mut now, &mut client, &mut server, 600);
+    let small = charges(&client, &server);
+    for (after, before) in [(small.0, idle.0), (small.1, idle.1)] {
+        // A page of ring and ledgers within their 4096-byte reserve.
+        assert!(
+            after > before && after - before <= N * 8192,
+            "{before} -> {after}"
+        );
+    }
+    exchange(&mut now, &mut client, &mut server, 60_000);
+    assert!(server.counters().buffer_bytes <= small.1);
+    exchange(&mut now, &mut client, &mut server, 600);
+    assert_eq!(server.counters().buffer_bytes, small.1);
+}

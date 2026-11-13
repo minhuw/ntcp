@@ -3316,15 +3316,19 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             slot.connection.expand_send(allowed);
         }
-        if self.slots[index]
-            .as_ref()
-            .is_some_and(|slot| slot.connection.ledgers_reclaimable())
-        {
-            // Drained ledgers above their reserve return to the budget,
-            // waking writers waiting for memory.
+        if self.slots[index].as_ref().is_some_and(|slot| {
+            slot.connection.ledgers_reclaimable() || slot.connection.send_ring_reclaimable()
+        }) {
+            // Drained ledgers and send ring above their reserves return to
+            // the budget, waking writers waiting for memory.
             let connection = &mut self.slots[index].as_mut().unwrap().connection;
             let old = connection.buffer_charge();
-            connection.reclaim_ledgers();
+            if connection.ledgers_reclaimable() {
+                connection.reclaim_ledgers();
+            }
+            if connection.send_ring_reclaimable() {
+                connection.reclaim_send_ring();
+            }
             let new = connection.buffer_charge();
             self.recharge(old, new);
         }
@@ -8964,6 +8968,63 @@ mod memory_wait_tests {
         let progress = a.slot(bulk).unwrap().connection.send_progress();
         assert_eq!(progress.queued_end, progress.acknowledged);
         assert_eq!(ledgers(&a), small);
+    }
+
+    // A connection whose queue drained frees a send ring grown past a
+    // page, as Linux frees an emptied write queue's skbs at ACK and
+    // sk_mem_reclaim returns what exceeds a page; the return wakes a writer
+    // waiting for memory. The send limit stays, and the next write grows
+    // the ring again from a page, which a small exchange keeps.
+    #[test]
+    fn drained_send_ring_above_a_page_is_freed_and_wakes_a_waiter() {
+        let (mut a, mut b, listener) = endpoints();
+        let (bulk, server) = connect(&mut a, &mut b, listener, 40000);
+        let (waiter, _) = connect(&mut a, &mut b, listener, 40001);
+        let ring = |a: &Endpoint| a.slot(bulk).unwrap().connection.send_ring_bytes();
+        let ledgers = |a: &Endpoint| a.slot(bulk).unwrap().connection.ledger_bytes();
+        a.set_send_buffer(bulk, 8192).unwrap();
+        let data: Vec<u8> = (0..6000).map(|i| (i % 251) as u8).collect();
+        assert_eq!(a.write(bulk, &data), Ok(data.len()));
+        assert_eq!(ring(&a), 2 * 8192);
+        let held = ring(&a) + ledgers(&a);
+        assert!(ledgers(&a) > crate::connection::LEDGER_RESERVE);
+        writable(&mut a, waiter);
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        assert_eq!(a.write(waiter, &[1; 9]), Err(Error::WouldBlock.into()));
+        assert!(!writable(&mut a, waiter));
+        let charged = a.buffer_bytes();
+        let mut read = Vec::new();
+        for now in 1..256 {
+            exchange(&mut a, &mut b, now);
+            let mut out = [0; 1024];
+            let len = b.read(server, &mut out).unwrap_or(0);
+            read.extend_from_slice(&out[..len]);
+            if a.slot(bulk).unwrap().connection.send_progress().queued_end
+                == a.acknowledged(bulk).unwrap()
+            {
+                break;
+            }
+            // Nothing is freed while bytes are queued.
+            assert_eq!(ring(&a), 2 * 8192);
+        }
+        assert_eq!(read, data);
+        assert_eq!((ring(&a), ledgers(&a)), (0, 0));
+        assert_eq!(a.buffer_bytes(), charged - held);
+        assert_eq!(a.buffer_capacities(bulk).unwrap().0, 8192);
+        assert!(writable(&mut a, waiter));
+        assert_eq!(a.write(waiter, &[1; 9]), Ok(9));
+        // A 600-byte write grows a page of ring, which stays once it is
+        // acknowledged.
+        a.config.max_buffer_bytes = usize::MAX;
+        assert_eq!(a.write(bulk, &[2; 600]), Ok(600));
+        assert_eq!(ring(&a), crate::connection::SEND_RING_RESERVE);
+        for now in 300..310 {
+            exchange(&mut a, &mut b, now);
+            let _ = b.read(server, &mut [0; 1024]);
+        }
+        let progress = a.slot(bulk).unwrap().connection.send_progress();
+        assert_eq!(progress.queued_end, progress.acknowledged);
+        assert_eq!(ring(&a), crate::connection::SEND_RING_RESERVE);
     }
 
     #[test]

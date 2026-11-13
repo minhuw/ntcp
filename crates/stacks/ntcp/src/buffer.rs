@@ -132,6 +132,22 @@ impl SendBuffer {
         self.capacity = capacity;
     }
 
+    // Frees the storage of an empty queue, as Linux frees an emptied write
+    // queue's skbs (tcp_clean_rtx_queue, sk_wmem_free_skb): deallocation
+    // only, and the next write grows the rings again. No PUSH or EOR mark
+    // and no shared span is left with no byte queued; the limit and the
+    // stream position stay.
+    pub(crate) fn release(&mut self) {
+        assert!(self.data.is_empty());
+        debug_assert!(self.shared.is_empty());
+        debug_assert!(self.push_offset().is_none() && self.eor_offset().is_none());
+        self.data = VecDeque::new();
+        self.marks = VecDeque::new();
+        self.shared = VecDeque::new();
+        self.last_push = u64::MAX;
+        self.last_eor = u64::MAX;
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.data.len()
     }
@@ -3642,19 +3658,40 @@ mod tests {
         };
         let mut send = SendBuffer::new(32).unwrap();
         let mut model: VecDeque<(u8, u8)> = VecDeque::new();
-        let mut wrapped = 0;
+        let (mut wrapped, mut released) = (0, 0);
         for step in 0..4000 {
             match next(5) {
                 0 | 1 => {
                     let input: Vec<u8> = (0..next(100)).map(|i| (step + i) as u8).collect();
+                    // As Connection::send_ring_target: double, within the
+                    // limit, before queueing.
+                    let live = (model.len() + input.len()).min(send.capacity());
+                    if live > send.allocation_capacity() {
+                        let ring = live
+                            .max(2 * send.allocation_capacity())
+                            .next_power_of_two()
+                            .min(send.capacity());
+                        send.grow(ring).unwrap();
+                    }
                     let count = send.write(&input);
                     assert_eq!(count, input.len().min(send.capacity() - model.len()));
                     model.extend(input[..count].iter().map(|&b| (b, 0)));
                 }
                 2 => {
-                    let count = next(model.len() + 1);
+                    // Sometimes everything, so that the queue drains.
+                    let count = if next(4) == 0 {
+                        model.len()
+                    } else {
+                        next(model.len() + 1)
+                    };
                     send.acknowledge(count).unwrap();
                     model.drain(..count);
+                    // A drained queue may free its rings.
+                    if model.is_empty() && next(2) == 0 {
+                        send.release();
+                        assert_eq!(send.storage_bytes(), 0);
+                        released += 1;
+                    }
                 }
                 3 if !model.is_empty() => {
                     let offset = next(model.len());
@@ -3681,8 +3718,78 @@ mod tests {
             }
             assert!(send.data.iter().copied().eq(model.iter().map(|b| b.0)));
             assert!(send.marks.iter().copied().eq(model.iter().map(|b| b.1)));
+            if !model.is_empty() {
+                let offset = next(model.len());
+                let count = 1 + next(model.len() - offset);
+                let range = model.range(offset..offset + count);
+                assert_eq!(
+                    send.pushed(offset, count),
+                    range.clone().any(|b| b.1 & 1 != 0)
+                );
+                assert_eq!(
+                    send.record_len(offset, count),
+                    range
+                        .clone()
+                        .position(|b| b.1 & 2 != 0)
+                        .map_or(count, |n| n + 1)
+                );
+            }
         }
-        assert!(wrapped > 20, "{wrapped}");
+        assert!(wrapped > 20 && released > 20, "{wrapped} {released}");
+    }
+
+    // Releasing an empty queue's storage keeps its limit and stream
+    // position and leaves no PUSH, EOR or shared span behind: the regrown
+    // ring marks, finds and copies its new bytes as a fresh one would.
+    #[test]
+    fn release_and_regrowth_keep_marks_positions_and_spans() {
+        let mut send = SendBuffer::new(16).unwrap();
+        send.write(&[1; 12]);
+        send.acknowledge(8).unwrap();
+        send.write(b"abcdefghij");
+        send.mark_end_of_record();
+        send.mark_push();
+        send.finish_send(2, true, true);
+        send.mark_ptb(0, 14);
+        assert!(send.pushed(13, 1) && send.record_len(0, 14) == 3);
+        send.acknowledge(14).unwrap();
+        send.release();
+        assert_eq!((send.storage_bytes(), send.allocation_capacity()), (0, 0));
+        assert_eq!((send.capacity(), send.remaining()), (16, 16));
+        send.grow(8).unwrap();
+        assert_eq!(send.write(b"xyz"), 3);
+        assert!(!send.pushed(0, 3) && !send.ptb_pending(0) && !send.retransmitted(0));
+        assert_eq!(send.record_len(0, 8), 3);
+        assert_eq!(send.tail_record_offset(0, 3), 0);
+        send.finish_send(0, false, true);
+        send.mark_push();
+        assert!(send.pushed(2, 1) && !send.pushed(0, 2));
+        assert_eq!(send.record_len(0, 8), 1);
+        send.acknowledge(1).unwrap();
+        assert!(send.pushed(0, 2) && send.record_len(0, 8) == 2);
+        let mut out = [0; 8];
+        assert_eq!(send.copy(0, &mut out), 2);
+        assert_eq!(&out[..2], b"yz");
+        // Shared spans start at the stream position the queue reached.
+        send.set_shared_output(Some(4));
+        let payload = Payload::from_vec(alloc::vec![7; 5]);
+        send.acknowledge(2).unwrap();
+        send.release();
+        send.grow(8).unwrap();
+        send.prepare_shared(&payload, usize::MAX).unwrap();
+        assert_eq!(send.write_shared(payload.clone()), 5);
+        let mut parts = Vec::with_capacity(4);
+        assert!(send.shared_slices(0, 5, &mut parts));
+        assert_eq!(parts[0].as_slice(), &[7; 5]);
+        send.acknowledge(5).unwrap();
+        assert_eq!(send.shared_spans(), 0);
+        send.release();
+        assert_eq!(send.storage_bytes(), 0);
+        send.grow(8).unwrap();
+        send.prepare_shared(&payload, usize::MAX).unwrap();
+        assert_eq!(send.write_shared(payload), 5);
+        assert_eq!(send.copy(0, &mut out), 5);
+        assert!(send.shared_slices(0, 5, &mut Vec::with_capacity(4)));
     }
 
     #[test]

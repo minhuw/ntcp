@@ -770,10 +770,12 @@ fn window_scale(space: usize) -> u8 {
 // The first write's ledgers (2 * 10 + SPARE entries, 2.2 KB) fit in it.
 pub(crate) const LEDGER_RESERVE: usize = 4096;
 
-// The least send ring storage a write allocates: one page, as Linux
-// charges send memory in whole pages (__sk_mem_schedule, sk_mem_pages).
-// The ring holds a payload byte and a mark byte per queued byte, so this
-// is 2048 queued bytes.
+// The least send ring storage a write allocates, and what a drained
+// connection keeps: one page, as Linux charges send memory in whole pages
+// (__sk_mem_schedule, sk_mem_pages) and sk_mem_reclaim leaves a socket
+// less than a page of sk_forward_alloc. The ring holds a payload byte and
+// a mark byte per queued byte, so this is 2048 queued bytes: a
+// request/response connection's 600-byte responses reallocate nothing.
 pub(crate) const SEND_RING_RESERVE: usize = 4096;
 
 fn rounded_send_space(capacity: usize, quantum: usize) -> usize {
@@ -5257,6 +5259,29 @@ impl Connection {
             && self.rack.len() == 0
             && self.scoreboard.ranges().is_empty()
             && self.rack.allocation_bytes() + self.scoreboard.storage_bytes() > LEDGER_RESERVE
+    }
+
+    // Whether the send ring holds more than SEND_RING_RESERVE with nothing
+    // queued, so nothing in flight. Linux frees an emptied write queue's
+    // skbs at ACK (tcp_clean_rtx_queue, sk_wmem_free_skb) and sk_mem_reclaim
+    // returns the memory above less than a page; the ring likewise frees
+    // what it grew past a page once drained. A ring within the page (the
+    // first growth step, send_ring_target) stays, so request/response
+    // traffic reallocates nothing per exchange.
+    pub(crate) fn send_ring_reclaimable(&self) -> bool {
+        self.send.len() == 0 && self.send.storage_bytes() > SEND_RING_RESERVE
+    }
+
+    // Frees the drained send ring (`send_ring_reclaimable`); nothing
+    // allocates, the send limit stays, and the next write grows the ring
+    // again.
+    pub(crate) fn reclaim_send_ring(&mut self) {
+        self.send.release();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_ring_bytes(&self) -> usize {
+        self.send.storage_bytes()
     }
 
     #[cfg(test)]
