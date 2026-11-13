@@ -1,3 +1,39 @@
+//! # Egress validation
+//!
+//! A connection's packet is validated when it is built, against the
+//! connection's checked egress decision, as Linux validates a socket's
+//! cached route in ip_queue_xmit (__sk_dst_check, which compares the
+//! route's genid or fib6 serial number with the socket's cookie), and not
+//! again when it leaves. `Host::egress_context` takes that decision
+//! (`Host::refresh`: forwarding selection, port and forwarding mode, the
+//! connection's complete headers within the path budget), valid while its
+//! PathService change stamp holds, and checks the packet's addresses,
+//! class and forwarding destination against it.
+//!
+//! At each physical attempt `Host::submit` and `Host::submit_group` make
+//! O(1) checks only: the context's path stamp is still the path's (any
+//! change of a path's selection, budget or validity, a rebind or a release
+//! refuses the frame as `Error::Obsolete`, and a connection's binding is
+//! first brought up to date so that its output is packetized again), the
+//! packet fits the path's first-hop MTU (Linux's ip_finish_output check
+//! against the device; for an aggregate each segment, as
+//! ip_finish_output_gso), and an IPv4 packet on a path that clears DF
+//! carries none (the embedding's per-attempt rewrite, RFC 1191 section
+//! 6.6). The frame is the embedding's encoding of the attempt's packet for
+//! the context's path: debug builds check its addresses, base destination,
+//! header plan, lengths, class and ECN codepoint on every attempt; release
+//! builds trust it, as Linux's device layer trusts the skb its IP layer
+//! built. A stateless reply's frame is still parsed for the ledger evidence
+//! that ICMP errors about it are correlated with.
+//!
+//! As in Linux, where packets already built or queued leave on the route
+//! they were built for (ip_finish_output reads the skb's dst, not the
+//! socket's current one), a packet authorized before a change its path's
+//! stamp does not record may leave stale: bytes built before a path change
+//! and authorized again under the new path's context (they are not sized
+//! again), or a frame whose next hop's link-layer address changed after
+//! the frame was addressed. The next packet built uses the new state.
+
 #![no_std]
 
 extern crate alloc;
@@ -2586,9 +2622,11 @@ impl Host {
         }
     }
 
-    /// Obtain authority for a selected reservation. Keep this context with a
-    /// blocked frame: `submit` checks the frame against it at every physical
-    /// attempt and refuses it once the context's path has changed.
+    /// Obtain authority for a selected reservation: the build-time
+    /// validation of its packet against the connection's checked egress
+    /// decision (see "Egress validation" in the crate documentation). Keep
+    /// this context with a blocked frame: `submit` refuses it once the
+    /// context's path has changed.
     pub fn egress_context(
         &mut self,
         endpoint: &mut Endpoint,
@@ -2947,9 +2985,16 @@ impl Host {
             .is_ok_and(|s| s.clears_dont_fragment())
     }
 
-    /// The frame starts at IP and contains exactly its resident bytes (no
-    /// Ethernet padding). shared_payload_len is added exactly once. Software
-    /// GSO calls this separately for each actual physical segment/attempt.
+    /// The checks of one physical attempt, which `submit` makes before the
+    /// backend call (see "Egress validation" in the crate documentation):
+    /// the context's path is unchanged (its stamp), the packet fits the
+    /// path's first hop, and an IPv4 packet on a path that clears DF
+    /// carries none; a stateless reply's evidence is recorded. The frame
+    /// starts at IP and contains exactly its resident bytes (no Ethernet
+    /// padding); shared_payload_len is added exactly once. It is the
+    /// attempt's packet as the embedding encoded it, which debug builds
+    /// check. Software GSO calls this separately for each actual physical
+    /// segment/attempt.
     pub fn validate_egress(
         &mut self,
         endpoint: &mut Endpoint,
@@ -2961,6 +3006,17 @@ impl Host {
         let packet = endpoint
             .transmit_attempt_packet(context.attempt)
             .ok_or(Error::Obsolete)?;
+        self.validate_attempt(endpoint, context, &packet, frame, shared_payload_len)
+    }
+    // `validate_egress` of the attempt's current `packet`.
+    fn validate_attempt(
+        &mut self,
+        endpoint: &mut Endpoint,
+        context: EgressContext,
+        packet: &Transmit,
+        frame: &[u8],
+        shared_payload_len: usize,
+    ) -> Result<EgressContext, Error> {
         // `egress_context` granted the authority; it holds while the path
         // is unchanged. Every change of a path's selection, budget or
         // validity gives it a new stamp, and a rebind or release retires the
@@ -2969,124 +3025,59 @@ impl Host {
         // output again for the current path; a stateless reply is dropped.
         if self.paths.stamp(context.binding.client) != Ok(context.binding.snapshot.stamp()) {
             if let Some(owner) = packet.connection {
-                self.authorized_refresh(endpoint, owner, &packet)?;
+                self.authorized_refresh(endpoint, owner, packet)?;
             }
             return Err(Error::Obsolete);
         }
-        let live = context;
-        // The embedding encoded the frame (`ntcp_ip::encode`), checksum
-        // included, which is not verified again.
-        let (ip, header, total, protocol) = if packet.ip.source.is_ipv4() {
-            ntcp_ip::egress_header(frame)?
-        } else {
-            ntcp_ip6::quote_header(frame)?
-        };
+        let snapshot = &context.binding.snapshot;
         let actual = frame
             .len()
             .checked_add(shared_payload_len)
             .ok_or(Error::Capacity)?;
-        let class = if packet.ip.source.is_ipv4() {
-            frame[1]
-        } else {
-            (frame[0] << 4) | (frame[1] >> 4)
-        };
-        let plan = self.header_plan(live.binding.snapshot.key())?;
-        let expected_header = transmit_header_len(&packet, plan)?;
-        // The base Destination Address: the forwarding destination, which
-        // on an SR route is S1 while `ip` carries the final destination.
-        let actual_destination = if packet.ip.source.is_ipv4() {
-            IpAddr::V4(core::net::Ipv4Addr::new(
-                frame[16], frame[17], frame[18], frame[19],
-            ))
-        } else {
-            IpAddr::V6(core::net::Ipv6Addr::from(
-                <[u8; 16]>::try_from(&frame[24..40]).unwrap(),
-            ))
-        };
-        // The chain is exactly the path's plan, its Segment Routing Header
-        // unadvanced (Segments Left n).
-        if packet.ip.source.is_ipv6()
-            && planned_routing(plan.segments, frame) != Some(plan.segments.len())
+        let ipv4 = packet.ip.source.is_ipv4();
+        // Linux's output check (ip_finish_output against the device MTU,
+        // as for IP_PMTUDISC_PROBE: discovery probes exceed the estimate),
+        // and RFC 1191 section 6.6: no DF on a discovery-disabled route,
+        // which the embedding clears (`clears_dont_fragment`).
+        if actual > snapshot.first_hop_mtu() as usize
+            || (ipv4
+                && snapshot.clears_dont_fragment()
+                && frame.get(6).is_none_or(|f| f & 0x40 != 0))
         {
             return Err(Error::Obsolete);
         }
-        if actual_destination
-            != live
-                .binding
-                .snapshot
-                .key()
-                .forwarding_destination()
-                .address()
-            || protocol != 6
-            || ip != packet.ip
-            || actual != total
-            || total != packet.len + expected_header
-            || header != expected_header
-            || Dscp::from_traffic_class(class).value() != packet.dscp
-            || (class & 3) != packet.ecn
-            || total as u32 > live.binding.snapshot.first_hop_mtu()
-            // RFC 1191 section 6.6: no DF on a discovery-disabled route.
-            || (packet.ip.source.is_ipv4()
-                && live.binding.snapshot.clears_dont_fragment()
-                && frame[6] & 0x40 != 0)
-        {
-            return Err(Error::Obsolete);
+        debug_assert_eq!(
+            self.attempt_frame(snapshot.key(), packet, frame, shared_payload_len, false),
+            Ok(())
+        );
+        if packet.connection.is_some() {
+            return Ok(context);
         }
-        let ordinary = if let Some(owner) = packet.connection {
-            endpoint
-                .managed_route(owner)?
-                .ordinary_ip_budget
-                .min(live.binding.snapshot.ip_packet_budget()?)
+        // A stateless reply's evidence: the quoted fields an ICMP error
+        // about it is correlated with.
+        let (_, header, total, protocol) = if ipv4 {
+            ntcp_ip::egress_header(frame)?
         } else {
-            live.binding.snapshot.ip_packet_budget()?
+            ntcp_ip6::quote_header(frame)?
         };
-        let evidence = match packet.connection {
-            Some(_) => None,
-            None => Some((
-                tcp_selector(&frame[header..], total - header)?,
-                self.reserve_attempt(endpoint, Owner::Stateless, context.attempt)?,
-            )),
-        };
-        if total as u32 > ordinary {
-            let intent = endpoint
-                .transmit_discovery_intent(context.attempt)
-                .ok_or(Error::Obsolete)?;
-            let selected = intent.binding();
-            // Only discovery may exceed the ordinary budget: never on a path
-            // whose owner disabled it, nor for a probe selected under
-            // another discovery policy.
-            if (packet.ip.source.is_ipv4() && frame[6] & 0x40 == 0)
-                || live.binding.snapshot.discovery_disabled()
-                || selected.snapshot.discovery_revision()
-                    != live.binding.snapshot.discovery_revision()
-                || selected.client != live.binding.client
-                || selected.snapshot.path() != live.binding.snapshot.path()
-                || selected.snapshot.negative_revision()
-                    != live.binding.snapshot.negative_revision()
-                || intent.selected_at() < live.binding.snapshot.retry_not_before()
-                || intent.ip_packet_len() != total as u32
-            {
-                return Err(Error::Obsolete);
-            }
-        }
-        if let Some((transport, pending)) = evidence {
-            self.ledger.set_evidence(
-                pending,
-                Evidence {
-                    link: live.link,
-                    path: live.binding.snapshot.path(),
-                    owner: Owner::Stateless,
-                    source: packet.ip.source,
-                    destination: packet.ip.destination,
-                    dscp: packet.dscp,
-                    header_len: header as u32,
-                    packet_len: total as u32,
-                    protocol,
-                    transport,
-                },
-            );
-        }
-        Ok(live)
+        let transport = tcp_selector(frame.get(header..).ok_or(Error::Obsolete)?, total - header)?;
+        let pending = self.reserve_attempt(endpoint, Owner::Stateless, context.attempt)?;
+        self.ledger.set_evidence(
+            pending,
+            Evidence {
+                link: context.link,
+                path: snapshot.path(),
+                owner: Owner::Stateless,
+                source: packet.ip.source,
+                destination: packet.ip.destination,
+                dscp: packet.dscp,
+                header_len: header as u32,
+                packet_len: total as u32,
+                protocol,
+                transport,
+            },
+        );
+        Ok(context)
     }
 
     /// Issue the single ticket for this attempt's (idempotent) reservation.
@@ -3126,9 +3117,11 @@ impl Host {
     }
 
     /// The physical-attempt transaction. Every fallible step happens before
-    /// `submit` runs: exact revalidation of the bytes and path (at EVERY
-    /// retry), a stateless reply's evidence reservation, and the
-    /// Endpoint's acceptance preflight. Afterwards the outcome is finalized
+    /// `submit` runs: the O(1) checks of each physical attempt
+    /// (`validate_egress`: the context's path stamp and the first-hop MTU,
+    /// not a revalidation of what `egress_context` decided), a stateless
+    /// reply's evidence reservation, and the Endpoint's acceptance
+    /// preflight. Afterwards the outcome is finalized
     /// without allocation or fallible lookup. The closure is the one backend
     /// call, including any timestamp fallback it performs; software GSO
     /// submits each physical segment with its own attempt and ticket.
@@ -3143,24 +3136,25 @@ impl Host {
         shared_payload_len: usize,
         submit: impl FnOnce(EgressContext) -> BackendOutcome,
     ) -> Result<Submission, Refused> {
+        let packet = endpoint.transmit_attempt_packet(context.attempt);
         let ticketed = match ticket.ticket {
             Some(ticket) => self
                 .ledger
                 .find_ticket(ticket)
                 .and_then(|index| self.ledger.pending(index))
                 .is_some_and(|p| p.attempt == Some(context.attempt)),
-            None => endpoint
-                .transmit_attempt_packet(context.attempt)
-                .is_some_and(|p| p.connection.is_some()),
+            None => packet.is_some_and(|p| p.connection.is_some()),
         };
-        if !ticketed {
+        let Some(packet) = packet.filter(|_| ticketed) else {
             return Err(Refused {
                 error: Error::Obsolete,
                 ticket,
             });
-        }
+        };
         let prepared = (|| {
-            let live = self.validate_egress(endpoint, context, frame, shared_payload_len)?;
+            self.check_endpoint(endpoint)?;
+            let live =
+                self.validate_attempt(endpoint, context, &packet, frame, shared_payload_len)?;
             if !endpoint.preflight_accept_transmit(now, context.attempt)? {
                 return Err(Error::Obsolete);
             }
@@ -3181,8 +3175,8 @@ impl Host {
                 if let Some(ticket) = ticket.ticket {
                     self.ledger.seal(ticket, now, false);
                 }
-                // Only a definite submission certifies the exact bytes the
-                // backend took; validate_egress checked them just above.
+                // Only a definite submission certifies the bytes the
+                // backend took.
                 let receipt = ntcp::PhysicalReceipt {
                     ip_packet_len: (frame.len() + shared_payload_len) as u32,
                     dont_fragment: unfragmentable(frame),
@@ -3214,13 +3208,13 @@ impl Host {
     /// segment's payload. Its checksum fields, an IPv4 header's and the
     /// TCP checksum, are zero: the backend fills them for every segment it
     /// cuts, as Linux's segmentation does (inet_gso_segment, tcp_gso_segment). At
-    /// every call, before the backend's, the frame and path are revalidated
-    /// as `validate_egress` revalidates one packet, except that each
-    /// physical segment, not the aggregate, must fit the first hop and the
-    /// ordinary budget (a group never carries a discovery probe), and that
-    /// the aggregate must be unfragmentable: an IPv4 path that clears DF
+    /// every call, before the backend's, the checks of `validate_egress`
+    /// are made, except that each physical segment, not the aggregate, must
+    /// fit the first hop (Linux's ip_finish_output_gso), and that the
+    /// aggregate must be unfragmentable: an IPv4 path that clears DF
     /// leases each packet its own Identification, which one header cannot
-    /// carry for many (`Unsupported`). Then `Endpoint::validate_transmit_group`.
+    /// carry for many, and one header without DF would give every segment
+    /// the same one (`Unsupported`). Then `Endpoint::validate_transmit_group`.
     /// A definite submission certifies every segment's size evidence
     /// (`Endpoint::accept_transmit_group_submitted`). A connection's output
     /// keeps no ledger evidence, so no ticket is involved; refusals change
@@ -3267,19 +3261,57 @@ impl Host {
         self.check_endpoint(endpoint)?;
         let view = endpoint.transmit_group(group).ok_or(Error::Obsolete)?;
         let packet = view.packet;
-        let segment_tcp = packet.len - view.payload.len() + view.segment_payload_len;
         let owner = packet.connection.ok_or(Error::Obsolete)?;
-        let route = endpoint.managed_route(owner)?;
-        if route.client != context.binding.client {
-            return Err(Error::Obsolete);
-        }
         if self.paths.stamp(context.binding.client) != Ok(context.binding.snapshot.stamp()) {
             self.authorized_refresh(endpoint, owner, &packet)?;
             return Err(Error::Obsolete);
         }
         let snapshot = context.binding.snapshot;
+        // The aggregate is the IP and TCP headers of one segment and the
+        // payload of all of them.
+        let segment = frame
+            .len()
+            .checked_sub(view.payload.len())
+            .ok_or(Error::Obsolete)?
+            + view.segment_payload_len;
+        if segment > snapshot.first_hop_mtu() as usize {
+            return Err(Error::Obsolete);
+        }
+        debug_assert_eq!(
+            self.attempt_frame(snapshot.key(), &packet, frame, 0, true),
+            Ok(())
+        );
+        if packet.ip.source.is_ipv4() && (snapshot.clears_dont_fragment() || !unfragmentable(frame))
+        {
+            return Err(Error::Unsupported);
+        }
+        if !endpoint.validate_transmit_group(now, group)? {
+            return Err(Error::Obsolete);
+        }
+        Ok(segment)
+    }
+}
+
+impl Host {
+    // Whether `frame` (plus `shared_payload_len` octets elsewhere) is the
+    // IP packet of the attempt whose packet is `packet`, encoded for the
+    // path `key` as its embedding must: addresses, base destination (the
+    // forwarding destination, S1 on an SR route), the path's header plan
+    // with its Segment Routing Header unadvanced, protocol, class, ECN
+    // codepoint and lengths. The debug cross-check of every physical
+    // attempt, which release builds made at each one before (see "Egress
+    // validation" in the crate documentation). `group`: a transmit group's
+    // aggregate, whose IPv4 header and TCP checksum fields are zero.
+    fn attempt_frame(
+        &self,
+        key: path::PathKey,
+        packet: &Transmit,
+        frame: &[u8],
+        shared_payload_len: usize,
+        group: bool,
+    ) -> Result<(), Error> {
         let ipv4 = packet.ip.source.is_ipv4();
-        let (ip, header, total, protocol) = if ipv4 {
+        let (ip, header, total, protocol) = if ipv4 && group {
             // The header as one packet carries it, its checksum filled.
             let len = frame.first().map_or(0, |b| usize::from(b & 15) * 4);
             if frame.len() < len.max(20) || frame[10..12] != [0, 0] {
@@ -3290,6 +3322,8 @@ impl Host {
             let sum = ntcp_ip_common::checksum(&copy[..len]);
             copy[10..12].copy_from_slice(&sum.to_be_bytes());
             ntcp_ip::quote_header(&copy[..len])?
+        } else if ipv4 {
+            ntcp_ip::egress_header(frame)?
         } else {
             ntcp_ip6::quote_header(frame)?
         };
@@ -3298,9 +3332,19 @@ impl Host {
         } else {
             (frame[0] << 4) | (frame[1] >> 4)
         };
-        let plan = self.header_plan(snapshot.key())?;
-        let expected_header = transmit_header_len(&packet, plan)?;
-        let actual_destination = if ipv4 {
+        let plan = self.header_plan(key)?;
+        let expected_header = if let (IpAddr::V4(source), IpAddr::V4(destination)) =
+            (packet.ip.source, packet.ip.destination)
+        {
+            20 + packet
+                .ipv4_options
+                .encode(source, destination, 0, &mut [0; 40])
+                .map_err(|e| Error::Endpoint(EndpointError::Ipv4Options(e)))?
+                .1
+        } else {
+            plan.len
+        };
+        let destination = if ipv4 {
             IpAddr::V4(core::net::Ipv4Addr::new(
                 frame[16], frame[17], frame[18], frame[19],
             ))
@@ -3309,31 +3353,17 @@ impl Host {
                 <[u8; 16]>::try_from(&frame[24..40]).unwrap(),
             ))
         };
-        if !ipv4 && planned_routing(plan.segments, frame) != Some(plan.segments.len()) {
-            return Err(Error::Obsolete);
-        }
-        let segment = header + segment_tcp;
-        let ordinary = route.ordinary_ip_budget.min(snapshot.ip_packet_budget()?);
-        if actual_destination != snapshot.key().forwarding_destination().address()
-            || protocol != 6
-            || ip != packet.ip
-            || frame.len() != total
-            || total != packet.len + expected_header
-            || header != expected_header
-            || Dscp::from_traffic_class(class).value() != packet.dscp
-            || (class & 3) != packet.ecn
-            || segment as u32 > snapshot.first_hop_mtu()
-            || segment as u32 > ordinary
-        {
-            return Err(Error::Obsolete);
-        }
-        if ipv4 && (snapshot.clears_dont_fragment() || !unfragmentable(frame)) {
-            return Err(Error::Unsupported);
-        }
-        if !endpoint.validate_transmit_group(now, group)? {
-            return Err(Error::Obsolete);
-        }
-        Ok(segment)
+        (destination == key.forwarding_destination().address()
+            && (ipv4 || planned_routing(plan.segments, frame) == Some(plan.segments.len()))
+            && protocol == 6
+            && ip == packet.ip
+            && frame.len() + shared_payload_len == total
+            && header == expected_header
+            && total == packet.len + header
+            && Dscp::from_traffic_class(class).value() == packet.dscp
+            && class & 3 == packet.ecn)
+            .then_some(())
+            .ok_or(Error::Obsolete)
     }
 }
 
@@ -3382,27 +3412,6 @@ fn planned_routing(segments: &[core::net::Ipv6Addr], quoted: &[u8]) -> Option<us
         && (1..=n).all(|i| entry(i) == segments[n - i].octets())
         && quoted[24..40] == *entry(left))
     .then_some(left)
-}
-
-// Complete IP header length of an Endpoint transmission: the IPv4 header
-// with its encoded options, or the IPv6 header of its path's `plan`.
-pub(crate) fn transmit_header_len(
-    packet: &ntcp::Transmit,
-    plan: HeaderPlan<'_>,
-) -> Result<usize, Error> {
-    Ok(
-        if let (IpAddr::V4(source), IpAddr::V4(destination)) =
-            (packet.ip.source, packet.ip.destination)
-        {
-            20 + packet
-                .ipv4_options
-                .encode(source, destination, 0, &mut [0; 40])
-                .map_err(|e| Error::Endpoint(EndpointError::Ipv4Options(e)))?
-                .1
-        } else {
-            plan.len
-        },
-    )
 }
 
 // Transport selector of an exactly validated outgoing TCP segment. The

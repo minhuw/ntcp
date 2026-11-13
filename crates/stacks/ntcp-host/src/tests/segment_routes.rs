@@ -1222,29 +1222,6 @@ fn tcp_over_a_segment_route_sizes_and_repairs_segments_with_h() {
     assert_eq!(a.1.managed_path(id).unwrap().ip_header_len as usize, H);
     let (_, context, syn) = routed_frame(&mut a, 1).unwrap();
     assert_routed_tcp(&syn, local, remote);
-    // The barrier admits exactly the route generation's chain: not the
-    // segment behind a base header toward D or S1, nor an SRH with an
-    // altered segment, Segments Left, Last Entry or tag.
-    let tcp = &syn[H..];
-    let packet = a.1.transmit_attempt_packet(context.attempt).unwrap();
-    for destination in [remote.ip(), IpAddr::V6(segments()[0])] {
-        let mut base = vec![0; 40 + tcp.len()];
-        base[40..].copy_from_slice(tcp);
-        ntcp_ip6::encode(&mut base, packet).unwrap();
-        base[24..40].copy_from_slice(&v6(destination).octets());
-        assert_eq!(
-            a.0.validate_egress(&mut a.1, context, &base, 0),
-            Err(Error::Obsolete)
-        );
-    }
-    for at in [64, 43, 44, 47] {
-        let mut altered = syn.clone();
-        altered[at] ^= 1;
-        assert!(
-            a.0.validate_egress(&mut a.1, context, &altered, 0).is_err(),
-            "{at}"
-        );
-    }
     assert!(submit_frame(&mut a, 1, context, &syn, 0) == Ok(Submission::Submitted));
     a.0.collect(&mut a.1).unwrap();
     assert_eq!(

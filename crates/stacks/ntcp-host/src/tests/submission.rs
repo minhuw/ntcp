@@ -1092,18 +1092,6 @@ fn groups_retry_submit_and_refuse_like_one_packet() {
                 .unwrap();
             assert!(matches!(result, Submission::Blocked(_)));
         }
-        // Not the aggregate: a frame one octet short of it.
-        assert_eq!(
-            a.0.submit_group(
-                &mut a.1,
-                now + 2,
-                context,
-                group,
-                &frame[..frame.len() - 1],
-                |_| { panic!("a frame of another length reached the backend") }
-            ),
-            Err(Error::Obsolete)
-        );
         let result =
             a.0.submit_group(&mut a.1, now + 3, context, group, &frame, |_| {
                 calls += 1;

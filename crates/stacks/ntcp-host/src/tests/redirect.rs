@@ -403,12 +403,16 @@ fn ipv4_redirect_keeps_restrictions_and_revalidates_held_output() {
     assert_eq!(owner.policy.estimate, Some(1200));
     assert_eq!(owner.route_policy.unwrap().estimate, Some(1300));
     // The rebound connection starts the new incarnation from its own
-    // conservative budget (no delivery proof carries over), so the held
-    // segment is refused there too and re-segmented within it.
+    // conservative budget (no delivery proof carries over). The segment
+    // built before the Redirect is not sized again at submission: under
+    // authority for the new path it may leave as built, like a packet
+    // Linux built before a route change (see "Egress validation" in the
+    // crate documentation). Withdrawn instead, it is re-segmented within
+    // the new budget.
     assert!(a.1.managed_path(id).unwrap().ordinary_ip_budget < frame.len() as u32);
     assert_eq!(
         a.0.validate_egress(&mut a.1, current, &frame, 0),
-        Err(Error::Obsolete)
+        Ok(current)
     );
     a.1.reject_unsubmitted(attempt).unwrap();
     a.1.on_timeout(10 * SECOND, 32).unwrap();
@@ -1503,4 +1507,53 @@ fn admin_estimate_lowers_a_redirected_binding_at_once() {
     assert!(!a.0.dst_held(&a.1, id));
     assert_eq!(binding.snapshot.ip_packet_budget(), Ok(estimate));
     assert!(a.1.transport_ceilings(id).unwrap().effective_mss <= before - 100);
+}
+
+// The submission contract ("Egress validation" in the crate
+// documentation) across a Redirect: the retransmission built and
+// authorized before it is refused at its next attempt by its path's stamp,
+// and the one built after it leaves through the Redirect's gateway.
+#[test]
+fn the_packet_built_after_a_redirect_uses_its_gateway() {
+    let cfg = config(2);
+    let (mut a, _b, id, data) = ipv4_connection(640, &cfg, 0);
+    a.1.on_timeout(5 * SECOND, 32).unwrap();
+    let (attempt, _, frame) = selected(&mut a.1, 5 * SECOND).unwrap();
+    let held = a.0.egress_context(&mut a.1, attempt).unwrap();
+    assert_eq!(
+        held.next_hop,
+        ResolvedNextHop::Address(unscoped(v4("192.0.2.254")))
+    );
+    assert_eq!(
+        dispatch(&mut a, 5 * SECOND, &redirect4(&data, 1, "192.0.2.253")),
+        RedirectOutcome::Installed
+    );
+    let ticket = a.0.submission_ticket(&mut a.1, held).unwrap();
+    let refused =
+        a.0.submit(&mut a.1, 5 * SECOND, ticket, held, &frame, 0, |_| {
+            panic!("a frame built before the Redirect left")
+        })
+        .unwrap_err();
+    assert_eq!(refused.error, Error::Obsolete);
+    a.0.cancel_submission(refused.ticket);
+    assert!(a.1.reject_unsubmitted(attempt).unwrap());
+    let (attempt, _, frame) = selected(&mut a.1, 5 * SECOND + 1).unwrap();
+    let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+    let gateway = ResolvedNextHop::Address(unscoped(v4("192.0.2.253")));
+    assert_eq!((context.next_hop, next_hop(&a, id)), (gateway, gateway));
+    let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
+    assert!(
+        a.0.submit(
+            &mut a.1,
+            5 * SECOND + 1,
+            ticket,
+            context,
+            &frame,
+            0,
+            |context| {
+                assert_eq!(context.next_hop, gateway);
+                BackendOutcome::Submitted
+            }
+        ) == Ok(Submission::Submitted)
+    );
 }
