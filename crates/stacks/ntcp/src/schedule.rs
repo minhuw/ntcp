@@ -143,6 +143,9 @@ impl Deadlines {
                 self.positions[index] = Some(position);
                 self.up(position);
             }
+            // An unchanged expiry leaves the heap as it is, as __mod_timer
+            // returns early for a pending timer re-armed to the same expiry.
+            (Some(position), Some(time)) if self.heap[position].0 == time => {}
             (Some(position), Some(time)) => {
                 self.heap[position].0 = time;
                 let position = self.up(position);
@@ -222,5 +225,27 @@ mod tests {
             deadlines.set(i, None);
         }
         assert_eq!(deadlines.first(), None);
+    }
+
+    #[test]
+    fn rearming_an_unchanged_deadline_leaves_the_heap_as_it_was() {
+        let mut deadlines = Deadlines::new(64).unwrap();
+        let mut seed = 11u64;
+        for round in 0..2000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let slot = (seed >> 32) as usize % 64;
+            // Few distinct times, so ties between slots are common.
+            deadlines.set(slot, (seed & 15 != 0).then_some(seed % 8));
+            if round % 50 != 49 {
+                continue;
+            }
+            let heap = deadlines.heap.clone();
+            let positions = deadlines.positions.clone();
+            for &(time, index) in &heap {
+                deadlines.set(index, Some(time));
+            }
+            assert!(deadlines.heap == heap);
+            assert!(deadlines.positions == positions);
+        }
     }
 }
