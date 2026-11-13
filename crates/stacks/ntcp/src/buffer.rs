@@ -915,10 +915,13 @@ impl ChunkSummary {
 
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
-    // A set presence bit implies the payload byte in that slot was initialized.
-    // Every typed payload read checks presence first; clearing presence makes
-    // the slot inaccessible until insertion writes a new byte before setting it.
-    // Unset slots may contain uninitialized bytes; they are never read as u8.
+    // Bytes in order sit in the contiguous prefix, which needs no presence
+    // bits (`contiguous_len`); only bytes held beyond a gap carry them, as
+    // Linux keeps in-order data on the receive queue and only out-of-order
+    // data in its ofo tree. A set presence bit, past the prefix, implies the
+    // slot's payload byte was initialized: insertion writes the byte before
+    // setting it. Every other slot past the prefix may hold an uninitialized
+    // byte, never read as u8.
     data: Vec<MaybeUninit<u8>>,
     pushed: bool,
     metadata: Vec<u8>,
@@ -928,10 +931,11 @@ pub(crate) struct ReceiveBuffer {
     read_base: Seq,
     head: usize,
     // Every slot of the first `contiguous_len` offsets holds an initialized
-    // byte, which reads copy without testing presence again. Each way the
-    // prefix grows establishes it: promote_syn admits the bytes defer_syn
-    // wrote, in-order insertion copies its bytes first, and the prefix
-    // takes over retained bytes only after checking their presence. Reads
+    // byte and none has a presence or PUSH bit. Reads copy them without
+    // testing presence. Each way the prefix grows establishes it:
+    // promote_syn admits the bytes defer_syn wrote, in-order insertion
+    // copies its bytes first, and the prefix takes over retained bytes only
+    // after checking their presence, clearing it (`take_retained`). Reads
     // drop the prefix's first bytes, and growth moves every slot with its
     // offset.
     contiguous_len: usize,
@@ -946,6 +950,9 @@ pub(crate) struct ReceiveBuffer {
     // Input never allocates reporting work; application-read anchors become
     // cumulative-only debt, bounded by capacity even if output is exhausted.
     report_pending: Vec<u8>,
+    // The set bits of `report_pending`: none on the in-order path, whose
+    // reads then leave the bitmap alone.
+    report_marks: usize,
     report_debt: usize,
     pending_first: Option<Seq>,
     dsack: Option<(Seq, Seq)>,
@@ -989,6 +996,7 @@ impl ReceiveBuffer {
             latest: None,
             reported: [None; 4],
             report_pending,
+            report_marks: 0,
             report_debt: 0,
             pending_first: None,
             dsack: None,
@@ -1010,11 +1018,6 @@ impl ReceiveBuffer {
 
     pub(crate) fn promote_syn(&mut self) -> Option<usize> {
         let (count, fin, push) = self.deferred_syn.take()?;
-        for offset in 0..count {
-            let index = self.index(offset);
-            self.set_present(index, true);
-        }
-        self.summarize_logical(0, count);
         self.occupied = count;
         self.contiguous_len = count;
         self.pushed = push && count != 0;
@@ -1151,6 +1154,7 @@ impl ReceiveBuffer {
         self.latest = None;
         self.reported = [None; 4];
         self.report_pending.fill(0);
+        self.report_marks = 0;
         self.report_debt = 0;
         self.pending_first = None;
         self.dsack = None;
@@ -1450,6 +1454,8 @@ impl ReceiveBuffer {
         self.report_debt = undo.report_debt;
         self.pending_first = undo.pending_first;
         if let Some((index, value)) = undo.pending_byte {
+            self.report_marks += value.count_ones() as usize;
+            self.report_marks -= self.report_pending[index].count_ones() as usize;
             self.report_pending[index] = value;
         }
     }
@@ -1505,6 +1511,7 @@ impl ReceiveBuffer {
             let offset = anchor.distance_from(self.read_base) as usize;
             let index = self.index(offset);
             self.report_pending[index / 8] &= !(1 << (index % 8));
+            self.report_marks -= 1;
             if self.pending_first == Some(anchor) {
                 self.pending_first = self.find_pending(offset + 1);
             }
@@ -1570,14 +1577,15 @@ impl ReceiveBuffer {
     // so the cost does not grow with the distance.
     fn find_presence(&self, offset: usize, present: bool) -> usize {
         let capacity = self.data.len();
-        // The contiguous prefix accounts for every retained byte on the common
-        // in-order path.
+        // The contiguous prefix is all present, without presence bits; past
+        // it, a slot's bit tells. On the common in-order path the prefix
+        // accounts for every retained byte.
+        if offset < self.contiguous_len && present {
+            return offset;
+        }
+        let offset = offset.max(self.contiguous_len);
         if present && self.occupied == self.contiguous_len {
-            return if offset < self.contiguous_len {
-                offset
-            } else {
-                capacity
-            };
+            return capacity;
         }
         if offset >= capacity {
             return capacity;
@@ -1708,6 +1716,14 @@ impl ReceiveBuffer {
         self.metadata[index / 4] & (1 << (2 * (index % 4))) != 0
     }
 
+    // Whether slot `index` holds a byte: in the contiguous prefix, or
+    // present past it.
+    #[cfg(test)]
+    fn holds(&self, index: usize) -> bool {
+        let offset = (index + self.data.len() - self.head) % self.data.len();
+        offset < self.contiguous_len || self.is_present(index)
+    }
+
     fn set_present(&mut self, index: usize, present: bool) {
         let shift = 2 * (index % 4);
         // Both insertion and removal clear stale PUSH marks on reused slots.
@@ -1773,6 +1789,19 @@ impl ReceiveBuffer {
         any
     }
 
+    // Hands the retained bytes of physical `range` over to the contiguous
+    // prefix, which keeps no presence or PUSH bits: clears both; whether
+    // one had PUSH. Reads copy prefix bytes unchecked (`contiguous_len`),
+    // so each must have been written: checked here, once per byte taken
+    // over, on the out-of-order path alone.
+    fn take_retained(&mut self, range: core::ops::Range<usize>) -> bool {
+        assert!(self.all_present(range.clone()));
+        let push = self.take_push_range(range.clone());
+        self.set_present_range(range.clone(), false);
+        self.summarize_filled(range, false);
+        push
+    }
+
     // Whether every slot of `range` holds a byte.
     fn all_present(&self, range: core::ops::Range<usize>) -> bool {
         let mut index = range.start;
@@ -1795,26 +1824,33 @@ impl ReceiveBuffer {
         (index..range.end).all(|index| self.is_present(index))
     }
 
-    // Clears the reporting anchors of every slot of `range`.
-    fn clear_pending_range(&mut self, range: core::ops::Range<usize>) {
+    // Clears the reporting anchors of every slot of `range`; how many
+    // there were.
+    fn clear_pending_range(&mut self, range: core::ops::Range<usize>) -> usize {
+        let mut cleared = 0;
         let mut index = range.start;
         while index < range.end && !index.is_multiple_of(8) {
+            cleared += usize::from(self.report_pending[index / 8] & (1 << (index % 8)) != 0);
             self.report_pending[index / 8] &= !(1 << (index % 8));
             index += 1;
         }
         let whole = (range.end - index) / 8 * 8;
-        self.report_pending[index / 8..(index + whole) / 8].fill(0);
+        for bits in &mut self.report_pending[index / 8..(index + whole) / 8] {
+            cleared += bits.count_ones() as usize;
+            *bits = 0;
+        }
         index += whole;
         for index in index..range.end {
+            cleared += usize::from(self.report_pending[index / 8] & (1 << (index % 8)) != 0);
             self.report_pending[index / 8] &= !(1 << (index % 8));
         }
+        cleared
     }
 
     pub(crate) fn peek(&self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.contiguous_len);
         for (offset, dst) in out[..count].iter_mut().enumerate() {
             let index = self.index(offset);
-            debug_assert!(self.is_present(index));
             // SAFETY: `offset` < contiguous_len, whose slots hold
             // initialized bytes (`contiguous_len`).
             *dst = unsafe { self.data[index].assume_init() };
@@ -1826,7 +1862,8 @@ impl ReceiveBuffer {
         let count = out.len().min(self.contiguous_len);
         let mut copied = 0;
         for range in self.ranges(0, count) {
-            debug_assert!(self.all_present(range.clone()));
+            // The prefix keeps no presence bits (`contiguous_len`).
+            debug_assert!(self.find_slot(range.clone(), true).is_none());
             let len = range.len();
             // SAFETY: count <= contiguous_len, so the ranges are slots of
             // the contiguous prefix, which hold initialized bytes
@@ -1840,9 +1877,10 @@ impl ReceiveBuffer {
                 );
             }
             copied += len;
-            self.set_present_range(range.clone(), false);
-            self.summarize_filled(range.clone(), false);
-            self.clear_pending_range(range);
+            // Anchors survive in the prefix only after out-of-order input.
+            if self.report_marks != 0 {
+                self.report_marks -= self.clear_pending_range(range);
+            }
         }
         self.occupied -= count;
         self.head = self.index(count);
@@ -1905,8 +1943,8 @@ impl ReceiveBuffer {
             .map_or(capacity, |end| end.distance_from(self.read_base) as usize);
         // In-order text that fits, with no byte retained beyond the contiguous
         // prefix: every byte is new and extends the prefix, so the per-byte
-        // path below reduces to copying the run and marking it present, with
-        // no reporting anchor and PUSH taken at once. A FIN on it follows
+        // path below reduces to copying the run into the prefix, which keeps
+        // no presence bits, with no reporting anchor and PUSH taken at once. A FIN on it follows
         // every retained byte, so it is kept when it lies within capacity
         // and none is kept yet, as below.
         let start = self.contiguous_len;
@@ -1927,8 +1965,6 @@ impl ReceiveBuffer {
                     );
                 }
                 copied += len;
-                self.set_present_range(range.clone(), true);
-                self.summarize_filled(range, true);
             }
             let end = start + payload.len();
             accepted(start, end);
@@ -1964,7 +2000,7 @@ impl ReceiveBuffer {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
             //# If a segment's contents straddle the boundary between old and new, only the
             //# new parts are processed.
-            if !self.is_present(index) {
+            if distance >= self.contiguous_len && !self.is_present(index) {
                 self.data[index].write(byte);
                 self.set_present(index, true);
                 outcome.new_bytes += 1;
@@ -1991,7 +2027,10 @@ impl ReceiveBuffer {
         {
             let offset = anchor.distance_from(self.read_base) as usize;
             let index = self.index(offset);
-            self.report_pending[index / 8] |= 1 << (index % 8);
+            if self.report_pending[index / 8] & (1 << (index % 8)) == 0 {
+                self.report_pending[index / 8] |= 1 << (index % 8);
+                self.report_marks += 1;
+            }
             if self
                 .pending_first
                 .is_none_or(|old| offset < old.distance_from(self.read_base) as usize)
@@ -2033,10 +2072,7 @@ impl ReceiveBuffer {
         // slot, taking their PUSH marks.
         let end = self.find_presence(self.contiguous_len, false);
         for range in self.ranges(self.contiguous_len, end - self.contiguous_len) {
-            // Reads copy prefix bytes unchecked (`contiguous_len`): check
-            // here, once per byte taken over, that each was written.
-            assert!(self.all_present(range.clone()));
-            self.pushed |= self.take_push_range(range);
+            self.pushed |= self.take_retained(range);
         }
         self.contiguous_len = end;
         // This buffer consumes FIN once after preceding data; SYN processing is in the
@@ -2114,7 +2150,235 @@ fn move_fields(map: &mut [u8], width: usize, from: usize, to: usize, count: usiz
 }
 
 #[cfg(test)]
+#[path = "buffer_receive_reference.rs"]
+mod receive_reference;
+
+#[cfg(test)]
 mod tests {
+    // Every query of the ring that keeps no presence bits for its contiguous
+    // prefix answers as the ring that kept them for every byte
+    // (receive_reference), under random in-order, out-of-order, duplicate,
+    // FIN and PUSH input, reads, peeks, SACK output with its commits and
+    // undo, D-SACK records, growth, clearing and SYN data, across wraps and
+    // summary levels.
+    #[test]
+    fn implicit_prefix_presence_matches_the_per_byte_ring() {
+        use receive_reference::ReferenceReceiveBuffer as Reference;
+        let mut state = 0x7f4a_7c15_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        fn same(n: &ReceiveBuffer, r: &Reference) {
+            assert_eq!(
+                (
+                    n.next(),
+                    n.readable(),
+                    n.eof(),
+                    n.has_data(),
+                    n.right_edge()
+                ),
+                (
+                    r.next(),
+                    r.readable(),
+                    r.eof(),
+                    r.has_data(),
+                    r.right_edge()
+                )
+            );
+            assert_eq!(
+                (n.out_of_order_end(), n.has_sack_blocks(), n.dsack_pending()),
+                (r.out_of_order_end(), r.has_sack_blocks(), r.dsack_pending())
+            );
+            assert_eq!(
+                (n.has_pending_report(), n.capacity(), n.storage_bytes()),
+                (r.has_pending_report(), r.capacity(), r.storage_bytes())
+            );
+            assert_eq!(
+                (
+                    n.read_base,
+                    n.head,
+                    n.contiguous_len,
+                    n.occupied,
+                    n.fin_sequence
+                ),
+                (
+                    r.read_base,
+                    r.head,
+                    r.contiguous_len,
+                    r.occupied,
+                    r.fin_sequence
+                )
+            );
+            assert_eq!(
+                (
+                    n.latest,
+                    n.reported,
+                    n.report_debt,
+                    n.pending_first,
+                    n.dsack
+                ),
+                (
+                    r.latest,
+                    r.reported,
+                    r.report_debt,
+                    r.pending_first,
+                    r.dsack
+                )
+            );
+            assert_eq!((n.pushed, n.deferred_syn), (r.pushed, r.deferred_syn));
+            for limit in 0..=5 {
+                assert_eq!(n.sack_blocks(limit), r.sack_blocks(limit));
+            }
+            let capacity = n.capacity();
+            assert_eq!(
+                n.report_marks,
+                n.report_pending
+                    .iter()
+                    .map(|b| b.count_ones() as usize)
+                    .sum::<usize>()
+            );
+            for offset in 0..capacity {
+                let (i, j) = (n.index(offset), r.index(offset));
+                assert_eq!(n.holds(i), r.is_present(j), "{offset}");
+                assert_eq!(n.is_push(i), r.is_push(j), "{offset}");
+                if n.holds(i) {
+                    // Both slots hold initialized bytes.
+                    let bytes = unsafe { (n.data[i].assume_init(), r.data[j].assume_init()) };
+                    assert_eq!(bytes.0, bytes.1, "{offset}");
+                }
+                let seq = n.read_base.wrapping_add(offset as u32);
+                assert_eq!(n.pending(seq), r.pending(seq), "{offset}");
+                assert_eq!(n.block_at(seq), r.block_at(seq), "{offset}");
+                for present in [false, true] {
+                    assert_eq!(
+                        n.find_presence(offset, present),
+                        r.find_presence(offset, present),
+                        "{offset} {present}"
+                    );
+                }
+            }
+            assert_eq!(
+                n.find_presence(capacity, true),
+                r.find_presence(capacity, true)
+            );
+            assert_eq!(n.find_pending(0), r.find_pending(0));
+        }
+        let mut steps = 0;
+        let mut absorbed = 0;
+        for round in 0..60 {
+            let capacity = 1 + next(if round % 4 == 0 { 5000 } else { 600 });
+            let start = Seq(next(1 << 31) as u32 * 2 + next(2) as u32);
+            let mut n = ReceiveBuffer::new(start, capacity).unwrap();
+            let mut r = Reference::new(start, capacity).unwrap();
+            if next(3) == 0 {
+                let len = next(capacity.min(64) + 1).min(capacity - 1);
+                let payload: Vec<u8> = (0..len).map(|_| next(256) as u8).collect();
+                let (fin, push) = (next(4) == 0, next(2) == 0);
+                n.defer_syn(&payload, fin, push);
+                r.defer_syn(&payload, fin, push);
+                same(&n, &r);
+                assert_eq!(n.promote_syn(), r.promote_syn());
+            }
+            same(&n, &r);
+            for _ in 0..120 {
+                steps += 1;
+                let capacity = n.capacity();
+                match next(16) {
+                    0..=6 => {
+                        // Near the frontier, beyond it, or a duplicate.
+                        let distance = match next(4) {
+                            0 => 0,
+                            1 => next(capacity + 40),
+                            _ => next(64),
+                        } as i64
+                            - if next(5) == 0 { next(40) as i64 } else { 0 };
+                        let sequence = n.next().wrapping_add(distance as u32);
+                        let len = next(capacity.min(300) + 1);
+                        let payload: Vec<u8> = (0..len).map(|_| next(256) as u8).collect();
+                        let (fin, push) = (next(10) == 0, next(3) == 0);
+                        if next(2) == 0 {
+                            n.record_duplicate(sequence, len);
+                            r.record_duplicate(sequence, len);
+                        }
+                        let before = n.contiguous_len;
+                        let (mut a, mut b) = (Vec::new(), Vec::new());
+                        let x =
+                            n.insert_observed(sequence, &payload, fin, push, |s, e| a.push((s, e)));
+                        let y =
+                            r.insert_observed(sequence, &payload, fin, push, |s, e| b.push((s, e)));
+                        assert_eq!(
+                            (
+                                x.new_bytes,
+                                x.sack_overflow,
+                                x.advanced,
+                                x.fin,
+                                x.out_of_order
+                            ),
+                            (
+                                y.new_bytes,
+                                y.sack_overflow,
+                                y.advanced,
+                                y.fin,
+                                y.out_of_order
+                            )
+                        );
+                        assert_eq!(a, b);
+                        absorbed += usize::from(n.contiguous_len > before + x.new_bytes);
+                    }
+                    7..=9 => {
+                        let len = next(capacity + 1);
+                        let (mut a, mut b) = (alloc::vec![0; len], alloc::vec![0; len]);
+                        assert_eq!(n.read(&mut a), r.read(&mut b));
+                        assert_eq!(a, b);
+                    }
+                    10 => {
+                        let len = next(capacity + 1);
+                        let (mut a, mut b) = (alloc::vec![0; len], alloc::vec![0; len]);
+                        assert_eq!(n.peek(&mut a), r.peek(&mut b));
+                        assert_eq!(a, b);
+                    }
+                    11 | 12 => {
+                        let limit = 1 + next(4);
+                        let blocks = n.sack_blocks(limit);
+                        assert_eq!(blocks, r.sack_blocks(limit));
+                        let (u, v) = (n.output_undo(), r.output_undo());
+                        if let Some(first) = blocks[0] {
+                            n.commit_sack(first);
+                            r.commit_sack(first);
+                        }
+                        n.commit_report();
+                        r.commit_report();
+                        if next(4) == 0 {
+                            same(&n, &r);
+                            n.restore_output(u);
+                            r.restore_output(v);
+                        }
+                    }
+                    13 => assert_eq!(n.take_push(), r.take_push()),
+                    14 if capacity < 6000 => {
+                        let grown = capacity + 1 + next(800);
+                        assert_eq!(n.grow(grown), r.grow(grown));
+                    }
+                    15 if next(8) == 0 => {
+                        n.clear();
+                        r.clear();
+                        let start = Seq(next(1 << 31) as u32 * 2 + next(2) as u32);
+                        assert_eq!(n.reset_start(start), r.reset_start(start));
+                    }
+                    _ => {
+                        n.clear_dsack();
+                        r.clear_dsack();
+                    }
+                }
+                same(&n, &r);
+            }
+        }
+        assert!(steps == 7200 && absorbed > 100, "{absorbed}");
+    }
+
     #[test]
     fn resizing_wrapped_ring_preserves_holes_push_fin_and_reporting() {
         let start = Seq(u32::MAX - 5);
@@ -2153,8 +2417,8 @@ mod tests {
             let seq = base.wrapping_add(offset as u32);
             assert_eq!(grown.pending(seq), recv.pending(seq));
             assert_eq!(
-                grown.is_present(grown.index(offset)),
-                recv.is_present(recv.index(offset))
+                grown.holds(grown.index(offset)),
+                recv.holds(recv.index(offset))
             );
             assert_eq!(
                 grown.is_push(grown.index(offset)),
@@ -2266,7 +2530,7 @@ mod tests {
     fn occupied_data(recv: &ReceiveBuffer) -> Vec<Option<(u8, bool)>> {
         (0..recv.data.len())
             .map(|index| {
-                recv.is_present(index).then(|| {
+                recv.holds(index).then(|| {
                     // Only occupied slots have initialized bytes; never inspect holes.
                     (
                         unsafe { recv.data[index].assume_init() },
@@ -2281,12 +2545,12 @@ mod tests {
         let mut expected = Vec::new();
         let mut offset = recv.contiguous_len;
         while offset < recv.data.len() {
-            if !recv.is_present(recv.index(offset)) {
+            if !recv.holds(recv.index(offset)) {
                 offset += 1;
                 continue;
             }
             let start = offset;
-            while offset < recv.data.len() && recv.is_present(recv.index(offset)) {
+            while offset < recv.data.len() && recv.holds(recv.index(offset)) {
                 offset += 1;
             }
             expected.push((
@@ -2335,7 +2599,7 @@ mod tests {
         let mut first = alloc::vec![[capacity; 2]; capacity + 1];
         for offset in (0..capacity).rev() {
             first[offset] = first[offset + 1];
-            first[offset][usize::from(recv.is_present(recv.index(offset)))] = offset;
+            first[offset][usize::from(recv.holds(recv.index(offset)))] = offset;
         }
         let mut offset = recv.contiguous_len;
         while offset < capacity {
@@ -2970,10 +3234,7 @@ mod tests {
         //# Segments with higher beginning sequence numbers SHOULD be held for later
         //# processing (SHLD-31).
         assert_eq!(recv.readable(), 0);
-        assert_eq!(
-            (0..recv.data.len()).filter(|&i| recv.is_present(i)).count(),
-            4
-        );
+        assert_eq!((0..recv.data.len()).filter(|&i| recv.holds(i)).count(), 4);
         let result = recv.insert(start.wrapping_add(u32::MAX), b"!abXYZ", false);
         assert_eq!(result.new_bytes, 2);
         assert!(result.advanced);
@@ -2991,10 +3252,7 @@ mod tests {
         assert_eq!(&out[..6], b"cdefgh");
         assert_eq!(recv.read(&mut out), 0);
         assert_eq!(recv.next(), Seq(5));
-        assert_eq!(
-            (0..recv.data.len()).filter(|&i| recv.is_present(i)).count(),
-            0
-        );
+        assert_eq!((0..recv.data.len()).filter(|&i| recv.holds(i)).count(), 0);
     }
 
     #[test]
@@ -3115,10 +3373,7 @@ mod tests {
             );
         }
         assert_eq!(recv.readable(), 0);
-        assert_eq!(
-            (0..recv.data.len()).filter(|&i| recv.is_present(i)).count(),
-            32
-        );
+        assert_eq!((0..recv.data.len()).filter(|&i| recv.holds(i)).count(), 32);
         for offset in (0..64).step_by(2) {
             assert_eq!(
                 recv.insert(Seq(offset), &[offset as u8], false).new_bytes,
@@ -3126,10 +3381,7 @@ mod tests {
             );
         }
         assert_eq!(recv.readable(), 64);
-        assert_eq!(
-            (0..recv.data.len()).filter(|&i| recv.is_present(i)).count(),
-            64
-        );
+        assert_eq!((0..recv.data.len()).filter(|&i| recv.holds(i)).count(), 64);
         let mut out = [0; 64];
         assert_eq!(recv.read(&mut out), 64);
         for (offset, &byte) in out.iter().enumerate() {
@@ -3572,7 +3824,7 @@ mod tests {
                 let index = recv.index(offset);
                 (
                     // Only occupied slots have initialized bytes.
-                    recv.is_present(index)
+                    recv.holds(index)
                         .then(|| unsafe { recv.data[index].assume_init() }),
                     recv.is_push(index),
                     recv.report_pending[index / 8] & (1 << (index % 8)) != 0,
