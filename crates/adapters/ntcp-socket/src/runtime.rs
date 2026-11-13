@@ -44,12 +44,22 @@ use memory::PacketBackend;
 pub const REQUESTS: usize = 512;
 pub const BYTES: usize = 65536;
 pub(crate) const BUDGET: usize = 32;
-// Linux sock_setsockopt clamps the unsigned request before doubling. Fixed
-// project cap, not host sysctls: RACK's per-byte ledger also consumes the budget.
-const BUFFER_REQUEST_CAP: u32 = 1024 * 1024;
+// sock_setsockopt clamps the unsigned request to net.core.rmem_max or
+// wmem_max before doubling it. Fixed project caps, not host sysctls:
+// RMEM_MAX is Linux master's default, 4 MiB (net/core/sock.c,
+// sysctl_rmem_max = 4 << 20). The send request stays at 1 MiB, below
+// master's sysctl_wmem_max of 4 << 20, while RACK's ledger is charged per
+// queued byte (68 bytes each): wmem_max's 8 MiB limit would take about
+// 570 MB of ledger, more than the default 128 MiB budget.
+const RMEM_MAX: u32 = 4 << 20;
+const WMEM_MAX: u32 = 1 << 20;
 fn socket_buffer_value(name: i32, value: i32) -> usize {
-    let minimum = if name == SO_SNDBUF { 4608 } else { 2304 };
-    ((value as u32).min(BUFFER_REQUEST_CAP) as usize * 2).max(minimum)
+    let (cap, minimum) = if name == SO_SNDBUF {
+        (WMEM_MAX, 4608)
+    } else {
+        (RMEM_MAX, 2304)
+    };
+    ((value as u32).min(cap) as usize * 2).max(minimum)
 }
 #[derive(Clone)]
 pub enum Op {
@@ -4337,8 +4347,26 @@ impl Owner {
                     (SOL_SOCKET, SO_MARK) => s.mark as i32,
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse as i32,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive as i32,
-                    (SOL_SOCKET, SO_SNDBUF) => s.send_capacity as i32,
-                    (SOL_SOCKET, SO_RCVBUF) => s.receive_capacity as i32,
+                    // The live size, as Linux reports sk_sndbuf and
+                    // sk_rcvbuf: grown by autotuning, or the doubled size
+                    // setsockopt locked. Before a connection exists, the
+                    // configured initial size (tcp_wmem[1], tcp_rmem[1]) or
+                    // the locked one; after a failed connect, the last
+                    // size the connection had. ntcp counts window and
+                    // payload bytes where Linux counts skb memory.
+                    (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => {
+                        let (send, receive) = match s.handle {
+                            Handle::Connection(cid) => {
+                                self.endpoint.buffer_capacities(cid).map_err(engine)?
+                            }
+                            Handle::Fresh => match s.terminal_transport {
+                                Some(Ok(info)) => (info.send_capacity, info.receive_capacity),
+                                _ => (s.send_capacity, s.receive_capacity),
+                            },
+                            Handle::Listener(_) => (s.send_capacity, s.receive_capacity),
+                        };
+                        (if name == SO_SNDBUF { send } else { receive }) as i32
+                    }
                     (IPPROTO_TCP, TCP_FASTOPEN) => s.fast_open_limit,
                     (IPPROTO_TCP, TCP_FASTOPEN_CONNECT) => s.fast_open_connect as i32,
                     (IPPROTO_TCP, TCP_MAXSEG) => match s.handle {

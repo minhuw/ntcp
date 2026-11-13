@@ -2748,10 +2748,9 @@ mod tests {
                     0
                 );
                 assert_eq!(len, 4);
-                assert_eq!(
-                    value,
-                    ((request as u32).min(1024 * 1024) * 2).max(minimum) as i32
-                );
+                // wmem_max 1 MiB, rmem_max Linux master's 4 MiB.
+                let cap = if name == SO_SNDBUF { 1 << 20 } else { 4 << 20 };
+                assert_eq!(value, ((request as u32).min(cap) * 2).max(minimum) as i32);
                 if (0..=65536).contains(&request) {
                     let mut native_value = 0i32;
                     let mut native_len = 4u32;
