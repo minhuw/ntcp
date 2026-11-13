@@ -73,7 +73,7 @@ impl Owner {
     ) -> Result<(SocketAddr, ports::Binding)> {
         self.collect_paths()?;
         self.collect_connection_options();
-        if self.connection_options.len() == self.socket_limit() {
+        if self.connection_options.len() == self.options_limit() {
             return Err(ENOBUFS);
         }
         let source = self.source_for(remote, zone);

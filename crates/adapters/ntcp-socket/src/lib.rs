@@ -5,10 +5,30 @@
 //! and the epoll instances that watch them are tracked by fd number, in
 //! tables grown on demand like Linux's fdtable (fs/file.c expand_files), so
 //! any descriptor the kernel hands out below RLIMIT_NOFILE can be managed.
-//! Earlier versions held 512 managed descriptors and failed the next one with
-//! EMFILE. The runtime still holds at most 512 sockets: socket() and accept()
-//! fail with EMFILE beyond that, whatever the descriptor numbers, and at most
-//! 512 epoll instances can watch managed sockets (epoll_ctl fails with ENOSPC).
+//!
+//! Limits, as Linux's: managed sockets are limited by RLIMIT_NOFILE alone,
+//! each holding descriptors as a Linux socket holds its file (socket() and
+//! accept() fail with EMFILE at the limit, as alloc_fd), and their
+//! connections and listeners by the endpoint's `tcp.max_connections` and
+//! `tcp.max_listeners` (512 each unless configured; connect() then fails
+//! with ENOBUFS and an incoming SYN is refused, as a full accept queue
+//! refuses it). Epoll instances watching managed sockets are descriptors
+//! too, limited the same way, and an instance watches any number of them,
+//! as Linux bounds watches only by memory (max_user_watches); epoll_wait
+//! returns at most 4096 events per call, leaving the rest ready for the
+//! next. poll() takes up to RLIMIT_NOFILE descriptors, as do_sys_poll, and
+//! managed FILEs (fdopen) are limited by memory. Earlier versions held at
+//! most 512 managed descriptors, 512 sockets (EMFILE), 512 epoll instances
+//! and 4096 registrations per instance (ENOSPC), 4096 poll() descriptors
+//! (EINVAL) and 512 managed FILEs (EMFILE).
+//!
+//! Costs, as Linux's: the owner reaches a socket from an event on its
+//! connection or listener by an index (as sk leads to its socket), and
+//! refreshes only the sockets an event, an operation, a completion or
+//! pending output concerned (as sk_data_ready and sk_write_space wake only
+//! their socket). Each epoll instance keeps a ready list fed by the owner's
+//! log of readiness changes (as ep_poll_callback feeds rdllist), so an
+//! epoll_wait costs what is ready or changed, not what is registered.
 #![cfg(target_os = "linux")]
 #![allow(clippy::missing_safety_doc)]
 // Linux preload boundary. Native cancellation points tail-jump through C to
@@ -127,9 +147,19 @@ impl Tokens {
     // Socket `id`'s descriptors, in fd order.
     fn of(&self, id: u64) -> impl Iterator<Item = (i32, &Token)> + '_ {
         if cfg!(debug_assertions) {
-            let indexed = self.aliases.range((id, i32::MIN)..=(id, i32::MAX)).map(|&(_, fd)| fd);
-            let swept = self.by_fd.iter().filter(|(_, t)| t.id == id).map(|(&fd, _)| fd);
-            assert!(indexed.eq(swept), "aliases of socket {id} differ from a sweep");
+            let indexed = self
+                .aliases
+                .range((id, i32::MIN)..=(id, i32::MAX))
+                .map(|&(_, fd)| fd);
+            let swept = self
+                .by_fd
+                .iter()
+                .filter(|(_, t)| t.id == id)
+                .map(|(&fd, _)| fd);
+            assert!(
+                indexed.eq(swept),
+                "aliases of socket {id} differ from a sweep"
+            );
         }
         self.aliases
             .range((id, i32::MIN)..=(id, i32::MAX))
@@ -3151,13 +3181,7 @@ mod tests {
             assert_eq!(closer.join().unwrap(), 0);
             // Other tests may immediately allocate this fd number. Assert the
             // original OFD has no ghost alias, not that the number stays unused.
-            assert!(
-                !TOKENS
-                    .lock()
-                    .unwrap()
-                    .of(982)
-                    .any(|(fd, _)| fd != source)
-            );
+            assert!(!TOKENS.lock().unwrap().of(982).any(|(fd, _)| fd != source));
             assert_eq!(owned(source), Ok(Some(982)));
             TOKENS.lock().unwrap().remove(&source);
             unsafe {
@@ -3606,3 +3630,125 @@ mod send_state_abi_tests;
 
 #[cfg(all(test, feature = "linux"))]
 mod syncnt_abi_tests;
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    // Raises the soft descriptor limit for this (child) process: each
+    // managed socket and each epoll holds two descriptors.
+    fn descriptors(wanted: rlim_t) -> bool {
+        let mut limit: rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) }, 0);
+        if limit.rlim_cur < wanted {
+            limit.rlim_cur = wanted.min(limit.rlim_max);
+            assert_eq!(unsafe { setrlimit(RLIMIT_NOFILE, &limit) }, 0);
+        }
+        limit.rlim_cur >= wanted
+    }
+    #[test]
+    fn sockets_and_epolls_beyond_512_through_the_abi() {
+        const CHILD: &str = "NTCP_TEST_CAP_ABI_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cap_tests::sockets_and_epolls_beyond_512_through_the_abi",
+                        "--test-threads=1"
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        assert!(descriptors(8192), "RLIMIT_NOFILE below 8192");
+        PACKET_SOCKET.with(|p| p.set(true));
+        assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
+        const SOCKETS: usize = 1500;
+        const EPOLLS: usize = 600;
+        let fds: Vec<i32> = (0..SOCKETS)
+            .map(|i| {
+                let fd = unsafe { ntcp_managed_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0) };
+                assert!(fd >= 0, "socket {i}: errno {}", errno());
+                fd
+            })
+            .collect();
+        let epoll = || {
+            let epfd = unsafe { syscall(SYS_epoll_create1, EPOLL_CLOEXEC) as i32 };
+            assert!(epfd >= 0);
+            epfd
+        };
+        let register = |epfd: i32, fd: i32| {
+            let mut event = epoll_event {
+                events: (EPOLLIN | EPOLLOUT) as u32,
+                u64: fd as u64,
+            };
+            let result =
+                unsafe { readiness::ntcp_managed_epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut event) };
+            assert_eq!(result, 0, "epoll_ctl: errno {}", errno());
+        };
+        // One instance watching every socket, and more instances watching
+        // managed sockets than the former 512.
+        let all = epoll();
+        for &fd in &fds {
+            register(all, fd);
+        }
+        let small: Vec<i32> = (0..EPOLLS)
+            .map(|i| {
+                let epfd = epoll();
+                register(epfd, fds[i % SOCKETS]);
+                epfd
+            })
+            .collect();
+        let wait = |epfd: i32| {
+            let mut out = [epoll_event { events: 0, u64: 0 }; 16];
+            let n = unsafe { readiness::ntcp_managed_epoll_wait(epfd, out.as_mut_ptr(), 16, 0) };
+            assert!(n >= 0, "epoll_wait: errno {}", errno());
+            out[..n as usize]
+                .iter()
+                .map(|e| (e.events, e.u64))
+                .collect::<Vec<_>>()
+        };
+        assert!(wait(all).is_empty());
+        // One socket among them changes: only it is reported, by every
+        // instance watching it, and again while it stays ready (level).
+        let index = SOCKETS - 1 - EPOLLS / 2;
+        let changed = fds[index];
+        let peer = sockaddr_in {
+            sin_family: AF_INET as sa_family_t,
+            sin_port: 80u16.to_be(),
+            sin_addr: in_addr {
+                s_addr: u32::from_ne_bytes([10, 73, 0, 9]),
+            },
+            sin_zero: [0; 8],
+        };
+        let connected = unsafe {
+            ntcp_managed_connect(
+                changed,
+                (&peer as *const sockaddr_in).cast(),
+                std::mem::size_of::<sockaddr_in>() as socklen_t,
+            )
+        };
+        assert_eq!((connected, errno()), (-1, EINPROGRESS));
+        assert_eq!(unsafe { ntcp_managed_shutdown(changed, SHUT_RDWR) }, 0);
+        for _ in 0..2 {
+            let events = wait(all);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].1, changed as u64);
+            assert_ne!(events[0].0 & EPOLLHUP as u32, 0);
+        }
+        for (i, &epfd) in small.iter().enumerate() {
+            let events = wait(epfd);
+            assert_eq!(
+                events.len(),
+                usize::from(fds[i % SOCKETS] == changed),
+                "epoll {i}"
+            );
+        }
+        for fd in fds.into_iter().chain(small).chain([all]) {
+            assert_eq!(unsafe { ntcp_managed_close(fd) }, 0);
+        }
+    }
+}

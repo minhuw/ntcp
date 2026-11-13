@@ -288,7 +288,7 @@ fn full_deferred_commands_do_not_hide_capture_or_inject() {
                     .bytes
                     .clone();
                 let mut replies = Vec::new();
-                for _ in 0..a.socket_limit() {
+                for _ in 0..a.request_limit() {
                     let (reply, rx) = mpsc::sync_channel(1);
                     replies.push(rx);
                     a.pending.push_back(Request {

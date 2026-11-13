@@ -226,7 +226,7 @@ fn client_tfo_permission_management_progresses_with_full_waiter_queue() {
     let (mut a, _b, client, _, _) = pair();
     a.execute(client, Op::Flags(F_SETFL, 0)).unwrap();
     let (reply, _) = mpsc::sync_channel(1);
-    for _ in 0..a.socket_limit() {
+    for _ in 0..a.request_limit() {
         let mut request = Request {
             id: client,
             op: Op::Wait(Box::new(Op::Read(1)), None),
@@ -247,12 +247,12 @@ fn client_tfo_permission_management_progresses_with_full_waiter_queue() {
         send: None,
         closing: None,
     };
-    assert_eq!(a.pending.len(), a.socket_limit());
+    assert_eq!(a.pending.len(), a.request_limit());
     assert!(!a.admission_full(&control));
     assert!(a.service(&mut control));
     assert!(result.try_recv().unwrap().is_ok());
     assert!(!a.socket_policy.fast_open_client_enabled);
-    assert_eq!(a.pending.len(), a.socket_limit());
+    assert_eq!(a.pending.len(), a.request_limit());
 }
 
 #[test]
@@ -920,10 +920,13 @@ fn bounds_flags_addresses_and_honest_options() {
             .value,
         60
     );
-    for _ in 1..LIMIT {
+    // The owner holds as many sockets as there are descriptors for them:
+    // more than its former 512.
+    for _ in 1..600 {
         new(&mut a, 0);
     }
-    assert_eq!(a.execute(0, Op::New(0)).unwrap_err(), EMFILE);
+    assert_eq!(a.sockets.len(), 600);
+    assert_eq!(a.socket_limit(), None);
 }
 #[test]
 fn reset_drains_payload_then_reports_error_once_then_eof() {
@@ -1046,8 +1049,8 @@ fn option_application_failure_releases_connect_and_accept_records() {
 
 #[test]
 fn close_delivery_waits_for_space_in_bounded_queue() {
-    let (tx, rx) = mpsc::sync_channel(LIMIT);
-    for _ in 0..LIMIT {
+    let (tx, rx) = mpsc::sync_channel(REQUESTS);
+    for _ in 0..REQUESTS {
         let (reply, _) = mpsc::sync_channel(1);
         tx.send(Request {
             id: 1,
@@ -1068,7 +1071,7 @@ fn close_delivery_waits_for_space_in_bounded_queue() {
         worker: Mutex::new(None),
     };
     let caller = std::thread::spawn(move || runtime.call(1, Op::Close));
-    for _ in 0..LIMIT {
+    for _ in 0..REQUESTS {
         assert!(matches!(rx.recv().unwrap().op, Op::Ready));
     }
     let request = rx.recv().unwrap();
@@ -1262,4 +1265,31 @@ fn detached_connection_waits_for_its_terminal_event() {
     b.release_detached();
     assert!(b.detached.is_empty());
     assert!(!b.endpoint.connection_exists(cid));
+}
+
+// What the per-event passes visit does not grow with idle sockets: after a
+// pass none of 2000 idle sockets is listed for a refresh, a completion
+// pass or an epoll's changes; one changed socket is the only one listed.
+#[test]
+fn passes_visit_only_listed_sockets_among_many_idle() {
+    let mut a = owner(2);
+    let ids: Vec<u64> = (0..2000).map(|_| new(&mut a, SOCK_NONBLOCK)).collect();
+    a.events();
+    assert!(a.lists.iter().all(Option::is_none));
+    let since = a.changes;
+    assert_eq!(a.ready_changes(since, Vec::new()), Some(Vec::new()));
+    let target = ids[1234];
+    assert_eq!(
+        a.execute(target, Op::Connect("10.73.0.9:80".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    a.execute(target, Op::Shutdown(SHUT_RDWR)).unwrap();
+    a.events();
+    let changed = a.ready_changes(since, Vec::new()).unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].0, target);
+    assert_ne!(changed[0].1 & EPOLLHUP, 0);
+    assert!(a.lists[FINISHING].is_none() && a.lists[LEASED].is_none());
+    assert!(a.lists[STAMPING].is_none());
 }

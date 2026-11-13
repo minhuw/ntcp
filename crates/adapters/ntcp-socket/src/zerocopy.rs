@@ -1,4 +1,7 @@
-use crate::{Result, runtime::LIMIT};
+use crate::Result;
+// Payloads registered at once at most: a bound on the registry, not on
+// sockets.
+const REGISTRATIONS: usize = 512;
 use ntcp_io::Payload;
 use std::{
     collections::BTreeMap,
@@ -31,7 +34,7 @@ impl RegisteredPayload {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
         let mut registry = REGISTRY.lock().map_err(|_| std::io::ErrorKind::Other)?;
-        if registry.len() >= LIMIT {
+        if registry.len() >= REGISTRATIONS {
             return Err(std::io::Error::from_raw_os_error(libc::ENOBUFS));
         }
         let end = address + payload.len();

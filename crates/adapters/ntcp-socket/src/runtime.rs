@@ -37,7 +37,11 @@ mod memory;
 #[cfg(feature = "packet-test")]
 use memory::PacketBackend;
 
-pub const LIMIT: usize = 512;
+// The owner's request backlog: requests the channel holds, and requests of
+// each class (teardown, everything else) that may wait in `pending`. Each
+// caller has one request in flight; this bounds what the owner queues, not
+// how many sockets exist.
+pub const REQUESTS: usize = 512;
 pub const BYTES: usize = 65536;
 pub(crate) const BUDGET: usize = 32;
 // Linux sock_setsockopt clamps the unsigned request before doubling. Fixed
@@ -181,7 +185,7 @@ impl Runtime {
     pub(crate) fn in_memory_test() -> Self {
         let wake = unsafe { syscall(SYS_eventfd2, 0, EFD_NONBLOCK | EFD_CLOEXEC) as i32 };
         assert!(wake >= 0);
-        let (tx, rx) = mpsc::sync_channel::<Request>(LIMIT);
+        let (tx, rx) = mpsc::sync_channel::<Request>(REQUESTS);
         std::thread::spawn(move || {
             set_internal(true);
             let local = Ipv4Addr::new(10, 73, 0, 2);
@@ -264,7 +268,7 @@ impl Runtime {
         if wake < 0 {
             return Err(errno());
         }
-        let (tx, rx) = mpsc::sync_channel(if packet { 128 } else { LIMIT });
+        let (tx, rx) = mpsc::sync_channel(if packet { 128 } else { REQUESTS });
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
@@ -1575,12 +1579,26 @@ impl Owner {
             .map(Some)
             .ok_or(ENODEV)
     }
-    fn socket_limit(&self) -> usize {
+    // The sockets an owner holds at most: none beyond the descriptors each
+    // needs (socket() and accept() fail with EMFILE at RLIMIT_NOFILE, as
+    // Linux's alloc_fd), except the explicit synthetic packet profiles'.
+    fn socket_limit(&self) -> Option<usize> {
         #[cfg(feature = "packet-test")]
         if self.packets.is_some() {
-            return crate::packet_profile::LIMIT;
+            return Some(crate::packet_profile::LIMIT);
         }
-        LIMIT
+        None
+    }
+    // The connections whose options the owner keeps at most: the
+    // endpoint's (`connection_options` names live connections only),
+    // except the synthetic packet profiles' own bound.
+    fn options_limit(&self) -> usize {
+        self.socket_limit().unwrap_or(self.defaults.max_connections)
+    }
+    // The owner's request backlog per class, and a socket's queued
+    // zero-copy completions at most.
+    fn request_limit(&self) -> usize {
+        self.socket_limit().unwrap_or(REQUESTS)
     }
     fn fresh_socket(&self, flags: i32) -> Socket {
         #[cfg(feature = "packet-test")]
@@ -1662,7 +1680,7 @@ impl Owner {
             .iter()
             .filter(|r| matches!(r.op, Op::Close) == closing)
             .count()
-            >= self.socket_limit()
+            >= self.request_limit()
     }
     // One transport sample, with its measured suspend passed to the
     // Endpoint. A provider failure or a sample the Endpoint rejects is EIO:
@@ -1914,7 +1932,7 @@ impl Owner {
             // Keep admission open while teardown has room; packet capture must
             // always remain reachable to free held output.
             if !self.packet_backend()
-                && self.pending.len() >= 2 * self.socket_limit()
+                && self.pending.len() >= 2 * self.request_limit()
                 && self.egress.as_ref().is_some_and(|e| e.has_held())
             {
                 std::thread::sleep(wait);
@@ -2025,7 +2043,9 @@ impl Owner {
         }
         self.children_reclaimed = self.endpoint.reclaimed();
         debug_assert!(
-            self.child_timeouts.iter().map(|p| p.0)
+            self.child_timeouts
+                .iter()
+                .map(|p| p.0)
                 .chain(self.child_timestamps.iter().map(|p| p.0))
                 .all(|cid| self.endpoint.connection_exists(cid))
         );
@@ -2144,7 +2164,7 @@ impl Owner {
             })
         {
             self.collect_connection_options();
-            if self.connection_options.len() == self.socket_limit() {
+            if self.connection_options.len() == self.options_limit() {
                 return Err(EndpointError::LimitReached.into());
             }
         }
@@ -2183,16 +2203,13 @@ impl Owner {
         // duplicated or replaced with the listener's current policy.
         let new_child = tuple
             .and_then(|tuple| self.arrival_connection(tuple, arrival))
-            .filter(|cid| {
-                Some(*cid) != before && !self.connection_options.contains(*cid)
-            });
+            .filter(|cid| Some(*cid) != before && !self.connection_options.contains(*cid));
         if let Some(cid) = new_child
             && let Some(listener) = listener.and_then(|listener| self.listener_socket(listener))
         {
             let s = &self.sockets[&listener];
             // Runtime bind policy admits only one listener per port. Input can
             // only create passive children; active opens go through Connect.
-            debug_assert!(self.child_timeouts.len() < LIMIT);
             self.child_timestamps.push((cid, s.timestamps.options));
             self.rx_software_children +=
                 usize::from(s.timestamps.options.flags & crate::timestamping::RX_SOFTWARE != 0);
@@ -2222,8 +2239,7 @@ impl Owner {
                     self.endpoint.state(cid),
                     Ok(State::Established | State::CloseWait)
                 )
-                && let Some((_, listener, _, _, _)) =
-                    self.child_timeouts.get(cid)
+                && let Some((_, listener, _, _, _)) = self.child_timeouts.get(cid)
                 && let listener = *listener
                 && let Some(s) = self.sockets.get_mut(&listener)
                 && s.acceptable
@@ -2380,11 +2396,8 @@ impl Owner {
     // Queues the sockets of connections with output to send or held by
     // egress: at most the connections egress is serving.
     fn queue_transmitting(&mut self) {
-        let (holders, sockets, lists) = (
-            &self.connection_holders,
-            &mut self.sockets,
-            &mut self.lists,
-        );
+        let (holders, sockets, lists) =
+            (&self.connection_holders, &mut self.sockets, &mut self.lists);
         let held = self.egress.iter().flat_map(|e| e.held_owners());
         for cid in self.endpoint.ready_connections().chain(held) {
             if let Some(&id) = holders.get(&cid) {
@@ -2411,7 +2424,11 @@ impl Owner {
         for (id, s) in &self.sockets {
             let (want, member) = (listed(s), s.lists[list].member);
             assert!(
-                if exact { want == member } else { !want || member },
+                if exact {
+                    want == member
+                } else {
+                    !want || member
+                },
                 "socket {id}: list {list} membership {member}"
             );
         }
@@ -2502,7 +2519,7 @@ impl Owner {
         self.touch(id);
     }
     fn alloc(&mut self, s: Socket) -> Result<i32> {
-        if self.sockets.len() == self.socket_limit() || self.next_id > i32::MAX as u64 {
+        if Some(self.sockets.len()) == self.socket_limit() || self.next_id > i32::MAX as u64 {
             return Err(EMFILE);
         }
         let id = self.next_id;
@@ -2512,7 +2529,8 @@ impl Owner {
             self.port_sockets.insert((local.port(), id));
         }
         self.hold(id, s.handle, true);
-        self.rx_software += usize::from(s.timestamps.options.flags & crate::timestamping::RX_SOFTWARE != 0);
+        self.rx_software +=
+            usize::from(s.timestamps.options.flags & crate::timestamping::RX_SOFTWARE != 0);
         self.sockets.insert(id, s);
         self.touch(id);
         self.settle_timestamp_charge(id);
@@ -2937,7 +2955,8 @@ impl Owner {
         if missed > CHANGE_LOG as u64 {
             return None;
         }
-        let logged = (since..self.changes).map(|n| self.change_log[(n % CHANGE_LOG as u64) as usize]);
+        let logged =
+            (since..self.changes).map(|n| self.change_log[(n % CHANGE_LOG as u64) as usize]);
         let mut seen = HashSet::new();
         Some(
             logged
@@ -3396,7 +3415,7 @@ impl Owner {
                 self.set_handle(id, Handle::Listener(listener));
             }
             Op::Accept(flags) => {
-                if self.sockets.len() == self.socket_limit() {
+                if Some(self.sockets.len()) == self.socket_limit() {
                     return Err(EMFILE);
                 }
                 let Handle::Listener(listener) = s.handle else {

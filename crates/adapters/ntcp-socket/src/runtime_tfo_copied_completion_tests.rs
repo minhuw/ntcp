@@ -294,7 +294,7 @@ fn copied_initial_tfo_overlapping_successes_assign_unique_ids_at_commit() {
 #[test]
 fn copied_initial_tfo_pending_reservation_stays_charged_and_counter_wraps_once() {
     let mut f = Flight::new(false, true, false, 500);
-    let limit = f.a.socket_limit();
+    let limit = f.a.request_limit();
     for i in 0..limit - 1 {
         f.a.sockets
             .get_mut(&f.client)
@@ -485,7 +485,7 @@ fn initial_tfo_copy_completion_fault_and_full_queue_do_not_start_or_consume_id()
             a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
                 .unwrap();
             if full {
-                let limit = a.socket_limit();
+                let limit = a.request_limit();
                 let s = a.sockets.get_mut(&client).unwrap();
                 for i in 0..limit {
                     s.completions

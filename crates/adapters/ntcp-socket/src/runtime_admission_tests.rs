@@ -15,7 +15,7 @@ fn close_full_listener(
                     .unwrap();
                 owner.execute(listener, Op::Listen(1)).unwrap();
                 let mut waiters = Vec::new();
-                for _ in 0..owner.socket_limit() {
+                for _ in 0..owner.request_limit() {
                     let (reply, rx) = mpsc::sync_channel(1);
                     let mut request = Request {
                         id: listener,
@@ -30,7 +30,7 @@ fn close_full_listener(
                     owner.pending.push_back(request);
                     waiters.push(rx);
                 }
-                assert_eq!(owner.pending.len(), owner.socket_limit());
+                assert_eq!(owner.pending.len(), owner.request_limit());
                 initialized.send((listener, waiters)).unwrap();
                 Ok(owner)
             },
@@ -113,14 +113,14 @@ fn teardown_and_ordinary_admission_have_independent_bounds() {
         closing: None,
     };
     for op in [Op::Accept(0), Op::Close] {
-        for _ in 0..owner.socket_limit() {
+        for _ in 0..owner.request_limit() {
             let r = request(op.clone());
             assert!(!owner.admission_full(&r));
             owner.pending.push_back(r);
         }
         assert!(owner.admission_full(&request(op)));
     }
-    assert_eq!(owner.pending.len(), 2 * owner.socket_limit());
+    assert_eq!(owner.pending.len(), 2 * owner.request_limit());
     assert!(owner.admission_full(&request(Op::Accept(0))));
     assert!(owner.admission_full(&request(Op::Close)));
 }

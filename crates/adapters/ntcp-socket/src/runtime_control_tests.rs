@@ -125,7 +125,7 @@ fn runtime_with(
             if held.is_some() {
                 owner.service_egress()?;
                 let (reply, _) = std::sync::mpsc::sync_channel(1);
-                for _ in 0..2 * owner.socket_limit() {
+                for _ in 0..2 * owner.request_limit() {
                     owner.pending.push_back(Request {
                         id: socket,
                         op: Op::Read(16),

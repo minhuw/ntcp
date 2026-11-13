@@ -633,8 +633,8 @@ fn layering_order_defaults_and_adapter_constraints() {
         |c| c.tcp.connection.timebase.units_per_second = 1_000_000_000,
         |c| c.tcp.connection.send_ip_payload_limit = 65516,
         |c| c.tcp.ipv4_options_enabled = true,
-        |c| c.tcp.max_connections = 513,
-        |c| c.tcp.max_listeners = 513,
+        |c| c.tcp.max_connections = 0,
+        |c| c.tcp.max_listeners = 0,
         |c| c.tcp.preallocate_connections = 513,
         |c| {
             c.tcp.preallocate_connections = 1;
@@ -839,6 +839,26 @@ fn client_tfo_permission_configuration_is_strict_and_defaults_to_allowed() {
             SocketConfig::parse(&format!("{BASE}socket.fast_open_client_enabled={value}\n"))
                 .is_err()
         );
+    }
+}
+
+#[test]
+fn endpoint_connections_and_listeners_are_configured_without_a_runtime_cap() {
+    let changed = SocketConfig::parse(&format!(
+        "{BASE}tcp.max_connections=20000\ntcp.max_listeners=1024\n"
+    ))
+    .unwrap();
+    assert_eq!(changed.tcp.max_connections, 20000);
+    assert_eq!(changed.tcp.max_listeners, 1024);
+    assert!(changed.validate().is_ok());
+    for key in ["tcp.max_connections", "tcp.max_listeners"] {
+        for value in ["0", "-1", "+5", "many"] {
+            let config = SocketConfig::parse(&format!("{BASE}{key}={value}\n"));
+            assert!(
+                config.is_err() || config.unwrap().validate().is_err(),
+                "{key}={value}"
+            );
+        }
     }
 }
 

@@ -220,34 +220,34 @@ int main(int argc, char **argv) {
     exchange(target);
 
     if (managed) {
-        int aliases[512], count = 0;
-        while (count < 512) {
-            int next = dup(fd);
-            if (next < 0) { assert(errno == EMFILE); break; }
-            aliases[count++] = next;
+        // More aliases than the former 512-slot registry held: only the
+        // descriptor limit ends them, with EMFILE as Linux's alloc_fd.
+        enum { ALIASES = 600 };
+        static int aliases[ALIASES];
+        int count = 0;
+        for (; count < ALIASES; ++count) {
+            aliases[count] = dup(fd);
+            assert(aliases[count] >= 0);
         }
-        assert(count == 510); // fd + target occupy two tracked slots.
         int probe = fcntl(native, F_DUPFD_CLOEXEC, 0);
         assert(probe >= 0 && close(probe) == 0);
+        struct rlimit full = saved;
+        full.rlim_cur = (rlim_t)probe; // No free number below the limit.
+        assert(setrlimit(RLIMIT_NOFILE, &full) == 0);
         for (int i = 0; i < 16; ++i) {
             assert(dup(fd) == -1 && errno == EMFILE);
             assert(socket(AF_INET, SOCK_STREAM, 0) == -1 && errno == EMFILE);
         }
+        assert(setrlimit(RLIMIT_NOFILE, &saved) == 0);
         int after = fcntl(native, F_DUPFD_CLOEXEC, 0);
         assert(after == probe && close(after) == 0); // No retained-token fd leak.
         assert(fcntl(fd, F_DUPFD, -1) == -1 && errno == EINVAL);
         assert(fcntl(fd, F_DUPFD, 0x7fffffff) == -1 && errno == EINVAL);
         assert(dup2(fd, -1) == -1 && errno == EBADF);
         assert(dup3(fd, target, O_NONBLOCK) == -1 && errno == EINVAL);
-        assert(dup2(fd, native) == -1 && errno == EMFILE);
-        assert(write(native, &value, sizeof(value)) == sizeof(value));
-        assert(read(native, &value, sizeof(value)) == sizeof(value));
-        // Replacement at capacity needs no extra slot and must be atomic.
+        // Replacement of a managed alias is atomic.
         assert(dup2(fd, target) == target);
         assert(dup2(-1, target) == -1 && errno == EBADF);
-        assert(close(aliases[--count]) == 0);
-        int next = dup(fd);
-        assert(next >= 0 && close(next) == 0);
         while (count) assert(close(aliases[--count]) == 0);
     }
     assert(close(target) == 0);

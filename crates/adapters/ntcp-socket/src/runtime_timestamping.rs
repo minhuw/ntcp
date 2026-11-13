@@ -413,7 +413,7 @@ impl Owner {
         if (phases != 0
             && (self.timestamp_cookie == u64::MAX || s.timestamps.pending.len() >= PHASES))
             || (phases != 0 || s.timestamps.reserved() != 0) && total > PHASES
-            || new_zc != 0 && total > self.socket_limit()
+            || new_zc != 0 && total > self.request_limit()
             || phases != 0
                 && s.timestamp_charge() + phases * RECORD + pending_bytes + queue_bytes
                     > s.receive_capacity

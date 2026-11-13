@@ -147,6 +147,9 @@ impl IoConfig {
     }
 }
 
+// The endpoint's connections, listeners and control packets unless
+// configured (`tcp.max_connections`, `tcp.max_listeners`).
+pub(crate) const DEFAULT_CONNECTIONS: usize = 512;
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid socket configuration")
 }
@@ -155,9 +158,9 @@ impl SocketConfig {
     pub fn new(interface: impl Into<String>, address: impl Into<IpAddr>) -> Self {
         let address = address.into();
         let mut tcp = ntcp::EndpointConfig {
-            max_connections: crate::runtime::LIMIT,
-            max_listeners: crate::runtime::LIMIT,
-            max_control_packets: crate::runtime::LIMIT,
+            max_connections: DEFAULT_CONNECTIONS,
+            max_listeners: DEFAULT_CONNECTIONS,
+            max_control_packets: DEFAULT_CONNECTIONS,
             max_buffer_bytes: 128 * 1024 * 1024,
             ..ntcp::EndpointConfig::default()
         };
@@ -392,8 +395,6 @@ impl SocketConfig {
         if self.tcp.ipv4_options_enabled // Native TCP neither sends IPv4 options nor admits source routes.
             || c.timebase.units_per_second != 1_000_000
             || c.send_ip_payload_limit > 65515
-            || self.tcp.max_connections > crate::runtime::LIMIT
-            || self.tcp.max_listeners > crate::runtime::LIMIT
             || c.keepalive.is_some_and(|k| {
                 k.send_garbage || k.idle_us % 1_000_000 != 0
                     || k.interval_us % 1_000_000 != 0
@@ -651,6 +652,10 @@ impl SocketConfig {
                         value.parse().map_err(|_| invalid())?,
                     ));
                 }
+                // The endpoint's connections and listeners, which bound
+                // the runtime's (`lib.rs`, Limits).
+                "tcp.max_connections" => config.tcp.max_connections = number(value)?,
+                "tcp.max_listeners" => config.tcp.max_listeners = number(value)?,
                 "tcp.advertised_mss" => config.tcp.connection.advertised_mss = Some(number(value)?),
                 "tcp.pacing" => {
                     pacing_enabled = match value {

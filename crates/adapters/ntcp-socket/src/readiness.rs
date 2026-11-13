@@ -1,7 +1,11 @@
 use crate::*;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
-const LIMIT: usize = 4096;
+// Events one epoll_wait returns at most, whatever its maxevents: the rest
+// stay on its ready list for the next call.
+const EVENTS: usize = 4096;
+// Pollfds inspected per chunk on the stack before any allocation.
+const CHUNK: usize = 512;
 #[derive(Clone, Copy)]
 struct Registration {
     id: u64,
@@ -73,7 +77,8 @@ impl Epoll {
         if self.ready.len() > 2 * self.regs.len() + 64 {
             let regs = &self.regs;
             self.ready.retain(|&(key, generation)| {
-                regs.get(&key).is_some_and(|r| r.queued && r.generation == generation)
+                regs.get(&key)
+                    .is_some_and(|r| r.queued && r.generation == generation)
             });
         }
     }
@@ -142,9 +147,6 @@ impl Registry {
         let ep = self.epolls.get_mut(&epfd).expect("tracked epoll");
         if ep.regs.contains_key(&key) {
             return Err(EEXIST);
-        }
-        if ep.regs.len() == LIMIT {
-            return Err(ENOSPC);
         }
         ep.regs.insert(key, r);
         self.watched.insert((key.1, epfd, key.0));
@@ -340,10 +342,7 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
         if map.epolls.get(&epfd).is_some_and(|ep| !ep.matches(epfd)) {
             map.remove(epfd);
         }
-        if !map.epolls.contains_key(&epfd) {
-            if map.epolls.len() == runtime::LIMIT {
-                return Err(ENOSPC);
-            }
+        if let std::collections::btree_map::Entry::Vacant(vacant) = map.epolls.entry(epfd) {
             // A private, empty eventfd validates epfd without leaking a ready
             // wake event to concurrent native epoll_wait callers.
             let probe = raw(unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) })? as i32;
@@ -373,20 +372,17 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
             unsafe {
                 syscall(SYS_fstat, epfd, &mut st);
             }
-            map.epolls.insert(
-                epfd,
-                Epoll {
-                    slot: reserve_fd(&EPOLL_FDS, epfd)?,
-                    retained,
-                    dev: st.st_dev,
-                    ino: st.st_ino,
-                    regs: BTreeMap::new(),
-                    generation: 0,
-                    ready: VecDeque::new(),
-                    changes: 0,
-                    native_first: false,
-                },
-            );
+            vacant.insert(Epoll {
+                slot: reserve_fd(&EPOLL_FDS, epfd)?,
+                retained,
+                dev: st.st_dev,
+                ino: st.st_ino,
+                regs: BTreeMap::new(),
+                generation: 0,
+                ready: VecDeque::new(),
+                changes: 0,
+                native_first: false,
+            });
         }
         let ep = map.epolls.get_mut(&epfd).unwrap();
         ep.generation = ep.generation.wrapping_add(1);
@@ -456,7 +452,7 @@ unsafe fn epwait(
     let deadline = deadline(timeout);
     // ponytail: bounded 10ms readiness polling; use private wake epoll if latency matters.
     // Bounded result storage independent of the caller's maxevents.
-    let cap = (max as usize).min(LIMIT);
+    let cap = (max as usize).min(EVENTS);
     loop {
         // The sockets of the ready queue's registrations: only those, and
         // those whose readiness changed since this instance last looked,
@@ -552,7 +548,12 @@ unsafe fn epwait(
                 plan.push(Action::Drop); // Last alias closed during the query.
                 continue;
             }
-            let value = bits as u32 | if tokens.buffered(r.id) != 0 { EPOLLIN as u32 } else { 0 };
+            let value = bits as u32
+                | if tokens.buffered(r.id) != 0 {
+                    EPOLLIN as u32
+                } else {
+                    0
+                };
             let ready = value & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
             // Like poll, report all currently ready requested bits once an
             // event triggers delivery. Only consume classes actually eligible
@@ -582,8 +583,21 @@ unsafe fn epwait(
         for (&(key, generation), action) in entries.iter().zip(plan) {
             match action {
                 Action::Stale => (),
-                Action::Drop => map.epolls.get_mut(&epfd).unwrap().regs.get_mut(&key).unwrap().queued = false,
-                Action::Keep => map.epolls.get_mut(&epfd).unwrap().ready.push_back((key, generation)),
+                Action::Drop => {
+                    map.epolls
+                        .get_mut(&epfd)
+                        .unwrap()
+                        .regs
+                        .get_mut(&key)
+                        .unwrap()
+                        .queued = false
+                }
+                Action::Keep => map
+                    .epolls
+                    .get_mut(&epfd)
+                    .unwrap()
+                    .ready
+                    .push_back((key, generation)),
                 Action::Deliver(observed, claim) => {
                     if map.epolls[&epfd].regs[&key].events & EPOLLEXCLUSIVE as u32 != 0 {
                         claim_exclusive(&mut map, epfd, key, observed, claim);
@@ -674,10 +688,9 @@ unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset
     if !any_sockets() || !unsafe { large_poll_virtual(p, n)? } {
         return raw(unsafe { syscall(SYS_poll, p, n, timeout) });
     }
-    if n > LIMIT as nfds_t {
-        return Err(EINVAL);
-    }
-    let mut original = load_array(p, poll_count(n)?, LIMIT)?;
+    // poll_count bounds nfds by RLIMIT_NOFILE, as Linux's do_sys_poll.
+    let count = poll_count(n)?;
+    let mut original = load_array(p, count, count)?;
     let mut owned_fds = Vec::new();
     for (i, fd) in original.iter().enumerate() {
         if let Some(id) = owned(fd.fd)? {
@@ -955,7 +968,7 @@ unsafe fn large_poll_virtual(p: *const pollfd, n: nfds_t) -> Result<bool> {
         fd: -1,
         events: 0,
         revents: 0,
-    }; runtime::LIMIT];
+    }; CHUNK];
     for offset in (0..n).step_by(chunk.len()) {
         let len = (n - offset).min(chunk.len());
         memory(

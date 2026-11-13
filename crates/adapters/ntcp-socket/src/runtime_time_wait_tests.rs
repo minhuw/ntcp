@@ -1,5 +1,7 @@
 use super::*;
 
+// The endpoint's connections: the bound of the options the owner keeps.
+const CONNECTIONS: usize = 512;
 fn request(ip: ntcp::IpMetadata, port: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0; 128];
     let n = ntcp::wire::encode(
@@ -44,7 +46,7 @@ fn time_wait_data_syn_reset_keeps_old_metadata_at_capacity() {
 
 fn time_wait_data_syn_metadata(reset_candidate: bool) {
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 3)).tcp;
-    config.max_connections = LIMIT + 2;
+    config.max_connections = CONNECTIONS;
     config.connection.send_capacity = 64;
     config.connection.receive_capacity = 64;
     config.connection.mss = 64;
@@ -55,7 +57,7 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     let listener = new(&mut b, SOCK_NONBLOCK);
     b.execute(listener, Op::Bind("10.73.0.3:8080".parse().unwrap()))
         .unwrap();
-    b.execute(listener, Op::Listen(LIMIT as i32)).unwrap();
+    b.execute(listener, Op::Listen(CONNECTIONS as i32)).unwrap();
     let ip = ntcp::IpMetadata {
         source: "10.73.0.2".parse().unwrap(),
         destination: b.local,
@@ -99,18 +101,18 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     let final_ack = output(&mut b, 3_000);
     assert_eq!(final_ack.acknowledgment, 102);
     assert_eq!(b.endpoint.state(old), Ok(State::TimeWait));
-    // Fill the actual production metadata bound using real passive children.
-    // Core has spare slots; no test-only limit or fabricated metadata entries.
-    for index in 0..LIMIT - 1 {
+    // Fill the actual production metadata bound, the endpoint's connections,
+    // using real passive children; no fabricated metadata entries.
+    for index in 0..CONNECTIONS - 1 {
         let syn = request(ip, 41000 + index as u16, 1000, 0, ntcp::wire::SYN, &[]);
         b.input_stamped(3_000, ip, 0, &syn, Default::default())
             .unwrap();
     }
-    for _ in 0..LIMIT - 1 {
+    for _ in 0..CONNECTIONS - 1 {
         output(&mut b, 3_000);
     }
-    assert_eq!(b.connection_options.len(), b.socket_limit());
-    assert_eq!(b.child_timeouts.len(), LIMIT - 1);
+    assert_eq!(b.connection_options.len(), b.options_limit());
+    assert_eq!(b.child_timeouts.len(), CONNECTIONS - 1);
     let snapshots = (
         b.connection_options.clone(),
         b.child_timeouts.clone(),
@@ -197,13 +199,13 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
         b.child_timeouts.clone(),
         b.child_timestamps.clone(),
     );
-    assert_eq!(b.connection_options.len(), b.socket_limit());
+    assert_eq!(b.connection_options.len(), b.options_limit());
     assert_eq!(
         b.connection_options
             .iter()
             .filter(|p| b.endpoint.connection_exists(p.0))
             .count(),
-        b.socket_limit() - 1
+        b.options_limit() - 1
     );
     b.test_now = Some(6_000);
     b.execute(listener, Op::Set(IPPROTO_IP, IP_TOS, 44))
@@ -226,7 +228,7 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
     assert_eq!(b.endpoint.state(child), Ok(State::SynReceived));
     // The SYN ended the old socket's TIME-WAIT, as in Linux.
     assert_eq!(b.endpoint.state(old), Ok(State::Closed));
-    assert_eq!(b.connection_options.len(), LIMIT);
+    assert_eq!(b.connection_options.len(), CONNECTIONS);
     let snapshot = b.connection_options.iter().find(|p| p.0 == child).unwrap();
     assert_eq!((snapshot.1, snapshot.4), (44, tuple.local));
     let snapshot = b.child_timeouts.iter().find(|p| p.0 == child).unwrap();
@@ -295,9 +297,9 @@ fn time_wait_data_syn_metadata(reset_candidate: bool) {
         for (index, record) in b.child_timestamps.iter().enumerate() {
             assert!(!b.child_timestamps[..index].iter().any(|p| p.0 == record.0));
         }
-        assert!(b.connection_options.len() <= b.socket_limit());
-        assert!(b.child_timeouts.len() <= b.socket_limit());
-        assert!(b.child_timestamps.len() <= b.socket_limit());
+        assert!(b.connection_options.len() <= b.options_limit());
+        assert!(b.child_timeouts.len() <= b.options_limit());
+        assert!(b.child_timestamps.len() <= b.options_limit());
         // No TIME-WAIT is left to ACK a retransmitted peer FIN: the
         // listener resets it.
         b.input_stamped(8_000, ip, 0, &close, Default::default())
