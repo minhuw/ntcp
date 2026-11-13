@@ -1128,3 +1128,84 @@ fn failed_resolution_discards_held_icmp_output() {
     // No pending slot stays behind: both can hold output again.
     assert!(a.0.neighbor_wake().is_none());
 }
+
+// Neighbor Discovery's half of `NeighborDst`: a connection keeps its next
+// hop's link-layer address while the entry is REACHABLE (ND keeps no
+// permanent entries); an advertisement changing it, ReachableTime expiring
+// and the link's removal each end that, and the next output resolves
+// again.
+#[test]
+fn a_connection_keeps_a_reachable_neighbor_until_its_entry_changes() {
+    let (mut a, _id, mut held, target) = resolving();
+    let link = a.2.link();
+    let own_address: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let all_nodes = ntcp_ethernet::IPV6_ALL_NODES;
+    let na = |solicited, target_link_layer| NeighborAdvertisement {
+        router: false,
+        solicited,
+        override_: true,
+        target,
+        target_link_layer: Some(target_link_layer),
+    };
+    let frame = na_frame(target, own_address, na(true, PEER));
+    assert_eq!(input(&mut a.0, link, 4, &frame), Ok(true));
+    assert_eq!(emit_resolved(&mut a, 5, &mut held).unwrap().0, PEER);
+    // The SYN's retransmission takes the address the SYN found.
+    let now = 2 * SECOND;
+    a.1.on_timeout(now, 32).unwrap();
+    let (attempt, packet, _) = selected(&mut a.1, now).unwrap();
+    let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+    let owner = Owner::Tcp(packet.connection.unwrap());
+    assert_eq!(a.0.neighbor_cached(context, owner), Some(PEER));
+    assert_eq!(
+        a.0.resolve_neighbor(context, owner, now),
+        Ok(NeighborHop::Resolved(PEER))
+    );
+    // An overriding advertisement of another address: STALE, resolved
+    // again (DELAY).
+    let frame = na_frame(target, all_nodes, na(false, OTHER));
+    assert_eq!(input(&mut a.0, link, now, &frame), Ok(true));
+    assert_eq!(a.0.neighbor_cached(context, owner), None);
+    assert_eq!(
+        a.0.resolve_neighbor(context, owner, now),
+        Ok(NeighborHop::Resolved(OTHER))
+    );
+    assert_eq!(
+        a.0.neighbor(link, target).map(|n| n.0),
+        Some(NeighborState::Delay)
+    );
+    assert_eq!(a.0.neighbor_cached(context, owner), None);
+    // Confirmed: REACHABLE and kept; then ReachableTime passes.
+    let frame = na_frame(target, own_address, na(true, OTHER));
+    assert_eq!(input(&mut a.0, link, now, &frame), Ok(true));
+    assert_eq!(
+        a.0.resolve_neighbor(context, owner, now),
+        Ok(NeighborHop::Resolved(OTHER))
+    );
+    assert_eq!(a.0.neighbor_cached(context, owner), Some(OTHER));
+    let expiry = a.0.next_neighbor_deadline().unwrap();
+    a.0.service_neighbors(expiry);
+    assert_eq!(
+        a.0.neighbor(link, target).map(|n| n.0),
+        Some(NeighborState::Stale)
+    );
+    assert_eq!(a.0.neighbor_cached(context, owner), None);
+    assert_eq!(
+        a.0.resolve_neighbor(context, owner, expiry),
+        Ok(NeighborHop::Resolved(OTHER))
+    );
+    assert_eq!(
+        a.0.neighbor(link, target).map(|n| n.0),
+        Some(NeighborState::Delay)
+    );
+    // Confirmed again, then the link goes.
+    assert_eq!(input(&mut a.0, link, expiry, &frame), Ok(true));
+    assert_eq!(
+        a.0.resolve_neighbor(context, owner, expiry),
+        Ok(NeighborHop::Resolved(OTHER))
+    );
+    assert_eq!(a.0.neighbor_cached(context, owner), Some(OTHER));
+    a.0.remove_link(a.2).unwrap();
+    assert_eq!(a.0.neighbor_cached(context, owner), None);
+    assert!(a.0.resolve_neighbor(context, owner, expiry).is_err());
+}

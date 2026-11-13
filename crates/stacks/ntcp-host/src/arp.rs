@@ -108,6 +108,20 @@ pub trait Ipv4NeighborTable: Any + Send {
     fn entry(&self, _link: LinkId, _address: Ipv4Addr) -> Option<(ArpState, Option<[u8; 6]>)> {
         None
     }
+    /// The neighbour-state generation (`ArpCache::neighbor_generation`):
+    /// it changes whenever a REACHABLE or PERMANENT entry leaves that
+    /// state, changes its MAC or is removed. While it is unchanged, a MAC
+    /// `connected` returned is what `resolve` returns, and the Host sends a
+    /// connection's output to it without calling `resolve`. None (the
+    /// default): every output resolves.
+    fn generation(&self) -> Option<u64> {
+        None
+    }
+    /// The MAC `resolve` would return for `address` on `link` while its
+    /// entry is REACHABLE or PERMANENT, changing nothing; None otherwise.
+    fn connected(&self, _link: LinkId, _address: Ipv4Addr) -> Option<[u8; 6]> {
+        None
+    }
 }
 
 // The Host's own cache.
@@ -318,5 +332,11 @@ impl Ipv4NeighborTable for Ipv4Neighbors {
     }
     fn entry(&self, link: LinkId, address: Ipv4Addr) -> Option<(ArpState, Option<[u8; 6]>)> {
         self.cache.entry(link, address)
+    }
+    fn generation(&self) -> Option<u64> {
+        Some(self.cache.neighbor_generation())
+    }
+    fn connected(&self, link: LinkId, address: Ipv4Addr) -> Option<[u8; 6]> {
+        self.cache.connected(link, address)
     }
 }

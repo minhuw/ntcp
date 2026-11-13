@@ -501,3 +501,113 @@ fn an_installed_table_serves_the_ipv4_neighbor_calls() {
     // A Host without one has no table to reach.
     assert!(side().0.ipv4_neighbor_table_mut().is_none());
 }
+
+fn hop(
+    side: &mut Side,
+    context: EgressContext,
+    owner: Owner,
+    now: u64,
+) -> Result<NeighborHop, Error> {
+    side.0.resolve_neighbor(context, owner, now)
+}
+fn reply(sender_mac: [u8; 6]) -> [u8; 28] {
+    body(Arp {
+        operation: Operation::Reply,
+        sender_mac,
+        sender_ip: GATEWAY,
+        target_mac: OWN,
+        target_ip: LOCAL,
+    })
+}
+
+// A connection keeps its next hop's MAC while the ARP entry is REACHABLE or
+// PERMANENT and sends to it without resolving, as Linux's neigh_output
+// sends to a NUD_CONNECTED entry (`NeighborDst`); each change of the entry
+// (a new MAC, REACHABLE expiring to STALE, a permanent mapping configured
+// or replaced, the link removed) ends that, and the next output resolves
+// again: a STALE entry's first use starts DELAY, as before.
+#[test]
+fn a_connection_keeps_a_connected_next_hop_until_its_entry_changes() {
+    const NEW: [u8; 6] = [2, 0, 0, 0, 0, 0xfd];
+    const PERMANENT: [u8; 6] = [2, 0, 0, 0, 0, 0xfc];
+    let mut side = side();
+    let link = side.2.link();
+    connect(&mut side, "198.51.100.7:80");
+    let (attempt, packet, _) = selected(&mut side.1, 0).unwrap();
+    let context = side.0.egress_context(&mut side.1, attempt).unwrap();
+    let owner = Owner::Tcp(packet.connection.unwrap());
+    assert_eq!(hop(&mut side, context, owner, 0), Ok(NeighborHop::Held));
+    let (_, _, ticket) = output(&mut side.0, link, 0).unwrap();
+    side.0
+        .complete_neighbor_output(ticket, BackendOutcome::Submitted, 0)
+        .unwrap();
+    side.0
+        .receive_arp(side.2, SECOND / 2, &reply(GATEWAY_MAC))
+        .unwrap();
+    assert!(side.0.neighbor_wake().is_some());
+    assert_eq!(side.0.neighbor_cached(context, owner), None);
+    // REACHABLE: found once, then kept.
+    for now in [SECOND / 2, SECOND] {
+        assert_eq!(
+            hop(&mut side, context, owner, now),
+            Ok(NeighborHop::Resolved(GATEWAY_MAC))
+        );
+        assert_eq!(side.0.neighbor_cached(context, owner), Some(GATEWAY_MAC));
+    }
+    // The gateway's MAC changes: STALE, resolved again (DELAY), not kept.
+    side.0.receive_arp(side.2, 2 * SECOND, &reply(NEW)).unwrap();
+    assert_eq!(side.0.neighbor_cached(context, owner), None);
+    assert_eq!(
+        hop(&mut side, context, owner, 2 * SECOND),
+        Ok(NeighborHop::Resolved(NEW))
+    );
+    assert_eq!(
+        side.0.ipv4_neighbor(link, GATEWAY),
+        Some((ArpState::Delay, Some(NEW)))
+    );
+    assert_eq!(side.0.neighbor_cached(context, owner), None);
+    // Its probe is answered: REACHABLE, kept again.
+    side.0.service_neighbors(7 * SECOND);
+    let (destination, _, ticket) = output(&mut side.0, link, 7 * SECOND).unwrap();
+    assert_eq!(destination, NEW);
+    side.0
+        .complete_neighbor_output(ticket, BackendOutcome::Submitted, 7 * SECOND)
+        .unwrap();
+    side.0.receive_arp(side.2, 7 * SECOND, &reply(NEW)).unwrap();
+    assert_eq!(
+        side.0.ipv4_neighbor(link, GATEWAY),
+        Some((ArpState::Reachable, Some(NEW)))
+    );
+    assert_eq!(
+        hop(&mut side, context, owner, 7 * SECOND),
+        Ok(NeighborHop::Resolved(NEW))
+    );
+    assert_eq!(side.0.neighbor_cached(context, owner), Some(NEW));
+    // ReachableTime passes: STALE, and the next use starts DELAY.
+    let expiry = side.0.next_neighbor_deadline().unwrap();
+    side.0.service_neighbors(expiry);
+    assert_eq!(side.0.neighbor_cached(context, owner), None);
+    assert_eq!(
+        hop(&mut side, context, owner, expiry),
+        Ok(NeighborHop::Resolved(NEW))
+    );
+    assert_eq!(
+        side.0.ipv4_neighbor(link, GATEWAY),
+        Some((ArpState::Delay, Some(NEW)))
+    );
+    // A permanent mapping replaces it and is kept; replacing that ends it.
+    for mac in [PERMANENT, GATEWAY_MAC] {
+        side.0
+            .add_static_neighbor(link, IpAddr::V4(GATEWAY), mac, expiry)
+            .unwrap();
+        assert_eq!(side.0.neighbor_cached(context, owner), None);
+        assert_eq!(
+            hop(&mut side, context, owner, expiry),
+            Ok(NeighborHop::Resolved(mac))
+        );
+        assert_eq!(side.0.neighbor_cached(context, owner), Some(mac));
+    }
+    side.0.remove_link(side.2).unwrap();
+    assert_eq!(side.0.neighbor_cached(context, owner), None);
+    assert!(hop(&mut side, context, owner, expiry).is_err());
+}

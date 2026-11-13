@@ -597,6 +597,9 @@ struct Binding {
     ports: (u16, u16),
     // The egress decision `refresh` last checked in full for `prepared`.
     dst: Option<Dst>,
+    // The next hop's link-layer address `resolve_neighbor` last found
+    // connected.
+    neighbor: Option<NeighborDst>,
 }
 impl Binding {
     fn rebind(&mut self, prepared: PreparedPath, now: Instant) {
@@ -605,7 +608,25 @@ impl Binding {
         }
         self.prepared = prepared;
         self.dst = None;
+        self.neighbor = None;
     }
+}
+// A connection's resolved next hop, as Linux's neigh_output sends to a
+// NUD_CONNECTED entry through its cached header (neigh_hh_output) with no
+// lookup and no write to the entry: the link-layer address of the next
+// hop of the path with `stamp` on the port in slot `port`, which its
+// neighbour entry held while REACHABLE or PERMANENT. The neighbour-state
+// generation of the next hop's family (ARP or ND) moves whenever such an
+// entry leaves that state, changes its address or is removed, the path
+// stamp whenever the path's next hop or a Redirect's router target can
+// change, and a port slot names its link while the port is registered.
+// Debug builds compare it with what resolution returns on every use.
+#[derive(Clone, Copy)]
+struct NeighborDst {
+    stamp: path::ChangeStamp,
+    port: usize,
+    generation: u64,
+    mac: [u8; 6],
 }
 // A connection's checked egress decision, as Linux keeps a socket's route
 // in sk_dst_cache and revalidates it on each transmit only by its cookie
@@ -3605,6 +3626,7 @@ impl PathProvider for Host {
             ports,
             prepared,
             dst: None,
+            neighbor: None,
             registration: plan.map(|plan| Registration {
                 plan,
                 authorized: snapshot.key(),

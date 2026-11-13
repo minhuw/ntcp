@@ -246,6 +246,10 @@ pub struct ArpCache<L, T> {
     // Advanced whenever a mapping `resolve` returned may change or stop
     // being returned (`mapping_epoch`).
     epoch: u64,
+    // Advanced whenever a REACHABLE or PERMANENT entry leaves that state,
+    // changes its MAC or is removed, and with `epoch`
+    // (`neighbor_generation`).
+    generation: u64,
     counters: ArpCounters,
     interfaces: Vec<Option<Interface<L>>>,
     entries: Vec<Option<Entry<L>>>,
@@ -318,6 +322,14 @@ fn unresolvable(address: Ipv4Addr) -> bool {
     address.is_unspecified() || address.is_broadcast() || address.is_multicast()
 }
 
+// The MAC of a REACHABLE or PERMANENT entry (Linux's NUD_CONNECTED).
+fn connected<L>(entry: &Option<Entry<L>>) -> Option<[u8; 6]> {
+    entry
+        .as_ref()
+        .filter(|e| matches!(e.state, ArpState::Reachable | ArpState::Permanent))
+        .and_then(|e| e.mac)
+}
+
 // A broadcast or multicast Ethernet address (the group bit) names no
 // single station.
 fn group_mac(mac: [u8; 6]) -> bool {
@@ -338,6 +350,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
             delay_first_probe: units(timers.delay_first_probe_ms),
             next_id: 0,
             epoch: 0,
+            generation: 0,
             counters: ArpCounters::default(),
             interfaces: table(limits.links, None)?,
             entries: table(limits.entries, None)?,
@@ -381,6 +394,45 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     }
     fn remapped(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The neighbour-state generation: a counter that changes whenever an
+    /// entry that is REACHABLE or PERMANENT (Linux's NUD_CONNECTED) leaves
+    /// that state, changes its MAC or is removed, and whenever
+    /// `mapping_epoch` changes. A mapping `connected` returned stays what
+    /// `resolve` returns while it is unchanged, so an embedding may send to
+    /// it without resolving, as Linux's neigh_output sends to a connected
+    /// entry by neigh_hh_output without touching it. Such sends leave the
+    /// entry's use time alone, which only orders STALE entries for reuse.
+    pub fn neighbor_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The MAC `resolve` would return for `address` on `link` while its
+    /// entry is REACHABLE or PERMANENT, without changing anything; None
+    /// otherwise (`neighbor_generation`).
+    pub fn connected(&self, link: L, address: Ipv4Addr) -> Option<[u8; 6]> {
+        self.interface(link)?;
+        if unresolvable(address) || self.answered(address).is_some() {
+            return None;
+        }
+        connected(&self.entries[self.find(link, address)?])
+    }
+    // Store `entry` in `slot`, which is occupied before and after.
+    fn update(&mut self, slot: usize, entry: Entry<L>) {
+        self.changed(slot, &Some(entry));
+        self.entries[slot] = Some(entry);
+    }
+    // A write of `entry` to `slot` is about to happen: the generation moves
+    // when it ends a connected mapping.
+    fn changed(&mut self, slot: usize, entry: &Option<Entry<L>>) {
+        let old = &self.entries[slot];
+        if connected(old).is_some()
+            && (connected(entry) != connected(old) || entry.map(|e| e.id) != old.map(|e| e.id))
+        {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
     // Store `entry` in `slot`; a mapping it reclaims is gone.
     fn occupy(&mut self, slot: usize, entry: Entry<L>) {
@@ -391,6 +443,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
     }
     // The only writer of an entry slot's occupancy.
     fn set_entry(&mut self, slot: usize, entry: Option<Entry<L>>) {
+        self.changed(slot, &entry);
         self.occupied.set(slot, entry.is_some());
         self.entries[slot] = entry;
     }
@@ -724,7 +777,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
         e.deadline = self.confirmation(link, now, random)?;
         e.state = ArpState::Reachable;
         e.sent = 0;
-        self.entries[slot] = Some(e);
+        self.update(slot, e);
         Ok(true)
     }
 
@@ -756,7 +809,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                     e.deadline = now.saturating_add(self.delay_first_probe);
                 }
                 e.used_at = now;
-                self.entries[slot] = Some(e);
+                self.update(slot, e);
                 return Ok(Resolution::Ready(mac));
             }
         }
@@ -975,7 +1028,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                     e.deadline = now;
                     e.sent = 0;
                 }
-                self.entries[slot] = Some(e);
+                self.update(slot, e);
             }
         }
         let Some(kind) = target else {
@@ -1172,7 +1225,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 // Submitted or Uncertain alike: one attempt is consumed.
                 e.sent = sent + 1;
                 e.deadline = now.saturating_add(self.retrans);
-                self.entries[slot] = Some(e);
+                self.update(slot, e);
                 self.counters.requests_sent += 1;
             }
         }
@@ -1226,7 +1279,7 @@ impl<L: Copy + Eq, T: Copy + PartialEq> ArpCache<L, T> {
                 }
                 _ => continue,
             }
-            self.entries[slot] = Some(e);
+            self.update(slot, e);
         }
     }
 

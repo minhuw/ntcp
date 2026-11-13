@@ -338,7 +338,12 @@ impl Host {
     /// IPv6 next hop and by ARP for an IPv4 one (`Unsupported` on a port
     /// that does not resolve the family). Exhausted neighbor or pending
     /// storage is backpressure (`Error::Capacity`) that leaves no entry
-    /// behind.
+    /// behind. A TCP owner keeps the address it found while the entry is
+    /// REACHABLE or PERMANENT and uses it until that entry changes, without
+    /// resolving again and so without refreshing the entry's use time, as
+    /// Linux's neigh_output sends to a NUD_CONNECTED entry; an IPv4 table
+    /// installed with `set_ipv4_neighbor_table` takes part when it reports
+    /// a generation (`Ipv4NeighborTable::generation`).
     //= https://www.rfc-editor.org/rfc/rfc8201#section-3
     //= reason=No same-link bypass: PathService::select resolves an on-link route's next hop to the destination itself and keys, estimates and correlates that path exactly as a gateway path, so on-link destinations get the same shared estimate, Packet Too Big processing and PLPMTUD; the Host resolves the next hop by bounded host Neighbor Discovery (Host::resolve_neighbor holds output until an NS/NA exchange maps it), which changes no Path MTU state. Host test on_link_route_resolves_by_neighbor_discovery_and_keeps_pmtud: an on-link route is resolved by NS/NA before the SYN leaves and a downstream PTB correlated with a definitely submitted data segment lowers the path estimate to 1280 while the 1500 first-hop fact stays; core wire test ipv6_same_prefix_proxy_wire_path_does_not_bypass_downstream_ptb: 1500-to-1280 feedback, bounded repair and real receiver progress for a same-/64 peer. Namespace evidence (T19, AC-22; integration/rfc_host nd-proxy cases): the native runtime selects a destination inside its /64 through its on-link route, and a Linux router answers its Neighbor Solicitation for that destination, which lies behind it, as an NDP proxy (proxy_ndp with ip -6 neigh add proxy); no native segment precedes the solicited proxy NA and every segment carries the router's MAC with the destination's IPv6 address. After the router's downstream link falls from 1500 to 1280 its kernel-generated PTB (MTU 1280, valid checksum, Icmp6OutPktTooBigs rising by the PTBs captured) quotes a captured native packet larger than 1280, the dropped range is repaired in packets of at most 1280 octets, complete bidirectional hashed streams reach EOF with the native runtime as client and as server, the 1500-octet first-hop MTU stays, and existing and new sockets report 1280 through IPV6_MTU. The black-hole variant (the router's outgoing PTBs dropped by an owned nft rule) still delivers the stream through connection-local PLPMTUD fallback without a shared-estimate change, and the gateway variant shows the same PTB processing through an io.gateway route resolved by NS/NA.
     //# Note that Path MTU Discovery must be performed even in cases where a node "thinks" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.
@@ -348,7 +353,17 @@ impl Host {
         owner: Owner,
         now: Instant,
     ) -> Result<NeighborHop, Error> {
-        self.port(context.link)?;
+        let binding = match owner {
+            Owner::Tcp(id) => self.binding_index(id),
+            _ => None,
+        };
+        // A connection whose next hop's entry is still connected sends to
+        // the address it found.
+        if let Some(mac) = self.cached_neighbor(context, binding) {
+            return Ok(NeighborHop::Resolved(mac));
+        }
+        let stamp = context.binding.snapshot.stamp();
+        let port = self.port_slot(context.link)?;
         let ResolvedNextHop::Address(next_hop) = context.next_hop else {
             return Err(Error::Unsupported);
         };
@@ -356,9 +371,77 @@ impl Host {
             owner,
             attempt: context.attempt,
         };
-        match next_hop.address() {
+        let hop = match next_hop.address() {
             IpAddr::V6(next_hop) => self.neighbor_hop(context.link, next_hop, now, held),
             IpAddr::V4(next_hop) => self.ipv4_hop(context.link, next_hop, now, held),
+        }?;
+        // Kept only while the entry is connected: a STALE, DELAY or PROBE
+        // one is resolved on every use, which advances its state and use
+        // time as before.
+        if let (Some(index), NeighborHop::Resolved(mac)) = (binding, hop)
+            && self.connected_neighbor(context.link, next_hop.address()) == Some(mac)
+            && let Some(generation) = self.neighbor_generation(next_hop.address())
+        {
+            self.bindings[index].as_mut().unwrap().neighbor = Some(crate::NeighborDst {
+                stamp,
+                port,
+                generation,
+                mac,
+            });
+        }
+        Ok(hop)
+    }
+
+    // The link-layer address binding record `binding` keeps for the next
+    // hop of `context` (`NeighborDst`), while it holds.
+    fn cached_neighbor(&self, context: EgressContext, binding: Option<usize>) -> Option<[u8; 6]> {
+        let n = self.bindings[binding?].as_ref().unwrap().neighbor?;
+        let ResolvedNextHop::Address(next_hop) = context.next_hop else {
+            return None;
+        };
+        if n.stamp != context.binding.snapshot.stamp()
+            || !self.ports[n.port].is_some_and(|p| p.link == context.link)
+            || self.neighbor_generation(next_hop.address()) != Some(n.generation)
+        {
+            return None;
+        }
+        debug_assert_eq!(self.port_slot(context.link), Ok(n.port));
+        debug_assert_eq!(
+            self.connected_neighbor(context.link, next_hop.address()),
+            Some(n.mac)
+        );
+        Some(n.mac)
+    }
+    // Whether `resolve_neighbor` of `owner`'s `context` takes the kept
+    // address, and which.
+    #[cfg(test)]
+    pub(crate) fn neighbor_cached(&self, context: EgressContext, owner: Owner) -> Option<[u8; 6]> {
+        let Owner::Tcp(id) = owner else {
+            return None;
+        };
+        self.cached_neighbor(context, self.binding_index(id))
+    }
+
+    // The neighbour-state generation of `next_hop`'s family, None for an
+    // IPv4 table that keeps none.
+    fn neighbor_generation(&self, next_hop: IpAddr) -> Option<u64> {
+        match next_hop {
+            IpAddr::V6(_) => Some(self.neighbors.generation()),
+            IpAddr::V4(_) => self.ipv4_neighbors.table().generation(),
+        }
+    }
+    // The link-layer address resolution returns for `next_hop` on `link`
+    // while its entry is connected, read without changing it.
+    fn connected_neighbor(&self, link: LinkId, next_hop: IpAddr) -> Option<[u8; 6]> {
+        match next_hop {
+            IpAddr::V6(next_hop) => self.neighbors.connected(link, next_hop),
+            IpAddr::V4(next_hop) => {
+                let table = self.ipv4_neighbors.table();
+                table
+                    .has_link(link)
+                    .then(|| table.connected(link, next_hop))
+                    .flatten()
+            }
         }
     }
 

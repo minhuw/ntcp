@@ -1070,3 +1070,52 @@ fn ended_holds_are_visited_without_removal_and_released_by_owner() {
     assert_eq!(wakes(&mut cache), [Wake::Retry(1), Wake::Retry(2)]);
     assert_eq!(ended(&cache), []);
 }
+
+// The neighbour-state generation moves exactly when a mapping `connected`
+// returned stops being what `resolve` returns: a REACHABLE or PERMANENT
+// entry leaving that state, changing its MAC or going away, and with the
+// mapping epoch. Resolving, confirming and refreshing a REACHABLE entry,
+// and every change of an entry that is not connected, leave it alone.
+#[test]
+fn the_generation_moves_when_a_connected_mapping_ends() {
+    let mut cache = cache();
+    let start = cache.neighbor_generation();
+    assert_eq!(cache.connected(0, PEER_IP), None);
+    reachable(&mut cache, 0);
+    assert_eq!(cache.connected(0, PEER_IP), Some(PEER));
+    cache.resolve(0, PEER_IP, S, 1).unwrap();
+    assert_eq!(cache.confirm(0, PEER_IP, S, 2 * S, &mut half), Ok(true));
+    assert_eq!(cache.neighbor_generation(), start);
+    // REACHABLE to STALE.
+    service(&mut cache, 32 * S);
+    assert_eq!(cache.connected(0, PEER_IP), None);
+    let stale = cache.neighbor_generation();
+    assert_ne!(stale, start);
+    // STALE to DELAY to PROBE: not connected, nothing moves.
+    cache.resolve(0, PEER_IP, 33 * S, 1).unwrap();
+    service(&mut cache, 38 * S);
+    assert_eq!(cache.entry(0, PEER_IP).unwrap().0, ArpState::Probe);
+    assert_eq!(cache.neighbor_generation(), stale);
+    // Confirmed: REACHABLE again, which moves nothing either.
+    submit(&mut cache, 38 * S).unwrap();
+    receive(&mut cache, reply_from(PEER, PEER_IP), 38 * S);
+    assert_eq!(cache.connected(0, PEER_IP), Some(PEER));
+    assert_eq!(cache.neighbor_generation(), stale);
+    // A new MAC: STALE with it.
+    receive(&mut cache, request_from(OTHER, PEER_IP, OTHER_IP), 39 * S);
+    assert_eq!(cache.connected(0, PEER_IP), None);
+    let changed = cache.neighbor_generation();
+    assert_ne!(changed, stale);
+    // A permanent mapping is connected; its replacement and removal end it.
+    cache.add_permanent(0, PEER_IP, PEER, 40 * S).unwrap();
+    assert_eq!(cache.connected(0, PEER_IP), Some(PEER));
+    let permanent = cache.neighbor_generation();
+    assert_ne!(permanent, changed);
+    cache.add_permanent(0, PEER_IP, OTHER, 41 * S).unwrap();
+    assert_eq!(cache.connected(0, PEER_IP), Some(OTHER));
+    let replaced = cache.neighbor_generation();
+    assert_ne!(replaced, permanent);
+    assert!(cache.remove_entry(0, PEER_IP));
+    assert_eq!(cache.connected(0, PEER_IP), None);
+    assert_ne!(cache.neighbor_generation(), replaced);
+}

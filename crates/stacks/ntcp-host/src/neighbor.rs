@@ -268,6 +268,18 @@ pub(crate) struct Neighbors<T> {
     addresses: Vec<Option<Address>>,
     answers: Vec<Option<Answer>>,
     pending: Vec<Option<Pending<T>>>,
+    // Advanced whenever a REACHABLE entry leaves that state, changes its
+    // link-layer address or is removed (`generation`).
+    generation: u64,
+}
+
+// The link-layer address of a REACHABLE entry (Linux's NUD_CONNECTED; ND
+// keeps no permanent entries).
+fn connected(entry: &Option<Entry>) -> Option<[u8; 6]> {
+    entry
+        .as_ref()
+        .filter(|e| e.state == NeighborState::Reachable)
+        .and_then(|e| e.mac)
 }
 
 fn random_u32(entropy: Option<&mut Entropy>) -> Result<u32, Error> {
@@ -298,7 +310,33 @@ impl<T: Copy + PartialEq> Neighbors<T> {
             addresses: table(limits.addresses, None)?,
             answers: table(limits.answers, None)?,
             pending: table(limits.pending_packets, None)?,
+            generation: 0,
         })
+    }
+    // The neighbour-state generation (ARP's `neighbor_generation`): while
+    // it is unchanged, a link-layer address `connected` returned is what
+    // `output` returns, and the Host sends a connection's output to it
+    // without resolving, as Linux's neigh_output sends to a connected
+    // entry by neigh_hh_output.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+    // The link-layer address `output` would return for `address` on
+    // `link` while its entry is REACHABLE, changing nothing.
+    pub(crate) fn connected(&self, link: LinkId, address: Ipv6Addr) -> Option<[u8; 6]> {
+        self.port(link)?;
+        connected(&self.entries[self.find(link, address)?])
+    }
+    // Store `entry` in `slot`; the generation moves when the write ends a
+    // REACHABLE mapping.
+    fn store(&mut self, slot: usize, entry: Option<Entry>) {
+        let old = &self.entries[slot];
+        if connected(old).is_some()
+            && (connected(&entry) != connected(old) || entry.map(|e| e.id) != old.map(|e| e.id))
+        {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.entries[slot] = entry;
     }
     fn units(&self, ms: u64) -> u64 {
         ms.saturating_mul(self.units_per_second) / 1000
@@ -577,7 +615,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
                     e.state = NeighborState::Stale;
                     e.deadline = now;
                     e.sent = 0;
-                    self.entries[slot] = Some(e);
+                    self.store(slot, Some(e));
                 }
             }
             None => {
@@ -585,17 +623,20 @@ impl<T: Copy + PartialEq> Neighbors<T> {
                 // the mapping is resolved when this node first sends to it.
                 if let Some(slot) = self.vacancy() {
                     let id = self.id();
-                    self.entries[slot] = Some(Entry {
-                        id,
-                        link,
-                        address,
-                        state: NeighborState::Stale,
-                        mac: Some(mac),
-                        mapped_at: now,
-                        router: false,
-                        deadline: now,
-                        sent: 0,
-                    });
+                    self.store(
+                        slot,
+                        Some(Entry {
+                            id,
+                            link,
+                            address,
+                            state: NeighborState::Stale,
+                            mac: Some(mac),
+                            mapped_at: now,
+                            router: false,
+                            deadline: now,
+                            sent: 0,
+                        }),
+                    );
                 }
             }
         }
@@ -629,7 +670,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
         if let Some(slot) = self.find(link, address) {
             let mut e = self.entries[slot].unwrap();
             e.router = true;
-            self.entries[slot] = Some(e);
+            self.store(slot, Some(e));
         }
     }
 
@@ -714,7 +755,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
                 }
             }
         };
-        self.entries[slot] = Some(e);
+        self.store(slot, Some(e));
         if router_lost {
             events(NdEvent::RouterLost {
                 link,
@@ -765,7 +806,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
         e.deadline = self.confirmation(link, now, entropy)?;
         e.state = NeighborState::Reachable;
         e.sent = 0;
-        self.entries[slot] = Some(e);
+        self.store(slot, Some(e));
         Ok(true)
     }
 
@@ -792,7 +833,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
                 if e.state == NeighborState::Stale {
                     e.state = NeighborState::Delay;
                     e.deadline = now.saturating_add(self.units(DELAY_FIRST_PROBE_TIME_MS));
-                    self.entries[slot] = Some(e);
+                    self.store(slot, Some(e));
                 }
                 return Ok(Resolution::Ready(mac));
             }
@@ -815,17 +856,20 @@ impl<T: Copy + PartialEq> Neighbors<T> {
             None => {
                 let slot = self.vacancy().ok_or(Error::Capacity)?;
                 let id = self.id();
-                self.entries[slot] = Some(Entry {
-                    id,
-                    link,
-                    address,
-                    state: NeighborState::Incomplete,
-                    mac: None,
-                    mapped_at: now,
-                    router: false,
-                    deadline: now,
-                    sent: 0,
-                });
+                self.store(
+                    slot,
+                    Some(Entry {
+                        id,
+                        link,
+                        address,
+                        state: NeighborState::Incomplete,
+                        mac: None,
+                        mapped_at: now,
+                        router: false,
+                        deadline: now,
+                        sent: 0,
+                    }),
+                );
                 id
             }
         };
@@ -893,7 +937,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
     // Resolution failed: the entry is removed and its held packets fail.
     fn fail(&mut self, slot: usize) {
         let id = self.entries[slot].unwrap().id;
-        self.entries[slot] = None;
+        self.store(slot, None);
         for p in self.pending.iter_mut().flatten() {
             if p.entry == id {
                 p.failed = true;
@@ -1022,7 +1066,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
                 // Submitted or Uncertain alike: one attempt is consumed.
                 e.sent = sent + 1;
                 e.deadline = now.saturating_add(self.interface(e.link).map_or(0, |i| i.retrans));
-                self.entries[slot] = Some(e);
+                self.store(slot, Some(e));
             }
         }
     }
@@ -1066,7 +1110,7 @@ impl<T: Copy + PartialEq> Neighbors<T> {
                 }
                 _ => continue,
             }
-            self.entries[slot] = Some(e);
+            self.store(slot, Some(e));
         }
         for slot in 0..self.addresses.len() {
             let Some(mut a) = self.addresses[slot] else {
