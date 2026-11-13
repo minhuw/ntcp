@@ -147,11 +147,11 @@ fn defaults_follow_linux_and_stay_configurable() {
     assert_eq!(c.time_wait_us, 60_000_000);
     assert!(config.tcp.reuse_time_wait);
     // tcp_rmem = 4096 131072 33554432 in window bytes (Linux's 128 KiB of
-    // memory starts about 64 KiB of window); the send limit stays fixed.
+    // memory starts about 64 KiB of window), and tcp_wmem[2] = 4 MiB.
     let buffers = config.tcp.buffers();
     let sizes = |min, initial, max| ntcp::BufferSizes { min, initial, max };
     assert_eq!(buffers.receive, sizes(4096, 65536, 32 << 20));
-    assert_eq!(buffers.send, sizes(4096, 65536, 65536));
+    assert_eq!(buffers.send, sizes(4096, 65536, 4 << 20));
     let memory = buffers.memory;
     assert_eq!(
         (memory.low, memory.pressure, memory.high),
@@ -172,7 +172,9 @@ fn defaults_follow_linux_and_stay_configurable() {
     config.tcp.connection.prr = baseline.prr;
     config.tcp.connection.time_wait_us = baseline.time_wait_us;
     config.tcp.connection.receive_capacity_max = baseline.receive_capacity_max;
+    config.tcp.connection.send_capacity_max = baseline.send_capacity_max;
     assert_eq!(config.tcp.buffers().receive, sizes(4096, 65536, 65536));
+    assert_eq!(config.tcp.buffers().send, sizes(4096, 65536, 65536));
     config.tcp.reuse_time_wait = ntcp::EndpointConfig::default().reuse_time_wait;
     let wire = || Wire {
         incoming: Queue::default(),
@@ -386,10 +388,13 @@ fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
 // Linux's tcp_select_initial_window derives it from tcp_rmem[2], while the
 // SYN window is the 64 KiB initial size, at most 65535. A reader that keeps
 // up with a bulk sender then grows its ring at read (DRS, Linux's
-// tcp_rcv_space_adjust), and its ACKs advertise more than 64 KiB. Both
-// keep the default 256 MiB cap: `buffer_budget` leaves no room to write.
+// tcp_rcv_space_adjust), and its ACKs advertise more than 64 KiB, while the
+// sender's limit rises with its congestion window past the 64 KiB start
+// (tcp_sndbuf_expand), so it holds more than 64 KiB written and unread.
+// Both keep the default 256 MiB cap: `buffer_budget` leaves no room to
+// write.
 #[test]
-fn the_receive_buffer_starts_at_64_kib_with_window_scale_10_and_grows_at_read() {
+fn the_buffers_start_at_64_kib_with_window_scale_10_and_grow() {
     let (a, b) = (Queue::default(), Queue::default());
     let (mut client, client_wire) = side_with(1, &a, &b, |_, _| ());
     let (mut server, server_wire) = side_with(2, &b, &a, |_, _| ());
@@ -412,7 +417,7 @@ fn the_receive_buffer_starts_at_64_kib_with_window_scale_10_and_grows_at_read() 
     }
     let opened = server.counters().buffer_bytes;
     let mut out = vec![0; 1 << 16];
-    let mut read = 0;
+    let (mut read, mut written, mut deepest) = (0, 0, 0);
     let data = [5; 1 << 14];
     let mut widest = 0;
     let mut seen = server_wire.sent.borrow().len();
@@ -421,7 +426,9 @@ fn the_receive_buffer_starts_at_64_kib_with_window_scale_10_and_grows_at_read() 
             if receipt.accepted == 0 {
                 break;
             }
+            written += receipt.accepted;
         }
+        deepest = deepest.max(written - read);
         step(&mut now, &mut client, &mut server);
         while let Ok(ReadOutcome::Data { len, .. }) = server.try_read(accepted, &mut out) {
             read += len;
@@ -437,6 +444,10 @@ fn the_receive_buffer_starts_at_64_kib_with_window_scale_10_and_grows_at_read() 
     assert!(
         widest > 65536,
         "the widest advertised window was {widest} bytes"
+    );
+    assert!(
+        deepest > 65536,
+        "at most {deepest} bytes written and unread"
     );
     // The grown ring is charged, 1.375 bytes per byte.
     assert!(server.counters().buffer_bytes > opened);

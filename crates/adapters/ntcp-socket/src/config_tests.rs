@@ -864,14 +864,14 @@ fn endpoint_connections_and_listeners_are_configured_without_a_runtime_cap() {
 
 // tcp.wmem and tcp.rmem take Linux's "min initial max", tcp.mem its
 // "low pressure high" (in bytes); the endpoint reports them as it took them.
-// By default the receive size is tuned up to Linux master's tcp_rmem[2] and
-// the send limit is fixed.
+// By default both are tuned up to Linux master's tcp_wmem[2] and
+// tcp_rmem[2].
 #[test]
 fn buffer_sizes_and_memory_are_configured_as_the_sysctls() {
     let baseline = SocketConfig::parse(BASE).unwrap();
     assert_eq!(
         baseline.tcp.buffers().to_string(),
-        "wmem=4096 65536 65536 rmem=4096 65536 33554432 mem=67108864 89478485 134217728"
+        "wmem=4096 65536 4194304 rmem=4096 65536 33554432 mem=67108864 89478485 134217728"
     );
     let changed = SocketConfig::parse(&format!(
         "{BASE}tcp.wmem=4096 16384 4194304\ntcp.rmem=4096\t131072  33554432\ntcp.mem=1000 2000 3000000\n"

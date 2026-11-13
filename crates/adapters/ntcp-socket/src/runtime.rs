@@ -46,13 +46,10 @@ pub const BYTES: usize = 65536;
 pub(crate) const BUDGET: usize = 32;
 // sock_setsockopt clamps the unsigned request to net.core.rmem_max or
 // wmem_max before doubling it. Fixed project caps, not host sysctls:
-// RMEM_MAX is Linux master's default, 4 MiB (net/core/sock.c,
-// sysctl_rmem_max = 4 << 20). The send request stays at 1 MiB, below
-// master's sysctl_wmem_max of 4 << 20, while RACK's ledger is charged per
-// queued byte (68 bytes each): wmem_max's 8 MiB limit would take about
-// 570 MB of ledger, more than the default 128 MiB budget.
+// Linux master's defaults, 4 MiB each (net/core/sock.c, sysctl_rmem_max
+// and sysctl_wmem_max = 4 << 20).
 const RMEM_MAX: u32 = 4 << 20;
-const WMEM_MAX: u32 = 1 << 20;
+const WMEM_MAX: u32 = 4 << 20;
 fn socket_buffer_value(name: i32, value: i32) -> usize {
     let (cap, minimum) = if name == SO_SNDBUF {
         (WMEM_MAX, 4608)

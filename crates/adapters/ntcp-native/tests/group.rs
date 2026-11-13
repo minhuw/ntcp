@@ -95,6 +95,9 @@ fn config(address: IpAddr, ethernet: bool, side: u8) -> NetworkConfig {
     config.tcp.max_connections = 8;
     config.tcp.max_listeners = 2;
     config.tcp.connection.send_capacity = 256;
+    // A fixed send limit, whatever send_capacity a test sets: these tests
+    // fill it, where NetworkConfig::new's limit rises to 4 MiB.
+    config.tcp.connection.send_capacity_max = 0;
     config.tcp.connection.receive_capacity = 4096;
     config.tx_timestamp_phases = 4;
     config.rx_timestamp_ranges = 4;

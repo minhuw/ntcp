@@ -1120,13 +1120,13 @@ fn startup_failure_joins_before_closing_wake() {
 
 #[test]
 fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
-    for (name, minimum, max) in [(SO_SNDBUF, 4608, 2 << 20), (SO_RCVBUF, 2304, 8 << 20)] {
+    for (name, minimum) in [(SO_SNDBUF, 4608), (SO_RCVBUF, 2304)] {
         for (request, expected) in [
             (0, minimum),
             (1, minimum),
             (65536, 131072),
-            (-1, max),
-            (i32::MAX, max),
+            (-1, 8 << 20),
+            (i32::MAX, 8 << 20),
         ] {
             assert_eq!(socket_buffer_value(name, request), expected);
         }
@@ -1226,7 +1226,7 @@ fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
 // getsockopt(SO_SNDBUF/SO_RCVBUF) reports the live size, as Linux reports
 // sk_sndbuf and sk_rcvbuf: the configured initial size before a connection
 // exists, then the receive ring DRS grew while the reader kept up with a
-// bulk sender; the untuned send limit stays where it started.
+// bulk sender, and the send limit the congestion window expanded.
 #[test]
 fn socket_buffer_sizes_report_the_live_size() {
     let mut a = owner(2);
@@ -1258,8 +1258,12 @@ fn socket_buffer_sizes_report_the_live_size() {
         .value as u64;
     assert_eq!(get(&mut b, server, SO_RCVBUF), 32768);
     let mut read = 0;
+    let data = [7u8; 16384];
+    let sources = vec![(data.as_ptr() as usize, data.len())];
     for _ in 0..200 {
-        while a.execute(client, Op::Write(vec![7; 16384])).is_ok() {}
+        // The send path a blocked writer takes (EAGAIN records it, as
+        // SOCK_NOSPACE), which lets the ACKs that free room expand the limit.
+        while a.execute(client, Op::Send(sources.clone(), 0)).is_ok() {}
         pump(&mut a, &mut b);
         while let Ok(reply) = b.execute(server, Op::Read(1 << 16)) {
             read += reply.bytes.len();
@@ -1277,7 +1281,15 @@ fn socket_buffer_sizes_report_the_live_size() {
     };
     let info = b.endpoint.transport_info(cid).unwrap();
     assert_eq!(grown as usize, info.receive_capacity);
-    assert_eq!(get(&mut a, client, SO_SNDBUF), BYTES as i32);
+    let expanded = get(&mut a, client, SO_SNDBUF);
+    assert!(expanded > BYTES as i32, "SO_SNDBUF {expanded}");
+    let Handle::Connection(cid) = a.sockets[&client].handle else {
+        panic!("not a connection")
+    };
+    assert_eq!(
+        expanded as usize,
+        a.endpoint.transport_info(cid).unwrap().send_capacity
+    );
 }
 
 #[test]

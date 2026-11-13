@@ -49,6 +49,9 @@ fn network(side: u8, incoming: &Queue, outgoing: &Queue) -> Network<Wire> {
     config.tcp.max_connections = 8;
     config.tcp.max_listeners = 2;
     config.tcp.connection.send_capacity = 2048;
+    // A fixed send limit for the tests that fill it, where
+    // NetworkConfig::new's limit rises to 4 MiB.
+    config.tcp.connection.send_capacity_max = 0;
     config.tcp.connection.receive_capacity = 8192;
     let wire = Wire {
         incoming: incoming.clone(),

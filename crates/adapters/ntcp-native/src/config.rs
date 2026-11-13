@@ -96,11 +96,12 @@ impl NetworkConfig {
     /// refuses takes what the connection's storage holds and then waits for
     /// memory, as Linux's: a partial write or `Error::WouldBlock`, the
     /// connection writable again once memory comes back
-    /// (`Counters::memory_throttled_writes`). A tuned receive ring, as
-    /// `NetworkConfig::new`'s, grows at read, 1.375 bytes per byte of
-    /// window up to `receive_capacity_max`; a growth the cap or memory
-    /// pressure refuses leaves the window as it is
-    /// (`Counters::memory_refused_growths`).
+    /// (`Counters::memory_throttled_writes`). With `NetworkConfig::new`'s
+    /// tuned buffers a send limit rises with the congestion window up to
+    /// `send_capacity_max`, its ring and ledgers growing at write, and a
+    /// receive ring grows at read, 1.375 bytes per byte of window up to
+    /// `receive_capacity_max`; a growth the cap or memory pressure refuses
+    /// leaves the window as it is (`Counters::memory_refused_growths`).
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the
@@ -191,8 +192,12 @@ impl NetworkConfig {
     ///   tcp_rmem = 4096 131072 33554432 with tcp_moderate_rcvbuf (its
     ///   128 KiB of memory starts a window of about 64 KiB; here sizes are
     ///   window bytes). The 32 MiB maximum gives the SYN a window scale of
-    ///   10, as tcp_select_initial_window takes it from tcp_rmem[2]. The
-    ///   send limit stays fixed at 64 KiB.
+    ///   10, as tcp_select_initial_window takes it from tcp_rmem[2];
+    /// - send limits of 4 KiB, 64 KiB and 4 MiB: each starts at 64 KiB and
+    ///   rises with the congestion window, to twice it, up to 4 MiB, as
+    ///   Linux's tcp_wmem[2] = 4 MiB with tcp_sndbuf_expand. The 64 KiB
+    ///   start (Linux's tcp_wmem[1] is 16 KiB of memory, about 7 KiB of
+    ///   payload before expansion) keeps a 64 KiB response in one write.
     ///
     /// Each remains a field of `tcp` or `tcp.connection` to change.
     /// `tcp.buffers()` reads the buffer sizes and memory thresholds in
@@ -221,6 +226,7 @@ impl NetworkConfig {
         connection.delayed_ack_us = 200_000;
         connection.time_wait_us = 60_000_000;
         connection.receive_capacity_max = 32 << 20;
+        connection.send_capacity_max = 4 << 20;
         Self {
             local_address,
             mtu,
