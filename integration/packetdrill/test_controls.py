@@ -15,7 +15,7 @@ from expectations import PORTED_EXCLUSION, PORTED_SCRIPTS
 from run import (AUDITED_CONTROLS, CUSTOM_TFO_KEY_OPTION, CUSTOM_TFO_SCRIPTS, HERE, PIN,
                  UPSTREAM_OPTION_AUDIT, adapt_source, enabled_controls, execution_variant_flags,
                  linux_key_words, preflight, profile_metadata, runner_provenance, select_cases,
-                 variant_setup)
+                 pinned_source, variant_setup)
 
 
 DELETED = object()
@@ -256,7 +256,7 @@ class AuditedControlTable(unittest.TestCase):
 
 class AuditedControlMappings(unittest.TestCase):
     def setUp(self):
-        self.directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        self.directory = pinned_source() / PIN['tcp_tests']
         if not self.directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         self.manifest = json.loads((HERE / 'adaptations.json').read_text())

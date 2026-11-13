@@ -4,8 +4,19 @@
   # The nixpkgs revision xylem pins, so both repositories build one identical DPDK.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/f9a75f41be3a74eab55d3a7679d34ad6cc0da977";
 
+  # The packetdrill revision integration/packetdrill/upstream.json pins; flake.lock holds
+  # its NAR hash, which run.py checks the source against.
+  inputs.packetdrill = {
+    url = "github:google/packetdrill/83f72d3f9085d0e26eb4d206fe4d7cfab5b6d872";
+    flake = false;
+  };
+
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      packetdrill,
+    }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -54,9 +65,65 @@
         pkgs.zlib
         pkgs.zstd # libelf.pc
       ];
+
+      # The pinned packetdrill runner with the audited socket-data and ICMP repairs of
+      # code-sockopt.patch, as build_runner.py builds an operator checkout: the whole patched
+      # build tree, so test_patched_runner.py can compare its sources and link its objects.
+      # packetdrill.provenance.json beside the runner names the source revision and NAR
+      # hash, the patch, nix_system.c and the executable; run.py verifies them.
+      packetdrill-runner = pkgs.stdenv.mkDerivation {
+        pname = "ntcp-packetdrill-runner";
+        version = builtins.substring 0 12 packetdrill.rev;
+        src = packetdrill;
+        patches = [ ./integration/packetdrill/code-sockopt.patch ];
+        nativeBuildInputs = [
+          pkgs.bison
+          pkgs.flex
+        ];
+        # The Makefile's flags are -g -Wall -Werror without -O, so a distribution compiler
+        # applies no _FORTIFY_SOURCE; Nix's fortify would mark asprintf warn_unused_result.
+        # Nix's glibc 2.44 <netinet/tcp.h> defines the four TCP_ACCECN_*_FAIL_* flags that
+        # packetdrill's tcp.h defines again with the same values (0x1..0x8 as BIT(0..3)):
+        # build with -g -Wall, which leaves those redefinitions warnings.
+        hardeningDisable = [
+          "fortify"
+          "fortify3"
+        ];
+        dontConfigure = true;
+        # nix_system.c replaces glibc's system(), whose /bin/sh is the host's: the shell
+        # that runs script commands and code inherits the Nix-built plugin in LD_PRELOAD.
+        buildPhase = ''
+          runHook preBuild
+          cc -g -Wall -Werror -DNTCP_SHELL='"${pkgs.bash}/bin/sh"' \
+            -c ${./integration/packetdrill/nix_system.c} -o $NIX_BUILD_TOP/nix_system.o
+          make -C gtests/net/packetdrill -j$NIX_BUILD_CORES CC=cc CFLAGS="-g -Wall" \
+            packetdrill-extra-static-libs=$NIX_BUILD_TOP/nix_system.o \
+            packetdrill-ext-libs="-lpthread -lrt -ldl -Wl,--wrap=system" packetdrill
+          runHook postBuild
+        '';
+        installPhase = ''
+          runHook preInstall
+          cp -r . $out
+          runner=$out/gtests/net/packetdrill/packetdrill
+          cat > $out/gtests/net/packetdrill/packetdrill.provenance.json <<EOF
+          {
+            "source_revision": "${packetdrill.rev}",
+            "source_nar_hash": "${packetdrill.narHash}",
+            "patch_sha256": "$(sha256sum < ${./integration/packetdrill/code-sockopt.patch} | cut -d' ' -f1)",
+            "system_sha256": "$(sha256sum < ${./integration/packetdrill/nix_system.c} | cut -d' ' -f1)",
+            "builder": "nix",
+            "executable_sha256": "$(sha256sum < $runner | cut -d' ' -f1)"
+          }
+          EOF
+          runHook postInstall
+        '';
+        # Stripping would change the executable after its hash is recorded.
+        dontStrip = true;
+        dontPatchELF = true;
+      };
     in
     {
-      packages.${system} = { inherit dpdk-mlx5; };
+      packages.${system} = { inherit dpdk-mlx5 packetdrill-runner; };
 
       # The PMDs exist in both linkages, and libdpdk.pc's static flags link every archive
       # without the C driver's implicit libatomic, as rustc's -nodefaultlibs links do.
@@ -88,6 +155,9 @@
       devShells.${system}.default = pkgs.mkShell {
         NTCP_BPF_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
         NTCP_BPF_CFLAGS = "-isystem ${pkgs.linuxHeaders}/include";
+        # integration/packetdrill/run.py's default source and runner.
+        NTCP_PACKETDRILL_SOURCE = "${packetdrill}";
+        NTCP_PACKETDRILL_RUNNER = "${packetdrill-runner}/gtests/net/packetdrill/packetdrill";
         packages = [
           pkgs.pkg-config
           pkgs.rustc

@@ -16,9 +16,27 @@
         "type": "github"
       }
     },
+    "packetdrill": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790108857,
+        "narHash": "sha256-ocDJZAgkFP23HLGqiV1hV+Z5pa+wjOVBTprvk34j36U=",
+        "owner": "google",
+        "repo": "packetdrill",
+        "rev": "83f72d3f9085d0e26eb4d206fe4d7cfab5b6d872",
+        "type": "github"
+      },
+      "original": {
+        "owner": "google",
+        "repo": "packetdrill",
+        "rev": "83f72d3f9085d0e26eb4d206fe4d7cfab5b6d872",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "packetdrill": "packetdrill"
       }
     }
   },

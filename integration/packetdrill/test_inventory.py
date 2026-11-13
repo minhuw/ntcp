@@ -3,24 +3,21 @@ import copy
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 import tempfile
 import unittest
 
 from expectations import PORTED_SCRIPTS
 from run import (AUDITED_CONTROLS, HERE, PIN, SYN_DATA_ACK_SCRIPTS, adapt_source, enabled_controls,
-                 preflight, select_cases)
+                 pinned_source, preflight, select_cases, tracked_files)
 
 
 class CompleteInventory(unittest.TestCase):
     def test_every_pinned_tcp_source_has_an_owner_and_a_safe_audit(self):
-        checkout = HERE.parent.parent / 'workbench/packetdrill-upstream'
+        checkout = pinned_source()
         if not checkout.is_dir():
             self.skipTest('pinned checkout unavailable')
         directory = checkout / PIN['tcp_tests']
-        tracked = subprocess.check_output(
-            ['git', '-C', str(checkout), 'ls-files', '-z', '--', PIN['tcp_tests']],
-            text=True).split('\0')
+        tracked = tracked_files(checkout)
         names = {str(Path(n).relative_to(PIN['tcp_tests'])) for n in tracked if n.endswith('.pkt')}
         manifest = json.loads((HERE / 'adaptations.json').read_text())
         self.assertEqual(len(names), 162)
@@ -53,7 +50,7 @@ class CompleteInventory(unittest.TestCase):
                                                enabled_controls(entry)), [])
 
     def test_syn_data_setup_cannot_rehash_an_alternate_policy_into_execution(self):
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())

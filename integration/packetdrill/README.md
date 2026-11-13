@@ -19,6 +19,30 @@ owned by `ntcp-ported` is excluded from `upstream`, including explicit `--script
 selection. [expectations.json](expectations.json) records the ported fixtures,
 source hashes, and changed expectations.
 
+## Running
+
+The Nix dev shell provides the pinned upstream source and the patched runner.
+[flake.lock](../../flake.lock) locks the packetdrill revision of
+[upstream.json](upstream.json) with its NAR hash, and the flake's
+`packetdrill-runner` package builds that source with
+[code-sockopt.patch](code-sockopt.patch). Build the plugin in the same shell, so
+the runner, the plugin and Python share one glibc:
+
+```sh
+nix develop -c cargo build -p ntcp-packetdrill
+nix develop -c python3 integration/packetdrill/run.py --suite upstream --variant ipv4
+```
+
+`run.py` checks the source tree against the NAR hash in `flake.lock`, and the
+runner against the provenance file beside it: source revision and NAR hash, patch
+hash and executable hash. The Python tests use the same source and runner.
+
+`--checkout DIR` selects a Git checkout of the pinned revision instead, verified
+with `git rev-parse` and `git diff`. It uses the checkout's own runner unless
+`--runner` names one built by `build_runner.py --checkout DIR`. Build that runner
+and the plugin, and run `run.py`, in one environment, since the plugin is loaded
+into the runner and into Python.
+
 ## Known exceptions
 
 Upstream scripts encode Linux implementation choices as well as TCP requirements.

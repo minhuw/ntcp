@@ -6,11 +6,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from run import HERE, PIN, adapt_source, preflight, profile_metadata, runner_provenance
+from run import HERE, PIN, adapt_source, pinned_source, preflight, profile_metadata, runner_provenance
 
 class ReceiveSegmentationMapping(unittest.TestCase):
     def test_original_aggregate_and_both_mss_directions_survive_setup_mapping(self):
-        directory=HERE.parent.parent/'workbench/packetdrill-upstream'/PIN['tcp_tests']
+        directory=pinned_source()/PIN['tcp_tests']
         if not directory.is_dir():self.skipTest('pinned source unavailable')
         name='gro/gro-mss-option.pkt';manifest=json.loads((HERE/'adaptations.json').read_text());entry=manifest['scripts'][name];source=(directory/name).read_bytes()
         generated,audit=adapt_source(directory,name,manifest,entry['adapter_flags'])

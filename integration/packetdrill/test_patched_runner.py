@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from run import HERE, PIN, check_checkout, preflight, runner_provenance, tcp_info_only
+from run import (HERE, PIN, check_checkout, in_nix_store, locked_source, nar_sha256, preflight,
+                 runner_provenance, tcp_info_only)
 
 
 class SelectionChecks(unittest.TestCase):
@@ -60,24 +61,96 @@ class SelectionChecks(unittest.TestCase):
                     path.write_bytes(original)
 
 
-@unittest.skipUnless(os.environ.get('PACKETDRILL_PATCHED_RUNNER'),
-                     'set PACKETDRILL_PATCHED_RUNNER and PACKETDRILL_CHECKOUT for C regression')
+class NixSourceChecks(unittest.TestCase):
+    def tree(self, root):
+        (root / 'sub').mkdir()
+        (root / 'a.txt').write_bytes(b'data\n')
+        (root / 'run.sh').write_bytes(b'#!/bin/sh\n')
+        (root / 'run.sh').chmod(0o755)
+        (root / 'sub/empty').write_bytes(b'')
+        (root / 'sub/odd').write_bytes(b'x' * 13)
+        (root / 'link').symlink_to('a.txt')
+        return root
+
+    def test_nar_hash_is_nix_hash_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            # `nix hash path --type sha256 --sri` of the same tree.
+            self.assertEqual(nar_sha256(self.tree(Path(temporary))),
+                             'sha256-AxDlg50/0G23YgajvIKBP/zUoUS/erqcXd6OR7GjzJM=')
+
+    def test_flake_lock_pins_the_upstream_revision(self):
+        self.assertEqual(locked_source()['rev'], PIN['revision'])
+        with patch('run.PIN', {**PIN, 'revision': '0' * 40}), self.assertRaises(ValueError):
+            locked_source()
+
+    def test_store_source_must_be_the_locked_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.tree(Path(temporary))
+            locked = {'rev': PIN['revision'], 'narHash': nar_sha256(root)}
+            with patch('run.in_nix_store', return_value=True), patch('run.locked_source', return_value=locked):
+                self.assertEqual(check_checkout(root), PIN['revision'])
+                for change in (lambda: (root / 'sub/odd').write_bytes(b'y' * 13),
+                               lambda: (root / 'a.txt').chmod(0o755),
+                               lambda: (root / 'extra').write_bytes(b'')):
+                    change()
+                    with self.assertRaises(ValueError):
+                        check_checkout(root)
+                    locked['narHash'] = nar_sha256(root)
+
+    def test_nix_provenance_is_bound_to_source_patch_binary_and_store(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / 'packetdrill'
+            runner.write_bytes(b'executable')
+            for name in ('build_runner.py', 'code-sockopt.patch', 'nix_system.c'):
+                (root / name).write_bytes(name.encode())
+            digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            locked = {'rev': PIN['revision'], 'narHash': 'sha256-source'}
+            data = {'source_revision': PIN['revision'], 'source_nar_hash': 'sha256-source',
+                    'patch_sha256': digest(root / 'code-sockopt.patch'), 'builder': 'nix',
+                    'system_sha256': digest(root / 'nix_system.c'),
+                    'executable_sha256': digest(runner)}
+            runner.with_suffix('.provenance.json').write_text(json.dumps(data))
+            with patch('run.HERE', root), patch('run.locked_source', return_value=locked):
+                with self.assertRaisesRegex(ValueError, 'outside the Nix store'):
+                    runner_provenance(runner)
+                with patch('run.in_nix_store', return_value=True):
+                    self.assertEqual(runner_provenance(runner), data)
+                    for key in data:
+                        runner.with_suffix('.provenance.json').write_text(json.dumps({**data, key: 'wrong'}))
+                        with self.assertRaises(ValueError):
+                            runner_provenance(runner)
+
+
+# An operator's runner and checkout, else the dev shell's flake-built runner and source.
+PATCHED_RUNNER = os.environ.get('PACKETDRILL_PATCHED_RUNNER') or os.environ.get('NTCP_PACKETDRILL_RUNNER')
+PATCHED_CHECKOUT = os.environ.get('PACKETDRILL_CHECKOUT') or os.environ.get('NTCP_PACKETDRILL_SOURCE')
+
+
+@unittest.skipUnless(PATCHED_RUNNER and PATCHED_CHECKOUT,
+                     'run inside nix develop, or set PACKETDRILL_PATCHED_RUNNER and '
+                     'PACKETDRILL_CHECKOUT, for C regression')
 class CompiledSnapshotChecks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        runner = Path(os.environ['PACKETDRILL_PATCHED_RUNNER']).resolve()
-        checkout = Path(os.environ['PACKETDRILL_CHECKOUT']).resolve()
+        runner = Path(PATCHED_RUNNER).resolve()
+        checkout = Path(PATCHED_CHECKOUT).resolve()
         check_checkout(checkout)
         runner_provenance(runner)
         cls.temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temporary.cleanup)
         directory = Path(cls.temporary.name)
-        with tempfile.TemporaryFile() as archive:
-            subprocess.run(['git', '-C', str(checkout), 'archive', PIN['revision']],
-                           stdout=archive, check=True)
-            archive.seek(0)
-            subprocess.run(['tar', '-xf', '-', '-C', str(directory)],
-                           stdin=archive, check=True)
+        if in_nix_store(checkout):
+            # The flake's tree holds the tracked files only; copies are writable for patch.
+            subprocess.run(['cp', '-r', '--no-preserve=mode', f'{checkout}/.', str(directory)],
+                           check=True)
+        else:
+            with tempfile.TemporaryFile() as archive:
+                subprocess.run(['git', '-C', str(checkout), 'archive', PIN['revision']],
+                               stdout=archive, check=True)
+                archive.seek(0)
+                subprocess.run(['tar', '-xf', '-', '-C', str(directory)],
+                               stdin=archive, check=True)
         source = directory / 'gtests/net/packetdrill/code.c'
         subprocess.run(['patch', '-p1', '-i', str(HERE / 'code-sockopt.patch')],
                        cwd=directory, check=True, capture_output=True)
@@ -85,17 +158,25 @@ class CompiledSnapshotChecks(unittest.TestCase):
                      'parser.y', 'socket.h', 'run_packet.c', 'so_testing.c', 'run_command.c'):
             if (source.parent / name).read_bytes() != (runner.parent / name).read_bytes():
                 raise AssertionError(f'built {name} differs from pinned source plus patch')
+        # Compile as the runner was built: flake.nix uses -g -Wall without Nix's fortify
+        # hardening, since Nix's glibc headers redefine packetdrill's TCP_ACCECN flags.
+        flags, env = ['-g', '-Wall', '-Werror'], None
+        if in_nix_store(runner):
+            hardening = os.environ.get('NIX_HARDENING_ENABLE', '').split()
+            flags = ['-g', '-Wall']
+            env = {**os.environ, 'NIX_HARDENING_ENABLE': ' '.join(
+                flag for flag in hardening if not flag.startswith('fortify'))}
         cls.binary = directory / 'snapshot-test'
-        subprocess.run(['cc', '-g', '-Wall', '-Werror', '-I', str(runner.parent),
+        subprocess.run(['cc', *flags, '-I', str(runner.parent),
                         str(HERE / 'code_sockopt_test.c'), str(source),
-                        '-o', str(cls.binary)], check=True)
+                        '-o', str(cls.binary)], env=env, check=True)
         cls.icmp_binary = directory / 'icmp-test'
         objects = sorted(str(path) for path in runner.parent.glob('*.o')
                          if path.name not in {'packetdrill.o', 'run_packet.o', 'so_testing.o'}
                          and not path.name.endswith('_test.o'))
-        subprocess.run(['cc', '-g', '-Wall', '-Werror', '-I', str(source.parent),
+        subprocess.run(['cc', *flags, '-I', str(source.parent),
                         str(HERE / 'icmp_runner_test.c'), *objects,
-                        '-lpthread', '-lrt', '-ldl', '-o', str(cls.icmp_binary)], check=True)
+                        '-lpthread', '-lrt', '-ldl', '-o', str(cls.icmp_binary)], env=env, check=True)
 
     def test_icmp_quote_mapping_and_callback_errors(self):
         result = subprocess.run([str(self.icmp_binary)], capture_output=True, text=True)

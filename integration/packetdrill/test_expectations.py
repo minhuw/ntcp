@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from expectations import NATIVE_SETUP_SCRIPTS, PORTED_EXCLUSION, PORTED_SCRIPTS, apply_expectations, digest, load_expectations
-from run import HERE, PIN, adapt_source, enabled_controls, main, preflight, select_cases
+from run import HERE, PIN, adapt_source, enabled_controls, main, pinned_source, preflight, select_cases
 
 
 class AccountingExpectations(unittest.TestCase):
@@ -20,7 +20,7 @@ class AccountingExpectations(unittest.TestCase):
         self.manifest, self.manifest_hash = load_expectations(HERE, PIN['revision'], self.adaptations)
 
     def checkout(self):
-        path = Path(os.environ.get('PACKETDRILL_CHECKOUT', HERE.parent.parent / 'workbench/packetdrill-upstream'))
+        path = Path(os.environ.get('PACKETDRILL_CHECKOUT', pinned_source()))
         base = path / PIN['tcp_tests']
         if not (base / 'timestamping/partial.pkt').exists():
             self.skipTest('pinned upstream checkout unavailable')

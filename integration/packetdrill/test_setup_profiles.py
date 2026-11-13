@@ -3,14 +3,14 @@ import copy
 import hashlib
 import json
 import unittest
-from run import HERE, PIN, SLOW_START_ACK_SCRIPTS, adapt_source, profile_metadata
+from run import HERE, PIN, SLOW_START_ACK_SCRIPTS, adapt_source, pinned_source, profile_metadata
 
 
 class SetupProfiles(unittest.TestCase):
     def test_empty_tfo_syn_server_first_uses_existing_explicit_policy(self):
         from run import upstream_flags
         name = 'fastopen/server/opt34/basic-zero-payload.pkt'
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())
@@ -40,7 +40,7 @@ class SetupProfiles(unittest.TestCase):
         self.assertNotIn('abort_with_ack', profile_metadata('baseline,local=192.0.2.1'))
 
     def test_exact_setup_only_and_fail_closed(self):
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())
@@ -94,7 +94,7 @@ class SetupProfiles(unittest.TestCase):
         from pathlib import Path
         from run import SLOW_START_ACK_SETUP, preflight
 
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())
@@ -130,7 +130,7 @@ class SetupProfiles(unittest.TestCase):
     def test_linux_cookie_explicit_listener_setup_and_capability_metadata(self):
         from run import (LINUX_COOKIE_OPTION, LINUX_COOKIE_SCRIPTS,
                          LINUX_COOKIE_SETTINGS, IMPLICIT_TFO_LISTENER_SCRIPTS, CUSTOM_TFO_SCRIPTS, preflight, tcp_info_only)
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())
@@ -186,7 +186,7 @@ class SetupProfiles(unittest.TestCase):
                           if FASTOPEN_PMTUD_OPTION in entry['adapter_flags'].split(',')},
                          FASTOPEN_PMTUD_SCRIPTS | {'mtu_probe/basic-v4.pkt'})
         self.assertEqual(len(FASTOPEN_PMTUD_SCRIPTS), 2)
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         for name in sorted(FASTOPEN_PMTUD_SCRIPTS):
@@ -234,7 +234,7 @@ class SetupProfiles(unittest.TestCase):
                           if ADAPTIVE_ACK_OPTION in entry['adapter_flags'].split(',')},
                          ADAPTIVE_ACK_SCRIPTS)
         self.assertEqual(len(ADAPTIVE_ACK_SCRIPTS), 3)
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         for name in sorted(ADAPTIVE_ACK_SCRIPTS):
@@ -283,7 +283,7 @@ class SetupProfiles(unittest.TestCase):
         from pathlib import Path
         from run import FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, preflight
         from test_runner import TFO26
-        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        directory = pinned_source() / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())

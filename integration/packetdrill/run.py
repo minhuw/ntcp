@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import ast
+import base64
 import collections
 import hashlib
 import json
@@ -736,9 +737,16 @@ def runner_provenance(runner):
     expected = {
         'source_revision': PIN['revision'],
         'patch_sha256': hashlib.sha256((HERE / 'code-sockopt.patch').read_bytes()).hexdigest(),
-        'build_helper_sha256': hashlib.sha256((HERE / 'build_runner.py').read_bytes()).hexdigest(),
         'executable_sha256': hashlib.sha256(runner.read_bytes()).hexdigest(),
     }
+    if provenance.get('builder') == 'nix':
+        # flake.nix's packetdrill-runner, built from the locked source into the read-only store.
+        if not in_nix_store(runner):
+            raise ValueError('Nix-built packetdrill runner outside the Nix store')
+        expected.update(builder='nix', source_nar_hash=locked_source()['narHash'],
+                        system_sha256=hashlib.sha256((HERE / 'nix_system.c').read_bytes()).hexdigest())
+    else:
+        expected['build_helper_sha256'] = hashlib.sha256((HERE / 'build_runner.py').read_bytes()).hexdigest()
     if provenance != expected:
         raise ValueError('patched runner provenance differs from audited build')
     return provenance
@@ -1066,7 +1074,63 @@ def outcome(code, expired, log):
     return 'failed'
 
 
+def nar_sha256(path):
+    """SRI SHA-256 of path's NAR serialization, the narHash flake.lock records."""
+    digest = hashlib.sha256()
+
+    def string(data):
+        digest.update(len(data).to_bytes(8, 'little') + data + b'\0' * (-len(data) % 8))
+
+    def node(path):
+        string(b'(')
+        if path.is_symlink():
+            for token in (b'type', b'symlink', b'target', os.fsencode(os.readlink(path))):
+                string(token)
+        elif path.is_dir():
+            string(b'type')
+            string(b'directory')
+            for name in sorted(os.listdir(path), key=os.fsencode):
+                for token in (b'entry', b'(', b'name', os.fsencode(name), b'node'):
+                    string(token)
+                node(path / name)
+                string(b')')
+        else:
+            string(b'type')
+            string(b'regular')
+            if path.stat().st_mode & 0o100:
+                string(b'executable')
+                string(b'')
+            string(b'contents')
+            string(path.read_bytes())
+        string(b')')
+
+    string(b'nix-archive-1')
+    node(path)
+    return 'sha256-' + base64.b64encode(digest.digest()).decode()
+
+
+def locked_source():
+    """flake.lock's entry for the packetdrill input, which must lock the pinned revision."""
+    lock = json.loads((ROOT / 'flake.lock').read_text())
+    nodes = lock['nodes']
+    locked = nodes[nodes[lock['root']]['inputs']['packetdrill']]['locked']
+    if locked['rev'] != PIN['revision']:
+        raise ValueError(f'flake.lock packetdrill revision {locked["rev"]} differs from pin {PIN["revision"]}')
+    return locked
+
+
+def in_nix_store(path):
+    """Whether path is in the read-only Nix store: the flake's source tree or runner."""
+    return path.resolve().is_relative_to('/nix/store')
+
+
 def check_checkout(checkout):
+    if in_nix_store(checkout):
+        # The flake's source tree (NTCP_PACKETDRILL_SOURCE): the NAR hash identifies the
+        # pinned tree as rev-parse and diff do for a Git checkout.
+        if nar_sha256(checkout) != locked_source()['narHash']:
+            raise ValueError('packetdrill source differs from the pinned tree in flake.lock')
+        return PIN['revision']
     actual = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'],
                                      text=True).strip()
     if actual != PIN['revision']:
@@ -1075,6 +1139,23 @@ def check_checkout(checkout):
                        'gtests/net'], check=False).returncode != 0:
         raise ValueError('packetdrill checkout has modified tracked runner/tests')
     return actual
+
+
+def tracked_files(checkout):
+    """Checkout-relative paths of the pinned tree's tracked TCP test files."""
+    if not in_nix_store(checkout):
+        return subprocess.check_output(
+            ['git', '-C', str(checkout), 'ls-files', '-z', '--', PIN['tcp_tests']],
+            text=True,
+        ).split('\0')
+    # A source tree is GitHub's archive of the revision: tracked files only.
+    return sorted(path.relative_to(checkout).as_posix()
+                  for path in (checkout / PIN['tcp_tests']).rglob('*') if path.is_file())
+
+
+def pinned_source():
+    """The tests' pinned tree: the dev shell's flake source, else workbench/packetdrill-upstream."""
+    return Path(os.environ.get('NTCP_PACKETDRILL_SOURCE') or ROOT / 'workbench/packetdrill-upstream')
 
 
 def variants(script, upstream):
@@ -1217,9 +1298,12 @@ def profile_metadata(so_flags):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkout', required=True, type=Path)
+    parser.add_argument('--checkout', type=Path,
+                        help='Git checkout of the pinned revision, with its own runner unless '
+                             '--runner is given (default: the dev shell\'s NTCP_PACKETDRILL_SOURCE '
+                             'and NTCP_PACKETDRILL_RUNNER)')
     parser.add_argument('--runner', type=Path,
-                        help='explicit patched executable produced by build_runner.py')
+                        help='explicit patched executable produced by build_runner.py or the flake')
     parser.add_argument('--plugin', type=Path,
                         default=ROOT / 'target/debug/libntcp_packetdrill.so')
     parser.add_argument('--suite', choices=['smoke', 'sack', 'upstream-raw', 'upstream', 'ntcp-ported'], default='smoke')
@@ -1239,6 +1323,15 @@ def main():
                          'baseline,local=192.168.0.1')
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--timeout must be finite and positive')
+    if args.checkout is None:
+        # The flake's pinned source and patched runner, which `nix develop` names.
+        if not os.environ.get('NTCP_PACKETDRILL_SOURCE'):
+            parser.error('run inside nix develop (NTCP_PACKETDRILL_SOURCE) or pass --checkout')
+        args.checkout = Path(os.environ['NTCP_PACKETDRILL_SOURCE'])
+        if args.runner is None:
+            if not os.environ.get('NTCP_PACKETDRILL_RUNNER'):
+                parser.error('run inside nix develop (NTCP_PACKETDRILL_RUNNER) or pass --runner')
+            args.runner = Path(os.environ['NTCP_PACKETDRILL_RUNNER'])
     checkout = args.checkout.resolve()
     plugin = args.plugin.resolve()
     try:
@@ -1287,10 +1380,7 @@ def main():
                  HERE / ('sack-tests' if args.suite == 'sack' else 'tests'))
     upstream_scripts = []
     if upstream:
-        tracked = subprocess.check_output(
-            ['git', '-C', str(checkout), 'ls-files', '-z', '--', PIN['tcp_tests']],
-            text=True,
-        ).split('\0')
+        tracked = tracked_files(checkout)
         upstream_scripts = sorted(checkout / path for path in tracked if path.endswith('.pkt'))
         scripts = (sorted(directory / path for path in manifest['scripts']
                           if args.suite != 'ntcp-ported' or path in PORTED_SCRIPTS)

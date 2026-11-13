@@ -16,7 +16,7 @@ from expectations import PORTED_SCRIPTS
 
 from run import (AUDITED_CONTROLS, CUSTOM_TFO_SCRIPTS, SYN_DATA_ACK_SCRIPTS, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, enabled_controls, invoke, main, outcome,
-                 preflight, profile_metadata, select_cases, variants, verify_backend)
+                 pinned_source, preflight, profile_metadata, select_cases, variants, verify_backend)
 
 
 def mock_backend(test):
@@ -1202,7 +1202,7 @@ class PublishedSelectionChecks(unittest.TestCase):
         mock_backend(self)
         # Optional pinned upstream checkout, as used by the runner itself.
         self.checkout = Path(os.environ.get('NTCP_PACKETDRILL_CHECKOUT',
-                            HERE.parent.parent / 'workbench/packetdrill-upstream'))
+                            pinned_source()))
         self.directory = self.checkout / PIN['tcp_tests']
         if not self.directory.is_dir():
             self.skipTest('pinned packetdrill checkout unavailable; set NTCP_PACKETDRILL_CHECKOUT')
