@@ -1418,7 +1418,7 @@ impl<P: PacketIo> Network<P> {
     // A frame of `owner` left its transmit slot, ending the reservation that
     // kept the connection's events, and its close, from being acted on.
     fn reservation_released(&mut self, owner: Option<ntcp::ConnectionId>) {
-        if let Some(slot) = owner.and_then(|core| self.connection_map.get(&core).copied()) {
+        if let Some(slot) = owner.and_then(|core| self.connection_slot(core)) {
             self.touch(slot);
         }
     }
@@ -1545,7 +1545,10 @@ impl<P: PacketIo> Network<P> {
                     self.flows.as_ref().unwrap().release(held);
                     self.holding -= 1;
                 }
-                if let Some(index) = self.connection_map.remove(&core) {
+                if let Some(index) =
+                    self.core_slots
+                        .forget(core, &self.live_connections, &self.connections)
+                {
                     let c = self.connections[index].value.take().unwrap();
                     debug_assert!(c.released);
                     vacate(&mut self.live_connections, index);
@@ -1562,7 +1565,8 @@ impl<P: PacketIo> Network<P> {
                 if !c.released || self.endpoint.connection_exists(core) {
                     continue;
                 }
-                self.connection_map.remove(&core);
+                self.core_slots
+                    .forget(core, &self.live_connections, &self.connections);
                 self.connections[index].value = None;
                 vacate(&mut self.live_connections, index);
                 give_back(&mut self.free_connections, &self.connections, index);

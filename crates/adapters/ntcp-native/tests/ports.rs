@@ -608,3 +608,46 @@ fn a_proxy_keeps_connecting_with_17k_connections_in_time_wait() {
     assert_eq!(client.counters().time_wait_overflows, 0);
     assert!(ports.len() < RECORDS, "{} ports", ports.len());
 }
+
+// The endpoint gives a reclaimed connection's slot to the next open; what
+// the connection on it raises reaches that connection's handle, never the
+// handle of the one the slot held before.
+#[test]
+fn a_reused_endpoint_slot_reports_to_its_own_connection() {
+    let mut pair = Pair::new(40000..=40015, 50000..=50000);
+    let server_address = SocketAddr::new(address(2), PORT);
+    for _ in 0..4 {
+        let earlier = pair.client.connect(server_address).unwrap();
+        let _ = pair.accepted();
+        pair.client.abort(earlier).unwrap();
+        pair.steps(4);
+        let client = pair.client.connect(server_address).unwrap();
+        let server = pair.accepted();
+        pair.server
+            .try_write(server, b"slot", WriteOptions::default())
+            .unwrap();
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            pair.now += 1000;
+            pair.server.drive(pair.now, BUDGET).unwrap();
+            pair.client.drive(pair.now, BUDGET).unwrap();
+            events.extend(drain(&mut pair.client));
+            drain(&mut pair.server);
+        }
+        assert!(events.contains(&Event::Readable(client)), "{events:?}");
+        assert!(events.iter().all(|e| !matches!(
+            e,
+            Event::Readable(id) | Event::Connected(id) | Event::Writable(id)
+                if *id == earlier
+        )));
+        let mut out = [0; 8];
+        assert!(matches!(
+            pair.client.try_read(client, &mut out),
+            Ok(ReadOutcome::Data { len: 4, .. })
+        ));
+        assert_eq!(&out[..4], b"slot");
+        pair.client.abort(client).unwrap();
+        pair.server.abort(server).unwrap();
+        pair.steps(4);
+    }
+}

@@ -80,7 +80,8 @@ pub struct Network<P: PacketIo> {
     // through TIME-WAIT.
     ports: PortUsers,
     connections: Vec<Slot<Connection>>,
-    connection_map: HashMap<ntcp::ConnectionId, usize>,
+    // The slot of `connections` installed from each endpoint connection.
+    core_slots: CoreSlots,
     listeners: Vec<Slot<Listener>>,
     listener_map: HashMap<ntcp::ListenerId, usize>,
     // Occupied slots of `connections` and `listeners`, ascending. The passes
@@ -211,6 +212,85 @@ fn next_live(live: &[usize], from: usize) -> Option<usize> {
 }
 fn occupied<T>(slots: &[Slot<T>]) -> impl Iterator<Item = usize> + '_ {
     (0..slots.len()).filter(|&i| slots[i].value.is_some())
+}
+
+// Per endpoint connection slot (`ConnectionId::index`, below
+// `max_connections`), the connection last installed from it and its slot of
+// `connections`, as a slab finds an object by its index and checks its
+// generation. Should the endpoint give a reclaimed slot to a connection
+// installed before `maintain_connections` frees its predecessor's, the
+// predecessor is displaced: `displaced` counts those, found by their `core`.
+struct CoreSlots {
+    slots: Vec<Option<(ntcp::ConnectionId, usize)>>,
+    displaced: usize,
+}
+impl CoreSlots {
+    fn new(capacity: usize) -> Result<Self> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::Capacity)?;
+        slots.resize(capacity, None);
+        Ok(Self {
+            slots,
+            displaced: 0,
+        })
+    }
+    // Records `core` installed in `slot`; returns the connection it displaced.
+    fn insert(&mut self, core: ntcp::ConnectionId, slot: usize) -> Option<ntcp::ConnectionId> {
+        let earlier = self.slots[core.index()]
+            .replace((core, slot))
+            .map(|(id, _)| id);
+        self.displaced += usize::from(earlier.is_some());
+        earlier
+    }
+    fn get(
+        &self,
+        core: ntcp::ConnectionId,
+        live: &[usize],
+        connections: &[Slot<Connection>],
+    ) -> Option<usize> {
+        match self.slots[core.index()] {
+            Some((id, slot)) if id == core => Some(slot),
+            _ if self.displaced != 0 => displaced_slot(core, live, connections),
+            _ => None,
+        }
+    }
+    // Forgets `core`, returning its slot.
+    fn forget(
+        &mut self,
+        core: ntcp::ConnectionId,
+        live: &[usize],
+        connections: &[Slot<Connection>],
+    ) -> Option<usize> {
+        let entry = &mut self.slots[core.index()];
+        match *entry {
+            Some((id, slot)) if id == core => {
+                *entry = None;
+                Some(slot)
+            }
+            _ if self.displaced != 0 => {
+                let slot = displaced_slot(core, live, connections);
+                self.displaced -= usize::from(slot.is_some());
+                slot
+            }
+            _ => None,
+        }
+    }
+}
+// A displaced connection's slot, by a pass over the live ones: only while
+// one is displaced.
+fn displaced_slot(
+    core: ntcp::ConnectionId,
+    live: &[usize],
+    connections: &[Slot<Connection>],
+) -> Option<usize> {
+    live.iter().copied().find(|&slot| {
+        connections[slot]
+            .value
+            .as_ref()
+            .is_some_and(|c| c.core == core)
+    })
 }
 
 // Slots a change may have given work, oldest first, each queued at most
@@ -736,10 +816,7 @@ impl<P: PacketIo> Network<P> {
         events
             .try_reserve_exact(event_capacity)
             .map_err(|_| Error::Capacity)?;
-        let mut connection_map = HashMap::new();
-        connection_map
-            .try_reserve(config.tcp.max_connections)
-            .map_err(|_| Error::Capacity)?;
+        let core_slots = CoreSlots::new(config.tcp.max_connections)?;
         let mut listener_map = HashMap::new();
         listener_map
             .try_reserve(config.tcp.max_listeners)
@@ -782,7 +859,7 @@ impl<P: PacketIo> Network<P> {
             tagged_ports,
             ports,
             connections,
-            connection_map,
+            core_slots,
             listeners,
             listener_map,
             live_connections,
@@ -1056,6 +1133,11 @@ impl<P: PacketIo> Network<P> {
     fn free_connection_slot(&self) -> Result<usize> {
         self.free_connections.last().copied().ok_or(Error::Capacity)
     }
+    // The slot of `connections` installed from endpoint connection `core`.
+    fn connection_slot(&self, core: ntcp::ConnectionId) -> Option<usize> {
+        self.core_slots
+            .get(core, &self.live_connections, &self.connections)
+    }
     fn install(
         &mut self,
         slot: usize,
@@ -1088,7 +1170,8 @@ impl<P: PacketIo> Network<P> {
         debug_assert_eq!(taken, Some(slot));
         occupy(&mut self.live_connections, slot);
         self.ports.take(tuple.local.port(), binding);
-        self.connection_map.insert(core, slot);
+        let earlier = self.core_slots.insert(core, slot);
+        debug_assert!(earlier.is_none_or(|e| e != core && !self.endpoint.connection_exists(e)));
         self.touch(slot);
         self.check_live();
         Ok(self.conn_id(slot))
@@ -1863,7 +1946,7 @@ impl<P: PacketIo> Network<P> {
         while self.events.len() < self.event_capacity {
             match self.endpoint.next_event() {
                 Some(ntcp::Event::Connection(core, events)) => {
-                    if let Some(&slot) = self.connection_map.get(&core) {
+                    if let Some(slot) = self.connection_slot(core) {
                         if (events.readable || events.half_closed)
                             && let Some(c) = self.connections[slot].value.as_mut()
                             && !(c.close_requested || c.abort_requested || c.released)
