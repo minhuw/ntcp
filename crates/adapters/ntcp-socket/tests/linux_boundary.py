@@ -82,8 +82,9 @@ def main():
         early = directory / 'early.so'
         run(['cc', '-Wall', '-Wextra', '-Werror', '-O2', '-pthread', '-fPIC', '-shared',
              '-DNTCP_EARLY', str(Path(__file__).with_name('cancellation.c')), '-o', str(early)])
-        # Loader runs the second preload's constructor before our constructor.
-        run(['/bin/true'], env=clean_env() | {'LD_PRELOAD': f'{LIBRARY}:{early}'})
+        # Loader runs the second preload's constructor before our constructor. The
+        # shell's true shares the library's glibc; the host's /bin/true does not.
+        run(['true'], env=clean_env() | {'LD_PRELOAD': f'{LIBRARY}:{early}'})
         for env in (clean_env(), clean_env() | {'LD_PRELOAD': str(LIBRARY)}):
             run([str(directory / 'cancellation')], env=env)
         run(['unshare', '--user', '--map-root-user', '--net', sys.executable,
