@@ -30,7 +30,7 @@ fn reserved_nonhead_sack_retry_keeps_exhausted_prr_credit_and_recovery_state() {
         reservation.bytes.resize(2048, 0);
         let token = reservation.token().unwrap();
         reservation.capture(
-            crate::Transmit {
+            &crate::Transmit {
                 connection: None,
                 tx_timestamp: None,
                 ipv4_options: Default::default(),
@@ -528,7 +528,7 @@ fn gso_wrap_eor_cwr_rack_physical_segments_and_no_hotpath_allocation() {
         assert_eq!(a.snd_nxt, start.wrapping_add(300));
         let token = reservation.token().unwrap();
         reservation.capture(
-            crate::Transmit {
+            &crate::Transmit {
                 connection: None,
                 tx_timestamp: None,
                 ipv4_options: Default::default(),
@@ -965,7 +965,7 @@ fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
     assert_eq!(total, 4000);
     let token = reservation.token().unwrap();
     reservation.capture(
-        crate::Transmit {
+        &crate::Transmit {
             connection: None,
             tx_timestamp: None,
             ipv4_options: Default::default(),
@@ -1308,7 +1308,7 @@ fn gso_matches_scalar(
     let s = departure.segmentation.unwrap();
     let token = reservation.token().unwrap();
     reservation.capture(
-        crate::Transmit {
+        &crate::Transmit {
             connection: None,
             tx_timestamp: None,
             ipv4_options: Default::default(),

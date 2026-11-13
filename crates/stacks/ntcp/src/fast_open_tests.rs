@@ -801,7 +801,7 @@ fn fast_open_reserved_syn_is_indivisible_after_path_shrink() {
     let mut reservation = crate::output_reservation::OutputReservation::new();
     reservation.bytes = vec![0; 2048];
     let attempt = reservation.token().unwrap();
-    reservation.capture(tx, &bytes, attempt);
+    reservation.capture(&tx, &bytes, attempt);
     assert_eq!(
         reservation.fragment(tx.len - 1, &mut bytes),
         Err(EndpointError::ReservationMtuTooSmall)

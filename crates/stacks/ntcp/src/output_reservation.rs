@@ -200,7 +200,7 @@ impl OutputReservation {
 
     pub fn capture_shared(
         &mut self,
-        packet: Transmit,
+        packet: &Transmit,
         header: &[u8],
         payload: &[crate::Payload],
         attempt: TransmitAttempt,
@@ -233,8 +233,8 @@ impl OutputReservation {
         self.shared_options[..n - 20].copy_from_slice(&header[20..n]);
         self.shared_option_len = n - 20;
         self.current = Some(ReservedOutput {
-            emitted_packet: packet,
-            packet,
+            emitted_packet: *packet,
+            packet: *packet,
             attempt: Some(attempt),
             group: None,
             abandon_attempt: attempt,
@@ -321,12 +321,12 @@ impl OutputReservation {
         Ok(packet)
     }
 
-    pub fn capture(&mut self, packet: Transmit, bytes: &[u8], attempt: TransmitAttempt) {
+    pub fn capture(&mut self, packet: &Transmit, bytes: &[u8], attempt: TransmitAttempt) {
         self.clear();
         self.bytes[..packet.len].copy_from_slice(&bytes[..packet.len]);
         self.current = Some(ReservedOutput {
-            emitted_packet: packet,
-            packet,
+            emitted_packet: *packet,
+            packet: *packet,
             attempt: Some(attempt),
             group: None,
             abandon_attempt: attempt,

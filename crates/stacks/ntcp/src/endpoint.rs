@@ -354,6 +354,15 @@ pub struct PollTransmit {
     pub packet: Option<Transmit>,
     pub more_work: bool,
 }
+// What a reserved poll selected. With an attempt, its packet is the
+// attempt's (`emitted_packet`), which the public poll copies out of the
+// reservation once (`Endpoint::polled`) rather than moving it through each
+// internal return.
+#[derive(Clone, Copy)]
+pub(crate) struct Polled {
+    more_work: bool,
+    attempt: Option<crate::TransmitAttempt>,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputDisposition {
     Processed,
@@ -6034,7 +6043,9 @@ impl Endpoint {
         {
             return Err(Error::InvalidArgument.into());
         }
-        self.poll_reserved_selected(now, out, budget, Some(id), Some(payload), None)
+        let polled =
+            self.poll_reserved_selected(now, out, budget, Some(id), Some(payload), None)?;
+        Ok(self.polled(polled))
     }
 
     pub fn enable_output_reservations(&mut self) -> Result<(), EndpointError> {
@@ -6490,7 +6501,8 @@ impl Endpoint {
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         self.retained_slot(id)?;
-        self.poll_reserved_selected(now, out, budget, Some(id), None, None)
+        let polled = self.poll_reserved_selected(now, out, budget, Some(id), None, None)?;
+        Ok(self.polled(polled))
     }
 
     pub fn poll_reserved_stateless_transmit(
@@ -6499,7 +6511,8 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
-        self.poll_reserved_selected(now, out, budget, None, None, None)
+        let polled = self.poll_reserved_selected(now, out, budget, None, None, None)?;
+        Ok(self.polled(polled))
     }
 
     pub fn poll_reserved_transmit(
@@ -6508,7 +6521,8 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
-        self.poll_reserved_any(now, out, budget, None)
+        let polled = self.poll_reserved_any(now, out, budget, None)?;
+        Ok(self.polled(polled))
     }
 
     pub(crate) fn poll_reserved_any(
@@ -6517,7 +6531,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
         mut reply: ReplyHeader<'_>,
-    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+    ) -> Result<Polled, EndpointError> {
         if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
         }
@@ -6549,17 +6563,33 @@ impl Endpoint {
                     self.output.push(id.slot);
                 }
             }
-            if result.0.packet.is_some() {
+            if result.attempt.is_some() {
                 return Ok(result);
             }
         }
-        Ok((
+        Ok(Polled {
+            more_work: self.has_pending_output(),
+            attempt: None,
+        })
+    }
+
+    // The public form of a reserved poll's result: the attempt's packet,
+    // copied out of its reservation once.
+    pub(crate) fn polled(&self, polled: Polled) -> (PollTransmit, Option<crate::TransmitAttempt>) {
+        let packet = polled.attempt.map(|attempt| {
+            self.reservations[attempt.reservation]
+                .current
+                .as_ref()
+                .unwrap()
+                .emitted_packet
+        });
+        (
             PollTransmit {
-                packet: None,
-                more_work: self.has_pending_output(),
+                packet,
+                more_work: polled.more_work,
             },
-            None,
-        ))
+            polled.attempt,
+        )
     }
 
     // Select exactly one owner; None is the independent stateless lane.
@@ -6571,7 +6601,7 @@ impl Endpoint {
         selected: Option<ConnectionId>,
         mut shared: Option<&mut Vec<crate::Payload>>,
         reply: ReplyHeader<'_>,
-    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+    ) -> Result<Polled, EndpointError> {
         if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
         }
@@ -6596,13 +6626,10 @@ impl Endpoint {
         }
         if budget == 0 {
             self.clock(now)?;
-            return Ok((
-                PollTransmit {
-                    packet: None,
-                    more_work: self.has_pending_output(),
-                },
-                None,
-            ));
+            return Ok(Polled {
+                more_work: self.has_pending_output(),
+                attempt: None,
+            });
         }
         if let Some(r) = &self.reservations[index].current {
             let connection = r.packet.connection;
@@ -6629,13 +6656,10 @@ impl Endpoint {
                     .reserved_pacing_deadline(now, d)
                     .is_some()
             {
-                return Ok((
-                    PollTransmit {
-                        packet: None,
-                        more_work: true,
-                    },
-                    None,
-                ));
+                return Ok(Polled {
+                    more_work: true,
+                    attempt: None,
+                });
             }
             let attempt = self.reservations[index].token()?;
             self.set_reservation_attempt(index, Some(attempt));
@@ -6649,13 +6673,17 @@ impl Endpoint {
                 self.output.push(id.slot);
             }
             self.control_turn = true;
-            return Ok((
-                PollTransmit {
-                    packet: Some(packet),
-                    more_work: true,
-                },
-                Some(attempt),
-            ));
+            debug_assert_eq!(
+                Some(packet),
+                self.reservations[index]
+                    .current
+                    .as_ref()
+                    .map(|r| r.emitted_packet)
+            );
+            return Ok(Polled {
+                more_work: true,
+                attempt: Some(attempt),
+            });
         }
         // Reserve identity before selection: exhaustion must not consume output.
         let attempt = self.reservations[index].token()?;
@@ -6695,8 +6723,12 @@ impl Endpoint {
             reply,
         );
         self.reservations[index].payload = payload;
-        let (mut output, mut zone) = output?;
-        if let Some(packet) = output.packet {
+        // By reference: the packet is copied once, into the reservation.
+        let (output, mut zone) = match &output {
+            Ok((output, zone)) => (output, *zone),
+            Err(error) => return Err(*error),
+        };
+        if let Some(packet) = &output.packet {
             if let Some(parts) = shared.filter(|p| !p.is_empty()) {
                 self.reservations[index].capture_shared(packet, out, parts, attempt)?;
             } else {
@@ -6732,15 +6764,18 @@ impl Endpoint {
                         .tx_timestamp
                         .map(|token| token.part(0, s.segment_payload_len));
                     r.emitted_packet.tx_timestamp = first;
-                    if let Some(p) = &mut output.packet {
-                        p.tx_timestamp = first;
-                    }
                 }
                 self.refresh(id.slot);
             }
-            Ok((output, Some(attempt)))
+            Ok(Polled {
+                more_work: output.more_work,
+                attempt: Some(attempt),
+            })
         } else {
-            Ok((output, None))
+            Ok(Polled {
+                more_work: output.more_work,
+                attempt: None,
+            })
         }
     }
 

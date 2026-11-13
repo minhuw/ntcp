@@ -264,7 +264,7 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
         mark: 0,
     };
     let token = a.reservations[0].token().unwrap();
-    a.reservations[0].capture(packet, &bytes, token);
+    a.reservations[0].capture(&packet, &bytes, token);
     a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
@@ -356,7 +356,7 @@ fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
         mark: 0,
     };
     let token = a.reservations[0].token().unwrap();
-    a.reservations[0].capture(packet, &bytes, token);
+    a.reservations[0].capture(&packet, &bytes, token);
     a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
@@ -405,7 +405,7 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
     let len = wire::encode(ip, header, &options, &[7; 40], &mut bytes).unwrap();
     let token = a.reservations[0].token().unwrap();
     a.reservations[0].capture(
-        Transmit {
+        &Transmit {
             connection: Some(id),
             tx_timestamp: None,
             ipv4_options: Default::default(),
