@@ -698,6 +698,8 @@ pub struct Host {
     now: Instant,
     timebase: ntcp::CallerTimebase,
     attached: bool,
+    // `ipv4_header_errors`.
+    ipv4_header_errors: u64,
 }
 
 /// The IP header plan of output on one path (`Host::header_plan`).
@@ -821,6 +823,7 @@ impl Host {
             now: 0,
             timebase,
             attached: false,
+            ipv4_header_errors: 0,
         })
     }
     pub fn paths(&self) -> &PathService {
@@ -941,6 +944,15 @@ impl Host {
     }
     pub fn reassembly_counters(&self) -> ReassemblyCounters {
         self.reassembly.counters()
+    }
+    /// Arriving IPv4 packets and fragments discarded for an error in their
+    /// header (`ntcp_ip::header_error`), a bad checksum included, by
+    /// `receive` or by the destination processing of a frame given to
+    /// `input_icmp`, as Linux counts the Ip MIB's InHdrErrors. A frame the
+    /// embedding's link framing refused before the IP layer saw it is not
+    /// counted. For administrative reporting.
+    pub fn ipv4_header_errors(&self) -> u64 {
+        self.ipv4_header_errors
     }
     /// The earliest reassembly deadline, at which a `service_changes` pass
     /// discards the expired datagram (and may queue its Time Exceeded) even
@@ -2092,7 +2104,13 @@ impl Host {
         let datagram = Envelope::physical(context, frame.len(), false)
             .datagram(frame)
             .ok_or(Error::Obsolete)?;
-        let processed = self.process(datagram, timestamps)?;
+        let processed = self.process(datagram, timestamps).inspect_err(|error| {
+            if let Error::Codec(error) = *error
+                && frame.first().is_some_and(|b| b >> 4 == 4)
+            {
+                self.count_header_error(frame, error);
+            }
+        })?;
         self.input_icmp_datagram(endpoint, now, processed)
     }
 

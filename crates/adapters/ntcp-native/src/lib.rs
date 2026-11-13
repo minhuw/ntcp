@@ -875,6 +875,8 @@ impl<P: PacketIo> Network<P> {
             resolution_failures: self.host.arp_counters().resolution_failures,
             listen_overflows: self.endpoint.listen_overflows(),
             listen_drops: self.endpoint.listen_drops(),
+            tcp_checksum_errors: self.endpoint.checksum_errors(),
+            ip_header_errors: self.host.ipv4_header_errors(),
             time_wait_connections: self.endpoint.time_wait_connections(),
             time_wait_overflows: self.endpoint.time_wait_overflows(),
             retransmitted_segments: loss.retransmitted_segments,

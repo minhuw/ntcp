@@ -393,6 +393,27 @@ fn ipv4_header_checksums_are_verified_once_on_arrival() {
         );
     }
     assert_eq!(a.0.reassembly_counters().completed, 0);
+    // Each refusal is a header error (Linux's InHdrErrors).
+    let pieces = fragments(&request, 51, 304).len() as u64;
+    assert_eq!(a.0.ipv4_header_errors(), 2 + pieces);
+    // So are a header shorter than its IHL or 20 octets and one below
+    // version 4's minimum IHL; a Total Length other than the packet's is
+    // not.
+    let mut longer = request.clone();
+    longer.push(0);
+    let mut low_ihl = request.clone();
+    low_ihl[0] = 0x44;
+    for (frame, counted) in [
+        (&request[..19], 1),
+        (&low_ihl[..], 1),
+        (&longer[..], 0),
+        (&request[..request.len() - 1], 0),
+    ] {
+        let before = a.0.ipv4_header_errors();
+        assert!(a.0.receive(a.2, 1, frame, false, &mut out).is_err());
+        assert_eq!(a.0.ipv4_header_errors(), before + counted);
+    }
+    let errors = a.0.ipv4_header_errors();
     let Received::Datagram(datagram) = a.0.receive(a.2, 1, &request, false, &mut out).unwrap()
     else {
         panic!("an unfragmented request is a datagram");
@@ -402,6 +423,7 @@ fn ipv4_header_checksums_are_verified_once_on_arrival() {
     assert!(a.0.process(rejoined, None).is_ok());
     assert!(a.0.process(datagram, None).is_ok());
     assert_eq!(a.0.icmp_output_pending(), 0);
+    assert_eq!(a.0.ipv4_header_errors(), errors);
 }
 
 // Insert a Destination Options header (one PadN) directly after the base

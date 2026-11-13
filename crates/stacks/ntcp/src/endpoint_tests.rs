@@ -3850,6 +3850,33 @@ fn a_time_wait_answers_a_syn_that_may_not_reopen_it_as_without_reuse() {
 // refused for memory, in ListenDrops alone; one its full accept queue
 // refuses also in ListenOverflows
 // (accept_queue_overflows_count_refused_syns_and_held_acks).
+// A segment whose TCP checksum is wrong is discarded (RFC 9293 MUST-3) and
+// counted, as Linux counts TCP_MIB_CSUMERRORS; other malformed segments are
+// discarded uncounted.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
+//= type=test
+//# and the receiver MUST check it (MUST-3).
+#[test]
+fn checksum_errors_count_segments_with_a_bad_tcp_checksum() {
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    b.listen(remote, 4).unwrap();
+    a.connect(0, local, remote).unwrap();
+    let (ip, syn) = packets(&mut a, 0).pop().unwrap();
+    let mut corrupt = syn.clone();
+    corrupt[4] ^= 1;
+    assert_eq!(b.input(0, ip, &corrupt), Ok(InputDisposition::Dropped));
+    assert_eq!(b.input(0, ip, &syn[..19]), Ok(InputDisposition::Dropped));
+    let mut short = syn.clone();
+    short[12] = 4 << 4;
+    assert_eq!(b.input(0, ip, &short), Ok(InputDisposition::Dropped));
+    assert_eq!(b.checksum_errors(), 1);
+    assert!(packets(&mut b, 0).is_empty());
+    assert_eq!(b.input(0, ip, &syn), Ok(InputDisposition::Processed));
+    assert_eq!(b.checksum_errors(), 1);
+}
+
 #[test]
 fn listen_overflows_and_drops_count_the_syns_a_listener_refuses() {
     // A full SYN queue (backlog 0 holds one), no connection slot, no buffer

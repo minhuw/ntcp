@@ -313,6 +313,16 @@ pub struct Counters {
     // Error::AddressNotAvailable, and one whose buffers the budget or the
     // allocator refused with Error::NoMemory.
     pub listen_drops: u64,
+    // Segments discarded because their TCP checksum was wrong: Linux's Tcp
+    // InCsumErrors (`Endpoint::checksum_errors`). Each is also in
+    // discarded.
+    pub tcp_checksum_errors: u64,
+    // Arriving IPv4 packets and fragments discarded for an error in their
+    // header, a bad header checksum included: Linux's Ip InHdrErrors
+    // (`Host::ipv4_header_errors`). Each is also in discarded; a frame whose
+    // Ethernet framing (`ntcp_ethernet::parse_ethernet_fragment`) already
+    // failed is in discarded only.
+    pub ip_header_errors: u64,
     // Connections in TIME-WAIT now, released or not: Linux's sockstat `tw`
     // (`Endpoint::time_wait_connections`).
     pub time_wait_connections: usize,

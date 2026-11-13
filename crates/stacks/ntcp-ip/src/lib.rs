@@ -150,6 +150,23 @@ pub fn ipv4_received_bounds(b: &[u8]) -> Result<(usize, usize, Fragmentation), E
     bounds(b, true, false)
 }
 
+/// Whether `parse`, `parse_fragment` or `parse_received` refused `b`
+/// (with `error`) for its header itself, which Linux counts as the Ip MIB's
+/// InHdrErrors (IPSTATS_MIB_INHDRERRORS, in ip_rcv_core and for options in
+/// ip_rcv_options): shorter than a header or than its IHL, a version other
+/// than 4, an IHL below 5 or a Total Length below it, the reserved flag, a
+/// bad checksum or malformed options. A Total Length other than the
+/// packet's (truncated, or not trimmed) and fragmentation are not.
+pub fn header_error(b: &[u8], error: Error) -> bool {
+    match error {
+        Error::Truncated | Error::Version | Error::Invalid | Error::Checksum | Error::Options => {
+            true
+        }
+        Error::Length => bounds(b, true, false).is_err(),
+        _ => false,
+    }
+}
+
 // Shared header validation. The atomic entrypoints refuse every flag but DF
 // exactly as before; the fragment API admits MF and offsets. `checksum`:
 // verify the header checksum, unless the caller's packet was verified

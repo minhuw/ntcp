@@ -570,7 +570,8 @@ impl Host {
                 // (RFC 1122 section 3.2.1.2, cited at ntcp_ip::ipv4_bounds).
                 let source_routes = capabilities.ipv4.source_routes();
                 let packet =
-                    ntcp_ip::parse_fragment(frame, source_routes.ok_or(Error::Unsupported)?)?;
+                    ntcp_ip::parse_fragment(frame, source_routes.ok_or(Error::Unsupported)?)
+                        .inspect_err(|&error| self.count_header_error(frame, error))?;
                 if packet.fragmentation.is_complete() {
                     return Ok(Received::Datagram(whole));
                 }
@@ -658,6 +659,11 @@ impl Host {
                 Ok(Received::Discarded)
             }
         }
+    }
+
+    // An arriving IPv4 packet refused with `error` (`ipv4_header_errors`).
+    pub(crate) fn count_header_error(&mut self, frame: &[u8], error: ntcp_ip::Error) {
+        self.ipv4_header_errors += u64::from(ntcp_ip::header_error(frame, error));
     }
 
     // `receive` under `Ipv6Receive::Extensions`. Physical framing first: a

@@ -656,6 +656,8 @@ pub struct Endpoint {
     // last for connections; records count themselves.
     listen_overflows: u64,
     listen_drops: u64,
+    // `checksum_errors`.
+    checksum_errors: u64,
     time_wait_slots: usize,
     time_wait: crate::time_wait::TimeWaitTable,
     // Released connections that closed without TIME-WAIT because the table
@@ -872,6 +874,7 @@ impl Endpoint {
             reclaimed: 0,
             reclaims,
             listen_overflows: 0,
+            checksum_errors: 0,
             listen_drops: 0,
             time_wait_slots: 0,
             time_wait: crate::time_wait::TimeWaitTable::new(config.max_time_wait),
@@ -4006,7 +4009,7 @@ impl Endpoint {
     /// consume a provider transaction nor surface as an embedding error.
     /// `Ok(None)` is the ordinary discard.
     pub(crate) fn ingress_admission<'a>(
-        &self,
+        &mut self,
         ip: IpMetadata,
         zone: Option<ntcp_path::LinkId>,
         options: Ipv4Options,
@@ -4065,7 +4068,10 @@ impl Endpoint {
         }
         let segment = match wire::parse(ip, bytes) {
             Ok(segment) => segment,
-            Err(_) => return Ok(None),
+            Err(error) => {
+                self.checksum_errors += u64::from(error == wire::WireError::InvalidChecksum);
+                return Ok(None);
+            }
         };
         metadata.validate_segment(&segment)?;
         Ok(Some((route, segment)))
@@ -5615,6 +5621,13 @@ impl Endpoint {
     /// For administrative reporting.
     pub fn listen_overflows(&self) -> u64 {
         self.listen_overflows
+    }
+
+    /// Segments discarded because their TCP checksum was wrong (RFC 9293
+    /// MUST-3), as Linux counts TCP_MIB_CSUMERRORS (Tcp InCsumErrors) in
+    /// tcp_v4_rcv and tcp_v6_rcv. For administrative reporting.
+    pub fn checksum_errors(&self) -> u64 {
+        self.checksum_errors
     }
 
     /// What a listener dropped for lack of room, as Linux counts
