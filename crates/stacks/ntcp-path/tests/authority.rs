@@ -755,3 +755,50 @@ fn batch_route_replacement_preflights_all_definitions_and_retires_old_ids() {
     assert_eq!(service.usage().routes, 0);
     assert_eq!(service.resolve(key.request()), Err(Error::NoRoute));
 }
+
+// A caller's own selection is acquired or rebound as made while nothing
+// selection reads changed since, and made again after any change: a
+// shadowing route, a Redirect-free route removal, a new source, a link.
+#[test]
+fn resolved_selections_are_taken_only_while_unchanged() {
+    let mut service = service(41);
+    let a = service.register_link(InterfaceKey(4), 1500).unwrap();
+    let b = service.register_link(InterfaceKey(9), 1400).unwrap();
+    let source = service.register_source(address("192.0.2.1"), a).unwrap();
+    let mut default = route(a, "0.0.0.0", 0);
+    default.next_hop = NextHop::Gateway(address("192.0.2.254"));
+    service.add_route(default).unwrap();
+    let req = request(source, "198.51.100.20");
+    let via = req.destination;
+    // Unchanged: the selection itself.
+    let resolved = service.resolve_via(req, via).unwrap();
+    let (client, snapshot) = service.acquire_resolved(req, via, resolved).unwrap();
+    assert_eq!(snapshot.key(), resolved.key());
+    // Stale: a shadowing route since; the selection now is taken.
+    let stale = service.resolve_via(req, via).unwrap();
+    let shadow = service.add_route(route(b, "198.51.100.0", 24)).unwrap();
+    let (client, snapshot) = service.rebind_resolved(client, req, via, stale).unwrap();
+    assert_eq!(snapshot.key().route(), shadow);
+    assert_eq!(snapshot.key().link(), b);
+    let stale = service.resolve_via(req, via).unwrap();
+    service.remove_route(shadow).unwrap();
+    let (other, snapshot) = service.acquire_resolved(req, via, stale).unwrap();
+    assert_eq!(snapshot.key().link(), a);
+    // A selection for other arguments is never taken for these.
+    let elsewhere = service
+        .resolve_via(request(source, "203.0.113.9"), address("203.0.113.9"))
+        .unwrap();
+    let (third, snapshot) = service.acquire_resolved(req, via, elsewhere).unwrap();
+    assert_eq!(snapshot.key().destination(), req.destination);
+    // No route now: the stale selection is refused, as `acquire_via` refuses.
+    let stale = service.resolve_via(req, via).unwrap();
+    service.remove_link(a).unwrap();
+    assert_eq!(
+        service.acquire_resolved(req, via, stale).map(|_| ()),
+        service.acquire_via(req, via).map(|_| ())
+    );
+    assert!(service.acquire_resolved(req, via, stale).is_err());
+    for client in [client, other, third] {
+        let _ = service.release(client);
+    }
+}

@@ -380,6 +380,12 @@ pub struct ResolvedPath {
     key: PathKey,
     first_hop_mtu: u32,
     link_version: u64,
+    // The service revision the selection was made at: every change of
+    // what selection reads (routes and their segments, sources and their
+    // owners, links, Redirect overrides) commits a newer one, so a
+    // selection made at the current revision is the selection now
+    // (`acquire_resolved`).
+    revision: u64,
 }
 
 impl ResolvedPath {
@@ -1153,6 +1159,7 @@ impl PathService {
                 ),
             };
         Ok(ResolvedPath {
+            revision: self.revision,
             key: PathKey {
                 context: self.context,
                 source: request.source,

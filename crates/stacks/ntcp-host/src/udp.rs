@@ -487,7 +487,7 @@ impl Host {
                 let via = crate::scoped(remote.ip(), zone)?;
                 let resolved = self.paths.resolve_via(request, via)?;
                 self.forwarding_resolved(resolved.key())?;
-                let (client, snapshot) = self.paths.acquire_via(request, via)?;
+                let (client, snapshot) = self.paths.acquire_resolved(request, via, resolved)?;
                 self.holders[client.index()] = crate::Holder::Flow(slot);
                 // The flow observes its initial path here (and through
                 // `udp_path_limits`); only later changes notify it.
@@ -799,8 +799,10 @@ impl Host {
                 let resolved = self.paths.resolve_via(request, via)?;
                 self.forwarding_resolved(resolved.key())?;
                 let (client, snapshot) = match flow.path {
-                    Some(old) => self.paths.rebind_via(old.client, request, via)?,
-                    None => self.paths.acquire_via(request, via)?,
+                    Some(old) => self
+                        .paths
+                        .rebind_resolved(old.client, request, via, resolved)?,
+                    None => self.paths.acquire_resolved(request, via, resolved)?,
                 };
                 self.holders[client.index()] = crate::Holder::Flow(slot);
                 PreparedPath { client, snapshot }

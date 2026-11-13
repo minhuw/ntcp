@@ -688,6 +688,50 @@ impl PathService {
     }
     pub fn acquire_via(&mut self, request: PathRequest, forwarding_destination: ScopedAddress) -> Result<(ClientId, PathSnapshot), Error> {
         let resolved = self.resolve_via(request, forwarding_destination)?;
+        self.acquire_selected(resolved)
+    }
+    /// `acquire_via(request, forwarding_destination)` after the caller's
+    /// own `resolve_via` of the same arguments gave `resolved`, which it
+    /// checked: that selection is taken while the service is unchanged
+    /// since (as Linux connects on the route ip_route_connect chose), and
+    /// made again otherwise.
+    pub fn acquire_resolved(
+        &mut self,
+        request: PathRequest,
+        forwarding_destination: ScopedAddress,
+        resolved: ResolvedPath,
+    ) -> Result<(ClientId, PathSnapshot), Error> {
+        let resolved = self.reselect(request, forwarding_destination, resolved)?;
+        self.acquire_selected(resolved)
+    }
+    // `resolved` if it is what `resolve_via(request, forwarding_destination)`
+    // gives now, which it is when it was selected for these arguments at
+    // the current revision; that selection made again otherwise.
+    fn reselect(
+        &self,
+        request: PathRequest,
+        forwarding_destination: ScopedAddress,
+        resolved: ResolvedPath,
+    ) -> Result<ResolvedPath, Error> {
+        let key = resolved.key;
+        if resolved.revision == self.revision
+            && key.context == self.context
+            && key.request() == request
+            && (key.forwarding_destination == forwarding_destination
+                || forwarding_destination == request.destination)
+        {
+            debug_assert_eq!(
+                self.resolve_via(request, forwarding_destination),
+                Ok(resolved)
+            );
+            return Ok(resolved);
+        }
+        self.resolve_via(request, forwarding_destination)
+    }
+    fn acquire_selected(
+        &mut self,
+        resolved: ResolvedPath,
+    ) -> Result<(ClientId, PathSnapshot), Error> {
         let client_slot = *self.free_clients.last().ok_or(Error::Capacity)?;
         let (index, new) = self.path_slot(resolved.key)?;
         let needed = if new { 2 } else { 1 };
@@ -739,8 +783,29 @@ impl PathService {
         request: PathRequest,
         forwarding_destination: ScopedAddress,
     ) -> Result<(ClientId, PathSnapshot), Error> {
-        let old = self.clients.get(self.context, client.0)?;
+        self.clients.get(self.context, client.0)?;
         let resolved = self.resolve_via(request, forwarding_destination)?;
+        self.rebind_selected(client, resolved)
+    }
+    /// `rebind_via` after the caller's own `resolve_via` of the same
+    /// arguments gave `resolved`, as `acquire_resolved`.
+    pub fn rebind_resolved(
+        &mut self,
+        client: ClientId,
+        request: PathRequest,
+        forwarding_destination: ScopedAddress,
+        resolved: ResolvedPath,
+    ) -> Result<(ClientId, PathSnapshot), Error> {
+        self.clients.get(self.context, client.0)?;
+        let resolved = self.reselect(request, forwarding_destination, resolved)?;
+        self.rebind_selected(client, resolved)
+    }
+    fn rebind_selected(
+        &mut self,
+        client: ClientId,
+        resolved: ResolvedPath,
+    ) -> Result<(ClientId, PathSnapshot), Error> {
+        let old = self.clients.get(self.context, client.0)?;
         let (index, new) = self.path_slot(resolved.key)?;
         if !new && self.slot_path(index) == old.path {
             return Ok((client, self.snapshot(client)?));

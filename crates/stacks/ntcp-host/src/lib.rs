@@ -1333,7 +1333,8 @@ impl Host {
             )?;
             let resolved = self.paths.resolve_via(request, via)?;
             self.forwarding_resolved(resolved.key())?;
-            let (rebound_client, rebound) = self.paths.rebind_via(client, request, via)?;
+            let (rebound_client, rebound) =
+                self.paths.rebind_resolved(client, request, via, resolved)?;
             client = rebound_client;
             let now = self.now;
             self.bindings[index].as_mut().unwrap().rebind(
@@ -1431,7 +1432,9 @@ impl Host {
         let via = scoped(old.forwarding_destination, old.zone)?;
         let resolved = self.paths.resolve_via(request, via)?;
         self.forwarding_resolved(resolved.key())?;
-        let (client, snapshot) = self.paths.rebind_via(binding.client, request, via)?;
+        let (client, snapshot) =
+            self.paths
+                .rebind_resolved(binding.client, request, via, resolved)?;
         let prepared = PreparedPath { client, snapshot };
         // The same source/destination/context was preflighted above. Core's
         // application does no allocation and permits this exact rebind.
@@ -2617,7 +2620,8 @@ impl Host {
                 let resolved = self.paths.resolve_via(request, via)?;
                 self.forwarding_resolved(resolved.key())?;
                 let (client, rebound) =
-                    self.paths.rebind_via(lease.prepared.client, request, via)?;
+                    self.paths
+                        .rebind_resolved(lease.prepared.client, request, via, resolved)?;
                 snapshot = rebound;
                 PreparedPath { client, snapshot }
             } else {
@@ -2646,7 +2650,7 @@ impl Host {
             let via = scoped(destination, zone)?;
             let resolved = self.paths.resolve_via(request, via)?;
             self.forwarding_resolved(resolved.key())?;
-            let (client, snapshot) = self.paths.acquire_via(request, via)?;
+            let (client, snapshot) = self.paths.acquire_resolved(request, via, resolved)?;
             let prepared = PreparedPath { client, snapshot };
             self.leases[index] = Some(Lease { attempt, prepared });
             prepared
@@ -3552,7 +3556,7 @@ impl PathProvider for Host {
         let via = scoped(destination, zone)?;
         let resolved = self.paths.resolve_via(request, via)?;
         self.forwarding_resolved(resolved.key())?;
-        let (client, snapshot) = self.paths.acquire_via(request, via)?;
+        let (client, snapshot) = self.paths.acquire_resolved(request, via, resolved)?;
         self.holders[client.index()] = Holder::Binding(index);
         let prepared = PreparedPath { client, snapshot };
         // A planned open is authorized for exactly the authority selected

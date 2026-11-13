@@ -915,7 +915,7 @@ impl Host {
         let via = ScopedAddress::new(entry.ip.destination, None)?;
         let resolved = self.paths.resolve_via(request, via)?;
         self.forwarding_resolved(resolved.key())?;
-        let (client, snapshot) = self.paths.acquire_via(request, via)?;
+        let (client, snapshot) = self.paths.acquire_resolved(request, via, resolved)?;
         self.paths.release(client)?;
         if snapshot.status() != PathStatus::Valid {
             return Err(Error::Obsolete);
