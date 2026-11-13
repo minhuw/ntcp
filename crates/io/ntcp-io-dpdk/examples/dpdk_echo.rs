@@ -592,6 +592,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 // The members only open connections, from ports whose flows
                 // they own: none takes another's SYN.
                 redirected_flows: 0,
+                ..SharedFlowLimits::default()
             };
             Some(steer(&port, &args, limits)?)
         }

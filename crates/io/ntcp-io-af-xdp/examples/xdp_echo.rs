@@ -497,6 +497,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
                 // The members only open connections, from ports whose flows
                 // they own: none takes another's SYN.
                 redirected_flows: 0,
+                ..SharedFlowLimits::default()
             };
             // Flows no port rule steers are hashed: with the device's RSS
             // when it places them at their owners, else with ntcp's own key.

@@ -84,6 +84,9 @@ impl<P: PacketIo> Network<P> {
         if let Some(inlet) = &self.inlet {
             inlet.begin();
         }
+        // After the wake is taken: memory another member returned since
+        // wakes this member's waiting writers.
+        self.endpoint.poll_shared_memory();
         self.advance_time(now)?;
         let mut report = DriveReport::default();
         // Take reusable scratch out of the owner while processed datagrams
@@ -94,6 +97,13 @@ impl<P: PacketIo> Network<P> {
         let result = self.drive_inner(now, budget, &mut rx, &mut completed, &mut report);
         self.rx = rx;
         self.completed = completed;
+        // Memory this member returned to the group wakes the members whose
+        // writers wait for it.
+        if self.endpoint.take_memory_returned()
+            && let Some(flows) = &self.flows
+        {
+            flows.wake_memory_waiters();
+        }
         self.counters.received += report.received as u64;
         self.counters.transmitted += report.transmitted as u64;
         self.counters.discarded += report.discarded as u64;

@@ -43,7 +43,7 @@ mod hystart;
 mod ipv4_options;
 mod loss_counters;
 mod memory;
-pub use memory::{BufferMemory, MemoryCounters};
+pub use memory::{BufferMemory, MemoryCounters, SharedBufferMemory};
 mod pacing;
 mod pmtud;
 pub use pmtud::{

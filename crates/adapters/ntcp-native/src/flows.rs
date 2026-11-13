@@ -83,7 +83,12 @@ pub enum FlowOwnership {
     },
 }
 
-/// Storage of a `SharedFlows`, allocated by `SharedFlows::new`.
+/// Storage of a `SharedFlows`, allocated by `SharedFlows::new`, and the
+/// buffer memory its members share. `SharedFlowLimits::new` and `Default`
+/// (whose counts are zero, which `SharedFlows::new` refuses, for struct
+/// literals ending in `..Default::default()`) set the memory fields to
+/// their defaults: one budget, the sum of the members' own, charged in
+/// 1 MiB batches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SharedFlowLimits {
     /// Members, numbered from 0; `FlowOwnership::Hash` tables name them.
@@ -106,6 +111,52 @@ pub struct SharedFlowLimits {
     /// does not listen (`Counters::redirects_dropped`), and its peer sends
     /// it again.
     pub redirected_flows: usize,
+    /// The thresholds of the buffer memory the members share
+    /// (`ntcp::SharedBufferMemory`), as Linux's tcp_mem is one for every
+    /// CPU: the hard cap, and where pressure begins and ends, for the
+    /// members' charges together. None (the default) sums the thresholds
+    /// of the members present (`EndpointConfig::buffer_memory` of each
+    /// one's `tcp`), so the group holds what its members held apart.
+    pub buffer_memory: Option<ntcp::BufferMemory>,
+    /// The bytes a member charges or returns before it publishes them to
+    /// the shared count: Linux's net.core.mem_pcpu_rsv, by default its
+    /// SK_MEMORY_PCPU_RESERVE of 1 MiB (`ntcp::SharedBufferMemory::
+    /// DEFAULT_BATCH`). What a member sees of the others' charge lags by at
+    /// most members × batch. 0 gives each member its own budget instead,
+    /// as a lone Network has.
+    pub memory_batch_bytes: usize,
+}
+
+impl SharedFlowLimits {
+    /// Limits with the default buffer memory: one budget summing the
+    /// members', charged in batches of 1 MiB.
+    pub fn new(
+        members: usize,
+        inbox_packets: usize,
+        packet_bytes: usize,
+        redirected_flows: usize,
+    ) -> Self {
+        Self {
+            members,
+            inbox_packets,
+            packet_bytes,
+            redirected_flows,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for SharedFlowLimits {
+    fn default() -> Self {
+        Self {
+            members: 0,
+            inbox_packets: 0,
+            packet_bytes: 0,
+            redirected_flows: 0,
+            buffer_memory: None,
+            memory_batch_bytes: ntcp::SharedBufferMemory::DEFAULT_BATCH,
+        }
+    }
 }
 
 /// The divided flows of one port, shared by the Networks built on it with
@@ -125,6 +176,8 @@ struct Shared {
     // under the registry's lock, read without it for a SYN its owner has
     // no listener for, which then takes no lock unless a member listens.
     listened: Box<[AtomicU64]>,
+    // The members' shared buffer memory, unless each keeps its own.
+    memory: Option<ntcp::SharedBufferMemory>,
 }
 
 enum Ownership {
@@ -414,6 +467,21 @@ struct Wake {
     file: Mutex<Option<Arc<File>>>,
 }
 
+impl Wake {
+    // Sets `woken`, and writes the descriptor if this set it.
+    fn wake(&self) {
+        if !self.woken.load(Ordering::Relaxed)
+            && !self.woken.swap(true, Ordering::Relaxed)
+            && self.armed.load(Ordering::Relaxed)
+            && let Some(file) = &*lock(&self.file)
+        {
+            // An eventfd's count only grows; a descriptor that would block
+            // is already readable.
+            let _ = (&**file).write(&1u64.to_ne_bytes());
+        }
+    }
+}
+
 struct Registry {
     // The local ports members listen on, ascending, each with a member
     // that listens on it, once per listener: the sockets of a port's
@@ -519,6 +587,15 @@ impl SharedFlows {
             .try_reserve_exact(1 << 10)
             .map_err(|_| Error::Capacity)?;
         listened.resize_with(1 << 10, AtomicU64::default);
+        let memory = match limits.memory_batch_bytes {
+            0 => None,
+            batch => Some(
+                ntcp::SharedBufferMemory::new(limits.members, limits.buffer_memory, batch)
+                    .map_err(|_| {
+                        Error::InvalidConfig("shared buffer memory needs low < pressure <= its cap")
+                    })?,
+            ),
+        };
         Ok(Self {
             shared: Arc::new(Shared {
                 ownership,
@@ -526,12 +603,19 @@ impl SharedFlows {
                 slots: slots.into_boxed_slice(),
                 registry: Mutex::new(registry),
                 listened: listened.into_boxed_slice(),
+                memory,
             }),
         })
     }
 
     pub fn limits(&self) -> SharedFlowLimits {
         self.shared.limits
+    }
+
+    /// The buffer memory the members share, None if each keeps its own
+    /// (`SharedFlowLimits::memory_batch_bytes` 0).
+    pub fn buffer_memory(&self) -> Option<&ntcp::SharedBufferMemory> {
+        self.shared.memory.as_ref()
     }
 
     /// The member that owns the TCP flow between `local` and `remote`. Under
@@ -1078,17 +1162,30 @@ impl Member {
         // owner's clear before its reads of the inbox (`Wake`); the swap
         // only elects the one handoff that writes.
         fence(Ordering::SeqCst);
-        let wake = &slot.wake;
-        if !wake.woken.load(Ordering::Relaxed)
-            && !wake.woken.swap(true, Ordering::Relaxed)
-            && wake.armed.load(Ordering::Relaxed)
-            && let Some(file) = &*lock(&wake.file)
-        {
-            // An eventfd's count only grows; a descriptor that would block
-            // is already readable.
-            let _ = (&**file).write(&1u64.to_ne_bytes());
-        }
+        slot.wake.wake();
         true
+    }
+    /// This member's endpoint joins the members' shared buffer memory, if
+    /// they share one.
+    pub(crate) fn share_buffer_memory(&self, endpoint: &mut ntcp::Endpoint) -> Result<()> {
+        if let Some(memory) = &self.shared.memory {
+            endpoint.share_buffer_memory(memory, self.index)?;
+        }
+        Ok(())
+    }
+    /// This member returned memory to the shared budget: wake every other
+    /// member whose writers wait for memory, which looks again as its next
+    /// drive begins (`Endpoint::poll_shared_memory`). The return was
+    /// published before the flags are read (`SharedBufferMemory::waiting`).
+    pub(crate) fn wake_memory_waiters(&self) {
+        let Some(memory) = &self.shared.memory else {
+            return;
+        };
+        for (index, slot) in self.shared.slots.iter().enumerate() {
+            if index != self.index && memory.waiting(index) {
+                slot.wake.wake();
+            }
+        }
     }
     /// Whether this member may hand SYNs to listening members and hold
     /// flows of other members' shares: unless ownership is by address.
@@ -1358,6 +1455,7 @@ mod tests {
             inbox_packets: 2,
             packet_bytes: MTU,
             redirected_flows: 2,
+            ..SharedFlowLimits::default()
         }
     }
     fn hashed(members: usize, table: Vec<usize>) -> SharedFlows {

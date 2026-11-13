@@ -563,6 +563,7 @@ fn members_of_hashed_shared_flows_reassemble_alike() {
         inbox_packets: 4,
         packet_bytes: 1500,
         redirected_flows: 4,
+        ..SharedFlowLimits::default()
     };
     let address = IpAddr::V4(Ipv4Addr::new(10, 9, 0, 1));
     let join = |flows: &SharedFlows, member, config: NetworkConfig| {

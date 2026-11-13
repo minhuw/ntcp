@@ -137,6 +137,7 @@ fn limits(members: usize, inbox_packets: usize) -> SharedFlowLimits {
         inbox_packets,
         packet_bytes: 1500,
         redirected_flows: MEMBER_CONNECTIONS,
+        ..SharedFlowLimits::default()
     }
 }
 fn hash_flows(members: usize, inbox_packets: usize) -> SharedFlows {

@@ -93,6 +93,7 @@ fn limits(members: usize) -> SharedFlowLimits {
         inbox_packets: 64,
         packet_bytes: 1500,
         redirected_flows: 64,
+        ..SharedFlowLimits::default()
     }
 }
 fn neighbors(members: usize) -> SharedNeighbors {
@@ -622,4 +623,221 @@ fn the_inbox_and_the_queue_share_a_drives_receive_budget() {
     queue(second, 20);
     assert_eq!(receive(second, STEP, 8), (7, 1));
     assert_eq!(second.network.counters().handoffs_dropped, 0);
+}
+
+// Two members of one address, each with a buffer budget of one connection
+// at open beside its reservations plus `extra`, sharing those budgets as
+// one charged in 1-byte batches; each opens one connection to the peer.
+fn shared_memory_lan(extra: usize) -> (Lan, SharedFlows, Vec<ConnId>) {
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: vec![0, 1],
+    };
+    let limits = SharedFlowLimits {
+        memory_batch_bytes: 1,
+        ..limits(2)
+    };
+    let flows = SharedFlows::new(ownership, limits).unwrap();
+    let table = neighbors(2);
+    let members = (0..2)
+        .map(|k| {
+            Station::new(|port| {
+                let mut config = config(SHARED, PORT_MAC);
+                config.tcp.max_buffer_bytes = config.buffer_budget(1, &port).unwrap() + extra;
+                Network::with_shared_flows(config, port, [7; 32], 0, Some(&table), &flows, k)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut lan = lan(members);
+    let listener = lan.peer.network.listen(PEER_SERVICE, 4).unwrap();
+    let to = SocketAddr::new(PEER.into(), PEER_SERVICE);
+    let ids: Vec<ConnId> = lan
+        .members
+        .iter_mut()
+        .map(|m| m.network.connect(to).unwrap())
+        .collect();
+    let established = |lan: &Lan| {
+        (0..2).all(|k| {
+            lan.members[k]
+                .network
+                .connection_info(ids[k])
+                .unwrap()
+                .state
+                == State::Established
+        })
+    };
+    while !established(&lan) {
+        assert!(lan.now < 5 * SECOND, "connections established");
+        lan.step();
+        while lan.peer.network.accept(listener).is_ok() {}
+    }
+    (lan, flows, ids)
+}
+
+fn drained(network: &mut Network<Port>) -> Vec<Event> {
+    let mut result = Vec::new();
+    let mut out = [Event::NetworkStopped; 8];
+    loop {
+        let report = network.drain_events(&mut out);
+        result.extend_from_slice(&out[..report.written]);
+        if !report.more {
+            return result;
+        }
+    }
+}
+
+// Members of shared flows charge one budget, the sum of theirs: memory one
+// member holds is refused to another, whose writer waits; when the first
+// member's connection goes and returns its storage, its drive writes the
+// waiting member's wake descriptor, and that member's next drive makes its
+// writer writable (sk_stream_write_space after another CPU's release).
+#[cfg(target_os = "linux")]
+#[test]
+fn members_share_one_buffer_budget_and_wake_each_others_writers() {
+    use std::{
+        fs::File,
+        io::Read,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    };
+    // Two segments: the send space, rounded down to whole segments.
+    let data = vec![5u8; 2896];
+    // What a full write charges, with room to spare.
+    let (mut lan, flows, ids) = shared_memory_lan(1 << 30);
+    let memory = flows.buffer_memory().unwrap();
+    let charged = |lan: &Lan| -> usize {
+        lan.members
+            .iter()
+            .map(|m| m.network.counters().buffer_bytes)
+            .sum()
+    };
+    assert_eq!(memory.buffer_bytes(), charged(&lan));
+    assert_eq!(memory.connections(), 2);
+    let caps: usize = (0..2)
+        .map(|_| config(SHARED, PORT_MAC).buffer_budget(1, &port()).unwrap() + (1 << 30))
+        .sum();
+    assert_eq!(memory.buffer_memory().high, caps);
+    let before = lan.members[0].network.counters().buffer_bytes;
+    let receipt = lan.members[0]
+        .network
+        .try_write(ids[0], &data, WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, data.len());
+    let write = lan.members[0].network.counters().buffer_bytes - before;
+    drop((lan, flows));
+
+    // Room for one such write in the group, and a half.
+    let (mut lan, flows, ids) = shared_memory_lan(write * 3 / 4);
+    let memory = flows.buffer_memory().unwrap().clone();
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let wake = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let dup = unsafe { libc::dup(wake.as_raw_fd()) };
+    lan.members[1]
+        .network
+        .set_neighbor_wake_fd(unsafe { OwnedFd::from_raw_fd(dup) })
+        .unwrap();
+    let signalled = |file: &File| {
+        let mut entry = libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut entry, 1, 0) } > 0;
+        if ready {
+            let _ = (&*file).read(&mut [0; 8]);
+        }
+        ready
+    };
+    // Member 0 takes more than its own budget's room: the group's.
+    let receipt = lan.members[0]
+        .network
+        .try_write(ids[0], &data, WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, data.len());
+    let taken = match lan.members[1]
+        .network
+        .try_write(ids[1], &data, WriteOptions::default())
+    {
+        Ok(receipt) => receipt.accepted,
+        Err(error) => {
+            assert!(matches!(error, Error::WouldBlock(_)), "{error:?}");
+            0
+        }
+    };
+    assert!(taken < data.len());
+    assert_eq!(lan.members[1].network.counters().memory_throttled_writes, 1);
+    assert!(memory.waiting(1));
+    assert!(
+        lan.members
+            .iter()
+            .all(|m| m.network.counters().memory_pressure)
+    );
+    assert_eq!(memory.buffer_bytes(), charged(&lan));
+    lan.step();
+    drained(&mut lan.members[1].network);
+    signalled(&wake);
+    // Member 0's connection goes: its storage returns to the group.
+    lan.members[0].network.abort(ids[0]).unwrap();
+    let held = lan.members[0].network.counters().buffer_bytes;
+    let mut woken = false;
+    // A pooled receive ring stays charged; the send storage goes.
+    while lan.members[0].network.counters().buffer_bytes > held - write / 2 {
+        assert!(lan.now < 200 * SECOND, "member 0 returned its storage");
+        lan.now += SECOND;
+        lan.step();
+        // Its Closed event drained, the connection is released.
+        drained(&mut lan.members[0].network);
+        woken |= signalled(&wake);
+    }
+    assert!(woken, "member 1's descriptor was written");
+    assert!(!memory.waiting(1));
+    // Its writer takes the rest now.
+    let receipt = lan.members[1]
+        .network
+        .try_write(ids[1], &data[taken..], WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, data.len() - taken);
+    assert_eq!(lan.members[1].network.counters().memory_throttled_writes, 1);
+    assert_eq!(memory.buffer_bytes(), charged(&lan));
+}
+
+// Shared flows share buffer memory by default, in Linux's 1 MiB batches;
+// a batch of 0 leaves each member its own budget, and fixed thresholds
+// must be ordered.
+#[test]
+fn shared_flows_share_buffer_memory_unless_told_not_to() {
+    let ownership = || FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: vec![0, 1],
+    };
+    assert_eq!(limits(2).memory_batch_bytes, 1 << 20);
+    assert_eq!(
+        SharedFlowLimits::new(2, 64, 1500, 64),
+        limits(2),
+        "new gives the defaults"
+    );
+    let flows = SharedFlows::new(ownership(), limits(2)).unwrap();
+    assert!(flows.buffer_memory().is_some());
+    let apart = SharedFlowLimits {
+        memory_batch_bytes: 0,
+        ..limits(2)
+    };
+    assert!(
+        SharedFlows::new(ownership(), apart)
+            .unwrap()
+            .buffer_memory()
+            .is_none()
+    );
+    for (low, pressure, high, valid) in [(1, 2, 3, true), (2, 2, 3, false), (1, 4, 3, false)] {
+        let fixed = SharedFlowLimits {
+            buffer_memory: Some(ntcp::BufferMemory {
+                low,
+                pressure,
+                high,
+            }),
+            ..limits(2)
+        };
+        assert_eq!(SharedFlows::new(ownership(), fixed).is_ok(), valid);
+    }
 }

@@ -641,6 +641,11 @@ impl<P: PacketIo> Network<P> {
                 },
             )?;
         host.attach(&mut endpoint)?;
+        // A member charges its group's buffer memory, its output
+        // reservations included.
+        if let Some(member) = &flows {
+            member.share_buffer_memory(&mut endpoint)?;
+        }
         let gso = config.gso(&io);
         endpoint.enable_output_reservations_with_packet_bytes(
             owners,

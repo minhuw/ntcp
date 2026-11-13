@@ -587,11 +587,8 @@ pub struct Endpoint {
     isn_clock: u32,
     last_isn_time: Instant,
     slots: Vec<Option<Slot>>,
-    // The occupied `slots`, for counts over live connections, and their
-    // number (Linux's sockets_allocated, for the fair share under memory
-    // pressure).
+    // The occupied `slots`, for counts over live connections.
     occupied: ReadyQueue,
-    live: usize,
     generations: Vec<u64>,
     free: Vec<usize>,
     listeners: Vec<Option<Listener>>,
@@ -812,7 +809,6 @@ impl Endpoint {
             passive_errors,
             tuples: TupleTable::new(count)?,
             occupied: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
-            live: 0,
             output: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             advice: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             events: ReadyQueue::new(event_capacity).map_err(|_| Error::NoMemory)?,
@@ -1526,16 +1522,23 @@ impl Endpoint {
         Ok(())
     }
 
-    // Remaining endpoint buffer budget, before any caller-specific credit.
+    // Remaining endpoint buffer budget, before any caller-specific credit:
+    // its own, or its group's as it sees it.
     fn buffer_room(&self) -> usize {
-        self.config
-            .max_buffer_bytes
-            .saturating_sub(self.budget.charged())
+        self.budget
+            .high(self.config.max_buffer_bytes)
+            .saturating_sub(self.budget.allocated())
+    }
+
+    // The thresholds in force: the group's for a member of shared buffer
+    // memory (`share_buffer_memory`), else the configuration's.
+    fn memory(&self) -> crate::BufferMemory {
+        self.budget.memory(self.config.buffer_memory())
     }
 
     // Charge `bytes` to the budget.
     fn charge(&mut self, bytes: usize) {
-        let memory = self.config.buffer_memory();
+        let memory = self.memory();
         self.budget.raise(bytes, self.now, memory);
     }
 
@@ -1547,7 +1550,7 @@ impl Endpoint {
     // waiters it wakes and one more, so a return with none waiting costs
     // one check.
     fn uncharge(&mut self, bytes: usize) {
-        let memory = self.config.buffer_memory();
+        let memory = self.memory();
         self.budget.reduce(bytes, self.now, memory);
         self.wake_memory_waiters();
     }
@@ -1952,7 +1955,7 @@ impl Endpoint {
         }
         self.free.pop();
         self.occupied.push(index);
-        self.live += 1;
+        self.budget.open_socket();
         let fast_open_owner = if connection.fast_open_early {
             listener
         } else {
@@ -2779,19 +2782,11 @@ impl Endpoint {
         let charge = connection
             .resize_peak_charge(receive)
             .ok_or(EndpointError::LimitReached)?;
-        if charge
-            > self
-                .config
-                .max_buffer_bytes
-                .saturating_sub(self.budget.charged() - old)
-        {
+        let max_charge = self.buffer_room().saturating_add(old);
+        if charge > max_charge {
             self.memory_refused_growths += 1;
             return Err(EndpointError::LimitReached);
         }
-        let max_charge = self
-            .config
-            .max_buffer_bytes
-            .saturating_sub(self.budget.charged() - old);
         let result = self
             .slot_mut(id)?
             .connection
@@ -2829,7 +2824,7 @@ impl Endpoint {
         let total = Connection::open_bytes(capacities.1, usize::from(self.config.connection.mss))
             .and_then(|bytes| bytes.checked_add(metadata))
             .ok_or(Error::NoMemory)?;
-        if total > self.config.max_buffer_bytes {
+        if total > self.memory().high {
             return Err(Error::NoMemory.into());
         }
         Ok(())
@@ -3010,7 +3005,7 @@ impl Endpoint {
         debug_assert!(!self.is_output_reserved(id));
         let slot = self.slots[index].take().unwrap();
         self.occupied.remove(index);
-        self.live -= 1;
+        self.budget.close_socket();
         let tuple = slot.connection.scoped_tuple();
         if slot.mapped {
             self.tuples.remove(self.hash(tuple), tuple, index);
@@ -4146,7 +4141,7 @@ impl Endpoint {
         let available = self
             .send_growth_room(connection, own_charge)
             .saturating_add(own_charge);
-        let before = self.budget.charged();
+        let before = self.budget.allocated();
         let refused = self
             .slot_mut(id)?
             .connection
@@ -4159,7 +4154,7 @@ impl Endpoint {
             // As __sk_mem_raise_allocated, the allocation tried enters
             // pressure if it passes the threshold, refused or not, and a
             // suppressed send allocation moderates the send limit.
-            let memory = self.config.buffer_memory();
+            let memory = self.memory();
             self.budget
                 .attempted(before.saturating_add(wanted), self.now, memory);
             if self.budget.under_pressure() {
@@ -4183,13 +4178,13 @@ impl Endpoint {
         if !connection.send_tuned() || connection.send_below_min() {
             return room;
         }
-        let memory = self.config.buffer_memory();
-        if charge.saturating_mul(self.live) < memory.high {
+        let memory = self.memory();
+        if charge.saturating_mul(self.budget.sockets()) < memory.high {
             room
         } else if self.budget.under_pressure() {
             0
         } else {
-            room.min(memory.pressure.saturating_sub(self.budget.charged()))
+            room.min(memory.pressure.saturating_sub(self.budget.allocated()))
         }
     }
 
@@ -4198,6 +4193,12 @@ impl Endpoint {
         self.memory_throttled_writes += 1;
         self.memory_refused_growths += 1;
         self.memory_waiters.push(index);
+        // A member of shared buffer memory flags its waiters for the others
+        // to wake it, then looks for memory they returned meanwhile.
+        self.budget.set_waiting(true);
+        if self.budget.poll_returns() {
+            self.wake_memory_waiters();
+        }
     }
 
     // Memory came back to the budget. As Linux's sk_stream_write_space
@@ -4215,6 +4216,7 @@ impl Endpoint {
         let mut room = self.buffer_room();
         loop {
             let Some(index) = self.memory_waiters.iter().next() else {
+                self.budget.set_waiting(false);
                 break;
             };
             self.memory_waiters.remove(index);
@@ -5441,6 +5443,48 @@ impl Endpoint {
     /// `__sk_mem_reduce_allocated`).
     pub fn memory_pressure(&self) -> bool {
         self.budget.under_pressure()
+    }
+
+    /// Join `shared` as its member `owner` (`SharedBufferMemory`): from now
+    /// on this endpoint charges the group's budget, in batches, against the
+    /// group's thresholds, and is under pressure whenever the group is.
+    /// All it charged and holds open moves into the group; dropping the
+    /// endpoint takes it out again. Once, and `owner` not another
+    /// member's (InvalidArgument).
+    pub fn share_buffer_memory(
+        &mut self,
+        shared: &crate::SharedBufferMemory,
+        owner: usize,
+    ) -> Result<(), EndpointError> {
+        let own = self.config.buffer_memory();
+        self.budget.share(shared, owner, own, self.now)?;
+        if !self.memory_waiters.is_empty() {
+            self.budget.set_waiting(true);
+        }
+        self.wake_memory_waiters();
+        Ok(())
+    }
+
+    /// For a member of shared buffer memory: wake the writers waiting for
+    /// memory if another member returned some, or pressure ended, since the
+    /// last look. One atomic load when nothing came back. Call it as each
+    /// drive begins; true if it looked again.
+    #[inline]
+    pub fn poll_shared_memory(&mut self) -> bool {
+        if !self.budget.poll_returns() {
+            return false;
+        }
+        self.wake_memory_waiters();
+        true
+    }
+
+    /// For a member of shared buffer memory: whether this endpoint returned
+    /// memory to its group since the last call (a batch published back, or
+    /// the end of pressure). Then the members `SharedBufferMemory::waiting`
+    /// names should drive and `poll_shared_memory`.
+    #[inline]
+    pub fn take_memory_returned(&mut self) -> bool {
+        self.budget.take_returned()
     }
 
     /// The endpoint's buffer memory gauges and counters (`MemoryCounters`).
@@ -9061,5 +9105,119 @@ mod memory_wait_tests {
         assert!(a.memory_waiters.is_empty());
         assert!(writable(&mut a, writer));
         assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+    }
+
+    // Two endpoints of one group, charging through reserves of `batch`
+    // bytes: the group sees each member's charge late by less than one
+    // batch, members share one pressure state and connection count, and a
+    // member that goes takes its charge out.
+    #[test]
+    fn shared_buffer_memory_publishes_in_batches_with_bounded_lag() {
+        let (mut a, mut b, listener) = endpoints();
+        connect(&mut a, &mut b, listener, 40000);
+        connect(&mut a, &mut b, listener, 40001);
+        let (base_a, base_b) = (a.buffer_bytes(), b.buffer_bytes());
+        let base = base_a + base_b;
+        let memory = crate::BufferMemory {
+            low: base + 3000,
+            pressure: base + 6000,
+            high: base + 10_000,
+        };
+        let batch = 1000;
+        let group = crate::SharedBufferMemory::new(2, Some(memory), batch).unwrap();
+        a.share_buffer_memory(&group, 0).unwrap();
+        assert_eq!(
+            b.share_buffer_memory(&group, 0),
+            Err(Error::InvalidArgument.into())
+        );
+        b.share_buffer_memory(&group, 1).unwrap();
+        assert_eq!(
+            a.share_buffer_memory(&group, 1),
+            Err(Error::InvalidArgument.into())
+        );
+        assert_eq!(group.buffer_bytes(), base);
+        assert_eq!(group.connections(), 4);
+        assert_eq!(a.budget.sockets(), 4);
+        // Below a batch nothing is published; each member sees its own.
+        a.charge(999);
+        b.charge(999);
+        assert_eq!(group.buffer_bytes(), base);
+        assert_eq!(a.budget.allocated(), base + 999);
+        let truth = a.buffer_bytes() + b.buffer_bytes();
+        assert!(truth - group.buffer_bytes() < 2 * batch);
+        a.charge(1);
+        assert_eq!(group.buffer_bytes(), base + 1000);
+        assert_eq!(b.budget.allocated(), base + 1000 + 999);
+        // Past the group's pressure threshold both members are in pressure,
+        // and the group counts one entry.
+        a.charge(5000);
+        assert_eq!(group.buffer_bytes(), base + 6000);
+        assert!(!a.memory_pressure());
+        a.charge(1);
+        assert!(a.memory_pressure() && b.memory_pressure() && group.memory_pressure());
+        assert_eq!(b.memory_counters().memory_pressures, 1);
+        // The room each sees is the group's.
+        assert_eq!(b.buffer_room(), memory.high - (base + 6000 + 999));
+        // A return that brings the group to low ends it for both, seen
+        // through what has been published.
+        a.uncharge(2000);
+        assert_eq!(group.buffer_bytes(), base + 4001);
+        assert!(a.memory_pressure());
+        b.uncharge(999);
+        assert!(b.memory_pressure(), "the group is above low");
+        a.uncharge(1000);
+        assert_eq!(group.buffer_bytes(), base + 3001);
+        assert!(a.memory_pressure(), "above low");
+        // The member's own reserve counts in what it sees.
+        a.uncharge(1);
+        assert_eq!(group.buffer_bytes(), base + 3001);
+        assert!(!a.memory_pressure() && !b.memory_pressure());
+        assert!(a.take_memory_returned());
+        assert!(!a.take_memory_returned());
+        assert_eq!(a.memory_counters().memory_pressures, 1);
+        assert_eq!(a.memory_counters().buffer_bytes, base_a + 3000);
+        // b leaves: its charge and connections go with it.
+        assert_eq!(b.buffer_bytes(), base_b);
+        drop(b);
+        assert_eq!(group.buffer_bytes(), base_a + 3001);
+        assert_eq!(group.connections(), 2);
+    }
+
+    // A member whose writer waits for memory is flagged; another member
+    // that returns memory says so, and the waiting member's next poll wakes
+    // the writer (sk_stream_write_space after another CPU's release).
+    #[test]
+    fn shared_buffer_memory_returned_by_one_member_wakes_anothers_writer() {
+        let (mut a, mut b, listener) = endpoints();
+        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        writable(&mut a, writer);
+        // Storage b will give back.
+        b.charge(10_000);
+        let base = a.buffer_bytes() + b.buffer_bytes();
+        let memory = crate::BufferMemory {
+            low: 0,
+            pressure: base,
+            high: base,
+        };
+        let group = crate::SharedBufferMemory::new(2, Some(memory), 1).unwrap();
+        a.share_buffer_memory(&group, 0).unwrap();
+        b.share_buffer_memory(&group, 1).unwrap();
+        assert!(!group.waiting(0));
+        let data: Vec<u8> = (0..64).collect();
+        assert_eq!(a.write(writer, &data), Ok(7));
+        assert!(group.waiting(0));
+        assert!(!writable(&mut a, writer));
+        assert!(!a.poll_shared_memory());
+        b.uncharge(10_000);
+        assert!(b.take_memory_returned());
+        assert!(group.waiting(0));
+        assert!(!writable(&mut a, writer));
+        assert!(a.poll_shared_memory());
+        assert!(!group.waiting(0));
+        assert!(!a.poll_shared_memory());
+        exchange(&mut a, &mut b, 1);
+        assert!(writable(&mut a, writer));
+        assert_eq!(a.write(writer, &data[7..]), Ok(57));
     }
 }
