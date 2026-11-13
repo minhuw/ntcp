@@ -205,7 +205,10 @@ impl Owner {
             };
             (cid, 0)
         };
-        if let Err(e) = self.apply_options(cid, &options) {
+        if let Err(e) = self
+            .lock_buffers(cid, &options)
+            .and_then(|()| self.apply_options(cid, &options))
+        {
             // Serialized factory: no input or output can have observed this
             // active generation. Cancel it without leaving a retained slot.
             self.endpoint.cancel_unsubmitted_open(cid).map_err(engine)?;

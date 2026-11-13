@@ -630,8 +630,8 @@ fn receive_sizes(
 #[test]
 fn a_locked_receive_size_does_not_grow() {
     let (sizes, _) = receive_sizes(bulk_receiver(true), 2 << 20, |b, server, size| {
-        if size == 65536 && b.buffer_capacities(server).unwrap().0 != 8192 {
-            b.set_buffer_capacities(server, 8192, 65536).unwrap();
+        if size == 65536 {
+            b.set_receive_buffer(server, 65536).unwrap();
         }
     });
     assert_eq!(sizes, [65536]);
@@ -686,4 +686,141 @@ fn memory_pressure_refuses_receive_growth_at_the_fair_share() {
             .windows(2)
             .all(|e| e[1].at_or_after(e[0]) || e[0].distance_from(e[1]) < 1 << 5)
     );
+}
+
+// SO_RCVBUF before connect() (SOCK_RCVBUF_LOCK) sets the window scale from
+// the locked size, as Linux clamps window_clamp to it before
+// tcp_select_initial_window (RFC 7323 section 2.1); once the SYN has left,
+// a lock keeps the scale it sent.
+#[test]
+fn a_receive_lock_before_the_syn_fixes_the_window_scale() {
+    let mut config = config();
+    config.connection.receive_capacity_max = 32 << 20;
+    for (before_syn, bytes, scale) in [(true, 65536, 1), (true, 1 << 20, 5), (false, 65536, 10)] {
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config.clone(), [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+        let client = a.connect(0, local, REMOTE.parse().unwrap()).unwrap();
+        let mut trace = [Vec::new(), Vec::new()];
+        if before_syn {
+            a.set_receive_buffer(client, bytes).unwrap();
+        }
+        exchange(&mut a, &mut b, 0, &mut trace);
+        b.accept(listener).unwrap();
+        if !before_syn {
+            a.set_receive_buffer(client, bytes).unwrap();
+        }
+        assert_eq!(window_scale_option(&trace[0][0]), Some(scale));
+        let info = a.transport_info(client).unwrap();
+        assert_eq!(
+            (info.receive_window_scale, info.receive_capacity),
+            (scale, bytes)
+        );
+        // The server, unlocked, scales from its maximum.
+        assert_eq!(window_scale_option(&trace[1][0]), Some(10));
+    }
+}
+
+// A child takes its listener's locked sizes, locked, one direction at a
+// time (a child socket inherits sk_userlocks): its locked receive size sets
+// its scale and never grows; its unlocked direction stays tuned.
+#[test]
+fn children_inherit_their_listeners_locks() {
+    for (send_lock, receive_lock) in [(true, true), (false, true), (true, false)] {
+        let mut config = bulk_receiver(true);
+        config.connection.send_capacity_max = 1 << 20;
+        // The client's window does not limit the server's echo.
+        let mut client_config = bulk_sender(true);
+        client_config.connection.receive_capacity = 1 << 20;
+        let mut a = Endpoint::new(client_config, [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+        if send_lock {
+            b.set_listener_send_buffer(listener, 8192).unwrap();
+        }
+        if receive_lock {
+            b.set_listener_receive_buffer(listener, 32768).unwrap();
+        }
+        assert_eq!(
+            b.listener_buffer_capacities(listener),
+            Ok((
+                if send_lock { 8192 } else { 65536 },
+                if receive_lock { 32768 } else { 65536 }
+            ))
+        );
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+        let client = a.connect(0, local, REMOTE.parse().unwrap()).unwrap();
+        let mut link = Link::new(a, b, 12_500, 5_000);
+        let server = loop {
+            link.pump();
+            if let Ok(server) = link.b.accept(listener) {
+                break server;
+            }
+            link.advance();
+        };
+        let info = link.b.transport_info(server).unwrap();
+        assert_eq!(info.receive_window_scale, if receive_lock { 0 } else { 5 });
+        let data = [7; 65536];
+        let mut out = [0; 65536];
+        let mut read = 0;
+        // Both sides send in bulk and read everything.
+        while read < 256 << 10 {
+            while link.a.write(client, &data).is_ok_and(|count| count != 0) {}
+            while link.b.write(server, &data).is_ok_and(|count| count != 0) {}
+            link.pump();
+            while let Ok(count) = link.b.read(server, &mut out) {
+                read += count;
+            }
+            while link.a.read(client, &mut out).is_ok() {}
+            link.pump();
+            link.advance();
+        }
+        let info = link.b.transport_info(server).unwrap();
+        if send_lock {
+            assert_eq!(info.send_capacity, 8192);
+        } else {
+            assert!(info.send_capacity > 65536, "{}", info.send_capacity);
+        }
+        if receive_lock {
+            assert_eq!(info.receive_capacity, 32768);
+        } else {
+            assert!(info.receive_capacity > 65536, "{}", info.receive_capacity);
+        }
+    }
+}
+
+// set_send_buffer locks the send direction (SOCK_SNDBUF_LOCK): no later
+// ACK expands it, and it allocates nothing.
+#[test]
+fn a_send_lock_stops_expansion() {
+    let mut a = Endpoint::new(sender_config(), [1; 32], 0, |_| true).unwrap();
+    let mut b = Endpoint::new(sender_config(), [2; 32], 0, |_| true).unwrap();
+    let mut trace = [Vec::new(), Vec::new()];
+    let (client, server) = connect(&mut a, &mut b, 40000, &mut trace);
+    let charge = a.buffer_bytes();
+    a.set_send_buffer(client, 6000).unwrap();
+    assert_eq!(a.buffer_bytes(), charge);
+    assert_eq!(
+        a.set_send_buffer(client, 0),
+        Err(Error::InvalidArgument.into())
+    );
+    assert_eq!(
+        a.set_send_buffer(client, 1 << 30),
+        Err(Error::InvalidArgument.into())
+    );
+    assert_eq!(
+        a.set_receive_buffer(client, 0),
+        Err(Error::InvalidArgument.into())
+    );
+    let data = [7; 65536];
+    let mut out = [0; 65536];
+    for now in 1..40 {
+        while a.write(client, &data).is_ok_and(|count| count != 0) {}
+        exchange(&mut a, &mut b, now, &mut trace);
+        while b.read(server, &mut out).is_ok() {}
+    }
+    let info = a.transport_info(client).unwrap();
+    assert_eq!(info.send_capacity, 6000);
+    assert!(info.cwnd > 3 * 6000);
 }

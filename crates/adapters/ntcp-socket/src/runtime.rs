@@ -452,6 +452,11 @@ struct Socket {
     ipv6_discover: i32,
     send_capacity: usize,
     receive_capacity: usize,
+    // SO_SNDBUF or SO_RCVBUF was set: as Linux's SOCK_SNDBUF_LOCK and
+    // SOCK_RCVBUF_LOCK, that direction's size is fixed (an accepted child
+    // inherits the lock).
+    send_locked: bool,
+    receive_locked: bool,
     handle: Handle,
     // Inline, one per socket (bounded by socket_limit), not endpoint buffer
     // storage or a retained connection. Err preserves an unavailable snapshot.
@@ -555,6 +560,8 @@ impl Socket {
             ipv6_discover: IP_PMTUDISC_WANT,
             send_capacity: BYTES,
             receive_capacity: BYTES,
+            send_locked: false,
+            receive_locked: false,
             handle: Handle::Fresh,
             terminal_transport: None,
             local: None,
@@ -2739,6 +2746,22 @@ impl Owner {
             })
             || connection
     }
+    // An active open's sizes SO_SNDBUF/SO_RCVBUF set before connect(), locked
+    // before its SYN leaves (a locked receive size sets the window scale).
+    fn lock_buffers(&mut self, cid: ConnectionId, s: &Socket) -> Result<()> {
+        if s.send_locked {
+            self.endpoint
+                .set_send_buffer(cid, s.send_capacity)
+                .map_err(engine)?;
+        }
+        if s.receive_locked {
+            self.endpoint
+                .set_receive_buffer(cid, s.receive_capacity)
+                .map_err(engine)?;
+        }
+        Ok(())
+    }
+
     fn apply_options(&mut self, cid: ConnectionId, s: &Socket) -> Result<()> {
         // Validate the fallible option before changing the infallible one.
         self.endpoint
@@ -3295,6 +3318,7 @@ impl Owner {
                 let cookie_policy = s.fast_open_cookie_policy.clone();
                 let cookie_lease = s.fast_open_key_lease;
                 let capacities = (s.send_capacity, s.receive_capacity);
+                let locks = (s.send_locked, s.receive_locked);
                 let application_timeout = user_timeout_us(s.user_timeout_ms)?;
                 let syn_retries = s.syn_retries;
                 let user_mss = s.user_mss;
@@ -3328,11 +3352,22 @@ impl Owner {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
                 }
-                if let Err(e) = self.endpoint.set_listener_buffer_capacities(
-                    listener,
-                    capacities.0,
-                    capacities.1,
-                ) {
+                // Children take the sizes SO_SNDBUF/SO_RCVBUF set, locked.
+                let locked = (if locks.0 {
+                    self.endpoint
+                        .set_listener_send_buffer(listener, capacities.0)
+                } else {
+                    Ok(())
+                })
+                .and_then(|()| {
+                    if locks.1 {
+                        self.endpoint
+                            .set_listener_receive_buffer(listener, capacities.1)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(e) = locked {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
                 }
@@ -3430,6 +3465,8 @@ impl Owner {
                     s.other_ip_policy(self.local).1,
                 );
                 child.reuse = s.reuse;
+                child.send_locked = s.send_locked;
+                child.receive_locked = s.receive_locked;
                 child.freebind = s.freebind;
                 child.nodelay = s.nodelay;
                 child.cork = s.cork;
@@ -4042,9 +4079,13 @@ impl Owner {
                     }
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse = value != 0,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive = value != 0,
-                    (SOL_SOCKET, SO_SNDBUF) => s.send_capacity = socket_buffer_value(name, value),
+                    (SOL_SOCKET, SO_SNDBUF) => {
+                        s.send_capacity = socket_buffer_value(name, value);
+                        s.send_locked = true;
+                    }
                     (SOL_SOCKET, SO_RCVBUF) => {
-                        s.receive_capacity = socket_buffer_value(name, value)
+                        s.receive_capacity = socket_buffer_value(name, value);
+                        s.receive_locked = true;
                     }
                     (SOL_SOCKET, SO_ZEROCOPY) => {
                         if !(0..=1).contains(&value) {
@@ -4135,18 +4176,25 @@ impl Owner {
                     }
                 }
                 if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)) {
+                    // Each option sets and locks its own direction, as
+                    // sock_setsockopt does.
+                    let send = name == SO_SNDBUF;
                     match s.handle {
+                        Handle::Connection(cid) if send => self
+                            .endpoint
+                            .set_send_buffer(cid, s.send_capacity)
+                            .map_err(engine)?,
                         Handle::Connection(cid) => self
                             .endpoint
-                            .set_buffer_capacities(cid, s.send_capacity, s.receive_capacity)
+                            .set_receive_buffer(cid, s.receive_capacity)
+                            .map_err(engine)?,
+                        Handle::Listener(listener) if send => self
+                            .endpoint
+                            .set_listener_send_buffer(listener, s.send_capacity)
                             .map_err(engine)?,
                         Handle::Listener(listener) => self
                             .endpoint
-                            .set_listener_buffer_capacities(
-                                listener,
-                                s.send_capacity,
-                                s.receive_capacity,
-                            )
+                            .set_listener_receive_buffer(listener, s.receive_capacity)
                             .map_err(engine)?,
                         Handle::Fresh => (),
                     }

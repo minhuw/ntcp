@@ -1027,10 +1027,7 @@ fn explicit_budget128_allows_200000_sndbuf_growth() {
             .unwrap();
         // All three pinned scripts request 200000; SO_SNDBUF doubles it.
         let charged = endpoint.buffer_bytes();
-        assert_eq!(
-            endpoint.set_buffer_capacities(id, 400000, config.connection.receive_capacity),
-            Ok(())
-        );
+        assert_eq!(endpoint.set_send_buffer(id, 400000), Ok(()));
         assert_eq!(endpoint.buffer_capacities(id).unwrap().0, 400000);
         assert_eq!(endpoint.buffer_bytes(), charged);
         let written = endpoint.write(id, &[7; 400000]).unwrap();

@@ -1026,6 +1026,8 @@ impl ReceiveBuffer {
 
     // Rebase the physical ring, not sequence/reporting state. Uninitialized slots
     // are copied only as MaybeUninit; payload reads still require presence.
+    // The reference that `grow` is tested against.
+    #[cfg(test)]
     pub(crate) fn grown(&self, capacity: usize) -> Result<Self, ()> {
         let mut result = Self::new(self.read_base, capacity)?;
         for offset in 0..self.data.len() {

@@ -6022,7 +6022,9 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     );
     a.set_buffer_capacities(client, 128, 128).unwrap();
     assert_eq!(a.buffer_bytes(), grown_charge);
-    // The receive ring's three parts; the send ring grows at write.
+    // The receive ring's three parts grow in place; the send ring grows at
+    // write. A part that grew before another failed keeps its storage, and
+    // its charge.
     for allocation in 0..3 {
         assert_eq!(
             crate::allocation_tests::fail_after(allocation, || a
@@ -6030,16 +6032,19 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
             Err(Error::NoMemory.into())
         );
         assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
-        assert_eq!(a.buffer_bytes(), grown_charge);
-        assert_eq!(a.transport_info(client).unwrap().send_used, 512);
+        let info = a.transport_info(client).unwrap();
+        assert_eq!(a.buffer_bytes(), info.buffer_charge);
+        assert!(a.buffer_bytes() >= grown_charge);
+        assert_eq!(info.send_used, 512);
     }
+    let grown_charge = a.buffer_bytes();
     assert_eq!(
         a.set_buffer_capacities(client, 1 << 30, 1),
         Err(Error::InvalidArgument.into())
     );
     assert_eq!(
         a.set_buffer_capacities(client, 1 << 29, 1 << 29),
-        Err(EndpointError::LimitReached)
+        Err(Error::NoMemory.into())
     );
     assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
     assert_eq!(a.buffer_bytes(), grown_charge);

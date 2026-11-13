@@ -497,6 +497,7 @@ mod tests {
             send_space: 65536,
             receive_used: 42,
             receive_capacity: 65536,
+            buffer_charge: 0,
         };
         for (loss, recovery, ecn_response, sacked, state) in [
             (false, false, false, 0, 0),

@@ -750,10 +750,7 @@ fn run() -> io::Result<()> {
                 let parse = |s: &str| s.parse::<usize>().map_err(|_| other("invalid size".into()));
                 let (capacity, total, salt) = (parse(capacity)?, parse(total)?, parse(salt)?);
                 network.receive(&mut endpoint)?;
-                let (_, receive) = endpoint.buffer_capacities(id).map_err(engine)?;
-                endpoint
-                    .set_buffer_capacities(id, capacity, receive)
-                    .map_err(engine)?;
+                endpoint.set_send_buffer(id, capacity).map_err(engine)?;
                 let resized = info_json(&endpoint, id)?;
                 let bytes = pattern(total, 0, salt);
                 let mut written = 0usize;

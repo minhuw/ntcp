@@ -684,6 +684,9 @@ pub struct TransportInfo {
     pub send_space: usize,
     pub receive_used: usize,
     pub receive_capacity: usize,
+    // This connection's share of Endpoint::buffer_bytes: what its buffers
+    // and records hold allocated now.
+    pub buffer_charge: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1623,12 +1626,13 @@ impl Connection {
             + self.rx_timestamps.storage_bytes()
     }
 
-    // The charge at the peak of `set_buffer_capacities(_, receive)`: the
-    // original receive ring stays live while its replacement is filled. A
-    // send limit allocates nothing; the next write grows the send ring.
+    // The charge at the peak of growing the receive ring to `receive` bytes
+    // (`set_receive_buffer`, DRS): the original storage stays live while the
+    // ring reallocates, to a multiple of 8 slots. A send limit allocates
+    // nothing; the next write grows the send ring.
     pub(crate) fn resize_peak_charge(&self, receive: usize) -> Option<usize> {
         let receiver = if receive > self.receive.capacity() {
-            ReceiveBuffer::allocation_bytes(receive)?
+            ReceiveBuffer::allocation_bytes(receive.next_multiple_of(8))?
         } else {
             0
         };
@@ -1639,6 +1643,9 @@ impl Connection {
         (self.send.capacity(), self.config.receive_capacity)
     }
 
+    // Shorthand for tests: both setters, receive first so that a refused
+    // growth changes nothing.
+    #[cfg(test)]
     pub(crate) fn set_buffer_capacities(
         &mut self,
         send: usize,
@@ -1646,7 +1653,35 @@ impl Connection {
         max_charge: usize,
     ) -> Result<(), Error> {
         Self::validate_buffer_capacities(send, receive)?;
-        // The original remains live until its replacement has been staged.
+        self.set_receive_buffer(receive, max_charge)?;
+        self.set_send_buffer(send);
+        Ok(())
+    }
+
+    // The send limit, locked as SO_SNDBUF sets SOCK_SNDBUF_LOCK: neither
+    // expansion nor pressure changes it. It allocates nothing; the next
+    // write grows the send ring.
+    pub(crate) fn set_send_buffer(&mut self, send: usize) {
+        self.send.set_limit(send);
+        self.config.send_capacity = send;
+        self.send_tuned = false;
+        self.send_expand_pending = false;
+        if self.send_space_remaining() != 0 {
+            self.send_backpressured = false;
+        }
+        self.refresh_writable();
+    }
+
+    // The receive window, locked as SO_RCVBUF sets SOCK_RCVBUF_LOCK: DRS no
+    // longer grows it. A larger size grows the ring in place now, if its
+    // peak charge fits `max_charge`; a smaller one keeps the ring and the
+    // window already offered.
+    pub(crate) fn set_receive_buffer(
+        &mut self,
+        receive: usize,
+        max_charge: usize,
+    ) -> Result<(), Error> {
+        // The original remains live while the ring reallocates.
         if self
             .resize_peak_charge(receive)
             .is_none_or(|peak| peak > max_charge)
@@ -1654,32 +1689,18 @@ impl Connection {
             return Err(Error::NoMemory);
         }
         let old_window = self.advertised_window(false);
-        // Stage the allocation before changing any quota or live protocol state.
-        let receiver = if receive > self.receive.capacity() {
-            Some(self.receive.grown(receive).map_err(|_| Error::NoMemory)?)
-        } else {
-            None
-        };
-        if self
-            .buffer_charge()
-            .checked_add(receiver.as_ref().map_or(0, ReceiveBuffer::storage_bytes))
-            .is_none_or(|peak| peak > max_charge)
-        {
-            return Err(Error::NoMemory);
+        if receive > self.receive.capacity() {
+            self.receive.grow(receive).map_err(|_| Error::NoMemory)?;
         }
-        if let Some(buffer) = receiver {
-            self.receive = buffer;
-        }
-        self.send.set_limit(send);
-        self.config.send_capacity = send;
-        // As SO_SNDBUF and SO_RCVBUF set SOCK_SNDBUF_LOCK and
-        // SOCK_RCVBUF_LOCK: no longer tuned.
-        self.send_tuned = false;
         self.receive_tuned = false;
-        if self.send_space_remaining() != 0 {
-            self.send_backpressured = false;
-        }
         self.config.receive_capacity = receive;
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
+        //= reason=A receive size locked before the SYN reaches the wire sets the window scale from that size, as Linux clamps window_clamp to a locked SO_RCVBUF before tcp_select_initial_window; once the SYN has left, the scale stays as sent.
+        //# In a typical modern
+        //# implementation, this maximum buffer space is set by default but can
+        //# be overridden by a user program before a TCP connection is opened.
+        //# This determines the scale factor, and therefore no new user interface
+        //# is needed for window scaling.
         if self.handshake_pending() && self.snd_nxt == self.iss {
             // No local SYN has reached the wire, including after failed output.
             self.local_scale = window_scale(receive);
@@ -1700,14 +1721,19 @@ impl Connection {
         }
         // ponytail: retain backing on shrink until reclamation; compaction can
         // reclaim slack later, but must preserve queued bytes and promised edges.
-        self.events.writable = !self.shutdown
-            && !self.read_closed
-            && matches!(self.state, State::Established | State::CloseWait)
-            && self.send_space_remaining() != 0;
+        self.refresh_writable();
         if self.synchronized() && self.advertised_window(false) > old_window {
             self.immediate_ack();
         }
         Ok(())
+    }
+
+    // A setter's writability: room in an open send direction.
+    fn refresh_writable(&mut self) {
+        self.events.writable = !self.shutdown
+            && !self.read_closed
+            && matches!(self.state, State::Established | State::CloseWait)
+            && self.send_space_remaining() != 0;
     }
 
     pub(crate) fn into_receive(self: Box<Self>) -> ReceiveBuffer {
@@ -2073,6 +2099,7 @@ impl Connection {
             send_space: self.send_space(),
             receive_used: self.receive_used,
             receive_capacity: self.config.receive_capacity,
+            buffer_charge: self.buffer_charge(),
         }
     }
 

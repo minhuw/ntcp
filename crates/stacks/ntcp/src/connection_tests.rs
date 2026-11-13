@@ -1802,19 +1802,22 @@ fn live_buffer_resize_is_atomic_and_preserves_recovery_and_window_promises() {
         ],
     );
     let before_sack = a.scoreboard.ranges().to_vec();
-    // Only the receive ring's three parts are staged: the send ring grows at
-    // the next write.
-    for allocation in 0..3 {
-        let result = crate::allocation_tests::fail_after(allocation, || {
-            a.set_buffer_capacities(256, 256, usize::MAX)
-        });
-        assert_eq!(result, Err(Error::NoMemory));
+    // Only the receive ring grows, in place, its payload and bitmaps one by
+    // one: the send ring grows at the next write. Whichever allocation
+    // fails, the sizes and state are as they were.
+    let mut allocation = 0;
+    while let Err(error) = crate::allocation_tests::fail_after(allocation, || {
+        a.set_buffer_capacities(256, 256, usize::MAX)
+    }) {
+        assert_eq!(error, Error::NoMemory);
         assert_eq!(a.buffer_capacities(), (128, 128));
         assert_eq!(a.send.len(), 26);
         assert_eq!(alloc::format!("{:?}", a.rack), before_rack);
         assert_eq!(a.scoreboard.ranges(), &before_sack);
+        allocation += 1;
+        assert!(allocation <= 3);
     }
-    a.set_buffer_capacities(256, 256, usize::MAX).unwrap();
+    assert!(allocation >= 1);
     assert_eq!(a.scoreboard.ranges(), &before_sack);
     assert_eq!(alloc::format!("{:?}", a.rack), before_rack);
     a.set_buffer_capacities(4, 4, usize::MAX).unwrap();

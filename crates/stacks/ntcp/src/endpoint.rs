@@ -536,6 +536,10 @@ struct Listener {
     reset_debt_expiry: Option<Instant>,
     rx_timestamp_capacity: usize,
     buffer_capacities: (usize, usize),
+    // The send and receive sizes a setter locked (`set_listener_send_buffer`,
+    // `set_listener_receive_buffer`): children take them locked, as a
+    // child socket inherits its listener's sk_userlocks.
+    buffer_locks: (bool, bool),
     application_timeout_us: Option<u64>,
     handshake_retransmission_limit: Option<NonZeroU8>,
     user_mss: Option<u16>,
@@ -1404,6 +1408,7 @@ impl Endpoint {
                 self.config.connection.send_capacity,
                 self.config.connection.receive_capacity,
             ),
+            buffer_locks: (false, false),
             application_timeout_us: None,
             handshake_retransmission_limit: None,
             user_mss: self.config.connection.user_mss,
@@ -1646,17 +1651,20 @@ impl Endpoint {
                 self.config.connection.send_capacity,
                 self.config.connection.receive_capacity,
             ),
+            (false, false),
             0,
             RxPacketTimestamps::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_connection_with_buffers(
         &mut self,
         tuple: Tuple,
         iss: u32,
         syn: Option<&wire::Segment<'_>>,
         capacities: (usize, usize),
+        locks: (bool, bool),
         rx_ranges: usize,
         timestamps: RxPacketTimestamps,
     ) -> Result<Box<Connection>, Error> {
@@ -1669,6 +1677,7 @@ impl Endpoint {
                 receive_capacity: capacities.1,
                 ..ActiveOpenOptions::from(&self.config.connection)
             },
+            locks,
             rx_ranges,
             timestamps,
             None,
@@ -1716,6 +1725,7 @@ impl Endpoint {
         iss: u32,
         syn: Option<&wire::Segment<'_>>,
         options: ActiveOpenOptions,
+        locks: (bool, bool),
         rx_ranges: usize,
         timestamps: RxPacketTimestamps,
         receive_authority: Option<ListenerId>,
@@ -1761,15 +1771,16 @@ impl Endpoint {
         let scoped = self.scoped(tuple);
         let mut connection_config = self.config.connection.clone();
         connection_config.timestamps = self.new_connection_timestamps();
-        // A size given for this open or its listener is locked, as a size
-        // set with SO_SNDBUF or SO_RCVBUF before connect() or listen() is
-        // (SOCK_SNDBUF_LOCK, SOCK_RCVBUF_LOCK): neither autotuning nor
-        // pressure changes it, and a locked receive size sets the window
-        // scale.
-        if capacities.0 != connection_config.send_capacity {
+        // A size its listener locked, or one given for this open, is locked,
+        // as a size set with SO_SNDBUF or SO_RCVBUF before connect() or
+        // listen() is (SOCK_SNDBUF_LOCK, SOCK_RCVBUF_LOCK, which a child
+        // inherits): neither autotuning nor pressure changes it, and a
+        // locked receive size sets the window scale. A max at the initial
+        // size leaves a direction untuned.
+        if locks.0 || capacities.0 != connection_config.send_capacity {
             connection_config.send_capacity_max = capacities.0;
         }
-        if capacities.1 != connection_config.receive_capacity {
+        if locks.1 || capacities.1 != connection_config.receive_capacity {
             connection_config.receive_capacity_max = capacities.1;
         }
         connection_config.send_capacity = capacities.0;
@@ -1900,6 +1911,7 @@ impl Endpoint {
         iss: u32,
         syn: Option<&wire::Segment<'_>>,
         options: ActiveOpenOptions,
+        locks: (bool, bool),
         rx_ranges: usize,
         timestamps: RxPacketTimestamps,
         receive_authority: Option<ListenerId>,
@@ -1909,6 +1921,7 @@ impl Endpoint {
             iss,
             syn,
             options,
+            locks,
             rx_ranges,
             timestamps,
             receive_authority,
@@ -2680,6 +2693,7 @@ impl Endpoint {
             iss,
             None,
             options,
+            (false, false),
             0,
             RxPacketTimestamps::default(),
             receive_authority,
@@ -2802,6 +2816,7 @@ impl Endpoint {
             iss,
             None,
             options,
+            (false, false),
             0,
             RxPacketTimestamps::default(),
             receive_authority,
@@ -2815,48 +2830,107 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.buffer_capacities())
     }
 
-    pub fn set_buffer_capacities(
+    /// Sets the send limit of `id` to `bytes` and locks its send
+    /// direction, as SO_SNDBUF sets SOCK_SNDBUF_LOCK: neither autotuning
+    /// nor memory pressure changes it. Allocates nothing; the next write
+    /// grows the send ring. 0 < `bytes` < 2^30.
+    pub fn set_send_buffer(&mut self, id: ConnectionId, bytes: usize) -> Result<(), EndpointError> {
+        self.reject_if_output_reserved(id)?;
+        Connection::validate_buffer_capacities(bytes, 1)?;
+        self.slot_mut(id)?.connection.set_send_buffer(bytes);
+        self.refresh(id.slot);
+        Ok(())
+    }
+
+    /// Sets the receive window of `id` to `bytes` and locks its receive
+    /// direction, as SO_RCVBUF sets SOCK_RCVBUF_LOCK: DRS no longer grows
+    /// it. A larger size grows the receive ring now, refused with
+    /// `NoMemory` if its peak charge does not fit the budget; a smaller one
+    /// keeps the ring and never retracts the window offered. Before the SYN
+    /// leaves, it also sets the window scale. 0 < `bytes` ≤ 65535·2^14.
+    pub fn set_receive_buffer(
+        &mut self,
+        id: ConnectionId,
+        bytes: usize,
+    ) -> Result<(), EndpointError> {
+        self.reject_if_output_reserved(id)?;
+        Connection::validate_buffer_capacities(1, bytes)?;
+        let old = self.slot(id)?.connection.buffer_charge();
+        let max_charge = self.buffer_room().saturating_add(old);
+        let result = self
+            .slot_mut(id)?
+            .connection
+            .set_receive_buffer(bytes, max_charge);
+        self.memory_refused_growths += u64::from(result == Err(Error::NoMemory));
+        // Charged even when refused: a bitmap that grew before another
+        // failed keeps its storage.
+        let new = self.slot(id)?.connection.buffer_charge();
+        self.recharge(old, new);
+        result?;
+        self.refresh(id.slot);
+        Ok(())
+    }
+
+    // Shorthand for tests: both setters, receive first so that a refused
+    // growth changes nothing.
+    #[cfg(test)]
+    pub(crate) fn set_buffer_capacities(
         &mut self,
         id: ConnectionId,
         send: usize,
         receive: usize,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
         Connection::validate_buffer_capacities(send, receive)?;
-        let connection = &self.slot(id)?.connection;
-        let old = connection.buffer_charge();
-        // This charge includes the original buffers plus all staged replacements.
-        let charge = connection
-            .resize_peak_charge(receive)
-            .ok_or(EndpointError::LimitReached)?;
-        let max_charge = self.buffer_room().saturating_add(old);
-        if charge > max_charge {
-            self.memory_refused_growths += 1;
-            return Err(EndpointError::LimitReached);
-        }
-        let result = self
-            .slot_mut(id)?
-            .connection
-            .set_buffer_capacities(send, receive, max_charge);
-        self.memory_refused_growths += u64::from(result == Err(Error::NoMemory));
-        result?;
-        let new = self.slot(id)?.connection.buffer_charge();
-        self.recharge(old, new);
-        self.refresh(id.slot);
+        self.set_receive_buffer(id, receive)?;
+        self.set_send_buffer(id, send)
+    }
+
+    /// `set_send_buffer` for the connections `id` accepts from now on:
+    /// each starts with this send limit, locked.
+    pub fn set_listener_send_buffer(
+        &mut self,
+        id: ListenerId,
+        bytes: usize,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        Connection::validate_buffer_capacities(bytes, 1)?;
+        let listener = self.listeners[id.slot].as_mut().unwrap();
+        listener.buffer_capacities.0 = bytes;
+        listener.buffer_locks.0 = true;
         Ok(())
     }
 
-    pub fn set_listener_buffer_capacities(
+    /// `set_receive_buffer` for the connections `id` accepts from now on:
+    /// each opens with a ring and window of this size, locked, and takes
+    /// its window scale from it. Refused with `NoMemory` if one such
+    /// connection's open charge with the listener's RX timestamp capacity
+    /// exceeds the cap.
+    pub fn set_listener_receive_buffer(
+        &mut self,
+        id: ListenerId,
+        bytes: usize,
+    ) -> Result<(), EndpointError> {
+        let listener = self.listener(id)?;
+        let (send, rx_ranges) = (listener.buffer_capacities.0, listener.rx_timestamp_capacity);
+        Connection::validate_buffer_capacities(1, bytes)?;
+        self.validate_listener_rx_capacity((send, bytes), rx_ranges)?;
+        let listener = self.listeners[id.slot].as_mut().unwrap();
+        listener.buffer_capacities.1 = bytes;
+        listener.buffer_locks.1 = true;
+        Ok(())
+    }
+
+    // Shorthand for tests: both listener setters, receive first.
+    #[cfg(test)]
+    pub(crate) fn set_listener_buffer_capacities(
         &mut self,
         id: ListenerId,
         send: usize,
         receive: usize,
     ) -> Result<(), EndpointError> {
-        let rx_ranges = self.listener(id)?.rx_timestamp_capacity;
         Connection::validate_buffer_capacities(send, receive)?;
-        self.validate_listener_rx_capacity((send, receive), rx_ranges)?;
-        self.listeners[id.slot].as_mut().unwrap().buffer_capacities = (send, receive);
-        Ok(())
+        self.set_listener_receive_buffer(id, receive)?;
+        self.set_listener_send_buffer(id, send)
     }
 
     fn validate_listener_rx_capacity(
@@ -3863,6 +3937,7 @@ impl Endpoint {
             let application_timeout = record.application_timeout_us;
             let handshake_retransmission_limit = record.handshake_retransmission_limit;
             let buffer_capacities = record.buffer_capacities;
+            let buffer_locks = record.buffer_locks;
             let rx_ranges = record.rx_timestamp_capacity;
             let iss = self.isn(tuple);
             let mut connection = match self.new_connection_with_buffers(
@@ -3870,6 +3945,7 @@ impl Endpoint {
                 iss,
                 Some(segment),
                 buffer_capacities,
+                buffer_locks,
                 rx_ranges,
                 timestamps,
             ) {
@@ -4134,6 +4210,7 @@ impl Endpoint {
         let application_timeout = record.application_timeout_us;
         let handshake_retransmission_limit = record.handshake_retransmission_limit;
         let buffer_capacities = record.buffer_capacities;
+        let buffer_locks = record.buffer_locks;
         let rx_ranges = record.rx_timestamp_capacity;
         let candidate = self.isn(scoped);
         let (iss, offset) = match target {
@@ -4153,6 +4230,7 @@ impl Endpoint {
             iss,
             Some(syn),
             buffer_capacities,
+            buffer_locks,
             rx_ranges,
             timestamps,
         ) {
@@ -7482,7 +7560,7 @@ mod recovery_observation_tests {
                 endpoint.config.max_buffer_bytes = peak - 1;
                 assert_eq!(
                     endpoint.set_buffer_capacities(id, send, receive),
-                    Err(EndpointError::LimitReached)
+                    Err(Error::NoMemory.into())
                 );
                 assert_eq!(endpoint.buffer_capacities(id).unwrap(), (1024, 1));
                 assert_eq!(endpoint.buffer_bytes(), old);
@@ -8069,7 +8147,7 @@ mod recovery_observation_tests {
         endpoint.config.max_buffer_bytes = peak - 1;
         assert_eq!(
             endpoint.set_buffer_capacities(id, send * 2, receive * 2),
-            Err(EndpointError::LimitReached)
+            Err(Error::NoMemory.into())
         );
         endpoint.config.max_buffer_bytes = peak;
         endpoint
@@ -8174,7 +8252,7 @@ mod recovery_observation_tests {
         endpoint.config.max_buffer_bytes = peak - 1;
         assert_eq!(
             endpoint.set_buffer_capacities(id, send, receive * 2),
-            Err(EndpointError::LimitReached)
+            Err(Error::NoMemory.into())
         );
         assert_eq!(
             endpoint.slot(id).unwrap().connection.rx_timestamps.at(2),
@@ -9256,7 +9334,7 @@ mod memory_wait_tests {
         assert_eq!(a.write(client, &[1; 64]), Ok(7));
         assert_eq!(
             a.set_buffer_capacities(client, 1024, 4096),
-            Err(EndpointError::LimitReached)
+            Err(Error::NoMemory.into())
         );
         let counters = a.memory_counters();
         assert_eq!(counters.memory_refused_growths, 2);
