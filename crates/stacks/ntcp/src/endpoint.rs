@@ -490,8 +490,10 @@ enum PassiveRefusal {
     // The listener's accept queue (its established, unaccepted children) is
     // full: Linux's ListenOverflows.
     AcceptQueue,
-    // No connection slot or buffer budget for the connection.
+    // No connection slot for the connection.
     Resources,
+    // No buffer budget for the connection's storage.
+    Memory,
     // A tuple no connection may have (a zero port).
     Invalid,
 }
@@ -609,8 +611,10 @@ pub struct Endpoint {
     // a link per slot, so a refusal never allocates and a wake visits only
     // the connections it wakes and the first it cannot.
     memory_waiters: ReadyQueue,
-    // `memory_throttled_writes`.
+    // `memory_counters`.
     memory_throttled_writes: u64,
+    memory_refused_opens: u64,
+    memory_refused_growths: u64,
     deadlines: Deadlines,
     reclaimed: u64,
     // The last `max_connections` reclaimed connections, the one counted
@@ -816,6 +820,8 @@ impl Endpoint {
             progress: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             memory_waiters: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             memory_throttled_writes: 0,
+            memory_refused_opens: 0,
+            memory_refused_growths: 0,
             progress_una: {
                 let mut una = reserved_vec(count)?;
                 una.resize(count, 0);
@@ -1537,7 +1543,7 @@ impl Endpoint {
     // waiting for memory.
     fn uncharge(&mut self, bytes: usize) {
         let memory = self.config.buffer_memory();
-        if self.budget.reduce(bytes, memory) {
+        if self.budget.reduce(bytes, self.now, memory) {
             self.wake_memory_waiters();
         }
     }
@@ -1656,7 +1662,7 @@ impl Endpoint {
     //# temporarily disables TFO entirely as described in "Server Cookie Handling" (Section 4.1.2). Then,
     //# subsequent TFO requests will be downgraded to regular connection requests, i.e., with the data
     //# dropped and only SYNs acknowledged.
-    fn new_connection_with_options(
+    fn construct_connection(
         &mut self,
         tuple: Tuple,
         iss: u32,
@@ -1830,6 +1836,42 @@ impl Endpoint {
             self.recharge(credit, charge);
         }
         result
+    }
+
+    // A connection the cap or the allocator refused storage for counts in
+    // `memory_refused_opens`.
+    #[allow(clippy::too_many_arguments)]
+    fn new_connection_with_options(
+        &mut self,
+        tuple: Tuple,
+        iss: u32,
+        syn: Option<&wire::Segment<'_>>,
+        options: ActiveOpenOptions,
+        rx_ranges: usize,
+        timestamps: RxPacketTimestamps,
+        receive_authority: Option<ListenerId>,
+    ) -> Result<Box<Connection>, Error> {
+        let result = self.construct_connection(
+            tuple,
+            iss,
+            syn,
+            options,
+            rx_ranges,
+            timestamps,
+            receive_authority,
+        );
+        self.memory_refused_opens += u64::from(result.as_ref().err() == Some(&Error::NoMemory));
+        result
+    }
+
+    // An active open's admission, a refusal for memory counted in
+    // `memory_refused_opens`.
+    pub(crate) fn admit_open(
+        &mut self,
+        admission: Result<(), EndpointError>,
+    ) -> Result<(), EndpointError> {
+        self.memory_refused_opens += u64::from(admission == Err(Error::NoMemory.into()));
+        admission
     }
 
     fn recycle_connection(&mut self, connection: Box<Connection>) {
@@ -2569,7 +2611,9 @@ impl Endpoint {
     ) -> Result<(ConnectionId, usize), EndpointError> {
         let tuple = Tuple { local, remote };
         let zone = self.scoped(tuple).zone;
-        self.active_admission(now, self.scoped(tuple), &options, receive_authority, true)?;
+        let admission =
+            self.active_admission(now, self.scoped(tuple), &options, receive_authority, true);
+        self.admit_open(admission)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
         let suppressed =
             service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote, zone);
@@ -2646,7 +2690,8 @@ impl Endpoint {
     ) -> Result<ConnectionId, EndpointError> {
         self.check_clock(now)?;
         let tuple = Tuple { local, remote };
-        self.admission(self.scoped(tuple))?;
+        let admission = self.admission(self.scoped(tuple));
+        self.admit_open(admission)?;
         self.clock(now)?;
         let iss = self.isn(self.scoped(tuple));
         let connection = self.new_connection(tuple, iss, None)?;
@@ -2695,7 +2740,8 @@ impl Endpoint {
     ) -> Result<ConnectionId, EndpointError> {
         let tuple = Tuple { local, remote };
         let scoped = self.scoped(tuple);
-        self.active_admission(now, scoped, &options, receive_authority, false)?;
+        let admission = self.active_admission(now, scoped, &options, receive_authority, false);
+        self.admit_open(admission)?;
         self.clock(now)?;
         let iss = self.isn(scoped);
         let connection = self.new_connection_with_options(
@@ -2736,15 +2782,19 @@ impl Endpoint {
                 .max_buffer_bytes
                 .saturating_sub(self.budget.charged() - old)
         {
+            self.memory_refused_growths += 1;
             return Err(EndpointError::LimitReached);
         }
         let max_charge = self
             .config
             .max_buffer_bytes
             .saturating_sub(self.budget.charged() - old);
-        self.slot_mut(id)?
+        let result = self
+            .slot_mut(id)?
             .connection
-            .set_buffer_capacities(send, receive, max_charge)?;
+            .set_buffer_capacities(send, receive, max_charge);
+        self.memory_refused_growths += u64::from(result == Err(Error::NoMemory));
+        result?;
         let new = self.slot(id)?.connection.buffer_charge();
         self.recharge(old, new);
         self.refresh(id.slot);
@@ -3752,6 +3802,7 @@ impl Endpoint {
             if let Some(refusal) = self.passive_refusal(now, None, listener, tuple, segment) {
                 if refusal != PassiveRefusal::Invalid {
                     self.count_listen_drop(refusal == PassiveRefusal::AcceptQueue);
+                    self.memory_refused_opens += u64::from(refusal == PassiveRefusal::Memory);
                 }
                 return Ok(InputDisposition::Dropped);
             }
@@ -3931,15 +3982,20 @@ impl Endpoint {
         match target {
             None => match self.resource_admission(tuple, record.buffer_capacities) {
                 Ok(()) => None,
-                Err(EndpointError::LimitReached | EndpointError::Connection(Error::NoMemory)) => {
-                    Some(PassiveRefusal::Resources)
-                }
+                Err(EndpointError::LimitReached) => Some(PassiveRefusal::Resources),
+                Err(EndpointError::Connection(Error::NoMemory)) => Some(PassiveRefusal::Memory),
                 Err(_) => Some(PassiveRefusal::Invalid),
             },
             Some(_) => self
                 .room_for(record.buffer_capacities.1)
                 .err()
-                .map(|_| PassiveRefusal::Resources),
+                .map(|error| {
+                    if error == Error::NoMemory.into() {
+                        PassiveRefusal::Memory
+                    } else {
+                        PassiveRefusal::Resources
+                    }
+                }),
         }
     }
 
@@ -4004,6 +4060,7 @@ impl Endpoint {
             Some(PassiveRefusal::TimeWait) => return Ok(None),
             Some(refusal) => {
                 self.count_listen_drop(refusal == PassiveRefusal::AcceptQueue);
+                self.memory_refused_opens += u64::from(refusal == PassiveRefusal::Memory);
                 return Ok(Some(InputDisposition::Dropped));
             }
             None => {}
@@ -4136,6 +4193,7 @@ impl Endpoint {
     // A write of the connection at `index` found its storage growth refused.
     fn memory_throttled(&mut self, index: usize) {
         self.memory_throttled_writes += 1;
+        self.memory_refused_growths += 1;
         self.memory_waiters.push(index);
     }
 
@@ -5381,6 +5439,20 @@ impl Endpoint {
     /// `__sk_mem_reduce_allocated`).
     pub fn memory_pressure(&self) -> bool {
         self.budget.under_pressure()
+    }
+
+    /// The endpoint's buffer memory gauges and counters (`MemoryCounters`).
+    pub fn memory_counters(&self) -> crate::MemoryCounters {
+        let (pressures, ticks) = self.budget.pressure_totals(self.now);
+        crate::MemoryCounters {
+            buffer_bytes: self.budget.charged(),
+            memory_pressure: self.budget.under_pressure(),
+            memory_pressures: pressures,
+            memory_pressure_us: self.config.connection.timebase.us_from_ticks(ticks),
+            memory_throttled_writes: self.memory_throttled_writes,
+            memory_refused_opens: self.memory_refused_opens,
+            memory_refused_growths: self.memory_refused_growths,
+        }
     }
 
     pub fn on_timeout(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
@@ -8408,6 +8480,7 @@ mod timestamp_default_control_tests {
 #[cfg(test)]
 mod memory_wait_tests {
     use super::*;
+    use crate::MemoryCounters;
     use alloc::vec::Vec;
 
     fn config() -> EndpointConfig {
@@ -8883,5 +8956,69 @@ mod memory_wait_tests {
         assert_eq!(late.1.iter().map(|p| p.len() - 20).sum::<usize>(), 265);
         assert_eq!(transfer(true, true), late);
         assert_ne!(transfer(false, true), transfer(false, false));
+    }
+
+    // Pressure time counts in the endpoint's clock, the current pressure
+    // included up to it (TCPMemoryPressures, TCPMemoryPressuresChrono).
+    #[test]
+    fn memory_counters_count_pressures_and_their_time() {
+        let (mut a, _, _) = endpoints();
+        let base = a.buffer_bytes();
+        a.config.max_buffer_bytes = base + 3000;
+        a.config.buffer_pressure_bytes = Some(base + 2000);
+        a.config.buffer_low_bytes = Some(base + 1000);
+        assert_eq!(
+            a.memory_counters(),
+            MemoryCounters {
+                buffer_bytes: base,
+                ..MemoryCounters::default()
+            }
+        );
+        a.now = 10;
+        a.charge(2001);
+        a.now = 50;
+        a.uncharge(1001);
+        a.now = 100;
+        a.charge(1001);
+        a.now = 130;
+        let counters = a.memory_counters();
+        assert!(counters.memory_pressure);
+        assert_eq!(counters.memory_pressures, 2);
+        assert_eq!(counters.memory_pressure_us, 40 + 30);
+        assert_eq!(counters.buffer_bytes, base + 2001);
+    }
+
+    // An active open, a SYN and a growth the budget refuses each count, the
+    // SYN in listen_drops too.
+    #[test]
+    fn memory_counters_count_refused_opens_and_growths() {
+        let (mut a, mut b, listener) = endpoints();
+        let (client, _) = connect(&mut a, &mut b, listener, 40000);
+        assert_eq!(a.write(client, &[1; 9]), Ok(9));
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40001);
+        assert_eq!(
+            a.connect(0, local, REMOTE.parse().unwrap()),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(a.memory_counters().memory_refused_opens, 1);
+        // The ledgers hold 16 bytes; more is refused.
+        assert_eq!(a.write(client, &[1; 64]), Ok(7));
+        assert_eq!(
+            a.set_buffer_capacities(client, 1024, 4096),
+            Err(EndpointError::LimitReached)
+        );
+        let counters = a.memory_counters();
+        assert_eq!(counters.memory_refused_growths, 2);
+        assert_eq!(counters.memory_throttled_writes, 1);
+        // The server has room for none: its SYN is dropped.
+        let mut c = Endpoint::new(config(), [3; 32], 0, |_| true).unwrap();
+        b.config.max_buffer_bytes = b.buffer_bytes();
+        let local = SocketAddr::new("192.0.2.3".parse().unwrap(), 40002);
+        c.connect(0, local, REMOTE.parse().unwrap()).unwrap();
+        flush(&mut c, &mut b, 0);
+        assert_eq!(b.listen_drops(), 1);
+        assert_eq!(b.memory_counters().memory_refused_opens, 1);
+        assert_eq!(b.memory_counters().memory_refused_growths, 0);
     }
 }

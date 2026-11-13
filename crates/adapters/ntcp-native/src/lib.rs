@@ -833,6 +833,7 @@ impl<P: PacketIo> Network<P> {
     }
     pub fn counters(&self) -> Counters {
         let loss = self.endpoint.loss_counters();
+        let memory = self.endpoint.memory_counters();
         Counters {
             retained_input: self.retained.len(),
             resolution_failures: self.host.arp_counters().resolution_failures,
@@ -848,7 +849,13 @@ impl<P: PacketIo> Network<P> {
             sack_recoveries: loss.sack_recoveries,
             reno_recoveries: loss.reno_recoveries,
             dsack_received: loss.dsack_received,
-            memory_throttled_writes: self.endpoint.memory_throttled_writes(),
+            buffer_bytes: memory.buffer_bytes,
+            memory_pressure: memory.memory_pressure,
+            memory_pressures: memory.memory_pressures,
+            memory_pressure_us: memory.memory_pressure_us,
+            memory_throttled_writes: memory.memory_throttled_writes,
+            memory_refused_opens: memory.memory_refused_opens + self.counters.memory_refused_opens,
+            memory_refused_growths: memory.memory_refused_growths,
             ..self.counters
         }
     }
@@ -1201,6 +1208,9 @@ impl<P: PacketIo> Network<P> {
                     .set_rx_timestamp_capacity(core, self.config.rx_timestamp_ranges)
             })
         {
+            // Its timestamp records refused for memory refuse the open.
+            self.counters.memory_refused_opens +=
+                u64::from(e == EndpointError::Connection(ntcp::Error::NoMemory));
             let _ = self.endpoint.abort(core);
             let _ = self.endpoint.release(core);
             self.host.collect(&self.endpoint)?;

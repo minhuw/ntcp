@@ -335,4 +335,26 @@ pub struct Counters {
     // MIB counts (`Endpoint::memory_throttled_writes`). The connection is
     // writable again once memory comes back to the budget.
     pub memory_throttled_writes: u64,
+    // Buffer memory (`ntcp::MemoryCounters`, `Endpoint::memory_counters`).
+    // The bytes charged now against tcp.max_buffer_bytes: sockstat TCP
+    // `mem`, in bytes.
+    pub buffer_bytes: usize,
+    // Under memory pressure now: since the charge exceeded
+    // tcp.buffer_memory().pressure, until it fell to its low (Linux's
+    // tcp_memory_pressure).
+    pub memory_pressure: bool,
+    // Entries into memory pressure: Linux's TCPMemoryPressures.
+    pub memory_pressures: u64,
+    // Microseconds under memory pressure, in the Network's clock, the
+    // current pressure included up to the last call (Linux's
+    // TCPMemoryPressuresChrono counts milliseconds of ended pressures).
+    pub memory_pressure_us: u64,
+    // Connects refused with Error::NoMemory, and SYNs and Fast Open
+    // children dropped because the budget or the allocator refused their
+    // storage (also in listen_drops). Linux has no MIB for this.
+    pub memory_refused_opens: u64,
+    // Storage growths refused by the budget, memory pressure or the
+    // allocator, at write or in a buffer setter: Linux's
+    // __sk_mem_raise_allocated suppressing an allocation (no MIB).
+    pub memory_refused_growths: u64,
 }

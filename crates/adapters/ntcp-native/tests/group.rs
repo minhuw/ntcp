@@ -1083,17 +1083,28 @@ fn the_buffer_budget_admits_exactly_its_connections() {
         let mut network = Network::new(config, wire, [1; 32], 0).unwrap();
         let count = (0..9).take_while(|_| network.connect(peer).is_ok()).count();
         let refusal = network.connect(peer).unwrap_err();
-        (count, refusal)
+        (count, refusal, network.counters())
     };
-    let (count, refusal) = admitted(budget);
+    // Each connect refused for memory counts: the one that ends the count
+    // and the one after. An exhausted budget is past its pressure
+    // threshold (two thirds).
+    let (count, refusal, counters) = admitted(budget);
     assert_eq!(count, 3);
     assert!(matches!(refusal, Error::NoMemory), "{refusal:?}");
-    let (count, refusal) = admitted(budget - 1);
+    assert_eq!(counters.memory_refused_opens, 2);
+    assert_eq!(counters.buffer_bytes, budget);
+    assert!(counters.memory_pressure);
+    assert_eq!(counters.memory_pressures, 1);
+    let (count, refusal, counters) = admitted(budget - 1);
     assert_eq!(count, 2);
     assert!(matches!(refusal, Error::NoMemory), "{refusal:?}");
-    let (count, refusal) = admitted(usize::MAX);
+    assert_eq!(counters.memory_refused_opens, 2);
+    let (count, refusal, counters) = admitted(usize::MAX);
     assert_eq!(count, 8);
     assert!(matches!(refusal, Error::Capacity), "{refusal:?}");
+    assert_eq!(counters.memory_refused_opens, 0);
+    assert!(!counters.memory_pressure);
+    assert_eq!(counters.memory_pressures, 0);
 }
 
 // Applications that read, write and accept only when an event says so

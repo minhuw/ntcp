@@ -534,13 +534,14 @@ impl Endpoint {
     ) -> Result<ConnectionId, ManagedError<P::Error>> {
         let tuple = scoped.tuple();
         let (local, remote) = (tuple.local, tuple.remote);
-        self.active_admission(
+        let admission = self.active_admission(
             now,
             scoped,
             &options.transport,
             options.receive_authority,
             false,
-        )?;
+        );
+        self.admit_open(admission)?;
         let dscp = ntcp_path::Dscp::new(options.dscp)
             .map_err(|_| EndpointError::Connection(Error::InvalidArgument))?;
         let request = PathFactoryRequest {
@@ -600,13 +601,14 @@ impl Endpoint {
     ) -> Result<(ConnectionId, usize), ManagedError<P::Error>> {
         let tuple = scoped.tuple();
         let (local, remote) = (tuple.local, tuple.remote);
-        self.active_admission(
+        let admission = self.active_admission(
             now,
             scoped,
             &options.transport,
             options.receive_authority,
             true,
-        )?;
+        );
+        self.admit_open(admission)?;
         let dscp = ntcp_path::Dscp::new(options.dscp)
             .map_err(|_| EndpointError::Connection(Error::InvalidArgument))?;
         let request = PathFactoryRequest {

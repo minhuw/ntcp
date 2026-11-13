@@ -37,13 +37,52 @@ impl fmt::Display for BufferMemory {
     }
 }
 
+/// An endpoint's buffer memory, after Linux's sockstat and MIB counters
+/// (`Endpoint::memory_counters`). The counts are cumulative from the
+/// endpoint's creation and never reset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryCounters {
+    /// The bytes charged now against `max_buffer_bytes`
+    /// (`Endpoint::buffer_bytes`): /proc/net/sockstat's TCP `mem`, in
+    /// bytes where Linux counts pages.
+    pub buffer_bytes: usize,
+    /// Whether the endpoint is under memory pressure now
+    /// (`Endpoint::memory_pressure`): Linux's tcp_memory_pressure.
+    pub memory_pressure: bool,
+    /// Entries into memory pressure: Linux's TCPMemoryPressures.
+    pub memory_pressures: u64,
+    /// Microseconds spent under memory pressure, the current pressure
+    /// included up to the endpoint's clock. Linux's
+    /// TCPMemoryPressuresChrono counts milliseconds, and only once a
+    /// pressure ends.
+    pub memory_pressure_us: u64,
+    /// Writes that took fewer bytes than offered, or none, because memory
+    /// was refused, not because the send buffer was full
+    /// (`Endpoint::memory_throttled_writes`): Linux's tcp_sendmsg waiting in
+    /// sk_stream_wait_memory, which no MIB counts.
+    pub memory_throttled_writes: u64,
+    /// Opens refused because the cap or the allocator refused their
+    /// storage: connects (Connection(NoMemory)), and SYNs and Fast Open
+    /// children dropped for it, which also count in `listen_drops`. Linux
+    /// has no MIB for this.
+    pub memory_refused_opens: u64,
+    /// Storage growths refused by the cap, by memory pressure or by the
+    /// allocator: at write (send ring and ledgers, shared spans) and in
+    /// `set_buffer_capacities`. Linux's __sk_mem_raise_allocated
+    /// suppressing an allocation, which no MIB counts.
+    pub memory_refused_growths: u64,
+}
+
 // The bytes an endpoint has charged and its pressure state. The thresholds
 // are the configuration's, resolved at each change.
 pub(crate) struct Budget {
     charged: usize,
     // When the current pressure began (Linux keeps it in
-    // tcp_memory_pressure).
+    // tcp_memory_pressure), entries into pressure, and the caller ticks of
+    // the pressures that ended.
     pressure_since: Option<Instant>,
+    pressures: u64,
+    pressure_ticks: u64,
 }
 
 impl Budget {
@@ -51,6 +90,8 @@ impl Budget {
         Self {
             charged: 0,
             pressure_since: None,
+            pressures: 0,
+            pressure_ticks: 0,
         }
     }
 
@@ -69,15 +110,16 @@ impl Budget {
         if self.charged > memory.pressure {
             self.enter(now);
         } else if self.charged <= memory.low {
-            self.leave();
+            self.leave(now);
         }
     }
 
-    // Return `bytes`; whether pressure ended, as __sk_mem_reduce_allocated
-    // leaves it once the charge falls to `memory.low`.
-    pub(crate) fn reduce(&mut self, bytes: usize, memory: BufferMemory) -> bool {
+    // Return `bytes` at `now`; whether pressure ended, as
+    // __sk_mem_reduce_allocated leaves it once the charge falls to
+    // `memory.low`.
+    pub(crate) fn reduce(&mut self, bytes: usize, now: Instant, memory: BufferMemory) -> bool {
         self.charged -= bytes;
-        self.charged <= memory.low && self.leave()
+        self.charged <= memory.low && self.leave(now)
     }
 
     // An allocation tried would have brought the charge to `total`: past
@@ -92,10 +134,24 @@ impl Budget {
     fn enter(&mut self, now: Instant) {
         if self.pressure_since.is_none() {
             self.pressure_since = Some(now);
+            self.pressures += 1;
         }
     }
 
-    fn leave(&mut self) -> bool {
-        self.pressure_since.take().is_some()
+    fn leave(&mut self, now: Instant) -> bool {
+        let Some(since) = self.pressure_since.take() else {
+            return false;
+        };
+        self.pressure_ticks += now.saturating_sub(since);
+        true
+    }
+
+    // Entries into pressure, and the caller ticks spent in it up to `now`,
+    // the current pressure included.
+    pub(crate) fn pressure_totals(&self, now: Instant) -> (u64, u64) {
+        let current = self
+            .pressure_since
+            .map_or(0, |since| now.saturating_sub(since));
+        (self.pressures, self.pressure_ticks + current)
     }
 }
