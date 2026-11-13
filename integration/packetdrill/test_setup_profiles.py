@@ -104,7 +104,7 @@ class SetupProfiles(unittest.TestCase):
             generated, _ = adapt_source(directory, name, manifest, entry['adapter_flags'])
             self.assertEqual(entry['command_line'].encode(), SLOW_START_ACK_SETUP)
             self.assertEqual(entry['mapping']['ntcp_settings']['endpoint_max_buffer_bytes'],
-                             128 * 1024 * 1024)
+                             32 * 1024 * 1024)
             self.assertEqual(preflight(generated.decode(), True), [])
             for command in (SLOW_START_ACK_SETUP.replace(b'=100', b'=50'),
                             SLOW_START_ACK_SETUP.replace(b'=100`', b'=100; false`')):
