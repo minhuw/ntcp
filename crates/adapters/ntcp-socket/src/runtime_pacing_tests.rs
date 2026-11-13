@@ -180,7 +180,8 @@ fn typed_core_settings_reach_native_connections() {
     let client = new(&mut a, SOCK_NONBLOCK);
     for (level, option, expected) in [
         (SOL_SOCKET, SO_SNDBUF, 32768),
-        (SOL_SOCKET, SO_RCVBUF, 16384),
+        // The 16384-byte window as the sk_rcvbuf that offers it.
+        (SOL_SOCKET, SO_RCVBUF, 32768),
         (SOL_SOCKET, SO_KEEPALIVE, 1),
         (IPPROTO_TCP, TCP_NODELAY, 1),
         (IPPROTO_TCP, TCP_KEEPIDLE, 5),

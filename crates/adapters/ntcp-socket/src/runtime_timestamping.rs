@@ -136,6 +136,11 @@ impl TimestampState {
     }
 }
 impl Socket {
+    // Linux's sk_rcvbuf, the memory sock_queue_err_skb charges error-queue
+    // records against: the receive size taken back to memory.
+    fn rcvbuf(&self) -> usize {
+        buffer_memory_from_size(SO_RCVBUF, self.receive_capacity)
+    }
     // Retained capacities plus the record sums kept as records are queued and
     // dequeued, as Linux charges each error-queue skb to sk_rmem_alloc in
     // sock_queue_err_skb and releases it in sock_rfree.
@@ -415,8 +420,7 @@ impl Owner {
             || (phases != 0 || s.timestamps.reserved() != 0) && total > PHASES
             || new_zc != 0 && total > self.request_limit()
             || phases != 0
-                && s.timestamp_charge() + phases * RECORD + pending_bytes + queue_bytes
-                    > s.receive_capacity
+                && s.timestamp_charge() + phases * RECORD + pending_bytes + queue_bytes > s.rcvbuf()
             || self.timestamp_charge() + phases * RECORD + pending_bytes + queue_bytes
                 > RUNTIME_BYTES
         {
@@ -585,9 +589,7 @@ impl Owner {
                 }
                 // Linux drops timestamp notifications under receive-memory pressure.
                 // Never retain an uncharged packet or substitute invented bytes.
-                if charge + bytes.len() <= s.receive_capacity
-                    && global + bytes.len() <= RUNTIME_BYTES
-                {
+                if charge + bytes.len() <= s.rcvbuf() && global + bytes.len() <= RUNTIME_BYTES {
                     let stored = s.timestamps.update(index, |pending| {
                         if let Some(packet) = &retained {
                             pending.payload = packet.clone();
@@ -692,7 +694,7 @@ impl Owner {
         };
         let charge = s.timestamp_charge();
         if let Some(value) = value.filter(|_| tsonly || !pending.payload.is_empty())
-            && charge + payload_charge <= s.receive_capacity
+            && charge + payload_charge <= s.rcvbuf()
             && *global + payload_charge <= RUNTIME_BYTES
         {
             let (sw, hw) = match event.source {

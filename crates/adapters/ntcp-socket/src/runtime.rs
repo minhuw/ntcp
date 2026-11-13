@@ -47,9 +47,13 @@ pub(crate) const BUDGET: usize = 32;
 // sock_setsockopt clamps the unsigned request to net.core.rmem_max or
 // wmem_max before doubling it. Fixed project caps, not host sysctls:
 // Linux master's defaults, 4 MiB each (net/core/sock.c, sysctl_rmem_max
-// and sysctl_wmem_max = 4 << 20).
+// and sysctl_wmem_max = 4 << 20; 6.12's are SK_RMEM_MAX and SK_WMEM_MAX,
+// SKB_TRUESIZE(256) * 256 = 212992 on x86-64).
 const RMEM_MAX: u32 = 4 << 20;
 const WMEM_MAX: u32 = 4 << 20;
+// Linux's sk_sndbuf or sk_rcvbuf for a setsockopt(SO_SNDBUF/SO_RCVBUF)
+// request, bytes of memory: the clamped request doubled, at least
+// SOCK_MIN_SNDBUF or SOCK_MIN_RCVBUF (sk_setsockopt, __sock_set_rcvbuf).
 fn socket_buffer_value(name: i32, value: i32) -> usize {
     let (cap, minimum) = if name == SO_SNDBUF {
         (WMEM_MAX, 4608)
@@ -57,6 +61,65 @@ fn socket_buffer_value(name: i32, value: i32) -> usize {
         (RMEM_MAX, 2304)
     };
     ((value as u32).min(cap) as usize * 2).max(minimum)
+}
+// The one conversion between Linux's socket buffer memory (sk_sndbuf,
+// sk_rcvbuf: what SO_SNDBUF/SO_RCVBUF set and report) and ntcp's sizes
+// (send payload bytes, receive window bytes), both ways. Linux master and
+// 6.12 agree on every step but the caps above.
+//
+// Receive: the window a locked sk_rcvbuf allows is tcp_full_space(sk) =
+// tcp_win_from_space(sk, sk_rcvbuf) = sk_rcvbuf * scaling_ratio >>
+// TCP_RMEM_TO_WIN_SCALE (include/net/tcp.h), and before the SYN it
+// clamps the window and, through it, the window scale
+// (tcp_connect_init, tcp_openreq_init_rwin, tcp_select_initial_window).
+// scaling_ratio starts at TCP_DEFAULT_SCALING_RATIO, 128 of 256, a 50%
+// guess at skb->len / skb->truesize (tcp_scaling_ratio_init), so the
+// window is half of sk_rcvbuf: SO_RCVBUF 212992 locks 425984 bytes of
+// memory and a 212992-byte window with scale 2, as Linux. getsockopt
+// takes the live window back through the inverse, __tcp_space_from_win.
+// Deviation, kept: Linux measures the ratio again from the first segment
+// larger than rcv_mss (tcp_measure_rcv_mss) and resets window_clamp to
+// tcp_win_from_space(sk_rcvbuf) even when SO_RCVBUF locked it. The
+// ratio is the memory a driver's receive buffers hold per payload byte;
+// ntcp copies each payload into its receive ring, one byte of ring per
+// byte of window whatever the NIC buffers were, so it has no such
+// measurement and keeps the default ratio.
+//
+// Send: writes stop once sk_wmem_queued, the queued skbs' truesize,
+// reaches sk_sndbuf (sk_stream_memory_free). tcp_sendmsg_locked charges
+// the copied payload byte for byte (sk_wmem_queued_add(sk, copy)) plus
+// one skb head, SKB_TRUESIZE of a MAX_TCP_HEADER allocation
+// (tcp_stream_alloc_skb), per skb of up to size_goal, about 64 KB with
+// GSO: a bulk writer queues about sk_sndbuf of payload (upstream
+// packetdrill cubic-bulk-166k: "SO_SNDBUF is doubled, so we can write
+// the full amount"). tcp_sndbuf_expand's per_mss (a power of two over
+// MSS plus headers) is its worst-case growth target, not the charge. So
+// the payload limit is sk_sndbuf itself; the core charges the entries
+// short segments take.
+const TCP_RMEM_TO_WIN_SCALE: u32 = 8;
+const TCP_DEFAULT_SCALING_RATIO: usize = 1 << (TCP_RMEM_TO_WIN_SCALE - 1);
+// ntcp's size for Linux's sk_sndbuf or sk_rcvbuf `memory`.
+fn buffer_size_from_memory(name: i32, memory: usize) -> usize {
+    if name == SO_SNDBUF {
+        memory
+    } else {
+        // __tcp_win_from_space
+        (memory * TCP_DEFAULT_SCALING_RATIO) >> TCP_RMEM_TO_WIN_SCALE
+    }
+}
+// Linux's sk_sndbuf or sk_rcvbuf for ntcp's `size`, what getsockopt
+// reports.
+fn buffer_memory_from_size(name: i32, size: usize) -> usize {
+    if name == SO_SNDBUF {
+        size
+    } else {
+        // __tcp_space_from_win
+        (size << TCP_RMEM_TO_WIN_SCALE) / TCP_DEFAULT_SCALING_RATIO
+    }
+}
+// ntcp's size for a setsockopt(SO_SNDBUF/SO_RCVBUF) request.
+fn socket_buffer_size(name: i32, value: i32) -> usize {
+    buffer_size_from_memory(name, socket_buffer_value(name, value))
 }
 #[derive(Clone)]
 pub enum Op {
@@ -4087,11 +4150,11 @@ impl Owner {
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse = value != 0,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive = value != 0,
                     (SOL_SOCKET, SO_SNDBUF) => {
-                        s.send_capacity = socket_buffer_value(name, value);
+                        s.send_capacity = socket_buffer_size(name, value);
                         s.send_locked = true;
                     }
                     (SOL_SOCKET, SO_RCVBUF) => {
-                        s.receive_capacity = socket_buffer_value(name, value);
+                        s.receive_capacity = socket_buffer_size(name, value);
                         s.receive_locked = true;
                     }
                     (SOL_SOCKET, SO_ZEROCOPY) => {
@@ -4349,8 +4412,9 @@ impl Owner {
                     // setsockopt locked. Before a connection exists, the
                     // configured initial size (tcp_wmem[1], tcp_rmem[1]) or
                     // the locked one; after a failed connect, the last
-                    // size the connection had. ntcp counts window and
-                    // payload bytes where Linux counts skb memory.
+                    // size the connection had. ntcp's window and payload
+                    // bytes go back to Linux's memory
+                    // (`buffer_memory_from_size`).
                     (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => {
                         let (send, receive) = match s.handle {
                             Handle::Connection(cid) => {
@@ -4362,7 +4426,8 @@ impl Owner {
                             },
                             Handle::Listener(_) => (s.send_capacity, s.receive_capacity),
                         };
-                        (if name == SO_SNDBUF { send } else { receive }) as i32
+                        let size = if name == SO_SNDBUF { send } else { receive };
+                        buffer_memory_from_size(name, size).min(i32::MAX as usize) as i32
                     }
                     (IPPROTO_TCP, TCP_FASTOPEN) => s.fast_open_limit,
                     (IPPROTO_TCP, TCP_FASTOPEN_CONNECT) => s.fast_open_connect as i32,

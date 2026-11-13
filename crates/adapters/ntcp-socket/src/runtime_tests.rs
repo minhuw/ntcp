@@ -1125,6 +1125,18 @@ fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
             (i32::MAX, 8 << 20),
         ] {
             assert_eq!(socket_buffer_value(name, request), expected);
+            // Receive sizes are window bytes, half of sk_rcvbuf at the
+            // default scaling ratio; send sizes are sk_sndbuf of payload.
+            let size = socket_buffer_size(name, request);
+            assert_eq!(
+                size,
+                if name == SO_SNDBUF {
+                    expected
+                } else {
+                    expected / 2
+                }
+            );
+            assert_eq!(buffer_memory_from_size(name, size), expected);
         }
     }
     let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;
@@ -1219,10 +1231,84 @@ fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
     assert_eq!(a.endpoint.buffer_bytes(), charged);
 }
 
+// SO_RCVBUF 212992 before connect() or listen() locks sk_rcvbuf = 425984
+// bytes of memory, and Linux clamps the window to tcp_full_space, half of
+// it at TCP_DEFAULT_SCALING_RATIO (tcp_connect_init,
+// tcp_openreq_init_rwin): window_clamp 212992, and
+// tcp_select_initial_window's scale ilog2(212992) - 15 = 2 on the SYN and
+// the SYN-ACK, whose unscaled window is 65535. SO_SNDBUF 212992 locks
+// sk_sndbuf = 425984, which a bulk writer fills with payload
+// (sk_stream_memory_free). getsockopt reports both doubled, on the
+// sockets that set them and on the child that inherits them.
+#[test]
+fn socket_buffer_requests_convert_to_linux_window_and_payload() {
+    use ntcp::wire::{self, SYN};
+    let mut a = owner(2);
+    let mut b = owner(3);
+    let get = |o: &mut Owner, id, name| o.execute(id, Op::Get(SOL_SOCKET, name)).unwrap().value;
+    let listener = new(&mut b, SOCK_NONBLOCK);
+    let client = new(&mut a, SOCK_NONBLOCK);
+    for (o, id) in [(&mut b, listener), (&mut a, client)] {
+        for name in [SO_SNDBUF, SO_RCVBUF] {
+            o.execute(id, Op::Set(SOL_SOCKET, name, 212992)).unwrap();
+            assert_eq!(get(o, id, name), 425984);
+        }
+    }
+    b.execute(listener, Op::Bind("10.73.0.3:16379".parse().unwrap()))
+        .unwrap();
+    b.execute(listener, Op::Listen(4)).unwrap();
+    assert_eq!(
+        a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    // The SYN, then the SYN-ACK, each checked on its way to the peer.
+    for reverse in [false, true] {
+        let (from, to) = if reverse {
+            (&mut b, &mut a)
+        } else {
+            (&mut a, &mut b)
+        };
+        let mut out = [0; 1480];
+        let tx = from
+            .endpoint
+            .poll_transmit(from.now(), &mut out, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        let segment = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+        assert_ne!(segment.header.flags & SYN, 0);
+        assert_eq!(segment.options.window_scale, Some(2));
+        assert_eq!(segment.header.window, 65535);
+        to.input(to.now(), tx.ip, tx.dscp << 2 | tx.ecn, &out[..tx.len])
+            .unwrap();
+        from.events();
+        to.events();
+    }
+    pump(&mut a, &mut b);
+    let server = b
+        .execute(listener, Op::Accept(SOCK_NONBLOCK))
+        .unwrap()
+        .value as u64;
+    for (o, id) in [(&mut a, client), (&mut b, server)] {
+        let Handle::Connection(cid) = o.sockets[&id].handle else {
+            panic!("not a connection")
+        };
+        let info = o.endpoint.transport_info(cid).unwrap();
+        assert_eq!(info.receive_window_scale, 2);
+        assert_eq!(info.receive_capacity, 212992);
+        assert_eq!(info.send_capacity, 425984);
+        assert_eq!(get(o, id, SO_RCVBUF), 425984);
+        assert_eq!(get(o, id, SO_SNDBUF), 425984);
+    }
+}
+
 // getsockopt(SO_SNDBUF/SO_RCVBUF) reports the live size, as Linux reports
 // sk_sndbuf and sk_rcvbuf: the configured initial size before a connection
 // exists, then the receive ring DRS grew while the reader kept up with a
-// bulk sender, and the send limit the congestion window expanded.
+// bulk sender, and the send limit the congestion window expanded. A
+// receive window reads back as the memory that offers it at the default
+// scaling ratio, twice the window (__tcp_space_from_win).
 #[test]
 fn socket_buffer_sizes_report_the_live_size() {
     let mut a = owner(2);
@@ -1235,13 +1321,13 @@ fn socket_buffer_sizes_report_the_live_size() {
     let mut b = owner_with_config(3, config);
     let get = |o: &mut Owner, id, name| o.execute(id, Op::Get(SOL_SOCKET, name)).unwrap().value;
     let listener = new(&mut b, SOCK_NONBLOCK);
-    assert_eq!(get(&mut b, listener, SO_RCVBUF), 32768);
+    assert_eq!(get(&mut b, listener, SO_RCVBUF), 65536);
     assert_eq!(get(&mut b, listener, SO_SNDBUF), BYTES as i32);
     b.execute(listener, Op::Bind("10.73.0.3:16379".parse().unwrap()))
         .unwrap();
     b.execute(listener, Op::Listen(4)).unwrap();
     let client = new(&mut a, SOCK_NONBLOCK);
-    assert_eq!(get(&mut a, client, SO_RCVBUF), BYTES as i32);
+    assert_eq!(get(&mut a, client, SO_RCVBUF), 2 * BYTES as i32);
     assert_eq!(
         a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
             .unwrap_err(),
@@ -1252,7 +1338,7 @@ fn socket_buffer_sizes_report_the_live_size() {
         .execute(listener, Op::Accept(SOCK_NONBLOCK))
         .unwrap()
         .value as u64;
-    assert_eq!(get(&mut b, server, SO_RCVBUF), 32768);
+    assert_eq!(get(&mut b, server, SO_RCVBUF), 65536);
     let mut read = 0;
     let data = [7u8; 16384];
     let sources = vec![(data.as_ptr() as usize, data.len())];
@@ -1271,12 +1357,12 @@ fn socket_buffer_sizes_report_the_live_size() {
     }
     assert!(read > 1 << 20, "read {read} bytes");
     let grown = get(&mut b, server, SO_RCVBUF);
-    assert!(grown > 32768, "SO_RCVBUF {grown}");
+    assert!(grown > 65536, "SO_RCVBUF {grown}");
     let Handle::Connection(cid) = b.sockets[&server].handle else {
         panic!("not a connection")
     };
     let info = b.endpoint.transport_info(cid).unwrap();
-    assert_eq!(grown as usize, info.receive_capacity);
+    assert_eq!(grown as usize, 2 * info.receive_capacity);
     let expanded = get(&mut a, client, SO_SNDBUF);
     assert!(expanded > BYTES as i32, "SO_SNDBUF {expanded}");
     let Handle::Connection(cid) = a.sockets[&client].handle else {

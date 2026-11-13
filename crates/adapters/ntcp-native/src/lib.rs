@@ -1688,9 +1688,13 @@ impl<P: PacketIo> Network<P> {
     /// direction: neither expansion with the congestion window nor memory
     /// pressure changes it again. Linux's sock_setsockopt SO_SNDBUF, which
     /// sets sk_sndbuf and SOCK_SNDBUF_LOCK (tcp_should_expand_sndbuf). The
-    /// size is bytes of payload, used as given: the wmem_max clamp and the
-    /// doubling are the caller's. Allocates nothing: the next write grows
-    /// the send ring. 0 < `bytes` < 2^30, else `InvalidConfig`.
+    /// size is bytes of payload, used as given. A caller mapping Linux's
+    /// setsockopt converts as ntcp-socket does (runtime.rs,
+    /// `socket_buffer_size`): clamp to wmem_max and double, which gives
+    /// sk_sndbuf, about the payload Linux queues in it (tcp_sendmsg_locked
+    /// charges the copied bytes plus one skb head per skb). Allocates
+    /// nothing: the next write grows the send ring. 0 < `bytes` < 2^30,
+    /// else `InvalidConfig`.
     pub fn set_send_buffer(&mut self, id: ConnId, bytes: usize) -> Result<()> {
         self.running()?;
         let core = self.open_core(id)?;
@@ -1708,11 +1712,15 @@ impl<P: PacketIo> Network<P> {
     /// keeps the ring and never retracts the window offered. Called before
     /// the SYN leaves (after `connect`, before the next `drive`), it also
     /// sets the window scale the SYN offers, as
-    /// `ConnectOptions::receive_buffer` does. The
-    /// size is bytes of window, used as given: the rmem_max clamp and the
-    /// doubling are the caller's, and where Linux offers tcp_full_space,
-    /// half of sk_rcvbuf at the default scaling ratio, ntcp offers all of
-    /// it. 0 < `bytes` ≤ 65535·2^14, else `InvalidConfig`.
+    /// `ConnectOptions::receive_buffer` does. The size is bytes of window,
+    /// used as given. A caller mapping Linux's setsockopt converts as
+    /// ntcp-socket does (runtime.rs, `socket_buffer_size`): clamp to
+    /// rmem_max and double, which gives sk_rcvbuf, then take the window
+    /// Linux offers from it, tcp_full_space: half of sk_rcvbuf at
+    /// TCP_DEFAULT_SCALING_RATIO, so SO_RCVBUF 212992 is 212992 bytes here
+    /// and window scale 2. Reporting sk_rcvbuf back doubles the window
+    /// (`buffer_memory_from_size`). 0 < `bytes` ≤ 65535·2^14, else
+    /// `InvalidConfig`.
     pub fn set_receive_buffer(&mut self, id: ConnId, bytes: usize) -> Result<()> {
         self.running()?;
         let core = self.open_core(id)?;

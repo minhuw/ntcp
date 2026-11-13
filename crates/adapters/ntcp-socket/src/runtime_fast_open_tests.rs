@@ -603,9 +603,10 @@ fn fast_open_deferred_fault_retry_partial_and_server_early_response_barrier() {
         .value as usize;
     assert!(n > 0 && n < bytes.len());
     let connection = cid(&a, client);
+    // sk_sndbuf 4608 of payload; sk_rcvbuf 8192 offers a 4096-byte window.
     assert_eq!(
         a.endpoint.buffer_capacities(connection).unwrap(),
-        (4608, 8192)
+        (4608, 4096)
     );
     assert_eq!(a.endpoint.transport_info(connection).unwrap().send_used, n);
     let syn = tfo_capture(&mut a);

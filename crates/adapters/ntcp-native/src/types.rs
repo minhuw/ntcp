@@ -122,11 +122,13 @@ pub struct ConnectOptions {
     /// ephemeral port (`Network::connect_from`).
     pub local_port: Option<u16>,
     /// A send size set and locked before the SYN leaves, as SO_SNDBUF
-    /// before connect(2) (`Network::set_send_buffer`).
+    /// before connect(2): bytes of payload, converted from a Linux
+    /// request as `Network::set_send_buffer` describes.
     pub send_buffer: Option<usize>,
     /// A receive size set and locked before the SYN leaves, as SO_RCVBUF
-    /// before connect(2): the SYN's window scale follows it
-    /// (`Network::set_receive_buffer`).
+    /// before connect(2): bytes of window, converted from a Linux request
+    /// as `Network::set_receive_buffer` describes (half of sk_rcvbuf). The
+    /// SYN's window scale follows it.
     pub receive_buffer: Option<usize>,
 }
 

@@ -169,8 +169,10 @@ impl SocketConfig {
         // Autotuning as ntcp-native's NetworkConfig::new: receive 4 KiB,
         // 64 KiB and 32 MiB, Linux master's tcp_rmem[2] (net/ipv4/tcp.c
         // tcp_init), which also gives the SYN a window scale of 10; send
-        // 4 KiB, 64 KiB and 4 MiB, tcp_wmem[2]. SO_RCVBUF and SO_SNDBUF lock
-        // a socket's size (`tcp.rmem` and `tcp.wmem` change all three).
+        // 4 KiB, 64 KiB and 4 MiB, tcp_wmem[2]. These are window and
+        // payload bytes: Linux's tcp_rmem[1] of 128 KiB of memory offers a
+        // 64 KiB window. SO_RCVBUF and SO_SNDBUF lock a socket's size
+        // (`tcp.rmem` and `tcp.wmem` change all three).
         tcp.connection.receive_capacity_max = 32 << 20;
         tcp.connection.send_capacity_max = 4 << 20;
         tcp.connection.mss = MSS;
@@ -663,9 +665,19 @@ impl SocketConfig {
                 // the runtime's (`lib.rs`, Limits).
                 "tcp.max_connections" => config.tcp.max_connections = number(value)?,
                 "tcp.max_listeners" => config.tcp.max_listeners = number(value)?,
-                // Linux's tcp_wmem and tcp_rmem, "min initial max" in bytes,
-                // and tcp_mem, "low pressure high" in bytes where Linux
-                // counts pages.
+                // Linux's tcp_wmem and tcp_rmem, "min initial max", and
+                // tcp_mem, "low pressure high" in bytes where Linux counts
+                // pages. tcp.wmem and tcp.rmem are ntcp's sizes, payload
+                // and window bytes, not Linux's memory: they are the
+                // core's BufferSizes, as ntcp-native's, and the receive
+                // max serves two roles no one conversion keeps, the window
+                // scale, which tcp_select_initial_window takes from the
+                // unconverted tcp_rmem[2], and the ceiling DRS grows the
+                // window to, tcp_win_from_space(tcp_rmem[2]). Linux's
+                // tcp_rmem "a b c" is about tcp.rmem "a/2 b/2 c"
+                // (SO_RCVBUF converts in runtime.rs,
+                // buffer_size_from_memory); tcp_wmem's payload is about
+                // its memory, tcp_sndbuf_expand aside.
                 "tcp.wmem" => config
                     .tcp
                     .connection
