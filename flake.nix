@@ -79,7 +79,12 @@
 
       # nixpkgs' C toolchain compiles the shim and links Rust binaries, so DPDK, rdma-core and
       # every binary built here share nix's glibc. ntcp-io-af-xdp's host feature compiles its
-      # XDP program with clang-unwrapped: cc-wrapper's host-target flags do not apply to BPF.
+      # XDP program with clang-unwrapped: cc-wrapper's host-target flags do not apply to BPF;
+      # tests/run-native.sh compiles its redirect program with the same compiler and flags.
+      # stdenv already puts cc, ar, nm, make, patch, tar, sh and coreutils on PATH. Every
+      # other tool a script or test runs comes from here, so `nix develop -i` works on a
+      # machine with nothing but Nix; sudo, KVM, VFIO, hugepages and user namespaces stay
+      # host features.
       devShells.${system}.default = pkgs.mkShell {
         NTCP_BPF_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
         NTCP_BPF_CFLAGS = "-isystem ${pkgs.linuxHeaders}/include";
@@ -89,6 +94,26 @@
           pkgs.cargo
           pkgs.clippy
           pkgs.rustfmt
+          # duvet/, integration/ and the crates' Python tests; tomllib needs Python 3.11.
+          pkgs.python3
+          # Source snapshots (rfc_host, check_mac_cost) and operator packetdrill checkouts.
+          pkgs.git
+          # integration/packetdrill/build_runner.py builds an operator checkout's runner.
+          pkgs.bison
+          pkgs.flex
+          # Namespace tests: ip and tc (iproute2); unshare, nsenter, mount (util-linux);
+          # offload control (ethtool); rfc_host's ICMP filters (nftables); the peer's
+          # sysctls in linux_tun.py (procps); host_veth.py's ping (iputils).
+          pkgs.iproute2
+          pkgs.util-linux
+          pkgs.ethtool
+          pkgs.nftables
+          pkgs.procps
+          pkgs.iputils
+          # ntcp-io-af-xdp/tests/run-native.sh pins and attaches its XDP program.
+          pkgs.bpftools
+          # ntcp-socket/tests/redis.py runs redis-server and redis-cli over the preload.
+          pkgs.redis
         ];
         buildInputs = [
           dpdk-mlx5

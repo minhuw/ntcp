@@ -4,7 +4,9 @@ trap 'echo "native AF_XDP runner failed at line $LINENO (requires kernel support
 
 root=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$root"
-for tool in cargo clang python3 unshare mount umount ip bpftool readlink mktemp rm; do
+# Run inside `nix develop`, which provides every tool and the BPF compiler and flags.
+: "${NTCP_BPF_CLANG:?run inside nix develop (NTCP_BPF_CLANG names the BPF compiler)}"
+for tool in cargo "$NTCP_BPF_CLANG" pkg-config python3 unshare mount umount ip bpftool readlink mktemp rm; do
     command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
 done
 privilege=()
@@ -30,8 +32,10 @@ assert len(binaries) == 1, f'expected one native test executable, got {binaries}
 print(binaries[0])
 PY
 )
-multiarch=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("MULTIARCH") or "")')
-clang -O2 -g -target bpf -I"/usr/include/$multiarch" -c crates/io/ntcp-io-af-xdp/tests/redirect.c -o "$assets/redirect.o"
+# The compiler and flags of build.rs: libbpf's headers from pkg-config, the UAPI headers
+# from NTCP_BPF_CFLAGS.
+"$NTCP_BPF_CLANG" -O2 -g -target bpf $(pkg-config --cflags-only-I libbpf) ${NTCP_BPF_CFLAGS-} \
+    -c crates/io/ntcp-io-af-xdp/tests/redirect.c -o "$assets/redirect.o"
 
 # No setup command can run unless BOTH namespace identities differ from the caller.
 "${privilege[@]}" "$(command -v unshare)" --net --mount --propagation private \
