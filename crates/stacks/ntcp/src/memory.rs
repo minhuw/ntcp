@@ -45,6 +45,14 @@ impl fmt::Display for BufferMemory {
 /// An endpoint's buffer memory, after Linux's sockstat and MIB counters
 /// (`Endpoint::memory_counters`). The counts are cumulative from the
 /// endpoint's creation and never reset.
+///
+/// For a member of shared buffer memory (`Endpoint::share_buffer_memory`)
+/// `memory_pressure`, `memory_pressures` and `memory_pressure_us` are the
+/// group's, as Linux keeps one tcp_memory_pressure for every CPU: the same
+/// in every member while it is one, so a sum over members counts each
+/// pressure once per member, and an endpoint's own counts from before it
+/// joined show again only once it leaves. The other fields are the
+/// member's own and sum over members.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MemoryCounters {
     /// The bytes charged now against `max_buffer_bytes`

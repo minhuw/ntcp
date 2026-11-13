@@ -336,12 +336,21 @@ pub struct Counters {
     // writable again once memory comes back to the budget.
     pub memory_throttled_writes: u64,
     // Buffer memory (`ntcp::MemoryCounters`, `Endpoint::memory_counters`).
-    // The bytes charged now against tcp.max_buffer_bytes: sockstat TCP
-    // `mem`, in bytes.
+    // The bytes this Network charged now against tcp.max_buffer_bytes, or
+    // against its group's cap for a member of shared flows that shares
+    // buffer memory: sockstat TCP `mem`, in bytes. The members' values sum
+    // to the group's charge, which the group's published count
+    // (`ntcp::SharedBufferMemory::buffer_bytes`) trails by less than a
+    // batch per member.
     pub buffer_bytes: usize,
     // Under memory pressure now: since the charge exceeded
     // tcp.buffer_memory().pressure, until it fell to its low (Linux's
-    // tcp_memory_pressure).
+    // tcp_memory_pressure). For a member of shared buffer memory this and
+    // the next two are the group's, as Linux keeps one pressure state for
+    // every CPU: the group's charge against its thresholds, its entries
+    // and its time, the same in every member. Read them from any one
+    // member (`SharedFlows::buffer_memory` gives the group); a sum over
+    // members counts each pressure once per member.
     pub memory_pressure: bool,
     // Entries into memory pressure: Linux's TCPMemoryPressures.
     pub memory_pressures: u64,
