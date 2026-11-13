@@ -273,3 +273,111 @@ fn fixed_sizes_leave_the_trace_as_it_was() {
     tuned.connection.receive_capacity_max = 1 << 20;
     assert_ne!(transfer(&tuned), default);
 }
+
+// A client of `a` with a tuned send direction ({4096, 4096, 256 KiB}), to a
+// peer whose fixed 1 MiB receive window never limits it.
+fn sender_config() -> EndpointConfig {
+    let mut config = config();
+    config.connection.send_capacity = 4096;
+    config.connection.send_capacity_max = 256 << 10;
+    config.connection.receive_capacity = 1 << 20;
+    config
+}
+
+// The client's send limit and congestion window after each round of a bulk
+// transfer in which it keeps its send buffer full and the peer reads
+// everything: the send limit after the handshake, then one entry a round.
+fn send_limits(a_config: EndpointConfig, open: Option<usize>) -> Vec<(usize, u32, u32)> {
+    let mut a = Endpoint::new(a_config, [1; 32], 0, |_| true).unwrap();
+    let mut b = Endpoint::new(sender_config(), [2; 32], 0, |_| true).unwrap();
+    let mut trace = [Vec::new(), Vec::new()];
+    let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+    let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+    let client = match open {
+        None => a.connect(0, local, REMOTE.parse().unwrap()),
+        Some(send) => {
+            a.connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), send, 1 << 20)
+        }
+    }
+    .unwrap();
+    exchange(&mut a, &mut b, 0, &mut trace);
+    let server = b.accept(listener).unwrap();
+    let mut limits = Vec::new();
+    let record = |a: &Endpoint, limits: &mut Vec<_>| {
+        let info = a.transport_info(client).unwrap();
+        limits.push((info.send_capacity, info.cwnd, info.mss));
+    };
+    record(&a, &mut limits);
+    let data = [7; 65536];
+    let mut out = [0; 65536];
+    for now in 1..80 {
+        while a.write(client, &data).is_ok_and(|count| count != 0) {}
+        exchange(&mut a, &mut b, now, &mut trace);
+        while b.read(server, &mut out).is_ok() {}
+        record(&a, &mut limits);
+        trace = [Vec::new(), Vec::new()];
+    }
+    limits
+}
+
+// Linux's tcp_sndbuf_expand: the limit is twice the congestion window, at
+// least ten segments, up to send_capacity_max. It rises at establishment
+// (tcp_init_buffer_space) and after ACKs that free room for the blocked
+// writer (tcp_new_space), and never falls without pressure.
+#[test]
+fn the_send_limit_follows_the_congestion_window() {
+    let limits = send_limits(sender_config(), None);
+    let max = 256 << 10;
+    let (established, _, mss) = limits[0];
+    let mss = mss as usize;
+    assert_eq!(established, 20 * mss);
+    for pair in limits.windows(2) {
+        let ((before, _, _), (after, cwnd, _)) = (pair[0], pair[1]);
+        assert!(after >= before, "{limits:?}");
+        let ceiling = (2 * (cwnd as usize / mss).max(10) * mss).min(max);
+        assert!(after <= ceiling, "{limits:?}");
+        assert!(after == max || after % (2 * mss) == 0, "{limits:?}");
+    }
+    assert!(
+        limits
+            .iter()
+            .any(|&(limit, _, _)| limit > established && limit < max)
+    );
+    assert_eq!(limits.last().unwrap().0, max, "{limits:?}");
+}
+
+// A fixed direction, or one whose size the open locked (SOCK_SNDBUF_LOCK),
+// keeps its limit.
+#[test]
+fn a_fixed_or_locked_send_limit_does_not_expand() {
+    let mut fixed = sender_config();
+    fixed.connection.send_capacity_max = 0;
+    for (config, open, limit) in [(fixed, None, 4096), (sender_config(), Some(8192), 8192)] {
+        let limits = send_limits(config, open);
+        assert!(limits.iter().all(|&(l, _, _)| l == limit), "{limits:?}");
+        assert!(limits.last().unwrap().1 > 20 * 1460);
+    }
+}
+
+// Under memory pressure, or once the charge reaches tcp_mem[0], ACKs do not
+// expand the limit (tcp_should_expand_sndbuf); establishment does, as
+// tcp_init_buffer_space checks only the lock.
+#[test]
+fn memory_pressure_or_the_low_threshold_stops_send_expansion() {
+    for (pressure, low) in [(2, 1), (usize::MAX / 2, 1)] {
+        let mut config = sender_config();
+        config.buffer_pressure_bytes = Some(pressure.min(config.max_buffer_bytes));
+        config.buffer_low_bytes = Some(low);
+        let limits = send_limits(config, None);
+        let established = 20 * limits[0].2 as usize;
+        assert!(
+            limits.iter().all(|&(l, _, _)| l == established),
+            "{limits:?}"
+        );
+        // The flight left cwnd room that would have expanded the limit.
+        assert!(
+            limits.last().unwrap().1 as usize > established,
+            "{limits:?}"
+        );
+    }
+}

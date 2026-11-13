@@ -1062,6 +1062,11 @@ pub(crate) struct Connection {
     // the send limit to.
     send_tuned: bool,
     send_min: usize,
+    // The ceiling autotuning raises the send limit to, and an ACK that
+    // freed send space for a blocked writer, whose limit the endpoint may
+    // now raise (Linux's tcp_check_space with SOCK_NOSPACE set).
+    send_max: usize,
+    send_expand_pending: bool,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1426,6 +1431,8 @@ impl Connection {
             send_memory_wanted: None,
             send_tuned,
             send_min: send_sizes.min,
+            send_max: send_sizes.max,
+            send_expand_pending: false,
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -4644,6 +4651,11 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
     //# 3. Advance to the ESTABLISHED state.
     fn establish(&mut self) {
+        // Linux's tcp_init_buffer_space sizes an unlocked send buffer for
+        // the initial window as the connection is established.
+        if self.send_tuned {
+            self.sndbuf_expand();
+        }
         self.fast_open_attempt = false;
         if self.deferred_tfo_push {
             self.deferred_tfo_push = false;
@@ -5209,6 +5221,61 @@ impl Connection {
         if limit < self.config.send_capacity {
             self.config.send_capacity = limit;
             self.send.set_limit(limit);
+        }
+    }
+
+    // Linux's tcp_sndbuf_expand: room for twice the congestion window
+    // (Cubic's 1.7 factor, rounded up for an application slow to refill),
+    // and for no fewer than the initial window or the reordering degree
+    // plus one segments, up to send_capacity_max. Linux counts each
+    // segment's skb truesize; this limit counts payload, so a segment is
+    // its MSS. Raising the limit allocates nothing: the next write grows
+    // the ring, within the budget. It never lowers the limit.
+    fn sndbuf_expand(&mut self) {
+        let mss = self.mss.max(1);
+        let segments = (self.congestion.cwnd() as usize / mss)
+            .max(10)
+            .max(self.rack.reordering as usize + 1);
+        let limit = segments.saturating_mul(2 * mss).min(self.send_max);
+        if limit > self.config.send_capacity {
+            self.config.send_capacity = limit;
+            self.send.set_limit(limit);
+        }
+    }
+
+    pub(crate) fn send_expand_pending(&self) -> bool {
+        self.send_expand_pending
+    }
+
+    // Whether the flight leaves part of the congestion window unused once
+    // what is queued has been sent as both windows allow, in segments:
+    // Linux's tcp_should_expand_sndbuf asks this after tcp_data_snd_check
+    // has pushed the pending frames, and does not expand a buffer whose
+    // flight already fills cwnd.
+    fn cwnd_unfilled(&self) -> bool {
+        let mss = self.mss.max(1) as u64;
+        let cwnd = u64::from(self.congestion.cwnd());
+        let flight = u64::from(self.flight());
+        let room = cwnd.min(u64::from(self.snd_wnd)).saturating_sub(flight);
+        let pushed = flight + (self.notsent_bytes() as u64).min(room);
+        pushed.div_ceil(mss) < cwnd / mss
+    }
+
+    // After an ACK freed send space for a blocked writer
+    // (`send_expand_pending`): Linux's tcp_new_space, which expands the
+    // send limit unless `allowed` is false (the endpoint is under memory
+    // pressure, or charged at least tcp_mem[0]) or the flight fills the
+    // congestion window, and lets the writer in if it now has room.
+    pub(crate) fn expand_send(&mut self, allowed: bool) {
+        self.send_expand_pending = false;
+        if !allowed || !self.cwnd_unfilled() {
+            return;
+        }
+        self.sndbuf_expand();
+        if self.send_space_remaining() != 0 {
+            self.send_backpressured = false;
+            self.events.writable |=
+                !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
         }
     }
 
@@ -7572,6 +7639,10 @@ impl Connection {
             self.send
                 .acknowledge(bytes as usize)
                 .expect("ACK is bounded by sent sequence space");
+            // As Linux's tcp_check_space calls tcp_new_space once ACKs free
+            // space while SOCK_NOSPACE is set: a writer that found no room
+            // lets the endpoint raise a tuned limit (`expand_send`).
+            self.send_expand_pending |= self.send_tuned && self.send_backpressured;
             if self.send_space_remaining() != 0 {
                 self.send_backpressured = false;
             }

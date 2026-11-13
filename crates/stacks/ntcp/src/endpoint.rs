@@ -3231,6 +3231,17 @@ impl Endpoint {
         // RFC 7413 §5.1: retain recent remote resets in admission accounting.
         // Sixty seconds and latest-reset batch retention are local policy.
         let reset_cooldown = self.config.connection.timebase.ticks_from_us(60_000_000);
+        if self.slots[index]
+            .as_ref()
+            .is_some_and(|slot| slot.connection.send_expand_pending())
+        {
+            // tcp_should_expand_sndbuf: neither under memory pressure nor
+            // charged tcp_mem[0] or more.
+            let allowed =
+                !self.budget.under_pressure() && self.budget.allocated() < self.memory().low;
+            let slot = self.slots[index].as_mut().unwrap();
+            slot.connection.expand_send(allowed);
+        }
         if let Some(slot) = self.slots[index].as_mut() {
             // Every change of a connection's state is followed by its
             // refresh, or ends in its reclaim.
@@ -8951,6 +8962,9 @@ mod memory_wait_tests {
         let (small, _) = connect(&mut a, &mut b, listener, 40001);
         assert_eq!(a.write(big, &[1; 200]), Ok(200));
         assert_eq!(a.write(small, &[2; 20]), Ok(20));
+        // Establishment raised it to ten segments (tcp_init_buffer_space).
+        let small_limit = a.buffer_capacities(small).unwrap().0;
+        assert_eq!(small_limit, 20 * 64);
         let charged = a.buffer_bytes();
         let big_charge = a.slot(big).unwrap().connection.buffer_charge();
         // Two connections: the fair share is half the cap, which `big`
@@ -8973,7 +8987,7 @@ mod memory_wait_tests {
         assert_eq!(a.write(small, &[2; 40]), Ok(40));
         assert_eq!(a.memory_throttled_writes(), 1);
         assert!(a.buffer_room() < room);
-        assert_eq!(a.buffer_capacities(small).unwrap().0, 1024);
+        assert_eq!(a.buffer_capacities(small).unwrap().0, small_limit);
         // Once the peer acknowledges everything, `big` holds less than its
         // floor: it may grow again, within its moderated limit.
         exchange(&mut a, &mut b, 1);
