@@ -2345,6 +2345,8 @@ mod linux {
             max_setup_cache_entries: 64,
             max_route_policies: 64,
             max_buffer_bytes: MAX_FLOWS * (5 * 65536 + 1460),
+            buffer_pressure_bytes: None,
+            buffer_low_bytes: None,
             hop_limit: 64,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
             //# Generally, an application SHOULD NOT change the Diffserv field value

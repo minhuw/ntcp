@@ -470,6 +470,8 @@ fn config(local: IpAddr) -> EndpointConfig {
         max_route_policies: 4,
         // Ample for the one connection and its output reservation.
         max_buffer_bytes: 64 << 20,
+        buffer_pressure_bytes: None,
+        buffer_low_bytes: None,
         hop_limit: 64,
         dscp: 0,
         ipv4_options_enabled: false,

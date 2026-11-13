@@ -524,6 +524,8 @@ fn config(local: IpAddr, small_mtu: u32) -> EndpointConfig {
         max_setup_cache_entries: 4,
         max_route_policies: 4,
         max_buffer_bytes: 64 << 20,
+        buffer_pressure_bytes: None,
+        buffer_low_bytes: None,
         hop_limit: 64,
         dscp: 0,
         ipv4_options_enabled: false,

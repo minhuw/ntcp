@@ -115,7 +115,14 @@ pub struct EndpointConfig {
     // Bounded FIFO of local/remote IP pairs with inferred initial/restart loss.
     pub max_setup_cache_entries: usize,
     pub max_route_policies: usize,
+    // The hard cap on the bytes charged for connection storage, Linux's
+    // tcp_mem[2].
     pub max_buffer_bytes: usize,
+    // Where memory pressure begins and ends (`buffer_memory`), Linux's
+    // tcp_mem[1] and tcp_mem[0]: None is ⌊max_buffer_bytes·2/3⌋ and
+    // ⌊max_buffer_bytes/2⌋. Given, low < pressure ≤ max_buffer_bytes.
+    pub buffer_pressure_bytes: Option<usize>,
+    pub buffer_low_bytes: Option<usize>,
     pub hop_limit: u8,
     pub dscp: u8,
     pub connection: ConnectionConfig,
@@ -153,8 +160,27 @@ impl EndpointConfig {
                 return Err(Error::InvalidArgument.into());
             }
         }
+        if self.buffer_pressure_bytes.is_some() || self.buffer_low_bytes.is_some() {
+            let memory = self.buffer_memory();
+            if memory.low >= memory.pressure || memory.pressure > memory.high {
+                return Err(Error::InvalidArgument.into());
+            }
+        }
         self.preallocation_bytes()?;
         Ok(())
+    }
+
+    /// The buffer memory thresholds, Linux's tcp_mem in bytes: `high` is
+    /// `max_buffer_bytes`, the hard cap; pressure begins once the charge
+    /// exceeds `pressure` and ends once it is at most `low`
+    /// (`buffer_pressure_bytes`, `buffer_low_bytes`, by default ⅔ and ½ of
+    /// the cap, tcp_init_mem's ratios).
+    pub fn buffer_memory(&self) -> crate::BufferMemory {
+        crate::BufferMemory::resolve(
+            self.max_buffer_bytes,
+            self.buffer_pressure_bytes,
+            self.buffer_low_bytes,
+        )
     }
 
     /// The share of `max_buffer_bytes` one connection with the configured
@@ -243,6 +269,8 @@ impl Default for EndpointConfig {
             max_setup_cache_entries: 64,
             max_route_policies: 64,
             max_buffer_bytes: 256 * 1024 * 1024,
+            buffer_pressure_bytes: None,
+            buffer_low_bytes: None,
             hop_limit: 64,
             dscp: 0,
             connection: ConnectionConfig::default(),
@@ -621,7 +649,8 @@ pub struct Endpoint {
     control_epoch: Instant,
     control_count: usize,
     control_turn: bool,
-    buffer_bytes: usize,
+    // The bytes charged against max_buffer_bytes and the pressure state.
+    budget: crate::memory::Budget,
     per_connection_bytes: usize,
     receive_pool: Vec<ReceiveBuffer>,
     // ponytail: conservative FIFO loss retention until eviction; add path-qualified
@@ -716,6 +745,8 @@ impl Endpoint {
             .checked_add(listeners_count)
             .ok_or(EndpointError::LimitReached)?;
         let (per_connection_bytes, buffer_bytes) = config.preallocation_bytes()?;
+        let mut budget = crate::memory::Budget::new();
+        budget.raise(buffer_bytes, now, config.buffer_memory());
         let mut receive_pool = reserved_vec(config.preallocate_connections)?;
         for _ in 0..config.preallocate_connections {
             receive_pool.push(
@@ -818,7 +849,7 @@ impl Endpoint {
             oversized_control: 0,
             undeliverable_control: 0,
             control_turn: true,
-            buffer_bytes,
+            budget,
             per_connection_bytes,
             receive_pool,
         })
@@ -1489,7 +1520,31 @@ impl Endpoint {
     fn buffer_room(&self) -> usize {
         self.config
             .max_buffer_bytes
-            .saturating_sub(self.buffer_bytes)
+            .saturating_sub(self.budget.charged())
+    }
+
+    // Charge `bytes` to the budget.
+    fn charge(&mut self, bytes: usize) {
+        let memory = self.config.buffer_memory();
+        self.budget.raise(bytes, self.now, memory);
+    }
+
+    // Return `bytes` to the budget. Pressure that ends wakes the writers
+    // waiting for memory.
+    fn uncharge(&mut self, bytes: usize) {
+        let memory = self.config.buffer_memory();
+        if self.budget.reduce(bytes, memory) {
+            self.wake_memory_waiters();
+        }
+    }
+
+    // Storage charged `old` bytes now holds `new`.
+    fn recharge(&mut self, old: usize, new: usize) {
+        if new > old {
+            self.charge(new - old);
+        } else if new < old {
+            self.uncharge(old - new);
+        }
     }
 
     // Pooled receive storage a new connection would reuse, and the charge it
@@ -1761,22 +1816,25 @@ impl Endpoint {
             self.receive_pool.push(receive);
         }
         if let Ok(connection) = &result {
-            self.buffer_bytes = self.buffer_bytes - credit + connection.buffer_charge();
+            let charge = connection.buffer_charge();
+            self.recharge(credit, charge);
         }
         result
     }
 
     fn recycle_connection(&mut self, connection: Box<Connection>) {
         let charge = connection.buffer_charge();
-        self.buffer_bytes -= charge;
+        // A ring the pool keeps stays charged its open charge.
         if self.receive_pool.len() < self.config.preallocate_connections
             && connection.receive_allocation_capacity() == self.config.connection.receive_capacity
-            && self.per_connection_bytes <= self.buffer_room()
+            && self.per_connection_bytes <= self.buffer_room().saturating_add(charge)
         {
             let mut receive = connection.into_receive();
             receive.clear();
             self.receive_pool.push(receive);
-            self.buffer_bytes += self.per_connection_bytes;
+            self.recharge(charge, self.per_connection_bytes);
+        } else {
+            self.uncharge(charge);
         }
         self.wake_memory_waiters();
     }
@@ -1996,7 +2054,7 @@ impl Endpoint {
             lease,
             room,
         )?;
-        self.buffer_bytes += self.fast_open_credentials.allocation_bytes() - before;
+        self.charge(self.fast_open_credentials.allocation_bytes() - before);
         Ok(id)
     }
 
@@ -2233,7 +2291,7 @@ impl Endpoint {
             }
             let service = crate::fast_open::FastOpen::new()?;
             self.fast_open = Some(service);
-            self.buffer_bytes += charge;
+            self.charge(charge);
         }
         Ok(())
     }
@@ -2535,12 +2593,12 @@ impl Endpoint {
             Err(error) => {
                 // A send ring that grew before the other failed is charged
                 // until recycling releases it.
-                self.buffer_bytes = self.buffer_bytes - old_charge + connection.buffer_charge();
+                self.recharge(old_charge, connection.buffer_charge());
                 self.recycle_connection(connection);
                 return Err(error.into());
             }
         };
-        self.buffer_bytes = self.buffer_bytes - old_charge + connection.buffer_charge();
+        self.recharge(old_charge, connection.buffer_charge());
         let id = self.insert(connection, None, None)?;
         self.slots[id.slot].as_mut().unwrap().receive_authority = receive_authority;
         Ok((id, accepted))
@@ -2665,18 +2723,19 @@ impl Endpoint {
             > self
                 .config
                 .max_buffer_bytes
-                .saturating_sub(self.buffer_bytes - old)
+                .saturating_sub(self.budget.charged() - old)
         {
             return Err(EndpointError::LimitReached);
         }
         let max_charge = self
             .config
             .max_buffer_bytes
-            .saturating_sub(self.buffer_bytes - old);
+            .saturating_sub(self.budget.charged() - old);
         self.slot_mut(id)?
             .connection
             .set_buffer_capacities(send, receive, max_charge)?;
-        self.buffer_bytes = self.buffer_bytes - old + self.slot(id)?.connection.buffer_charge();
+        let new = self.slot(id)?.connection.buffer_charge();
+        self.recharge(old, new);
         self.refresh(id.slot);
         Ok(())
     }
@@ -4018,8 +4077,8 @@ impl Endpoint {
             .prepare_send_metadata(len, lowat, available, timestamp);
         // Charged even when refused: a send ring that grew before the other
         // failed keeps its storage.
-        self.buffer_bytes =
-            self.buffer_bytes - own_charge + self.slot(id)?.connection.buffer_charge();
+        let charge = self.slot(id)?.connection.buffer_charge();
+        self.recharge(own_charge, charge);
         if refused? {
             self.memory_throttled(id.slot);
         } else if !self.slot(id)?.connection.send_memory_throttled() {
@@ -4099,7 +4158,7 @@ impl Endpoint {
                 room,
             );
             let after = self.slot(id)?.connection.buffer_charge();
-            self.buffer_bytes += after - before;
+            self.recharge(before, after);
             // Span storage refused for memory admits nothing: the payload
             // waits for memory as a copied write would.
             if result == Err(Error::NoMemory) {
@@ -4193,8 +4252,8 @@ impl Endpoint {
             .connection
             .rx_timestamps
             .resize(ranges, spare)?;
-        self.buffer_bytes =
-            self.buffer_bytes - old + self.slot(id)?.connection.rx_timestamps.storage_bytes();
+        let new = self.slot(id)?.connection.rx_timestamps.storage_bytes();
+        self.recharge(old, new);
         self.wake_memory_waiters();
         Ok(())
     }
@@ -4226,8 +4285,8 @@ impl Endpoint {
             .connection
             .tx_timestamps
             .resize(phases, spare)?;
-        self.buffer_bytes =
-            self.buffer_bytes - old + self.slot(id)?.connection.tx_timestamps.storage_bytes();
+        let new = self.slot(id)?.connection.tx_timestamps.storage_bytes();
+        self.recharge(old, new);
         self.wake_memory_waiters();
         Ok(())
     }
@@ -5060,7 +5119,7 @@ impl Endpoint {
         slot.connection.tx_timestamps = Default::default();
         slot.connection.rx_timestamps = Default::default();
         slot.released = true;
-        self.buffer_bytes -= charge;
+        self.uncharge(charge);
         self.events.remove(id.slot);
         self.wake_memory_waiters();
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
@@ -5260,7 +5319,16 @@ impl Endpoint {
             || !self.cleanup.is_empty()
     }
     pub fn buffer_bytes(&self) -> usize {
-        self.buffer_bytes
+        self.budget.charged()
+    }
+
+    /// Whether the endpoint is under memory pressure, Linux's
+    /// tcp_memory_pressure: since the bytes charged (`buffer_bytes`)
+    /// exceeded `EndpointConfig::buffer_memory().pressure`, until they fell
+    /// to at most its `low` (`__sk_mem_raise_allocated`,
+    /// `__sk_mem_reduce_allocated`).
+    pub fn memory_pressure(&self) -> bool {
+        self.budget.under_pressure()
     }
 
     pub fn on_timeout(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
@@ -5353,11 +5421,12 @@ impl Endpoint {
         if charge > self.buffer_room() {
             return Err(Error::NoMemory.into());
         }
+        let mut old = 0;
         for (slot, payload) in self.reservations.iter_mut().zip(staged) {
-            self.buffer_bytes -= slot.shared.capacity() * core::mem::size_of::<crate::Payload>();
+            old += slot.shared.capacity() * core::mem::size_of::<crate::Payload>();
             slot.shared = payload;
         }
-        self.buffer_bytes += charge;
+        self.recharge(old, charge);
         Ok(())
     }
 
@@ -5476,7 +5545,7 @@ impl Endpoint {
         self.stateless_reservation = None;
         self.free_reservations = count;
         self.unattempted_reservations = unattempted;
-        self.buffer_bytes += charge;
+        self.charge(charge);
         Ok(())
     }
 
@@ -8022,7 +8091,7 @@ mod endpoint_mtu_update_tests {
         b.input(1, syn.ip, &bytes[..syn.len]).unwrap();
         let child = b.listener(listener).unwrap().children[0];
         assert!(!b.slot(child).unwrap().accepted_ready);
-        let allocated = b.buffer_bytes;
+        let allocated = b.budget.charged();
         let mss = b.config.connection.mss;
         let send_limit = b.config.connection.send_ip_payload_limit;
         crate::allocation_tests::fail_after(0, || {
@@ -8049,12 +8118,12 @@ mod endpoint_mtu_update_tests {
             .connect(2, "192.0.2.2:40001".parse().unwrap(), local)
             .unwrap();
         assert_eq!(b.path_mtu_info(future).unwrap().unwrap().first_hop_mtu, 68);
-        let allocated_after_open = b.buffer_bytes;
+        let allocated_after_open = b.budget.charged();
         assert!(allocated_after_open >= allocated);
         crate::allocation_tests::fail_after(0, || {
             b.set_endpoint_first_hop_mtu(3, 9000).unwrap();
         });
-        assert_eq!(b.buffer_bytes, allocated_after_open);
+        assert_eq!(b.budget.charged(), allocated_after_open);
         assert_eq!(b.config.connection.mss, mss);
         assert_eq!(b.config.connection.send_ip_payload_limit, send_limit);
         assert_eq!(b.path_mtu_info(child).unwrap().unwrap().current_mtu, 68);
@@ -8424,5 +8493,108 @@ mod memory_wait_tests {
         exchange(&mut a, &mut b, reclaimed);
         assert_eq!(b.read(server, &mut [0; 16]), Ok(9));
         assert!(a.buffer_bytes() <= a.config.max_buffer_bytes);
+    }
+
+    // As Linux's tcp_mem: pressure begins once the charge exceeds the
+    // pressure threshold (__sk_mem_raise_allocated) and ends only once it
+    // is at most the low one (__sk_mem_reduce_allocated), whatever it does
+    // between them.
+    #[test]
+    fn pressure_begins_above_its_threshold_and_ends_at_low() {
+        let (mut a, _, _) = endpoints();
+        let base = a.buffer_bytes();
+        a.config.max_buffer_bytes = base + 3000;
+        a.config.buffer_pressure_bytes = Some(base + 2000);
+        a.config.buffer_low_bytes = Some(base + 1000);
+        a.now = 10;
+        a.charge(2000);
+        assert!(!a.memory_pressure(), "at the threshold");
+        a.charge(1);
+        assert!(a.memory_pressure());
+        a.now = 25;
+        a.uncharge(900);
+        assert!(a.memory_pressure(), "above low");
+        a.charge(800);
+        a.uncharge(800);
+        assert!(a.memory_pressure(), "above low");
+        a.now = 50;
+        a.uncharge(101);
+        assert_eq!(a.buffer_bytes(), base + 1000);
+        assert!(!a.memory_pressure(), "at low");
+        a.charge(1000);
+        assert!(!a.memory_pressure(), "at the threshold");
+        a.now = 100;
+        a.charge(1);
+        assert!(a.memory_pressure());
+        a.uncharge(2001);
+        assert_eq!(a.buffer_bytes(), base);
+    }
+
+    // The storage connections allocate is what enters and leaves pressure.
+    #[test]
+    fn connection_storage_enters_and_leaves_pressure() {
+        let (mut a, mut b, listener) = endpoints();
+        let (client, _) = connect(&mut a, &mut b, listener, 40000);
+        let (other, _) = connect(&mut a, &mut b, listener, 40001);
+        let open = a.buffer_bytes();
+        // The first write allocates the send ring and ledgers.
+        assert_eq!(a.write(client, &[1; 9]), Ok(9));
+        let written = a.buffer_bytes();
+        let per_write = written - open;
+        a.config.max_buffer_bytes = written * 4;
+        a.config.buffer_pressure_bytes = Some(written + per_write - 1);
+        a.config.buffer_low_bytes = Some(written / 2);
+        assert!(!a.memory_pressure());
+        assert_eq!(a.write(other, &[1; 9]), Ok(9));
+        assert!(a.memory_pressure());
+        // Reclaiming one connection does not reach low.
+        a.abort(other).unwrap();
+        a.release(other).unwrap();
+        exchange(&mut a, &mut b, 1);
+        a.on_timeout(1 + a.config.connection.time_wait_us, 64)
+            .unwrap();
+        assert!(!a.connection_exists(other));
+        assert!(a.buffer_bytes() < written);
+        assert!(a.memory_pressure());
+        a.config.buffer_low_bytes = Some(a.buffer_bytes());
+        a.charge(1);
+        assert!(a.memory_pressure(), "only a return leaves");
+        a.uncharge(1);
+        assert!(!a.memory_pressure());
+    }
+
+    #[test]
+    fn buffer_memory_resolves_tcp_mem_thresholds() {
+        let config = EndpointConfig {
+            max_buffer_bytes: 3 << 20,
+            ..config()
+        };
+        let memory = config.buffer_memory();
+        assert_eq!(
+            (memory.low, memory.pressure, memory.high),
+            (3 << 19, 2 << 20, 3 << 20)
+        );
+        assert_eq!(alloc::format!("{memory}"), "1572864 2097152 3145728");
+        assert!(config.validate().is_ok());
+        let usize_max = EndpointConfig {
+            max_buffer_bytes: usize::MAX,
+            ..config.clone()
+        };
+        assert_eq!(usize_max.buffer_memory().pressure, usize::MAX / 3 * 2);
+        for (pressure, low, valid) in [
+            (Some(2 << 20), Some(1 << 20), true),
+            (Some(3 << 20), None, true),
+            (Some(1 << 20), Some(1 << 20), false),
+            (None, Some(2 << 20), false),
+            (Some((3 << 20) + 1), None, false),
+        ] {
+            let config = EndpointConfig {
+                buffer_pressure_bytes: pressure,
+                buffer_low_bytes: low,
+                ..config.clone()
+            };
+            assert_eq!(config.validate().is_ok(), valid, "{pressure:?} {low:?}");
+            assert_eq!(Endpoint::new(config, [1; 32], 0, |_| true).is_ok(), valid);
+        }
     }
 }

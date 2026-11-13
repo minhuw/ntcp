@@ -42,6 +42,8 @@ mod endpoint_tests;
 mod hystart;
 mod ipv4_options;
 mod loss_counters;
+mod memory;
+pub use memory::BufferMemory;
 mod pacing;
 mod pmtud;
 pub use pmtud::{

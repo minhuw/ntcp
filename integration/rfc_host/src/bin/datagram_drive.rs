@@ -782,6 +782,8 @@ fn config(local: IpAddr) -> EndpointConfig {
         max_setup_cache_entries: 1,
         max_route_policies: 1,
         max_buffer_bytes: 1 << 20,
+        buffer_pressure_bytes: None,
+        buffer_low_bytes: None,
         hop_limit: 64,
         dscp: 0,
         ipv4_options_enabled: false,
