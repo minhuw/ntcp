@@ -927,6 +927,13 @@ pub(crate) struct ReceiveBuffer {
     missing: ChunkSummary,
     read_base: Seq,
     head: usize,
+    // Every slot of the first `contiguous_len` offsets holds an initialized
+    // byte, which reads copy without testing presence again. Each way the
+    // prefix grows establishes it: promote_syn admits the bytes defer_syn
+    // wrote, in-order insertion copies its bytes first, and the prefix
+    // takes over retained bytes only after checking their presence. Reads
+    // drop the prefix's first bytes, and growth moves every slot with its
+    // offset.
     contiguous_len: usize,
     // Initialized prefix in the existing ring, not yet admitted to receive state.
     deferred_syn: Option<(usize, bool, bool)>,
@@ -1807,8 +1814,9 @@ impl ReceiveBuffer {
         let count = out.len().min(self.contiguous_len);
         for (offset, dst) in out[..count].iter_mut().enumerate() {
             let index = self.index(offset);
-            assert!(self.is_present(index));
-            // Presence guarantees an initialized payload byte.
+            debug_assert!(self.is_present(index));
+            // SAFETY: `offset` < contiguous_len, whose slots hold
+            // initialized bytes (`contiguous_len`).
             *dst = unsafe { self.data[index].assume_init() };
         }
         count
@@ -1818,10 +1826,12 @@ impl ReceiveBuffer {
         let count = out.len().min(self.contiguous_len);
         let mut copied = 0;
         for range in self.ranges(0, count) {
-            assert!(self.all_present(range.clone()));
+            debug_assert!(self.all_present(range.clone()));
             let len = range.len();
-            // SAFETY: presence guarantees initialized payload bytes; `out`
-            // holds `count` bytes and the ranges cover `count` slots.
+            // SAFETY: count <= contiguous_len, so the ranges are slots of
+            // the contiguous prefix, which hold initialized bytes
+            // (`contiguous_len`); `out` holds `count` bytes and the ranges
+            // cover `count` slots.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     self.data[range.clone()].as_ptr().cast::<u8>(),
@@ -2023,6 +2033,9 @@ impl ReceiveBuffer {
         // slot, taking their PUSH marks.
         let end = self.find_presence(self.contiguous_len, false);
         for range in self.ranges(self.contiguous_len, end - self.contiguous_len) {
+            // Reads copy prefix bytes unchecked (`contiguous_len`): check
+            // here, once per byte taken over, that each was written.
+            assert!(self.all_present(range.clone()));
             self.pushed |= self.take_push_range(range);
         }
         self.contiguous_len = end;
@@ -3216,14 +3229,19 @@ mod tests {
         assert_eq!(recv.peek(&mut out), 0);
     }
 
+    // Reads copy the contiguous prefix without testing presence, so the
+    // prefix checks each retained byte it takes over, whatever the search
+    // for its end found: here a summary that hides chunk 2's hole would
+    // carry the prefix over unwritten slots, which a read would then copy.
     #[test]
     #[should_panic]
-    fn read_checks_presence_before_accessing_uninitialized_byte() {
-        let mut recv = ReceiveBuffer::new(Seq(0), 1).unwrap();
-        // Deliberately break the frontier invariant: read must still reject a
-        // hole before it could read an uninitialized u8.
-        recv.contiguous_len = 1;
-        recv.read(&mut [0]);
+    fn prefix_takes_over_only_written_bytes() {
+        let mut recv = ReceiveBuffer::new(Seq(0), 128).unwrap();
+        // Slots 33..70 are held: chunk 1 is full once 0..33 arrive, and
+        // chunk 2's hole from 70 is hidden.
+        recv.insert(Seq(33), &[1; 37], false);
+        recv.missing.mark(2, false);
+        recv.insert(Seq(0), &[2; 33], false);
     }
 
     #[test]
