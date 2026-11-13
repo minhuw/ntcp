@@ -607,19 +607,22 @@ impl Rack {
     // Reclaim cumulative bytes without consulting SACK advice or creating
     // delivery/RTT evidence. Trim in place: a full ledger needs no split slot.
     pub(crate) fn trim_cumulative(&mut self, ack: Seq) {
-        let count = self.locate(ack);
-        self.acknowledge_units(ack, None, &[(0, count)]);
-        for r in self.intervals.range(0, count) {
-            if !r.stats_flag(PACKET_DELIVERED)
-                && r.end == r.transmission_end
-                && !r.stats_flag(SYN_PAYLOAD)
-            {
-                self.delivered_segments_valid = false;
+        // Usually the ACK's acknowledge_within emptied the ledger already.
+        if !self.intervals.is_empty() {
+            let count = self.locate(ack);
+            self.acknowledge_units(ack, None, &[(0, count)]);
+            for r in self.intervals.range(0, count) {
+                if !r.stats_flag(PACKET_DELIVERED)
+                    && r.end == r.transmission_end
+                    && !r.stats_flag(SYN_PAYLOAD)
+                {
+                    self.delivered_segments_valid = false;
+                }
             }
-        }
-        self.remove_prefix(count);
-        if self.intervals.first().is_some_and(|r| ack.after(r.start)) {
-            self.edit(0, 1, |s| s.intervals[0].start = ack);
+            self.remove_prefix(count);
+            if self.intervals.first().is_some_and(|r| ack.after(r.start)) {
+                self.edit(0, 1, |s| s.intervals[0].start = ack);
+            }
         }
         if self.fallback.is_some_and(|boundary| !boundary.after(ack)) {
             self.fallback = None;
@@ -1660,6 +1663,33 @@ impl Rack {
         // here since can hold work; without a record, visit everything.
         let fresh = scoreboard.take_fresh();
         let scoreboard = &*scoreboard;
+        // A cumulative ACK of every interval with no SACK advice held, as
+        // for a request answered, takes them all: nothing to look up,
+        // split or count (tcp_clean_rtx_queue taking the whole queue).
+        if scoreboard.ranges().is_empty()
+            && self.intervals.last().is_some_and(|r| !r.end.after(ack))
+        {
+            self.dirty_len = 0;
+            self.rescan = false;
+            let input = AckInput {
+                ack,
+                scoreboard,
+                now,
+                echo,
+                timestamps,
+                mss,
+            };
+            let mut walk = AckWalk {
+                delivered: 0,
+                newest: None,
+                prior_fack: self.fack,
+                sack_reordered: false,
+                cumulative_reordered: false,
+            };
+            self.deliver_all(&input, &mut walk);
+            let acked = self.intervals.len();
+            return self.finish_ack(walk, acked, ack, high, now, dsack);
+        }
         let mut spans = [(Seq(0), Seq(0)); SPANS];
         let mut count = 0;
         let mut fresh_from = 0;
@@ -1761,6 +1791,23 @@ impl Rack {
         for i in 0..self.intervals.len() {
             debug_assert!(!self.newly_covered(i, &input));
         }
+        let acked = self.locate(ack);
+        self.finish_ack(walk, acked, ack, high, now, dsack)
+    }
+
+    // The end of acknowledge_within once the ACK's intervals are marked:
+    // RACK's update from the newest delivered transmission (RFC 8985
+    // section 6.2), the cumulative prefix of `acked` intervals dropped and
+    // the DSACK round.
+    fn finish_ack(
+        &mut self,
+        walk: AckWalk,
+        acked: usize,
+        ack: Seq,
+        high: Seq,
+        now: u64,
+        dsack: bool,
+    ) -> u32 {
         let delivered = walk.delivered;
         self.reordering_events = self
             .reordering_events
@@ -1776,7 +1823,6 @@ impl Rack {
             }
             // Karn: retransmissions can advance RACK, not the ordinary RTT estimator.
         }
-        let acked = self.locate(ack);
         self.remove_prefix(acked);
         if self.dsack_round.is_some_and(|end| !end.after(ack)) {
             self.dsack_round = None;
@@ -1817,6 +1863,30 @@ impl Rack {
             dsack,
             SplitBound::NONE,
         )
+    }
+
+    // acknowledge_units and the marking of an ACK of every interval with
+    // no SACK advice, in one pass: a unit is complete once its intervals
+    // are committed, all being below the ACK. Their flags and the tally
+    // need no update: finish_ack drops every interval, and the tally with
+    // them.
+    fn deliver_all(&mut self, input: &AckInput, walk: &mut AckWalk) {
+        let (mut committed, mut newly) = (true, false);
+        for i in 0..self.intervals.len() {
+            let r = &self.intervals[i];
+            let sacked = r.sacked;
+            committed &= r.departure_committed;
+            newly |= !r.stats_flag(PACKET_DELIVERED) && !r.stats_flag(SYN_PAYLOAD);
+            if r.stats_flag(DELIVERY_END) {
+                if committed && newly && self.delivered_segments_valid {
+                    self.delivered_segments = self.delivered_segments.saturating_add(1);
+                }
+                (committed, newly) = (true, false);
+            }
+            if !sacked {
+                self.deliver(i, input, walk);
+            }
+        }
     }
 
     // Splits the entry a SACK block's edge falls inside, unless the split
@@ -1990,6 +2060,11 @@ impl Rack {
     //# Return timeout
     pub(crate) fn detect(&mut self, now: u64, recovery: bool, srtt: Option<u64>) -> bool {
         self.deadline = None;
+        // Nothing outstanding can be lost (tcp_identify_packet_loss returns
+        // on an empty retransmission queue).
+        if self.intervals.is_empty() {
+            return false;
+        }
         let window = self.reo_window(recovery, srtt);
         let Some(latest) = self.latest else {
             return false;
