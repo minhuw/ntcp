@@ -2571,8 +2571,12 @@ impl Host {
         // A connection's packets carry its scoped identity; a stateless reply
         // to a link-local peer carries the arrival link of the input that
         // caused it. Either leaves only on that link.
-        let zone = match packet.connection {
-            Some(owner) => endpoint.managed_route(owner)?.zone,
+        let route = match packet.connection {
+            Some(owner) => Some(endpoint.managed_route(owner)?),
+            None => None,
+        };
+        let zone = match route {
+            Some(route) => route.zone,
             None => endpoint
                 .transmit_attempt_zone(attempt)
                 .ok_or(Error::Obsolete)?,
@@ -2587,8 +2591,8 @@ impl Host {
             endpoint.count_undeliverable_reply(attempt);
             return Err(Error::Obsolete);
         }
-        let binding = if let Some(owner) = packet.connection {
-            self.authorized_refresh(endpoint, owner, &packet)?
+        let binding = if let (Some(owner), Some(route)) = (packet.connection, route) {
+            self.authorized_route(endpoint, owner, route, &packet)?
         } else if let Some(index) = self
             .leases
             .iter()
@@ -2652,10 +2656,24 @@ impl Host {
         if packet.connection.is_none() {
             self.forwarding(&binding.snapshot)?;
         }
+        // Refresh checked that a connection's binding forwards via the
+        // destination its route names now, the packet's own: the Endpoint
+        // takes no input for a connection while its output is reserved, so
+        // no later return route changes it under a selected packet.
+        let checked = route.is_some_and(|r| r.forwarding_destination == wire_destination(packet));
+        debug_assert!(
+            !checked
+                || scoped(wire_destination(packet), zone)
+                    .is_ok_and(|via| self.forwards_via(binding.snapshot.key(), via))
+        );
         if packet.dscp != binding.snapshot.key().dscp().value()
             || packet.ip.source != binding.snapshot.key().source_address().address()
             || packet.ip.destination != binding.snapshot.key().destination().address()
-            || !self.forwards_via(binding.snapshot.key(), scoped(wire_destination(packet), zone)?)
+            || (!checked
+                && !self.forwards_via(
+                    binding.snapshot.key(),
+                    scoped(wire_destination(packet), zone)?,
+                ))
         {
             return Err(Error::Obsolete);
         }
@@ -2685,15 +2703,46 @@ impl Host {
         owner: ConnectionId,
         packet: &Transmit,
     ) -> Result<PreparedPath, Error> {
-        let registration = self
-            .registration(owner)
+        self.check_endpoint(endpoint)?;
+        let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
+        let current = endpoint.managed_route(owner)?;
+        self.authorized_index(endpoint, owner, index, current, packet)
+    }
+    // `authorized_refresh` of a connection whose route `egress_context`
+    // read for its packet.
+    fn authorized_route(
+        &mut self,
+        endpoint: &mut Endpoint,
+        owner: ConnectionId,
+        current: ManagedRoute,
+        packet: &Transmit,
+    ) -> Result<PreparedPath, Error> {
+        let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
+        self.authorized_index(endpoint, owner, index, current, packet)
+    }
+    fn authorized_index(
+        &mut self,
+        endpoint: &mut Endpoint,
+        owner: ConnectionId,
+        index: usize,
+        current: ManagedRoute,
+        packet: &Transmit,
+    ) -> Result<PreparedPath, Error> {
+        let registration = self.bindings[index]
+            .as_ref()
+            .unwrap()
+            .registration
             .filter(|_| packet.ipv4_options != OutgoingIpv4Options::default());
-        match (self.refresh(endpoint, owner), registration) {
+        match (
+            self.refresh_route(endpoint, owner, index, current),
+            registration,
+        ) {
             (Ok(live), Some(r)) if live.snapshot.key() != r.authorized => Err(Error::StaleRoute),
             (Err(Error::Path(path::Error::NoRoute)), Some(_)) => Err(Error::StaleRoute),
             (result, _) => result,
         }
     }
+    #[cfg(test)]
     fn registration(&self, owner: ConnectionId) -> Option<Registration> {
         self.binding_index(owner)
             .and_then(|index| self.bindings[index].as_ref().unwrap().registration)
