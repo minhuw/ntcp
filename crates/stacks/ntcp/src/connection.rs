@@ -10,7 +10,7 @@ use crate::{
     output_reservation::Departure,
     pacing::Pacer,
     pmtud_config::min_mtu,
-    rack::Rack,
+    rack::{Rack, SPARE, SplitBound},
     recovery::{
         Congestion, CongestionAlgorithm, InitialWindow, Prr, RecoveryAlgorithm, RttEstimator,
     },
@@ -1245,7 +1245,7 @@ impl Connection {
         //= reason=All initial-window choices share RFC6298 estimator and connection timer/sampling implementation. Default/configured >=1s floors retain the recommended floor; explicit subsecond Linux compatibility is a scoped departure, not universal inherited conformance.
         //# Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
         let rtt = RttEstimator::with_timebase(config.rto_min_us, config.timebase);
-        let rack = Rack::with_timebase(2, config.timebase).map_err(|_| Error::NoMemory)?;
+        let rack = Rack::with_timebase(SPARE, config.timebase).map_err(|_| Error::NoMemory)?;
         let scoreboard = Scoreboard::with_capacity(0).map_err(|_| Error::NoMemory)?;
         let storage = Self::storage()?;
         // Take pooled storage only after every fallible allocation has succeeded.
@@ -1600,13 +1600,13 @@ impl Connection {
     // What a connection with a `receive`-byte ring and an `mss`-byte scratch
     // segment allocates at open, its charge until the first write: the
     // receive ring, which backs every window it advertises, the scratch
-    // segment and the sender ledgers' initial entries (two RACK intervals,
-    // the scoreboard's four spare ranges). The send ring and the ledgers'
-    // growth are allocated, and charged, at write.
+    // segment and the sender ledgers' initial entries (the RACK ledger's
+    // SPARE entries, the scoreboard's four spare ranges). The send ring and
+    // the ledgers' growth are allocated, and charged, at write.
     pub(crate) fn open_bytes(receive: usize, mss: usize) -> Option<usize> {
         ReceiveBuffer::allocation_bytes(receive)?
             .checked_add(mss)?
-            .checked_add(Rack::storage_bytes(0)?)?
+            .checked_add(Rack::storage_bytes(SPARE)?)?
             .checked_add(Scoreboard::allocation_bytes(0)?)
     }
 
@@ -5234,14 +5234,84 @@ impl Connection {
             .min(usize::try_from(cursor_room).unwrap_or(usize::MAX))
     }
 
+    // What an ACK's SACK splits are held to: the queued payload and
+    // ENTRY_BYTES per RACK entry (Linux's sk_wmem_queued, skb truesize)
+    // against the send limit (tcp_fragment).
+    fn split_bound(&self) -> SplitBound {
+        SplitBound {
+            queued: self.send.len(),
+            limit: self.config.send_capacity,
+        }
+    }
+
+    // SACK splits the ledger refused since the last call
+    // (MemoryCounters::ledger_split_refusals).
+    pub(crate) fn take_split_refusals(&mut self) -> u64 {
+        core::mem::take(&mut self.rack.split_refusals)
+    }
+
+    pub(crate) fn split_refusals(&self) -> u64 {
+        self.rack.split_refusals
+    }
+
     // Bytes the send ring and both sender ledgers, as allocated, hold beyond
     // those queued.
-    fn allocated_send_room(&self) -> usize {
+    pub(crate) fn allocated_send_room(&self) -> usize {
         self.send
             .allocation_capacity()
-            .min(self.rack.admitted_bytes())
-            .min(self.scoreboard.admitted_bytes())
             .saturating_sub(self.send.len())
+            .min(self.ledger_room())
+    }
+
+    // Entries both ledgers hold allocated: the RACK ledger's, as far as the
+    // scoreboard has a range for every two.
+    fn ledger_capacity(&self) -> usize {
+        self.rack.capacity().min(self.scoreboard.admitted_entries())
+    }
+
+    // Entries the RACK ledger holds once `live` queued bytes have all been
+    // sent in segments of the current MSS: those it holds now and one per
+    // segment of what is not yet sent.
+    fn ledger_entries(&self, live: usize) -> usize {
+        let sent = self.send.len() - self.notsent_bytes();
+        self.rack
+            .len()
+            .saturating_add(live.saturating_sub(sent).div_ceil(self.mss.max(1)))
+    }
+
+    // Bytes beyond those queued that the allocated ledger entries admit:
+    // an entry for each segment of the unsent bytes, beside SPARE.
+    fn ledger_room(&self) -> usize {
+        self.ledger_capacity()
+            .saturating_sub(self.rack.len().saturating_add(SPARE))
+            .saturating_mul(self.mss.max(1))
+            .saturating_sub(self.notsent_bytes())
+    }
+
+    // Ledger entries for `live` queued bytes: (wanted, target). A write
+    // needs every entry the ledger holds once those bytes are sent, plus
+    // SPARE. It grows a ledger holding fewer than wanted, twice as many
+    // (room for an ACK, SACK or retransmission split of each, and for
+    // segments shorter than the MSS: record ends, window and credit
+    // clipping), and no fewer than twice the initial window's ten segments,
+    // as Linux's tcp_sndbuf_expand sizes sk_sndbuf for 2 * max(cwnd, 10)
+    // skbs. It grows to target, the next power of two, so that a stream of
+    // writes reallocates geometrically. Neither passes the entries at which
+    // SplitBound starts refusing SACK splits, where peer-forced splits stop:
+    // past them fresh output waits for ACKs to free entries
+    // (fresh_entry_room), and the bytes queued meanwhile leave coalesced.
+    fn ledger_growth(&self, live: usize) -> (usize, usize) {
+        let entries = self.ledger_entries(live);
+        let needed = entries.saturating_add(SPARE);
+        let ceiling = SplitBound::entries(self.config.send_capacity).saturating_add(SPARE);
+        let doubled = entries.max(10).saturating_mul(2).saturating_add(SPARE);
+        let wanted = doubled.max(needed).min(ceiling);
+        let target = doubled
+            .checked_next_power_of_two()
+            .unwrap_or(doubled)
+            .max(needed)
+            .min(ceiling);
+        (wanted, target)
     }
 
     pub(crate) fn send_memory_throttled(&self) -> bool {
@@ -5414,6 +5484,18 @@ impl Connection {
             .saturating_sub(self.data_flight() as usize)
     }
 
+    // Fresh payload the RACK ledger has an entry for: none once fresh
+    // output has taken every entry the writes allocated beyond SPARE, as
+    // Linux's tcp_write_xmit stops when tso_fragment cannot allocate the skb
+    // it splits off. ACKs free entries; the next write allocates more.
+    fn fresh_entry_room(&self) -> usize {
+        if self.rack.fresh_room() == 0 {
+            0
+        } else {
+            usize::MAX
+        }
+    }
+
     // Allocate the send ring and stage both sender ledgers before accepting
     // any bytes, within `max_charge` for the whole connection. The ring
     // takes the send limit whole once admitted bytes outgrow it: at the
@@ -5510,18 +5592,18 @@ impl Connection {
         } else {
             self.send.allocation_capacity()
         };
-        let target = live.checked_next_power_of_two().unwrap_or(limit).min(limit);
         let ring = if grow_ring {
             self.send.growth_bytes(limit)
         } else {
             0
         };
-        let rack = if self.rack.admits_bytes(live) {
+        let (wanted, target) = self.ledger_growth(live);
+        let rack = if self.rack.capacity() >= wanted {
             0
         } else {
             self.rack.growth_bytes(target)?
         };
-        let scoreboard = if self.scoreboard.admits_bytes(live) {
+        let scoreboard = if self.scoreboard.admits_entries(wanted) {
             0
         } else {
             Scoreboard::allocation_bytes(target)?
@@ -5530,11 +5612,22 @@ impl Connection {
     }
 
     // Grow the send ring and the ledgers to hold `live` queued bytes, or
-    // leave them as they were and give the bytes the growth needed.
+    // leave them as they were and give the bytes the growth needed. The
+    // ledgers' headroom beyond the entries those bytes need is taken only
+    // if the budget and the allocator grant it.
     fn grow_send_storage(&mut self, live: usize, max_charge: usize) -> Result<(), usize> {
+        let held = self.send.len().saturating_add(self.allocated_send_room());
+        match self.grow_send_storage_to(live, max_charge) {
+            Err(_) if live <= held => Ok(()),
+            result => result,
+        }
+    }
+
+    fn grow_send_storage_to(&mut self, live: usize, max_charge: usize) -> Result<(), usize> {
+        let (wanted, target) = self.ledger_growth(live);
         let grow_ring = live > self.send.allocation_capacity();
-        let grow_rack = !self.rack.admits_bytes(live);
-        let grow_scoreboard = !self.scoreboard.admits_bytes(live);
+        let grow_rack = self.rack.capacity() < wanted;
+        let grow_scoreboard = !self.scoreboard.admits_entries(wanted);
         if !grow_ring && !grow_rack && !grow_scoreboard {
             return Ok(());
         }
@@ -5545,7 +5638,6 @@ impl Connection {
             self.send.allocation_capacity()
         };
         debug_assert!(live <= limit);
-        let target = live.checked_next_power_of_two().unwrap_or(limit).min(limit);
         let existing = self.buffer_charge();
         let staged = self.send_growth_cost(live).ok_or(usize::MAX)?;
         if existing
@@ -7187,7 +7279,8 @@ impl Connection {
                 self.congestion.cancel_sack_recovery();
                 self.reset_limited_transmit();
             }
-            self.rack.acknowledge(
+            let bound = self.split_bound();
+            self.rack.acknowledge_within(
                 live_ack,
                 self.data_high(),
                 &mut self.scoreboard,
@@ -7199,6 +7292,7 @@ impl Connection {
                 self.timestamps.then_some(self.config.timestamp_granularity),
                 self.mss as u32,
                 update.dsack,
+                bound,
             );
             reo_grew = self.rack.reo_grew;
             if update.newly_sacked != 0 {
@@ -7827,7 +7921,8 @@ impl Connection {
             self.fin_delivered = true;
         }
         if !self.sack_receive || self.handshake_pending() {
-            self.rack.acknowledge(
+            let bound = self.split_bound();
+            self.rack.acknowledge_within(
                 ack,
                 self.data_high(),
                 &mut self.scoreboard,
@@ -7836,6 +7931,7 @@ impl Connection {
                 self.timestamps.then_some(self.config.timestamp_granularity),
                 self.mss as u32,
                 false,
+                bound,
             );
         }
         // Timestamp storage follows cumulative send-buffer reclamation even
@@ -9597,7 +9693,8 @@ impl Connection {
                         )
                         .saturating_sub(option_len),
                     )
-                    .min(self.fresh_send_allowance());
+                    .min(self.fresh_send_allowance())
+                    .min(self.fresh_entry_room());
                 count = self.send.copy(0, &mut self.scratch[..limit]);
             }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
@@ -9643,7 +9740,8 @@ impl Connection {
             //# the most recent <ACK>.
             // New data needs fresh send space too; otherwise probe the tail.
             let credit = (self.snd_wnd.saturating_sub(self.flight()) as usize)
-                .min(self.fresh_send_allowance());
+                .min(self.fresh_send_allowance())
+                .min(self.fresh_entry_room());
             if unsent != 0 && credit >= unsent.min(packet_mss) {
                 count = self
                     .send
@@ -9914,7 +10012,9 @@ impl Connection {
                 && (usable > unsent || unsent == 0 && self.prr.is_none())
                 && matches!(self.state, State::Established | State::CloseWait);
             // FIN consumes no send space; payload, probes and GSO totals do.
-            let usable = usable.min(self.fresh_send_allowance());
+            let usable = usable
+                .min(self.fresh_send_allowance())
+                .min(self.fresh_entry_room());
             //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
             //# It has no outstanding probes or losses.
             // Leading/trailing retransmissions are tracked through cumulative
@@ -10229,7 +10329,12 @@ impl Connection {
                     buffer.limits.max_segments
                 };
                 let record = self.send.record_len(offset, bounded);
-                let limit = buffer.limits.max_segments.min(group_limit);
+                // Each segment of the group becomes its own ledger entry.
+                let limit = buffer
+                    .limits
+                    .max_segments
+                    .min(group_limit)
+                    .min(self.rack.fresh_room());
                 let full = (record / wire_mss).min(limit);
                 // A short last segment ends the group, as it may end a Linux
                 // TSO skb (tcp_mss_split_point), exactly when scalar selection

@@ -245,11 +245,14 @@ fn statistics_interval_fits_original_allocation_budget() {
     assert_eq!(
         Rack::storage_bytes(400_000),
         Some(
-            400_002 * size
-                + 400_002_usize.div_ceil(64 * 1024 / size) * core::mem::size_of::<Vec<Interval>>()
+            400_000 * size
+                + 400_000_usize.div_ceil(64 * 1024 / size) * core::mem::size_of::<Vec<Interval>>()
         )
     );
     assert!(Rack::storage_bytes(400_000).unwrap() <= 26_000_000);
+    // What send usage charges per entry: the interval and half a
+    // scoreboard range.
+    assert_eq!(super::ENTRY_BYTES, 68);
 }
 
 #[test]

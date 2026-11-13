@@ -41,8 +41,10 @@ impl Scoreboard {
         Self::with_capacity(CAPACITY * 2).unwrap()
     }
 
-    pub(crate) fn with_capacity(send_capacity: usize) -> Result<Self, ()> {
-        let capacity = send_capacity.div_ceil(2);
+    // Room for a range per two RACK entries: SACK blocks whose edges fall
+    // on entry boundaries cover every other entry at most.
+    pub(crate) fn with_capacity(entries: usize) -> Result<Self, ()> {
+        let capacity = entries.div_ceil(2);
         let mut ranges = Vec::new();
         ranges
             .try_reserve_exact(capacity.checked_add(4).ok_or(())?)
@@ -61,17 +63,18 @@ impl Scoreboard {
         self.ranges.capacity() * core::mem::size_of::<(Seq, Seq)>()
     }
 
-    pub(crate) fn admits_bytes(&self, bytes: usize) -> bool {
-        bytes.div_ceil(2) <= self.capacity
+    // Whether the ranges suit a ledger of `entries` entries.
+    pub(crate) fn admits_entries(&self, entries: usize) -> bool {
+        entries.div_ceil(2) <= self.capacity
     }
 
-    // The most live bytes the allocated ranges admit.
-    pub(crate) fn admitted_bytes(&self) -> usize {
+    // The most RACK entries the allocated ranges suit.
+    pub(crate) fn admitted_entries(&self) -> usize {
         self.capacity.saturating_mul(2)
     }
 
-    pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
-        let mut result = Self::with_capacity(send_capacity)?;
+    pub(crate) fn grown(&self, entries: usize) -> Result<Self, ()> {
+        let mut result = Self::with_capacity(entries)?;
         result.ranges[..self.len].copy_from_slice(&self.ranges[..self.len]);
         result.len = self.len;
         result.ack = self.ack;
@@ -79,8 +82,8 @@ impl Scoreboard {
         Ok(result)
     }
 
-    pub(crate) fn allocation_bytes(send_capacity: usize) -> Option<usize> {
-        send_capacity
+    pub(crate) fn allocation_bytes(entries: usize) -> Option<usize> {
+        entries
             .div_ceil(2)
             .checked_add(4)?
             .checked_mul(core::mem::size_of::<(Seq, Seq)>())
@@ -122,7 +125,7 @@ impl Scoreboard {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
-    //= reason=Write admission backs ceil(admitted_send_bytes/2) intervals plus four temporary slots: every possible disjoint byte union inside the admitted flight fits, without incoming-SACK allocation.
+    //= reason=Writes allocate ceil(entries/2) ranges for the RACK ledger's entries plus four temporary slots, without incoming-SACK allocation: every union of blocks whose edges fall on entry boundaries fits. A union of more ranges takes the overflow path (scoreboard cleared, no inference from it): the sender's ledger, not the peer, sizes the record.
     //# When receiving an ACK containing a SACK option, the data sender SHOULD
     //# record the selective acknowledgment for future reference.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-3
@@ -615,7 +618,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
     //= type=test
-    //= reason=Write admission backs ceil(admitted_send_bytes/2) intervals plus four temporary slots: every possible disjoint byte union inside the admitted flight fits, without incoming-SACK allocation.
+    //= reason=Writes allocate ceil(entries/2) ranges for the RACK ledger's entries plus four temporary slots, without incoming-SACK allocation: every union of blocks whose edges fall on entry boundaries fits. A union of more ranges takes the overflow path (scoreboard cleared, no inference from it): the sender's ledger, not the peer, sizes the record.
     //# When receiving an ACK containing a SACK option, the data sender SHOULD
     //# record the selective acknowledgment for future reference.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-3

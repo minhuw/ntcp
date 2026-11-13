@@ -1,8 +1,12 @@
 // Randomized operation sequences over Rack and the walk-based reference
-// ledger (rack_reference.rs): every result, every interval and every
-// scalar must stay identical. Operations follow the connection's use:
-// fresh data only at the high edge, repairs inside the flight, selections
-// resolved (or abandoned with an unsubmitted suffix) before input.
+// ledger (rack_reference.rs, which holds an interval per entry as master
+// did): every result, every interval and every scalar must stay identical
+// while the ledger is not constrained. Rack gets SPARE more entries than
+// the reference, so it refuses a SACK split exactly where the reference
+// would overflow; a seed is compared until the reference abandons its
+// ledger. Operations follow the connection's use: fresh data only at the
+// high edge, repairs inside the flight, selections resolved (or abandoned
+// with an unsubmitted suffix) before input.
 use super::reference::Reference;
 use super::*;
 use crate::connection::TimestampGranularity;
@@ -52,13 +56,16 @@ struct Model {
     orderly: bool,
     // SACK negotiated: otherwise the scoreboard stays empty.
     sack: bool,
+    // The reference overflowed its ledger and abandoned it, where Rack,
+    // with SPARE more entries, refuses a split instead.
+    constrained: bool,
     trace: Vec<String>,
 }
 
 fn snapshot_rack(r: &Rack) -> String {
     format!(
         "{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
-        r.capacity,
+        r.capacity - SPARE,
         r.selection_generation,
         r.departure_selection,
         r.sample_floor,
@@ -134,7 +141,7 @@ impl Model {
         let mut scoreboard = Scoreboard::with_capacity(capacity).unwrap();
         scoreboard.update(base, base, &[None; 4]);
         Self {
-            rack: Rack::with_capacity(capacity).unwrap(),
+            rack: Rack::with_capacity(capacity + SPARE).unwrap(),
             reference: Reference::with_capacity(capacity).unwrap(),
             scoreboard,
             rng,
@@ -146,6 +153,7 @@ impl Model {
             pending: None,
             orderly,
             sack,
+            constrained: false,
             trace: Vec::new(),
         }
     }
@@ -159,6 +167,7 @@ impl Model {
     }
 
     fn check(&mut self) {
+        assert_eq!(self.rack.split_refusals, 0, "{}", self.context());
         let a: Vec<Interval> = self.rack.intervals.iter().copied().collect();
         let b: Vec<Interval> = self.reference.intervals.iter().copied().collect();
         if a != b || snapshot_rack(&self.rack) != snapshot_reference(&self.reference) {
@@ -271,8 +280,13 @@ impl Model {
         let (start, end) = (self.nxt, self.nxt.wrapping_add(len));
         let now = self.now;
         self.note(format!("fresh {start:?}..{end:?} @{now}"));
+        let valid = self.reference.valid();
         self.rack.transmit(start, end, now, false);
         self.reference.transmit(start, end, now, false);
+        if valid && !self.reference.valid() {
+            self.constrained = true;
+            return;
+        }
         let in_window = self.rng.chance(50);
         self.rack.commit_original_window(start, end, in_window);
         self.reference.commit_original_window(start, end, in_window);
@@ -350,11 +364,16 @@ impl Model {
         let probe = self.rng.chance(20);
         let now = self.now;
         self.note(format!("repair {start:?}..{end:?} probe={probe} @{now}"));
+        let valid = self.reference.valid();
         self.rack.transmit(start, end, now, true);
         self.reference.transmit(start, end, now, true);
         if !probe {
             self.rack.commit_retry_span(start, end);
             self.reference.commit_retry_span(start, end);
+        }
+        if valid && !self.reference.valid() {
+            self.constrained = true;
+            return;
         }
         self.select(start, end, true, undo);
     }
@@ -381,17 +400,20 @@ impl Model {
             let valid = self
                 .rack
                 .validate_departure_group(p.selection, start, segment, bytes, now);
-            assert_eq!(
-                valid,
+            let expected =
                 self.reference
-                    .validate_departure_group(p.selection, start, segment, bytes, now)
-            );
+                    .validate_departure_group(p.selection, start, segment, bytes, now);
+            if valid != expected && self.short_of_entries() {
+                self.constrained = true;
+                return;
+            }
+            assert_eq!(valid, expected);
             if valid && self.rng.chance(50) {
                 // Accepted whole: what committing each segment in turn leaves,
                 // dirty ranges and storage layout included.
                 self.note(format!("commit group @{now}"));
-                let mut whole = self.rack.grown(self.rack.capacity - 2).unwrap();
-                let mut each = self.rack.grown(self.rack.capacity - 2).unwrap();
+                let mut whole = self.rack.grown(self.rack.capacity).unwrap();
+                let mut each = self.rack.grown(self.rack.capacity).unwrap();
                 for k in 0..bytes.div_ceil(segment as usize) {
                     let a = start.wrapping_add(k as u32 * segment);
                     let b = start.wrapping_add(((k + 1) * segment as usize).min(bytes) as u32);
@@ -414,11 +436,14 @@ impl Model {
         let end = start.wrapping_add(piece);
         self.note(format!("depart {start:?}..{end:?} @{now}"));
         let valid = self.rack.validate_departure(p.selection, start, end, now);
-        assert_eq!(
-            valid,
-            self.reference
-                .validate_departure(p.selection, start, end, now)
-        );
+        let expected = self
+            .reference
+            .validate_departure(p.selection, start, end, now);
+        if valid != expected && self.short_of_entries() {
+            self.constrained = true;
+            return;
+        }
+        assert_eq!(valid, expected);
         if valid {
             self.rack
                 .commit_validated_departure(p.selection, start, end, now);
@@ -429,6 +454,12 @@ impl Model {
         if valid && p.offset < total && !self.rng.chance(10) {
             self.pending = Some(p);
         }
+    }
+
+    // Whether a departure's splits may need the entries Rack holds beyond
+    // the reference's: a group splits at most at each of its edges.
+    fn short_of_entries(&self) -> bool {
+        self.reference.intervals.len() + 5 > self.reference.capacity
     }
 
     fn cancel(&mut self) {
@@ -511,6 +542,7 @@ impl Model {
         self.note(format!(
             "ack {ack:?} sack={sack} {blocks:?} echo={echo:?} @{now}"
         ));
+        let valid = self.reference.valid();
         if sack {
             let update = self.scoreboard.update(ack, high, &blocks);
             let mss = self.mss;
@@ -534,6 +566,10 @@ impl Model {
                 mss,
                 update.dsack,
             );
+            if valid && !self.reference.valid() {
+                self.constrained = true;
+                return;
+            }
             assert_eq!(got, expected, "{}", self.context());
         } else {
             let mss = self.mss;
@@ -649,17 +685,36 @@ impl Model {
 
 #[test]
 fn randomized_operations_match_the_walking_ledger() {
+    // Steps compared, and seeds whose reference never overflowed.
+    let (mut compared, mut unconstrained) = (0, 0);
     for seed in 1..=400u64 {
         let mut model = Model::new(seed);
+        let mut whole = true;
         for _ in 0..500 {
             let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
                 model.step();
+                if model.constrained {
+                    return false;
+                }
                 model.check();
+                true
             }));
-            if let Err(panic) = outcome {
-                std::eprintln!("seed {seed}: {}", model.context());
-                std::panic::resume_unwind(panic);
+            match outcome {
+                Ok(true) => compared += 1,
+                Ok(false) => {
+                    whole = false;
+                    break;
+                }
+                Err(panic) => {
+                    std::eprintln!("seed {seed}: {}", model.context());
+                    std::panic::resume_unwind(panic);
+                }
             }
         }
+        unconstrained += usize::from(whole);
     }
+    // Most seeds (every 4096-entry one) never constrain the ledger: 342 of
+    // 400 seeds and 181,351 of 200,000 steps when written.
+    assert!(compared > 400 * 500 * 85 / 100, "{compared}");
+    assert!(unconstrained > 300, "{unconstrained}");
 }

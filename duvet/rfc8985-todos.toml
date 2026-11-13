@@ -8,3 +8,14 @@ For each data segment sent, the sender MUST store its most recent
 transmission time with a timestamp whose granularity is finer
 than 1/4 of the minimum RTT of the connection.
 '''
+
+# Peer-forced ledger splits are bounded as Linux bounds tcp_fragment.
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-4"
+reason = "Bounded per-segment ledger: each transmitted segment gets its own RACK entry, allocated at write (never on ACK, SACK or timer paths) and charged in send usage as Linux charges skb truesize to sk_wmem_queued. A SACK block edge inside an entry splits it unless the split would take one of the two entries kept for cumulative-ACK and retransmission splits, or send usage exceeds 2 * (send limit + 128 KiB) and the entry is neither the first outstanding nor the last (Linux tcp_fragment, TCPWqueueTooBig). A refused entry stays whole with one transmission time and is marked delivered only once SACK blocks or the cumulative ACK cover all of it: that block yields no RACK inference about it (the conservative path). Rack::sack_split; counted in MemoryCounters::ledger_split_refusals; rack_tests split_refusals_* cover the refusal, the first/last exemption and the later full cover."
+quote = '''
+For each data segment sent, the sender MUST store its most recent
+transmission time with a timestamp whose granularity is finer
+than 1/4 of the minimum RTT of the connection.
+'''

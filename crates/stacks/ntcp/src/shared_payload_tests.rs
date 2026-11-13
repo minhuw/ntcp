@@ -197,13 +197,9 @@ fn adjacent_shared_writes_coalesce_into_one_span() {
             Ok(1)
         );
     }
-    // 64 one-byte writes hold one span: the span storage did not grow,
-    // only the ledgers, from one byte to 64.
-    let ledgers = |bytes| {
-        crate::rack::Rack::storage_bytes(bytes).unwrap()
-            + crate::sack::Scoreboard::allocation_bytes(bytes).unwrap()
-    };
-    assert_eq!(a.buffer_bytes(), charge + ledgers(64) - ledgers(1));
+    // 64 one-byte writes hold one span and one segment: neither the span
+    // storage nor the ledgers grew.
+    assert_eq!(a.buffer_bytes(), charge);
     drop(lease);
     // One reference carries the whole segment (MSS 64), where 64 spans
     // would have stopped it at the 8 references a packet may carry.

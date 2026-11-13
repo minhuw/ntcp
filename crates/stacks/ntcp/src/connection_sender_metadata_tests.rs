@@ -31,7 +31,10 @@ fn metadata_bytes(a: &Connection) -> usize {
 fn idle_sender_backing_is_independent_of_configured_payload_limit() {
     for limit in [64, 65536, 2 * 1024 * 1024] {
         let (mut a, _) = pair(config(limit, 64), 100);
-        assert_eq!(a.rack.allocation_bytes(), Rack::storage_bytes(0).unwrap());
+        assert_eq!(
+            a.rack.allocation_bytes(),
+            Rack::storage_bytes(crate::rack::SPARE).unwrap()
+        );
         assert_eq!(
             a.scoreboard.storage_bytes(),
             Scoreboard::allocation_bytes(0).unwrap()
@@ -127,7 +130,10 @@ fn growing_with_live_sack_and_retry_history_preserves_records() {
     let scoreboard = format!("{:?}", a.scoreboard.grown(64).unwrap());
     let deadline = a.loss_timer;
     let delivered = a.acknowledged;
-    a.prepare_send_metadata(20, None, usize::MAX, None).unwrap();
+    // 200 more bytes take 25 segments: with the 6 entries held, the
+    // ledgers grow from 32 entries to 64.
+    a.prepare_send_metadata(200, None, usize::MAX, None)
+        .unwrap();
     assert_eq!(format!("{:?}", a.rack), rack);
     assert_eq!(format!("{:?}", a.scoreboard), scoreboard);
     assert_eq!(a.loss_timer, deadline);
@@ -306,4 +312,59 @@ fn failure_at_any_multiblock_growth_allocation_preserves_live_history() {
         assert_eq!(a.write(&data[taken..]), Ok(3072 - taken));
         assert_eq!(a.send.len(), 4096);
     }
+}
+
+// One-byte NODELAY writes take a ledger entry per segment. Writes grow the
+// ledgers only up to the entries at which SACK splits start being refused
+// (2 * (limit + 128 KiB) of send usage), so they cost at most that much
+// memory: then fresh output waits for ACKs to free entries, as Linux's
+// tcp_write_xmit stops when it cannot allocate the skb it would split off,
+// while further writes queue their bytes, which leave coalesced.
+#[test]
+fn one_byte_writes_hold_at_most_the_split_bound_in_entries() {
+    let mut cfg = config(16384, 1000);
+    cfg.nagle = false;
+    cfg.initial_window = crate::InitialWindow::Iw10;
+    let (mut a, mut b) = pair(cfg, u32::MAX - 20);
+    let ceiling = crate::rack::SplitBound::entries(16384) + crate::rack::SPARE;
+    let mut out = [0; 2048];
+    let mut segments = alloc::vec::Vec::new();
+    for _ in 0..10_000 {
+        assert_eq!(a.write(&[5]), Ok(1));
+        while let Some(n) = a.transmit(100, &mut out).unwrap() {
+            segments.push(out[..n].to_vec());
+        }
+        assert!(a.rack.capacity() <= ceiling);
+    }
+    let sent = segments.len();
+    // Every entry but the spare ones holds a one-byte segment; the rest of
+    // the bytes wait unsent.
+    assert_eq!(a.rack.capacity(), ceiling);
+    assert_eq!(a.rack.len(), ceiling - crate::rack::SPARE);
+    assert_eq!(sent, a.rack.len());
+    assert_eq!(a.send.len(), 10_000);
+    assert_eq!(a.notsent_bytes(), 10_000 - sent);
+    assert_eq!(
+        metadata_bytes(&a),
+        Rack::storage_bytes(ceiling).unwrap() + Scoreboard::allocation_bytes(ceiling).unwrap()
+    );
+    // Once the peer acknowledges them, the queued bytes leave in full
+    // segments, with no more allocation.
+    let ack = a.snd_nxt;
+    for bytes in &segments {
+        b.input(150, &wire::parse(ip(a.tuple()), bytes).unwrap())
+            .unwrap();
+    }
+    while let Some(n) = b.transmit(150, &mut out).unwrap() {
+        a.input(200, &wire::parse(ip(b.tuple()), &out[..n]).unwrap())
+            .unwrap();
+    }
+    assert_eq!(a.snd_una, ack);
+    let charged = metadata_bytes(&a);
+    let n = crate::allocation_tests::fail_after(0, || a.transmit(200, &mut out))
+        .unwrap()
+        .unwrap();
+    let segment = wire::parse(ip(a.tuple()), &out[..n]).unwrap();
+    assert_eq!(segment.payload.len(), 1000);
+    assert_eq!(metadata_bytes(&a), charged);
 }

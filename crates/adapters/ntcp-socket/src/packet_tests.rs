@@ -1009,12 +1009,12 @@ fn explicit_budget128_allows_200000_sndbuf_growth() {
     assert_eq!(config.connection.receive_capacity, 8 * 1024 * 1024);
     assert_eq!(config.preallocate_connections, 1);
     // A send limit allocates nothing, so either budget takes it; the write
-    // that fills it allocates the 800 KB send ring and, until the ledgers
-    // are kept per segment, 68 bytes a byte of RACK and SACK ledger for the
-    // next power of two of the bytes queued: about 36 MB. The 32 MiB budget
-    // takes a prefix, and then waits for memory, as Linux's tcp_sendmsg
-    // copies until sk_wmem_schedule refuses and then waits.
-    for (budget, throttled) in [(32 * 1024 * 1024, true), (config.max_buffer_bytes, false)] {
+    // that fills it allocates the 800 KB send ring and RACK and SACK ledger
+    // entries per segment of the bytes queued (a few KB), so the default
+    // 32 MiB budget takes it whole as the 128 MiB one does. (While the
+    // ledgers held 68 bytes per send byte, about 36 MB, the 32 MiB budget
+    // took a prefix and waited for memory.)
+    for budget in [32 * 1024 * 1024, config.max_buffer_bytes] {
         let mut limited = config.clone();
         limited.max_buffer_bytes = budget;
         let mut endpoint = Endpoint::new(limited, [42; 32], 0, |_| true).unwrap();
@@ -1032,18 +1032,10 @@ fn explicit_budget128_allows_200000_sndbuf_growth() {
         assert_eq!(endpoint.buffer_bytes(), charged);
         let written = endpoint.write(id, &[7; 400000]).unwrap();
         assert!(endpoint.buffer_bytes() <= budget);
-        if throttled {
-            assert!(written > 0 && written < 400000, "{written}");
-            assert_eq!(
-                endpoint.write(id, &[7; 400000 - 1]),
-                Err(EndpointError::Connection(ntcp::Error::WouldBlock))
-            );
-            assert_eq!(endpoint.send_admission_room(id, None), Ok(0));
-            assert_eq!(endpoint.memory_throttled_writes(), 2);
-        } else {
-            assert_eq!(written, 400000);
-            assert_eq!(endpoint.memory_throttled_writes(), 0);
-        }
+        // The 800 KB ring and at most 128 KiB of ledger (1,024 entries).
+        assert!(endpoint.buffer_bytes() - charged <= 2 * 400000 + 128 * 1024);
+        assert_eq!(written, 400000);
+        assert_eq!(endpoint.memory_throttled_writes(), 0);
     }
 }
 

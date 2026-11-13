@@ -415,6 +415,8 @@ fn group_departure_preflight_capacity_wrap_and_distinct_physical_identity() {
                 assert!(rack.commit_departure(token, base, base.wrapping_add(8), 20));
                 continue;
             }
+            // Scalar departures keep SPARE entries free.
+            let mut rack = rack.grown(capacity + SPARE).unwrap();
             crate::allocation_tests::fail_after(0, || {
                 for n in 0..3 {
                     assert!(rack.commit_departure(
@@ -444,7 +446,9 @@ fn group_departure_preflight_capacity_wrap_and_distinct_physical_identity() {
 
 #[test]
 fn departure_capacity_no_allocation_and_failure_atomicity() {
-    let mut rack = Rack::with_capacity(256).unwrap();
+    // Every part of a selection departing alone becomes its own entry while
+    // a split leaves the SPARE entries free.
+    let mut rack = Rack::with_capacity(256 + SPARE).unwrap();
     rack.transmit(Seq(0), Seq(256), 10, false);
     let token = rack.departure_selection().unwrap();
     let bytes = rack.allocation_bytes();
@@ -453,7 +457,7 @@ fn departure_capacity_no_allocation_and_failure_atomicity() {
         for n in 0..256 {
             assert!(rack.commit_departure(token, Seq(n), Seq(n + 1), 100 + u64::from(n)));
         }
-        assert_eq!(rack.intervals.len(), rack.capacity);
+        assert_eq!(rack.intervals.len(), rack.capacity - SPARE);
         assert_eq!(rack.intervals.as_ptr(), ptr);
         assert_eq!(rack.allocation_bytes(), bytes);
     });
@@ -462,18 +466,28 @@ fn departure_capacity_no_allocation_and_failure_atomicity() {
         assert_eq!(r.original_sent, r.sent);
         assert_eq!(r.successful_retries, 0);
     }
-    // Two edges need two slots: do not apply the first split on failure.
-    let mut rack = Rack::with_capacity(2).unwrap();
+    // Without a free entry the parts coalesce: the entry stays whole and
+    // uncommitted until the part reaching its end departs, then records
+    // that part's time and one transmission over the whole entry.
+    let mut rack = Rack::with_capacity(1 + SPARE).unwrap();
     rack.transmit(Seq(0), Seq(8), 10, false);
     let token = rack.departure_selection().unwrap();
-    let before = alloc::format!("{rack:?}");
-    assert!(!rack.commit_departure(token, Seq(2), Seq(6), 20));
-    assert_eq!(alloc::format!("{rack:?}"), before);
-    assert!(rack.commit_departure(token, Seq(0), Seq(4), 20));
-    // A full ledger still accepts an already aligned suffix without a slot.
     crate::allocation_tests::fail_after(0, || {
-        assert!(rack.commit_departure(token, Seq(4), Seq(8), 30));
+        assert!(rack.commit_departure(token, Seq(0), Seq(2), 20));
+        assert!(rack.commit_departure(token, Seq(2), Seq(6), 25));
     });
+    assert_eq!(rack.intervals.len(), 1);
+    assert!(!rack.intervals[0].departure_committed);
+    assert_eq!(rack.intervals[0].sent, 10);
+    crate::allocation_tests::fail_after(0, || {
+        assert!(rack.commit_departure(token, Seq(6), Seq(8), 30));
+    });
+    assert_eq!(rack.head_transmission(Seq(0)), Some((Seq(8), 30)));
+    assert_eq!(
+        original_packet(&rack, Seq(0)),
+        Some((Seq(0), Seq(8), 30, false))
+    );
+    assert!(rack.intervals[0].departure_committed);
 }
 
 #[test]
@@ -1366,7 +1380,8 @@ fn capacity_overflow_disables_inference_until_flight_is_acked() {
         }
         let mut high = CAPACITY as u32 * 1000;
         if split_overflow {
-            sack(&mut rack, &mut scoreboard, 0, high, 100, &[(1111, 1555)]);
+            // A retransmission split past the allocated entries.
+            rack.transmit(Seq(1111), Seq(1555), 1, true);
         } else {
             rack.transmit(Seq(high), Seq(high + 1000), 1, false);
             high += 1000;
@@ -1757,4 +1772,125 @@ fn dsack_is_not_delivery_and_growth_is_bounded_per_round() {
         rack.recovery_exit(false);
     }
     assert_eq!(rack.reo_window(false, Some(100)), 25);
+}
+
+fn sack_within(
+    rack: &mut Rack,
+    scoreboard: &mut Scoreboard,
+    ack: u32,
+    high: u32,
+    blocks: &[(u32, u32)],
+    bound: SplitBound,
+) {
+    let mut wire = [None; 4];
+    for (slot, &block) in wire.iter_mut().zip(blocks) {
+        *slot = Some(block);
+    }
+    let update = scoreboard.update(Seq(ack), Seq(high), &wire);
+    rack.acknowledge_within(
+        Seq(ack),
+        Seq(high),
+        scoreboard,
+        100,
+        None,
+        None,
+        1000,
+        update.dsack,
+        bound,
+    );
+}
+
+fn segments(rack: &mut Rack, count: u32) {
+    for i in 0..count {
+        rack.transmit(Seq(i * 1000), Seq((i + 1) * 1000), 0, false);
+        let selection = rack.departure_selection().unwrap();
+        assert!(rack.commit_departure(selection, Seq(i * 1000), Seq((i + 1) * 1000), 0));
+    }
+}
+
+// A SACK edge inside an entry splits it only while a split leaves the
+// SPARE entries free: otherwise the entry stays whole and unmarked, the
+// ledger stays valid, and the entry is marked once blocks cover all of it.
+#[test]
+fn split_refusals_at_capacity_leave_the_entry_whole_until_covered() {
+    let mut rack = Rack::with_capacity(8).unwrap();
+    let mut scoreboard = Scoreboard::with_capacity(8).unwrap();
+    segments(&mut rack, 6);
+    let bound = SplitBound::NONE;
+    sack_within(&mut rack, &mut scoreboard, 0, 6000, &[(2500, 4000)], bound);
+    assert!(rack.valid());
+    assert_eq!(rack.split_refusals, 1);
+    assert_eq!(rack.intervals.len(), 6);
+    assert!(!rack.intervals[2].sacked);
+    assert!(rack.intervals[3].sacked);
+    // The refused entry still counts in flight whole.
+    assert_eq!(rack.pipe(), 5000);
+    sack_within(&mut rack, &mut scoreboard, 0, 6000, &[(2000, 4000)], bound);
+    assert_eq!(rack.split_refusals, 1);
+    assert!(rack.intervals[2].sacked);
+    assert_eq!(rack.pipe(), 4000);
+}
+
+// Past the bound, as Linux's tcp_fragment, only the first outstanding and
+// the last entry are split.
+#[test]
+fn split_refusals_past_the_bound_spare_the_first_and_last_entries() {
+    let mut rack = Rack::with_capacity(64).unwrap();
+    let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+    segments(&mut rack, 6);
+    let bound = SplitBound {
+        queued: 1 << 20,
+        limit: 0,
+    };
+    assert!(bound.refuses(rack.len()));
+    sack_within(
+        &mut rack,
+        &mut scoreboard,
+        0,
+        6000,
+        &[(500, 1000), (2500, 3000), (5000, 5500)],
+        bound,
+    );
+    assert!(rack.valid());
+    assert_eq!(rack.split_refusals, 1);
+    assert_eq!(rack.intervals.len(), 8);
+    let sacked: Vec<(u32, u32)> = rack
+        .intervals
+        .iter()
+        .filter(|r| r.sacked)
+        .map(|r| (r.start.0, r.end.0))
+        .collect();
+    assert_eq!(sacked, [(500, 1000), (5000, 5500)]);
+    // A repeated block brings nothing fresh: the refused edge is not tried
+    // again. Below the bound a new block's edges split.
+    let below = SplitBound {
+        queued: 0,
+        limit: 1 << 20,
+    };
+    sack_within(&mut rack, &mut scoreboard, 0, 6000, &[(2500, 3000)], below);
+    assert!(
+        !rack
+            .intervals
+            .iter()
+            .any(|r| r.sacked && r.start == Seq(2500))
+    );
+    sack_within(&mut rack, &mut scoreboard, 0, 6000, &[(3500, 4000)], below);
+    assert_eq!(rack.split_refusals, 1);
+    assert!(
+        rack.intervals
+            .iter()
+            .any(|r| r.sacked && r.start == Seq(3500))
+    );
+}
+
+// The entries at which, with nothing queued, the bound starts refusing:
+// usage / 2 > limit + 128 KiB.
+#[test]
+fn split_bound_entries_are_where_refusal_begins() {
+    for limit in [0, 1, 65536, 4 << 20] {
+        let bound = SplitBound { queued: 0, limit };
+        let entries = SplitBound::entries(limit);
+        assert!(bound.refuses(entries));
+        assert!(!bound.refuses(entries - 1));
+    }
 }

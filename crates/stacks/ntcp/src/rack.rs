@@ -18,6 +18,56 @@ const MIN_RTT_BUCKET: u64 = MIN_RTT_WINDOW / 3;
 // Even a one-caller-tick minimum can reach any u64 SRTT with this multiplier.
 const MAX_MULTIPLIER: u128 = 4 * u64::MAX as u128;
 
+// Entries that fresh output and peer-forced SACK splits leave free, for
+// the splits a cumulative ACK and a retransmission make.
+pub(crate) const SPARE: usize = 2;
+
+// What one entry costs in send usage: its interval and half a scoreboard
+// range (the scoreboard holds a range per two entries), as Linux counts
+// each skb's truesize in sk_wmem_queued.
+pub(crate) const ENTRY_BYTES: usize =
+    core::mem::size_of::<Interval>() + core::mem::size_of::<(Seq, Seq)>() / 2;
+
+// Linux's tcp_fragment allowance above the send buffer for splits of
+// entries in the middle of the flight: 2 * SKB_TRUESIZE(GSO_LEGACY_MAX_SIZE).
+const SPLIT_ALLOWANCE: usize = 128 * 1024;
+
+// Send usage (queued payload plus ENTRY_BYTES per entry) and the send
+// limit an ACK's SACK splits are held to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SplitBound {
+    pub queued: usize,
+    pub limit: usize,
+}
+
+impl SplitBound {
+    #[cfg(test)]
+    pub(crate) const NONE: Self = Self {
+        queued: 0,
+        limit: usize::MAX / 4,
+    };
+
+    // The entries at which, with nothing queued, `refuses` starts: more
+    // than a write ever needs under a `limit`-byte send limit.
+    pub(crate) fn entries(limit: usize) -> usize {
+        limit
+            .saturating_add(SPLIT_ALLOWANCE)
+            .saturating_mul(2)
+            .saturating_add(2)
+            .div_ceil(ENTRY_BYTES)
+    }
+
+    // Linux's tcp_fragment refuses to split an skb other than the first or
+    // last of the retransmission queue once sk_wmem_queued / 2 exceeds
+    // sk_sndbuf + 2 * SKB_TRUESIZE(64 KiB).
+    fn refuses(&self, entries: usize) -> bool {
+        let usage = self
+            .queued
+            .saturating_add(entries.saturating_mul(ENTRY_BYTES));
+        usage / 2 > self.limit.saturating_add(SPLIT_ALLOWANCE)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Interval {
     start: Seq,
@@ -204,9 +254,12 @@ struct AckWalk {
 #[derive(Debug)]
 pub(crate) struct Rack {
     // No Clone/snapshot on packet paths: split copies one Interval and all
-    // pushes/inserts stay inside the fallibly reserved admission capacity.
+    // pushes/inserts stay inside the entries allocated at write.
     intervals: storage::Intervals,
     capacity: usize,
+    // SACK splits refused at the SplitBound (Linux's TCPWqueueTooBig), for
+    // the connection to take.
+    pub(crate) split_refusals: u64,
     selection_generation: u64,
     departure_selection: Option<DepartureSelection>,
     timebase: CallerTimebase,
@@ -257,26 +310,36 @@ impl Rack {
         Self::with_capacity(CAPACITY)
     }
 
-    // One interval per outstanding octet is the worst case after arbitrary
-    // retransmission/SACK splits; reserve control space as well.
+    // The ledger holds one entry per transmitted segment and per piece an
+    // ACK, SACK or retransmission split off, in entries the connection
+    // allocates at write.
     pub(crate) fn allocation_bytes(&self) -> usize {
         self.intervals.allocation_bytes()
     }
 
-    pub(crate) fn admits_bytes(&self, bytes: usize) -> bool {
-        bytes
-            .checked_add(2)
-            .is_some_and(|needed| needed <= self.capacity)
+    // Entries held now: what send usage charges ENTRY_BYTES for.
+    pub(crate) fn len(&self) -> usize {
+        self.intervals.len()
     }
 
-    // The most live bytes the allocated intervals admit.
-    pub(crate) fn admitted_bytes(&self) -> usize {
-        self.capacity.saturating_sub(2)
+    // Entries allocated.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    // Entries fresh output may still take, leaving SPARE; unbounded while
+    // the ledger is abandoned, which records no transmission.
+    pub(crate) fn fresh_room(&self) -> usize {
+        if !self.valid() {
+            return usize::MAX;
+        }
+        self.capacity
+            .saturating_sub(self.intervals.len())
+            .saturating_sub(SPARE)
     }
 
     #[cfg(test)]
-    pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
-        let capacity = send_capacity.checked_add(2).ok_or(())?;
+    pub(crate) fn grown(&self, capacity: usize) -> Result<Self, ()> {
         let mut intervals = storage::Intervals::new(capacity)?;
         for interval in self.intervals.iter() {
             intervals.push(*interval);
@@ -288,22 +351,21 @@ impl Rack {
         })
     }
 
-    pub(crate) fn growth_bytes(&self, send_capacity: usize) -> Option<usize> {
-        self.intervals.growth_bytes(send_capacity.checked_add(2)?)
+    pub(crate) fn growth_bytes(&self, entries: usize) -> Option<usize> {
+        self.intervals.growth_bytes(entries)
     }
 
-    pub(crate) fn prepare_growth(&self, send_capacity: usize) -> Result<storage::Growth, ()> {
-        self.intervals
-            .prepare_growth(send_capacity.checked_add(2).ok_or(())?)
+    pub(crate) fn prepare_growth(&self, entries: usize) -> Result<storage::Growth, ()> {
+        self.intervals.prepare_growth(entries)
     }
 
-    pub(crate) fn commit_growth(&mut self, growth: storage::Growth, send_capacity: usize) {
+    pub(crate) fn commit_growth(&mut self, growth: storage::Growth, entries: usize) {
         self.intervals.commit_growth(growth);
-        self.capacity = send_capacity + 2;
+        self.capacity = entries;
     }
 
-    pub(crate) fn storage_bytes(send_capacity: usize) -> Option<usize> {
-        storage::Intervals::storage_bytes(send_capacity.checked_add(2)?)
+    pub(crate) fn storage_bytes(entries: usize) -> Option<usize> {
+        storage::Intervals::storage_bytes(entries)
     }
 
     #[cfg(test)]
@@ -316,6 +378,7 @@ impl Rack {
         Ok(Self {
             intervals,
             capacity,
+            split_refusals: 0,
             selection_generation: 0,
             departure_selection: None,
             timebase,
@@ -984,17 +1047,9 @@ impl Rack {
             }
             covered = if r.end.after(end) { end } else { r.end };
         }
-        if covered != end {
-            return false;
-        }
-        let splits = [start, end]
-            .iter()
-            .filter(|&&edge| self.inside(edge).is_some())
-            .count();
-        if splits > self.capacity.saturating_sub(self.intervals.len()) {
-            return false;
-        }
-        true
+        // Splits that find no free entry coalesce instead
+        // (commit_validated_departure).
+        covered == end
     }
 
     // `validate_departure` of the consecutive departures of `bytes` from
@@ -1002,6 +1057,9 @@ impl Rack {
     // committed at `now` one after another: each segment becomes its own
     // physical transmission, so every inner edge may split an interval.
     // Count those splits before an indivisible submission.
+    // Unlike a scalar departure, a group needs a free entry for every
+    // split: fresh output, which alone forms groups, clips them to the
+    // entries it has (Rack::fresh_room).
     pub(crate) fn validate_departure_group(
         &self,
         selection: DepartureSelection,
@@ -1041,7 +1099,14 @@ impl Rack {
     }
 
     // `commit_departure` of a departure `validate_departure` accepted, with
-    // the intervals unchanged since.
+    // the intervals unchanged since. Each departure of a selection accepted
+    // in parts (an MTU repair's frames) becomes its own entry, split off at
+    // its edges. An edge that finds no free entry leaves its entry whole:
+    // the entry is committed once the part reaching its end departs, at that
+    // part's time and as one transmission, as Linux keeps one skb with one
+    // timestamp for the segments of a GSO skb it could not fragment. That is
+    // RACK's conservative side: a later transmission time detects loss
+    // later, and the whole entry must be acknowledged.
     pub(crate) fn commit_validated_departure(
         &mut self,
         selection: DepartureSelection,
@@ -1050,10 +1115,13 @@ impl Rack {
         now: u64,
     ) {
         debug_assert!(self.validate_departure(selection, start, end, now));
-        // Validation guarantees these cannot fail or allocate.
-        let left = self.split(start);
-        let right = self.split(end);
-        debug_assert!(left && right);
+        // Nothing allocates; a split that would take a SPARE entry, which
+        // retransmissions and cumulative ACKs need, coalesces.
+        for edge in [start, end] {
+            if self.intervals.len() + SPARE < self.capacity {
+                self.split(edge);
+            }
+        }
         let (first, last) = self.overlapping(start, end);
         let previous = first
             .checked_sub(1)
@@ -1066,9 +1134,12 @@ impl Rack {
             if let Some(previous) = previous {
                 s.intervals[previous].set_stats_flag(DELIVERY_END, true);
             }
+            // An entry starting before `start` holds earlier parts of the
+            // same selection, which departed already.
             for r in s.intervals.range_mut(first, last) {
-                if !start.after(r.start) && !r.end.after(end) {
-                    Self::depart(r, selection, start, end, now);
+                if !r.end.after(end) {
+                    let from = if start.after(r.start) { r.start } else { start };
+                    Self::depart(r, selection, from, end, now);
                 }
             }
         });
@@ -1180,11 +1251,12 @@ impl Rack {
         self.verify();
     }
 
-    // Called only after encoding succeeds. Production reserves one interval
-    // per admitted send-buffer byte plus control space; byte-edge splits cannot exhaust
-    // that backing. Undersized synthetic ledgers retain a defensive fallback.
+    // Called only after encoding succeeds. Fresh output takes an entry only
+    // from Rack::fresh_room, which the write that queued its bytes grew;
+    // a retransmission split past the allocated entries keeps the
+    // defensive fallback (abandon).
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
-    //= reason=Capacity-backed intervals retain every committed original/retransmission timestamp, including arbitrary byte splits, in caller ticks without microsecond truncation. Physical precision finer than min_RTT/4 is a caller precondition, never measured or runtime-gated; violation leaves protocol timing guarantees unspecified, not Rust UB or memory-safety violations.
+    //= reason=Each transmitted segment gets its own entry, allocated at write and charged in send usage; entries retain every committed original/retransmission timestamp, including the pieces ACK, SACK and retransmission splits make, in caller ticks without microsecond truncation. A SACK split refused at the send-usage bound or past the allocated entries leaves its entry whole, with one transmission time (duvet exception in rfc8985-todos.toml). Physical precision finer than min_RTT/4 is a caller precondition, never measured or runtime-gated; violation leaves protocol timing guarantees unspecified, not Rust UB or memory-safety violations.
     //# For each data segment sent, the sender MUST store its most recent
     //# transmission time with a timestamp whose granularity is finer
     //# than 1/4 of the minimum RTT of the connection.
@@ -1450,7 +1522,7 @@ impl Rack {
     //# 1323 [JBB92] suggests that TCP connections utilizing large congestion windows should
     //# take many RTT samples per window of data to avoid aliasing effects in the estimated
     //# RTT.
-    pub(crate) fn acknowledge(
+    pub(crate) fn acknowledge_within(
         &mut self,
         ack: Seq,
         high: Seq,
@@ -1460,6 +1532,7 @@ impl Rack {
         timestamps: Option<TimestampGranularity>,
         mss: u32,
         dsack: bool,
+        bound: SplitBound,
     ) -> u32 {
         self.ack_sample = None;
         self.reo_grew = false;
@@ -1503,7 +1576,8 @@ impl Rack {
             self.abandon(high);
             return 0;
         }
-        // Edges of ranges that existed at the last ACK were split then.
+        // Edges of ranges that existed at the last ACK were split then,
+        // or refused.
         let advice = scoreboard.ranges();
         let (mut first, mut last) = (0, advice.len());
         if !everything && let Some(&(base, _)) = advice.first() {
@@ -1525,10 +1599,8 @@ impl Rack {
             }
         }
         for &(left, right) in &advice[first..last.max(first)] {
-            if !self.split(left) || !self.split(right) {
-                self.abandon(high);
-                return 0;
-            }
+            self.sack_split(left, ack, bound);
+            self.sack_split(right, ack, bound);
         }
         let mut walk = AckWalk {
             delivered: 0,
@@ -1599,6 +1671,54 @@ impl Rack {
         }
         self.verify();
         delivered
+    }
+
+    // `acknowledge_within` with no bound on SACK splits but the entries.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn acknowledge(
+        &mut self,
+        ack: Seq,
+        high: Seq,
+        scoreboard: &mut Scoreboard,
+        now: u64,
+        echo: Option<u32>,
+        timestamps: Option<TimestampGranularity>,
+        mss: u32,
+        dsack: bool,
+    ) -> u32 {
+        self.acknowledge_within(
+            ack,
+            high,
+            scoreboard,
+            now,
+            echo,
+            timestamps,
+            mss,
+            dsack,
+            SplitBound::NONE,
+        )
+    }
+
+    // Splits the entry a SACK block's edge falls inside, unless the split
+    // would take one of the SPARE entries, or the entry is neither the
+    // first one above the cumulative ACK nor the last one and send usage
+    // passed the bound: Linux's tcp_fragment refusing (TCPWqueueTooBig),
+    // after which tcp_sacktag_walk leaves the skb untagged. A refused entry
+    // stays whole and unmarked: the block yields no inference about it, and
+    // it is marked once blocks or the cumulative ACK cover all of it
+    // (duvet exception to RFC 8985 section 4, rfc8985-todos.toml).
+    fn sack_split(&mut self, edge: Seq, ack: Seq, bound: SplitBound) {
+        let Some(i) = self.inside(edge) else {
+            return;
+        };
+        let len = self.intervals.len();
+        let end = i == self.locate(ack) || i + 1 == len;
+        if len + SPARE >= self.capacity || !end && bound.refuses(len) {
+            self.split_refusals = self.split_refusals.saturating_add(1);
+            return;
+        }
+        self.split(edge);
     }
 
     // Covered by this ACK or its scoreboard but not marked yet.

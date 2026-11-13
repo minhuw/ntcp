@@ -648,6 +648,9 @@ pub struct Endpoint {
     memory_throttled_writes: u64,
     memory_refused_opens: u64,
     memory_refused_growths: u64,
+    // MemoryCounters::ledger_split_refusals, taken from connections at
+    // their refresh and reclaim.
+    ledger_split_refusals: u64,
     deadlines: Deadlines,
     reclaimed: u64,
     // The last `max_connections` reclaimed connections, the one counted
@@ -863,6 +866,7 @@ impl Endpoint {
             memory_throttled_writes: 0,
             memory_refused_opens: 0,
             memory_refused_growths: 0,
+            ledger_split_refusals: 0,
             progress_una: {
                 let mut una = reserved_vec(count)?;
                 una.resize(count, 0);
@@ -3144,6 +3148,7 @@ impl Endpoint {
             self.time_wait_slots -= 1;
         }
         self.loss_counters.add(slot.connection.loss_events);
+        self.ledger_split_refusals += slot.connection.split_refusals();
         self.recycle_connection(slot.connection);
         let at = (self.reclaimed % self.reclaims.len() as u64) as usize;
         self.reclaims[at] = id;
@@ -3330,6 +3335,7 @@ impl Endpoint {
             }
             self.loss_counters
                 .add(core::mem::take(&mut slot.connection.loss_events));
+            self.ledger_split_refusals += slot.connection.take_split_refusals();
             if core::mem::take(&mut slot.connection.fast_open_negative)
                 && let Some(service) = self.fast_open.as_mut()
             {
@@ -5767,6 +5773,7 @@ impl Endpoint {
             memory_throttled_writes: self.memory_throttled_writes,
             memory_refused_opens: self.memory_refused_opens,
             memory_refused_growths: self.memory_refused_growths,
+            ledger_split_refusals: self.ledger_split_refusals,
         }
     }
 
@@ -8808,11 +8815,13 @@ mod memory_wait_tests {
     use crate::MemoryCounters;
     use alloc::vec::Vec;
 
+    // Eight-byte segments, so that a write of a few hundred bytes needs
+    // more ledger entries than the first write allocated.
     fn config() -> EndpointConfig {
         EndpointConfig {
             max_connections: 4,
             connection: ConnectionConfig {
-                mss: 64,
+                mss: 8,
                 send_capacity: 1024,
                 receive_capacity: 1024,
                 nagle: false,
@@ -8870,6 +8879,18 @@ mod memory_wait_tests {
         (client, b.accept(listener).unwrap())
     }
 
+    // The bytes beyond those queued that `id`'s allocated send ring and
+    // ledger entries hold: what a write the budget refuses to grow takes.
+    fn held(a: &Endpoint, id: ConnectionId) -> usize {
+        a.slot(id).unwrap().connection.allocated_send_room()
+    }
+
+    // More bytes than the ledgers the first write allocated hold entries
+    // for.
+    fn long_data() -> Vec<u8> {
+        (0..512).map(|i| i as u8).collect()
+    }
+
     // Whether the events since the last call made `id` writable.
     fn writable(endpoint: &mut Endpoint, id: ConnectionId) -> bool {
         let mut writable = false;
@@ -8887,21 +8908,26 @@ mod memory_wait_tests {
     fn a_refused_write_takes_what_fits_and_completes_after_the_peer_acks() {
         let (mut a, mut b, listener) = endpoints();
         let (client, server) = connect(&mut a, &mut b, listener, 40000);
-        // The first write allocates the send ring and ledgers for 16 bytes.
+        // The first write allocates the send ring and the ledgers.
         assert_eq!(a.write(client, &[1; 9]), Ok(9));
         writable(&mut a, client);
-        // The budget has no room for the ledgers to grow past 16 bytes.
+        // The budget has no room for the ledgers to grow.
         a.config.max_buffer_bytes = a.buffer_bytes();
-        let data: Vec<u8> = (0..64).collect();
-        assert_eq!(a.write(client, &data), Ok(7));
+        let data = long_data();
+        let room = held(&a, client);
+        assert!(room > 0 && room < data.len());
+        assert_eq!(a.write(client, &data), Ok(room));
         assert_eq!(a.memory_throttled_writes(), 1);
-        assert_eq!(a.write(client, &data[7..]), Err(Error::WouldBlock.into()));
+        assert_eq!(
+            a.write(client, &data[room..]),
+            Err(Error::WouldBlock.into())
+        );
         assert_eq!(a.memory_throttled_writes(), 2);
         assert_eq!(a.send_admission_room(client, None), Ok(0));
         assert!(!writable(&mut a, client));
         // The peer's ACK frees ring and ledger room the connection holds.
         let mut now = 1;
-        let mut sent = 7;
+        let mut sent = room;
         exchange(&mut a, &mut b, now);
         while sent < data.len() {
             assert!(writable(&mut a, client), "{sent}");
@@ -8909,10 +8935,10 @@ mod memory_wait_tests {
             now += 1;
             exchange(&mut a, &mut b, now);
         }
-        let mut out = [0; 128];
-        assert_eq!(b.read(server, &mut out), Ok(73));
+        let mut out = [0; 1024];
+        assert_eq!(b.read(server, &mut out), Ok(9 + data.len()));
         assert_eq!(out[..9], [1; 9]);
-        assert_eq!(out[9..73], data[..]);
+        assert_eq!(out[9..9 + data.len()], data[..]);
         assert!(a.buffer_bytes() <= a.config.max_buffer_bytes);
     }
 
@@ -9095,13 +9121,20 @@ mod memory_wait_tests {
         let mut a = Endpoint::new(tuned(), [1; 32], 0, |_| true).unwrap();
         let mut b = Endpoint::new(tuned(), [2; 32], 0, |_| true).unwrap();
         let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
-        let (big, _) = connect(&mut a, &mut b, listener, 40000);
+        // `big`'s large receive ring keeps it above its fair share.
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+        let big = a
+            .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
+            .unwrap();
+        exchange(&mut a, &mut b, 0);
+        b.accept(listener).unwrap();
         let (small, _) = connect(&mut a, &mut b, listener, 40001);
         assert_eq!(a.write(big, &[1; 200]), Ok(200));
         assert_eq!(a.write(small, &[2; 20]), Ok(20));
-        // Establishment raised it to ten segments (tcp_init_buffer_space).
+        // Establishment's expansion to ten segments (tcp_init_buffer_space)
+        // stays below the initial limit.
         let small_limit = a.buffer_capacities(small).unwrap().0;
-        assert_eq!(small_limit, 20 * 64);
+        assert_eq!(small_limit, 1024);
         let charged = a.buffer_bytes();
         let big_charge = a.slot(big).unwrap().connection.buffer_charge();
         // Two connections: the fair share is half the cap, which `big`
@@ -9121,7 +9154,8 @@ mod memory_wait_tests {
         assert_eq!(a.send_admission_room(big, None), Ok(0));
         assert!(!writable(&mut a, big));
         // Below its fair share, `small` grows its ledgers.
-        assert_eq!(a.write(small, &[2; 40]), Ok(40));
+        assert!(held(&a, small) < 400);
+        assert_eq!(a.write(small, &[2; 400]), Ok(400));
         assert_eq!(a.memory_throttled_writes(), 1);
         assert!(a.buffer_room() < room);
         assert_eq!(a.buffer_capacities(small).unwrap().0, small_limit);
@@ -9136,7 +9170,7 @@ mod memory_wait_tests {
             a.buffer_room()
         );
         assert!(writable(&mut a, big));
-        assert_eq!(a.write(big, &[1; 300]), Ok(200 + taken));
+        assert_eq!(a.write(big, &[1; 300]), Ok(300.min(200 + taken)));
         assert!(a.memory_pressure());
     }
 
@@ -9175,10 +9209,14 @@ mod memory_wait_tests {
         assert!(charged < a.config.max_buffer_bytes);
         enter_pressure(&mut a, charged - 1, charged - first_charge - second_charge);
         writable(&mut a, writer);
-        // The ledgers hold 16 bytes: the write takes what they hold.
-        assert_eq!(a.write(writer, &[1; 64]), Ok(7));
+        // The write takes what the allocated ledgers hold, and the limit
+        // falls to what is then queued (sk_stream_moderate_sndbuf).
+        let usage = a.transport_info(writer).unwrap().send_used;
+        let room = held(&a, writer);
+        assert_eq!(a.write(writer, &long_data()), Ok(room));
         assert_eq!(a.memory_throttled_writes(), 1);
-        assert_eq!(a.buffer_capacities(writer).unwrap().0, 16);
+        let limit = a.buffer_capacities(writer).unwrap().0;
+        assert_eq!(limit, usage + room);
         assert!(!writable(&mut a, writer));
         let reclaim = |a: &mut Endpoint, id: ConnectionId, now: u64| {
             a.abort(id).unwrap();
@@ -9203,7 +9241,7 @@ mod memory_wait_tests {
         a.on_timeout(5_000_000, 64).unwrap();
         exchange(&mut a, &mut b, 5_000_000);
         assert!(writable(&mut a, writer));
-        assert_eq!(a.write(writer, &[1; 64]), Ok(16));
+        assert_eq!(a.write(writer, &[1; 64]), Ok(64.min(limit)));
         assert_eq!(a.memory_throttled_writes(), 1);
     }
 
@@ -9229,13 +9267,20 @@ mod memory_wait_tests {
             let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
             let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
             let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
-            let (client, server) = connect(&mut a, &mut b, listener, 40000);
+            // The client's large receive ring keeps it above its fair share.
+            let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+            let client = a
+                .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
+                .unwrap();
+            exchange(&mut a, &mut b, 0);
+            let server = b.accept(listener).unwrap();
             for port in 40001..40004 {
                 connect(&mut a, &mut b, listener, port);
             }
-            // Room to grow a little.
+            // Room to grow the ledgers for a quarter of the limit, not for
+            // all of it.
             assert_eq!(a.write(client, &[1; 9]), Ok(9));
-            a.config.max_buffer_bytes = a.buffer_bytes() + 4096;
+            a.config.max_buffer_bytes = a.buffer_bytes() + 16384;
             if early {
                 enter_pressure(&mut a, 1, 0);
             } else {
@@ -9243,7 +9288,7 @@ mod memory_wait_tests {
             }
             let mut results = Vec::new();
             let mut packets = Vec::new();
-            let data: Vec<u8> = (0..=255).collect();
+            let data: Vec<u8> = (0..1015).map(|i| i as u8).collect();
             let mut sent = 0;
             let mut read = 0;
             for now in 2..200 {
@@ -9281,7 +9326,7 @@ mod memory_wait_tests {
         }
         let late = transfer(true, false);
         assert!(late.2 > 0);
-        assert_eq!(late.1.iter().map(|p| p.len() - 20).sum::<usize>(), 265);
+        assert_eq!(late.1.iter().map(|p| p.len() - 20).sum::<usize>(), 1024);
         assert_eq!(transfer(true, true), late);
         assert_ne!(transfer(false, true), transfer(false, false));
     }
@@ -9330,8 +9375,9 @@ mod memory_wait_tests {
             Err(Error::NoMemory.into())
         );
         assert_eq!(a.memory_counters().memory_refused_opens, 1);
-        // The ledgers hold 16 bytes; more is refused.
-        assert_eq!(a.write(client, &[1; 64]), Ok(7));
+        // The ledgers hold entries for `room` more bytes; more is refused.
+        let room = held(&a, client);
+        assert_eq!(a.write(client, &long_data()), Ok(room));
         assert_eq!(
             a.set_buffer_capacities(client, 1024, 4096),
             Err(Error::NoMemory.into())
@@ -9486,8 +9532,9 @@ mod memory_wait_tests {
         a.share_buffer_memory(&group, 0).unwrap();
         b.share_buffer_memory(&group, 1).unwrap();
         assert!(!group.waiting(0));
-        let data: Vec<u8> = (0..64).collect();
-        assert_eq!(a.write(writer, &data), Ok(7));
+        let data = long_data();
+        let room = held(&a, writer);
+        assert_eq!(a.write(writer, &data), Ok(room));
         assert!(group.waiting(0));
         assert!(!writable(&mut a, writer));
         assert!(!a.poll_shared_memory());
@@ -9500,7 +9547,7 @@ mod memory_wait_tests {
         assert!(!a.poll_shared_memory());
         exchange(&mut a, &mut b, 1);
         assert!(writable(&mut a, writer));
-        assert_eq!(a.write(writer, &data[7..]), Ok(57));
+        assert_eq!(a.write(writer, &data[room..]), Ok(data.len() - room));
     }
 
     // A member that leaves publishes its reserve and takes its whole charge
@@ -9527,8 +9574,9 @@ mod memory_wait_tests {
         // Charged and unpublished: b's reserve.
         b.charge(600);
         assert_eq!(group.buffer_bytes(), base_a + base_b);
-        let data: Vec<u8> = (0..64).collect();
-        assert_eq!(a.write(writer, &data), Ok(7));
+        let data = long_data();
+        let room = held(&a, writer);
+        assert_eq!(a.write(writer, &data), Ok(room));
         assert!(group.memory_pressure());
         assert!(group.waiting(0));
         assert_eq!(group.connections(), 2);
@@ -9548,7 +9596,7 @@ mod memory_wait_tests {
         assert!(!group.waiting(0));
         exchange(&mut a, &mut b, 1);
         assert!(writable(&mut a, writer));
-        assert_eq!(a.write(writer, &data[7..]), Ok(57));
+        assert_eq!(a.write(writer, &data[room..]), Ok(data.len() - room));
         // b's owner number is free again; dropped, b leaves as it did.
         let before = group.buffer_bytes();
         b.share_buffer_memory(&group, 1).unwrap();
@@ -9613,8 +9661,9 @@ mod memory_wait_tests {
         assert!(group.memory_pressure());
         assert_eq!(group.connections(), 4);
         writable(&mut a, writer);
-        // The ledgers hold 16 bytes: the write takes what they hold.
-        assert_eq!(a.write(writer, &[1; 64]), Ok(7));
+        // The write takes what the allocated ledgers hold.
+        let room = held(&a, writer);
+        assert_eq!(a.write(writer, &long_data()), Ok(room));
         assert_eq!(a.memory_throttled_writes(), 1);
         let refused = a.now;
         let retry = retry_at(&a, writer).unwrap();
@@ -9669,8 +9718,9 @@ mod memory_wait_tests {
         let group = crate::SharedBufferMemory::new(2, Some(memory), 10_000).unwrap();
         a.share_buffer_memory(&group, 0).unwrap();
         b.share_buffer_memory(&group, 1).unwrap();
-        let data: Vec<u8> = (0..64).collect();
-        assert_eq!(a.write(writer, &data), Ok(7));
+        let data = long_data();
+        let room = held(&a, writer);
+        assert_eq!(a.write(writer, &data), Ok(room));
         let first = retry_at(&a, writer).unwrap();
         b.uncharge(5_000);
         assert!(!b.take_memory_returned());
@@ -9689,7 +9739,7 @@ mod memory_wait_tests {
         assert_eq!(retry_at(&a, writer), None);
         exchange(&mut a, &mut b, first);
         assert!(writable(&mut a, writer));
-        assert_eq!(a.write(writer, &data[7..]), Ok(57));
+        assert_eq!(a.write(writer, &data[room..]), Ok(data.len() - room));
     }
 
     // A lone endpoint's waiter retries too, as every Linux writer short of

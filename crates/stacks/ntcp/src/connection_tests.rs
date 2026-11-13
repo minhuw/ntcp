@@ -6631,14 +6631,18 @@ fn prr_active_delivery_matches_signed_scoreboard_delta() {
         rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
         a.timeout(225_000).unwrap();
         assert!(a.prr.is_some());
-        // More than 64 intervals no longer invalidate SACK/PRR state.
-        for i in 0..65 {
+        // Advice cut inside segments into more ranges than the scoreboard
+        // holds (a range per two ledger entries) ends SACK recovery and PRR:
+        // the conservative path, which keeps RACK's transmission times.
+        let ranges = a.scoreboard.admitted_entries() / 2;
+        for i in 0..=ranges as u32 {
             rack_sack(&mut a, 226_000, 0, &[(i * 2, i * 2 + 1)]);
         }
         assert!(a.rack.valid());
-        assert!(a.prr.is_some());
-        assert!(a.sack_recovery.is_some());
-        assert!(a.scoreboard.ranges().len() > 64);
+        assert!(a.prr.is_none());
+        assert!(a.sack_recovery.is_none());
+        assert!(a.sack_fallback.is_some());
+        assert!(a.scoreboard.ranges().is_empty());
     }
 }
 
@@ -8896,20 +8900,25 @@ fn sack_after_rto_uses_fresh_holes_without_reentering_recovery() {
 
 #[test]
 fn sack_sender_alternating_flight_retains_advice_until_rto() {
+    // Eight segments of 128 bytes; the peer SACKs every other one, a range
+    // per two ledger entries.
     let mut a = sack_flight(128, u32::MAX - 100, 8);
     let una = a.snd_una;
     let end = a.data_high();
     let storage = a.scoreboard.ranges().as_ptr();
-    for i in 0..512 {
+    for i in 0..4 {
         sack_ack(
             &mut a,
             200 + i as u64,
             una,
-            &[(una.wrapping_add(2 * i + 1).0, una.wrapping_add(2 * i + 2).0)],
+            &[(
+                una.wrapping_add(256 * i + 128).0,
+                una.wrapping_add(256 * i + 256).0,
+            )],
         );
     }
     assert!(a.sack_fallback.is_none());
-    assert_eq!(a.scoreboard.ranges().len(), 512);
+    assert_eq!(a.scoreboard.ranges().len(), 4);
     assert_eq!(a.scoreboard.ranges().as_ptr(), storage);
     assert_eq!(a.scoreboard.unsacked_bytes(una, end), 512);
     assert_eq!(a.send.len(), 1024); // Advice never frees payload.
@@ -8923,6 +8932,38 @@ fn sack_sender_alternating_flight_retains_advice_until_rto() {
     assert_eq!(a.send.len(), 1024);
     sack_ack(&mut a, deadline + 1, end, &[]);
     assert_eq!(a.send.len(), 0);
+}
+
+// The scoreboard holds a range per two ledger entries. Blocks the peer cuts
+// inside segments that need more ranges overflow it, and the sender takes
+// the conservative path: SACK inference stops until the flight is
+// cumulatively acknowledged, while RACK keeps every transmission time.
+#[test]
+fn sack_sender_misaligned_advice_beyond_the_scoreboard_falls_back() {
+    let mut a = sack_flight(128, u32::MAX - 100, 8);
+    let una = a.snd_una;
+    let end = a.data_high();
+    let ranges = a.scoreboard.admitted_entries() / 2;
+    for i in 0..=ranges as u32 {
+        sack_ack(
+            &mut a,
+            200 + u64::from(i),
+            una,
+            &[(una.wrapping_add(2 * i + 1).0, una.wrapping_add(2 * i + 2).0)],
+        );
+    }
+    assert_eq!(a.sack_fallback, Some(end));
+    assert!(a.scoreboard.ranges().is_empty());
+    assert!(a.rack.valid());
+    assert_eq!(a.send.len(), 1024);
+    a.timeout(a.rto_deadline.unwrap()).unwrap();
+    let deadline = a.now;
+    let bytes = packet(&mut a, deadline);
+    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(seg.header.sequence, una.0);
+    sack_ack(&mut a, deadline + 1, end, &[]);
+    assert_eq!(a.send.len(), 0);
+    assert_eq!(a.sack_fallback, None);
 }
 
 #[test]

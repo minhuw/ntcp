@@ -85,6 +85,14 @@ pub struct MemoryCounters {
     /// __sk_mem_raise_allocated
     /// suppressing an allocation, which no MIB counts.
     pub memory_refused_growths: u64,
+    /// SACK splits of a RACK ledger entry refused: once send usage passed
+    /// twice the send limit plus 128 KiB (Linux's tcp_fragment counting
+    /// TCPWqueueTooBig), or when the entries the writes allocated ran out
+    /// (where Linux's tcp_fragment fails to allocate, which no MIB
+    /// counts). The entry stays whole, and the SACK block yields no
+    /// inference about it until a block or the cumulative ACK covers all
+    /// of it.
+    pub ledger_split_refusals: u64,
 }
 
 /// One budget of buffer memory for a group of endpoints, each driven on its

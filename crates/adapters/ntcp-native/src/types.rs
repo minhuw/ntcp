@@ -366,4 +366,9 @@ pub struct Counters {
     // allocator, at write or in a buffer setter: Linux's
     // __sk_mem_raise_allocated suppressing an allocation (no MIB).
     pub memory_refused_growths: u64,
+    // SACK splits of a RACK ledger entry refused, at twice the send limit
+    // plus 128 KiB of send usage (Linux's TCPWqueueTooBig) or where the
+    // entries the writes allocated ran out: the entry stays whole and
+    // that SACK block yields no loss inference about it.
+    pub ledger_split_refusals: u64,
 }

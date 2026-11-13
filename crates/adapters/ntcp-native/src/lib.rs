@@ -874,6 +874,7 @@ impl<P: PacketIo> Network<P> {
             memory_throttled_writes: memory.memory_throttled_writes,
             memory_refused_opens: memory.memory_refused_opens + self.counters.memory_refused_opens,
             memory_refused_growths: memory.memory_refused_growths,
+            ledger_split_refusals: memory.ledger_split_refusals,
             ..self.counters
         }
     }

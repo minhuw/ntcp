@@ -4791,6 +4791,26 @@ fn application_timeout_does_not_close_healthy_fin_wait2_receive_half() {
     assert_eq!(a.close_reason(client), Ok(Some(CloseReason::TimedOut)));
 }
 
+// The allocation of both sender ledgers at `entries` RACK entries.
+pub(crate) fn ledgers(entries: usize) -> usize {
+    crate::rack::Rack::storage_bytes(entries).unwrap()
+        + crate::sack::Scoreboard::allocation_bytes(entries).unwrap()
+}
+
+// Both sender ledgers at open: the RACK ledger's spare entries and the
+// scoreboard's temporary ranges.
+pub(crate) fn open_ledgers() -> usize {
+    crate::rack::Rack::storage_bytes(crate::rack::SPARE).unwrap()
+        + crate::sack::Scoreboard::allocation_bytes(0).unwrap()
+}
+
+// The entries a write grows the ledgers to when the bytes it holds leave in
+// `segments` segments: twice as many, at least twice ten, plus the spare
+// entries, to the next power of two.
+pub(crate) fn ledger_target(segments: usize) -> usize {
+    (segments.max(10) * 2 + crate::rack::SPARE).next_power_of_two()
+}
+
 // A connection's charge at open, and a pooled one's: its receive ring
 // (payload, 2-bit presence/PUSH and 1-bit report maps), scratch segment and
 // the sender ledgers' first entries (two RACK intervals, four SACK ranges).
@@ -4800,19 +4820,15 @@ fn connection_charge(cfg: &EndpointConfig) -> usize {
         + receive.div_ceil(4)
         + receive.div_ceil(8)
         + usize::from(cfg.connection.mss)
-        + crate::rack::Rack::storage_bytes(0).unwrap()
-        + crate::sack::Scoreboard::allocation_bytes(0).unwrap()
+        + open_ledgers()
 }
 
 // What a connection's first write, of `live` bytes, adds to its charge: the
-// send ring for its whole limit and the sender ledgers grown to the next
-// power of two of the bytes it holds.
+// send ring for its whole limit and the sender ledgers grown for the
+// segments those bytes take.
 fn first_write_charge(cfg: &EndpointConfig, live: usize) -> usize {
-    let target = live.next_power_of_two().min(cfg.connection.send_capacity);
-    2 * cfg.connection.send_capacity + crate::rack::Rack::storage_bytes(target).unwrap()
-        - crate::rack::Rack::storage_bytes(0).unwrap()
-        + crate::sack::Scoreboard::allocation_bytes(target).unwrap()
-        - crate::sack::Scoreboard::allocation_bytes(0).unwrap()
+    let segments = live.div_ceil(usize::from(cfg.connection.mss));
+    2 * cfg.connection.send_capacity + ledgers(ledger_target(segments)) - open_ledgers()
 }
 
 #[test]
@@ -4891,8 +4907,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     let charge = connection_charge(&cfg);
     let written = first_write_charge(&cfg, 9);
     // While the grown ledgers are filled the first ones are still held.
-    let staging = crate::rack::Rack::storage_bytes(0).unwrap()
-        + crate::sack::Scoreboard::allocation_bytes(0).unwrap();
+    let staging = open_ledgers();
     cfg.max_buffer_bytes = 2 * charge + written + staging;
     let time_wait = cfg.connection.time_wait_us;
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
@@ -6146,12 +6161,9 @@ fn endpoint_cork_more_eor_deadline_flush_and_failed_output() {
         b"abc"
     );
     deliver(&mut b, 0, first);
-    // No per-record allocations: only the ledgers grew, from 4 to 8 bytes.
-    let ledgers = |bytes| {
-        crate::rack::Rack::storage_bytes(bytes).unwrap()
-            + crate::sack::Scoreboard::allocation_bytes(bytes).unwrap()
-    };
-    assert_eq!(a.buffer_bytes(), charge + ledgers(8) - ledgers(4));
+    // No per-record allocations: the first write's ledgers hold both
+    // records' segments.
+    assert_eq!(a.buffer_bytes(), charge);
     a.set_nagle(client, false).unwrap();
     assert_eq!(
         a.poll_transmit(0, &mut [0; 21], 16),
@@ -6205,12 +6217,8 @@ fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
         Ok(24)
     );
     // Charged what was allocated for the 24 bytes admitted: the send ring
-    // for the 32-byte limit and ledgers grown to 32 bytes.
-    let ledgers = |bytes| {
-        crate::rack::Rack::storage_bytes(bytes).unwrap()
-            + crate::sack::Scoreboard::allocation_bytes(bytes).unwrap()
-    };
-    let charge = charge + 2 * 32 + ledgers(32) - ledgers(0);
+    // for the 32-byte limit and ledgers grown for their segment.
+    let charge = charge + 2 * 32 + ledgers(ledger_target(1)) - open_ledgers();
     assert_eq!(a.buffer_bytes(), charge);
     assert_eq!(a.send_admission_room(client, Some(24)), Ok(0));
     assert_eq!(
@@ -6230,11 +6238,9 @@ fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
         a.write_with_options_and_notsent_lowat(client, &[3; 32], true, false, Some(u32::MAX)),
         Ok(24)
     );
-    // The ring grew in place to the 64-byte limit, the ledgers to 64 bytes.
-    assert_eq!(
-        a.buffer_bytes(),
-        charge + 2 * (64 - 32) + ledgers(64) - ledgers(32)
-    );
+    // The ring grew in place to the 64-byte limit; the ledgers' entries
+    // still hold the 64 bytes' segments.
+    assert_eq!(a.buffer_bytes(), charge + 2 * (64 - 32));
 }
 
 #[test]
@@ -6952,11 +6958,10 @@ fn checked_external_write_admission_covers_bytes_phases_and_shutdown() {
     // Preparation allocated and charged the send ring and the ledgers; the
     // write that follows allocates nothing.
     let charged = a.buffer_bytes();
-    let ledgers = |bytes| {
-        crate::rack::Rack::storage_bytes(bytes).unwrap()
-            + crate::sack::Scoreboard::allocation_bytes(bytes).unwrap()
-    };
-    assert_eq!(charged, before + 2 * 32 + ledgers(32) - ledgers(0));
+    assert_eq!(
+        charged,
+        before + 2 * 32 + ledgers(ledger_target(1)) - open_ledgers()
+    );
     crate::allocation_tests::fail_after(0, || {
         assert_eq!(a.check_write_admission(client, None, request), Ok(32));
         assert_eq!(
