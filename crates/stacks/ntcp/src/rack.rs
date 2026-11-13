@@ -808,6 +808,12 @@ impl Rack {
             return;
         }
         let len = self.intervals.len();
+        if count == len {
+            // The tally sums the whole ledger, so an empty one counts nothing.
+            self.intervals.remove_prefix(count);
+            self.tally = Tally::default();
+            return;
+        }
         let packets = if count < len {
             self.packet_end(count + 1)
         } else {
