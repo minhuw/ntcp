@@ -215,8 +215,6 @@ class MacCostEvidence(unittest.TestCase):
         def query(args, query_env):
             if args == ["cargo", "-Vv"]:
                 return "cargo 1.92.0"
-            if args == ["rustup", "show", "active-toolchain"]:
-                return "stable (default)"
             return versions[args[0]]
 
         invocation = f"     Running `CARGO_CRATE_NAME=ntcp {selected} --crate-name ntcp --test src/lib.rs`"
@@ -225,11 +223,12 @@ class MacCostEvidence(unittest.TestCase):
             result = mac.provenance(env, ["cargo", "test"], MODULE, {"profile": {}, "features": []}, invocation, {})
         self.assertEqual(result["rustc"], versions[selected])
         self.assertEqual(result["compiler_selection"]["compiler_path"], selected)
-        self.assertEqual(result["rustup_active_toolchain"], "stable (default)")
+        self.assertEqual(result["path_rustc"], versions["rustc"])
         self.assertEqual(result["build_environment"]["RUSTC"], selected)
         self.assertEqual(result["build_environment"]["CARGO_BUILD_RUSTC"], env["CARGO_BUILD_RUSTC"])
         self.assertEqual(result["build_environment"]["PATH"], env["PATH"])
         self.assertNotIn(mock.call(["rustc", "-Vv"], env), command.call_args_list)
+        command.assert_any_call(["rustc", "--version"], env)
         command.assert_any_call([selected, "-Vv"], {**env, "CARGO_CRATE_NAME": "ntcp"})
 
     def test_compiler_selection_uses_recorded_configuration_wrappers_and_environment(self):
