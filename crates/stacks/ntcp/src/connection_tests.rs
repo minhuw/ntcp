@@ -20107,3 +20107,112 @@ fn tx_timestamp_write_error_lowat_eor_and_cursor_exhaustion_rollback() {
 }
 #[path = "connection_rx_tests.rs"]
 mod rx_metadata;
+
+// Randomized request/response and bulk exchanges, with and without loss and
+// reordering. The SACK report, D-SACK search, scoreboard and TLP eligibility
+// fast paths each check themselves against the walk they skip in debug
+// builds; this drives them through no-block ACKs over an empty scoreboard,
+// PTO arms and rearms on every ACK and transmit, loss probes, SACK recovery
+// and RTO, and checks that each side reads exactly what the other wrote.
+#[test]
+fn randomized_exchanges_cross_check_sack_and_tlp_fast_paths() {
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            if n == 0 { 0 } else { x % n }
+        }
+    }
+    // Loss probes sent, segments carrying SACK blocks, blockless ACKs taken
+    // while nothing was SACKed, timer expirations.
+    let mut totals = [0u64; 4];
+    for seed in 1..=48u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let loss = [0, 0, 15, 60][seed as usize % 4];
+        let reorder = seed % 3 == 0;
+        let cfg = ConnectionConfig {
+            sack: true,
+            rack: true,
+            tlp: true,
+            ..config(65_536, 1000)
+        };
+        let (mut a, mut b) = pair(cfg, (seed as u32).wrapping_mul(0x9e37_79b9));
+        let (ta, tb) = (a.tuple(), b.tuple());
+        let mut now: Instant = 40;
+        // (arrival, to b, frame)
+        let mut flights: Vec<(Instant, bool, Vec<u8>)> = Vec::new();
+        let mut written = [Vec::new(), Vec::new()];
+        let mut read = [Vec::new(), Vec::new()];
+        for step in 0..500u64 {
+            for (side, conn) in [&mut a, &mut b].into_iter().enumerate() {
+                if rng.below(3) == 0 {
+                    let bulk = rng.below(6) == 0;
+                    let len = 1 + rng.below(if bulk { 9000 } else { 200 });
+                    let data: Vec<u8> = (0..len).map(|i| (i ^ step) as u8).collect();
+                    let n = conn.write(&data).unwrap_or(0);
+                    written[side].extend_from_slice(&data[..n]);
+                }
+            }
+            for (to_b, conn) in [(true, &mut a), (false, &mut b)] {
+                loop {
+                    let mut out = vec![0; 65535];
+                    let Some(len) = conn.transmit(now, &mut out).unwrap() else {
+                        break;
+                    };
+                    out.truncate(len);
+                    if rng.below(1000) >= loss {
+                        let delay = 2_000 + if reorder { rng.below(6_000) } else { 0 };
+                        flights.push((now + delay, to_b, out));
+                    }
+                }
+            }
+            let Some(next) = flights
+                .iter()
+                .map(|f| f.0)
+                .chain(a.next_deadline())
+                .chain(b.next_deadline())
+                .min()
+            else {
+                continue;
+            };
+            now = now.max(next);
+            flights.sort_by_key(|f| f.0);
+            while flights.first().is_some_and(|f| f.0 <= now) {
+                let (_, to_b, frame) = flights.remove(0);
+                let (to, from) = if to_b { (&mut b, ta) } else { (&mut a, tb) };
+                let segment = wire::parse(ip(from), &frame).unwrap();
+                if segment.options.sack_blocks[0].is_some() {
+                    totals[1] += 1;
+                } else if to.scoreboard.ranges().is_empty() {
+                    totals[2] += 1;
+                }
+                to.input(now, &segment).unwrap();
+            }
+            for conn in [&mut a, &mut b] {
+                if conn.next_deadline().is_some_and(|deadline| deadline <= now) {
+                    conn.timeout(now).unwrap();
+                    totals[3] += 1;
+                }
+            }
+            for (side, conn) in [&mut b, &mut a].into_iter().enumerate() {
+                let mut buf = vec![0; 65536];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                read[side].extend_from_slice(&buf[..n]);
+            }
+        }
+        for side in 0..2 {
+            assert!(!read[side].is_empty(), "seed {seed}");
+            assert_eq!(
+                read[side][..],
+                written[side][..read[side].len()],
+                "seed {seed}"
+            );
+        }
+        totals[0] += a.loss_events.loss_probes + b.loss_events.loss_probes;
+    }
+    assert!(totals.iter().all(|&n| n > 50), "{totals:?}");
+}

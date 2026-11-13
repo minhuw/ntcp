@@ -2207,20 +2207,23 @@ impl Connection {
     }
 
     fn tlp_arm_packets(&self) -> Option<u32> {
+        // Plain state tests first, the flight before all (an ACK of every
+        // byte arms nothing, as tcp_set_xmit_timer tests packets_out
+        // first); the composite rack_enabled and synchronized last.
         if !(self.config.tlp
-            && self.rack_enabled()
-            && self.synchronized()
             && self.flight() != 0
             && self.snd_wnd != 0
-            && !self.congestion.in_recovery()
-            && self.sack_post_rto.is_none()
             && self.consecutive_timeouts == 0
             && !self.retx_pending
-            && self.ecn_pause.is_none_or(|deadline| self.now >= deadline)
             && self.rack.deadline.is_none()
+            && self.sack_post_rto.is_none()
+            && !self.congestion.in_recovery()
+            && self.ecn_pause.is_none_or(|deadline| self.now >= deadline)
             // A loss probe must not bypass the PTB Restart allowance or
             // ordinary admission of known-dropped ranges.
-            && self.ptb_idle())
+            && self.ptb_idle()
+            && self.rack_enabled()
+            && self.synchronized())
         {
             return None;
         }
@@ -2295,51 +2298,56 @@ impl Connection {
     //# sender should attempt to wait long enough that the receiver has sent
     //# any delayed ACKs that it is withholding.
     fn schedule_tlp(&mut self) {
-        if let Some(unacked_packets) = self.tlp_arm_packets() {
+        self.arm_tlp(self.tlp_arm_packets());
+        self.select_loss_timer();
+    }
+
+    // The PTO deadline for `packets`, tlp_arm_packets() as the caller has
+    // just computed it (a loss timer selection must follow). Linux likewise
+    // recomputes the probe timeout on each arm and only resets its timer
+    // (tcp_schedule_loss_probe).
+    fn arm_tlp(&mut self, packets: Option<u32>) {
+        debug_assert_eq!(packets, self.tlp_arm_packets());
+        if let Some(unacked_packets) = packets {
             // Preserve a short flight's peer ACK budget without imposing that
             // delay on full-sized flights. A separate scheduling margin covers
             // local timing variance for sampled multi-packet flights.
-            let pto =
-                self.rtt
-                    .srtt()
-                    .map_or(self.config.timebase.ticks_from_us(1_000_000), |srtt| {
-                        let fin_packet = u32::from(self.fin_sequence.is_some_and(|fin| {
-                            fin.at_or_after(self.snd_una)
-                                && (self.fin_standalone || fin == self.snd_una)
-                        }));
-                        let packets = unacked_packets + fin_packet;
-                        let delay = if packets == 1 {
-                            self.config
-                                .timebase
-                                .ticks_from_us(self.config.peer_max_ack_delay_us)
-                        } else if packets > 1 {
-                            // Conservative scheduling allowance, not delivery or
-                            // congestion credit. Preserve RTO as the outer cap.
-                            self.config
-                                .timebase
-                                .ticks_from_us(self.config.tlp_timer_margin_us)
-                        } else {
-                            0
-                        };
-                        let pto = srtt.saturating_mul(2).saturating_add(delay);
-                        if self.rack.has_short_transmission(self.mss as u32) {
-                            pto.max(
-                                srtt.saturating_add(
-                                    self.config
-                                        .timebase
-                                        .ticks_from_us(self.config.peer_max_ack_delay_us),
-                                ),
-                            )
-                        } else {
-                            pto
-                        }
-                        .max(1)
-                    });
+            let pto = self.rtt.srtt().map_or_else(
+                || self.config.timebase.ticks_from_us(1_000_000),
+                |srtt| {
+                    let peer_delay = self
+                        .config
+                        .timebase
+                        .ticks_from_us(self.config.peer_max_ack_delay_us);
+                    let fin_packet = u32::from(self.fin_sequence.is_some_and(|fin| {
+                        fin.at_or_after(self.snd_una)
+                            && (self.fin_standalone || fin == self.snd_una)
+                    }));
+                    let packets = unacked_packets + fin_packet;
+                    let delay = if packets == 1 {
+                        peer_delay
+                    } else if packets > 1 {
+                        // Conservative scheduling allowance, not delivery or
+                        // congestion credit. Preserve RTO as the outer cap.
+                        self.config
+                            .timebase
+                            .ticks_from_us(self.config.tlp_timer_margin_us)
+                    } else {
+                        0
+                    };
+                    let pto = srtt.saturating_mul(2).saturating_add(delay);
+                    if self.rack.has_short_transmission(self.mss as u32) {
+                        pto.max(srtt.saturating_add(peer_delay))
+                    } else {
+                        pto
+                    }
+                    .max(1)
+                },
+            );
             self.tlp_deadline = self
                 .rto_deadline
                 .map(|rto| self.now.saturating_add(pto).min(rto));
         }
-        self.select_loss_timer();
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.1
@@ -5016,14 +5024,17 @@ impl Connection {
     //# Therefore, zero window probing needs to be supported to prevent a
     //# connection from hanging forever if ACK segments that re-open the window
     //# are lost.
-    fn arm_work(&mut self) {
+    // Returns tlp_arm_packets(), unchanged by the rest of this work, for a
+    // caller that arms the PTO next.
+    fn arm_work(&mut self) -> Option<u32> {
         self.resolve_probe_response();
         let early_response = self.early_response_eligible();
         if !self.synchronized() && !early_response {
             self.select_loss_timer();
-            return;
+            return None;
         }
-        if self.tlp_arm_packets().is_none() {
+        let probe_packets = self.tlp_arm_packets();
+        if probe_packets.is_none() {
             self.tlp_deadline = None;
             self.tlp_pending = false;
         }
@@ -5126,6 +5137,7 @@ impl Connection {
             self.keepalive_pending = false;
         }
         self.select_loss_timer();
+        probe_packets
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
@@ -7821,9 +7833,10 @@ impl Connection {
         if advancing && self.more && !self.cork && (!self.config.nagle || self.flight() == 0) {
             self.release_corked();
         }
-        self.arm_work();
+        let probe_packets = self.arm_work();
         if advancing {
-            self.schedule_tlp();
+            self.arm_tlp(probe_packets);
+            self.select_loss_timer();
         }
         Ok(())
     }
@@ -11575,9 +11588,10 @@ impl Connection {
                 self.pacing_enabled() && !initial_burst && !probe && !tlp && !retransmit,
             );
         }
-        self.arm_work();
+        let probe_packets = self.arm_work();
         if (fresh_data || new_fin) && !tlp {
-            self.schedule_tlp();
+            self.arm_tlp(probe_packets);
+            self.select_loss_timer();
         }
         if count != 0
             && !syn
