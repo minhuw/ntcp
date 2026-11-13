@@ -656,6 +656,25 @@ impl SocketConfig {
                 // the runtime's (`lib.rs`, Limits).
                 "tcp.max_connections" => config.tcp.max_connections = number(value)?,
                 "tcp.max_listeners" => config.tcp.max_listeners = number(value)?,
+                // Linux's tcp_wmem and tcp_rmem, "min initial max" in bytes,
+                // and tcp_mem, "low pressure high" in bytes where Linux
+                // counts pages.
+                "tcp.wmem" => config
+                    .tcp
+                    .connection
+                    .set_send_buffer(buffer_sizes(value)?)
+                    .map_err(|_| invalid())?,
+                "tcp.rmem" => config
+                    .tcp
+                    .connection
+                    .set_receive_buffer(buffer_sizes(value)?)
+                    .map_err(|_| invalid())?,
+                "tcp.mem" => {
+                    let [low, pressure, high] = triple(value)?;
+                    config.tcp.max_buffer_bytes = high;
+                    config.tcp.buffer_pressure_bytes = Some(pressure);
+                    config.tcp.buffer_low_bytes = Some(low);
+                }
                 "tcp.advertised_mss" => config.tcp.connection.advertised_mss = Some(number(value)?),
                 "tcp.pacing" => {
                     pacing_enabled = match value {
@@ -937,6 +956,24 @@ fn mac(value: &str) -> io::Result<[u8; 6]> {
         *byte = u8::from_str_radix(field, 16).map_err(|_| invalid())?;
     }
     Ok(mac)
+}
+
+// Three numbers separated by whitespace, as the sysctls print them.
+fn triple(value: &str) -> io::Result<[usize; 3]> {
+    let mut fields = value.split_ascii_whitespace();
+    let mut triple = [0; 3];
+    for field in &mut triple {
+        *field = number(fields.next().ok_or_else(invalid)?)?;
+    }
+    if fields.next().is_some() {
+        return Err(invalid());
+    }
+    Ok(triple)
+}
+
+fn buffer_sizes(value: &str) -> io::Result<ntcp::BufferSizes> {
+    let [min, initial, max] = triple(value)?;
+    Ok(ntcp::BufferSizes { min, initial, max })
 }
 
 fn number<T: std::str::FromStr>(value: &str) -> io::Result<T> {
