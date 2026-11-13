@@ -381,3 +381,309 @@ fn memory_pressure_or_the_low_threshold_stops_send_expansion() {
         );
     }
 }
+
+// Two endpoints joined by a link in virtual time (microsecond ticks):
+// `bytes_per_ms` each way, `delay` microseconds one way.
+struct Link {
+    a: Endpoint,
+    b: Endpoint,
+    queues: [alloc::collections::VecDeque<(u64, IpMetadata, Vec<u8>)>; 2],
+    free_at: [u64; 2],
+    now: u64,
+    bytes_per_ms: u64,
+    delay: u64,
+    // Every packet `b` sent, after the handshake's.
+    from_b: Vec<Vec<u8>>,
+}
+
+impl Link {
+    fn new(a: Endpoint, b: Endpoint, bytes_per_ms: u64, delay: u64) -> Self {
+        Self {
+            a,
+            b,
+            queues: Default::default(),
+            free_at: [0; 2],
+            now: 0,
+            bytes_per_ms,
+            delay,
+            from_b: Vec::new(),
+        }
+    }
+
+    // Sends what both sides have to send and delivers what has arrived,
+    // until neither has anything more now.
+    fn pump(&mut self) {
+        loop {
+            let mut moved = false;
+            for side in 0..2 {
+                let endpoint = if side == 0 { &mut self.a } else { &mut self.b };
+                loop {
+                    let mut bytes = [0; 2048];
+                    let output = endpoint.poll_transmit(self.now, &mut bytes, 16).unwrap();
+                    if let Some(packet) = output.packet {
+                        let departure = self.now.max(self.free_at[side]);
+                        self.free_at[side] =
+                            departure + (packet.len as u64 * 1000).div_ceil(self.bytes_per_ms);
+                        let frame = bytes[..packet.len].to_vec();
+                        if side == 1 {
+                            self.from_b.push(frame.clone());
+                        }
+                        self.queues[side].push_back((
+                            self.free_at[side] + self.delay,
+                            packet.ip,
+                            frame,
+                        ));
+                    }
+                    if !output.more_work {
+                        break;
+                    }
+                }
+            }
+            for side in 0..2 {
+                while self.queues[side]
+                    .front()
+                    .is_some_and(|&(at, _, _)| at <= self.now)
+                {
+                    let (_, ip, frame) = self.queues[side].pop_front().unwrap();
+                    let to = if side == 0 { &mut self.b } else { &mut self.a };
+                    to.input(self.now, ip, &frame).unwrap();
+                    moved = true;
+                }
+            }
+            if !moved {
+                return;
+            }
+        }
+    }
+
+    // Moves time to the next arrival or deadline and services timers.
+    fn advance(&mut self) {
+        let next = [
+            self.queues[0].front().map(|q| q.0),
+            self.queues[1].front().map(|q| q.0),
+            self.a.next_deadline(),
+            self.b.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect("something to wait for");
+        self.now = self.now.max(next);
+        for endpoint in [&mut self.a, &mut self.b] {
+            if endpoint.next_deadline().is_some_and(|at| at <= self.now) {
+                endpoint.on_timeout(self.now, 64).unwrap();
+            }
+        }
+    }
+}
+
+// A bulk transfer from a client of `a_config` to a server of `b_config`
+// over 100 Mb/s with a 10 ms RTT (a 125 kB BDP). The client keeps its send
+// buffer full; the server reads everything as it arrives. Calls `observe`
+// after each read; returns the link once `total` bytes were read.
+fn bulk(
+    a_config: EndpointConfig,
+    b_config: EndpointConfig,
+    total: usize,
+    mut observe: impl FnMut(&mut Link, ConnectionId),
+) -> Link {
+    let mut a = Endpoint::new(a_config, [1; 32], 0, |_| true).unwrap();
+    let mut b = Endpoint::new(b_config, [2; 32], 0, |_| true).unwrap();
+    let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+    let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+    let client = a.connect(0, local, REMOTE.parse().unwrap()).unwrap();
+    let mut link = Link::new(a, b, 12_500, 5_000);
+    let server = loop {
+        link.pump();
+        if let Ok(server) = link.b.accept(listener) {
+            break server;
+        }
+        link.advance();
+    };
+    link.from_b.clear();
+    let data = [7; 65536];
+    let mut out = [0; 65536];
+    let mut read = 0;
+    while read < total {
+        while link.a.write(client, &data).is_ok_and(|count| count != 0) {}
+        link.pump();
+        while let Ok(count) = link.b.read(server, &mut out) {
+            read += count;
+            observe(&mut link, server);
+        }
+        link.pump();
+        link.advance();
+    }
+    link
+}
+
+// The client side of a bulk transfer: a fixed 512 KiB send buffer and
+// budget for its ledgers.
+fn bulk_sender(timestamps: bool) -> EndpointConfig {
+    let mut config = config();
+    config.connection.send_capacity = 512 << 10;
+    config.connection.timestamps = timestamps;
+    config.max_buffer_bytes = 1 << 30;
+    config
+}
+
+// The server side: receive {4096, 65536, 1 MiB}.
+fn bulk_receiver(timestamps: bool) -> EndpointConfig {
+    let mut config = config();
+    config.connection.receive_capacity_max = 1 << 20;
+    config.connection.timestamps = timestamps;
+    config
+}
+
+// The right edges of the windows `packets` (b's) advertised to the bulk
+// client (port 40000), after the handshake, with scale `scale`.
+fn right_edges(packets: &[Vec<u8>], scale: u8) -> Vec<Seq> {
+    packets
+        .iter()
+        .filter(|p| u16::from_be_bytes([p[2], p[3]]) == 40000)
+        .map(|p| {
+            let ack = u32::from_be_bytes(p[8..12].try_into().unwrap());
+            Seq(ack).wrapping_add(u32::from(window_field(p)) << scale)
+        })
+        .collect()
+}
+
+// Dynamic right-sizing (tcp_rcv_space_adjust, tcp_rcvbuf_grow): a bulk
+// receiver's ring grows over a few RTTs from its 64 KiB initial size, never
+// shrinks, and the window it advertises never retracts (RFC 9293 section
+// 3.8.6, SHLD-14) by a scale unit or more; the transfer then takes about half the time a fixed 64
+// KiB window, which carries 52 Mb/s at this RTT, needs. With timestamps the
+// receiver's RTT comes from TSecr (tcp_rcv_rtt_measure_ts), without them
+// from the time to receive a window (tcp_rcv_rtt_measure).
+#[test]
+fn drs_grows_the_receive_window_for_a_bulk_transfer() {
+    for timestamps in [true, false] {
+        let mut sizes = Vec::new();
+        let tuned = bulk(
+            bulk_sender(timestamps),
+            bulk_receiver(timestamps),
+            4 << 20,
+            |link, server| {
+                let info = link.b.transport_info(server).unwrap();
+                if sizes.last() != Some(&info.receive_capacity) {
+                    sizes.push(info.receive_capacity);
+                }
+            },
+        );
+        let mut fixed = bulk_receiver(timestamps);
+        fixed.connection.receive_capacity_max = 0;
+        let fixed = bulk(bulk_sender(timestamps), fixed, 4 << 20, |_, _| ());
+        assert_eq!(sizes[0], 65536);
+        assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]), "{sizes:?}");
+        // At least twice the BDP, a few doublings, within max.
+        assert!(*sizes.last().unwrap() >= 250_000, "{sizes:?}");
+        assert!(*sizes.last().unwrap() <= 1 << 20, "{sizes:?}");
+        // With timestamps a sample is one RTT, so the ring grows by steps;
+        // without them the first sample spans the slow start that filled the
+        // first window, and its measure (several times the initial ten
+        // segments read) asks for max at once, as Linux's does.
+        assert!(!timestamps || sizes.len() >= 3, "{sizes:?}");
+        let edges = right_edges(&tuned.from_b, 5);
+        let worst = edges
+            .windows(2)
+            .filter(|e| e[0].after(e[1]))
+            .map(|e| e[0].distance_from(e[1]))
+            .max();
+        // Only RFC 7323 section 2.4's rounding, less than one scale unit,
+        // moves the encoded edge back (`advertised_window` keeps the old
+        // promise internally).
+        assert!(worst.is_none_or(|w| w < 1 << 5), "{timestamps} {worst:?}");
+        assert!(
+            tuned.now * 10 < fixed.now * 6,
+            "{timestamps} {} {}",
+            tuned.now,
+            fixed.now
+        );
+        // The estimate is an RTT: 10 ms, plus the queue the grown window
+        // builds at the link, at most 1 MiB / 12.5 kB/ms.
+        let connection = &tuned.b.slots.iter().flatten().next().unwrap().connection;
+        let rtt = connection.receive_rtt_us();
+        assert!((10_000..95_000).contains(&rtt), "{timestamps} {rtt}");
+    }
+}
+
+// The receive sizes the server reported, each change once, and its count
+// of refused growths, for a bulk transfer of `total` bytes in which
+// `adjust` may change the server endpoint once its ring first grew.
+fn receive_sizes(
+    b_config: EndpointConfig,
+    total: usize,
+    mut adjust: impl FnMut(&mut Endpoint, ConnectionId, usize),
+) -> (Vec<usize>, Link) {
+    let mut sizes: Vec<usize> = Vec::new();
+    let link = bulk(bulk_sender(true), b_config, total, |link, server| {
+        let size = link.b.transport_info(server).unwrap().receive_capacity;
+        adjust(&mut link.b, server, size);
+        if sizes.last() != Some(&size) {
+            sizes.push(size);
+        }
+    });
+    (sizes, link)
+}
+
+// SO_RCVBUF (SOCK_RCVBUF_LOCK) stops DRS: tcp_rcvbuf_grow returns at once.
+#[test]
+fn a_locked_receive_size_does_not_grow() {
+    let (sizes, _) = receive_sizes(bulk_receiver(true), 2 << 20, |b, server, size| {
+        if size == 65536 && b.buffer_capacities(server).unwrap().0 != 8192 {
+            b.set_buffer_capacities(server, 8192, 65536).unwrap();
+        }
+    });
+    assert_eq!(sizes, [65536]);
+}
+
+// As Linux's __sk_mem_raise_allocated for SK_MEM_RECV: under pressure a
+// receive ring holding its fair share of the cap does not grow, and the
+// window stays as it was; one below its fair share grows.
+#[test]
+fn memory_pressure_refuses_receive_growth_at_the_fair_share() {
+    let mut idle = None;
+    let mut phase = 0;
+    let mut held = 0;
+    let (sizes, link) = receive_sizes(bulk_receiver(true), 6 << 20, |b, server, size| {
+        if phase == 1 {
+            assert_eq!(size, held);
+        }
+        if phase == 0 && size > 65536 {
+            phase = 1;
+            held = size;
+            // A second, idle connection: the fair share is half the cap,
+            // which the grown ring holds.
+            let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 9000);
+            idle = Some(
+                b.connect(b.now, local, "192.0.2.3:80".parse().unwrap())
+                    .unwrap(),
+            );
+            let charge = b.slot(server).unwrap().connection.buffer_charge();
+            b.config.max_buffer_bytes = 2 * charge;
+            assert!(b.buffer_bytes() < b.config.max_buffer_bytes);
+            b.config.buffer_pressure_bytes = Some(1);
+            b.config.buffer_low_bytes = Some(0);
+            b.charge(1);
+            b.uncharge(1);
+            assert!(b.memory_pressure());
+            assert_eq!(b.memory_refused_growths, 0);
+        } else if phase == 1 && b.memory_refused_growths >= 3 {
+            phase = 2;
+            // Far below its fair share of a larger cap, still in pressure.
+            b.config.max_buffer_bytes = 1 << 30;
+        }
+    });
+    assert_eq!(phase, 2);
+    assert!(link.b.memory_pressure());
+    // One size before pressure, then nothing until the cap grew.
+    assert!(sizes.len() >= 3, "{sizes:?}");
+    assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]), "{sizes:?}");
+    assert!(idle.is_some());
+    let edges = right_edges(&link.from_b, 5);
+    assert!(
+        edges
+            .windows(2)
+            .all(|e| e[1].at_or_after(e[0]) || e[0].distance_from(e[1]) < 1 << 5)
+    );
+}

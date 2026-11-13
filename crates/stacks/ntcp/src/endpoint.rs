@@ -4229,8 +4229,23 @@ impl Endpoint {
     // may not pass the pressure threshold, and under pressure may not grow.
     // A fixed (untuned) direction is held to the hard cap alone.
     fn send_growth_room(&self, connection: &Connection, charge: usize) -> usize {
+        self.growth_room(
+            connection.send_tuned() && !connection.send_below_min(),
+            charge,
+        )
+    }
+
+    // The same for a tuned receive ring's growth (DRS): Linux applies one
+    // rule to SK_MEM_RECV, with tcp_rmem[0] as the floor.
+    fn receive_growth_room(&self, connection: &Connection, charge: usize) -> usize {
+        self.growth_room(!connection.receive_below_min(), charge)
+    }
+
+    // What the hard cap leaves, and when `pressured`, Linux's limits past
+    // tcp_mem[1] for a connection charged `charge` that holds its fair share.
+    fn growth_room(&self, pressured: bool, charge: usize) -> usize {
         let room = self.buffer_room();
-        if !connection.send_tuned() || connection.send_below_min() {
+        if !pressured {
             return room;
         }
         let memory = self.memory();
@@ -4752,9 +4767,53 @@ impl Endpoint {
 
     pub fn read(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
         self.reject_if_output_reserved(id)?;
-        let count = self.slot_mut(id)?.connection.read(out)?;
+        let connection = &mut self.slot_mut(id)?.connection;
+        let count = connection.read(out)?;
+        if connection.receive_tuned()
+            && let Some(target) = connection.receive_space_adjust()
+        {
+            self.grow_receive(id, target);
+        }
         self.refresh(id.slot);
         Ok(count)
+    }
+
+    // DRS asks the receive ring of `id` to grow to `target` bytes. As
+    // Linux's __sk_mem_raise_allocated for SK_MEM_RECV, the growth's peak
+    // charge must fit the room `receive_growth_room` gives; a refused one
+    // is counted, enters pressure if it would have passed the threshold,
+    // and leaves the window as it is until the next RTT's measure.
+    #[cold]
+    #[inline(never)]
+    fn grow_receive(&mut self, id: ConnectionId, target: usize) {
+        let connection = &self.slots[id.slot].as_ref().unwrap().connection;
+        let own = connection.buffer_charge();
+        let room = self.receive_growth_room(connection, own);
+        let growth = connection
+            .receive_growth_peak(target)
+            .map_or(usize::MAX, |peak| peak - own);
+        let grown = growth <= room
+            && self.slots[id.slot]
+                .as_mut()
+                .unwrap()
+                .connection
+                .grow_receive(target)
+                .is_ok();
+        // Charged even when refused: a bitmap that grew before another
+        // failed keeps its storage.
+        let charge = self.slots[id.slot]
+            .as_ref()
+            .unwrap()
+            .connection
+            .buffer_charge();
+        let before = self.budget.allocated();
+        self.recharge(own, charge);
+        if !grown {
+            self.memory_refused_growths += 1;
+            let memory = self.memory();
+            self.budget
+                .attempted(before.saturating_add(growth), self.now, memory);
+        }
     }
     // Socket adapters may drain accepted bytes after CLOSED; the normal read
     // contract remains unchanged. Eligibility excludes unfinished handshakes

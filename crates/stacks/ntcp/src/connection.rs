@@ -1067,6 +1067,26 @@ pub(crate) struct Connection {
     // now raise (Linux's tcp_check_space with SOCK_NOSPACE set).
     send_max: usize,
     send_expand_pending: bool,
+    // The receive direction's limits, as the send direction's: whether it
+    // is tuned, the ring below which memory pressure still lets it grow
+    // (tcp_rmem[0]) and the ring it may grow to (tcp_rmem[2]).
+    receive_tuned: bool,
+    receive_min: usize,
+    receive_max: usize,
+    // The receiver's RTT estimate, Linux's rcv_rtt_est: eight times the
+    // smoothed microseconds, 0 before the first sample; the sequence that
+    // ends the window being timed and when its timing began; the last
+    // TSecr seen (rcv_rtt_last_tsecr).
+    rcv_rtt_us8: u32,
+    rcv_rtt_seq: Seq,
+    rcv_rtt_time: Option<Instant>,
+    rcv_rtt_last_tsecr: u32,
+    // Dynamic right-sizing, Linux's rcvq_space: the most the application
+    // read in one receiver RTT, and where (in bytes read) and when the
+    // current measure began.
+    rcvq_space: usize,
+    rcvq_seq: u64,
+    rcvq_time: Instant,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1146,6 +1166,7 @@ impl Connection {
         let send = SendBuffer::unallocated(config.send_capacity);
         let (send_sizes, receive_sizes) = (config.send_buffer(), config.receive_buffer());
         let send_tuned = send_sizes.max > send_sizes.initial;
+        let receive_tuned = receive_sizes.max > receive_sizes.initial;
         let mut scratch = Vec::new();
         scratch
             .try_reserve_exact(config.mss as usize)
@@ -1433,6 +1454,16 @@ impl Connection {
             send_min: send_sizes.min,
             send_max: send_sizes.max,
             send_expand_pending: false,
+            receive_tuned,
+            receive_min: receive_sizes.min,
+            receive_max: receive_sizes.max,
+            rcv_rtt_us8: 0,
+            rcv_rtt_seq: Seq(0),
+            rcv_rtt_time: None,
+            rcv_rtt_last_tsecr: 0,
+            rcvq_space: 0,
+            rcvq_seq: 0,
+            rcvq_time: now,
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -1641,8 +1672,10 @@ impl Connection {
         }
         self.send.set_limit(send);
         self.config.send_capacity = send;
-        // As SO_SNDBUF sets SOCK_SNDBUF_LOCK: no longer tuned.
+        // As SO_SNDBUF and SO_RCVBUF set SOCK_SNDBUF_LOCK and
+        // SOCK_RCVBUF_LOCK: no longer tuned.
         self.send_tuned = false;
+        self.receive_tuned = false;
         if self.send_space_remaining() != 0 {
             self.send_backpressured = false;
         }
@@ -4656,6 +4689,14 @@ impl Connection {
         if self.send_tuned {
             self.sndbuf_expand();
         }
+        // It also starts the first DRS measure, from the initial window,
+        // at most ten segments (rcvq_space.space).
+        self.rcvq_time = self.now;
+        self.rcvq_seq = self.received_read;
+        self.rcvq_space = self
+            .config
+            .receive_capacity
+            .min(10 * usize::from(self.receive_mss()));
         self.fast_open_attempt = false;
         if self.deferred_tfo_push {
             self.deferred_tfo_push = false;
@@ -5796,15 +5837,180 @@ impl Connection {
         }
         self.received_read = self.received_read.saturating_add(count as u64);
         self.rx_timestamps.consumed(self.received_read);
+        if count != 0 {
+            self.read_window_update();
+        }
+        Ok(count)
+    }
+
+    // A read or a receive ring growth made room: ACK now if the window it
+    // opens is worth an update.
+    fn read_window_update(&mut self) {
         // Only credit that an ordinary ACK can actually offer is useful:
         // backing storage may exceed the wire cap, or be below a scale unit.
         let shift = if self.scaling { self.local_scale } else { 0 };
         let credit = (u32::from(self.advertised_window(false)) << shift)
             .saturating_sub(self.receive_window());
-        if count != 0 && !self.receive.eof() && credit >= self.read_window_threshold() {
+        if !self.receive.eof() && credit >= self.read_window_threshold() {
             self.immediate_ack();
         }
-        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receive_rtt_us(&self) -> u32 {
+        self.rcv_rtt_us8 >> 3
+    }
+
+    pub(crate) fn receive_tuned(&self) -> bool {
+        self.receive_tuned
+    }
+
+    // A receive ring below its floor: as Linux lets a socket whose
+    // sk_rmem_alloc is below tcp_rmem[0] allocate under pressure
+    // (__sk_mem_raise_allocated).
+    pub(crate) fn receive_below_min(&self) -> bool {
+        self.receive.capacity() < self.receive_min
+    }
+
+    // Linux's tcp_rcv_rtt_update: a sample of `sample` microseconds. A
+    // smaller one replaces the estimate. A larger one is ignored when it
+    // timed a whole window (`whole_window`), which an application stalled
+    // by other work inflates, or while unread data waits; otherwise it is
+    // smoothed in by 1/8.
+    fn rcv_rtt_update(&mut self, sample: u32, whole_window: bool) {
+        let old = self.rcv_rtt_us8;
+        let scaled = sample.saturating_mul(8);
+        self.rcv_rtt_us8 = if old == 0 || scaled < old {
+            scaled
+        } else if whole_window || self.receive.readable() != 0 {
+            return;
+        } else {
+            (old - (old >> 3)).saturating_add(sample)
+        };
+    }
+
+    // Linux's tcp_rcv_rtt_measure, for in-sequence data: the time it took
+    // the peer to send the window advertised when the last timing began, a
+    // receiver's RTT without timestamps (DRS).
+    #[inline(never)]
+    fn rcv_rtt_measure(&mut self) {
+        let next = self.receive.next();
+        if let Some(time) = self.rcv_rtt_time {
+            if self.rcv_rtt_seq.after(next) {
+                return;
+            }
+            let delta = self.config.timebase.us_from_ticks(self.now - time);
+            self.rcv_rtt_update(delta.clamp(1, u64::from(u32::MAX)) as u32, true);
+        }
+        self.rcv_rtt_seq = next.wrapping_add(self.receive_window());
+        self.rcv_rtt_time = Some(self.now);
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
+    //= reason=The receiver also times its RTT from the TSecr of each new echo carried by a segment of at least the estimated peer MSS (Linux's tcp_rcv_rtt_measure_ts); the estimate sizes the receive buffer only (DRS), never the RTO.
+    //# These TSval values are echoed in TSecr values in the reverse
+    //# direction.  The difference between a received TSecr value and the
+    //# current timestamp clock value provides an RTT measurement.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
+    //= reason=A TSecr already seen is not sampled again: during one-way data flow it repeats across segments sent before the next local segment, and timing those would add the peer's sending time.
+    //# When timestamps are used, every segment that is received will contain
+    //# a TSecr value.  However, these values cannot all be used to update
+    //# the measured RTT.
+    #[inline(never)]
+    fn rcv_rtt_measure_ts(&mut self, echo: u32, payload: usize) {
+        if echo == self.rcv_rtt_last_tsecr {
+            return;
+        }
+        self.rcv_rtt_last_tsecr = echo;
+        if payload < usize::from(self.received_mss.value(self.receive_mss())) {
+            return;
+        }
+        let delta = self.timestamp_value(self.now).wrapping_sub(echo);
+        // tcp_rtt_tsopt_us: a zero delta in milliseconds is no sample.
+        let us = match self.config.timestamp_granularity {
+            TimestampGranularity::Milliseconds if delta < i32::MAX as u32 / 1000 => delta * 1000,
+            TimestampGranularity::Microseconds if delta <= i32::MAX as u32 => delta,
+            _ => 0,
+        };
+        if us != 0 {
+            self.rcv_rtt_update(us, false);
+        }
+    }
+
+    // Linux's tcp_rcv_space_adjust, after a read: once a receiver RTT has
+    // passed since the measure began, the bytes read in it, less those
+    // still unread, and if they exceed the most read in one RTT so far the
+    // receive ring size DRS asks for (`rcvbuf_grow`), when larger than the
+    // ring. Reads the connection's clock as of its last event, as Linux
+    // reads the cached tcp_mstamp.
+    #[inline(never)]
+    pub(crate) fn receive_space_adjust(&mut self) -> Option<usize> {
+        if !self.receive_tuned || self.rcv_rtt_us8 == 0 {
+            return None;
+        }
+        let elapsed = self
+            .config
+            .timebase
+            .us_from_ticks(self.now.saturating_sub(self.rcvq_time));
+        if elapsed < u64::from(self.rcv_rtt_us8 >> 3) {
+            return None;
+        }
+        let copied = (self.received_read - self.rcvq_seq) as i64 - self.receive.readable() as i64;
+        let target = if copied > self.rcvq_space as i64 {
+            self.rcvbuf_grow(copied as usize)
+        } else {
+            None
+        };
+        self.rcvq_seq = self.received_read;
+        self.rcvq_time = self.now;
+        target
+    }
+
+    // Linux's tcp_rcvbuf_grow for `copied` bytes read in one RTT: a window
+    // of twice them (DRS lags an RTT), plus room for the sender to double
+    // its rate as in slow start, in proportion to the growth since the last
+    // measure; below 1 ms (tcp_rcvbuf_low_rtt) only rtt/1 ms of the window
+    // more, so short paths do not inflate the buffer; plus the span of the
+    // data held beyond a gap. At most receive_capacity_max. The window is
+    // the ring: ntcp's receive ring holds payload only, where Linux's
+    // rcvbuf counts skb truesize (tcp_space_from_win).
+    fn rcvbuf_grow(&mut self, copied: usize) -> Option<usize> {
+        let old = self.rcvq_space.max(1) as u64;
+        self.rcvq_space = copied;
+        let copied = copied as u64;
+        let mut window = 2 * copied;
+        let rtt = u64::from(self.rcv_rtt_us8 >> 3);
+        window += if rtt < 1000 {
+            window * rtt / 1000
+        } else {
+            2 * window * copied.saturating_sub(old) / old
+        };
+        if let Some(end) = self.receive.out_of_order_end() {
+            window += u64::from(end.distance_from(self.receive.next()));
+        }
+        let target = window.min(self.receive_max as u64) as usize;
+        (target > self.config.receive_capacity).then_some(target)
+    }
+
+    // The peak charge of growing the receive ring to `target` bytes: the
+    // old storage stays live while the new is filled.
+    pub(crate) fn receive_growth_peak(&self, target: usize) -> Option<usize> {
+        self.resize_peak_charge(target)
+    }
+
+    // Grows the receive ring in place to `target` bytes (card B's grow,
+    // whose failure leaves it as it was) and offers the new room at once if
+    // it is worth an update: Linux raises sk_rcvbuf and window_clamp, and
+    // the next ACK advertises more.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= reason=Autotuning only raises receive_capacity and the ring that backs it; it never lowers either, so no right edge already offered moves left.
+    //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
+    //# edge to the left (SHLD-14).
+    pub(crate) fn grow_receive(&mut self, target: usize) -> Result<(), ()> {
+        self.receive.grow(target)?;
+        self.config.receive_capacity = target;
+        self.read_window_update();
+        Ok(())
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6
@@ -7938,6 +8144,15 @@ impl Connection {
         ) {
             return;
         }
+        // As Linux's tcp_rcv_established, every segment with a new echo,
+        // before its text; only a tuned receive direction uses the estimate.
+        if self.receive_tuned
+            && self.state == State::Established
+            && self.timestamps
+            && let Some((_, echo)) = segment.options.timestamps
+        {
+            self.rcv_rtt_measure_ts(echo, payload.len());
+        }
         let next = self.receive.next();
         let window = self.receive_window();
         if flags & URG != 0 && !self.read_closed {
@@ -7997,6 +8212,10 @@ impl Connection {
             flags & PSH != 0 && skip + count == payload.len(),
         );
         self.receive_used += outcome.new_bytes;
+        // In-sequence data, as Linux's tcp_event_data_recv.
+        if self.receive_tuned && offset == 0 && count != 0 && outcome.advanced {
+            self.rcv_rtt_measure();
+        }
         if outcome.new_bytes != 0 {
             self.last_data_received = self.now;
             let offer = self.receive_mss();

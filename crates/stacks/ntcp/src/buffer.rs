@@ -1061,10 +1061,6 @@ impl ReceiveBuffer {
     // failure every slot and all state are as they were: a bitmap or payload
     // that grew before another failed keeps its storage, which storage_bytes
     // counts and the next growth reuses.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "buffer autotuning will grow rings at read")
-    )]
     pub(crate) fn grow(&mut self, capacity: usize) -> Result<(), ()> {
         let old = self.data.len();
         if capacity <= old {
@@ -1168,6 +1164,22 @@ impl ReceiveBuffer {
 
     pub(crate) fn readable(&self) -> usize {
         self.contiguous_len
+    }
+
+    // The sequence after the last byte held beyond a gap, if any: the end
+    // of Linux's out-of-order queue (ooo_last_skb). One summary walk from
+    // the ring's end, however far that byte is from next().
+    pub(crate) fn out_of_order_end(&self) -> Option<Seq> {
+        if self.occupied == self.contiguous_len {
+            return None;
+        }
+        let start = self.contiguous_len;
+        let [first, second] = self.ranges(start, self.data.len() - start);
+        let offset = match self.find_slot_back(second.clone(), true) {
+            Some(index) => start + first.len() + index - second.start,
+            None => start + self.find_slot_back(first.clone(), true)? - first.start,
+        };
+        Some(self.read_base.wrapping_add(offset as u32 + 1))
     }
 
     pub(crate) fn has_data(&self) -> bool {
