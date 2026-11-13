@@ -1152,10 +1152,20 @@ impl Endpoint {
     // SipHash-1-3 of the digest's tuple encoding, not an HMAC. Its key is
     // secret-derived and the hash never leaves the endpoint: hostile tuples
     // cannot be chosen to collide, and the probe budget bounds the rest.
+    // The encoding is gathered on the stack and written once: SipHash
+    // streams its input, so one write of the concatenation hashes exactly
+    // what a write per field did, without a call per field.
     fn hash(&self, tuple: ScopedTuple) -> usize {
         use core::hash::Hasher;
+        // Two family-tagged IPv6 addresses with ports, then a zone.
+        let mut encoded = [0; 2 * (1 + 16 + 2) + 4 + 24];
+        let mut len = 0;
+        encode_tuple(tuple, |bytes| {
+            encoded[len..len + bytes.len()].copy_from_slice(bytes);
+            len += bytes.len();
+        });
         let mut hash = siphasher::sip::SipHasher13::new_with_key(&self.lookup_key);
-        encode_tuple(tuple, |bytes| hash.write(bytes));
+        hash.write(&encoded[..len]);
         hash.finish() as usize
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1

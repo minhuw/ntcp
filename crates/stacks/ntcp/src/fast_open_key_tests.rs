@@ -365,3 +365,59 @@ fn scoped_tuple_digests_separate_zones_and_keep_unscoped_bytes() {
     assert_ne!(hashes[0], hashes[2]);
     assert_ne!(hashes[1], hashes[2]);
 }
+
+// The lookup hash writes the tuple encoding once; SipHash streams, so it is
+// the hash of a write per encoded field, for either family, mixed families'
+// ports and every zone.
+#[test]
+fn lookup_hash_equals_a_write_per_encoded_field() {
+    use core::hash::Hasher;
+    let endpoint = Endpoint::new(EndpointConfig::default(), [9; 32], 0, |_| true).unwrap();
+    let per_field = |scoped: crate::ScopedTuple| {
+        let mut hash = siphasher::sip::SipHasher13::new_with_key(&endpoint.lookup_key);
+        encode_tuple(scoped, |bytes| hash.write(bytes));
+        hash.finish() as usize
+    };
+    let mut state = 0x9e37_79b9_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut checked = 0;
+    for round in 0..3000 {
+        let (a, b, c, d) = (next(), next(), next(), next());
+        let port = |x: u32| (x >> 16) as u16;
+        let tuple = if round % 2 == 0 {
+            Tuple {
+                local: SocketAddr::new(IpAddr::V4(a.into()), port(c)),
+                remote: SocketAddr::new(IpAddr::V4(b.into()), port(d)),
+            }
+        } else {
+            let v6 = |x: u32, y: u32| {
+                let mut octets = [0; 16];
+                octets[..4].copy_from_slice(&x.to_be_bytes());
+                octets[12..].copy_from_slice(&y.to_be_bytes());
+                IpAddr::V6(octets.into())
+            };
+            Tuple {
+                local: SocketAddr::new(v6(a, b), port(c)),
+                remote: SocketAddr::new(v6(b, a), port(d)),
+            }
+        };
+        let scoped = crate::ScopedTuple::unscoped(tuple);
+        assert_eq!(endpoint.hash(scoped), per_field(scoped));
+        checked += 1;
+    }
+    let tuple = Tuple {
+        local: "[fe80::1]:1000".parse().unwrap(),
+        remote: "[fe80::2]:8080".parse().unwrap(),
+    };
+    for zone in crate::fast_open_policy_tests::zones() {
+        let scoped = crate::ScopedTuple::new(tuple, Some(zone)).unwrap();
+        assert_eq!(endpoint.hash(scoped), per_field(scoped));
+        checked += 1;
+    }
+    assert_eq!(checked, 3003);
+}
