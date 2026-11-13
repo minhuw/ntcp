@@ -1054,6 +1054,12 @@ impl Reassembly {
         }
     }
 
+    /// Whether any assembly or marker is held: what `expire` has to look
+    /// at.
+    pub fn holds(&self) -> bool {
+        self.occupied != 0
+    }
+
     /// The earliest deadline of any assembly or marker, for embeddings that
     /// schedule their next service pass.
     pub fn next_deadline(&self) -> Option<Instant> {

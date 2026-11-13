@@ -1574,13 +1574,21 @@ impl Host {
         now: Instant,
     ) -> Result<ServiceReport, Error> {
         self.collect(endpoint)?;
-        self.expire_reassembly(now);
-        self.service_adjunct(now);
+        // Each pass runs only when its producer left it work: an assembly
+        // held, an adjunct path table, a binding listed.
+        if self.reassembly.holds() {
+            self.expire_reassembly(now);
+        }
+        if self.adjunct.enabled() {
+            self.service_adjunct(now);
+        }
         let mut report = ServiceReport::default();
         // Connections created after an owner aging change adopt it here,
         // before their first output selection.
         let mut next = 0;
-        while let Some(index) = self.unaged.next(next) {
+        while self.unaged.len() != 0
+            && let Some(index) = self.unaged.next(next)
+        {
             next = index + 1;
             let owner = self.bindings[index].as_ref().and_then(|b| b.owner).unwrap();
             match self.apply_search_aging(endpoint, now, owner) {
@@ -1590,7 +1598,9 @@ impl Host {
         }
         self.take_progress(endpoint);
         let mut next = 0;
-        while let Some(index) = self.unpublished.next(next) {
+        while self.unpublished.len() != 0
+            && let Some(index) = self.unpublished.next(next)
+        {
             next = index + 1;
             let owner = self.bindings[index].as_ref().and_then(|b| b.owner).unwrap();
             match self.publish_results(endpoint, now, owner, &mut report) {
@@ -1759,30 +1769,33 @@ impl Host {
         // each the one its slot names, or, past what the endpoint keeps of
         // them, of every connection gone.
         let reclaimed = endpoint.reclaimed();
-        if let Some(gone) = endpoint.reclaimed_since(self.reclaimed) {
-            for id in gone {
-                #[cfg(test)]
-                {
-                    self.collect_visits += 1;
+        // Nothing reclaimed since the last collection frees nothing.
+        if reclaimed != self.reclaimed {
+            if let Some(gone) = endpoint.reclaimed_since(self.reclaimed) {
+                for id in gone {
+                    #[cfg(test)]
+                    {
+                        self.collect_visits += 1;
+                    }
+                    if let Some(index) = self.owner_bindings[id.index()]
+                        && self.bindings[index].as_ref().unwrap().owner == Some(id)
+                    {
+                        self.free_binding(index)?;
+                    }
                 }
-                if let Some(index) = self.owner_bindings[id.index()]
-                    && self.bindings[index].as_ref().unwrap().owner == Some(id)
-                {
-                    self.free_binding(index)?;
-                }
-            }
-        } else {
-            let mut next = 0;
-            while let Some(index) = self.live_bindings.next(next) {
-                next = index + 1;
-                #[cfg(test)]
-                {
-                    self.collect_visits += 1;
-                }
-                if let Some(id) = self.bindings[index].as_ref().and_then(|b| b.owner)
-                    && !endpoint.connection_exists(id)
-                {
-                    self.free_binding(index)?;
+            } else {
+                let mut next = 0;
+                while let Some(index) = self.live_bindings.next(next) {
+                    next = index + 1;
+                    #[cfg(test)]
+                    {
+                        self.collect_visits += 1;
+                    }
+                    if let Some(id) = self.bindings[index].as_ref().and_then(|b| b.owner)
+                        && !endpoint.connection_exists(id)
+                    {
+                        self.free_binding(index)?;
+                    }
                 }
             }
         }
@@ -1796,7 +1809,9 @@ impl Host {
         }
         debug_assert!(lists_free(&self.free_bindings, &self.bindings));
         self.reclaimed = reclaimed;
-        self.maintain_ledger(endpoint);
+        if self.ledger.due(self.now) {
+            self.maintain_ledger(endpoint);
+        }
         Ok(())
     }
 
