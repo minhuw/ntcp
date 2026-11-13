@@ -336,9 +336,6 @@ UPSTREAM_OPTION_AUDIT = {
     'blocking/blocking-read.pkt': {
         'immediate-ack': 'Original scripted receive ACK precedes application read; explicit immediate ACK compatibility, not Linux quickACK emulation.',
     },
-    'cubic/cubic-rto-ss-ca-cwnd-bump.pkt': {
-        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
-    },
     'cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt': {
         'ecn': 'Exact audited inline tcp_ecn setup enables ECN for the active case or this passive listener only; this is not global Linux mode2 active-open semantics.',
     },
@@ -455,21 +452,6 @@ UPSTREAM_OPTION_AUDIT = {
     'notsent_lowat/notsent-lowat-sysctl.pkt': {
         'lowat4000': 'Exact setup sets global tcp_notsent_lowat=4000; raw per-socket zero still means inherit. No skb-accounting equivalence.',
     },
-    'slow_start/slow-start-ack-per-1pkt.pkt': {
-        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
-    },
-    'slow_start/slow-start-ack-per-2pkt.pkt': {
-        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
-    },
-    'slow_start/slow-start-ack-per-4pkt.pkt': {
-        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
-    },
-    'slow_start/slow-start-app-limited-9-packets-out.pkt': {
-        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
-    },
-    'slow_start/slow-start-app-limited.pkt': {
-        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
-    },
     'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt': {
         'budget224m': 'Four client sockets can retain charged storage through this short syscall-error trace; bounded seven-connection budget, not per-socket Linux memory accounting.',
         'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
@@ -493,9 +475,6 @@ for _name in SYN_DATA_ACK_SCRIPTS:
     }
 UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-mss.pkt'] = {
     'budget224m': 'Five client connections retain receive/send/scoreboard/RACK storage across the timed MSS and timestamp-default changes; use the existing bounded seven-connection budget without changing per-socket accounting.',
-}
-UPSTREAM_OPTION_AUDIT['zerocopy/fastopen-client.pkt'] = {
-    'budget128m': 'Two client connections retain charged receive/send/scoreboard/RACK storage across warmup and TIME-WAIT; the existing bounded budget accommodates both without changing per-socket accounting.',
 }
 UPSTREAM_OPTION_AUDIT['fastopen/client/synack-data.pkt'] = {
     'no-timestamps': 'Original setup disables timestamps until the exact timed event enables negotiation for future connections; existing connections and TFO cache remain unchanged.',

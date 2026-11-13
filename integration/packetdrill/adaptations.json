@@ -3060,7 +3060,7 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream,local=192.168.0.1,budget128m",
+      "adapter_flags": "upstream,local=192.168.0.1",
       "source_sha256": "edd82fda961653e95c57eba7db52da66eaa69bfb6ea7d0c0dc5d2da95c150d02",
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
@@ -3081,9 +3081,7 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [
-            "budget128m"
-          ],
+          "options": [],
           "fast_open_client_policy": "RequireCookie",
           "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
@@ -3101,7 +3099,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 134217728,
+          "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -3123,12 +3121,9 @@
         "claim": "Setup-only mapping to common upstream configuration plus individually audited options; Linux behavioral equivalence and passing assertions are not claimed.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities.",
-          "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
+          "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities."
         ],
-        "option_reasons": {
-          "budget128m": "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
-        }
+        "option_reasons": {}
       },
       "embedded_tcp_info": true
     },
@@ -3295,7 +3290,7 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1,budget128m",
+      "adapter_flags": "upstream,local=192.168.0.1",
       "source_sha256": "e9dacd1681931bf596488922f3c8e2a01ef54b61aa2fd7475b04c468bc34705f",
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`\n",
@@ -3316,9 +3311,7 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [
-            "budget128m"
-          ],
+          "options": [],
           "fast_open_client_policy": "RequireCookie",
           "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
@@ -3336,7 +3329,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 134217728,
+          "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -3359,12 +3352,9 @@
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
           "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities.",
-          "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.",
           "For these three10-to20-MSS slow-start traces, tcp_tso_win_divisor=100 makes the TSO defer threshold at most200 bytes, below a1000-byte full segment. The raw scalar backend has no TSO accumulation deferral. This maps the setup effect for these exact fixtures, not Linux TSO/GSO implementation or general sysctl behavior. No host command executes."
         ],
-        "option_reasons": {
-          "budget128m": "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
-        }
+        "option_reasons": {}
       },
       "audited_shell_commands": [
         {
@@ -3525,7 +3515,7 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1,budget128m",
+      "adapter_flags": "upstream,local=192.168.0.1",
       "source_sha256": "d6dc649547109b44e4d8262ff48f6af28e81a31639b871c52d551302006cb571",
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`\n",
@@ -3546,9 +3536,7 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [
-            "budget128m"
-          ],
+          "options": [],
           "fast_open_client_policy": "RequireCookie",
           "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
@@ -3566,7 +3554,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 134217728,
+          "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -3589,12 +3577,9 @@
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
           "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities.",
-          "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.",
           "For these three10-to20-MSS slow-start traces, tcp_tso_win_divisor=100 makes the TSO defer threshold at most200 bytes, below a1000-byte full segment. The raw scalar backend has no TSO accumulation deferral. This maps the setup effect for these exact fixtures, not Linux TSO/GSO implementation or general sysctl behavior. No host command executes."
         ],
-        "option_reasons": {
-          "budget128m": "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
-        }
+        "option_reasons": {}
       },
       "audited_shell_commands": [
         {
@@ -3611,7 +3596,7 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1,budget128m",
+      "adapter_flags": "upstream,local=192.168.0.1",
       "source_sha256": "5acfc60f7682a1c51601e084090f8b21807d3d0c1f2154b1798f51f951386f06",
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`\n",
@@ -3632,9 +3617,7 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [
-            "budget128m"
-          ],
+          "options": [],
           "fast_open_client_policy": "RequireCookie",
           "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
@@ -3652,7 +3635,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 134217728,
+          "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -3675,12 +3658,9 @@
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
           "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities.",
-          "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.",
           "For these three10-to20-MSS slow-start traces, tcp_tso_win_divisor=100 makes the TSO defer threshold at most200 bytes, below a1000-byte full segment. The raw scalar backend has no TSO accumulation deferral. This maps the setup effect for these exact fixtures, not Linux TSO/GSO implementation or general sysctl behavior. No host command executes."
         ],
-        "option_reasons": {
-          "budget128m": "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
-        }
+        "option_reasons": {}
       },
       "audited_shell_commands": [
         {
@@ -3891,7 +3871,7 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream,local=192.168.0.1,budget128m",
+      "adapter_flags": "upstream,local=192.168.0.1",
       "source_sha256": "278d947ade76d63bf8f1fbb8ee3374e7815b05f4e7fdb17f8391edd9f0c4fbc9",
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
@@ -3912,9 +3892,7 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [
-            "budget128m"
-          ],
+          "options": [],
           "fast_open_client_policy": "RequireCookie",
           "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
@@ -3932,7 +3910,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 134217728,
+          "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -3954,12 +3932,9 @@
         "claim": "Setup-only mapping to common upstream configuration plus individually audited options; Linux behavioral equivalence and passing assertions are not claimed.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities.",
-          "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
+          "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities."
         ],
-        "option_reasons": {
-          "budget128m": "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
-        }
+        "option_reasons": {}
       },
       "embedded_tcp_info": true
     },
@@ -3968,7 +3943,7 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream,local=192.168.0.1,budget128m",
+      "adapter_flags": "upstream,local=192.168.0.1",
       "source_sha256": "7c486a28882c3c2748e1b9c5771052b2c947da38032438e5214249f767b9c7a0",
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
@@ -3989,9 +3964,7 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [
-            "budget128m"
-          ],
+          "options": [],
           "fast_open_client_policy": "RequireCookie",
           "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
@@ -4009,7 +3982,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 134217728,
+          "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -4031,12 +4004,9 @@
         "claim": "Setup-only mapping to common upstream configuration plus individually audited options; Linux behavioral equivalence and passing assertions are not claimed.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities.",
-          "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
+          "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities."
         ],
-        "option_reasons": {
-          "budget128m": "Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change."
-        }
+        "option_reasons": {}
       },
       "embedded_tcp_info": true
     },
@@ -13864,7 +13834,7 @@
       "command_line": "`../../common/defaults.sh`\n",
       "command_sha256": "6c75c757b0ac9311ba3458f38b676a7841890410981ecdacfcb03ef7315546bf",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream,local=192.168.0.1,budget128m",
+      "adapter_flags": "upstream,local=192.168.0.1",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "zerocopy",
@@ -13896,9 +13866,7 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [
-            "budget128m"
-          ],
+          "options": [],
           "fast_open_client_policy": "RequireCookie",
           "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
@@ -13916,7 +13884,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 134217728,
+          "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -13940,12 +13908,9 @@
         "claim": "Exact setup and timed process-local timestamp-default mapping; original packet/syscall/completion assertions are preserved.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The exact timed tcp_timestamps=0 event affects future negotiation while preserving warmup TFO cookie/MSS state. Initial MSG_FASTOPEN|MSG_ZEROCOPY uses real copied-byte admission and the shared bounded copied-completion mechanism.",
-          "Two client connections retain charged receive/send/scoreboard/RACK storage across warmup and TIME-WAIT; the existing bounded budget accommodates both without changing per-socket accounting."
+          "The exact timed tcp_timestamps=0 event affects future negotiation while preserving warmup TFO cookie/MSS state. Initial MSG_FASTOPEN|MSG_ZEROCOPY uses real copied-byte admission and the shared bounded copied-completion mechanism."
         ],
-        "option_reasons": {
-          "budget128m": "Two client connections retain charged receive/send/scoreboard/RACK storage across warmup and TIME-WAIT; the existing bounded budget accommodates both without changing per-socket accounting."
-        }
+        "option_reasons": {}
       },
       "timestamp_control": true,
       "timestamp_event_sha256": "09049dda5e717f74aade790df31d7163d00b46bd12cf724931461172815262d9"

@@ -821,8 +821,12 @@ class AdaptationChecks(unittest.TestCase):
         large = {'cubic/cubic-rto-ss-ca-cwnd-bump.pkt',
                  'slow_start/slow-start-app-limited-9-packets-out.pkt',
                  'slow_start/slow-start-app-limited.pkt'} | SLOW_START_ACK_SCRIPTS
-        self.assertEqual({name for name, entry in self.manifest['scripts'].items()
-                          if 'budget128m' in entry['adapter_flags'].split(',')}, large)
+        # Their SO_SNDBUF=200000 needed a larger budget only while RACK held a
+        # ledger entry per send byte; per-segment ledgers fit the default.
+        flagged = {name for name, entry in self.manifest['scripts'].items()
+                   if 'budget128m' in entry['adapter_flags'].split(',')}
+        self.assertTrue(flagged.isdisjoint(large | {'zerocopy/fastopen-client.pkt'}))
+        self.assertTrue(flagged <= CUSTOM_TFO_SCRIPTS)
         for name, entry in self.manifest['scripts'].items():
             settings = entry['mapping']['ntcp_settings']
             self.assertEqual(settings['endpoint_max_buffer_bytes'],
@@ -874,12 +878,9 @@ class AdaptationChecks(unittest.TestCase):
         reasons = {name: entry['mapping']['option_reasons']['budget128m']
                    for name, entry in manifest['scripts'].items()
                    if 'budget128m' in entry['mapping']['option_reasons']}
-        retained = reasons.pop('zerocopy/fastopen-client.pkt')
-        self.assertIn('Two client connections retain', retained)
         for name in CUSTOM_TFO_SCRIPTS:
             self.assertIn('TIME_WAIT storage', reasons.pop(name))
-        self.assertEqual(len(reasons), 6)
-        self.assertTrue(all('SO_SNDBUF=200000' in reason and 'staged' in reason for reason in reasons.values()))
+        self.assertEqual(reasons, {})
         for entry in manifest['scripts'].values():
             if entry.get('blocked_reasons'):
                 self.assertTrue(any('Unavailable:' in command['semantic_mapping']
@@ -1332,8 +1333,8 @@ class PublishedSelectionChecks(unittest.TestCase):
                     self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
                 self.assertEqual((self.directory / name).read_bytes(), source)
                 if name in DEFAULTS_ONLY_CUBIC | SLOW_START_ACK_SCRIPTS and b'SO_SNDBUF' in source:
-                    self.assertIn('budget128m', entry['mapping']['option_reasons'])
-                    self.assertEqual(entry['mapping']['ntcp_settings']['endpoint_max_buffer_bytes'], 128 * 1024 * 1024)
+                    self.assertNotIn('budget128m', entry['mapping']['option_reasons'])
+                    self.assertEqual(entry['mapping']['ntcp_settings']['endpoint_max_buffer_bytes'], 32 * 1024 * 1024)
 
     def test_socket43_inventory_hashes_and_assertions(self):
         counts = {'blocking': 4, 'close': 3, 'shutdown': 6, 'ioctl': 1,
