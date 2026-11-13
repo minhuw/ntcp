@@ -141,6 +141,15 @@ impl Default for PacingConfig {
 pub struct ConnectionConfig {
     pub send_capacity: usize,
     pub receive_capacity: usize,
+    // The send limit's floor and ceiling, Linux's tcp_wmem[0] and
+    // tcp_wmem[2] (`send_capacity` is tcp_wmem[1]). The direction is tuned
+    // while `send_capacity_max` exceeds `send_capacity` and no setter locked
+    // it (`Endpoint::set_buffer_capacities`, SOCK_SNDBUF_LOCK): memory
+    // pressure refuses its growth and moderates its limit, down to
+    // `send_capacity_min` (or `send_capacity`, the lower). By default max
+    // is `send_capacity`'s default, so that size is not tuned.
+    pub send_capacity_min: usize,
+    pub send_capacity_max: usize,
     pub mss: u16,
     // Application maximum segment size; independent of path MTU and storage ceiling.
     pub user_mss: Option<u16>,
@@ -307,6 +316,8 @@ impl ConnectionConfig {
             || !(1..=60_000_000).contains(&self.rto_min_us)
             || self.send_capacity == 0
             || self.send_capacity >= 1 << 30
+            || self.send_capacity_min == 0
+            || self.send_capacity_max >= 1 << 30
             || self.receive_capacity == 0
             || self.receive_capacity > (65535usize << 14)
             || self.receive_ip_payload_limit < 21
@@ -411,6 +422,9 @@ impl Default for ConnectionConfig {
         Self {
             send_capacity: 65536,
             receive_capacity: 65536,
+            // Linux's tcp_wmem[0], PAGE_SIZE.
+            send_capacity_min: 4096,
+            send_capacity_max: 65536,
             mss: 1460,
             user_mss: None,
             advertised_mss: None,
@@ -980,6 +994,11 @@ pub(crate) struct Connection {
     // writes take only what the allocated storage holds, and the connection
     // is not writable beyond it.
     send_memory_wanted: Option<usize>,
+    // Whether memory pressure applies to the send direction
+    // (`ConnectionConfig::send_capacity_max`), and the floor it moderates
+    // the send limit to.
+    send_tuned: bool,
+    send_min: usize,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1057,6 +1076,8 @@ impl Connection {
                 .min((min_mtu(false) - 40) as u16);
         }
         let send = SendBuffer::unallocated(config.send_capacity);
+        let send_tuned = config.send_capacity_max > config.send_capacity;
+        let send_min = config.send_capacity_min.min(config.send_capacity);
         let mut scratch = Vec::new();
         scratch
             .try_reserve_exact(config.mss as usize)
@@ -1337,6 +1358,8 @@ impl Connection {
             transport_ticks: [0; 3],
             send_backpressured: false,
             send_memory_wanted: None,
+            send_tuned,
+            send_min,
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -1545,6 +1568,8 @@ impl Connection {
         }
         self.send.set_limit(send);
         self.config.send_capacity = send;
+        // As SO_SNDBUF sets SOCK_SNDBUF_LOCK: no longer tuned.
+        self.send_tuned = false;
         if self.send_space_remaining() != 0 {
             self.send_backpressured = false;
         }
@@ -5094,6 +5119,35 @@ impl Connection {
         }
     }
 
+    pub(crate) fn send_tuned(&self) -> bool {
+        self.send_tuned
+    }
+
+    // Queued payload below the send floor: as Linux lets a socket whose
+    // sk_wmem_queued is below tcp_wmem[0] allocate under pressure
+    // (__sk_mem_raise_allocated), so that RFC 7323 still works.
+    pub(crate) fn send_below_min(&self) -> bool {
+        self.send.len() < self.send_min
+    }
+
+    // A tuned send limit falls to what is queued, but not below its floor:
+    // Linux's sk_stream_moderate_sndbuf, applied where an allocation was
+    // suppressed. The write being refused still takes what the storage
+    // already allocated holds, as Linux then forces the allocation in
+    // flight through for a socket at its new sndbuf, so the limit keeps
+    // those bytes too. It allocates and frees nothing; the next ACKs that
+    // free room let writes in within it.
+    pub(crate) fn moderate_send(&mut self) {
+        if !self.send_tuned {
+            return;
+        }
+        let limit = (self.send.len() + self.allocated_send_room()).max(self.send_min);
+        if limit < self.config.send_capacity {
+            self.config.send_capacity = limit;
+            self.send.set_limit(limit);
+        }
+    }
+
     // A write found its storage growth refused for `wanted` bytes.
     pub(crate) fn throttle_send(&mut self, wanted: usize) {
         self.send_memory_wanted = Some(wanted);
@@ -5182,6 +5236,19 @@ impl Connection {
         max_charge: usize,
         timestamp: Option<TxTimestampRequest>,
     ) -> Result<bool, Error> {
+        self.prepare_send_storage(bytes, lowat, max_charge, timestamp)
+            .map(|refused| refused.is_some())
+    }
+
+    // As prepare_send_metadata; a refused growth gives the bytes the whole
+    // write's growth would have charged.
+    pub(crate) fn prepare_send_storage(
+        &mut self,
+        bytes: usize,
+        lowat: Option<u32>,
+        max_charge: usize,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> Result<Option<usize>, Error> {
         if self.shutdown
             || !matches!(
                 self.state,
@@ -5191,7 +5258,7 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         if bytes == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(request) = timestamp {
             self.tx_timestamps.admit(request)?;
@@ -5201,12 +5268,12 @@ impl Connection {
         let space = self.send_space().saturating_sub(self.send.len());
         let accepted = bytes.min(self.admission_room(lowat, space));
         if accepted == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let live = self.send.len().saturating_add(accepted);
         let Err(wanted) = self.grow_send_storage(live, max_charge) else {
             self.send_memory_wanted = None;
-            return Ok(false);
+            return Ok(None);
         };
         // As tcp_sendmsg copies skb by skb until sk_wmem_schedule refuses,
         // grow for the longest prefix the budget takes, halving the bytes
@@ -5232,7 +5299,7 @@ impl Connection {
         let held = self.send.len() + self.allocated_send_room();
         let next = self.send_growth_cost(held + 1).unwrap_or(wanted);
         self.throttle_send(next.min(wanted));
-        Ok(true)
+        Ok(Some(wanted))
     }
 
     // The peak bytes growing the send ring and both ledgers to hold `live`

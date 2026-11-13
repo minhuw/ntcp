@@ -80,6 +80,15 @@ impl Budget {
         self.charged <= memory.low && self.leave()
     }
 
+    // An allocation tried would have brought the charge to `total`: past
+    // `memory.pressure` it enters pressure whether or not it is refused, as
+    // __sk_mem_raise_allocated adds before it checks.
+    pub(crate) fn attempted(&mut self, total: usize, now: Instant, memory: BufferMemory) {
+        if total > memory.pressure {
+            self.enter(now);
+        }
+    }
+
     fn enter(&mut self, now: Instant) {
         if self.pressure_since.is_none() {
             self.pressure_since = Some(now);

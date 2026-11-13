@@ -585,8 +585,11 @@ pub struct Endpoint {
     isn_clock: u32,
     last_isn_time: Instant,
     slots: Vec<Option<Slot>>,
-    // The occupied `slots`, for counts over live connections.
+    // The occupied `slots`, for counts over live connections, and their
+    // number (Linux's sockets_allocated, for the fair share under memory
+    // pressure).
     occupied: ReadyQueue,
+    live: usize,
     generations: Vec<u64>,
     free: Vec<usize>,
     listeners: Vec<Option<Listener>>,
@@ -805,6 +808,7 @@ impl Endpoint {
             passive_errors,
             tuples: TupleTable::new(count)?,
             occupied: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
+            live: 0,
             output: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             advice: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
             events: ReadyQueue::new(event_capacity).map_err(|_| Error::NoMemory)?,
@@ -1703,6 +1707,12 @@ impl Endpoint {
         let scoped = self.scoped(tuple);
         let mut connection_config = self.config.connection.clone();
         connection_config.timestamps = self.new_connection_timestamps();
+        // A send size given for this open or its listener is locked, as a
+        // size set with SO_SNDBUF before connect() or listen() is
+        // (SOCK_SNDBUF_LOCK): pressure leaves it alone.
+        if capacities.0 != connection_config.send_capacity {
+            connection_config.send_capacity_max = capacities.0;
+        }
         connection_config.send_capacity = capacities.0;
         connection_config.receive_capacity = capacities.1;
         connection_config.user_mss = options.user_mss;
@@ -1897,6 +1907,7 @@ impl Endpoint {
         }
         self.free.pop();
         self.occupied.push(index);
+        self.live += 1;
         let fast_open_owner = if connection.fast_open_early {
             listener
         } else {
@@ -2946,6 +2957,7 @@ impl Endpoint {
         debug_assert!(!self.is_output_reserved(id));
         let slot = self.slots[index].take().unwrap();
         self.occupied.remove(index);
+        self.live -= 1;
         let tuple = slot.connection.scoped_tuple();
         if slot.mapped {
             self.tuples.remove(self.hash(tuple), tuple, index);
@@ -4069,22 +4081,56 @@ impl Endpoint {
         timestamp: Option<TxTimestampRequest>,
     ) -> Result<(), EndpointError> {
         self.reject_if_output_reserved(id)?;
-        let own_charge = self.slot(id)?.connection.buffer_charge();
-        let available = self.buffer_room().saturating_add(own_charge);
+        let connection = &self.slot(id)?.connection;
+        let own_charge = connection.buffer_charge();
+        let available = self
+            .send_growth_room(connection, own_charge)
+            .saturating_add(own_charge);
+        let before = self.budget.charged();
         let refused = self
             .slot_mut(id)?
             .connection
-            .prepare_send_metadata(len, lowat, available, timestamp);
+            .prepare_send_storage(len, lowat, available, timestamp);
         // Charged even when refused: a send ring that grew before the other
         // failed keeps its storage.
         let charge = self.slot(id)?.connection.buffer_charge();
         self.recharge(own_charge, charge);
-        if refused? {
+        if let Some(wanted) = refused? {
+            // As __sk_mem_raise_allocated, the allocation tried enters
+            // pressure if it passes the threshold, refused or not, and a
+            // suppressed send allocation moderates the send limit.
+            let memory = self.config.buffer_memory();
+            self.budget
+                .attempted(before.saturating_add(wanted), self.now, memory);
+            if self.budget.under_pressure() {
+                self.slot_mut(id)?.connection.moderate_send();
+            }
             self.memory_throttled(id.slot);
         } else if !self.slot(id)?.connection.send_memory_throttled() {
             self.memory_waiters.remove(id.slot);
         }
         Ok(())
+    }
+
+    // What `connection`, charged `charge`, may add to the budget for its send
+    // storage, after Linux's __sk_mem_raise_allocated: what the hard cap
+    // leaves, except that a tuned send direction which holds at least its
+    // floor and its fair share of the cap (charge · live connections ≥ cap)
+    // may not pass the pressure threshold, and under pressure may not grow.
+    // A fixed (untuned) direction is held to the hard cap alone.
+    fn send_growth_room(&self, connection: &Connection, charge: usize) -> usize {
+        let room = self.buffer_room();
+        if !connection.send_tuned() || connection.send_below_min() {
+            return room;
+        }
+        let memory = self.config.buffer_memory();
+        if charge.saturating_mul(self.live) < memory.high {
+            room
+        } else if self.budget.under_pressure() {
+            0
+        } else {
+            room.min(memory.pressure.saturating_sub(self.budget.charged()))
+        }
     }
 
     // A write of the connection at `index` found its storage growth refused.
@@ -4102,6 +4148,8 @@ impl Endpoint {
     // more than is ever free holds up no other: a wake visits the
     // connections it wakes and one more. A woken connection that finds less
     // than it needed is refused again and waits at the end.
+    // Under pressure, a connection whose growth the pressure would refuse
+    // (`send_growth_room`) does not fit: it waits for pressure to end.
     fn wake_memory_waiters(&mut self) {
         let mut room = self.buffer_room();
         loop {
@@ -4110,13 +4158,17 @@ impl Endpoint {
             };
             self.memory_waiters.remove(index);
             // Reclaim takes a connection off the list.
-            let connection = &mut self.slots[index].as_mut().unwrap().connection;
+            let connection = &self.slots[index].as_ref().unwrap().connection;
             let wanted = connection.send_memory_wanted().unwrap_or(0);
-            if wanted > room {
+            let allowed = self
+                .send_growth_room(connection, connection.buffer_charge())
+                .min(room);
+            if wanted > allowed {
                 self.memory_waiters.push(index);
                 break;
             }
             room -= wanted;
+            let connection = &mut self.slots[index].as_mut().unwrap().connection;
             connection.memory_released();
             self.refresh(index);
         }
@@ -8596,5 +8648,240 @@ mod memory_wait_tests {
             assert_eq!(config.validate().is_ok(), valid, "{pressure:?} {low:?}");
             assert_eq!(Endpoint::new(config, [1; 32], 0, |_| true).is_ok(), valid);
         }
+    }
+
+    // A send direction memory pressure applies to: its limit may grow to
+    // 4096 bytes (`send_capacity_max` above `send_capacity`), down to a
+    // 16-byte floor.
+    fn tuned() -> EndpointConfig {
+        let mut config = config();
+        config.connection.send_capacity_max = 4096;
+        config.connection.send_capacity_min = 16;
+        config
+    }
+
+    // Sends `from`'s packets nowhere: its data stays unacknowledged.
+    fn drain(from: &mut Endpoint, now: u64) {
+        loop {
+            let output = from.poll_transmit(now, &mut [0; 2048], 16).unwrap();
+            if !output.more_work {
+                return;
+            }
+        }
+    }
+
+    // The bytes a write took, WouldBlock as none.
+    fn taken(result: Result<usize, EndpointError>) -> usize {
+        match result {
+            Err(EndpointError::Connection(Error::WouldBlock)) => 0,
+            result => result.unwrap(),
+        }
+    }
+
+    // Puts `a` into pressure now: the next charge passes `pressure`.
+    fn enter_pressure(a: &mut Endpoint, pressure: usize, low: usize) {
+        a.config.buffer_pressure_bytes = Some(pressure);
+        a.config.buffer_low_bytes = Some(low);
+        a.charge(1);
+        a.uncharge(1);
+        assert!(a.memory_pressure());
+    }
+
+    // As Linux's __sk_mem_raise_allocated under pressure: a tuned
+    // connection holding its floor and its fair share of the cap grows
+    // nothing, and the refusal moderates its send limit to what it has
+    // queued (sk_stream_moderate_sndbuf); a connection below its fair share
+    // grows, as does one below its floor.
+    #[test]
+    fn pressure_refuses_growth_past_the_fair_share_and_moderates_the_limit() {
+        let mut a = Endpoint::new(tuned(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(tuned(), [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+        let (big, _) = connect(&mut a, &mut b, listener, 40000);
+        let (small, _) = connect(&mut a, &mut b, listener, 40001);
+        assert_eq!(a.write(big, &[1; 200]), Ok(200));
+        assert_eq!(a.write(small, &[2; 20]), Ok(20));
+        let charged = a.buffer_bytes();
+        let big_charge = a.slot(big).unwrap().connection.buffer_charge();
+        // Two connections: the fair share is half the cap, which `big`
+        // holds and `small` does not.
+        a.config.max_buffer_bytes = 2 * big_charge;
+        assert!(charged < a.config.max_buffer_bytes);
+        enter_pressure(&mut a, charged - 1, charged / 2);
+        let room = a.buffer_room();
+        let connection = &a.slot(big).unwrap().connection;
+        assert_eq!(a.send_growth_room(connection, big_charge), 0);
+        writable(&mut a, big);
+        // The write takes what the allocated ledgers hold, if anything.
+        let taken = taken(a.write(big, &[1; 300]));
+        assert!(taken < 300);
+        assert_eq!(a.memory_throttled_writes(), 1);
+        assert_eq!(a.buffer_capacities(big).unwrap().0, 200 + taken);
+        assert_eq!(a.send_admission_room(big, None), Ok(0));
+        assert!(!writable(&mut a, big));
+        // Below its fair share, `small` grows its ledgers.
+        assert_eq!(a.write(small, &[2; 40]), Ok(40));
+        assert_eq!(a.memory_throttled_writes(), 1);
+        assert!(a.buffer_room() < room);
+        assert_eq!(a.buffer_capacities(small).unwrap().0, 1024);
+        // Once the peer acknowledges everything, `big` holds less than its
+        // floor: it may grow again, within its moderated limit.
+        exchange(&mut a, &mut b, 1);
+        let connection = &a.slot(big).unwrap().connection;
+        let progress = connection.send_progress();
+        assert_eq!(progress.queued_end, progress.acknowledged);
+        assert_eq!(
+            a.send_growth_room(connection, connection.buffer_charge()),
+            a.buffer_room()
+        );
+        assert!(writable(&mut a, big));
+        assert_eq!(a.write(big, &[1; 300]), Ok(200 + taken));
+        assert!(a.memory_pressure());
+    }
+
+    // A release that leaves the endpoint in pressure does not wake a writer
+    // pressure refused, whatever room the cap has; the release that ends
+    // pressure does (__sk_mem_reduce_allocated, sk_stream_write_space).
+    #[test]
+    fn the_end_of_pressure_wakes_a_writer_pressure_refused() {
+        // An aborted connection's slot answers for its reset this long.
+        let mut config = tuned();
+        config.connection.time_wait_us = 10;
+        config.connection.send_capacity_min = 1;
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+        // The writer's large receive ring keeps it above its fair share.
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+        let writer = a
+            .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
+            .unwrap();
+        exchange(&mut a, &mut b, 0);
+        b.accept(listener).unwrap();
+        let (first, _) = connect(&mut a, &mut b, listener, 40001);
+        let (second, _) = connect(&mut a, &mut b, listener, 40002);
+        let (_idle, _) = connect(&mut a, &mut b, listener, 40003);
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        assert_eq!(a.write(first, &[2; 200]), Ok(200));
+        assert_eq!(a.write(second, &[3; 200]), Ok(200));
+        drain(&mut a, 1);
+        let charged = a.buffer_bytes();
+        let charge = |a: &Endpoint, id| a.slot(id).unwrap().connection.buffer_charge();
+        let (writer_charge, first_charge, second_charge) =
+            (charge(&a, writer), charge(&a, first), charge(&a, second));
+        // Two connections left still hold the writer to half the cap.
+        a.config.max_buffer_bytes = 2 * writer_charge;
+        assert!(charged < a.config.max_buffer_bytes);
+        enter_pressure(&mut a, charged - 1, charged - first_charge - second_charge);
+        writable(&mut a, writer);
+        // The ledgers hold 16 bytes: the write takes what they hold.
+        assert_eq!(a.write(writer, &[1; 64]), Ok(7));
+        assert_eq!(a.memory_throttled_writes(), 1);
+        assert_eq!(a.buffer_capacities(writer).unwrap().0, 16);
+        assert!(!writable(&mut a, writer));
+        let reclaim = |a: &mut Endpoint, id: ConnectionId, now: u64| {
+            a.abort(id).unwrap();
+            a.release(id).unwrap();
+            drain(a, now);
+            a.on_timeout(now + 10, 64).unwrap();
+            assert!(!a.connection_exists(id));
+        };
+        let waiting = |a: &Endpoint| a.slot(writer).unwrap().connection.send_memory_throttled();
+        assert!(waiting(&a));
+        reclaim(&mut a, first, 2);
+        assert!(a.memory_pressure());
+        assert!(a.buffer_room() >= first_charge);
+        assert!(waiting(&a));
+        assert!(!writable(&mut a, writer));
+        reclaim(&mut a, second, 20);
+        assert!(!a.memory_pressure());
+        assert!(!waiting(&a));
+        // Its moderated limit is full until the peer acknowledges what
+        // `drain` dropped, once the retransmission timer sends it again.
+        assert!(!writable(&mut a, writer));
+        a.on_timeout(5_000_000, 64).unwrap();
+        exchange(&mut a, &mut b, 5_000_000);
+        assert!(writable(&mut a, writer));
+        assert_eq!(a.write(writer, &[1; 64]), Ok(16));
+        assert_eq!(a.memory_throttled_writes(), 1);
+    }
+
+    // A fixed send direction (send_capacity_max at send_capacity) is held
+    // to the hard cap alone: pressure leaves its trace as it was. A tuned
+    // one, which pressure holds back, shows that the comparison sees it.
+    #[test]
+    fn pressure_leaves_a_fixed_configuration_as_it_was() {
+        // The write results, every packet `a` sent and its throttled
+        // writes, for a client among four connections that takes more than
+        // its fair share: under pressure from the start, or only once a
+        // growth passes the cap.
+        #[allow(clippy::type_complexity)]
+        fn transfer(
+            fixed: bool,
+            early: bool,
+        ) -> (Vec<Result<usize, EndpointError>>, Vec<Vec<u8>>, u64) {
+            let mut config = tuned();
+            config.connection.send_capacity_min = 1;
+            if fixed {
+                config.connection.send_capacity_max = config.connection.send_capacity;
+            }
+            let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+            let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+            let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+            let (client, server) = connect(&mut a, &mut b, listener, 40000);
+            for port in 40001..40004 {
+                connect(&mut a, &mut b, listener, port);
+            }
+            // Room to grow a little.
+            assert_eq!(a.write(client, &[1; 9]), Ok(9));
+            a.config.max_buffer_bytes = a.buffer_bytes() + 4096;
+            if early {
+                enter_pressure(&mut a, 1, 0);
+            } else {
+                a.config.buffer_pressure_bytes = Some(a.config.max_buffer_bytes);
+            }
+            let mut results = Vec::new();
+            let mut packets = Vec::new();
+            let data: Vec<u8> = (0..=255).collect();
+            let mut sent = 0;
+            let mut read = 0;
+            for now in 2..200 {
+                if sent < data.len() {
+                    let result = a.write(client, &data[sent..]);
+                    if let Ok(count) = result {
+                        sent += count;
+                    }
+                    results.push(result);
+                }
+                loop {
+                    let mut moved = false;
+                    loop {
+                        let mut bytes = [0; 2048];
+                        let output = a.poll_transmit(now, &mut bytes, 16).unwrap();
+                        if let Some(packet) = output.packet {
+                            packets.push(bytes[..packet.len].to_vec());
+                            b.input(now, packet.ip, &bytes[..packet.len]).unwrap();
+                            moved = true;
+                        }
+                        if !output.more_work {
+                            break;
+                        }
+                    }
+                    if !(flush(&mut b, &mut a, now) | moved) {
+                        break;
+                    }
+                }
+                read += b.read(server, &mut [0; 512]).unwrap_or(0);
+                if read == data.len() + 9 {
+                    break;
+                }
+            }
+            (results, packets, a.memory_throttled_writes())
+        }
+        let late = transfer(true, false);
+        assert!(late.2 > 0);
+        assert_eq!(late.1.iter().map(|p| p.len() - 20).sum::<usize>(), 265);
+        assert_eq!(transfer(true, true), late);
+        assert_ne!(transfer(false, true), transfer(false, false));
     }
 }
