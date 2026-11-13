@@ -476,7 +476,7 @@ unsafe fn epwait(
             ep.regs.get(key).is_some_and(|r| {
                 r.armed
                     && r.generation == *generation
-                    && tokens.values().any(|t| t.id == r.id)
+                    && tokens.holds(r.id)
                     && eligible_bits(r, event.events, *observed) != 0
             })
         });

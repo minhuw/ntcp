@@ -105,14 +105,15 @@ pub fn stop() {
     // The stock host has stopped its syscall thread before plugin free.
     let mut tokens = TOKENS.lock().unwrap_or_else(|e| e.into_inner());
     let _mutation = Mutation::enter();
-    for (&fd, token) in tokens.iter() {
+    for (&fd, token) in tokens.by_fd.iter() {
         if token.matches(fd) {
             unsafe {
                 syscall(SYS_close, fd);
             }
         }
     }
-    tokens.clear();
+    tokens.by_fd.clear();
+    tokens.aliases.clear();
     readiness::stop_packet_backend();
 }
 

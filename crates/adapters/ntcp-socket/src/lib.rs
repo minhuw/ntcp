@@ -89,7 +89,56 @@ fn inherited(fds: &FdTable, fd: i32) -> bool {
 fn reserve_fd(fds: &FdTable, fd: i32) -> Result<usize> {
     fds.reserve(fd)
 }
-static TOKENS: Mutex<BTreeMap<i32, Token>> = Mutex::new(BTreeMap::new());
+static TOKENS: Mutex<Tokens> = Mutex::new(Tokens::new());
+// Managed descriptors by fd number, and each socket's descriptors (its fd
+// aliases) by socket id: the descriptors of a socket an epoll registration
+// or a readiness probe names are found without visiting the others.
+struct Tokens {
+    by_fd: BTreeMap<i32, Token>,
+    aliases: std::collections::BTreeSet<(u64, i32)>,
+}
+impl Tokens {
+    const fn new() -> Self {
+        Self {
+            by_fd: BTreeMap::new(),
+            aliases: std::collections::BTreeSet::new(),
+        }
+    }
+    fn get(&self, fd: &i32) -> Option<&Token> {
+        self.by_fd.get(fd)
+    }
+    // A token's socket never changes in place: only its slot.
+    fn get_mut(&mut self, fd: &i32) -> Option<&mut Token> {
+        self.by_fd.get_mut(fd)
+    }
+    fn insert(&mut self, fd: i32, t: Token) -> Option<Token> {
+        self.aliases.insert((t.id, fd));
+        let old = self.by_fd.insert(fd, t)?;
+        if old.id != self.by_fd[&fd].id {
+            self.aliases.remove(&(old.id, fd));
+        }
+        Some(old)
+    }
+    fn remove(&mut self, fd: &i32) -> Option<Token> {
+        let t = self.by_fd.remove(fd)?;
+        self.aliases.remove(&(t.id, *fd));
+        Some(t)
+    }
+    // Socket `id`'s descriptors, in fd order.
+    fn of(&self, id: u64) -> impl Iterator<Item = (i32, &Token)> + '_ {
+        if cfg!(debug_assertions) {
+            let indexed = self.aliases.range((id, i32::MIN)..=(id, i32::MAX)).map(|&(_, fd)| fd);
+            let swept = self.by_fd.iter().filter(|(_, t)| t.id == id).map(|(&fd, _)| fd);
+            assert!(indexed.eq(swept), "aliases of socket {id} differ from a sweep");
+        }
+        self.aliases
+            .range((id, i32::MIN)..=(id, i32::MAX))
+            .map(|&(_, fd)| (fd, &self.by_fd[&fd]))
+    }
+    fn holds(&self, id: u64) -> bool {
+        self.of(id).next().is_some()
+    }
+}
 // Native close/dup use an atomic read-side guard, never a registry lock. A
 // writer pins classification through the syscall and alias publication.
 // ponytail: one mutation gate; shard by target fd if contention matters.
@@ -516,9 +565,9 @@ fn call(id: u64, op: Op) -> Result<Reply> {
         TOKENS
             .lock()
             .map_err(|_| EIO)?
-            .values()
-            .find(|t| t.id == id)
-            .map_or(0, |t| {
+            .of(id)
+            .next()
+            .map_or(0, |(_, t)| {
                 t.input
                     .ready
                     .load(Ordering::Acquire)
@@ -1414,9 +1463,10 @@ fn error_queue(id: u64, p: *mut msghdr, m: msghdr) -> Result<i64> {
     let input = TOKENS
         .lock()
         .map_err(|_| EIO)?
-        .values()
-        .find(|t| t.id == id)
+        .of(id)
+        .next()
         .ok_or(EBADF)?
+        .1
         .input
         .clone();
     let _guard = input.bytes.lock().map_err(|_| EIO)?;
@@ -2194,9 +2244,9 @@ pub unsafe extern "C" fn ioctl() -> i32 {
 // Registry mutation and the kernel descriptor operation are serialized together.
 // Close/dup release TOKENS before epoll cleanup and owner RPCs; ctl alone
 // nests the locks in TOKENS -> EPOLLS order.
-fn remove_alias(tokens: &mut BTreeMap<i32, Token>, fd: i32) -> Option<u64> {
+fn remove_alias(tokens: &mut Tokens, fd: i32) -> Option<u64> {
     let t = tokens.remove(&fd)?;
-    (!tokens.values().any(|alias| alias.id == t.id)).then_some(t.id)
+    (!tokens.holds(t.id)).then_some(t.id)
 }
 fn finish_close(last: Option<u64>) -> Result<()> {
     if let Some(id) = last {
@@ -2205,13 +2255,12 @@ fn finish_close(last: Option<u64>) -> Result<()> {
     }
     Ok(())
 }
-// ponytail: bounded 512-alias scan; index by id if readiness cost matters.
 fn live_id(id: u64) -> Result<bool> {
     Ok(TOKENS
         .lock()
         .map_err(|_| EIO)?
-        .iter()
-        .any(|(&fd, t)| t.id == id && t.matches(fd)))
+        .of(id)
+        .any(|(fd, t)| t.matches(fd)))
 }
 fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
     duplicate_registered(fd, new, cmd, arg).map(|(fd, _)| fd)
@@ -3113,8 +3162,8 @@ mod tests {
                 !TOKENS
                     .lock()
                     .unwrap()
-                    .iter()
-                    .any(|(&fd, t)| fd != source && t.id == 982)
+                    .of(982)
+                    .any(|(fd, _)| fd != source)
             );
             assert_eq!(owned(source), Ok(Some(982)));
             TOKENS.lock().unwrap().remove(&source);
