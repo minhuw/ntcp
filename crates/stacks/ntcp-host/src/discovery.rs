@@ -586,8 +586,8 @@ impl Host {
     /// The earliest caller time at which `service_neighbors` or
     /// `neighbor_output` has work.
     pub fn next_neighbor_deadline(&self) -> Option<Instant> {
-        let ipv4 = self.ipv4_neighbors.table().next_deadline();
-        match self.neighbors.next_deadline() {
+        let ipv4 = self.ipv4_neighbors.next_deadline();
+        match self.neighbors.deadline() {
             Some(ipv6) => Some(ipv4.map_or(ipv6, |ipv4| ipv4.min(ipv6))),
             None => ipv4,
         }

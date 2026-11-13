@@ -6,6 +6,7 @@
 // Hosts of its queues.
 use alloc::boxed::Box;
 use core::any::Any;
+use core::cell::Cell;
 use core::net::Ipv4Addr;
 use ntcp::Instant;
 use ntcp_arp::{
@@ -137,6 +138,9 @@ pub(crate) struct Ipv4Neighbors {
 // cache, which ports use when storage was provided.
 pub(crate) struct Ipv4Backend {
     own: Ipv4Neighbors,
+    // The own cache's next deadline, kept between changes, which reach the
+    // cache only through `table_mut`; None while not known.
+    next: Cell<Option<Option<Instant>>>,
     enabled: bool,
     installed: Option<Box<dyn Ipv4NeighborTable>>,
 }
@@ -160,6 +164,7 @@ impl Ipv4Backend {
                 cache: ArpCache::new(limits, ArpTimers::default(), units_per_second)?,
                 latest: 0,
             },
+            next: Cell::new(None),
             enabled,
             installed: None,
         })
@@ -174,6 +179,21 @@ impl Ipv4Backend {
     pub(crate) fn installed(&mut self) -> Option<&mut (dyn Ipv4NeighborTable + 'static)> {
         self.installed.as_deref_mut()
     }
+    // The table's next deadline (`Ipv4NeighborTable::next_deadline`). The
+    // own cache's is found once per change, not on every look; an
+    // installed table's, which other owners may change, on every look.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        if let Some(table) = &self.installed {
+            return table.next_deadline();
+        }
+        let next = self.next.get().unwrap_or_else(|| {
+            let next = self.own.next_deadline();
+            self.next.set(Some(next));
+            next
+        });
+        debug_assert_eq!(next, self.own.next_deadline());
+        next
+    }
     pub(crate) fn table(&self) -> &dyn Ipv4NeighborTable {
         match &self.installed {
             Some(table) => &**table,
@@ -181,6 +201,7 @@ impl Ipv4Backend {
         }
     }
     pub(crate) fn table_mut(&mut self) -> &mut dyn Ipv4NeighborTable {
+        self.next.set(None);
         match &mut self.installed {
             Some(table) => &mut **table,
             None => &mut self.own,

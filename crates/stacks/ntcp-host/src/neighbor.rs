@@ -6,7 +6,11 @@
 // keyed by its link (with generation) and next-hop address and shared by
 // every path that uses it.
 use alloc::vec::Vec;
-use core::net::Ipv6Addr;
+use core::{
+    cell::Cell,
+    net::Ipv6Addr,
+    ops::{Deref, DerefMut},
+};
 use ntcp::Instant;
 use ntcp_icmp::{NeighborAdvertisement, NeighborSolicitation};
 use ntcp_path::LinkId;
@@ -258,6 +262,46 @@ struct Pending<T> {
     // Resolution failed: the owner is advised and the attempt dropped.
     failed: bool,
     tag: T,
+}
+
+// The Host's Neighbor Discovery tables, with their next deadline kept
+// between changes: every mutable access forgets it, so it is found once per
+// change, not on every look.
+pub(crate) struct NdTables<T> {
+    tables: Neighbors<T>,
+    next: Cell<Option<Option<Instant>>>,
+}
+impl<T> NdTables<T> {
+    pub(crate) fn new(tables: Neighbors<T>) -> Self {
+        Self {
+            tables,
+            next: Cell::new(None),
+        }
+    }
+}
+impl<T: Copy + PartialEq> NdTables<T> {
+    // `Neighbors::next_deadline`.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        let next = self.next.get().unwrap_or_else(|| {
+            let next = self.tables.next_deadline();
+            self.next.set(Some(next));
+            next
+        });
+        debug_assert_eq!(next, self.tables.next_deadline());
+        next
+    }
+}
+impl<T> Deref for NdTables<T> {
+    type Target = Neighbors<T>;
+    fn deref(&self) -> &Neighbors<T> {
+        &self.tables
+    }
+}
+impl<T> DerefMut for NdTables<T> {
+    fn deref_mut(&mut self) -> &mut Neighbors<T> {
+        self.next.set(None);
+        &mut self.tables
+    }
 }
 
 pub(crate) struct Neighbors<T> {

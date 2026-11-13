@@ -91,8 +91,8 @@ pub use ident::{
 mod admin;
 pub use admin::{AdminCandidate, AdminClient, Administration, AffectedPath, ClientReport};
 mod neighbor;
-use neighbor::Neighbors;
 pub use neighbor::{AddressState, NdPort, NeighborLimits};
+use neighbor::{NdTables, Neighbors};
 pub use ntcp_arp::{ArpCounters, ArpState};
 // Neighbor cache inspection for the tests of embeddings (`Host::neighbor`).
 #[cfg(any(test, feature = "test-support"))]
@@ -758,7 +758,7 @@ pub struct Host {
     datagram_limits: DatagramLimits,
     identifiers: Allocator,
     adjunct: Adjunct,
-    neighbors: Neighbors<discovery::HeldOutput>,
+    neighbors: NdTables<discovery::HeldOutput>,
     ipv4_neighbors: arp::Ipv4Backend,
     // Addresses ND ingress found duplicate since the last
     // `service_neighbors` report, which carries them to the owner.
@@ -880,11 +880,11 @@ impl Host {
             datagram_limits: limits.datagrams,
             identifiers: Allocator::new(limits.datagrams.identifiers, timebase.units_per_second)?,
             adjunct: Adjunct::new(limits.datagrams.adjunct, timebase.units_per_second)?,
-            neighbors: Neighbors::new(
+            neighbors: NdTables::new(Neighbors::new(
                 limits.neighbors,
                 path_limits.links,
                 timebase.units_per_second,
-            )?,
+            )?),
             ipv4_neighbors: arp::Ipv4Backend::new(
                 limits.ipv4_neighbors,
                 path_limits.links,
