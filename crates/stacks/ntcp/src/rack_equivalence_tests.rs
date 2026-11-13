@@ -56,6 +56,9 @@ struct Model {
     orderly: bool,
     // SACK negotiated: otherwise the scoreboard stays empty.
     sack: bool,
+    // Request/response: one selection at a time, committed whole and
+    // mostly acknowledged whole, so the ledger holds an entry or two.
+    exchange: bool,
     // The reference overflowed its ledger and abandoned it, where Rack,
     // with SPARE more entries, refuses a split instead.
     constrained: bool,
@@ -117,6 +120,13 @@ fn snapshot_reference(r: &Reference) -> String {
 }
 
 impl Model {
+    fn exchanging(seed: u64) -> Self {
+        Self {
+            exchange: true,
+            ..Self::new(seed)
+        }
+    }
+
     fn new(seed: u64) -> Self {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let capacity = match rng.below(4) {
@@ -153,6 +163,7 @@ impl Model {
             pending: None,
             orderly,
             sack,
+            exchange: false,
             constrained: false,
             trace: Vec::new(),
         }
@@ -306,7 +317,7 @@ impl Model {
         let Some(selection) = selection else {
             return;
         };
-        if self.rng.chance(40) {
+        if self.exchange || self.rng.chance(40) {
             // Scalar output: committed whole at once.
             if self.rng.chance(30) {
                 self.advance();
@@ -489,7 +500,10 @@ impl Model {
 
     fn ack(&mut self) {
         let span = self.nxt.distance_from(self.una);
-        let ack = if self.rng.chance(40) || span == 0 {
+        let ack = if self.exchange && self.rng.chance(70) {
+            // Everything sent, as a response acknowledges its request.
+            self.nxt
+        } else if self.rng.chance(40) || span == 0 {
             self.una
         } else {
             let edge = self.edge();
@@ -601,6 +615,14 @@ impl Model {
     }
 
     fn step(&mut self) {
+        if self.exchange && self.pending.is_none() && self.rng.chance(70) {
+            if self.una == self.nxt || self.rng.chance(20) {
+                self.fresh();
+            } else {
+                self.ack();
+            }
+            return;
+        }
         let op = self.rng.below(100);
         let busy = self.pending.is_some();
         match op {
@@ -683,12 +705,12 @@ impl Model {
     }
 }
 
-#[test]
-fn randomized_operations_match_the_walking_ledger() {
-    // Steps compared, and seeds whose reference never overflowed.
+// Steps compared and seeds whose reference never overflowed, of 400
+// seeds of 500 steps.
+fn compare(model: impl Fn(u64) -> Model) -> (usize, usize) {
     let (mut compared, mut unconstrained) = (0, 0);
     for seed in 1..=400u64 {
-        let mut model = Model::new(seed);
+        let mut model = model(seed);
         let mut whole = true;
         for _ in 0..500 {
             let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
@@ -713,8 +735,21 @@ fn randomized_operations_match_the_walking_ledger() {
         }
         unconstrained += usize::from(whole);
     }
+    (compared, unconstrained)
+}
+
+#[test]
+fn randomized_operations_match_the_walking_ledger() {
+    let (compared, unconstrained) = compare(Model::new);
     // Most seeds (every 4096-entry one) never constrain the ledger: 342 of
     // 400 seeds and 181,351 of 200,000 steps when written.
+    assert!(compared > 400 * 500 * 85 / 100, "{compared}");
+    assert!(unconstrained > 300, "{unconstrained}");
+}
+
+#[test]
+fn randomized_exchanges_match_the_walking_ledger() {
+    let (compared, unconstrained) = compare(Model::exchanging);
     assert!(compared > 400 * 500 * 85 / 100, "{compared}");
     assert!(unconstrained > 300, "{unconstrained}");
 }

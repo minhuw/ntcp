@@ -222,6 +222,48 @@ impl Tally {
     }
 }
 
+// What an original packet or a delivery unit counts, folded over its
+// intervals.
+#[derive(Clone, Copy)]
+struct Run {
+    sacked: bool,
+    lost: bool,
+    retransmitted: bool,
+}
+
+impl Run {
+    const EMPTY: Self = Self {
+        sacked: true,
+        lost: false,
+        retransmitted: false,
+    };
+
+    fn packet(self, r: &Interval) -> Self {
+        Self {
+            sacked: self.sacked && r.sacked,
+            lost: self.lost || r.original_lost && !r.sacked,
+            retransmitted: self.retransmitted
+                || r.retransmitted && !r.sacked && !r.needs_retransmit,
+        }
+    }
+
+    fn unit(self, r: &Interval) -> Self {
+        Self {
+            sacked: self.sacked && r.sacked,
+            lost: self.lost || r.original_lost && !r.sacked,
+            retransmitted: self.retransmitted
+                || r.stats_flag(DIAGNOSTIC_RETRY) && !r.stats_flag(DIAGNOSTIC_LOST) && !r.sacked,
+        }
+    }
+
+    fn add_to(self, counts: &mut Counts) {
+        counts.unacked += 1;
+        counts.sacked += u32::from(self.sacked);
+        counts.lost += u32::from(self.lost);
+        counts.retransmitted += u32::from(self.retransmitted);
+    }
+}
+
 // Index ranges whose contribution to the tally is recomputed around a
 // change: changed intervals, and whole packets and delivery units.
 #[derive(Clone, Copy)]
@@ -577,7 +619,7 @@ impl Rack {
         }
         self.remove_prefix(count);
         if self.intervals.first().is_some_and(|r| ack.after(r.start)) {
-            self.retally(0, 1, |s| s.intervals[0].start = ack);
+            self.edit(0, 1, |s| s.intervals[0].start = ack);
         }
         if self.fallback.is_some_and(|boundary| !boundary.after(ack)) {
             self.fallback = None;
@@ -608,16 +650,15 @@ impl Rack {
         if self.intervals.len() == self.capacity {
             return false;
         }
-        let hull = self.hull(i, i + 1);
-        let before = self.contribution(hull);
+        // Both pieces keep the fields, packet and delivery unit of the
+        // interval: packets and units count the same and pipe and PTB bytes
+        // add up, while the counts of intervals gain the right piece, as
+        // tcp_fragment's tcp_adjust_pcount moves only the counts the split
+        // changes.
+        let r = self.intervals[i];
+        self.tally.short += u32::from(self.short(&r));
+        self.tally.lost += u32::from(!r.sacked && r.needs_retransmit);
         self.divide(i, edge);
-        // Both pieces keep the packet and delivery unit of the original.
-        let after = self.contribution(Hull {
-            items: (i, i + 2),
-            packets: (hull.packets.0, hull.packets.1 + 1),
-            units: (hull.units.0, hull.units.1 + 1),
-        });
-        self.tally.apply(before, after);
         true
     }
 
@@ -729,48 +770,60 @@ impl Rack {
         }
     }
 
+    // The original packets and delivery units holding intervals [a, b):
+    // what a change to their fields can alter if it keeps every packet's
+    // and unit's boundaries (original wire ranges and DELIVERY_END).
+    fn runs(&self, a: usize, b: usize) -> Hull {
+        Hull {
+            items: (a, b),
+            packets: (self.packet_start(a), self.packet_end(b)),
+            units: (self.unit_start(a), self.unit_end(b)),
+        }
+    }
+
+    fn short(&self, r: &Interval) -> bool {
+        r.transmission_end.distance_from(r.transmission_start) < self.short_mss
+    }
+
+    // What one interval adds to the sums kept per interval.
+    fn item(&self, r: &Interval) -> Tally {
+        let lost = !r.sacked && r.needs_retransmit;
+        let len = r.end.distance_from(r.start);
+        Tally {
+            pipe: if !r.sacked && !r.needs_retransmit {
+                len
+            } else {
+                0
+            },
+            short: u32::from(self.short(r)),
+            lost: u32::from(lost),
+            ptb_lost: if lost && r.ptb == Ptb::All { len } else { 0 },
+            ..Tally::default()
+        }
+    }
+
     fn contribution(&self, hull: Hull) -> Tally {
         let mut tally = Tally::default();
         for r in self.intervals.range(hull.items.0, hull.items.1) {
-            if !r.sacked && !r.needs_retransmit {
-                tally.pipe += r.end.distance_from(r.start);
-            }
-            tally.short +=
-                u32::from(r.transmission_end.distance_from(r.transmission_start) < self.short_mss);
-            tally.lost += u32::from(!r.sacked && r.needs_retransmit);
-            if !r.sacked && r.needs_retransmit && r.ptb == Ptb::All {
-                tally.ptb_lost += r.end.distance_from(r.start);
-            }
+            tally.apply(Tally::default(), self.item(r));
         }
         let (mut i, end) = hull.packets;
         while i < end {
             let first = i;
-            let (mut sacked, mut lost, mut retransmitted) = (true, false, false);
+            let mut run = Run::EMPTY;
             while i < end && (i == first || self.same_packet(i - 1, i)) {
-                let r = &self.intervals[i];
-                sacked &= r.sacked;
-                lost |= r.original_lost && !r.sacked;
-                retransmitted |= r.retransmitted && !r.sacked && !r.needs_retransmit;
+                run = run.packet(&self.intervals[i]);
                 i += 1;
             }
-            tally.packets.unacked += 1;
-            tally.packets.sacked += u32::from(sacked);
-            tally.packets.lost += u32::from(lost);
-            tally.packets.retransmitted += u32::from(retransmitted);
+            run.add_to(&mut tally.packets);
         }
-        let (mut sacked, mut lost, mut retransmitted) = (true, false, false);
+        let mut run = Run::EMPTY;
         for r in self.intervals.range(hull.units.0, hull.units.1) {
-            sacked &= r.sacked;
-            lost |= r.original_lost && !r.sacked;
-            retransmitted |=
-                r.stats_flag(DIAGNOSTIC_RETRY) && !r.stats_flag(DIAGNOSTIC_LOST) && !r.sacked;
+            run = run.unit(r);
             // Intervals after the last DELIVERY_END form no unit yet.
             if r.stats_flag(DELIVERY_END) {
-                tally.units.unacked += 1;
-                tally.units.sacked += u32::from(sacked);
-                tally.units.lost += u32::from(lost);
-                tally.units.retransmitted += u32::from(retransmitted);
-                (sacked, lost, retransmitted) = (true, false, false);
+                run.add_to(&mut tally.units);
+                run = Run::EMPTY;
             }
         }
         tally
@@ -787,20 +840,39 @@ impl Rack {
         result
     }
 
-    fn push(&mut self, interval: Interval) {
-        let from = self.intervals.len().saturating_sub(1);
-        let tail = |s: &Self| {
-            let len = s.intervals.len();
-            s.contribution(Hull {
-                items: (from, len),
-                packets: (s.packet_start(from), len),
-                units: (s.unit_start(from), len),
-            })
-        };
-        let before = tail(self);
-        self.intervals.push(interval);
-        let after = tail(self);
+    // `retally` of a change that keeps every original wire range and
+    // DELIVERY_END: the packets and units stay, so only those holding
+    // [a, b) count differently, as Linux moves an skb's pcount between
+    // sacked_out, lost_out and retrans_out when it tags only that skb
+    // (tcp_sacktag_one, tcp_mark_skb_lost).
+    fn edit<R>(&mut self, a: usize, b: usize, change: impl FnOnce(&mut Self) -> R) -> R {
+        let hull = self.runs(a, b);
+        let before = self.contribution(hull);
+        let result = change(self);
+        debug_assert!({
+            let after = self.runs(a, b);
+            after.packets == hull.packets && after.units == hull.units
+        });
+        let after = self.contribution(hull);
         self.tally.apply(before, after);
+        result
+    }
+
+    // A fresh interval lies above every entry, so it is an original packet
+    // of its own; with no DELIVERY_END it joins the intervals after the
+    // last delivery unit, which count none: it adds its own sums and one
+    // packet, as Linux adds the skb's pcount to packets_out
+    // (tcp_event_new_data_sent).
+    fn push(&mut self, interval: Interval) {
+        debug_assert!(!interval.stats_flag(DELIVERY_END));
+        debug_assert!(self.intervals.last().is_none_or(|last| {
+            (last.original_wire_start, last.original_wire_end)
+                != (interval.original_wire_start, interval.original_wire_end)
+        }));
+        let mut after = self.item(&interval);
+        Run::EMPTY.packet(&interval).add_to(&mut after.packets);
+        self.tally.apply(Tally::default(), after);
+        self.intervals.push(interval);
     }
 
     fn remove_prefix(&mut self, count: usize) {
@@ -994,7 +1066,7 @@ impl Rack {
             self.overlapping(undo.prior.original_wire_start, undo.prior.original_wire_end);
         let (a, b) = (first.min(wire_first), last.max(wire_last));
         if a < b {
-            self.retally(a, b, |s| {
+            self.edit(a, b, |s| {
                 for r in s.intervals.range_mut(a, b) {
                     if r.original_wire_start == undo.prior.original_wire_start
                         && r.original_wire_end == undo.prior.original_wire_end
@@ -1144,7 +1216,7 @@ impl Rack {
             .checked_sub(1)
             .filter(|&i| self.intervals[i].end == start);
         let from = previous.unwrap_or(first);
-        self.retally(from, last, |s| {
+        let commit = |s: &mut Self| {
             // Repacketize delivery units only after actual acceptance. Keep the
             // untouched prefix/suffix as separate queued units; do not tie their
             // completion to an overwritten latest-transmission sequence range.
@@ -1159,7 +1231,37 @@ impl Rack {
                     Self::depart(r, selection, from, end, now);
                 }
             }
-        });
+        };
+        // A departure of one whole interval that keeps its original packet
+        // (a retransmission, or the original as selected), whose unit starts
+        // at it and either ends there or is the open one after the last
+        // unit, changes only that interval's sums and its own unit: the
+        // usual departure, of the newest entry.
+        let r = &self.intervals[first];
+        if last == first + 1
+            && r.start == start
+            && r.end == end
+            && (selection.retransmit
+                || (r.original_wire_start, r.original_wire_end) == (start, end))
+            && (first == 0 || self.intervals[first - 1].stats_flag(DELIVERY_END))
+            && (r.stats_flag(DELIVERY_END) || last == self.intervals.len())
+        {
+            // Its own sums, and its own unit once it ends one.
+            let alone = |s: &Self| {
+                let r = &s.intervals[first];
+                let mut tally = s.item(r);
+                if r.stats_flag(DELIVERY_END) {
+                    Run::EMPTY.unit(r).add_to(&mut tally.units);
+                }
+                tally
+            };
+            let before = alone(self);
+            commit(self);
+            let after = alone(self);
+            self.tally.apply(before, after);
+        } else {
+            self.retally(from, last, commit);
+        }
         // Commitment and the new unit edges at both ends can complete a
         // delivery unit the scoreboard already covers.
         let dirty_start = self.intervals[from].start;
@@ -1309,7 +1411,7 @@ impl Rack {
             let (first, last) = self.overlapping(start, end);
             if first < last {
                 let (a, b) = (self.packet_start(first), self.packet_end(last));
-                let unsacked = self.retally(a, b, |s| {
+                let unsacked = self.edit(a, b, |s| {
                     for r in s.intervals.range_mut(a, b) {
                         r.original_retransmitted = true;
                     }
@@ -1647,7 +1749,7 @@ impl Rack {
                 while j < b && self.newly_covered(j, &input) {
                     j += 1;
                 }
-                self.retally(i, j, |s| {
+                self.edit(i, j, |s| {
                     for k in i..j {
                         s.deliver(k, &input, &mut walk);
                     }
@@ -1901,7 +2003,7 @@ impl Rack {
             let deadline = r.sent.saturating_add(self.rtt).saturating_add(window);
             if now >= deadline {
                 retransmission_lost |= r.retransmitted && r.loss_response_pending;
-                self.retally(i, i + 1, |s| {
+                self.edit(i, i + 1, |s| {
                     let r = &mut s.intervals[i];
                     r.original_lost = true;
                     r.needs_retransmit = true;
@@ -1963,7 +2065,7 @@ impl Rack {
                 .iter()
                 .take_while(|r| r.original_wire_end == end)
                 .count();
-            self.retally(0, count, |s| {
+            self.edit(0, count, |s| {
                 for r in s.intervals.range_mut(0, count) {
                     if !r.sacked {
                         r.original_lost = true;
@@ -1982,7 +2084,7 @@ impl Rack {
             let r = &self.intervals[i];
             if !r.sacked && !r.retransmitted && scoreboard.is_lost(r.start, mss) {
                 newly_lost |= !r.needs_retransmit;
-                self.retally(i, i + 1, |s| {
+                self.edit(i, i + 1, |s| {
                     let r = &mut s.intervals[i];
                     r.original_lost = true;
                     r.needs_retransmit = true;
