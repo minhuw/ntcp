@@ -1107,6 +1107,39 @@ fn the_buffer_budget_admits_exactly_its_connections() {
     assert_eq!(counters.memory_pressures, 0);
 }
 
+// Linux's tcp_init_mem: tcp_mem = {3/4, 1, 3/2} of memory/16 in pages, at
+// least 128 pages; the result is a valid set of thresholds.
+#[test]
+fn the_memory_cap_follows_tcp_init_mem() {
+    const GIB: usize = 1 << 30;
+    assert_eq!(
+        NetworkConfig::memory_cap_for(64 * GIB),
+        (3 * GIB, 4 * GIB, 6 * GIB)
+    );
+    // 1000 MB: 244140 pages, limit 15258 pages, tcp_mem[0] 11442 pages.
+    assert_eq!(
+        NetworkConfig::memory_cap_for(1_000_000_000),
+        (11442 * 4096, 15258 * 4096, 22884 * 4096)
+    );
+    assert_eq!(
+        NetworkConfig::memory_cap_for(0),
+        (96 * 4096, 128 * 4096, 192 * 4096)
+    );
+    let address = "10.73.0.1".parse().unwrap();
+    let mut config = config(address, false, 1);
+    let (low, pressure, max) = NetworkConfig::memory_cap_for(16 * GIB);
+    config.tcp.max_buffer_bytes = max;
+    config.tcp.buffer_pressure_bytes = Some(pressure);
+    config.tcp.buffer_low_bytes = Some(low);
+    let memory = config.tcp.buffer_memory();
+    assert_eq!(
+        (memory.low, memory.pressure, memory.high),
+        (low, pressure, max)
+    );
+    let (wire, _) = wires(PacketLayer::Ip);
+    assert!(Network::new(config, wire, [1; 32], 0).is_ok());
+}
+
 // Applications that read, write and accept only when an event says so
 // complete every exchange while transmits are refused at random and reads
 // take random amounts: no event is lost. Debug builds also check after

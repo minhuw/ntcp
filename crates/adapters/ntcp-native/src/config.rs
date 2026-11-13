@@ -114,6 +114,23 @@ impl NetworkConfig {
                 self.gso(io),
             )?)
     }
+    /// The buffer memory thresholds Linux's tcp_init_mem (net/ipv4/tcp.c)
+    /// gives a host whose free buffer memory is `memory_bytes`, as
+    /// `(low, pressure, max)` in bytes, for `tcp.buffer_low_bytes`,
+    /// `tcp.buffer_pressure_bytes` and `tcp.max_buffer_bytes`. In 4 KiB
+    /// pages, limit = max(pages / 16, 128), and tcp_mem = {limit / 4 * 3,
+    /// limit, (limit / 4 * 3) * 2}: about 4.7%, 6.25% and 9.4% of memory.
+    /// Linux sizes it from nr_free_buffer_pages() at boot; pass the memory
+    /// this Network, or its group of shared flows, may use.
+    ///
+    /// Unlike `buffer_budget`, which is the floor below which connections
+    /// cannot even open, this is a cap with room for buffers to grow.
+    pub fn memory_cap_for(memory_bytes: usize) -> (usize, usize, usize) {
+        const PAGE: usize = 4096;
+        let limit = (memory_bytes / PAGE / 16).max(128);
+        let low = limit / 4 * 3;
+        (low * PAGE, limit * PAGE, low * 2 * PAGE)
+    }
     // The TCP packet an output reservation holds: the driver polls each
     // into its frame after the link and IP headers, so no packet it
     // encodes, the first segment of an aggregate included, is larger. An
