@@ -28,6 +28,24 @@ pub(super) fn advance(a: &mut Owner, b: &mut Owner) {
     b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
     pump(a, b);
 }
+// Reads `len` bytes, advancing until they arrive: with SocketConfig::new's
+// window scale of 10 the receiver advertises its window in 1 KiB units, so
+// the last bytes of a flight that fills the 64 KiB ring wait until a read
+// opens a whole unit.
+pub(super) fn read_exactly(a: &mut Owner, b: &mut Owner, id: u64, len: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for _ in 0..8 {
+        match b.execute(id, Op::Read(len - bytes.len())) {
+            Ok(reply) => bytes.extend(reply.bytes),
+            Err(e) => assert_eq!(e, EAGAIN),
+        }
+        if bytes.len() == len {
+            return bytes;
+        }
+        advance(a, b);
+    }
+    panic!("read {} of {len} bytes", bytes.len());
+}
 #[test]
 fn logical_large_iov_tiny_buffer_progress_single_timestamp_and_zerocopy() {
     let (mut a, mut b, client, server, _) = pair();
@@ -172,7 +190,7 @@ fn logical_fault_prefix_capacity_lowat_and_nonblocking_short_return() {
         EAGAIN
     );
     advance(&mut a, &mut b);
-    b.execute(server, Op::Read(BYTES)).unwrap();
+    assert_eq!(read_exactly(&mut a, &mut b, server, BYTES).len(), BYTES);
     advance(&mut a, &mut b);
     assert_eq!(
         a.execute(
@@ -348,10 +366,7 @@ fn logical_later_copy_fault_preserves_only_prior_admitted_chunk_and_metadata() {
             assert_eq!(request.send.as_ref().unwrap().accepted, BYTES);
             let cookie = a.timestamp_cookie;
             advance(&mut a, &mut b);
-            assert_eq!(
-                b.execute(server, Op::Read(BYTES)).unwrap().bytes,
-                vec![35; BYTES]
-            );
+            assert_eq!(read_exactly(&mut a, &mut b, server, BYTES), vec![35; BYTES]);
             advance(&mut a, &mut b);
             assert!(a.sockets[&client].completions.is_empty());
             assert!(a.service(&mut request));

@@ -1,8 +1,9 @@
 // NetworkConfig::new's TCP defaults, as Linux's: SACK and timestamps offered
 // on the SYN and no ECN asked for, a lost tail segment retransmitted near
-// the 200 ms RTO floor rather than RFC 6298's 1 s, a 60 s TIME-WAIT, and a
-// listener that takes a fresh SYN for a tuple in TIME-WAIT. Two Networks over
-// an in-memory IP wire that can drop a chosen segment.
+// the 200 ms RTO floor rather than RFC 6298's 1 s, a 60 s TIME-WAIT, a
+// listener that takes a fresh SYN for a tuple in TIME-WAIT, and receive
+// buffers autotuned up to tcp_rmem[2]. Two Networks over an in-memory IP
+// wire that can drop a chosen segment.
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use ntcp_native::*;
 use std::{
@@ -62,20 +63,31 @@ fn tcp_payload(packet: &[u8]) -> usize {
 // Whether a SYN carries the option of `wanted` kind (4 SACK-permitted, 8
 // timestamps).
 fn has_option(packet: &[u8], wanted: u8) -> bool {
+    option(packet, wanted).is_some()
+}
+
+// The body of the first option of `wanted` kind.
+fn option(packet: &[u8], wanted: u8) -> Option<&[u8]> {
     let header = tcp(packet);
     let mut options = &header[20..usize::from(header[12] >> 4) * 4];
     while let [kind, rest @ ..] = options {
         match kind {
-            0 => return false,
+            0 => return None,
             1 => options = rest,
-            kind if *kind == wanted => return true,
             _ => {
-                let len = usize::from(rest[0]).max(2);
-                options = &options[len.min(options.len())..];
+                let len = usize::from(*rest.first()?).max(2).min(options.len());
+                if *kind == wanted {
+                    return Some(&options[2..len]);
+                }
+                options = &options[len..];
             }
         }
     }
-    false
+    None
+}
+
+fn window_field(packet: &[u8]) -> usize {
+    usize::from(u16::from_be_bytes([tcp(packet)[14], tcp(packet)[15]]))
 }
 
 const BUDGET: WorkBudget = WorkBudget::new(32, 32, 32, 32);
@@ -87,6 +99,17 @@ fn address(side: u8) -> IpAddr {
 }
 
 fn side(n: u8, incoming: &Queue, outgoing: &Queue) -> (Network<Wire>, Wire) {
+    side_with(n, incoming, outgoing, |config, wire| {
+        config.tcp.max_buffer_bytes = config.buffer_budget(4, wire).unwrap();
+    })
+}
+
+fn side_with(
+    n: u8,
+    incoming: &Queue,
+    outgoing: &Queue,
+    configure: impl FnOnce(&mut NetworkConfig, &Wire),
+) -> (Network<Wire>, Wire) {
     let make = || Wire {
         incoming: incoming.clone(),
         outgoing: outgoing.clone(),
@@ -101,7 +124,7 @@ fn side(n: u8, incoming: &Queue, outgoing: &Queue) -> (Network<Wire>, Wire) {
     };
     let mut config = NetworkConfig::new(address(n), 1500);
     config.tcp.max_connections = 4;
-    config.tcp.max_buffer_bytes = config.buffer_budget(4, &wire).unwrap();
+    configure(&mut config, &wire);
     (Network::new(config, wire, [n; 32], 0).unwrap(), probe)
 }
 
@@ -123,6 +146,17 @@ fn defaults_follow_linux_and_stay_configurable() {
     assert_eq!((c.rto_min_us, c.delayed_ack_us), (200_000, 200_000));
     assert_eq!(c.time_wait_us, 60_000_000);
     assert!(config.tcp.reuse_time_wait);
+    // tcp_rmem = 4096 131072 33554432 in window bytes (Linux's 128 KiB of
+    // memory starts about 64 KiB of window); the send limit stays fixed.
+    let buffers = config.tcp.buffers();
+    let sizes = |min, initial, max| ntcp::BufferSizes { min, initial, max };
+    assert_eq!(buffers.receive, sizes(4096, 65536, 32 << 20));
+    assert_eq!(buffers.send, sizes(4096, 65536, 65536));
+    let memory = buffers.memory;
+    assert_eq!(
+        (memory.low, memory.pressure, memory.high),
+        (128 << 20, (256 << 20) * 2 / 3, 256 << 20)
+    );
     // The RFC baseline of the Endpoint is still a configuration away.
     let mut config = config;
     let baseline = ntcp::ConnectionConfig::default();
@@ -137,6 +171,8 @@ fn defaults_follow_linux_and_stay_configurable() {
     config.tcp.connection.congestion_algorithm = baseline.congestion_algorithm;
     config.tcp.connection.prr = baseline.prr;
     config.tcp.connection.time_wait_us = baseline.time_wait_us;
+    config.tcp.connection.receive_capacity_max = baseline.receive_capacity_max;
+    assert_eq!(config.tcp.buffers().receive, sizes(4096, 65536, 65536));
     config.tcp.reuse_time_wait = ntcp::EndpointConfig::default().reuse_time_wait;
     let wire = || Wire {
         incoming: Queue::default(),
@@ -344,4 +380,64 @@ fn a_fresh_syn_reopens_a_tuple_in_time_wait_and_a_stale_one_does_not() {
         }
         assert!(now < 3_000 * MS, "no data on the new connection");
     }
+}
+
+// The 32 MiB receive maximum sets the window scale both SYNs offer, 10 as
+// Linux's tcp_select_initial_window derives it from tcp_rmem[2], while the
+// SYN window is the 64 KiB initial size, at most 65535. A reader that keeps
+// up with a bulk sender then grows its ring at read (DRS, Linux's
+// tcp_rcv_space_adjust), and its ACKs advertise more than 64 KiB. Both
+// keep the default 256 MiB cap: `buffer_budget` leaves no room to write.
+#[test]
+fn the_receive_buffer_starts_at_64_kib_with_window_scale_10_and_grows_at_read() {
+    let (a, b) = (Queue::default(), Queue::default());
+    let (mut client, client_wire) = side_with(1, &a, &b, |_, _| ());
+    let (mut server, server_wire) = side_with(2, &b, &a, |_, _| ());
+    let listener = server.listen(PORT, 4).unwrap();
+    let id = client.connect(SocketAddr::new(address(2), PORT)).unwrap();
+    let mut now = 0;
+    let accepted = loop {
+        step(&mut now, &mut client, &mut server);
+        if let Ok(accepted) = server.accept(listener) {
+            break accepted;
+        }
+        assert!(now < 100 * MS, "handshake did not finish");
+    };
+    let syn = client_wire.sent.borrow()[0].clone();
+    let syn_ack = server_wire.sent.borrow()[0].clone();
+    assert_eq!(tcp(&syn_ack)[13], 0x12);
+    for packet in [&syn, &syn_ack] {
+        assert_eq!(option(packet, 3), Some(&[10][..]));
+        assert_eq!(window_field(packet), 65535);
+    }
+    let opened = server.counters().buffer_bytes;
+    let mut out = vec![0; 1 << 16];
+    let mut read = 0;
+    let data = [5; 1 << 14];
+    let mut widest = 0;
+    let mut seen = server_wire.sent.borrow().len();
+    while now < 200 * MS {
+        while let Ok(receipt) = client.try_write(id, &data, WriteOptions::default()) {
+            if receipt.accepted == 0 {
+                break;
+            }
+        }
+        step(&mut now, &mut client, &mut server);
+        while let Ok(ReadOutcome::Data { len, .. }) = server.try_read(accepted, &mut out) {
+            read += len;
+        }
+        let sent = server_wire.sent.borrow();
+        widest = sent[seen..]
+            .iter()
+            .map(|p| window_field(p) << 10)
+            .fold(widest, usize::max);
+        seen = sent.len();
+    }
+    assert!(read > 1 << 20, "read {read} bytes");
+    assert!(
+        widest > 65536,
+        "the widest advertised window was {widest} bytes"
+    );
+    // The grown ring is charged, 1.375 bytes per byte.
+    assert!(server.counters().buffer_bytes > opened);
 }

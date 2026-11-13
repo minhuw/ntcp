@@ -96,7 +96,11 @@ impl NetworkConfig {
     /// refuses takes what the connection's storage holds and then waits for
     /// memory, as Linux's: a partial write or `Error::WouldBlock`, the
     /// connection writable again once memory comes back
-    /// (`Counters::memory_throttled_writes`).
+    /// (`Counters::memory_throttled_writes`). A tuned receive ring, as
+    /// `NetworkConfig::new`'s, grows at read, 1.375 bytes per byte of
+    /// window up to `receive_capacity_max`; a growth the cap or memory
+    /// pressure refuses leaves the window as it is
+    /// (`Counters::memory_refused_growths`).
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the
@@ -180,9 +184,20 @@ impl NetworkConfig {
     ///   (tcp_timewait_state_process, TCP_TW_SYN). An active open still
     ///   never takes a tuple in TIME-WAIT, as Linux's tcp_tw_reuse allows
     ///   only over loopback by default;
-    /// - ephemeral ports 32768 to 60999 (ip_local_port_range).
+    /// - ephemeral ports 32768 to 60999 (ip_local_port_range);
+    /// - receive buffers of 4 KiB, 64 KiB and 32 MiB (min, initial, max):
+    ///   each starts at 64 KiB and grows at read with the bytes the
+    ///   application takes per round trip, up to 32 MiB, as Linux's
+    ///   tcp_rmem = 4096 131072 33554432 with tcp_moderate_rcvbuf (its
+    ///   128 KiB of memory starts a window of about 64 KiB; here sizes are
+    ///   window bytes). The 32 MiB maximum gives the SYN a window scale of
+    ///   10, as tcp_select_initial_window takes it from tcp_rmem[2]. The
+    ///   send limit stays fixed at 64 KiB.
     ///
     /// Each remains a field of `tcp` or `tcp.connection` to change.
+    /// `tcp.buffers()` reads the buffer sizes and memory thresholds in
+    /// force; setting a direction's max to its initial size turns its
+    /// autotuning off.
     pub fn new(local_address: IpAddr, mtu: u32) -> Self {
         let mut tcp = EndpointConfig {
             reuse_time_wait: true,
@@ -205,6 +220,7 @@ impl NetworkConfig {
         connection.adaptive_ack = true;
         connection.delayed_ack_us = 200_000;
         connection.time_wait_us = 60_000_000;
+        connection.receive_capacity_max = 32 << 20;
         Self {
             local_address,
             mtu,

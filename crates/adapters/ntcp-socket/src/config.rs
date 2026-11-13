@@ -166,6 +166,12 @@ impl SocketConfig {
         };
         tcp.connection.receive_capacity = crate::runtime::BYTES;
         tcp.connection.send_capacity = crate::runtime::BYTES;
+        // Receive autotuning as ntcp-native's NetworkConfig::new: 4 KiB,
+        // 64 KiB and 32 MiB, Linux master's tcp_rmem[2] (net/ipv4/tcp.c
+        // tcp_init), which also gives the SYN a window scale of 10. The send
+        // limit stays fixed at its initial size; SO_RCVBUF locks a socket's
+        // receive size (`tcp.rmem` changes all three).
+        tcp.connection.receive_capacity_max = 32 << 20;
         tcp.connection.mss = MSS;
         tcp.connection.send_ip_payload_limit = if address.is_ipv4() { 1480 } else { 1460 };
         // receive_ip_payload_limit keeps the core default: it bounds only a
