@@ -1539,13 +1539,17 @@ impl Endpoint {
         self.budget.raise(bytes, self.now, memory);
     }
 
-    // Return `bytes` to the budget. Pressure that ends wakes the writers
-    // waiting for memory.
+    // Return `bytes` to the budget. Every return wakes the writers waiting
+    // for memory that it can feed (`wake_memory_waiters`), as Linux's
+    // sk_stream_write_space follows a release: a connection's storage
+    // released, reclaimed or shrunk, and the end of pressure, which lets
+    // the writers pressure held back grow again. A wake visits only the
+    // waiters it wakes and one more, so a return with none waiting costs
+    // one check.
     fn uncharge(&mut self, bytes: usize) {
         let memory = self.config.buffer_memory();
-        if self.budget.reduce(bytes, self.now, memory) {
-            self.wake_memory_waiters();
-        }
+        self.budget.reduce(bytes, self.now, memory);
+        self.wake_memory_waiters();
     }
 
     // Storage charged `old` bytes now holds `new`.
@@ -1888,7 +1892,6 @@ impl Endpoint {
         } else {
             self.uncharge(charge);
         }
-        self.wake_memory_waiters();
     }
 
     // `replaces` names the TIME-WAIT incarnation, a connection the
@@ -4364,7 +4367,6 @@ impl Endpoint {
             .resize(ranges, spare)?;
         let new = self.slot(id)?.connection.rx_timestamps.storage_bytes();
         self.recharge(old, new);
-        self.wake_memory_waiters();
         Ok(())
     }
 
@@ -4397,7 +4399,6 @@ impl Endpoint {
             .resize(phases, spare)?;
         let new = self.slot(id)?.connection.tx_timestamps.storage_bytes();
         self.recharge(old, new);
-        self.wake_memory_waiters();
         Ok(())
     }
 
@@ -5229,9 +5230,10 @@ impl Endpoint {
         slot.connection.tx_timestamps = Default::default();
         slot.connection.rx_timestamps = Default::default();
         slot.released = true;
-        self.uncharge(charge);
         self.events.remove(id.slot);
-        self.wake_memory_waiters();
+        // A released connection writes no more.
+        self.memory_waiters.remove(id.slot);
+        self.uncharge(charge);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
         //# Delete the
         //# TCB, enter CLOSED state, and return.
@@ -9020,5 +9022,44 @@ mod memory_wait_tests {
         assert_eq!(b.listen_drops(), 1);
         assert_eq!(b.memory_counters().memory_refused_opens, 1);
         assert_eq!(b.memory_counters().memory_refused_growths, 0);
+    }
+
+    // Storage a connection gives back outside pressure wakes a writer as a
+    // reclaim does; a released waiter leaves the queue.
+    #[test]
+    fn returned_slack_wakes_a_waiting_writer() {
+        let (mut a, mut b, listener) = endpoints();
+        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        let (other, _) = connect(&mut a, &mut b, listener, 40001);
+        let (released, _) = connect(&mut a, &mut b, listener, 40002);
+        a.set_rx_timestamp_capacity(other, 1024).unwrap();
+        let records = a
+            .slot(other)
+            .unwrap()
+            .connection
+            .rx_timestamps
+            .storage_bytes();
+        writable(&mut a, writer);
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        assert_eq!(a.write(released, &[1; 9]), Err(Error::WouldBlock.into()));
+        assert_eq!(a.write(writer, &[1; 9]), Err(Error::WouldBlock.into()));
+        assert_eq!(a.memory_waiters.iter().count(), 2);
+        a.abort(released).unwrap();
+        a.release(released).unwrap();
+        assert_eq!(a.memory_waiters.iter().collect::<Vec<_>>(), [writer.slot]);
+        assert!(!a.memory_pressure() || a.buffer_bytes() > a.config.buffer_memory().low);
+        assert!(!writable(&mut a, writer));
+        let wanted = a
+            .slot(writer)
+            .unwrap()
+            .connection
+            .send_memory_wanted()
+            .unwrap();
+        assert!(records >= wanted, "{records} {wanted}");
+        // The other connection's timestamp records shrink.
+        a.set_rx_timestamp_capacity(other, 0).unwrap();
+        assert!(a.memory_waiters.is_empty());
+        assert!(writable(&mut a, writer));
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
     }
 }

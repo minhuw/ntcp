@@ -114,12 +114,13 @@ impl Budget {
         }
     }
 
-    // Return `bytes` at `now`; whether pressure ended, as
-    // __sk_mem_reduce_allocated leaves it once the charge falls to
-    // `memory.low`.
-    pub(crate) fn reduce(&mut self, bytes: usize, now: Instant, memory: BufferMemory) -> bool {
+    // Return `bytes` at `now`: as __sk_mem_reduce_allocated, pressure ends
+    // once the charge falls to `memory.low`.
+    pub(crate) fn reduce(&mut self, bytes: usize, now: Instant, memory: BufferMemory) {
         self.charged -= bytes;
-        self.charged <= memory.low && self.leave(now)
+        if self.charged <= memory.low {
+            self.leave(now);
+        }
     }
 
     // An allocation tried would have brought the charge to `total`: past
@@ -138,12 +139,10 @@ impl Budget {
         }
     }
 
-    fn leave(&mut self, now: Instant) -> bool {
-        let Some(since) = self.pressure_since.take() else {
-            return false;
-        };
-        self.pressure_ticks += now.saturating_sub(since);
-        true
+    fn leave(&mut self, now: Instant) {
+        if let Some(since) = self.pressure_since.take() {
+            self.pressure_ticks += now.saturating_sub(since);
+        }
     }
 
     // Entries into pressure, and the caller ticks spent in it up to `now`,
