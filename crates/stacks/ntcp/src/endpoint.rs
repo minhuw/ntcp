@@ -613,6 +613,10 @@ pub struct Endpoint {
     stateless_reservation: Option<usize>,
     free_reservations: usize,
     unattempted_reservations: ReadyQueue,
+    // The attempt and instant of the last `preflight_accept_transmit` that
+    // found the attempt acceptable; `accept_transmit` consumes it (a Cell,
+    // since a preflight reads only, and the Endpoint is !Sync anyway).
+    preflighted: core::cell::Cell<Option<(crate::TransmitAttempt, Instant)>>,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
@@ -860,6 +864,7 @@ impl Endpoint {
             stateless_reservation: None,
             free_reservations: 0,
             unattempted_reservations: ReadyQueue::new(0).map_err(|_| Error::NoMemory)?,
+            preflighted: core::cell::Cell::new(None),
             address_policy: Box::new(address_policy),
             passive_errors,
             tuples: TupleTable::new(count)?,
@@ -6771,6 +6776,7 @@ impl Endpoint {
             }
         }
         self.check_clock(now)?;
+        self.preflighted.set(Some((attempt, now)));
         Ok(true)
     }
 
@@ -6781,7 +6787,17 @@ impl Endpoint {
     ) -> Result<bool, EndpointError> {
         // The checks of `preflight_accept_transmit`, but the connection's
         // validation of the departure, which `accept_reserved_output` makes
-        // first, before it changes anything.
+        // first, before it changes anything, unless a preflight of this
+        // attempt at this instant made it already. Nothing it reads can
+        // change while the attempt is current: the departure, offset and
+        // count belong to the attempt (every change to them replaces or
+        // ends it), and the connection takes no input, timer, selection or
+        // clock update while its output is reserved, so RACK's departure
+        // selection and intervals and the connection's clock stay as they
+        // were (input and timers refuse a reserved connection, refresh
+        // unschedules its deadline, and slot_mut skips update_time). A
+        // later endpoint clock fails check_clock below.
+        let preflighted = self.preflighted.take() == Some((attempt, now));
         let Some(r) = self
             .reservations
             .get(attempt.reservation)
@@ -6814,10 +6830,12 @@ impl Endpoint {
         if let Some(id) = connection
             && let Some(d) = &mut departure
         {
-            withdrawn = self
-                .retained_slot_mut(id)?
-                .connection
-                .accept_reserved_output(now, d, offset, count, finished)?;
+            let owner = &mut self.retained_slot_mut(id)?.connection;
+            withdrawn = if preflighted {
+                owner.accept_validated_output(now, d, offset, count, finished)?
+            } else {
+                owner.accept_reserved_output(now, d, offset, count, finished)?
+            };
         }
         // Checked above.
         self.clock(now)?;

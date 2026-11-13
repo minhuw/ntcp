@@ -3261,12 +3261,27 @@ impl Connection {
         finished: bool,
     ) -> Result<bool, Error> {
         self.validate_reserved_output(now, d, offset, count)?;
+        self.accept_validated_output(now, d, offset, count, finished)
+    }
+
+    /// `accept_reserved_output` once `validate_reserved_output` held for
+    /// the same arguments, with the connection unchanged since (a held
+    /// reservation freezes it).
+    pub(crate) fn accept_validated_output(
+        &mut self,
+        now: Instant,
+        d: &mut Departure,
+        offset: usize,
+        count: usize,
+        finished: bool,
+    ) -> Result<bool, Error> {
+        debug_assert!(self.validate_reserved_output(now, d, offset, count).is_ok());
         if d.stream
             && count != 0
             && let Some(selection) = self.reserved_ledger
         {
             let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
-            // Validated above; nothing since changed the intervals.
+            // Validated; nothing since changed the intervals.
             self.rack.commit_validated_departure(
                 selection,
                 start,

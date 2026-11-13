@@ -873,6 +873,64 @@ fn reserved_departure_preflight_failure_does_not_advance_endpoint_clock() {
     assert!(a.accept_transmit(3, token).unwrap());
 }
 
+// A successful preflight spares the acceptance its departure validation
+// only for the same attempt at the same instant: another instant or a
+// later attempt of the reservation is validated again, and the acceptance
+// consumes the preflight either way.
+#[test]
+fn reserved_preflight_spares_validation_only_for_its_attempt_and_instant() {
+    let (mut a, _, id, _) = pair();
+    a.write(id, &[1; 100]).unwrap();
+    let mut bytes = [0; 2048];
+    let corrupt = |a: &mut Endpoint, by: u32| {
+        let d = a.reservations[0]
+            .current
+            .as_mut()
+            .unwrap()
+            .departure
+            .as_mut()
+            .unwrap();
+        d.start = d.start.wrapping_add(by);
+    };
+    let first = a
+        .poll_reserved_transmit(2, &mut bytes, 16)
+        .unwrap()
+        .1
+        .unwrap();
+    assert!(a.preflight_accept_transmit(3, first).unwrap());
+    assert_eq!(a.preflighted.get(), Some((first, 3)));
+    // Another instant: validated, and the preflight is gone.
+    corrupt(&mut a, 1);
+    assert_eq!(
+        a.accept_transmit(4, first),
+        Err(Error::InvalidArgument.into())
+    );
+    assert_eq!(a.preflighted.get(), None);
+    corrupt(&mut a, u32::MAX);
+    // A later attempt at the preflight's instant: validated.
+    assert!(a.preflight_accept_transmit(3, first).unwrap());
+    a.reject_unsubmitted(first).unwrap();
+    let second = a
+        .poll_reserved_transmit(3, &mut bytes, 16)
+        .unwrap()
+        .1
+        .unwrap();
+    assert_ne!(second, first);
+    corrupt(&mut a, 1);
+    assert_eq!(
+        a.accept_transmit(3, second),
+        Err(Error::InvalidArgument.into())
+    );
+    corrupt(&mut a, u32::MAX);
+    // The same attempt and instant: accepted as without the preflight.
+    assert_eq!(a.transport_info(id).unwrap().unacked, 0);
+    assert!(a.preflight_accept_transmit(3, second).unwrap());
+    assert!(a.accept_transmit(3, second).unwrap());
+    assert_eq!(a.preflighted.get(), None);
+    assert!(a.reservations[0].current.is_none());
+    assert_eq!(a.transport_info(id).unwrap().unacked, 1);
+}
+
 fn two_flows() -> (Endpoint, Endpoint, [ConnectionId; 2], [ConnectionId; 2]) {
     let mut a = endpoint();
     let mut b = endpoint();
