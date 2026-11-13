@@ -1,5 +1,5 @@
 use crate::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 const LIMIT: usize = 4096;
 #[derive(Clone, Copy)]
@@ -12,6 +12,8 @@ struct Registration {
     seen: Option<[u64; 5]>,
     exclusive_grant: u32,
     exclusive_seen: [Option<u64>; 5],
+    // On its epoll's ready list (`Epoll::ready`).
+    queued: bool,
 }
 fn eligible_bits(r: &Registration, ready: u32, observed: [u64; 5]) -> u32 {
     if r.events & EPOLLEXCLUSIVE as u32 == 0 {
@@ -50,10 +52,31 @@ struct Epoll {
     ino: ino_t,
     regs: BTreeMap<(i32, u64), Registration>,
     generation: u64,
-    cursor: usize,
+    // The registrations epoll_wait looks at, each with the generation it
+    // was queued at, as Linux's rdllist: those just added or modified, those
+    // whose socket's readiness changed (the owner's change log, read from
+    // change `changes`), those an exclusive release reopened, and
+    // level-triggered ones still ready. An entry whose registration
+    // changed since is stale and skipped.
+    ready: VecDeque<((i32, u64), u64)>,
+    changes: u64,
     native_first: bool,
 }
 impl Epoll {
+    fn queued(&self, key: (i32, u64), generation: u64) -> Option<&Registration> {
+        self.regs
+            .get(&key)
+            .filter(|r| r.queued && r.generation == generation)
+    }
+    // Drops stale entries once they outnumber the live ones.
+    fn compact(&mut self) {
+        if self.ready.len() > 2 * self.regs.len() + 64 {
+            let regs = &self.regs;
+            self.ready.retain(|&(key, generation)| {
+                regs.get(&key).is_some_and(|r| r.queued && r.generation == generation)
+            });
+        }
+    }
     fn matches(&self, fd: i32) -> bool {
         let mut st: stat = unsafe { std::mem::zeroed() };
         // anon_inode epolls share inode numbers, so fstat only rejects non-epoll
@@ -126,6 +149,16 @@ impl Registry {
         ep.regs.insert(key, r);
         self.watched.insert((key.1, epfd, key.0));
         Ok(())
+    }
+    // Puts registration `key` of `epfd` on its ready list, once.
+    fn queue(&mut self, epfd: i32, key: (i32, u64)) {
+        if let Some(ep) = self.epolls.get_mut(&epfd)
+            && let Some(r) = ep.regs.get_mut(&key)
+            && !r.queued
+        {
+            r.queued = true;
+            ep.ready.push_back((key, r.generation));
+        }
     }
     fn unregister(&mut self, epfd: i32, key: (i32, u64)) -> Option<Registration> {
         let removed = self.epolls.get_mut(&epfd)?.regs.remove(&key)?;
@@ -215,13 +248,19 @@ fn claim_exclusive(map: &mut Registry, epfd: i32, key: (i32, u64), observed: [u6
     });
 }
 fn release_exclusive(map: &mut Registry, id: u64) {
-    map.each_watcher(id, |_, _, r| {
+    let mut reopened = Vec::new();
+    map.each_watcher(id, |epfd, fd, r| {
         if r.events & EPOLLEXCLUSIVE as u32 != 0 {
             r.seen = None;
             r.exclusive_grant = 0;
             r.exclusive_seen = [None; 5];
+            reopened.push((epfd, (fd, id)));
         }
     });
+    // Their readiness may be anyone's to claim again.
+    for (epfd, key) in reopened {
+        map.queue(epfd, key);
+    }
 }
 fn remaining(deadline: Option<Instant>) -> i32 {
     deadline.map_or(-1, |d| {
@@ -343,7 +382,8 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
                     ino: st.st_ino,
                     regs: BTreeMap::new(),
                     generation: 0,
-                    cursor: 0,
+                    ready: VecDeque::new(),
+                    changes: 0,
                     native_first: false,
                 },
             );
@@ -360,15 +400,21 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
             seen: None,
             exclusive_grant: 0,
             exclusive_seen: [None; 5],
+            queued: false,
         };
         match op {
-            EPOLL_CTL_ADD => map.register(epfd, key, registration)?,
+            EPOLL_CTL_ADD => {
+                map.register(epfd, key, registration)?;
+                // Ready now or not, as Linux's ep_insert polls the new item.
+                map.queue(epfd, key);
+            }
             EPOLL_CTL_MOD => {
                 let r = ep.regs.get_mut(&key).ok_or(ENOENT)?;
                 if r.events & EPOLLEXCLUSIVE as u32 != 0 {
                     return Err(EINVAL);
                 }
                 *r = registration;
+                map.queue(epfd, key);
             }
             EPOLL_CTL_DEL => {
                 let removed = map.unregister(epfd, key).ok_or(ENOENT)?;
@@ -412,16 +458,21 @@ unsafe fn epwait(
     // Bounded result storage independent of the caller's maxevents.
     let cap = (max as usize).min(LIMIT);
     loop {
-        let regs = {
+        // The sockets of the ready queue's registrations: only those, and
+        // those whose readiness changed since this instance last looked,
+        // are asked about, never every registration.
+        let (since, probe) = {
             let mut map = EPOLLS.lock().map_err(|_| EIO)?;
             let ep = map.epolls.get_mut(&epfd).ok_or(EBADF)?;
-            let mut regs: Vec<_> = ep.regs.iter().map(|(&key, &r)| (key, r)).collect();
-            if !regs.is_empty() {
-                let len = regs.len();
-                regs.rotate_left(ep.cursor % len);
-                ep.cursor = (ep.cursor + cap) % len;
-            }
-            regs
+            ep.compact();
+            let mut ids: Vec<u64> = ep
+                .ready
+                .iter()
+                .filter_map(|&(key, generation)| ep.queued(key, generation).map(|r| r.id))
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            (ep.changes, ids)
         };
         // Keep native-first copyout in the kernel: native ONESHOT must retain
         // its existing fault handling rather than disarm in a staging buffer.
@@ -433,37 +484,16 @@ unsafe fn epwait(
         if native_count == cap {
             return Ok(native_count as i64);
         }
-        let mut virtual_events = Vec::new();
-        for (key, r) in regs {
-            if !r.armed || !live_id(r.id)? {
-                continue;
-            }
-            let reply = match call(r.id, Op::Ready) {
-                Ok(reply) => reply,
-                Err(EBADF) => continue, // Last alias closed during the query.
-                Err(_) if native_count != 0 => return Ok(native_count as i64),
-                Err(e) => return Err(e),
-            };
-            let ready = reply.value as u32 & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
-            if eligible_bits(&r, ready, reply.readiness_generations) != 0 {
-                virtual_events.push((
-                    key,
-                    r.generation,
-                    reply.readiness_generations,
-                    epoll_event {
-                        events: ready,
-                        u64: r.data,
-                    },
-                ));
-            }
-        }
-        let wait = if native_count != 0 || !virtual_events.is_empty() || timeout == 0 {
-            0
-        } else if deadline.is_none() {
-            10
-        } else {
-            remaining(deadline).clamp(0, 10)
+        let reply = match runtime().and_then(|rt| rt.call(0, Op::ReadyChanges(since, probe))) {
+            Ok(reply) => reply,
+            Err(_) if native_count != 0 => return Ok(native_count as i64),
+            Err(e) => return Err(e),
         };
+        let states: HashMap<u64, (i32, [u64; 5])> = reply
+            .ready
+            .iter()
+            .map(|&(id, bits, observed)| (id, (bits, observed)))
+            .collect();
         let available = cap - native_count;
         // Serialize copyout + disarming with MOD and competing waiters. No owner
         // RPC or socket registry lock is taken while EPOLLS is held.
@@ -471,61 +501,120 @@ unsafe fn epwait(
         // lock order. Final close cannot commit a stale socket delivery.
         let tokens = TOKENS.lock().map_err(|_| EIO)?;
         let mut map = EPOLLS.lock().map_err(|_| EIO)?;
-        let ep = map.epolls.get_mut(&epfd).ok_or(EBADF)?;
-        virtual_events.retain(|(key, generation, observed, event)| {
-            ep.regs.get(key).is_some_and(|r| {
-                r.armed
-                    && r.generation == *generation
-                    && tokens.holds(r.id)
-                    && eligible_bits(r, event.events, *observed) != 0
-            })
-        });
-        let mut output = Vec::with_capacity(available);
-        let mut delivered = Vec::new();
-        for (key, generation, observed, event) in virtual_events {
-            if output.len() == available {
-                break;
+        if !map.epolls.contains_key(&epfd) {
+            return Err(EBADF);
+        }
+        // Wake the registrations of every socket that changed; past the
+        // change log's reach, every registration.
+        let woken: Vec<(i32, u64)> = if reply.value != 0 {
+            map.epolls[&epfd].regs.keys().copied().collect()
+        } else {
+            reply
+                .ready
+                .iter()
+                .flat_map(|&(id, ..)| map.watched.range(Registry::span(id)))
+                .filter(|&&(_, watcher, _)| watcher == epfd)
+                .map(|&(id, _, fd)| (fd, id))
+                .collect()
+        };
+        for key in woken {
+            map.queue(epfd, key);
+        }
+        let ep = map.epolls.get_mut(&epfd).unwrap();
+        ep.changes = reply.timeout_us;
+        enum Action {
+            // An entry its registration no longer owns.
+            Stale,
+            Drop,
+            Keep,
+            Deliver([u64; 5], u32),
+        }
+        let entries: Vec<_> = ep.ready.drain(..).collect();
+        let mut plan = Vec::with_capacity(entries.len());
+        let mut output = Vec::new();
+        let mut unprobed = false;
+        for &(key, generation) in &entries {
+            let Some(r) = ep.queued(key, generation) else {
+                plan.push(Action::Stale);
+                continue;
+            };
+            if !r.armed || !tokens.of(r.id).any(|(fd, t)| t.matches(fd)) {
+                plan.push(Action::Drop);
+                continue;
             }
+            let Some(&(bits, observed)) = states.get(&r.id) else {
+                // Queued since the probe: asked about next round.
+                unprobed = true;
+                plan.push(Action::Keep);
+                continue;
+            };
+            if bits < 0 {
+                plan.push(Action::Drop); // Last alias closed during the query.
+                continue;
+            }
+            let value = bits as u32 | if tokens.buffered(r.id) != 0 { EPOLLIN as u32 } else { 0 };
+            let ready = value & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
             // Like poll, report all currently ready requested bits once an
             // event triggers delivery. Only consume classes actually eligible
             // for this exclusive claim (e.g. a new ERR may accompany old OUT).
-            let claim = eligible_bits(&ep.regs[&key], event.events, observed);
-            output.push(event);
-            delivered.push((key, generation, observed, claim));
+            let claim = eligible_bits(r, ready, observed);
+            if claim == 0 {
+                plan.push(Action::Drop);
+            } else if output.len() == available {
+                plan.push(Action::Keep);
+            } else {
+                output.push(epoll_event {
+                    events: ready,
+                    u64: r.data,
+                });
+                plan.push(Action::Deliver(observed, claim));
+            }
         }
         if let Err(e) = store_array(p.wrapping_add(native_count), &output) {
+            // Nothing consumed: the queue stays as it was.
+            map.epolls.get_mut(&epfd).unwrap().ready.extend(entries);
             return if native_count != 0 {
                 Ok(native_count as i64)
             } else {
                 Err(e)
             };
         }
-        for (key, generation, observed, ready) in delivered {
-            let exclusive = map
-                .epolls
-                .get(&epfd)
-                .and_then(|ep| ep.regs.get(&key))
-                .is_some_and(|r| {
-                    r.generation == generation && r.events & EPOLLEXCLUSIVE as u32 != 0
-                });
-            if exclusive {
-                claim_exclusive(&mut map, epfd, key, observed, ready);
-            }
-            if let Some(r) = map
-                .epolls
-                .get_mut(&epfd)
-                .and_then(|ep| ep.regs.get_mut(&key))
-                && r.generation == generation
-            {
-                r.seen = Some(observed);
-                if r.events & EPOLLONESHOT as u32 != 0 {
-                    r.armed = false;
+        for (&(key, generation), action) in entries.iter().zip(plan) {
+            match action {
+                Action::Stale => (),
+                Action::Drop => map.epolls.get_mut(&epfd).unwrap().regs.get_mut(&key).unwrap().queued = false,
+                Action::Keep => map.epolls.get_mut(&epfd).unwrap().ready.push_back((key, generation)),
+                Action::Deliver(observed, claim) => {
+                    if map.epolls[&epfd].regs[&key].events & EPOLLEXCLUSIVE as u32 != 0 {
+                        claim_exclusive(&mut map, epfd, key, observed, claim);
+                    }
+                    let ep = map.epolls.get_mut(&epfd).unwrap();
+                    let r = ep.regs.get_mut(&key).unwrap();
+                    r.seen = Some(observed);
+                    if r.events & EPOLLONESHOT as u32 != 0 {
+                        r.armed = false;
+                    }
+                    // A level-triggered registration stays on the ready list
+                    // and is asked about again, as Linux's ep_send_events
+                    // puts it back on rdllist.
+                    if r.armed && r.events & EPOLLET as u32 == 0 {
+                        ep.ready.push_back((key, generation));
+                    } else {
+                        r.queued = false;
+                    }
                 }
             }
         }
         drop(map);
         drop(tokens);
         let delivered = native_count + output.len();
+        let wait = if delivered != 0 || unprobed || timeout == 0 {
+            0
+        } else if deadline.is_none() {
+            10
+        } else {
+            remaining(deadline).clamp(0, 10)
+        };
         // Virtual-first must finish faultable copyout before consuming native
         // ONESHOT. Let the kernel copy directly to the remaining caller buffer.
         let native_cap = cap - delivered;
@@ -1040,7 +1129,8 @@ mod tests {
             dev: 0,
             ino: 0,
             generation: 1,
-            cursor: 0,
+            ready: VecDeque::new(),
+            changes: 0,
             native_first: false,
             regs: BTreeMap::from([(
                 (4, 42),
@@ -1053,6 +1143,7 @@ mod tests {
                     seen: None,
                     exclusive_grant: 0,
                     exclusive_seen: [None; 5],
+                    queued: false,
                 },
             )]),
         }

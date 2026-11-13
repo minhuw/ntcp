@@ -138,6 +138,16 @@ impl Tokens {
     fn holds(&self, id: u64) -> bool {
         self.of(id).next().is_some()
     }
+    // Bytes a reader staged from socket `id` and the transport no longer
+    // holds: readable, though the owner's readiness does not count them.
+    fn buffered(&self, id: u64) -> usize {
+        self.of(id).next().map_or(0, |(_, t)| {
+            t.input
+                .ready
+                .load(Ordering::Acquire)
+                .saturating_sub(t.input.pending.load(Ordering::Acquire))
+        })
+    }
 }
 // Native close/dup use an atomic read-side guard, never a registry lock. A
 // writer pins classification through the syscall and alias publication.
@@ -562,17 +572,7 @@ fn owned(fd: i32) -> Result<Option<u64>> {
 }
 fn call(id: u64, op: Op) -> Result<Reply> {
     let buffered = if matches!(op, Op::Ready | Op::Available) {
-        TOKENS
-            .lock()
-            .map_err(|_| EIO)?
-            .of(id)
-            .next()
-            .map_or(0, |(_, t)| {
-                t.input
-                    .ready
-                    .load(Ordering::Acquire)
-                    .saturating_sub(t.input.pending.load(Ordering::Acquire))
-            })
+        TOKENS.lock().map_err(|_| EIO)?.buffered(id)
     } else {
         0
     };
@@ -2254,13 +2254,6 @@ fn finish_close(last: Option<u64>) -> Result<()> {
         call(id, Op::Close)?;
     }
     Ok(())
-}
-fn live_id(id: u64) -> Result<bool> {
-    Ok(TOKENS
-        .lock()
-        .map_err(|_| EIO)?
-        .of(id)
-        .any(|(fd, t)| t.matches(fd)))
 }
 fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
     duplicate_registered(fd, new, cmd, arg).map(|(fd, _)| fd)

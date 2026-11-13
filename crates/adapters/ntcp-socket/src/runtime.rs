@@ -116,6 +116,9 @@ pub enum Op {
     Get(i32, i32),
     Name(bool),
     Ready,
+    // An epoll_wait's probe: the sockets whose published readiness changed
+    // since change number `since`, and the readiness of sockets `probe`.
+    ReadyChanges(u64, Vec<u64>),
     Available,
     Inq(usize),
 }
@@ -124,6 +127,8 @@ pub struct Reply {
     pub value: i32,
     pub timeout_us: u64,
     pub readiness_generations: [u64; 5],
+    // Op::ReadyChanges: (socket, readiness bits or -1 for none, generations).
+    pub ready: Vec<(u64, i32, [u64; 5])>,
     pub bytes: Vec<u8>,
     pub addr: Option<SocketAddr>,
     #[cfg(feature = "packet-test")]
@@ -478,6 +483,8 @@ struct Socket {
     zone: Option<address_policy::Zone>,
     readiness: i32,
     readiness_generations: [u64; 5],
+    // The generations at the last change logged (`Owner::change_log`).
+    published: [u64; 5],
     keepalive: bool,
     idle: i32,
     interval: i32,
@@ -572,6 +579,7 @@ impl Socket {
             zone: None,
             readiness: 0,
             readiness_generations: [0; 5],
+            published: [0; 5],
             keepalive: false,
             idle: 7200,
             interval: 75,
@@ -732,6 +740,10 @@ impl<T: PartialEq> PartialEq for ByConnection<T> {
 // through the sockets as Linux links a socket into a wait queue: joining
 // one never allocates, and a socket leaves one in constant time.
 const LISTS: usize = 4;
+// Readiness changes kept for epoll instances to read (`Owner::change_log`):
+// one that has not looked for more than this many rescans its
+// registrations instead.
+const CHANGE_LOG: usize = 4096;
 // Readiness may have changed since the last refresh (`Owner::events`).
 const CHANGED: usize = 0;
 // A finish_send deferred while its output is held (`Socket::send_finish`).
@@ -875,6 +887,12 @@ struct Owner {
     // output (whose release has no event). The first of the socket lists
     // (`CHANGED`), whose heads these are.
     lists: Heads,
+    // The sockets whose published readiness (bits or generations) changed,
+    // the last CHANGE_LOG of them, numbered by `changes`: what an epoll
+    // instance reads since its last look, as Linux's ep_poll_callback adds
+    // only a woken file to its epoll's ready list.
+    change_log: Vec<u64>,
+    changes: u64,
     // Sockets whose options enable software receive timestamps.
     rx_software: usize,
     // The `io.*` port's address: the runtime's address family and the
@@ -1327,6 +1345,8 @@ impl Owner {
             connection_holders: HashMap::new(),
             listener_holders: HashMap::new(),
             lists: [None; LISTS],
+            change_log: Vec::new(),
+            changes: 0,
             rx_software: 0,
             local,
             clock,
@@ -2204,7 +2224,8 @@ impl Owner {
                 )
                 && let Some((_, listener, _, _, _)) =
                     self.child_timeouts.get(cid)
-                && let Some(s) = self.sockets.get_mut(listener)
+                && let listener = *listener
+                && let Some(s) = self.sockets.get_mut(&listener)
                 && s.acceptable
             {
                 // A child joining a ready accept queue is a Linux ET wake.
@@ -2212,6 +2233,7 @@ impl Owner {
                 // too; an edge observer compares generations, so the second
                 // increment adds no wake.
                 s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
+                self.touch(listener);
             }
             if Some(cid) == new_child
                 && let Some((tos, discover, _, mark, reuse)) = listener_options
@@ -2329,6 +2351,10 @@ impl Owner {
                     assert_eq!(
                         bits, s.readiness,
                         "readiness of socket {id} changed with nothing to refresh it"
+                    );
+                    assert_eq!(
+                        s.published, s.readiness_generations,
+                        "readiness generations of socket {id} moved unpublished"
                     );
                 }
             }
@@ -2886,8 +2912,43 @@ impl Owner {
                 s.readiness_generations[i] = s.readiness_generations[i].wrapping_add(1);
             }
         }
+        let changed = bits != s.readiness || s.readiness_generations != s.published;
         s.readiness = bits;
+        s.published = s.readiness_generations;
+        if changed {
+            self.log_change(id);
+        }
         Ok(bits)
+    }
+    fn log_change(&mut self, id: u64) {
+        let at = (self.changes % CHANGE_LOG as u64) as usize;
+        if at == self.change_log.len() {
+            self.change_log.push(id);
+        } else {
+            self.change_log[at] = id;
+        }
+        self.changes += 1;
+    }
+    // The sockets whose readiness changed since change `since` and the
+    // readiness of each of `probe`, each socket once; None once the log no
+    // longer reaches back to `since`.
+    fn ready_changes(&self, since: u64, probe: Vec<u64>) -> Option<Vec<(u64, i32, [u64; 5])>> {
+        let missed = self.changes.checked_sub(since)?;
+        if missed > CHANGE_LOG as u64 {
+            return None;
+        }
+        let logged = (since..self.changes).map(|n| self.change_log[(n % CHANGE_LOG as u64) as usize]);
+        let mut seen = HashSet::new();
+        Some(
+            logged
+                .chain(probe)
+                .filter(|&id| seen.insert(id))
+                .map(|id| match self.sockets.get(&id) {
+                    Some(s) => (id, s.readiness, s.readiness_generations),
+                    None => (id, -1, [0; 5]),
+                })
+                .collect(),
+        )
     }
     //= https://www.rfc-editor.org/rfc/rfc7413#appendix-A.2
     //# The application only needs to enable the reception of Fast Open requests via a new TCP_FASTOPEN
@@ -3017,6 +3078,16 @@ impl Owner {
             _ => (),
         }
         self.events();
+        if let Op::ReadyChanges(since, probe) = op {
+            // The pass above refreshed every socket queued for it, so each
+            // socket's readiness is current (debug-checked there).
+            match self.ready_changes(since, probe) {
+                Some(ready) => out.ready = ready,
+                None => out.value = 1,
+            }
+            out.timeout_us = self.changes;
+            return Ok(out);
+        }
         if let Op::New(flags) | Op::NewDomain(_, flags) = op {
             let domain = if let Op::NewDomain(domain, _) = op {
                 domain
@@ -4350,7 +4421,8 @@ impl Owner {
             | Op::NewDomain(..)
             | Op::SetFastOpenClientEnabled(_)
             | Op::SetFastOpenClientDefaultPolicy(_)
-            | Op::SetDestinationRoute(..) => {
+            | Op::SetDestinationRoute(..)
+            | Op::ReadyChanges(..) => {
                 unreachable!()
             }
             #[cfg(feature = "packet-test")]
