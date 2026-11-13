@@ -237,6 +237,9 @@
           pkgs.redis
           # duvet/rfc-report.sh.
           duvet
+          # Profiling the stack's cost per request (perf record/stat, callgrind).
+          pkgs.perf
+          pkgs.valgrind
         ];
         buildInputs = [
           dpdk-mlx5
