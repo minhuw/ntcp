@@ -1254,6 +1254,15 @@ impl ReceiveBuffer {
             ));
             return;
         }
+        // Nothing is retained beyond the contiguous prefix, so data at or
+        // above the frontier duplicates nothing: as Linux tcp_data_queue sets
+        // a D-SACK only below rcv_nxt or over its out-of-order queue.
+        if self.occupied == self.contiguous_len {
+            debug_assert!(
+                self.find_presence(self.contiguous_len + start as usize, true) == self.data.len()
+            );
+            return;
+        }
         let left = self.find_presence(self.contiguous_len + start as usize, true);
         let right = self
             .find_presence(left, false)
@@ -1280,7 +1289,9 @@ impl ReceiveBuffer {
     // slot, and the prefix is all present), as Linux tests its out-of-order
     // queue for emptiness.
     pub(crate) fn has_sack_blocks(&self) -> bool {
-        self.dsack.is_some() || self.occupied > self.contiguous_len
+        let any = self.dsack.is_some() || self.occupied > self.contiguous_len;
+        debug_assert!(any || self.walk_sack_blocks(4) == [None; 4]);
+        any
     }
 
     //= https://www.rfc-editor.org/rfc/rfc2018#section-4
@@ -1334,6 +1345,13 @@ impl ReceiveBuffer {
     //# the sequence numbers for the duplicate segment that triggers the
     //# acknowledgement.
     pub(crate) fn sack_blocks(&self, max_blocks: usize) -> [Option<(u32, u32)>; 4] {
+        if !self.has_sack_blocks() {
+            return [None; 4];
+        }
+        self.walk_sack_blocks(max_blocks)
+    }
+
+    fn walk_sack_blocks(&self, max_blocks: usize) -> [Option<(u32, u32)>; 4] {
         let mut blocks = [None; 4];
         let limit = max_blocks.min(blocks.len());
         if limit == 0 {
@@ -2271,7 +2289,13 @@ mod tests {
             );
         }
         assert_eq!(recv.occupied, occupied_data(recv).iter().flatten().count());
-        assert_eq!(recv.has_sack_blocks(), recv.sack_blocks(1)[0].is_some());
+        assert_eq!(
+            recv.has_sack_blocks(),
+            recv.walk_sack_blocks(1)[0].is_some()
+        );
+        for limit in 0..=5 {
+            assert_eq!(recv.sack_blocks(limit), recv.walk_sack_blocks(limit));
+        }
         assert_summaries(recv);
     }
 
@@ -3551,6 +3575,55 @@ mod tests {
                 (recv.dsack, recv.sack_blocks(4), slots),
             )
         )
+    }
+
+    // Mostly in-order arrivals keep the out-of-order area empty, where the
+    // report takes its fast path: blocks and D-SACKs must equal the walk's
+    // (record_duplicate asserts its own skip in debug builds).
+    #[test]
+    fn in_order_sack_report_fast_path_matches_the_walk() {
+        let mut state = 0x7f4a_7c15_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        let (mut fast, mut walked) = (0, 0);
+        for capacity in [64, 1000, 4096] {
+            let start = Seq(u32::MAX - 700);
+            let mut recv = ReceiveBuffer::new(start, capacity).unwrap();
+            for _ in 0..4000 {
+                match next(20) {
+                    0..=13 => {
+                        let sequence = match next(10) {
+                            0 => recv.next().wrapping_add((next(30) as u32).wrapping_neg()),
+                            1 => recv.next().wrapping_add(1 + next(capacity / 2) as u32),
+                            _ => recv.next(),
+                        };
+                        let payload = alloc::vec![7; next(48)];
+                        receive_packet(&mut recv, sequence, &payload);
+                    }
+                    14..=17 => {
+                        let mut out = alloc::vec![0; next(capacity + 1)];
+                        recv.read(&mut out);
+                    }
+                    _ => {
+                        if let Some(first) = recv.sack_blocks(4)[0] {
+                            recv.commit_sack(first);
+                        }
+                        recv.commit_report();
+                    }
+                }
+                if recv.has_sack_blocks() {
+                    walked += 1;
+                } else {
+                    fast += 1;
+                }
+                assert_ranges(&recv);
+            }
+        }
+        assert!(fast > 2000 && walked > 2000, "{fast} {walked}");
     }
 
     #[test]

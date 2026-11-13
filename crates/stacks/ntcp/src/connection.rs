@@ -9506,7 +9506,16 @@ impl Connection {
         let mut sack_option_len = 0;
         let mut sack_first = None;
         let mut sack_limited = false;
-        if reset.is_none() && !syn && live && self.sack_send && !self.sack_omit {
+        // With no out-of-order data and no duplicate to report every budget
+        // yields no block, so the option is neither sized nor built, as
+        // Linux tcp_established_options adds SACK only for eff_sacks != 0.
+        if reset.is_none()
+            && !syn
+            && live
+            && self.sack_send
+            && !self.sack_omit
+            && self.receive.has_sack_blocks()
+        {
             let control_payload = usize::from(
                 probe || keepalive && self.config.keepalive.is_some_and(|k| k.send_garbage),
             );
