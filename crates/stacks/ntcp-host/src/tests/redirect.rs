@@ -183,10 +183,14 @@ fn ipv4_redirects_move_the_destination_and_notify_tcp_and_udp() {
         let before = a.0.udp_path_limits(&a.1, flow, None).unwrap();
         assert_eq!(a.0.udp_path_change(flow).unwrap(), None);
         let now = 100 * SECOND;
+        // The connection's egress decision holds until the Redirect.
+        a.0.refresh(&mut a.1, id).unwrap();
+        assert!(a.0.dst_held(&a.1, id));
         assert_eq!(
             dispatch(&mut a, now, &redirect4(&data, code, "192.0.2.253")),
             RedirectOutcome::Installed
         );
+        assert!(!a.0.dst_held(&a.1, id));
         let report = a.0.service_changes(&mut a.1, now).unwrap();
         assert_eq!((report.applied, report.failed), (2, 0));
         let moved = ResolvedNextHop::Address(unscoped(v4("192.0.2.253")));
@@ -1438,6 +1442,8 @@ fn ipv6_redirect_ends_when_its_sender_is_unreachable() {
     );
     a.0.service_changes(&mut a.1, 3).unwrap();
     assert_eq!(next_hop(&a, id), scoped(&a, "fe80::2"));
+    a.0.refresh(&mut a.1, id).unwrap();
+    assert!(a.0.dst_held(&a.1, id));
     let mut out = [0; 128];
     let mut now = 3;
     while a.0.neighbor(link, v6("fe80::1")).is_some() && now < 30 * SECOND {
@@ -1449,6 +1455,8 @@ fn ipv6_redirect_ends_when_its_sender_is_unreachable() {
         now += SECOND / 4;
     }
     assert_eq!(a.0.neighbor(link, v6("fe80::1")), None);
+    // The override's end drops the egress decision checked under it.
+    assert!(!a.0.dst_held(&a.1, id));
     // fe80::2 itself is untouched.
     assert_eq!(
         a.0.neighbor(link, v6("fe80::2")),
@@ -1476,6 +1484,8 @@ fn admin_estimate_lowers_a_redirected_binding_at_once() {
         moved.snapshot.key().next_hop(),
         ResolvedNextHop::Address(unscoped(v4("192.0.2.253")))
     );
+    a.0.refresh(&mut a.1, id).unwrap();
+    assert!(a.0.dst_held(&a.1, id));
     let before = a.1.transport_ceilings(id).unwrap().effective_mss;
     // Below the connection's current packets.
     let estimate = before as u32 + 40 - 100;
@@ -1490,6 +1500,7 @@ fn admin_estimate_lowers_a_redirected_binding_at_once() {
     .unwrap();
     let binding = a.0.binding(id).unwrap();
     assert!(!a.0.paths().is_dirty(binding.client).unwrap());
+    assert!(!a.0.dst_held(&a.1, id));
     assert_eq!(binding.snapshot.ip_packet_budget(), Ok(estimate));
     assert!(a.1.transport_ceilings(id).unwrap().effective_mss <= before - 100);
 }

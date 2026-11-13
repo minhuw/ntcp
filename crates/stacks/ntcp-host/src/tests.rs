@@ -8,6 +8,7 @@ mod correlation;
 mod destination;
 mod discovery;
 mod dispatch;
+mod egress_dst;
 mod emitter;
 mod extensions;
 mod fanout;

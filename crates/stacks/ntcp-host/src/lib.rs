@@ -6,8 +6,9 @@ use core::net::IpAddr;
 use ntcp::{
     ConnectionId, CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError,
     ExpectedRegistrations, Instant, IpMetadata, Ipv4Options, Ipv4RegistrationPlan, ManagedError,
-    NetworkError, OutgoingIpv4Options, PathFactoryRequest, PathProvider, PmtuFeedback,
-    PreparedFactory, PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt, TransmitGroup,
+    ManagedRoute, NetworkError, OutgoingIpv4Options, PathFactoryRequest, PathProvider,
+    PmtuFeedback, PreparedFactory, PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt,
+    TransmitGroup,
 };
 use ntcp_icmp::{FeedbackKind, QuotedTransport};
 pub use ntcp_path as path;
@@ -558,6 +559,8 @@ struct Binding {
     // The connection's local and remote ports, which with its path's
     // addresses name it in a quote (`redirected_path`).
     ports: (u16, u16),
+    // The egress decision `refresh` last checked in full for `prepared`.
+    dst: Option<Dst>,
 }
 impl Binding {
     fn rebind(&mut self, prepared: PreparedPath, now: Instant) {
@@ -565,6 +568,49 @@ impl Binding {
             self.moved = Some(now);
         }
         self.prepared = prepared;
+        self.dst = None;
+    }
+}
+// A connection's checked egress decision, as Linux keeps a socket's route
+// in sk_dst_cache and revalidates it on each transmit only by its cookie
+// (__sk_dst_check: ipv4_dst_check compares the route's genid,
+// ip6_dst_check the fib6 serial number of the socket's cookie):
+// `refresh` found the binding current and its checks passed (forwarding
+// selection, port and forwarding mode, the connection's complete headers
+// within the path budget, the observation acknowledged) for exactly these
+// inputs. The path's stamp is the cookie: every change of a path's
+// selection, budget or validity gives a new one (route, source and link
+// changes, PMTU decreases and increases, Redirects and their end), and a
+// rebind gives the binding a new client. The connection's own route
+// inputs (class, scope, forwarding destination after a peer's return
+// route, IP header length) are compared, and the port by its slot, since
+// ports are immutable while registered. Debug builds repeat the full
+// checks on every use (`current_checks`).
+#[derive(Clone, Copy)]
+struct Dst {
+    stamp: path::ChangeStamp,
+    client: path::ClientId,
+    dscp: u8,
+    zone: Option<LinkId>,
+    forwarding_destination: IpAddr,
+    ip_header_len: u16,
+    port: usize,
+}
+impl Dst {
+    fn holds(
+        &self,
+        prepared: &PreparedPath,
+        stamp: path::ChangeStamp,
+        current: &ManagedRoute,
+    ) -> bool {
+        self.stamp == stamp
+            && prepared.snapshot.stamp() == stamp
+            && current.stamp == stamp
+            && self.client == prepared.client
+            && self.dscp == current.dscp
+            && self.zone == current.zone
+            && self.forwarding_destination == current.forwarding_destination
+            && self.ip_header_len == current.ip_header_len
     }
 }
 // A planned open's checked plan, whose options hold the connection's
@@ -992,12 +1038,13 @@ impl Host {
         Ok(IngressContext { link })
     }
     fn port(&self, link: LinkId) -> Result<Port, Error> {
+        self.port_slot(link).map(|slot| self.ports[slot].unwrap())
+    }
+    fn port_slot(&self, link: LinkId) -> Result<usize, Error> {
         self.paths.link(link)?;
         self.ports
             .iter()
-            .flatten()
-            .find(|port| port.link == link)
-            .copied()
+            .position(|port| port.is_some_and(|port| port.link == link))
             .ok_or(Error::InvalidContext)
     }
     pub fn receive_capabilities(
@@ -1043,14 +1090,22 @@ impl Host {
         Ok(())
     }
     fn forwarding(&self, snapshot: &PathSnapshot) -> Result<Port, Error> {
+        self.forwarding_slot(snapshot)
+            .map(|slot| self.ports[slot].unwrap())
+    }
+    // `forwarding`, naming the port by its slot.
+    fn forwarding_slot(&self, snapshot: &PathSnapshot) -> Result<usize, Error> {
         self.paths.validate_snapshot(snapshot)?;
         if snapshot.key().destination().address().is_ipv6() && snapshot.first_hop_mtu() < 1280 {
             return Err(Error::Unsupported);
         }
-        let port = self.port(snapshot.key().link())?;
-        match (port.forwarding, snapshot.key().next_hop()) {
-            (Forwarding::Forwarder(a), ResolvedNextHop::Forwarder(b)) if a == b => Ok(port),
-            (Forwarding::IpNextHop, ResolvedNextHop::Address(_)) => Ok(port),
+        let slot = self.port_slot(snapshot.key().link())?;
+        match (
+            self.ports[slot].unwrap().forwarding,
+            snapshot.key().next_hop(),
+        ) {
+            (Forwarding::Forwarder(a), ResolvedNextHop::Forwarder(b)) if a == b => Ok(slot),
+            (Forwarding::IpNextHop, ResolvedNextHop::Address(_)) => Ok(slot),
             _ => Err(Error::Unsupported),
         }
     }
@@ -1225,30 +1280,47 @@ impl Host {
         self.check_endpoint(endpoint)?;
         let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
         let current = endpoint.managed_route(owner)?;
-        let mut client = self.bindings[index].as_ref().unwrap().prepared.client;
+        self.refresh_route(endpoint, owner, index, current)
+    }
+    // `refresh` of `owner`'s binding record `index`, the connection's route
+    // as the Endpoint reports it now being `current`.
+    fn refresh_route(
+        &mut self,
+        endpoint: &mut Endpoint,
+        owner: ConnectionId,
+        index: usize,
+        current: ManagedRoute,
+    ) -> Result<PreparedPath, Error> {
+        let binding = self.bindings[index].as_ref().unwrap();
+        let mut client = binding.prepared.client;
         if current.client != client {
             return Err(Error::InvalidContext);
         }
-        let via = scoped(current.forwarding_destination, current.zone)?;
-        // The Host stored, and the Endpoint applied under the path's class,
-        // the client's current observation (a stamp names one snapshot) on
-        // the outgoing selection the connection still uses: nothing to
-        // rebind or apply, only the checks of any use.
-        let stamp = self.paths.stamp(client)?;
-        let stored = &self.bindings[index].as_ref().unwrap().prepared;
-        if stored.snapshot.stamp() == stamp
-            && current.stamp == stamp
-            && current.dscp == stored.snapshot.key().dscp().value()
-            && stored.snapshot.status() == PathStatus::Valid
-            && self.forwards_via(stored.snapshot.key(), via)
-        {
-            let prepared = *stored;
-            debug_assert_eq!(self.paths.snapshot(client), Ok(prepared.snapshot));
-            self.forwarding(&prepared.snapshot)?;
-            endpoint.validate_path_budget(owner, &prepared)?;
+        // The decision checked for these inputs, while its cookie holds.
+        if let Some(dst) = self.held_dst(binding, &current) {
+            debug_assert_eq!(
+                self.current_checks(endpoint, owner, &binding.prepared, &current),
+                Ok(Some(dst.port))
+            );
+            debug_assert_eq!(self.paths.is_dirty(client), Ok(false));
+            return Ok(binding.prepared);
+        }
+        if let Some(port) = self.current_checks(endpoint, owner, &binding.prepared, &current)? {
+            let prepared = binding.prepared;
+            let stamp = prepared.snapshot.stamp();
             self.paths.acknowledge(client, stamp)?;
+            self.bindings[index].as_mut().unwrap().dst = Some(Dst {
+                stamp,
+                client,
+                dscp: current.dscp,
+                zone: current.zone,
+                forwarding_destination: current.forwarding_destination,
+                ip_header_len: current.ip_header_len,
+                port,
+            });
             return Ok(prepared);
         }
+        let via = scoped(current.forwarding_destination, current.zone)?;
         let mut snapshot = self.paths.snapshot(client)?;
         // A validated peer return-route update need not invalidate the old
         // routing entry, so compare the actual outgoing selection as well.
@@ -1284,6 +1356,56 @@ impl Host {
         self.bindings[index].as_mut().unwrap().rebind(prepared, now);
         self.paths.acknowledge(prepared.client, snapshot.stamp())?;
         Ok(prepared)
+    }
+
+    // `binding`'s egress decision, if it still holds for the connection's
+    // route `current`.
+    fn held_dst(&self, binding: &Binding, current: &ManagedRoute) -> Option<Dst> {
+        let dst = binding.dst?;
+        let stamp = self.paths.stamp(binding.prepared.client).ok()?;
+        (dst.holds(&binding.prepared, stamp, current)
+            && self.ports[dst.port]
+                .is_some_and(|port| port.link == binding.prepared.snapshot.key().link()))
+        .then_some(dst)
+    }
+    // Whether `refresh` of `owner` would take its held egress decision now.
+    #[cfg(test)]
+    fn dst_held(&self, endpoint: &Endpoint, owner: ConnectionId) -> bool {
+        let binding = self.bindings[self.binding_index(owner).unwrap()]
+            .as_ref()
+            .unwrap();
+        self.held_dst(binding, &endpoint.managed_route(owner).unwrap())
+            .is_some()
+    }
+
+    // The checks `refresh` makes of a binding `prepared` whose observation
+    // is current, the connection's route being `current`: its port's slot
+    // when they pass, None when the binding is not current (to be brought
+    // up to date). The Host stored, and the Endpoint applied under the
+    // path's class, the client's current observation (a stamp names one
+    // snapshot) on the outgoing selection the connection still uses:
+    // nothing to rebind or apply, only the checks of any use. A pure read.
+    fn current_checks(
+        &self,
+        endpoint: &Endpoint,
+        owner: ConnectionId,
+        prepared: &PreparedPath,
+        current: &ManagedRoute,
+    ) -> Result<Option<usize>, Error> {
+        let via = scoped(current.forwarding_destination, current.zone)?;
+        let stamp = self.paths.stamp(prepared.client)?;
+        if prepared.snapshot.stamp() != stamp
+            || current.stamp != stamp
+            || current.dscp != prepared.snapshot.key().dscp().value()
+            || prepared.snapshot.status() != PathStatus::Valid
+            || !self.forwards_via(prepared.snapshot.key(), via)
+        {
+            return Ok(None);
+        }
+        debug_assert_eq!(self.paths.snapshot(prepared.client), Ok(prepared.snapshot));
+        let port = self.forwarding_slot(&prepared.snapshot)?;
+        endpoint.validate_path_budget(owner, prepared)?;
+        Ok(Some(port))
     }
 
     /// Atomic live routing-class change. Callers serialize socket-policy state
@@ -3391,6 +3513,7 @@ impl PathProvider for Host {
             moved: None,
             ports,
             prepared,
+            dst: None,
             registration: plan.map(|plan| Registration {
                 plan,
                 authorized: snapshot.key(),

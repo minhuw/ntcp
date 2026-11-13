@@ -147,7 +147,11 @@ fn passive_later_completed_route_changes_actual_wire_output_and_host_key() {
     assert_eq!(&bytes, b"first");
     a.1.write(client, b"later").unwrap();
     let later = emit(&mut a.0, &mut a.1, 14).unwrap();
+    // The peer's later route changes the forwarding destination the
+    // server's egress decision was checked for.
+    assert!(b.0.dst_held(&b.1, server));
     receive(&mut b, 15, &later, &LATER);
+    assert!(!b.0.dst_held(&b.1, server));
     b.1.write(server, b"reply").unwrap();
     let (attempt, _, frame) = selected(&mut b.1, 16).unwrap();
     // Check core's actual encoded selection before asking Host for authority.
@@ -172,6 +176,30 @@ fn passive_later_completed_route_changes_actual_wire_output_and_host_key() {
         a.1.read(client, &mut bytes),
         Err(EndpointError::Connection(ntcp::Error::WouldBlock))
     );
+}
+
+// A later return route through the same first hop, but longer, changes only
+// the server's IP header: the egress decision checked for the shorter one
+// is dropped and checked again, and output carries the new route.
+#[test]
+fn later_route_through_the_same_first_hop_checks_the_longer_header() {
+    let mut cfg = config(2);
+    cfg.ipv4_options_enabled = true;
+    let (mut a, mut b, client, server, _) = passive_pair(&cfg);
+    a.1.write(client, b"first").unwrap();
+    let first = emit(&mut a.0, &mut a.1, 10).unwrap();
+    receive(&mut b, 11, &first, &FIRST);
+    let ack = emit(&mut b.0, &mut b.1, 12).unwrap();
+    assert_wire(&ack, addresses(false).0, &[9, 8]);
+    receive(&mut a, 13, &ack, &FIRST);
+    assert!(b.0.dst_held(&b.1, server));
+    a.1.write(client, b"later").unwrap();
+    let later = emit(&mut a.0, &mut a.1, 14).unwrap();
+    receive(&mut b, 15, &later, &[7, 8, 9]);
+    assert!(!b.0.dst_held(&b.1, server));
+    let ack = emit(&mut b.0, &mut b.1, 16).unwrap();
+    assert_wire(&ack, addresses(false).0, &[9, 8, 7]);
+    assert!(b.0.dst_held(&b.1, server));
 }
 
 #[test]

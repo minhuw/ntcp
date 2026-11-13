@@ -170,6 +170,8 @@ pub struct ManagedRoute {
     pub zone: Option<ntcp_path::LinkId>,
     /// See `ManagedPathInfo::forwarding_destination`.
     pub forwarding_destination: core::net::IpAddr,
+    /// See `ManagedPathInfo::ip_header_len`.
+    pub ip_header_len: u16,
     /// See `ManagedPathInfo::ordinary_ip_budget`.
     pub ordinary_ip_budget: u32,
 }

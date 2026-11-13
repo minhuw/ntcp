@@ -856,6 +856,7 @@ impl Endpoint {
                 .and_then(|route| route.hops().first().copied())
                 .map(IpAddr::V4)
                 .unwrap_or(connection.tuple().remote.ip()),
+            ip_header_len: connection.ip_header_len(),
             ordinary_ip_budget: connection.path_payload_limit() as u32
                 + u32::from(connection.ip_header_len()),
         })
