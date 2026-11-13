@@ -75,6 +75,13 @@ impl<P: PacketIo> Network<P> {
             ));
         }
     }
+    /// Advances the stack: receives, runs timers and transmits. A Network has
+    /// no thread of its own, so protocol work happens only inside the caller's
+    /// `drive`, unlike Linux, whose softirq and timers run whatever the
+    /// application does. An embedding that busy-polls to keep latency low
+    /// therefore pays for every wakeup of another thread sharing its CPU: the
+    /// preempted owner stops receiving and acknowledging until it runs again
+    /// (for example an application timer thread that wakes once per request).
     pub fn drive(&mut self, now: Instant, budget: WorkBudget) -> Result<DriveReport> {
         // The drive's look at the inbox of a member of shared flows begins
         // before anything that can fail: every handoff from here on wakes
