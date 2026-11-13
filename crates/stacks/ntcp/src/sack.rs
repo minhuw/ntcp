@@ -160,7 +160,25 @@ impl Scoreboard {
     //# sender will turn on the SACKed flags for all segments in the retransmission
     //# queue that are wholly contained within that block. This requires
     //# straightforward sequence number comparisons.
+    #[inline]
     pub(crate) fn update_with_packet_ack(
+        &mut self,
+        ack: Seq,
+        packet_ack: Seq,
+        high_data: Seq,
+        blocks: &[Option<(u32, u32)>; 4],
+    ) -> UpdateOutcome {
+        // An ACK without SACK blocks over an empty scoreboard records
+        // nothing but its cumulative edge, as Linux tcp_ack enters
+        // tcp_sacktag_write_queue only for an ACK carrying SACK blocks.
+        if self.len == 0 && blocks.iter().all(Option::is_none) {
+            self.ack = ack;
+            return UpdateOutcome::default();
+        }
+        self.walk_update(ack, packet_ack, high_data, blocks)
+    }
+
+    fn walk_update(
         &mut self,
         ack: Seq,
         packet_ack: Seq,
@@ -428,7 +446,20 @@ impl Scoreboard {
             .filter(move |&(left, _)| self.is_lost(left, mss))
     }
 
+    #[inline]
     pub(crate) fn unsacked_bytes(&self, start: Seq, end: Seq) -> u32 {
+        // Nothing SACKed: the one hole is the whole span (none past half
+        // the sequence space), as Linux reads sacked_out == 0.
+        if self.len == 0 {
+            let span = end.distance_from(start);
+            let bytes = if span < HALF_SPACE { span } else { 0 };
+            debug_assert_eq!(bytes, self.walk_unsacked_bytes(start, end));
+            return bytes;
+        }
+        self.walk_unsacked_bytes(start, end)
+    }
+
+    fn walk_unsacked_bytes(&self, start: Seq, end: Seq) -> u32 {
         self.holes(start, end)
             .map(|(left, right)| right.distance_from(left))
             .sum()
@@ -1131,5 +1162,65 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ACKs mostly without blocks, the scoreboard often empty (a fast path),
+    // RTO clears and reordered packet ACKs: update_with_packet_ack and the
+    // walk it skips must leave the same outcome, ranges, edge and fresh
+    // ranges, and unsacked_bytes must equal the hole walk.
+    #[test]
+    fn blockless_update_fast_path_matches_the_walk() {
+        let mut state = 0x2b99_2ddf_a232_49d6_u64;
+        let mut next = |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound.max(1))) as u32
+        };
+        let (mut fast, mut walked) = (0, 0);
+        for base in [0u32, u32::MAX - 3000] {
+            let mut a = Scoreboard::with_capacity(16).unwrap();
+            let mut b = Scoreboard::with_capacity(16).unwrap();
+            let (mut ack, mut high) = (Seq(base), Seq(base));
+            for _ in 0..20_000 {
+                match next(10) {
+                    0..=2 => high = high.wrapping_add(1 + next(1500)),
+                    3 => {
+                        a.clear();
+                        b.clear();
+                    }
+                    4 => assert_eq!(a.take_fresh(), b.take_fresh()),
+                    _ => {
+                        let flight = high.distance_from(ack);
+                        if next(3) != 0 {
+                            ack = ack.wrapping_add(next(flight + 1));
+                        }
+                        let packet_ack = ack.wrapping_add(next(40).wrapping_sub(20));
+                        let mut blocks = [None; 4];
+                        if next(4) == 0 {
+                            for block in blocks.iter_mut().take(1 + next(4) as usize) {
+                                let left = ack.wrapping_add(next(flight + 200).wrapping_sub(100));
+                                *block = Some((left.0, left.wrapping_add(next(3000)).0));
+                            }
+                        }
+                        if a.len == 0 && blocks.iter().all(Option::is_none) {
+                            fast += 1;
+                        } else {
+                            walked += 1;
+                        }
+                        let outcome = a.update_with_packet_ack(ack, packet_ack, high, &blocks);
+                        assert_eq!(outcome, b.walk_update(ack, packet_ack, high, &blocks));
+                    }
+                }
+                assert_eq!((a.ranges(), a.ack, a.fresh), (b.ranges(), b.ack, b.fresh));
+                let start = ack.wrapping_add(next(3000).wrapping_sub(1000));
+                let end = start.wrapping_add(next(6000).wrapping_sub(500));
+                assert_eq!(
+                    a.unsacked_bytes(start, end),
+                    b.walk_unsacked_bytes(start, end)
+                );
+            }
+        }
+        assert!(fast > 5000 && walked > 5000, "{fast} {walked}");
     }
 }

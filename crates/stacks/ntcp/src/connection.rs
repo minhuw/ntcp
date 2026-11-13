@@ -7381,7 +7381,12 @@ impl Connection {
         // Never let a prior ACK's candidate leak into startup or RTO sampling.
         self.rack.ack_sample = None;
         let sack_evidence = if sack_allowed {
-            let ptb_sack = self.ptb_sack_candidates(&segment.options.sack_blocks);
+            // Only blocks can SACK bytes inside the PTB bounds.
+            let ptb_sack = if segment.options.sack_blocks.iter().any(Option::is_some) {
+                self.ptb_sack_candidates(&segment.options.sack_blocks)
+            } else {
+                [None; 4]
+            };
             let update = self.scoreboard.update_with_packet_ack(
                 live_ack,
                 ack,
@@ -7636,10 +7641,12 @@ impl Connection {
                 .saturating_add(self.mss as u32)
                 .min(self.data_flight());
         }
-        if self.sack_recovery_enabled()
-            && (!self.scoreboard.ranges().is_empty()
-                || self.sack_recovery.is_some()
-                || segment.options.sack_blocks.iter().any(Option::is_some))
+        // SACK evidence first: an ACK with none and no advice held (the
+        // common case) tests nothing else.
+        if (!self.scoreboard.ranges().is_empty()
+            || self.sack_recovery.is_some()
+            || segment.options.sack_blocks.iter().any(Option::is_some))
+            && self.sack_recovery_enabled()
             && !self.congestion.in_fast_recovery()
         {
             if sack_evidence && self.sack_recovery.is_none() {
