@@ -1051,6 +1051,9 @@ pub(crate) struct Connection {
     // handshake is dropped (TcpListenOverflow), and the child stays in
     // SYN-RECEIVED to retransmit its SYN-ACK.
     pub(crate) hold_establishment: bool,
+    // Set by the Endpoint for each input: whether its memory is in
+    // pressure (tcp_under_memory_pressure), which stops rcv_ssthresh growth.
+    pub(crate) memory_pressure: bool,
     // Why the segment input last took was discarded, for the Endpoint to
     // take and record: Linux's tcp_rcv_state_process returns its reason.
     pub(crate) dropped: Option<crate::DropReason>,
@@ -1136,6 +1139,20 @@ pub(crate) struct Connection {
     rcvq_space: usize,
     rcvq_seq: u64,
     rcvq_time: Instant,
+    // Linux's rcv_ssthresh: the most window a tuned receive direction
+    // offers from RCV.NXT while it learns what the connection needs. It
+    // starts at the initial size and rises with the data received
+    // (`grow_window`) toward window_clamp, the limit DRS raises: here
+    // config.receive_capacity. u32::MAX for a fixed or locked direction,
+    // whose ring backs its whole window from the open.
+    rcv_ssthresh: u32,
+    // The window to offer passed what the ring backs: the Endpoint grows
+    // the ring before the next read returns or the next segment is built
+    // (`receive_ring_target`).
+    receive_grow_pending: bool,
+    // That growth was refused for memory: no other is asked for until the
+    // next DRS measure, as a refused DRS growth waited for one.
+    receive_growth_refused: bool,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1468,6 +1485,7 @@ impl Connection {
             accepted_metadata: false,
             hold_establishment: false,
             local_refusals: false,
+            memory_pressure: false,
             dropped: None,
             sample: None,
             sample_departure: None,
@@ -1515,6 +1533,13 @@ impl Connection {
             rcvq_space: 0,
             rcvq_seq: 0,
             rcvq_time: now,
+            rcv_ssthresh: if receive_tuned {
+                receive_sizes.initial as u32
+            } else {
+                u32::MAX
+            },
+            receive_grow_pending: false,
+            receive_growth_refused: false,
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -1741,6 +1766,10 @@ impl Connection {
             self.receive.grow(receive).map_err(|_| Error::NoMemory)?;
         }
         self.receive_tuned = false;
+        // A locked ring backs its whole window, as a fixed one.
+        self.rcv_ssthresh = u32::MAX;
+        self.receive_grow_pending = false;
+        self.receive_growth_refused = false;
         self.config.receive_capacity = receive;
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
         //= reason=A receive size locked before the SYN reaches the wire sets the window scale from that size, as Linux clamps window_clamp to a locked SO_RCVBUF before tcp_select_initial_window; once the SYN has left, the scale stays as sent.
@@ -6289,9 +6318,10 @@ impl Connection {
     // Linux's tcp_rcv_space_adjust, after a read: once a receiver RTT has
     // passed since the measure began, the bytes read in it, less those
     // still unread, and if they exceed the most read in one RTT so far the
-    // receive ring size DRS asks for (`rcvbuf_grow`), when larger than the
-    // ring. Reads the connection's clock as of its last event, as Linux
-    // reads the cached tcp_mstamp.
+    // window_clamp DRS asks for (`rcvbuf_grow`), when larger than the
+    // current one. Reads the connection's clock as of its last event, as
+    // Linux reads the cached tcp_mstamp. A measure that ends lets a ring
+    // growth refused for memory be asked for again.
     #[inline(never)]
     pub(crate) fn receive_space_adjust(&mut self) -> Option<usize> {
         if !self.receive_tuned || self.rcv_rtt_us8 == 0 {
@@ -6312,6 +6342,10 @@ impl Connection {
         };
         self.rcvq_seq = self.received_read;
         self.rcvq_time = self.now;
+        if self.receive_growth_refused {
+            self.receive_growth_refused = false;
+            self.receive_grow_pending = self.receive_ring_target().is_some();
+        }
         target
     }
 
@@ -6320,9 +6354,9 @@ impl Connection {
     // its rate as in slow start, in proportion to the growth since the last
     // measure; below 1 ms (tcp_rcvbuf_low_rtt) only rtt/1 ms of the window
     // more, so short paths do not inflate the buffer; plus the span of the
-    // data held beyond a gap. At most receive_capacity_max. The window is
-    // the ring: ntcp's receive ring holds payload only, where Linux's
-    // rcvbuf counts skb truesize (tcp_space_from_win).
+    // data held beyond a gap. At most receive_capacity_max. It is the
+    // window_clamp, a limit: ntcp's receive ring holds payload only, where
+    // Linux's rcvbuf counts skb truesize (tcp_space_from_win).
     fn rcvbuf_grow(&mut self, copied: usize) -> Option<usize> {
         let old = self.rcvq_space.max(1) as u64;
         self.rcvq_space = copied;
@@ -6341,6 +6375,87 @@ impl Connection {
         (target > self.config.receive_capacity).then_some(target)
     }
 
+    // Raises window_clamp to the `target` DRS asked for, as Linux's
+    // tcp_rcvbuf_grow raises sk_rcvbuf and window_clamp: a limit, which
+    // allocates nothing. The window offered stays within rcv_ssthresh,
+    // which only the data received raises (`grow_window`).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= reason=Autotuning only raises window_clamp (receive_capacity), rcv_ssthresh and the ring that backs them; it never lowers any of them, so no right edge already offered moves left.
+    //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
+    //# edge to the left (SHLD-14).
+    pub(crate) fn raise_receive_clamp(&mut self, target: usize) {
+        self.config.receive_capacity = target;
+        self.receive_grow_pending |=
+            !self.receive_growth_refused && self.receive_ring_target().is_some();
+    }
+
+    // Linux's tcp_grow_window, for a tuned receive direction, after `len`
+    // new bytes were taken: in order (tcp_event_data_recv, from 128 bytes)
+    // or, with SACK, beyond a gap (tcp_data_queue_ofo). Outside memory
+    // pressure (check #1), rcv_ssthresh rises by twice the payload of a
+    // full-size segment (advmss), or twice `len` if more, at most to
+    // min(window_clamp, free space). Linux's check #2 and its slow part
+    // (__tcp_grow_window) give a segment whose truesize overhead would not
+    // fit the buffer at that window 2 * rcv_mss instead, or nothing; the
+    // ring charges each window byte the same whatever the segment
+    // (allocation_bytes), so every segment passes check #2. Under pressure
+    // Linux also lowers rcv_ssthresh to 4 * advmss (tcp_adjust_rcv_ssthresh)
+    // so that new skbs take less memory; the ring is already charged and
+    // never shrinks, so a lower window would free nothing and only stall
+    // the sender: here pressure only stops the growth. Linux also grants
+    // one quick ACK (icsk_ack.quick |= 1), which ntcp's ACK policy does
+    // not have; the ACK is sent as it would be.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-7
+    //= reason=A tuned receive window opens past its initial size only as full-size data arrives (rcv_ssthresh), up to the limit DRS set from what the application reads per RTT, and its ring is allocated only when that window is offered.
+    //# Hence, implementers should take care to not open the TCP window
+    //# drastically beyond the requirements of the connection.
+    #[inline(never)]
+    fn grow_window(&mut self, len: usize) {
+        let space = self
+            .config
+            .receive_capacity
+            .saturating_sub(self.receive_used)
+            .min(u32::MAX as usize) as u32;
+        let room = space.saturating_sub(self.rcv_ssthresh);
+        if room == 0 || self.memory_pressure {
+            return;
+        }
+        let increment = (2 * u32::from(self.advertised_payload_mss())).max(2 * len as u32);
+        self.rcv_ssthresh += room.min(increment);
+        self.receive_grow_pending |=
+            !self.receive_growth_refused && self.receive_ring_target().is_some();
+    }
+
+    pub(crate) fn receive_grow_pending(&self) -> bool {
+        self.receive_grow_pending
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receive_ssthresh(&self) -> u32 {
+        self.rcv_ssthresh
+    }
+
+    // The ring size to grow to when the window to offer, min(window_clamp
+    // less the unread bytes, rcv_ssthresh) as in Linux's __tcp_select_window,
+    // passes what the ring backs beyond them: twice the ring, and no less
+    // than what that window needs, within window_clamp. Doubling keeps a
+    // window that rises by segments to logarithmically many in-place
+    // growths, each moving at most the ring, as the send ring's
+    // (`send_ring_target`).
+    pub(crate) fn receive_ring_target(&self) -> Option<usize> {
+        if !self.receive_tuned || self.receive.eof() {
+            return None;
+        }
+        let readable = self.receive.readable();
+        let clamp = self.config.receive_capacity;
+        let window = clamp
+            .saturating_sub(readable)
+            .min(self.rcv_ssthresh as usize);
+        let needed = readable + window;
+        let ring = self.receive.capacity();
+        (needed > ring).then(|| needed.max(ring.saturating_mul(2)).min(clamp))
+    }
+
     // The peak charge of growing the receive ring to `target` bytes: the
     // old storage stays live while the new is filled.
     pub(crate) fn receive_growth_peak(&self, target: usize) -> Option<usize> {
@@ -6348,18 +6463,19 @@ impl Connection {
     }
 
     // Grows the receive ring in place to `target` bytes (card B's grow,
-    // whose failure leaves it as it was) and offers the new room at once if
-    // it is worth an update: Linux raises sk_rcvbuf and window_clamp, and
-    // the next ACK advertises more.
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
-    //= reason=Autotuning only raises receive_capacity and the ring that backs it; it never lowers either, so no right edge already offered moves left.
-    //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
-    //# edge to the left (SHLD-14).
-    pub(crate) fn grow_receive(&mut self, target: usize) -> Result<(), ()> {
-        self.receive.grow(target)?;
-        self.config.receive_capacity = target;
+    // whose failure leaves it as it was) to back the window to offer, if
+    // the budget `allowed` it. A refusal, for the budget or the allocator,
+    // holds further growths until the next DRS measure. Whether it grew.
+    pub(crate) fn grow_receive_ring(&mut self, target: usize, allowed: bool) -> bool {
+        self.receive_grow_pending = false;
+        let grown = allowed && self.receive.grow(target).is_ok();
+        self.receive_growth_refused = !grown;
+        grown
+    }
+
+    // Offers the room a ring growth made at once, if it is worth an update.
+    pub(crate) fn receive_grown(&mut self) {
         self.read_window_update();
-        Ok(())
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6
@@ -8635,6 +8751,16 @@ impl Connection {
         if self.receive_tuned && offset == 0 && count != 0 && outcome.advanced {
             self.rcv_rtt_measure();
         }
+        if self.receive_tuned
+            && outcome.new_bytes != 0
+            && if offset == 0 && outcome.advanced {
+                count >= 128
+            } else {
+                self.sack_send
+            }
+        {
+            self.grow_window(count);
+        }
         if outcome.new_bytes != 0 {
             self.last_data_received = self.now;
             let offer = self.receive_mss();
@@ -8915,10 +9041,13 @@ impl Connection {
         let shift = if self.scaling { self.local_scale } else { 0 };
         let unit = 1u32 << shift;
         let backing = self.receive.right_edge().distance_from(self.receive.next());
-        let quota = self
+        // Linux's __tcp_select_window: the free space, at most rcv_ssthresh
+        // (u32::MAX for a fixed or locked direction).
+        let quota = (self
             .config
             .receive_capacity
-            .saturating_sub(self.receive.readable()) as u32;
+            .saturating_sub(self.receive.readable()) as u32)
+            .min(self.rcv_ssthresh);
         // Never retract credit already offered to the peer on shrink.
         let available = backing.min(quota.max(self.receive_window()));
         let old = self.receive_window();

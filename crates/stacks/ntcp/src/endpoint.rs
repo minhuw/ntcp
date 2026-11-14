@@ -4042,6 +4042,7 @@ impl Endpoint {
                 authority.map(|id| self.crossing_syn_authorization(id, tuple, segment));
             let slot = self.slots[index].as_mut().unwrap();
             slot.connection.hold_establishment = hold;
+            slot.connection.memory_pressure = self.budget.under_pressure();
             slot.received_dscp = Some(traffic_class >> 2);
             let admitted = if let Some(authorization) = authorization {
                 slot.connection.input_with_receive_authorization(
@@ -5091,43 +5092,52 @@ impl Endpoint {
         self.reject_if_output_reserved(id)?;
         let connection = &mut self.slot_mut(id)?.connection;
         let count = connection.read(out)?;
-        if connection.receive_tuned()
-            && let Some(target) = connection.receive_space_adjust()
-        {
-            self.grow_receive(id, target);
+        if connection.receive_tuned() {
+            if let Some(target) = connection.receive_space_adjust() {
+                connection.raise_receive_clamp(target);
+            }
+            if connection.receive_grow_pending() {
+                self.grow_receive(id.slot, true);
+            }
         }
         self.refresh(id.slot);
         Ok(count)
     }
 
-    // DRS asks the receive ring of `id` to grow to `target` bytes. As
-    // Linux's __sk_mem_raise_allocated for SK_MEM_RECV, the growth's peak
-    // charge must fit the room `receive_growth_room` gives; a refused one
-    // is counted, enters pressure if it would have passed the threshold,
-    // and leaves the window as it is until the next RTT's measure.
+    // The window the connection at `index` is to offer passed what its
+    // receive ring backs (`Connection::receive_ring_target`): grows the
+    // ring, before a read returns (`read`, which then offers the room if it
+    // is worth an update) or before the next segment is built. As Linux's
+    // __sk_mem_raise_allocated for SK_MEM_RECV, the growth's peak charge
+    // must fit the room `receive_growth_room` gives; a refused one is
+    // counted, enters pressure if it would have passed the threshold, and
+    // leaves the window as the ring backs it until the next DRS measure.
+    // Linux charges skbs as they arrive, within the window offered; input
+    // here never allocates, so the ring is grown before that window is
+    // offered.
     #[cold]
     #[inline(never)]
-    fn grow_receive(&mut self, id: ConnectionId, target: usize) {
-        let connection = &self.slots[id.slot].as_ref().unwrap().connection;
+    fn grow_receive(&mut self, index: usize, update: bool) {
+        let connection = &self.slots[index].as_ref().unwrap().connection;
+        let Some(target) = connection.receive_ring_target() else {
+            // Reads since made the room: settle the request.
+            let connection = &mut self.slots[index].as_mut().unwrap().connection;
+            connection.grow_receive_ring(0, true);
+            return;
+        };
         let own = connection.buffer_charge();
         let room = self.receive_growth_room(connection, own);
         let growth = connection
             .receive_growth_peak(target)
             .map_or(usize::MAX, |peak| peak - own);
-        let grown = growth <= room
-            && self.slots[id.slot]
-                .as_mut()
-                .unwrap()
-                .connection
-                .grow_receive(target)
-                .is_ok();
+        let connection = &mut self.slots[index].as_mut().unwrap().connection;
+        let grown = connection.grow_receive_ring(target, growth <= room);
         // Charged even when refused: a bitmap that grew before another
         // failed keeps its storage.
-        let charge = self.slots[id.slot]
-            .as_ref()
-            .unwrap()
-            .connection
-            .buffer_charge();
+        let charge = connection.buffer_charge();
+        if grown && update {
+            connection.receive_grown();
+        }
         let before = self.budget.allocated();
         self.recharge(own, charge);
         if !grown {
@@ -7670,6 +7680,14 @@ impl Endpoint {
             };
             self.output.remove(index);
             let connection = self.id(index);
+            if self.slots[index]
+                .as_ref()
+                .unwrap()
+                .connection
+                .receive_grow_pending()
+            {
+                self.grow_receive(index, false);
+            }
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
             let output = if let Some(parts) = shared.as_deref_mut() {

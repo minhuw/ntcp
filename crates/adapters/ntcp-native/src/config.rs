@@ -98,10 +98,13 @@ impl NetworkConfig {
     /// connection writable again once memory comes back
     /// (`Counters::memory_throttled_writes`). With `NetworkConfig::new`'s
     /// tuned buffers a send limit rises with the congestion window up to
-    /// `send_capacity_max`, its ring and ledgers growing at write, and a
-    /// receive ring grows at read, 1.375 bytes per byte of window up to
-    /// `receive_capacity_max`; a growth the cap or memory pressure refuses
-    /// leaves the window as it is (`Counters::memory_refused_growths`).
+    /// `send_capacity_max`, its ring and ledgers growing at write; a
+    /// receive limit rises at read with the bytes read per round trip up to
+    /// `receive_capacity_max`, and its window with the full-size data
+    /// received (Linux's rcv_ssthresh), the ring growing at read or before
+    /// the next segment is sent, 1.375 bytes per byte of window offered; a
+    /// growth the cap or memory pressure refuses leaves the window as it is
+    /// (`Counters::memory_refused_growths`).
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the
@@ -187,8 +190,9 @@ impl NetworkConfig {
     ///   only over loopback by default;
     /// - ephemeral ports 32768 to 60999 (ip_local_port_range);
     /// - receive buffers of 4 KiB, 64 KiB and 32 MiB (min, initial, max):
-    ///   each starts at 64 KiB and grows at read with the bytes the
-    ///   application takes per round trip, up to 32 MiB, as Linux's
+    ///   each starts at 64 KiB, its limit grows at read with the bytes the
+    ///   application takes per round trip, up to 32 MiB, and its window and
+    ///   ring follow the full-size segments received, as Linux's
     ///   tcp_rmem = 4096 131072 33554432 with tcp_moderate_rcvbuf (its
     ///   128 KiB of memory starts a window of about 64 KiB; here sizes are
     ///   window bytes). The 32 MiB maximum gives the SYN a window scale of

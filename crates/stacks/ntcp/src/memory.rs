@@ -81,7 +81,8 @@ pub struct MemoryCounters {
     pub memory_refused_opens: u64,
     /// Storage growths refused by the cap, by memory pressure or by the
     /// allocator: at write (send ring and ledgers, shared spans), at read
-    /// (the receive ring's DRS growth) and in `set_receive_buffer`. Linux's
+    /// or before a segment is built (the receive ring's growth to back the
+    /// window to offer) and in `set_receive_buffer`. Linux's
     /// __sk_mem_raise_allocated
     /// suppressing an allocation, which no MIB counts.
     pub memory_refused_growths: u64,

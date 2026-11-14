@@ -587,6 +587,7 @@ fn right_edges(packets: &[Vec<u8>], scale: u8) -> Vec<Seq> {
 fn drs_grows_the_receive_window_for_a_bulk_transfer() {
     for timestamps in [true, false] {
         let mut sizes = Vec::new();
+        let mut rings = Vec::new();
         let tuned = bulk(
             bulk_sender(timestamps),
             bulk_receiver(timestamps),
@@ -595,6 +596,16 @@ fn drs_grows_the_receive_window_for_a_bulk_transfer() {
                 let info = link.b.transport_info(server).unwrap();
                 if sizes.last() != Some(&info.receive_capacity) {
                     sizes.push(info.receive_capacity);
+                }
+                // window_clamp bounds rcv_ssthresh and the ring that backs
+                // it, which grows by doubling.
+                let (ring, ssthresh, clamp) = receive_state(&link.b, server);
+                assert!(
+                    ssthresh as usize <= clamp && ring <= clamp.next_multiple_of(8),
+                    "{ring} {ssthresh} {clamp}"
+                );
+                if rings.last() != Some(&ring) {
+                    rings.push(ring);
                 }
             },
         );
@@ -611,6 +622,17 @@ fn drs_grows_the_receive_window_for_a_bulk_transfer() {
         // first window, and its measure (several times the initial ten
         // segments read) asks for max at once, as Linux's does.
         assert!(!timestamps || sizes.len() >= 3, "{sizes:?}");
+        // The ring follows the window offered: it grows from 64 KiB, at
+        // least doubling each time but at window_clamp.
+        assert_eq!(rings[0], 65536);
+        assert!(rings.len() >= 3, "{rings:?}");
+        assert!(
+            rings.windows(2).all(|pair| pair[1] >= 2 * pair[0]
+                || sizes
+                    .iter()
+                    .any(|&clamp| pair[1] == clamp.next_multiple_of(8))),
+            "{rings:?} {sizes:?}"
+        );
         let edges = right_edges(&tuned.from_b, 5);
         let worst = edges
             .windows(2)
@@ -633,6 +655,74 @@ fn drs_grows_the_receive_window_for_a_bulk_transfer() {
         let rtt = connection.receive_rtt_us();
         assert!((10_000..95_000).contains(&rtt), "{timestamps} {rtt}");
     }
+}
+
+// Requests of 18 to 89 bytes, one at a time over a 2 ms RTT, as a
+// key-value store's (n0bb fc_rr's masstree mix). Their only receiver RTT
+// sample times a whole 64 KiB window, and the first read after it finds
+// several times rcvq_space read: DRS raises window_clamp to about 1 MB, as
+// Linux's tcp_rcv_space_adjust does on the same flow. Segments below 128
+// bytes never raise rcv_ssthresh (tcp_event_data_recv), so the window
+// stays the initial one and the ring is never grown.
+#[test]
+fn small_requests_keep_the_initial_ring_after_drs_raises_the_clamp() {
+    let mut a = Endpoint::new(bulk_receiver(true), [1; 32], 0, |_| true).unwrap();
+    let b = Endpoint::new(bulk_receiver(true), [2; 32], 0, |_| true).unwrap();
+    let listener = {
+        let mut b = b;
+        let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+        let client = a.connect(0, local, REMOTE.parse().unwrap()).unwrap();
+        (Link::new(a, b, 12_500, 1_000), listener, client)
+    };
+    let (mut link, listener, client) = listener;
+    let server = loop {
+        link.pump();
+        if let Ok(server) = link.b.accept(listener) {
+            break server;
+        }
+        link.advance();
+    };
+    link.from_b.clear();
+    let mut out = [0; 4096];
+    let mut raised = 0;
+    for round in 0..4000 {
+        let request = [b'q'; 89];
+        let len = if round % 20 == 0 { 89 } else { 18 };
+        assert_eq!(link.a.write(client, &request[..len]).unwrap(), len);
+        let mut got = 0;
+        while got < len {
+            link.pump();
+            got += link.b.read(server, &mut out).unwrap_or(0);
+            if got < len {
+                link.advance();
+            }
+        }
+        link.b.write(server, &[b'r'; 71]).unwrap();
+        let mut got = 0;
+        while got < 71 {
+            link.pump();
+            got += link.a.read(client, &mut out).unwrap_or(0);
+            if got < 71 {
+                link.advance();
+            }
+        }
+        let (ring, ssthresh, clamp) = receive_state(&link.b, server);
+        assert_eq!((ring, ssthresh), (65536, 65536), "round {round}");
+        if clamp > 65536 {
+            raised += 1;
+        }
+    }
+    // The clamp rose well before the end; the ring stayed as it was.
+    assert!(raised > 500, "{raised}");
+    assert!(receive_state(&link.b, server).2 > 500_000);
+    assert_eq!(link.b.memory_refused_growths, 0);
+    let edges = right_edges(&link.from_b, 5);
+    assert!(
+        edges
+            .windows(2)
+            .all(|e| e[1].at_or_after(e[0]) || e[0].distance_from(e[1]) < 1 << 5)
+    );
 }
 
 // The receive sizes the server reported, each change once, and its count
@@ -665,49 +755,87 @@ fn a_locked_receive_size_does_not_grow() {
     assert_eq!(sizes, [65536]);
 }
 
-// As Linux's __sk_mem_raise_allocated for SK_MEM_RECV: under pressure a
-// receive ring holding its fair share of the cap does not grow, and the
-// window stays as it was; one below its fair share grows.
+// The server connection's receive ring, rcv_ssthresh and window_clamp.
+fn receive_state(b: &Endpoint, server: ConnectionId) -> (usize, u32, usize) {
+    let connection = &b.slot(server).unwrap().connection;
+    (
+        connection.receive_allocation_capacity(),
+        connection.receive_ssthresh(),
+        b.transport_info(server).unwrap().receive_capacity,
+    )
+}
+
+// Linux's tcp_grow_window check #1: under memory pressure rcv_ssthresh does
+// not rise, so the window and the ring stay as they are while window_clamp
+// (a limit, which DRS raises without memory) may grow; once pressure ends
+// rcv_ssthresh rises again and the ring with it.
 #[test]
-fn memory_pressure_refuses_receive_growth_at_the_fair_share() {
-    let mut idle = None;
+fn memory_pressure_stops_the_window_growth() {
     let mut phase = 0;
-    let mut held = 0;
-    let (sizes, link) = receive_sizes(bulk_receiver(true), 6 << 20, |b, server, size| {
-        if phase == 1 {
-            assert_eq!(size, held);
-        }
-        if phase == 0 && size > 65536 {
+    let mut held = (0, 0);
+    let mut reads = 0;
+    let (_, link) = receive_sizes(bulk_receiver(true), 6 << 20, |b, server, _| {
+        let (ring, ssthresh, _) = receive_state(b, server);
+        if phase == 0 && ring > 65536 {
             phase = 1;
-            held = size;
-            // A second, idle connection: the fair share is half the cap,
-            // which the grown ring holds.
-            let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 9000);
-            idle = Some(
-                b.connect(b.now, local, "192.0.2.3:80".parse().unwrap())
-                    .unwrap(),
-            );
-            let charge = b.slot(server).unwrap().connection.buffer_charge();
-            b.config.max_buffer_bytes = 2 * charge;
-            assert!(b.buffer_bytes() < b.config.max_buffer_bytes);
             b.config.buffer_pressure_bytes = Some(1);
             b.config.buffer_low_bytes = Some(0);
             b.charge(1);
             b.uncharge(1);
             assert!(b.memory_pressure());
-            assert_eq!(b.memory_refused_growths, 0);
-        } else if phase == 1 && b.memory_refused_growths >= 3 {
-            phase = 2;
-            // Far below its fair share of a larger cap, still in pressure.
-            b.config.max_buffer_bytes = 1 << 30;
+            held = (ring, ssthresh);
+        } else if phase == 1 {
+            assert_eq!(ssthresh, held.1);
+            // At most a growth asked for before pressure began.
+            assert!(ring <= 2 * held.0, "{ring} {held:?}");
+            reads += 1;
+            if reads == 200 {
+                phase = 2;
+                b.config.buffer_pressure_bytes = None;
+                b.config.buffer_low_bytes = None;
+                b.charge(1);
+                b.uncharge(1);
+                assert!(!b.memory_pressure());
+            }
+        } else if phase == 2 && ssthresh > held.1 && ring > 2 * held.0 {
+            phase = 3;
         }
     });
-    assert_eq!(phase, 2);
-    assert!(link.b.memory_pressure());
-    // One size before pressure, then nothing until the cap grew.
-    assert!(sizes.len() >= 3, "{sizes:?}");
-    assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]), "{sizes:?}");
-    assert!(idle.is_some());
+    assert_eq!(phase, 3);
+    let edges = right_edges(&link.from_b, 5);
+    assert!(
+        edges
+            .windows(2)
+            .all(|e| e[1].at_or_after(e[0]) || e[0].distance_from(e[1]) < 1 << 5)
+    );
+}
+
+// As Linux's __sk_mem_raise_allocated for SK_MEM_RECV: a ring growth past
+// the hard cap is refused and counted, the window stays what the ring
+// backs, and the growth is asked for again at the next DRS measure, so a
+// larger cap lets the ring grow.
+#[test]
+fn a_receive_ring_growth_past_the_cap_waits_for_the_next_measure() {
+    let mut phase = 0;
+    let mut held = 0;
+    let (_, link) = receive_sizes(bulk_receiver(true), 6 << 20, |b, server, _| {
+        let (ring, _, _) = receive_state(b, server);
+        if phase == 0 && ring > 65536 {
+            phase = 1;
+            held = ring;
+            b.config.max_buffer_bytes = b.buffer_bytes();
+            assert_eq!(b.memory_refused_growths, 0);
+        } else if phase == 1 {
+            assert_eq!(ring, held);
+            if b.memory_refused_growths >= 3 {
+                phase = 2;
+                b.config.max_buffer_bytes = 1 << 30;
+            }
+        } else if phase == 2 && ring > held {
+            phase = 3;
+        }
+    });
+    assert_eq!(phase, 3);
     let edges = right_edges(&link.from_b, 5);
     assert!(
         edges
