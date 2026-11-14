@@ -215,6 +215,8 @@
           pkgs.cargo
           pkgs.clippy
           pkgs.rustfmt
+          # .config/nextest.toml's profiles: one process per test, each test's output kept.
+          pkgs.cargo-nextest
           # duvet/, integration/ and the crates' Python tests; tomllib needs Python 3.11.
           pkgs.python3
           # Source snapshots (rfc_host, check_mac_cost) and operator packetdrill checkouts.

@@ -1,0 +1,20 @@
+# cargo-nextest runs each test in its own process, so a test's output, including that of
+# the children some ntcp-socket tests re-run the test binary as, stays with that test.
+# Doc-tests are not run by nextest: run them with `cargo test --doc`.
+
+# Full-list runs: every test runs to the end and each one's output is kept in
+# <target-dir>/nextest/full/junit.xml.
+[profile.full]
+fail-fast = false
+# The CPU rule's eight cores.
+test-threads = 8
+# Repeat failures and their output in the final summary, which survives a truncated log.
+failure-output = "immediate-final"
+final-status-level = "slow"
+# A hung test is killed after 10 minutes and reported by name instead of stalling the run.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[profile.full.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true
