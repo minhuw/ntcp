@@ -3,6 +3,8 @@
 //! a `HostedQueue` (a `Dpdk` adapter whose borrowed objects it keeps alive).
 //! Teardown order is structural: flows and queues hold the port, so the port
 //! is stopped and closed, and its pools freed, only after all of them drop.
+//! `Eal::init` refuses EAL arguments that would probe PCI devices implicitly
+//! (see `eal_args`).
 
 use crate::native::{Dpdk, driver_name, rx_checksum_check, tso_check, tx_checksum_check};
 use ntcp_io::{
@@ -169,12 +171,27 @@ impl Eal {
     /// A later call with identical args returns the same handle; different
     /// args are an error, as is any call after a failed initialization (DPDK
     /// does not support retrying it).
+    ///
+    /// The args must name every PCI device EAL may probe with an allow-list
+    /// entry (`-a <pci>[,key=value]...`, also spelled `-a<pci>`, `-a=<pci>`,
+    /// `--allow <pci>`, `--allow=<pci>`; one or more), or contain `--no-pci`
+    /// for virtual devices only. Without either, DPDK probes every supported
+    /// PCI device, and on bifurcated mlx5 that takes all traffic of every
+    /// ConnectX port from the kernel, the management (SSH) port included.
+    /// `InvalidInput`, naming the flag, for: neither; `--vdev` without
+    /// `--no-pci` (it does not stop the PCI probe); a block-list (`-b`,
+    /// `--block`) without an allow-list, or with one; an allow entry without
+    /// a device (`-a ""`, `-a ,dv_flow_en=1`); `--no-pci` with an allow
+    /// entry; the removed `-w`/`--pci-whitelist`; a NUL. These checks run
+    /// before EAL, and a refused call leaves EAL uninitialized, so a later
+    /// call with valid args can still initialize it.
     pub fn init<I, S>(args: I) -> io::Result<&'static Eal>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         let args: Vec<String> = args.into_iter().map(Into::into).collect();
+        crate::eal_args::check(&args)?;
         let state = EAL.get_or_init(|| EalState {
             result: init_eal(&args),
             args: args.clone(),
@@ -204,7 +221,7 @@ impl Eal {
 fn init_eal(args: &[String]) -> Result<Eal, (i32, String)> {
     let mut owned = Vec::with_capacity(args.len() + 1);
     for arg in std::iter::once("ntcp").chain(args.iter().map(String::as_str)) {
-        owned.push(CString::new(arg).map_err(|_| (-22, "EAL argument contains NUL".into()))?);
+        owned.push(CString::new(arg).expect("Eal::init refuses NUL"));
     }
     // EAL may keep argv pointers and permute the array; both live forever,
     // like EAL itself.

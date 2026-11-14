@@ -81,6 +81,13 @@ fn hosted_ring_ports() {
         "256".into(),
     ];
 
+    // Refused before EAL runs (it would probe every PCI device), so EAL is
+    // still uninitialized for the valid call below.
+    let probing: Vec<_> = args.iter().filter(|a| *a != "--no-pci").cloned().collect();
+    let refusal = Eal::init(probing).unwrap_err();
+    assert_eq!(refusal.kind(), ErrorKind::InvalidInput);
+    assert!(refusal.to_string().contains("--no-pci"), "{refusal}");
+
     let eal = Eal::init(args.clone()).unwrap();
     assert!(std::ptr::eq(eal, Eal::init(args.clone()).unwrap()));
     assert_eq!(eal.args(), args.as_slice());

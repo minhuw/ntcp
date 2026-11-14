@@ -29,8 +29,9 @@
 //   neither probes it again. Only a device EAL has not probed is probed by
 //   `Port::start` itself, with the arguments given there. This example
 //   passes `--dev` both to EAL (`-a DEVARGS` for a PCI address, `--vdev
-//   DEVARGS` otherwise) and as `PortConfig::device`: the PMD arguments are
-//   applied once, at init, and EAL probes no other PCI device.
+//   DEVARGS --no-pci` otherwise) and as `PortConfig::device`: the PMD
+//   arguments are applied once, at init, and EAL probes no other PCI device
+//   (Eal::init refuses arguments that would probe them all).
 // - Which CPUs? rte_eal_init pins the calling thread to the main lcore, and
 //   threads it spawns inherit that single CPU. Each worker therefore sets
 //   its affinity before attaching its queue: to `--cpu` if given, otherwise
@@ -530,6 +531,10 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         if is_pci(&args.dev) { "-a" } else { "--vdev" }.to_owned(),
         args.dev.clone(),
     ];
+    // A vdev needs no PCI device, and Eal::init refuses an implicit probe.
+    if !is_pci(&args.dev) && !args.eal.iter().any(|a| a == "--no-pci") {
+        eal_args.push("--no-pci".to_owned());
+    }
     let names_lcores = args.eal.iter().any(|a| {
         ["-l", "-c", "--lcores", "-L"]
             .iter()
