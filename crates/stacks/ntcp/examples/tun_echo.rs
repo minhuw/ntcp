@@ -1102,7 +1102,7 @@ mod linux {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
-    //= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+    //= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple and send-window sequence validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
     //# Setting the DF bit implies the use of Path MTU Discovery as described
     //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
     //# that implements PAWS MUST also implement Path MTU Discovery.
@@ -2313,7 +2313,7 @@ mod linux {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
-    //= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+    //= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple and send-window sequence validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
     //# Setting the DF bit implies the use of Path MTU Discovery as described
     //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
     //# that implements PAWS MUST also implement Path MTU Discovery.
@@ -3119,7 +3119,11 @@ mod linux {
         // a SYN rewritten DF clear with a leased Identification on a
         // discovery-disabled path, whose submission the backend refuses
         // with WouldBlock, leaves after the owner re-enables discovery with
-        // the atomic header (DF set, Identification 0, valid checksum).
+        // the atomic header (DF set, Identification 0, valid checksum). The
+        // re-enable changes the path's stamp, so the held frame is refused
+        // and the SYN selected and built again (f628595), as the same
+        // segment: its options may be laid out anew (the repair builder
+        // drops NOP padding), so the segment is compared parsed.
         #[test]
         fn blocked_df_clear_frame_follows_a_reenable() {
             use ntcp_io::{PacketIo, PacketLayer};
@@ -3230,7 +3234,12 @@ mod linux {
             .unwrap();
             assert!(!endpoint.is_output_reserved(id));
             let syn = &backend.submitted[0];
-            assert_eq!(&syn[20..], &blocked[20..], "the same held segment");
+            let parsed = |frame: &[u8]| {
+                let ip = ntcp_ip::parse(frame, false).unwrap().ip;
+                let tcp = ntcp::wire::parse(ip, &frame[20..]).unwrap();
+                (tcp.header, tcp.options, tcp.payload.to_vec())
+            };
+            assert_eq!(parsed(syn), parsed(&blocked), "the same held segment");
             assert_ne!(syn[6] & 0x40, 0, "DF set on the enabled path");
             assert_eq!(u16::from_be_bytes([syn[4], syn[5]]), 0, "atomic Identification");
             assert_eq!(checksum(&syn[..20]), 0);

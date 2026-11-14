@@ -105,7 +105,7 @@ fn endpoint_with_settings(
 // These assertions use the same constructor, dispatcher and output loop as run.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
 //= type=test
-//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple and send-window sequence validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
 //# Setting the DF bit implies the use of Path MTU Discovery as described
 //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 //# that implements PAWS MUST also implement Path MTU Discovery.
@@ -593,6 +593,12 @@ fn runtime_exhausted_timestamp_discards_then_valid_stream_progresses() {
     assert_eq!(a.transport_info(aid).unwrap().unacked, 0);
 }
 
+// A reset held by a blocked backend was granted its authority under the
+// path as it was. Since f628595 a held stateless reply is refused once that
+// path changes (here its route or source is removed) and dropped without a
+// backend call, its lease released: the peer's next segment draws another.
+// Once the route or source is back, the peer's retransmitted SYN gets the
+// same reset, which closes it.
 #[test]
 fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
     for replace_source in [false, true] {
@@ -600,19 +606,56 @@ fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
         let (mut a, mut ahost) = endpoint(local.ip(), false);
         let (mut b, mut bhost) = endpoint(remote.ip(), false);
         let cfg = runtime_config(&Backend::default(), local.ip(), false, true, false).unwrap();
-        let id = a.connect_with_path_provider(0, local, remote, ntcp::ManagedOpenOptions {
-            transport: ntcp::ActiveOpenOptions::from(&cfg.connection), dscp: 0,
-            ipv4_options: Default::default(), registration: None, receive_authority: None,
-        }, &mut ahost.host).unwrap();
+        let id = a
+            .connect_with_path_provider(
+                0,
+                local,
+                remote,
+                ntcp::ManagedOpenOptions {
+                    transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+                    dscp: 0,
+                    ipv4_options: Default::default(),
+                    registration: None,
+                    receive_authority: None,
+                },
+                &mut ahost.host,
+            )
+            .unwrap();
         let syn = emit(&mut ahost, &mut a, 1, local.ip()).pop().unwrap();
-        input_frame(&mut bhost, &mut b, 2, &syn, remote.ip(), false, &mut Sample(0)).unwrap();
-        let mut backend = Backend { blocked: true, ..Default::default() };
+        input_frame(
+            &mut bhost,
+            &mut b,
+            2,
+            &syn,
+            remote.ip(),
+            false,
+            &mut Sample(0),
+        )
+        .unwrap();
+        let mut backend = Backend {
+            blocked: true,
+            ..Default::default()
+        };
         let mut output = [0; MTU];
         let mut pending = None;
-        transmit_frames(&mut bhost, &mut b, 3, &mut output, &mut pending,
-            IP_HEADER, &mut Sample(0), &mut backend).unwrap();
+        transmit_frames(
+            &mut bhost,
+            &mut b,
+            3,
+            &mut output,
+            &mut pending,
+            IP_HEADER,
+            &mut Sample(0),
+            &mut backend,
+        )
+        .unwrap();
         let held = pending.as_ref().unwrap();
-        assert!(b.transmit_attempt_packet(held.attempt).unwrap().connection.is_none());
+        assert!(
+            b.transmit_attempt_packet(held.attempt)
+                .unwrap()
+                .connection
+                .is_none()
+        );
         let old = held.context.unwrap();
         let old_key = bhost.host.egress_snapshot(&old).unwrap().key();
         let staged = output[..held.len].to_vec();
@@ -627,23 +670,76 @@ fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
         }
         backend.blocked = false;
         let calls = backend.attempts;
-        transmit_frames(&mut bhost, &mut b, 4, &mut output, &mut pending,
-            IP_HEADER, &mut Sample(0), &mut backend).unwrap();
-        assert_eq!(backend.attempts, calls);
-        assert!(pending.as_ref().unwrap().blocked);
-        assert!(bhost.host.paths().is_dirty(old.client()).unwrap());
+        transmit_frames(
+            &mut bhost,
+            &mut b,
+            4,
+            &mut output,
+            &mut pending,
+            IP_HEADER,
+            &mut Sample(0),
+            &mut backend,
+        )
+        .unwrap();
+        assert_eq!(backend.attempts, calls, "refused before the backend");
+        assert!(pending.is_none(), "the held reset is dropped");
+        assert!(backend.frames.is_empty());
+        assert_eq!(bhost.host.lease_count(), 0);
+        assert_eq!(bhost.host.paths().usage().clients, 0);
         if replace_source {
-            bhost.host.register_source(path::ScopedAddress::new(remote.ip(), None).unwrap(), bhost.ingress.link()).unwrap();
+            bhost
+                .host
+                .register_source(
+                    path::ScopedAddress::new(remote.ip(), None).unwrap(),
+                    bhost.ingress.link(),
+                )
+                .unwrap();
         } else {
             bhost.host.add_route(route).unwrap();
         }
-        transmit_frames(&mut bhost, &mut b, 5, &mut output, &mut pending,
-            IP_HEADER, &mut Sample(0), &mut backend).unwrap();
+        let retry = a.next_deadline().unwrap();
+        a.on_timeout(retry, BUDGET).unwrap();
+        let again = emit(&mut ahost, &mut a, retry, local.ip()).pop().unwrap();
+        assert_eq!(
+            segment(&again).header.sequence,
+            segment(&syn).header.sequence,
+            "the SYN retransmitted"
+        );
+        input_frame(
+            &mut bhost,
+            &mut b,
+            retry,
+            &again,
+            remote.ip(),
+            false,
+            &mut Sample(0),
+        )
+        .unwrap();
+        transmit_frames(
+            &mut bhost,
+            &mut b,
+            retry,
+            &mut output,
+            &mut pending,
+            IP_HEADER,
+            &mut Sample(0),
+            &mut backend,
+        )
+        .unwrap();
         assert!(pending.is_none());
         assert_eq!(backend.frames, vec![staged]);
         assert_eq!(bhost.host.lease_count(), 0);
         assert_eq!(bhost.host.paths().usage().clients, 0);
-        input_frame(&mut ahost, &mut a, 6, &backend.frames[0], local.ip(), false, &mut Sample(0)).unwrap();
+        input_frame(
+            &mut ahost,
+            &mut a,
+            retry,
+            &backend.frames[0],
+            local.ip(),
+            false,
+            &mut Sample(0),
+        )
+        .unwrap();
         assert_eq!(a.state(id).unwrap(), State::Closed);
     }
 }
@@ -709,7 +805,7 @@ fn runtime_active_passive_without_timestamps_still_discovers() {
 
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
 //= type=test
-//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple and send-window sequence validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
 //# Setting the DF bit implies the use of Path MTU Discovery as described
 //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 //# that implements PAWS MUST also implement Path MTU Discovery.
@@ -827,7 +923,7 @@ fn runtime_send_space_rounds_to_segments_across_pmtu_change() {
 
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
 //= type=test
-//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple and send-window sequence validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
 //# Setting the DF bit implies the use of Path MTU Discovery as described
 //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 //# that implements PAWS MUST also implement Path MTU Discovery.
@@ -909,7 +1005,7 @@ fn runtime_icmp_blackhole_falls_back_with_paws_and_congestion_response() {
 
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
 //= type=test
-//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple and send-window sequence validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
 //# Setting the DF bit implies the use of Path MTU Discovery as described
 //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 //# that implements PAWS MUST also implement Path MTU Discovery.
@@ -934,7 +1030,6 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
             ("quoted source", if v6 { 8 } else { 12 }),
             ("source port", h),
             ("destination port", h + 2),
-            ("sequence", h + 7),
         ] {
             let mut quote = original.clone();
             quote[offset] ^= 1;
@@ -943,22 +1038,27 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
             }
             cases.push((name, ptb(&quote, path), p.local.ip()));
         }
+        // RFC 5927 section 4.1, as Linux (91e356a): the sequence must lie in
+        // the sent window, which half the sequence space away never does.
+        let mut quote = original.clone();
+        quote[h + 4] ^= 0x80;
+        cases.push(("out-of-window sequence", ptb(&quote, path), p.local.ip()));
+        // The acknowledged SYN's sequence, with a quoted length that leaves
+        // no payload past the data TCP header: nothing outstanding.
         let mut quote = original.clone();
         let stale_sequence = segment(&original).header.sequence.wrapping_sub(1);
         quote[h + 4..h + 8].copy_from_slice(&stale_sequence.to_be_bytes());
+        let len_offset = if v6 { 4 } else { 2 };
+        let bare = (if v6 { 0 } else { h }) + 20 + 12;
+        quote[len_offset..len_offset + 2].copy_from_slice(&(bare as u16).to_be_bytes());
+        if !v6 {
+            seal_ip(&mut quote);
+        }
         cases.push((
             "already acknowledged SYN sequence",
             ptb(&quote, path),
             p.local.ip(),
         ));
-        let mut quote = original.clone();
-        let len_offset = if v6 { 4 } else { 2 };
-        let size = u16::from_be_bytes([quote[len_offset], quote[len_offset + 1]]) + 1;
-        quote[len_offset..len_offset + 2].copy_from_slice(&size.to_be_bytes());
-        if !v6 {
-            seal_ip(&mut quote);
-        }
-        cases.push(("exact sent size", ptb(&quote, path), p.local.ip()));
         let mut bad = valid.clone();
         bad[h + 8] ^= 0x10;
         seal_feedback(&mut bad);
@@ -1042,12 +1142,61 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
         )
         .unwrap();
         assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, path);
+        // The four-tuple and an in-window sequence are all a quote must keep
+        // (RFC 5927 section 4.1 and Linux tcp_v4_err/tcp_v6_err, the policy
+        // 91e356a adopted): a later sequence of the outstanding segment, or
+        // another quoted length, is the connection's too, each on a fresh
+        // flight. 91e356a also accepts a quote starting before SND.UNA whose
+        // span (its IP payload less the data TCP header) reaches outstanding
+        // data (`Connection::quoted_span`), which Linux refuses.
+        let in_window: [(&str, fn(&mut Vec<u8>, usize, bool)); 3] = [
+            ("later in-window sequence", |quote, h, _| {
+                let sequence = u32::from_be_bytes(quote[h + 4..h + 8].try_into().unwrap());
+                quote[h + 4..h + 8].copy_from_slice(&sequence.wrapping_add(1).to_be_bytes());
+            }),
+            (
+                "from the acknowledged SYN into outstanding data",
+                |quote, h, _| {
+                    let sequence = u32::from_be_bytes(quote[h + 4..h + 8].try_into().unwrap());
+                    quote[h + 4..h + 8].copy_from_slice(&sequence.wrapping_sub(1).to_be_bytes());
+                },
+            ),
+            ("another quoted length", |quote, _, v6| {
+                let at = if v6 { 4 } else { 2 };
+                let size = u16::from_be_bytes([quote[at], quote[at + 1]]) + 1;
+                quote[at..at + 2].copy_from_slice(&size.to_be_bytes());
+                if !v6 {
+                    seal_ip(quote);
+                }
+            }),
+        ];
+        for (name, forge) in in_window {
+            let mut p = Pair::new(v6, true);
+            p.a.write(p.aid, &[0x5a; 12000]).unwrap();
+            let mut quote = emit(&mut p.ahost, &mut p.a, p.time, p.local.ip()).remove(0);
+            forge(&mut quote, h, v6);
+            input_frame(
+                &mut p.ahost,
+                &mut p.a,
+                p.time,
+                &ptb(&quote, path),
+                p.local.ip(),
+                false,
+                &mut Sample(0),
+            )
+            .unwrap();
+            assert_eq!(
+                p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu,
+                path,
+                "{v6}: {name}"
+            );
+        }
     }
 }
 
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.7
 //= type=test
-//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple/sequence/exact-packet validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
+//= reason=The supplied fixed-1500 TUN embedding queries and validates the real backend MTU, enables PMTUD with or without PAWS, and dispatches checksummed ICMP PTB through live tuple and send-window sequence validation. Runtime-constructor and framed peer tests prove timestamp negotiation, IPv4 DF, bounded IPv4/IPv6 repairs, receiver/ACK byte progress, rejected feedback, committed-output retention, and ICMP-blackhole R1 fallback with ordinary congestion response and subsequent ACK-confirmed probing. This evidence covers the supplied embedding and existing core discovery, not arbitrary external embeddings, native IPv6 sockets or a full host ICMP service.
 //# Setting the DF bit implies the use of Path MTU Discovery as described
 //# in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 //# that implements PAWS MUST also implement Path MTU Discovery.
@@ -1221,13 +1370,11 @@ fn stale_registration_route_terminates_the_flow() {
         &mut backend,
     )
     .unwrap();
-    let route = pending
-        .as_ref()
+    let context = pending.as_ref().unwrap().context.unwrap();
+    let route = network
+        .host
+        .egress_snapshot(&context)
         .unwrap()
-        .context
-        .unwrap()
-        .binding
-        .snapshot
         .key()
         .route();
     network.host.remove_route(route).unwrap();
@@ -1335,7 +1482,8 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
         after,
     );
     assert_eq!(
-        host.host
+        network
+            .host
             .egress_snapshot(&context)
             .unwrap()
             .key()
@@ -1344,9 +1492,10 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
         remote.ip()
     );
     assert_eq!(
-        context
-            .binding
-            .snapshot
+        network
+            .host
+            .egress_snapshot(&context)
+            .unwrap()
             .key()
             .forwarding_destination()
             .address(),
@@ -1354,12 +1503,18 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
     );
     assert_eq!(&staged[16..20], &hop.octets());
     assert!(header(&staged) > IP_HEADER);
-    // Harmless stamp changes retain the exact selected option/timestamp bytes.
+    // A frame held across a change of its path's stamp, even a harmless
+    // one, is refused and selected again (f628595: "A held frame is no
+    // longer resubmitted under a replacement lease or after a harmless
+    // stamp change: it is selected again instead"). The SYN is built again
+    // over the same source route and Record Route, its origin Timestamp
+    // sampled anew, and the same TCP segment.
     network
         .host
         .set_link_mtu(network.ingress.link(), 1600)
         .unwrap();
     backend.blocked = false;
+    let before = utc_read();
     transmit_frames(
         &mut network,
         &mut endpoint,
@@ -1371,10 +1526,34 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
         &mut backend,
     )
     .unwrap();
+    let after = utc_read();
     assert!(pending.is_none());
-    // The held frame was submitted as encoded, without another sample.
-    assert_eq!(utc.acquisitions, 1);
-    assert_eq!(backend.frames, vec![staged]);
+    assert_eq!(utc.acquisitions, 2);
+    assert_eq!(backend.frames.len(), 1);
+    let sent = &backend.frames[0];
+    let h = header(&staged);
+    assert_eq!(header(sent), h, "the full option header again");
+    standard_time(
+        u32::from_be_bytes(sent[46..50].try_into().unwrap()),
+        before,
+        after,
+    );
+    // Apart from the IP checksum and the Timestamp's value, the IP header is
+    // the one first built.
+    let (mut old_ip, mut new_ip) = (staged[..h].to_vec(), sent[..h].to_vec());
+    for ip in [&mut old_ip, &mut new_ip] {
+        ip[10..12].fill(0);
+        ip[46..50].fill(0);
+    }
+    assert_eq!(new_ip, old_ip);
+    let quoted = |frame: &[u8]| ntcp_ip::quote_header(frame).unwrap().0;
+    let (old_tcp, new_tcp) = (
+        ntcp::wire::parse(quoted(&staged), &staged[h..]).unwrap(),
+        ntcp::wire::parse(quoted(sent), &sent[h..]).unwrap(),
+    );
+    assert_eq!(new_tcp.header, old_tcp.header, "the same SYN");
+    assert_eq!(new_tcp.options, old_tcp.options);
+    assert_eq!(new_tcp.payload, old_tcp.payload);
     // This is an originating, not-yet-forwarded source route. The ingress
     // codec correctly rejects it as incomplete at the final destination;
     // quote_header validates the outbound header and its logical peer instead.
@@ -1641,6 +1820,9 @@ fn runtime_held_attempt_repacketizes_on_shared_or_physical_decrease() {
 // Header exactly once per pending frame: when the evidence ticket cannot be
 // issued after placement, the next pass asks for the ticket again and
 // submits the very bytes placed, a valid segment over the final destination.
+// Since 91e356a only stateless replies and Host datagrams carry ledger
+// evidence (a connection's segment takes no ticket, so it cannot fail), so
+// the frame here is the reset answering a SYN for a port nobody listens on.
 #[test]
 fn routed_placement_survives_a_failed_ticket() {
     let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
@@ -1650,9 +1832,9 @@ fn routed_placement_survives_a_failed_ticket() {
     cfg.connection.nagle = false;
     cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
     cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
-    let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+    let mut server = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
     let mut host = TunHost::attach_routed(
-        &mut client,
+        &mut server,
         &cfg,
         a.into(),
         &DatagramSettings::default(),
@@ -1660,31 +1842,44 @@ fn routed_placement_survives_a_failed_ticket() {
         1,
     )
     .unwrap();
-    client
-        .connect_with_path_provider(
-            0,
-            SocketAddr::new(a.into(), 1234),
-            SocketAddr::new(b.into(), 8080),
-            ntcp::ManagedOpenOptions {
-                transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
-                dscp: cfg.dscp,
-                ipv4_options: Default::default(),
-                registration: None,
-                receive_authority: None,
-            },
-            &mut host.host,
-        )
-        .unwrap();
-    // The SYN as `transmit_frames` selects and builds it, after the base
+    let mut peer = Endpoint::new(cfg.clone(), [2; 32], 0, tun_v6_policy(b)).unwrap();
+    let mut peer_host = TunHost::attach(&mut peer, &cfg, b.into()).unwrap();
+    peer.connect_with_path_provider(
+        0,
+        SocketAddr::new(b.into(), 1234),
+        SocketAddr::new(a.into(), 8080),
+        ntcp::ManagedOpenOptions {
+            transport: ntcp::ActiveOpenOptions::from(&cfg.connection),
+            dscp: cfg.dscp,
+            ipv4_options: Default::default(),
+            registration: None,
+            receive_authority: None,
+        },
+        &mut peer_host.host,
+    )
+    .unwrap();
+    let syn = emit(&mut peer_host, &mut peer, 0, b.into()).pop().unwrap();
+    input_frame(
+        &mut host,
+        &mut server,
+        0,
+        &syn,
+        a.into(),
+        false,
+        &mut Sample(0),
+    )
+    .unwrap();
+    // The reset as `transmit_frames` selects and builds it, after the base
     // header, and the frame its route's header plan makes of it.
     let mut output = [0; MTU];
-    let (polled, attempt) = client
-        .poll_reserved_transmit(0, &mut output[IPV6_HEADER..], 1)
+    let (polled, attempt) = server
+        .poll_reserved_transmit_with_path_provider(0, &mut output[IPV6_HEADER..], 1, &mut host.host)
         .unwrap();
     let packet = polled.packet.unwrap();
+    assert!(packet.connection.is_none(), "a stateless reply");
     let attempt = attempt.unwrap();
     let len = build_frame(&mut output, packet, &mut Sample(0)).unwrap();
-    let context = host.host.egress_context(&mut client, attempt).unwrap();
+    let context = host.host.egress_context(&mut server, attempt).unwrap();
     let plan = host
         .host
         .header_plan(host.host.egress_snapshot(&context).unwrap().key())
@@ -1694,7 +1889,7 @@ fn routed_placement_survives_a_failed_ticket() {
     expected[plan.len..].copy_from_slice(&output[IPV6_HEADER..len]);
     ntcp_ip6::encode_tcp_routed(&mut expected, packet, plan.segments, packet.len).unwrap();
     // A ticket already issued for this attempt refuses the pass's own.
-    let mut issued = Some(host.host.submission_ticket(&mut client, context).unwrap());
+    let mut issued = Some(host.host.submission_ticket(&mut server, context).unwrap());
     let mut pending = Some(PendingFrame {
         attempt,
         context: None,
@@ -1709,7 +1904,7 @@ fn routed_placement_survives_a_failed_ticket() {
         }
         transmit_frames(
             &mut host,
-            &mut client,
+            &mut server,
             time,
             &mut output,
             &mut pending,
@@ -1726,5 +1921,5 @@ fn routed_placement_survives_a_failed_ticket() {
     assert!(pending.is_none());
     assert_eq!(backend.frames, [expected]);
     let flags = segment(&backend.frames[0]).header.flags;
-    assert_eq!(flags & (ntcp::wire::SYN | ntcp::wire::ACK), ntcp::wire::SYN);
+    assert_ne!(flags & ntcp::wire::RST, 0);
 }
