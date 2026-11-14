@@ -56,7 +56,7 @@ fn binary_key_public_abi_faults_lengths_aliases_and_unsupported_get() {
     if std::env::var_os(CHILD).is_none() {
         assert!(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "cookie_policy_tests::binary_key_public_abi_faults_lengths_aliases_and_unsupported_get", "--test-threads=1"])
-            .env(CHILD, "1").status().unwrap().success());
+            .env(CHILD, "1").child_passed());
         return;
     }
     assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());

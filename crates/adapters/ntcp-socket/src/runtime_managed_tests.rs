@@ -587,7 +587,7 @@ fn managed_native_public_rust_fast_open_helper_and_fd_alias_use_production_attac
     if std::env::var_os(CHILD).is_none() {
         assert!(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "runtime::backend::tests::managed::managed_native_public_rust_fast_open_helper_and_fd_alias_use_production_attach", "--test-threads=1"])
-            .env(CHILD, "1").status().unwrap().success());
+            .env(CHILD, "1").child_passed());
         return;
     }
     let local = Ipv4Addr::new(10, 73, 0, 2);

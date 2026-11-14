@@ -597,7 +597,7 @@ fn ipv6_freebind_native_abi_aliases_keep_option_widths_and_fd_aliases() {
     if std::env::var_os(CHILD).is_none() {
         assert!(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "runtime::ipv6_tests::ipv6_freebind_native_abi_aliases_keep_option_widths_and_fd_aliases", "--test-threads=1"])
-            .env(CHILD,"1").status().unwrap().success());
+            .env(CHILD,"1").child_passed());
         return;
     }
     assert!(

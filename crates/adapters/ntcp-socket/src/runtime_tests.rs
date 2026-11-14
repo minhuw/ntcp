@@ -1082,16 +1082,16 @@ fn startup_failure_joins_before_closing_wake() {
     // tests may legitimately allocate the just-closed number immediately.
     const CHILD: &str = "NTCP_TEST_STARTUP_CLOSE_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runtime::tests::startup_failure_joins_before_closing_wake",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::startup_failure_joins_before_closing_wake",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .child_passed()
+        );
         return;
     }
     let wake = unsafe { syscall(SYS_eventfd2, 0, EFD_NONBLOCK | EFD_CLOEXEC) as i32 };

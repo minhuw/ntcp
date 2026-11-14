@@ -273,6 +273,35 @@ thread_local! {
     static READ_TO_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static DUP_AFTER_KERNEL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
+/// Runs the test binary re-run as a child on one test, which isolates process-global
+/// state. The child's output is captured, so its libtest lines never interleave with
+/// the parent's; a failed child's output goes to the parent test's own output, each
+/// line quoted so that none reads as one of the parent's result lines.
+#[cfg(test)]
+trait ChildTest {
+    fn child_passed(&mut self) -> bool;
+}
+#[cfg(test)]
+impl ChildTest for std::process::Command {
+    fn child_passed(&mut self) -> bool {
+        let output = self.output().unwrap();
+        if !output.status.success() {
+            let quote = |bytes: &[u8]| {
+                String::from_utf8_lossy(bytes)
+                    .lines()
+                    .map(|line| format!("| {line}\n"))
+                    .collect::<String>()
+            };
+            eprintln!(
+                "child {self:?}: {}\n--- child stdout\n{}--- child stderr\n{}",
+                output.status,
+                quote(&output.stdout),
+                quote(&output.stderr),
+            );
+        }
+        output.status.success()
+    }
+}
 struct Token {
     slot: Option<usize>,
     id: u64,
@@ -2444,9 +2473,7 @@ mod tests {
                         "--test-threads=1"
                     ])
                     .env(CHILD, "1")
-                    .status()
-                    .unwrap()
-                    .success()
+                    .child_passed()
             );
             return;
         }
@@ -2522,9 +2549,7 @@ mod tests {
                         "--test-threads=1"
                     ])
                     .env(CHILD, "1")
-                    .status()
-                    .unwrap()
-                    .success()
+                    .child_passed()
             );
             return;
         }
@@ -2670,9 +2695,7 @@ mod tests {
                         "--test-threads=1"
                     ])
                     .env(CHILD, "1")
-                    .status()
-                    .unwrap()
-                    .success()
+                    .child_passed()
             );
             return;
         }
@@ -3196,16 +3219,16 @@ mod tests {
         // Isolate the fork snapshot, as in the runtime startup-close test.
         const CHILD: &str = "NTCP_TEST_FORK_MUTATION_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::fork_child_native_mutations_bypass_vanished_writer",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .status()
-                .unwrap();
-            assert!(status.success());
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::fork_child_native_mutations_bypass_vanished_writer",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, "1")
+                    .child_passed()
+            );
             return;
         }
         PID.store(unsafe { syscall(SYS_getpid) as i32 }, Ordering::Release);
@@ -3658,9 +3681,7 @@ mod cap_tests {
                         "--test-threads=1"
                     ])
                     .env(CHILD, "1")
-                    .status()
-                    .unwrap()
-                    .success()
+                    .child_passed()
             );
             return;
         }

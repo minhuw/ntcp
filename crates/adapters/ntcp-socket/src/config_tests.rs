@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use super::*;
+use crate::ChildTest;
 
 const BASE: &str = "io.interface=ntcp0\nio.address=10.73.0.2\n";
 
@@ -363,7 +364,7 @@ fn selection_subprocess() {
             ] {
                 cmd.env(format!("NTCP_SOCKET_{key}"), "invalid");
             }
-            assert!(cmd.status().unwrap().success(), "{scenario}");
+            assert!(cmd.child_passed(), "{scenario}");
             if scenario == "malformed" || scenario == "file" {
                 std::fs::remove_file(&path).unwrap();
             }
@@ -560,9 +561,7 @@ fn packet_profile_ignores_production_configuration() {
                 ])
                 .env(CHILD, "1")
                 .env("NTCP_SOCKET_CONFIG", "/nonexistent/ntcp-config")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }
@@ -986,9 +985,7 @@ fn destination_route_api_before_config_does_not_select_runtime() {
                     "--test-threads=1"
                 ])
                 .env(CHILD, "1")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }

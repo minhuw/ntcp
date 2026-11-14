@@ -425,7 +425,7 @@ fn mapped_registered_zero_copy_keeps_ipv4_wire_and_ipv6_completion() {
 fn mapped_native_socket_abi_preserves_domain_bind_names_and_fd_alias() {
     const CHILD: &str = "NTCP_MAPPED_ABI_CHILD";
     if std::env::var_os(CHILD).is_none() {
-        assert!(std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","runtime::ipv6_tests::mapped_tests::mapped_native_socket_abi_preserves_domain_bind_names_and_fd_alias","--test-threads=1"]).env(CHILD,"1").status().unwrap().success());
+        assert!(std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","runtime::ipv6_tests::mapped_tests::mapped_native_socket_abi_preserves_domain_bind_names_and_fd_alias","--test-threads=1"]).env(CHILD,"1").child_passed());
         return;
     }
     let mut config = SocketConfig::new("external", Ipv4Addr::new(192, 0, 2, 1));

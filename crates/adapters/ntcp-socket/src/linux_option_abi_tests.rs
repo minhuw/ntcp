@@ -13,9 +13,7 @@ fn disabled_linux_options_preserve_native_and_posix_abi() {
                     "--test-threads=1",
                 ])
                 .env(CHILD, "1")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }

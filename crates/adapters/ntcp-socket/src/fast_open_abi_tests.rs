@@ -9,9 +9,7 @@ fn child(test: &str, variable: &str) -> bool {
         std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--test-threads=1"])
             .env(variable, "1")
-            .status()
-            .unwrap()
-            .success()
+            .child_passed()
     );
     false
 }

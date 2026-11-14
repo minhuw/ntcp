@@ -100,9 +100,7 @@ fn shared_abi_large_stream_read_requests() {
                         "--test-threads=1"
                     ])
                     .env(CHILD, kind)
-                    .status()
-                    .unwrap()
-                    .success()
+                    .child_passed()
             );
         }
         return;

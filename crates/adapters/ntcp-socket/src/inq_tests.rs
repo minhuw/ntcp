@@ -145,9 +145,7 @@ fn shared_abi_inq_timestamp_gate_staging_alias_fault_and_eof() {
                         "--test-threads=1"
                     ])
                     .env(CHILD, scenario)
-                    .status()
-                    .unwrap()
-                    .success()
+                    .child_passed()
             );
         }
         return;
@@ -348,9 +346,7 @@ fn splice_stops_at_urgent_octet_without_consuming_it() {
                     "--test-threads=1"
                 ])
                 .env(CHILD, "1")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }
@@ -425,9 +421,7 @@ fn lowat_shared_alias_partial_write() {
                     "--test-threads=1"
                 ])
                 .env(CHILD, "1")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }
@@ -504,9 +498,7 @@ fn shared_abi_pipeline_capacity_one_and_real_clock_pacing() {
                         "--test-threads=1"
                     ])
                     .env(CHILD, profile)
-                    .status()
-                    .unwrap()
-                    .success()
+                    .child_passed()
             );
         }
         return;
@@ -591,9 +583,7 @@ fn global_lowat_alias_writes_poll_epoll_and_drain() {
                     "--test-threads=1"
                 ])
                 .env(CHILD, "1")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }

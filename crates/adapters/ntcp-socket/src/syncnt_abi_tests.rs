@@ -12,9 +12,7 @@ fn syncnt_raw_values_faults_and_aliases() {
                     "--test-threads=1"
                 ])
                 .env("NTCP_SYNCNT_CHILD", "1")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }

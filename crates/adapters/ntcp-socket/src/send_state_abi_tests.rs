@@ -11,9 +11,7 @@ fn unconnected_stream_send_errno_payload_and_sigpipe_match_native() {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", NAME, "--test-threads=1"])
                 .env(CHILD, "1")
-                .status()
-                .unwrap()
-                .success()
+                .child_passed()
         );
         return;
     }

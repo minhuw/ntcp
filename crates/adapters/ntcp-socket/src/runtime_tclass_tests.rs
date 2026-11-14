@@ -234,7 +234,7 @@ fn ipv6_tclass_native_abi_signed_values_and_faults_are_atomic() {
     if std::env::var_os(CHILD).is_none() {
         assert!(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "runtime::ipv6_tests::tclass_tests::ipv6_tclass_native_abi_signed_values_and_faults_are_atomic", "--test-threads=1"])
-            .env(CHILD,"1").status().unwrap().success());
+            .env(CHILD,"1").child_passed());
         return;
     }
     assert!(
