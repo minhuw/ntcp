@@ -322,3 +322,41 @@ fn the_feed_is_off_by_default_bounded_and_drained_oldest_first() {
     assert!(events.is_empty());
     assert_eq!(s.network.counters().drops[DropReason::NoSocket], 6);
 }
+
+// Buffers the device ran short of (`PacketIo::device_counters`) are the
+// backend's: Counters reports them as it reads them, and none is a discard
+// of the stack's. A DPDK port's rx_nombuf/rx_missed are packets the device
+// dropped before the stack saw them (Linux's rx_missed_errors in ethtool
+// stats, not a kfree_skb reason).
+#[test]
+fn device_buffer_shortage_is_reported_apart_from_discards() {
+    struct Device(Rc<std::cell::Cell<ntcp_io::DeviceCounters>>);
+    impl PacketIo for Device {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ip
+        }
+        fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+            Ok(None)
+        }
+        fn transmit(&mut self, _: &[u8]) -> io::Result<TxOutcome> {
+            Ok(TxOutcome::Submitted)
+        }
+        fn device_counters(&self) -> ntcp_io::DeviceCounters {
+            self.0.get()
+        }
+    }
+    let device = Rc::new(std::cell::Cell::new(ntcp_io::DeviceCounters::default()));
+    let config = NetworkConfig::new(IpAddr::V4(Ipv4Addr::from(LOCAL)), 1500);
+    let mut network = Network::new(config, Device(device.clone()), [5; 32], 0).unwrap();
+    let c = network.counters();
+    assert_eq!((c.rx_nombuf, c.rx_missed, c.tx_nombuf), (0, 0, 0));
+    device.set(ntcp_io::DeviceCounters {
+        rx_nombuf: 7,
+        rx_missed: 11,
+        tx_nombuf: 3,
+    });
+    network.drive(100, BUDGET).unwrap();
+    let c = network.counters();
+    assert_eq!((c.rx_nombuf, c.rx_missed, c.tx_nombuf), (7, 11, 3));
+    assert_eq!((c.discarded, c.drops.total()), (0, 0));
+}

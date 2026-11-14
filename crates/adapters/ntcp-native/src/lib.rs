@@ -955,10 +955,14 @@ impl<P: PacketIo> Network<P> {
     pub fn now(&self) -> Instant {
         self.now
     }
+    /// This Network's counters. Reads the backend's device counters
+    /// (`PacketIo::device_counters`), a control-plane call on a DPDK port:
+    /// call it on demand, not per packet.
     pub fn counters(&self) -> Counters {
         let loss = self.endpoint.loss_counters();
         let memory = self.endpoint.memory_counters();
         let drops = self.drop_counts();
+        let device = self.io.device_counters();
         Counters {
             discarded: drops.total(),
             drops,
@@ -989,6 +993,9 @@ impl<P: PacketIo> Network<P> {
             memory_refused_opens: memory.memory_refused_opens + self.counters.memory_refused_opens,
             memory_refused_growths: memory.memory_refused_growths,
             ledger_split_refusals: memory.ledger_split_refusals,
+            rx_nombuf: device.rx_nombuf,
+            rx_missed: device.rx_missed,
+            tx_nombuf: device.tx_nombuf,
             ..self.counters
         }
     }

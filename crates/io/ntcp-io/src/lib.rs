@@ -198,6 +198,27 @@ pub struct TxTimestampCompletion {
     pub timestamp: PacketTimestamp,
 }
 
+// Packet buffers a backend or its device ran short of, cumulative since it
+// started, as the device reports them (a host that resets the device's
+// counters resets these). Zero where the backend has no such buffers or
+// does not know. None of these packets reached the stack, or left it: they
+// are not discards the stack made.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeviceCounters {
+    // Receive buffer allocation failures (DPDK rte_eth_stats rx_nombuf): the
+    // driver found its receive pool empty while refilling the RX ring.
+    // Failures, not packets: the packets the device then had no posted
+    // buffer for are rx_missed.
+    pub rx_nombuf: u64,
+    // Received packets the device dropped for want of a posted receive
+    // buffer, its RX ring full (DPDK imissed, mlx5's out_of_buffer; Linux's
+    // rx_missed_errors).
+    pub rx_missed: u64,
+    // Transmit attempts that found the transmit pool empty. Each returned
+    // WouldBlock and kept nothing: the packet stays the caller's to retry.
+    pub tx_nombuf: u64,
+}
+
 // Enabled adapter paths, not a guarantee that every packet has metadata.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TimestampCapabilities {
@@ -291,6 +312,12 @@ pub trait PacketIo {
                 "packet marks unsupported",
             ))
         }
+    }
+
+    // Read on demand, never on the packet path: a backend may ask its device
+    // (DPDK rte_eth_stats_get, which mlx5 serves with a system call).
+    fn device_counters(&self) -> DeviceCounters {
+        DeviceCounters::default()
     }
 
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>>;

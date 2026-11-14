@@ -125,6 +125,7 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
                 ntcp_test_check_tso(l3 as u32, l4 as u32, 100, packet.len() as u32);
             }
             assert_eq!(ntcp_test_available(), 1023);
+            let full = io.device_counters().tx_nombuf;
             for leave in [0, 1, 2] {
                 ntcp_test_hold(leave);
                 assert_eq!(
@@ -134,6 +135,8 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
                 assert_eq!(ntcp_test_available(), leave);
                 ntcp_test_release();
             }
+            // An aggregate whose chain the pool could not complete.
+            assert_eq!(io.device_counters().tx_nombuf, full + 3);
             io.tso.as_mut().unwrap().max_descriptors = 1;
             assert!(matches!(
                 io.transmit_segmented(&packet, request),
@@ -306,6 +309,7 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         for _ in 0..7 {
             ntcp_test_check_scheduled(when.value, 64);
         }
+        let full = io.device_counters().tx_nombuf;
         for leave in [0, 1] {
             ntcp_test_hold(leave);
             assert_eq!(
@@ -315,6 +319,7 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
             assert_eq!(ntcp_test_available(), leave);
             ntcp_test_release();
         }
+        assert_eq!(io.device_counters().tx_nombuf, full + 2);
         // Recycled mbufs do not retain the launch flag for ordinary transmit.
         assert_eq!(io.transmit(&[7; 64]).unwrap(), TxOutcome::Submitted);
         ntcp_test_loopback(); // Asserts every segment has zero offload flags.
@@ -328,6 +333,9 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
             checksummed_network(io, offload);
             assert_eq!(ntcp_test_available(), 1023);
         }
+        let io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
+        pool_exhausted_network(io);
+        assert_eq!(ntcp_test_available(), 1023);
     }
 }
 
@@ -652,6 +660,124 @@ unsafe fn checksummed_network(mut io: Dpdk, offload: bool) {
     let checksummed = unsafe { ntcp_test_checksummed() } - before;
     assert_eq!(checksummed, if offload { frames } else { 0 });
     assert!(frames > 70);
+    // What is left on the rings goes back to the pool.
+    for step in 0..4 {
+        a.drive(30_000_000 + step, budget).unwrap();
+        let mut mss = 0;
+        while unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) } != 0 {}
+    }
+    drop(a);
+}
+
+// ntcp-native over the ring port while its pool is empty: every frame the
+// Network tries to send finds no mbuf. The attempt is backpressure, as a
+// full TX ring is (TxOutcome::WouldBlock): the frame stays in its slot, is
+// neither counted sent nor discarded, and leaves once mbufs come back, with
+// no retransmission. Counters::tx_nombuf counts the attempts; drops,
+// discarded and transmitted do not move.
+unsafe fn pool_exhausted_network(io: Dpdk) {
+    use ntcp_native::{
+        EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, WorkBudget, WriteOptions,
+    };
+    let config = |address: &str, side: u8| {
+        let mut config = NetworkConfig::new(address.parse().unwrap(), 1500);
+        config.tcp.max_connections = 2;
+        config.link = Link::Ethernet {
+            local_mac: [2, 0, 0, 0, 0, side],
+            next_hop: EthernetNextHop::Fixed([2, 0, 0, 0, 0, 3 - side]),
+        };
+        config
+    };
+    let incoming = Rc::new(RefCell::new(VecDeque::new()));
+    let outgoing = Rc::new(RefCell::new(VecDeque::new()));
+    let peer = Peer {
+        incoming: incoming.clone(),
+        outgoing: outgoing.clone(),
+    };
+    let mut a = Network::new(config("10.76.0.1", 1), io, [1; 32], 0).unwrap();
+    let mut b = Network::new(config("10.76.0.2", 2), peer, [2; 32], 0).unwrap();
+    let listener = b.listen(9000, 1).unwrap();
+    let client = a.connect("10.76.0.2:9000".parse().unwrap()).unwrap();
+    let budget = WorkBudget::new(64, 64, 64, 64);
+    let mut frame = vec![0; MAX_PACKET_LEN];
+    // One round trip of the wire: a's frames to b, b's back to a.
+    let mut exchange = |a: &mut Network<Dpdk>, b: &mut Network<Peer>, now: u64| {
+        a.drive(now, budget).unwrap();
+        loop {
+            let mut mss = 0;
+            let len = unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) };
+            if len == 0 {
+                break;
+            }
+            incoming
+                .borrow_mut()
+                .push_back(frame[..len as usize].to_vec());
+        }
+        b.drive(now, budget).unwrap();
+        for frame in outgoing.borrow_mut().drain(..) {
+            assert_eq!(
+                unsafe { ntcp_test_inject(frame.as_ptr(), frame.len() as u32) },
+                0
+            );
+        }
+    };
+    let mut server = None;
+    for step in 1..100u64 {
+        exchange(&mut a, &mut b, step * 1000);
+        server = b.accept(listener).ok();
+        if server.is_some() {
+            break;
+        }
+    }
+    let server = server.unwrap();
+    exchange(&mut a, &mut b, 200_000);
+    let before = a.counters();
+    assert_eq!(before.tx_nombuf, 0);
+
+    let data: Vec<u8> = (0..3000).map(|i| (i * 11 % 251) as u8).collect();
+    assert_eq!(
+        a.try_write(client, &data, WriteOptions::default())
+            .unwrap()
+            .accepted,
+        data.len()
+    );
+    unsafe { ntcp_test_hold(0) };
+    for _ in 0..3 {
+        a.drive(300_000, budget).unwrap();
+    }
+    assert_eq!(unsafe { ntcp_test_tx_count() }, 0);
+    let held = a.counters();
+    // Each drive tried the frame at the head of its slots again.
+    assert!(held.tx_nombuf >= 3, "{}", held.tx_nombuf);
+    assert_eq!(
+        held.backend_backpressure - before.backend_backpressure,
+        held.tx_nombuf
+    );
+    assert_eq!(held.transmitted, before.transmitted);
+    assert_eq!(held.drops, before.drops);
+    assert_eq!(held.discarded, before.discarded);
+    // The ring PMD reports no receive counters.
+    assert_eq!((held.rx_nombuf, held.rx_missed), (0, 0));
+    unsafe { ntcp_test_release() };
+
+    let mut received = Vec::new();
+    let mut out = vec![0; 65536];
+    for step in 0..100u64 {
+        exchange(&mut a, &mut b, 300_000 + step * 1000);
+        while let Ok(ReadOutcome::Data { len, .. }) = b.try_read(server, &mut out) {
+            received.extend_from_slice(&out[..len]);
+        }
+        if received.len() == data.len() {
+            break;
+        }
+    }
+    assert_eq!(received, data);
+    let after = a.counters();
+    assert_eq!(after.tx_nombuf, held.tx_nombuf);
+    // Never counted sent while it waited, so nothing was repaired.
+    assert_eq!(after.retransmitted_segments, 0);
+    assert_eq!(after.loss_probes, 0);
+    assert_eq!(after.drops, before.drops);
     // What is left on the rings goes back to the pool.
     for step in 0..4 {
         a.drive(30_000_000 + step, budget).unwrap();

@@ -204,7 +204,7 @@ int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
         struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
         if (!m) {
             rte_pktmbuf_free(head);
-            return 0;
+            return NTCP_DPDK_NOMBUF;
         }
         size_t chunk = rte_pktmbuf_tailroom(m);
         if (!chunk) {
@@ -310,7 +310,7 @@ int ntcp_dpdk_tso_transmit(uint16_t port, uint16_t queue, void *pool,
     size_t offset = 0;
     while (offset < length) {
         struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
-        if (!m) { rte_pktmbuf_free(head); return 0; }
+        if (!m) { rte_pktmbuf_free(head); return NTCP_DPDK_NOMBUF; }
         size_t chunk = RTE_MIN(length - offset, config->room);
         void *dst = rte_pktmbuf_append(m, (uint16_t)chunk);
         if (!dst) { rte_pktmbuf_free(m); rte_pktmbuf_free(head); return -EINVAL; }
@@ -431,7 +431,7 @@ int ntcp_dpdk_shared_transmit(uint16_t port, uint16_t queue, void *pool,
         total += segments[i].length;
     }
     if (total > NTCP_DPDK_MAX_PACKET_LEN) { result = -EMSGSIZE; goto done; }
-    result = 0;
+    result = NTCP_DPDK_NOMBUF;
     head = rte_pktmbuf_alloc(pool);
     if (!head) goto done;
     void *dst = rte_pktmbuf_append(head, header_length);
@@ -440,7 +440,12 @@ int ntcp_dpdk_shared_transmit(uint16_t port, uint16_t queue, void *pool,
     for (; consumed < count;) {
         struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
         struct ntcp_external *e = calloc(1, sizeof(*e));
-        if (!m || !e) { rte_pktmbuf_free(m); free(e); goto done; }
+        if (!m || !e) {
+            if (m) result = 0; // The heap, not the pool, failed.
+            rte_pktmbuf_free(m);
+            free(e);
+            goto done;
+        }
         const struct ntcp_shared_segment *s = &segments[consumed];
         e->lease = s->lease;
         e->release = release;
@@ -464,6 +469,7 @@ int ntcp_dpdk_shared_transmit(uint16_t port, uint16_t queue, void *pool,
         memset(dst, 0, 60 - total);
         if (rte_pktmbuf_chain(head, pad)) { rte_pktmbuf_free(pad); result = -EINVAL; goto done; }
     }
+    result = 0;
     if (rte_eth_tx_burst(port, queue, &head, 1) == 1) {
         head = NULL;
         result = 1;
@@ -697,6 +703,18 @@ int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
 }
 
 int ntcp_dpdk_port_start(uint16_t port) { return rte_eth_dev_start(port); }
+
+// The port's receive buffer shortage (rte_eth_stats rx_nombuf, imissed).
+// ethdev control calls are not thread-safe: the caller serializes them per
+// port (mlx5 updates its imissed wrap state here).
+int ntcp_dpdk_port_stats(uint16_t port, uint64_t *rx_nombuf, uint64_t *imissed) {
+    struct rte_eth_stats stats;
+    int result = rte_eth_stats_get(port, &stats);
+    if (result < 0) return result;
+    *rx_nombuf = stats.rx_nombuf;
+    *imissed = stats.imissed;
+    return 0;
+}
 
 // Teardown after every queue user and flow is gone: stop, close (releases the
 // port), drop ownership, and detach the device once it has no ethdev port

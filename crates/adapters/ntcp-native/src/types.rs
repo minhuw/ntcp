@@ -416,4 +416,18 @@ pub struct Counters {
     // Discards the enabled feed had no room to report
     // (`Network::set_drop_feed`).
     pub drop_events_lost: u64,
+    // Packet buffers the backend and its device ran short of
+    // (`ntcp_io::DeviceCounters`, `PacketIo::device_counters`), read from
+    // the backend by each `counters()` call. None of them is in drops or
+    // discarded: the stack discarded nothing. rx_nombuf: receive buffer
+    // allocation failures (DPDK rte_eth_stats rx_nombuf), failures rather
+    // than packets; rx_missed: packets the device dropped with no receive
+    // buffer posted (DPDK imissed, Linux rx_missed_errors). On a DPDK port
+    // both are the port's, the same in every queue's Network: read them from
+    // one. tx_nombuf: this Network's transmit attempts that found the pool
+    // empty, which also count in backend_backpressure: each frame stayed in
+    // its slot, was not counted sent, and was retried.
+    pub rx_nombuf: u64,
+    pub rx_missed: u64,
+    pub tx_nombuf: u64,
 }

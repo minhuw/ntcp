@@ -186,6 +186,7 @@ impl Dpdk {
         match result {
             0 => Ok(TxOutcome::WouldBlock),
             1 => Ok(TxOutcome::Submitted),
+            NOMBUF => Ok(self.pool_empty()),
             error => Err(io::Error::from_raw_os_error(-error)),
         }
     }
@@ -237,12 +238,14 @@ pub(super) fn ring_test(io: &mut Dpdk) {
         assert!(io.zero_copy_payload_supported(&packet.payload[0]));
         assert!(!io.zero_copy_payload_supported(&Payload::from_vec(vec![1])));
         for leave in [0, 1] {
+            let before = io.device_counters().tx_nombuf;
             unsafe { ntcp_test_hold(leave) };
             assert_eq!(
                 io.transmit_zero_copy(&packet).unwrap(),
                 TxOutcome::WouldBlock
             );
             assert_eq!(unsafe { ntcp_test_available() }, leave);
+            assert_eq!(io.device_counters().tx_nombuf, before + 1);
             unsafe { ntcp_test_release() };
         }
         for _ in 0..7 {
@@ -252,11 +255,13 @@ pub(super) fn ring_test(io: &mut Dpdk) {
             );
         }
         let available = unsafe { ntcp_test_available() };
+        let before = io.device_counters().tx_nombuf;
         assert_eq!(
             io.transmit_zero_copy(&packet).unwrap(),
             TxOutcome::WouldBlock
         );
         assert_eq!(unsafe { ntcp_test_available() }, available);
+        assert_eq!(io.device_counters().tx_nombuf, before); // The ring was full.
         let prior = count.load(Ordering::SeqCst);
         drop(packet); // all remaining per-send leases now belong to real mbufs.
         for i in 0..7 {

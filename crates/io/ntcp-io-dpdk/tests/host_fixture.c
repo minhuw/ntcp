@@ -7,6 +7,7 @@
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_mempool.h>
+#include <rte_mbuf.h>
 
 // Independent observations for tests/host_pmd.rs; the host module under test
 // never calls these.
@@ -47,6 +48,25 @@ int ntcp_host_test_pool_geometry(unsigned *size, unsigned *object) {
     *size = found->size;
     *object = found->header_size + found->elt_size + found->trailer_size;
     return 0;
+}
+
+// Takes every mbuf of the one pool named by the host module but `leave`,
+// as frames held elsewhere would; ntcp_host_test_pool_release returns them.
+static struct rte_mbuf *held[1 << 15];
+static unsigned held_count;
+int ntcp_host_test_pool_hold(unsigned leave) {
+    struct rte_mempool *found = NULL;
+    rte_mempool_walk(find_pool, &found);
+    if (!found || found == (struct rte_mempool *)-1) return -1;
+    while (rte_mempool_avail_count(found) > leave && held_count < RTE_DIM(held)) {
+        struct rte_mbuf *m = rte_pktmbuf_alloc(found);
+        if (!m) break;
+        held[held_count++] = m;
+    }
+    return rte_mempool_avail_count(found) == leave ? 0 : -1;
+}
+void ntcp_host_test_pool_release(void) {
+    while (held_count) rte_pktmbuf_free(held[--held_count]);
 }
 
 unsigned ntcp_host_test_lcore(void) { return rte_lcore_id(); }

@@ -1,8 +1,9 @@
 use ntcp_io::{
-    ClockDescriptor, ClockDomain, PacketIo, PacketLayer, PacketTimestamp, PacketTimestamps,
-    ReceivedPacket, RxChecksum, TcpSegmentationCapabilities, TcpSegmentationError,
-    TcpSegmentationRequest, TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit,
-    TransmitTime, TxOutcome, TxSchedulingCapabilities, TxTimestampRequest,
+    ClockDescriptor, ClockDomain, DeviceCounters, PacketIo, PacketLayer, PacketTimestamp,
+    PacketTimestamps, ReceivedPacket, RxChecksum, TcpSegmentationCapabilities,
+    TcpSegmentationError, TcpSegmentationRequest, TimestampCapabilities, TimestampPoint,
+    TimestampSource, TimestampUnit, TransmitTime, TxOutcome, TxSchedulingCapabilities,
+    TxTimestampRequest,
 };
 use std::{
     ffi::{CStr, c_char, c_void},
@@ -18,6 +19,9 @@ pub const MAX_PACKET_LEN: usize = 65_535;
 // rte_eth_rx_burst requires a count divisible by eight to support every PMD.
 // Use the smallest portable burst to bound prefetching for the one-packet API.
 const RX_BURST_LEN: usize = 8;
+
+// NTCP_DPDK_NOMBUF: a transmit call found the pool empty and kept nothing.
+const NOMBUF: i32 = 2;
 
 #[path = "segmentation.rs"]
 mod segmentation;
@@ -126,6 +130,8 @@ pub struct Dpdk {
     rx_checksum: bool,
     // The device completes TCP checksums (enable_tx_checksum).
     tx_checksum: bool,
+    // Transmit attempts that found the pool empty (DeviceCounters).
+    tx_nombuf: u64,
     _local: PhantomData<Rc<()>>,
 }
 
@@ -246,6 +252,7 @@ impl Dpdk {
             tx_scheduling: None,
             rx_checksum: false,
             tx_checksum: false,
+            tx_nombuf: 0,
             _local: PhantomData,
         })
     }
@@ -344,8 +351,19 @@ impl Dpdk {
         } {
             0 => Ok(TxOutcome::WouldBlock),
             1 => Ok(TxOutcome::Submitted),
+            NOMBUF => Ok(self.pool_empty()),
             error => Err(io::Error::from_raw_os_error(-error)),
         }
+    }
+
+    // A transmit attempt the pool had no mbuf for: backpressure, as a full
+    // TX ring, since mbufs come back as the device completes frames
+    // (reclaim) and RX frames are freed; the caller keeps the packet and
+    // retries it.
+    #[cold]
+    fn pool_empty(&mut self) -> TxOutcome {
+        self.tx_nombuf += 1;
+        TxOutcome::WouldBlock
     }
 
     /// Read-only diagnostic; does not configure or register anything.
@@ -488,6 +506,7 @@ impl PacketIo for Dpdk {
         } {
             0 => Ok(TxOutcome::WouldBlock),
             1 => Ok(TxOutcome::Submitted),
+            NOMBUF => Ok(self.pool_empty()),
             // Every negative shim result is before tx_burst; only recognized
             // rejections carry a fallback certificate across the public API.
             error => {
@@ -498,6 +517,15 @@ impl PacketIo for Dpdk {
                     _ => TcpSegmentationError::Other(error),
                 })
             }
+        }
+    }
+
+    // Only what this adapter counts: the port's receive counters belong to
+    // the host that owns the port (HostedQueue reads them).
+    fn device_counters(&self) -> DeviceCounters {
+        DeviceCounters {
+            tx_nombuf: self.tx_nombuf,
+            ..DeviceCounters::default()
         }
     }
 

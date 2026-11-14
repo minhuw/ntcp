@@ -8,8 +8,8 @@
 
 use crate::native::{Dpdk, driver_name, rx_checksum_check, tso_check, tx_checksum_check};
 use ntcp_io::{
-    ClockDescriptor, ClockDomain, OwnedPacket, PacketIo, PacketLayer, Payload, ReceivedPacket,
-    TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
+    ClockDescriptor, ClockDomain, DeviceCounters, OwnedPacket, PacketIo, PacketLayer, Payload,
+    ReceivedPacket, TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
     TimestampCapabilities, TimestampUnit, TransmitTime, TxOutcome, TxSchedulingCapabilities,
     TxSchedulingError, TxTimestampCompletion, TxTimestampRequest, ZeroCopyCapabilities,
 };
@@ -22,7 +22,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -78,6 +78,7 @@ unsafe extern "C" {
         pool: *mut c_void,
     ) -> i32;
     fn ntcp_dpdk_port_start(port: u16) -> i32;
+    fn ntcp_dpdk_port_stats(port: u16, rx_nombuf: *mut u64, imissed: *mut u64) -> i32;
     fn ntcp_dpdk_port_release(port: u16, owner: u64, started: i32);
     fn ntcp_dpdk_read_clock(port: u16, clock: *mut u64) -> i32;
     fn ntcp_dpdk_port_mac(port: u16, mac: *mut u8) -> i32;
@@ -363,6 +364,10 @@ struct PortInner {
     tx_checksum: bool,
     // ethdev keeps a pointer to the configured key; it lives with the port.
     _rss_key: Option<Box<[u8]>>,
+    // Serializes rte_eth_stats_get among the port's queues, each read on
+    // its own worker thread: ethdev control calls are not thread-safe, and
+    // mlx5 updates its imissed state in them.
+    stats: Mutex<()>,
 }
 
 // SAFETY: the pool pointers are only passed to thread-agnostic DPDK calls
@@ -444,6 +449,7 @@ impl Port {
             rx_checksum: false,
             tx_checksum: false,
             _rss_key: rss_key,
+            stats: Mutex::new(()),
         };
         if config.isolate {
             let mut message = [0; 128];
@@ -1111,6 +1117,25 @@ impl HostedQueue {
         &self.io
     }
 
+    /// See `PacketIo::device_counters`: this queue's `tx_nombuf`, and the
+    /// port's `rx_nombuf` and `rx_missed` (rte_eth_stats `rx_nombuf` and
+    /// `imissed`), the same in every queue of the port, as DPDK reports them
+    /// per port only. Zero where the PMD reports nothing (the ring PMD's
+    /// stats count packets only). A control-plane call, serialized among the
+    /// port's queues; mlx5 serves `imissed` with a system call.
+    pub fn device_counters(&self) -> DeviceCounters {
+        let mut counters = self.io.device_counters();
+        let (mut rx_nombuf, mut imissed) = (0, 0);
+        let _serial = self.port.stats.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the port is started and kept so by `port`; calls on it
+        // are serialized by the lock; outputs are writable.
+        if unsafe { ntcp_dpdk_port_stats(self.port.port, &mut rx_nombuf, &mut imissed) } == 0 {
+            counters.rx_nombuf = rx_nombuf;
+            counters.rx_missed = imissed;
+        }
+        counters
+    }
+
     /// See `Dpdk::enable_zero_copy`; multi-segment TX is enabled when supported.
     pub fn enable_zero_copy(&mut self) -> io::Result<()> {
         self.io.enable_zero_copy()
@@ -1144,6 +1169,9 @@ impl PacketIo for HostedQueue {
     }
     fn set_packet_mark(&mut self, mark: u32) -> io::Result<()> {
         self.io.set_packet_mark(mark)
+    }
+    fn device_counters(&self) -> DeviceCounters {
+        HostedQueue::device_counters(self)
     }
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
         self.io.receive(out)

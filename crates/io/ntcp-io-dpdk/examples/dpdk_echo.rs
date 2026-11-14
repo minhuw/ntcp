@@ -41,7 +41,9 @@
 // - How much hugepage memory? Each queue pair's mbuf pool, at the default
 //   `PortConfig::mbufs_per_queue` (16383 mbufs of 2368 octets), takes 40.01
 //   MB of 2 MiB hugepages on the device's NUMA socket: one queue per
-//   `--ip`, or `--members` queues, besides what EAL and the PMD take.
+//   `--ip`, or `--members` queues, besides what EAL and the PMD take. A
+//   pool that ran dry shows as `METRIC rx_nombuf` and `rx_missed` (the
+//   port's, from rte_eth_stats) and `t<k>_tx_nombuf` (frames that waited).
 // - What does a queue receive? Without `--isolate` the port's unmatched
 //   traffic, ARP included, lands on queue 0 and `steer_ipv4` sends each
 //   address to its queue. With `--isolate` (bifurcated mlx5) only what the
@@ -987,6 +989,13 @@ fn summarize(reports: &[Report], neighbors: &SharedNeighbors, steering: Option<S
     );
     println!("METRIC transmitted={}", sum(|r| r.counters.transmitted));
     println!("METRIC received={}", sum(|r| r.counters.received));
+    // The port's, which every queue reports: the latest read is the largest.
+    let port = |f: fn(&ntcp_native::Counters) -> u64| {
+        reports.iter().map(|r| f(&r.counters)).max().unwrap_or(0)
+    };
+    println!("METRIC rx_nombuf={}", port(|c| c.rx_nombuf));
+    println!("METRIC rx_missed={}", port(|c| c.rx_missed));
+    println!("METRIC tx_nombuf={}", sum(|r| r.counters.tx_nombuf));
     for (index, report) in reports.iter().enumerate() {
         // Per worker (member k, or the k-th --ip): its queue's segmentation
         // and its Network's counters.
@@ -1011,6 +1020,7 @@ fn summarize(reports: &[Report], neighbors: &SharedNeighbors, steering: Option<S
             "METRIC t{index}_backend_backpressure={}",
             c.backend_backpressure
         );
+        println!("METRIC t{index}_tx_nombuf={}", c.tx_nombuf);
         println!("METRIC t{index}_arp_sent={}", c.arp_sent);
         println!("METRIC t{index}_arp_received={}", c.arp_received);
         println!("METRIC t{index}_handed_off={}", c.handed_off);

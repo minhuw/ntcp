@@ -1,4 +1,4 @@
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+use ntcp_io::{DeviceCounters, PacketIo, PacketLayer, TxOutcome};
 use ntcp_io_dpdk::{Eal, Port, PortConfig, Rss, RssAlgorithm};
 use std::{
     ffi::{CString, c_char, c_void},
@@ -10,6 +10,8 @@ unsafe extern "C" {
     fn ntcp_host_test_cpu() -> i32;
     fn ntcp_host_test_pools(full: *mut u32) -> u32;
     fn ntcp_host_test_pool_geometry(size: *mut u32, object: *mut u32) -> i32;
+    fn ntcp_host_test_pool_hold(leave: u32) -> i32;
+    fn ntcp_host_test_pool_release();
     fn ntcp_host_test_lcore() -> u32;
     fn ntcp_host_test_port_named(name: *const c_char) -> i32;
     fn ntcp_host_test_ring_driver() -> *mut c_void;
@@ -108,6 +110,7 @@ fn hosted_ring_ports() {
     mac_addresses(eal);
     rss_ports(eal);
     segmentation_not_offered(eal);
+    receive_pool_exhausted(eal);
     outstanding_mbufs_retain_pool(eal);
 }
 
@@ -516,6 +519,68 @@ fn segmentation_not_offered(eal: &'static Eal) {
     assert_eq!(&out[..sent.len()], sent.as_slice());
     drop((port, queue));
     assert_eq!(port_named("net_ring7"), None);
+    assert_eq!(pools(), (0, 0));
+}
+
+// A pcap file of `count` minimum Ethernet frames, each its index in every
+// octet after the header.
+fn pcap_file(path: &std::path::Path, count: u8) {
+    let mut bytes = Vec::new();
+    // Global header: magic (microseconds), version 2.4, zone, sigfigs,
+    // snaplen 65535, LINKTYPE_ETHERNET.
+    bytes.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    for word in [0u32, 0, 65535, 1] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for index in 0..count {
+        let frame = frame(index, 60);
+        for word in [0u32, 0, 60, 60] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&frame);
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+// The pcap PMD allocates each received frame's mbuf from the queue's pool
+// as it reads it, and counts rx_nombuf when the pool is empty, the frame
+// then lost, as a NIC whose ring has no buffer posted loses one. The port's
+// count reaches the queue's device counters (rte_eth_stats rx_nombuf), and
+// frames read once mbufs are back arrive. (The ring PMD hands over mbufs
+// its peer allocated and counts no rx_nombuf, mlx5 has no virtual device.)
+fn receive_pool_exhausted(eal: &'static Eal) {
+    let path = std::env::temp_dir().join(format!("ntcp-nombuf-{}.pcap", std::process::id()));
+    pcap_file(&path, 6);
+    let mut config = PortConfig::new(format!("net_pcap0,rx_pcap={}", path.display()));
+    config.rx_desc = 64;
+    config.tx_desc = 64;
+    config.mbufs_per_queue = 511;
+    let port = Port::start(eal, config).unwrap();
+    assert_eq!(port.driver_name().unwrap(), "net_pcap");
+    let mut queue = port.take_queue(0).unwrap().attach().unwrap();
+    assert_eq!(queue.device_counters(), DeviceCounters::default());
+    let mut out = vec![0; 2048];
+    // SAFETY: EAL is initialized and the port's single pool exists.
+    assert_eq!(unsafe { ntcp_host_test_pool_hold(0) }, 0);
+    for _ in 0..2 {
+        assert_eq!(queue.receive(&mut out).unwrap(), None);
+    }
+    // One frame read and lost per burst the pool could not serve.
+    let starved = queue.device_counters();
+    assert_eq!(starved.rx_nombuf, 2);
+    assert_eq!((starved.rx_missed, starved.tx_nombuf), (0, 0));
+    // SAFETY: as above.
+    unsafe { ntcp_host_test_pool_release() };
+    for index in 2..6 {
+        assert_eq!(queue.receive(&mut out).unwrap(), Some(60));
+        assert_eq!(&out[..60], frame(index, 60).as_slice());
+    }
+    assert_eq!(queue.receive(&mut out).unwrap(), None);
+    assert_eq!(queue.device_counters().rx_nombuf, 2);
+    drop((port, queue));
+    std::fs::remove_file(&path).unwrap();
     assert_eq!(pools(), (0, 0));
 }
 

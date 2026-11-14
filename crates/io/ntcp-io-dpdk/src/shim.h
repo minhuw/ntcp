@@ -3,6 +3,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #define NTCP_DPDK_MAX_PACKET_LEN 65535u
+// The transmit calls return 1 when the PMD took the packet, 0 when its TX
+// ring did not (or, shared, a heap allocation failed), NTCP_DPDK_NOMBUF when
+// the pool had no mbuf for it, and a negative errno when the packet was
+// refused. Nothing is kept on 0 or NTCP_DPDK_NOMBUF: the caller may retry.
+#define NTCP_DPDK_NOMBUF 2
 int ntcp_dpdk_get_mtu(uint16_t port, uint16_t *mtu);
 int ntcp_dpdk_valid_port(uint16_t port);
 int ntcp_dpdk_tx_timestamp_lookup(int *offset, uint64_t *flag);
@@ -71,6 +76,7 @@ int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *confi
 int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
                                uint16_t tx_desc, int socket, void *pool);
 int ntcp_dpdk_port_start(uint16_t port);
+int ntcp_dpdk_port_stats(uint16_t port, uint64_t *rx_nombuf, uint64_t *imissed);
 void ntcp_dpdk_port_release(uint16_t port, uint64_t owner, int started);
 int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock);
 int ntcp_dpdk_port_mac(uint16_t port, uint8_t mac[6]);

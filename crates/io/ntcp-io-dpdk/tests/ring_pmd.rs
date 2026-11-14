@@ -1,7 +1,7 @@
 use ntcp_io::{
-    ClockDescriptor, ClockDomain, PacketIo, PacketLayer, PacketTimestamp, PacketTimestamps,
-    TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit, TxOutcome,
-    TxTimestampRequest,
+    ClockDescriptor, ClockDomain, DeviceCounters, PacketIo, PacketLayer, PacketTimestamp,
+    PacketTimestamps, TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit,
+    TxOutcome, TxTimestampRequest,
 };
 use ntcp_io_dpdk::{Dpdk, MAX_PACKET_LEN};
 use std::ffi::c_void;
@@ -230,6 +230,8 @@ fn real_ring_pmd_copy_and_ownership() {
             let available = ntcp_test_available();
             assert_eq!(io.transmit(&[9; 129]).unwrap(), TxOutcome::WouldBlock);
             assert_eq!(ntcp_test_available(), available); // Whole unsent chain freed.
+            // A full TX ring is not a pool shortage.
+            assert_eq!(io.device_counters(), DeviceCounters::default());
             for _ in 0..7 {
                 ntcp_test_loopback();
                 assert_eq!(io.receive(&mut out).unwrap(), Some(64));
@@ -241,6 +243,16 @@ fn real_ring_pmd_copy_and_ownership() {
                 assert_eq!(ntcp_test_available(), leave); // Partial allocation unwound.
                 ntcp_test_release();
             }
+            // Each attempt the pool could not serve, the first mbuf or a
+            // later one of the chain; the borrowed adapter reports no port
+            // counters (its host owns the port).
+            assert_eq!(
+                io.device_counters(),
+                DeviceCounters {
+                    tx_nombuf: 2,
+                    ..DeviceCounters::default()
+                }
+            );
         } // Ending the adapter lifetime does not stop the borrowed port/pool.
         buffered_receive_ownership(port as u16, pool);
         let mut again = Dpdk::from_borrowed(port as u16, 0, 0, pool).unwrap();
