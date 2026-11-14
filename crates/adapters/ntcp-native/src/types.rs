@@ -143,7 +143,9 @@ pub enum ReadOutcome {
     Data {
         len: usize,
         range: TxStreamRange,
-        // Metadata describes the last byte of this read, not every byte.
+        /// The RX timestamps of the last byte of this read, not of every
+        /// byte; None when RX timestamps are off
+        /// (`NetworkConfig::rx_timestamp_ranges` 0).
         last_byte_timestamps: Option<RxReadTimestamps>,
     },
     Eof,

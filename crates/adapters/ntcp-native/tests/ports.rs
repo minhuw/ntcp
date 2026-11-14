@@ -651,3 +651,29 @@ fn a_reused_endpoint_slot_reports_to_its_own_connection() {
         pair.steps(4);
     }
 }
+
+// With RX timestamps off (NetworkConfig::new's rx_timestamp_ranges 0) a
+// read reports no timestamps rather than an empty record.
+#[test]
+fn reads_report_no_timestamps_while_rx_timestamps_are_off() {
+    let mut pair = Pair::new(40000..=40015, 50000..=50000);
+    assert_eq!(pair.server.config().rx_timestamp_ranges, 0);
+    let client = pair
+        .client
+        .connect(SocketAddr::new(address(2), PORT))
+        .unwrap();
+    let server = pair.accepted();
+    pair.client
+        .try_write(client, b"stamp", WriteOptions::default())
+        .unwrap();
+    pair.steps(4);
+    let mut out = [0; 8];
+    assert_eq!(
+        pair.server.try_read(server, &mut out).unwrap(),
+        ReadOutcome::Data {
+            len: 5,
+            range: TxStreamRange { start: 0, end: 5 },
+            last_byte_timestamps: None,
+        }
+    );
+}

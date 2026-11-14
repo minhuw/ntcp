@@ -1711,7 +1711,9 @@ impl<P: PacketIo> Network<P> {
             self.endpoint.readable_bytes(core)?
         };
         let count = out.len().min(available);
-        let metadata = if count != 0 {
+        // Without RX timestamp ranges no connection records any (its
+        // capacity is the configuration's), so there is nothing to report.
+        let metadata = if count != 0 && self.config.rx_timestamp_ranges != 0 {
             self.endpoint.peek_rx_timestamps(core, count)?
         } else {
             None
