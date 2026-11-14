@@ -144,6 +144,12 @@ pub struct Network<P: PacketIo> {
     retained: VecDeque<driver::RetainedInput>,
     receive_free: Vec<Vec<u8>>,
     counters: Counters,
+    // What the driver itself discarded, by reason; the Endpoint and Host
+    // record their own.
+    drops: ntcp::DropRecorder,
+    // The error the receive path is returning stands for a discard already
+    // recorded.
+    rx_recorded: bool,
     stopped: bool,
     stopped_event: bool,
     failure: Option<io::Error>,
@@ -894,6 +900,8 @@ impl<P: PacketIo> Network<P> {
             retained: retained_input,
             receive_free,
             counters: Counters::default(),
+            drops: ntcp::DropRecorder::new(),
+            rx_recorded: false,
             stopped: false,
             stopped_event: false,
             failure: None,
@@ -950,7 +958,13 @@ impl<P: PacketIo> Network<P> {
     pub fn counters(&self) -> Counters {
         let loss = self.endpoint.loss_counters();
         let memory = self.endpoint.memory_counters();
+        let drops = self.drop_counts();
         Counters {
+            discarded: drops.total(),
+            drops,
+            drop_events_lost: self.drops.feed_lost()
+                + self.endpoint.drops().feed_lost()
+                + self.host.drops().feed_lost(),
             retained_input: self.retained.len(),
             resolution_failures: self.host.arp_counters().resolution_failures,
             listen_overflows: self.endpoint.listen_overflows(),
@@ -977,6 +991,44 @@ impl<P: PacketIo> Network<P> {
             ledger_split_refusals: memory.ledger_split_refusals,
             ..self.counters
         }
+    }
+    // Every discard of this Network, by reason: the Endpoint's, the Host's
+    // and the driver's.
+    fn drop_counts(&self) -> ntcp::DropCounts {
+        self.endpoint.drop_counts() + self.host.drop_counts() + self.drops.counts()
+    }
+    /// Enable the per-discard feed, as dropwatch enables drop_monitor, with
+    /// room for `capacity` waiting events in each of the Endpoint, the Host
+    /// and the driver; 0 disables it and frees its storage. Disabled by
+    /// default. Its storage is allocated here, `capacity` times
+    /// `size_of::<ntcp::DropEvent>()` octets three times, and never grows:
+    /// a discard beyond a full feed is counted in
+    /// `Counters::drop_events_lost`, never reported. Enabling it again
+    /// discards what waits. `Error::NoMemory` leaves it disabled.
+    pub fn set_drop_feed(&mut self, capacity: usize) -> Result<()> {
+        let result = self
+            .endpoint
+            .drops_mut()
+            .set_feed(capacity)
+            .and_then(|()| self.host.drops_mut().set_feed(capacity))
+            .and_then(|()| self.drops.set_feed(capacity));
+        if result.is_err() {
+            let _ = self.endpoint.drops_mut().set_feed(0);
+            let _ = self.host.drops_mut().set_feed(0);
+            let _ = self.drops.set_feed(0);
+        }
+        result.map_err(|_| Error::NoMemory)
+    }
+    /// Hand every waiting discard event to `f`, oldest first.
+    pub fn drain_drop_events(&mut self, f: impl FnMut(ntcp::DropEvent)) {
+        ntcp::drain_drop_events(
+            &mut [
+                self.endpoint.drops_mut(),
+                self.host.drops_mut(),
+                &mut self.drops,
+            ],
+            f,
+        );
     }
     /// Fragments held, datagrams completed and every discard by reason,
     /// by which to size `NetworkConfig::reassembly_datagrams`. While

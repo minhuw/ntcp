@@ -1,4 +1,5 @@
 use super::*;
+use ntcp::DropReason;
 use ntcp_host::{
     Advice, BackendOutcome, Datagram, DeferredIcmp, EgressContext, IcmpDispatch, NeighborHop,
     NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
@@ -101,13 +102,14 @@ impl<P: PacketIo> Network<P> {
         // retained-input pool with their exact Host envelope.
         let mut rx = std::mem::take(&mut self.rx);
         let mut completed = std::mem::take(&mut self.completed);
+        let discarded = self.drop_total();
         let result = self.drive_inner(now, budget, &mut rx, &mut completed, &mut report);
+        report.discarded = (self.drop_total() - discarded) as usize;
         self.rx = rx;
         self.completed = completed;
         self.wake_members_for_memory();
         self.counters.received += report.received as u64;
         self.counters.transmitted += report.transmitted as u64;
-        self.counters.discarded += report.discarded as u64;
         if let Err(error) = result {
             return Err(match error {
                 Error::Backend(error) => self.stop_with_error(error),
@@ -153,25 +155,31 @@ impl<P: PacketIo> Network<P> {
                 continue;
             }
             if let Some(icmp) = item.icmp {
-                if let Ok(IcmpDispatch::Deferred(again)) =
-                    self.host.replay_icmp(&mut self.endpoint, icmp, now)
-                {
-                    item.icmp = Some(again);
-                    self.retained.push_back(item);
-                    continue;
+                match self.host.replay_icmp(&mut self.endpoint, icmp, now) {
+                    Ok(IcmpDispatch::Deferred(again)) => {
+                        item.icmp = Some(again);
+                        self.retained.push_back(item);
+                        continue;
+                    }
+                    Ok(IcmpDispatch::Completed(_)) => {}
+                    Err(error) => self.input_failed(&Error::Host(error), &[]),
                 }
-            } else if self.endpoint.connection_exists(item.owner)
-                && let Some(processed) = item
-                    .envelope
-                    .and_then(|e| e.datagram(&item.bytes[..item.len]))
+            } else if let Some(processed) = item
+                .envelope
+                .and_then(|e| e.datagram(&item.bytes[..item.len]))
             {
-                let _ = self.host.input_datagram(
+                // Its connection went away while it waited.
+                if !self.endpoint.connection_exists(item.owner) {
+                    self.drop_ip(DropReason::NoSocket, processed.bytes());
+                } else if let Err(error) = self.host.input_datagram(
                     &mut self.endpoint,
                     now,
                     processed,
                     item.metadata,
                     self.config.tcp.dscp,
-                );
+                ) {
+                    self.input_failed(&Error::Host(error), processed.bytes());
+                }
             }
             self.receive_free.push(item.bytes);
         }
@@ -189,7 +197,7 @@ impl<P: PacketIo> Network<P> {
         let mut handoffs = false;
         if self.inlet.as_ref().is_some_and(|i| i.pending()) {
             let share = (budget.receive - receive_work).div_ceil(2);
-            let (taken, more) = self.take_handoffs(share, completed, report);
+            let (taken, more) = self.take_handoffs(share, completed);
             receive_work += taken;
             handoffs = more;
         }
@@ -204,7 +212,7 @@ impl<P: PacketIo> Network<P> {
                         io::ErrorKind::InvalidData | io::ErrorKind::Unsupported
                     ) =>
                 {
-                    report.discarded += 1;
+                    self.drop_received(DropReason::DevHdr, &[]);
                     receive_work += 1;
                     continue;
                 }
@@ -225,16 +233,23 @@ impl<P: PacketIo> Network<P> {
                             unreachable!()
                         };
                         if frame.destination != local_mac {
-                            report.discarded += 1;
+                            self.drop_received(DropReason::OtherHost, &rx[..packet.len]);
                             continue;
                         }
                         frame.payload
                     }
-                    Err(_) => {
+                    Err(error) => {
                         // ARP rides its own EtherType, which the IP parser
                         // refuses.
-                        if self.control.is_empty() || !self.arp_input(&rx[..packet.len]) {
-                            report.discarded += 1;
+                        let bytes = &rx[..packet.len];
+                        let arp = bytes.get(12..14) == Some(&[0x08, 0x06]);
+                        let result = match (arp, self.control.is_empty()) {
+                            (true, false) => self.arp_input(bytes),
+                            (true, true) => Err(DropReason::ArpInvalid),
+                            (false, _) => Err(ntcp_host::ip_drop_reason(error)),
+                        };
+                        if let Err(reason) = result {
+                            self.drop_received(reason, bytes);
                         }
                         continue;
                     }
@@ -287,13 +302,13 @@ impl<P: PacketIo> Network<P> {
                 }
                 None => self.input(frame, packet, fragment, completed),
             };
-            if result.is_err() {
-                report.discarded += 1;
+            if let Err(error) = result {
+                self.input_failed(&error, frame);
             }
         }
         if handoffs && receive_work < budget.receive {
             let (taken, more) =
-                self.take_handoffs(budget.receive - receive_work, completed, report);
+                self.take_handoffs(budget.receive - receive_work, completed);
             receive_work += taken;
             handoffs = more;
         }
@@ -409,15 +424,14 @@ impl<P: PacketIo> Network<P> {
     }
     // An ARP frame addressed to this port or to broadcast, for the Host's
     // ARP; frames to other stations are not this port's to learn from.
-    fn arp_input(&mut self, bytes: &[u8]) -> bool {
+    fn arp_input(&mut self, bytes: &[u8]) -> core::result::Result<(), DropReason> {
         let Link::Ethernet { local_mac, .. } = self.config.link else {
-            return false;
+            return Err(DropReason::UnhandledProto);
         };
-        let Ok(frame) = ntcp_ethernet::parse_ethernet_arp(bytes) else {
-            return false;
-        };
+        let frame =
+            ntcp_ethernet::parse_ethernet_arp(bytes).map_err(|_| DropReason::ArpInvalid)?;
         if frame.destination != local_mac && frame.destination != ntcp_ethernet::BROADCAST {
-            return false;
+            return Err(DropReason::OtherHost);
         }
         self.counters.arp_received += 1;
         let taken = self
@@ -425,7 +439,7 @@ impl<P: PacketIo> Network<P> {
             .receive_arp(self.ingress, self.now, frame.payload)
             .is_ok();
         self.arp_input |= taken;
-        taken
+        if taken { Ok(()) } else { Err(DropReason::ArpInvalid) }
     }
     // ARP's due timers, then held frames whose resolution ended.
     fn service_neighbors(&mut self, now: Instant) -> Result<()> {
@@ -639,8 +653,12 @@ impl<P: PacketIo> Network<P> {
                         Advice::NetworkError(error) => Some(error),
                         Advice::PacketTooBig { .. } => None,
                     };
-                    self.endpoint
-                        .discard_unsubmitted(self.now, attempt, error)?;
+                    self.endpoint.discard_unsubmitted(
+                        self.now,
+                        attempt,
+                        error,
+                        DropReason::NeighFailed,
+                    )?;
                 }
             }
         }
@@ -814,6 +832,8 @@ impl<P: PacketIo> Network<P> {
                 }
                 flows::Redirect::Full => {
                     self.counters.redirects_dropped += 1;
+                    self.drop_ip(DropReason::RedirectTableFull, bytes);
+                    self.rx_recorded = true;
                     Err(Error::Capacity)
                 }
                 flows::Redirect::Nobody => take(self),
@@ -899,20 +919,17 @@ impl<P: PacketIo> Network<P> {
         &mut self,
         limit: usize,
         completed: &mut [u8],
-        report: &mut DriveReport,
     ) -> (usize, bool) {
         let Some(inlet) = self.inlet.take() else {
             return (0, false);
         };
         let limit = limit.min(self.receive_free.len());
-        let mut discarded = 0;
         let taken = inlet.drain(limit, |packet, handoff| {
-            if self.take_handoff(packet, handoff, completed).is_err() {
-                discarded += 1;
+            if let Err(error) = self.take_handoff(packet, handoff, completed) {
+                self.input_failed(&error, packet);
             }
         });
         self.inlet = Some(inlet);
-        report.discarded += discarded;
         self.counters.handoffs_received += taken as u64;
         (taken, taken == limit)
     }
@@ -923,7 +940,60 @@ impl<P: PacketIo> Network<P> {
             self.counters.handed_off += 1;
         } else {
             self.counters.handoffs_dropped += 1;
+            self.drop_ip(DropReason::CpuBacklog, packet);
         }
+    }
+    // Every discard this Network recorded.
+    fn drop_total(&self) -> u64 {
+        self.endpoint.drops().total() + self.host.drops().total() + self.drops.total()
+    }
+    // Record the discard of a received frame as the backend delivered it.
+    #[cold]
+    #[inline(never)]
+    fn drop_received(&mut self, reason: DropReason, frame: &[u8]) {
+        let ethernet = self.io.layer() == PacketLayer::Ethernet;
+        self.drops.record(reason, self.now, frame.len(), || {
+            if ethernet {
+                ntcp::DropSubject::of_ethernet_frame(frame)
+            } else {
+                ntcp::DropSubject::of_ip_packet(frame)
+            }
+        });
+    }
+    // Record the discard of IP packet `packet`.
+    #[cold]
+    #[inline(never)]
+    fn drop_ip(&mut self, reason: DropReason, packet: &[u8]) {
+        self.drops.record(reason, self.now, packet.len(), || {
+            ntcp::DropSubject::of_ip_packet(packet)
+        });
+    }
+    // A received IP packet whose input failed with `error`: recorded with the
+    // reason the error stands for, unless the layer that refused it recorded
+    // it already.
+    #[cold]
+    #[inline(never)]
+    fn input_failed(&mut self, error: &Error, packet: &[u8]) {
+        let recorded = core::mem::take(&mut self.rx_recorded)
+            | self.endpoint.drops_mut().take_error_recorded()
+            | self.host.drops_mut().take_error_recorded();
+        if recorded {
+            return;
+        }
+        let icmp = match packet.first().map(|b| b >> 4) {
+            Some(4) => packet.get(9) == Some(&1),
+            Some(6) => packet.get(6) == Some(&58),
+            _ => false,
+        };
+        let reason = match error {
+            Error::Host(error) if icmp => ntcp_host::icmp_drop_reason(error),
+            Error::Host(error) => ntcp_host::drop_reason(error),
+            Error::Tcp(_) => DropReason::InvalidMetadata,
+            Error::Capacity => DropReason::SocketBacklog,
+            Error::Unsupported(_) => DropReason::UnhandledProto,
+            _ => DropReason::NotSpecified,
+        };
+        self.drop_ip(reason, packet);
     }
     // Destination processing and dispatch of one complete datagram.
     fn dispatch(&mut self, datagram: Datagram<'_>, metadata: ntcp::RxPacketMetadata) -> Result<()> {
@@ -948,10 +1018,9 @@ impl<P: PacketIo> Network<P> {
             metadata,
             self.config.tcp.dscp,
         ) {
-            Ok(ntcp::InputDisposition::Processed) => Ok(()),
-            // Not taken in (malformed, or refused by the endpoint): counted
-            // as discarded.
-            Ok(ntcp::InputDisposition::Dropped) => Err(Error::Unsupported("datagram dropped")),
+            // Not taken in (malformed, or refused by the endpoint): the
+            // Endpoint or Host recorded why.
+            Ok(ntcp::InputDisposition::Processed | ntcp::InputDisposition::Dropped) => Ok(()),
             // The endpoint refuses a segment for a connection whose output is
             // reserved before taking anything in. It waits, with its exact
             // envelope, until the reservation ends.
@@ -1166,8 +1235,12 @@ impl<P: PacketIo> Network<P> {
                 // No neighbor entry or held record is free: the attempt is
                 // withdrawn unsubmitted, retried on TCP's own clock.
                 Err(ntcp_host::Error::Capacity) => {
-                    self.endpoint
-                        .discard_unsubmitted(self.now, pending.attempt, None)?;
+                    self.endpoint.discard_unsubmitted(
+                        self.now,
+                        pending.attempt,
+                        None,
+                        DropReason::NeighQueueFull,
+                    )?;
                     slot.pending = None;
                     return Ok(None);
                 }
@@ -1501,7 +1574,12 @@ impl<P: PacketIo> Network<P> {
                             // Every retained frame is certified unsubmitted. The
                             // explicit abort below supersedes its restored work.
                             if let Some(attempt) = attempt {
-                                self.endpoint.discard_unsubmitted(self.now, attempt, None)?;
+                                self.endpoint.discard_unsubmitted(
+                                    self.now,
+                                    attempt,
+                                    None,
+                                    DropReason::SocketClose,
+                                )?;
                             }
                         }
                     }

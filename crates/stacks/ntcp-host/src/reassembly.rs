@@ -464,6 +464,8 @@ pub(crate) struct Reassembly {
     // quotes; freed on the next input. Like `output`, it is not charged.
     retained: Box<[u8]>,
     counters: ReassemblyCounters,
+    // Held fragments discarded with their assembly since `take_abandoned`.
+    abandoned: usize,
 }
 
 fn storage<T: Clone>(count: usize, value: T) -> Result<Vec<T>, Error> {
@@ -496,6 +498,7 @@ impl Reassembly {
             occupied: 0,
             output: storage(capacity[0].max(capacity[1]), 0)?,
             retained: Box::default(),
+            abandoned: 0,
             counters: ReassemblyCounters::default(),
         })
     }
@@ -774,7 +777,7 @@ impl Reassembly {
                         &copied[..usize::from(len)],
                     ) =>
                 {
-                    self.release(index);
+                    self.abandon(index);
                     return Err(Discard::Options);
                 }
                 Some(_) => {}
@@ -826,11 +829,11 @@ impl Reassembly {
             //   discarded, and no ICMP error messages should be sent.
             Some(Err(Discard::Overlap)) => {
                 self.slots[index].as_mut().unwrap().rejected = true;
-                self.release(index);
+                self.abandon(index);
                 return Err(Discard::Overlap);
             }
             Some(Err(discard)) => {
-                self.release(index);
+                self.abandon(index);
                 return Err(discard);
             }
             None => {}
@@ -846,7 +849,7 @@ impl Reassembly {
                     .any(|d| d.end() > end || (!d.last && d.end() >= end))
         };
         if contradiction {
-            self.release(index);
+            self.abandon(index);
             return Err(Discard::Contradiction);
         }
         // The first fragment zero to arrive supplies the header; another
@@ -883,7 +886,7 @@ impl Reassembly {
         if let Some(discard) = refused {
             if zero {
                 // Its header is what makes the datagram too large.
-                self.release(index);
+                self.abandon(index);
             } else {
                 self.slots[index] = Some(slot);
             }
@@ -954,7 +957,10 @@ impl Reassembly {
             return Ok(Admitted::Held);
         }
         let Some(ecn) = ecn_result(slot.ecn) else {
-            self.release(index);
+            // The arriving fragment is held already and counts as the
+            // discarded one.
+            self.abandon(index);
+            self.abandoned -= 1;
             return Err(Discard::Ecn);
         };
         let ipv6 = slot.key.source.is_ipv6();
@@ -1002,6 +1008,18 @@ impl Reassembly {
         }))
     }
 
+    // `release` an assembly discarded, counting its held fragments.
+    fn abandon(&mut self, index: usize) {
+        self.abandoned += self.held[index].len();
+        self.release(index);
+    }
+
+    /// Held fragments discarded with their assembly since the last call,
+    /// besides the arriving fragment whose discard ended it.
+    pub(crate) fn take_abandoned(&mut self) -> usize {
+        core::mem::take(&mut self.abandoned)
+    }
+
     // Free an assembly's fragments and their descriptor list; a rejection
     // marker keeps its slot.
     fn release(&mut self, index: usize) {
@@ -1022,15 +1040,17 @@ impl Reassembly {
     /// `expired` receives each timed-out assembly whose fragment zero
     /// arrived, for its Time Exceeded; markers and retired assemblies are
     /// discarded silently. Runs on every Host service pass, with or without
-    /// traffic.
+    /// traffic. Returns the fragments discarded with timed-out assemblies
+    /// and with those whose local address went away.
     pub fn expire(
         &mut self,
         now: Instant,
         mut live: impl FnMut(LinkId, SourceId) -> bool,
         mut expired: impl FnMut(Expired<'_>),
-    ) {
+    ) -> (usize, usize) {
+        let (mut timed_out, mut retired) = (0, 0);
         if self.occupied == 0 {
-            return;
+            return (timed_out, retired);
         }
         for index in 0..self.slots.len() {
             let Some(slot) = self.slots[index] else {
@@ -1038,8 +1058,10 @@ impl Reassembly {
             };
             if !live(slot.arrival.link, slot.arrival.local) {
                 self.counters.retired += 1;
+                retired += self.held[index].len();
             } else if slot.deadline <= now {
                 self.counters.expired += 1;
+                timed_out += self.held[index].len();
                 if let Some(first) = slot.first {
                     expired(Expired {
                         arrival: first.arrival,
@@ -1052,6 +1074,7 @@ impl Reassembly {
             self.slots[index].as_mut().unwrap().rejected = false;
             self.release(index);
         }
+        (timed_out, retired)
     }
 
     /// Whether any assembly or marker is held: what `expire` has to look

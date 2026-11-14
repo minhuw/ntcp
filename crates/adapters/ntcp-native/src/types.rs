@@ -1,7 +1,7 @@
 use std::{fmt, io, net::SocketAddr};
 
 pub use ntcp::{
-    CallerTimebase, CloseReason, EndpointConfig, Instant, Payload, RxReadTimestamps,
+    CallerTimebase, CloseReason, DropCounts, DropEvent, DropReason, DropSubject, EndpointConfig, Instant, Payload, RxReadTimestamps,
     RxTimestampStatus, SendProgress, State, TimestampClock, TxStreamRange, TxTimestampClock,
     TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
 };
@@ -271,6 +271,8 @@ pub struct Counters {
     // whose output went out a segment at a time instead.
     pub segmented: u64,
     pub segmentation_refused: u64,
+    // Every frame, datagram and segment this Network discarded, received or
+    // to be sent: the sum of `drops`.
     pub discarded: u64,
     pub backend_backpressure: u64,
     pub timestamp_metadata_lost: u64,
@@ -401,4 +403,16 @@ pub struct Counters {
     // entries the writes allocated ran out: the entry stays whole and
     // that SACK block yields no loss inference about it.
     pub ledger_split_refusals: u64,
+    // Every discard by reason (`ntcp::DropReason`), which `discarded` sums:
+    // Linux's per-reason kfree_skb counts. tcp_checksum_errors is
+    // `TcpCsum`; ip_header_errors is `IpCsum` plus the IPv4 share of
+    // `IpInhdr` and `PktTooSmall`; handoffs_dropped is `CpuBacklog`;
+    // redirects_dropped is `RedirectTableFull`; listen_drops is
+    // `TcpListenOverflow`, `TcpSynQueueOverflow`, `TcpConnectionLimit`,
+    // `MemoryRefused` and the listeners' `IpOutnoroutes`, and
+    // listen_overflows `TcpListenOverflow`.
+    pub drops: ntcp::DropCounts,
+    // Discards the enabled feed had no room to report
+    // (`Network::set_drop_feed`).
+    pub drop_events_lost: u64,
 }

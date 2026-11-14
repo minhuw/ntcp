@@ -896,6 +896,31 @@ impl Host {
     // datagram; this Host originates no ICMP Port Unreachable.
     // A datagram with an IPv6 link-local address is scoped to its arrival
     // `link` and reaches only a flow of that zone.
+    // Record a received UDP datagram's discard.
+    #[cold]
+    #[inline(never)]
+    fn drop_udp(
+        &mut self,
+        reason: ntcp::DropReason,
+        packet: &IngressPacket,
+        ports: Option<(u16, u16)>,
+    ) -> InputDisposition {
+        let ip = packet.ip;
+        self.drops.record(reason, self.now, packet.payload.len(), || match ports {
+            Some((source, destination)) => ntcp::DropSubject::Transport {
+                protocol: 17,
+                source: SocketAddr::new(ip.source, source),
+                destination: SocketAddr::new(ip.destination, destination),
+            },
+            None => ntcp::DropSubject::Ip {
+                source: ip.source,
+                destination: ip.destination,
+                protocol: 17,
+            },
+        });
+        InputDisposition::Dropped
+    }
+
     pub(crate) fn input_udp(
         &mut self,
         endpoint: &Endpoint,
@@ -903,8 +928,16 @@ impl Host {
         packet: &IngressPacket,
     ) -> InputDisposition {
         let (source, destination) = (packet.ip.source, packet.ip.destination);
-        let Ok(udp) = ntcp_ip_common::parse_udp(source, destination, packet.payload) else {
-            return InputDisposition::Dropped;
+        let udp = match ntcp_ip_common::parse_udp(source, destination, packet.payload) {
+            Ok(udp) => udp,
+            Err(error) => {
+                let reason = match error {
+                    ntcp_ip_common::Error::Checksum => ntcp::DropReason::UdpCsum,
+                    ntcp_ip_common::Error::Truncated => ntcp::DropReason::PktTooSmall,
+                    _ => ntcp::DropReason::IpInhdr,
+                };
+                return self.drop_udp(reason, packet, None);
+            }
         };
         let zone = (link_local(source) || link_local(destination)).then_some(link);
         if !endpoint.admits_scoped_datagram(
@@ -914,10 +947,12 @@ impl Host {
             },
             zone,
         ) {
-            return InputDisposition::Dropped;
+            let ports = Some((udp.source_port, udp.destination_port));
+            return self.drop_udp(ntcp::DropReason::AddressPolicy, packet, ports);
         }
         let local = SocketAddr::new(destination, udp.destination_port);
         let remote = SocketAddr::new(source, udp.source_port);
+        let ports = Some((udp.source_port, udp.destination_port));
         let slots = &self.udp.slots;
         // An unconnected flow's zone scopes its link-local local address; a
         // global one receives no link-local source it could not answer.
@@ -935,7 +970,7 @@ impl Host {
                 })
             })
         else {
-            return InputDisposition::Dropped;
+            return self.drop_udp(ntcp::DropReason::NoSocket, packet, ports);
         };
         let (depth, stride) = (
             self.udp.limits.receive_datagrams,
@@ -943,7 +978,7 @@ impl Host {
         );
         let ring = self.udp.slots[slot].flow.unwrap().received;
         if ring.len == depth || udp.payload.len() > stride {
-            return InputDisposition::Dropped;
+            return self.drop_udp(ntcp::DropReason::SocketRcvbuff, packet, ports);
         }
         let entry = slot * depth + (ring.head + ring.len) % depth;
         self.udp.received[entry] = (remote, udp.payload.len());

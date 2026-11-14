@@ -85,10 +85,10 @@ fn discarded_syn_has_no_departure_and_retries_at_the_rto() {
     // Resolution failed three seconds later (three solicitations).
     let failed = 3_000_000;
     assert!(
-        a.discard_unsubmitted(failed, token, Some(crate::NetworkError::SoftUnreachable))
+        a.discard_unsubmitted(failed, token, Some(crate::NetworkError::SoftUnreachable), crate::DropReason::NeighFailed)
             .unwrap()
     );
-    assert!(!a.discard_unsubmitted(failed, token, None).unwrap());
+    assert!(!a.discard_unsubmitted(failed, token, None, crate::DropReason::NeighFailed).unwrap());
     assert!(!a.accept_transmit(failed, token).unwrap());
     assert!(!a.is_output_reserved(id));
     assert!(soft_error(&mut a, id));
@@ -139,7 +139,7 @@ fn repeatedly_discarded_syn_ends_at_its_deadline_with_the_error() {
             // Each attempt's resolution takes three RetransTimers.
             now += 3_000_000;
             assert!(
-                a.discard_unsubmitted(now, token, Some(crate::NetworkError::SoftUnreachable))
+                a.discard_unsubmitted(now, token, Some(crate::NetworkError::SoftUnreachable), crate::DropReason::NeighFailed)
                     .unwrap()
             );
             error |= soft_error(&mut a, id);
@@ -170,7 +170,7 @@ fn discarded_fin_and_fresh_data_restore_their_selection() {
     let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
     let (start, _, len) = segment(out.packet.unwrap(), &bytes);
     assert_eq!(len, 300);
-    assert!(a.discard_unsubmitted(10, token.unwrap(), None).unwrap());
+    assert!(a.discard_unsubmitted(10, token.unwrap(), None, crate::DropReason::NeighFailed).unwrap());
     let info = a.transport_info(id).unwrap();
     assert_eq!((info.unacked, info.retransmitted, info.rto_backoff), (0, 0, 0));
     let (out, token) = a.poll_reserved_transmit(10, &mut bytes, 16).unwrap();
@@ -194,7 +194,7 @@ fn discarded_fin_and_fresh_data_restore_their_selection() {
     let (fin, flags, _) = segment(out.packet.unwrap(), &bytes);
     assert_ne!(flags & wire::FIN, 0);
     assert_eq!(a.state(id).unwrap(), State::FinWait1);
-    assert!(a.discard_unsubmitted(t, token.unwrap(), None).unwrap());
+    assert!(a.discard_unsubmitted(t, token.unwrap(), None, crate::DropReason::NeighFailed).unwrap());
     assert_eq!(a.state(id).unwrap(), State::Established);
     assert_eq!(a.transport_info(id).unwrap().unacked, 0);
     let retry = a.next_deadline().unwrap();
@@ -230,7 +230,7 @@ fn discarded_pure_ack_and_reset_are_dropped() {
         token = attempt;
         t = a.next_deadline().unwrap_or(t + 1).max(t + 1);
     }
-    assert!(a.discard_unsubmitted(t, token.unwrap(), None).unwrap());
+    assert!(a.discard_unsubmitted(t, token.unwrap(), None, crate::DropReason::NeighFailed).unwrap());
     assert!(!a.is_output_reserved(id));
     // Dropped like an ACK lost on the wire: nothing is retried.
     let (out, _) = a.poll_reserved_transmit(t, &mut bytes, 16).unwrap();
@@ -238,7 +238,7 @@ fn discarded_pure_ack_and_reset_are_dropped() {
     a.abort(id).unwrap();
     let (out, token) = a.poll_reserved_transmit(t, &mut bytes, 16).unwrap();
     assert_ne!(segment(out.packet.unwrap(), &bytes).1 & RST, 0);
-    assert!(a.discard_unsubmitted(t, token.unwrap(), None).unwrap());
+    assert!(a.discard_unsubmitted(t, token.unwrap(), None, crate::DropReason::NeighFailed).unwrap());
     assert!(!a.is_output_reserved(id));
     let (out, _) = a.poll_reserved_transmit(t, &mut bytes, 16).unwrap();
     assert!(out.packet.is_none());
@@ -265,10 +265,10 @@ fn unrestorable_selection_is_released_as_unsent_output() {
     let token = token.unwrap();
     let failed = 3_000_003;
     assert!(
-        a.discard_unsubmitted(failed, token, Some(crate::NetworkError::SoftUnreachable))
+        a.discard_unsubmitted(failed, token, Some(crate::NetworkError::SoftUnreachable), crate::DropReason::NeighFailed)
             .unwrap()
     );
-    assert!(!a.discard_unsubmitted(failed, token, None).unwrap());
+    assert!(!a.discard_unsubmitted(failed, token, None, crate::DropReason::NeighFailed).unwrap());
     assert!(!a.accept_transmit(failed, token).unwrap());
     assert!(!a.is_output_reserved(id));
     assert!(soft_error(&mut a, id));
@@ -324,7 +324,7 @@ fn discarded_syn_ack_has_no_departure_and_retries_at_the_rto() {
         b.discard_unsubmitted(
             failed,
             token.unwrap(),
-            Some(crate::NetworkError::SoftUnreachable)
+            Some(crate::NetworkError::SoftUnreachable), crate::DropReason::NeighFailed
         )
         .unwrap()
     );
@@ -383,7 +383,7 @@ fn discarded_retransmission_counts_no_retransmission() {
         a.discard_unsubmitted(
             failed,
             token.unwrap(),
-            Some(crate::NetworkError::SoftUnreachable)
+            Some(crate::NetworkError::SoftUnreachable), crate::DropReason::NeighFailed
         )
         .unwrap()
     );

@@ -7287,6 +7287,9 @@ mod time_wait;
 #[path = "endpoint_time_wait_record_tests.rs"]
 mod time_wait_record;
 
+#[path = "endpoint_drop_reason_tests.rs"]
+mod drop_reasons;
+
 #[path = "endpoint_handshake_limit_tests.rs"]
 mod handshake_limit;
 

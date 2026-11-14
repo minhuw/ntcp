@@ -1285,7 +1285,7 @@ impl Owner {
             };
             if !self
                 .endpoint
-                .discard_unsubmitted(now, attempt, error)
+                .discard_unsubmitted(now, attempt, error, ntcp::DropReason::NeighFailed)
                 .map_err(engine)?
             {
                 return Err(EIO);

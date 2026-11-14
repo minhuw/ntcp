@@ -18,6 +18,8 @@ mod buffer_sizes;
 pub use buffer_sizes::{BufferSizes, Buffers};
 mod connection;
 mod cubic;
+mod drop;
+pub use drop::{DropCounts, DropEvent, DropReason, DropRecorder, DropSubject, drain_drop_events};
 mod endpoint;
 mod ephemeral;
 pub use ephemeral::EphemeralPorts;

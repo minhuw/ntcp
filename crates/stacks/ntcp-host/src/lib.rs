@@ -137,6 +137,77 @@ pub enum Error {
     /// (an RFC 4861 ReachableTime or RFC 4862 DAD delay) did not change.
     Entropy,
 }
+/// Why a received frame or datagram that `receive`, `process`,
+/// `decode_datagram` or `input_datagram` refused with `error` is
+/// discarded, for the caller that swallows the error to record. An
+/// `Unsupported` refusal is named by the frame's own fields where the
+/// caller can read them.
+pub fn drop_reason(error: &Error) -> ntcp::DropReason {
+    use ntcp::DropReason as R;
+    match error {
+        Error::Codec(error) => ip_drop_reason(*error),
+        Error::Path(_) => R::IpInaddrerrors,
+        Error::Endpoint(_) => R::InvalidMetadata,
+        Error::Unsupported => R::UnhandledProto,
+        _ => R::NotSpecified,
+    }
+}
+
+/// Why an ICMP message completed as `outcome` was discarded without being
+/// acted on; None for one acted on.
+pub fn icmp_outcome_reason(outcome: &IcmpOutcome) -> Option<ntcp::DropReason> {
+    use ntcp::DropReason as R;
+    Some(match outcome {
+        IcmpOutcome::Discarded(IcmpDiscard::SourceQuench) => R::IcmpSourceQuench,
+        IcmpOutcome::Discarded(IcmpDiscard::Implausible) => R::IcmpOutOfWindow,
+        IcmpOutcome::Discarded(
+            IcmpDiscard::Uncorrelated
+            | IcmpDiscard::Ambiguous
+            | IcmpDiscard::LinkScope
+            | IcmpDiscard::Stale,
+        ) => R::IcmpNoSocket,
+        IcmpOutcome::Echo(EchoDisposition::Dropped) => R::IcmpOutputDropped,
+        IcmpOutcome::Echo(EchoDisposition::UnauthorizedRoute) => R::IpSourceRouteRefused,
+        IcmpOutcome::Probe(ProbeOutcome::Unmatched) => R::IcmpNoSocket,
+        IcmpOutcome::Redirect(RedirectOutcome::Rejected(
+            RedirectRejection::NoEvidence
+            | RedirectRejection::Uncorrelated
+            | RedirectRejection::Stale,
+        )) => R::IcmpNoSocket,
+        IcmpOutcome::Redirect(RedirectOutcome::Rejected(_)) => R::IcmpInvalid,
+        _ => return None,
+    })
+}
+
+/// `drop_reason` of an IP codec error.
+pub fn ip_drop_reason(error: ntcp_ip::Error) -> ntcp::DropReason {
+    use ntcp::DropReason as R;
+    use ntcp_ip::Error as E;
+    match error {
+        E::Truncated => R::PktTooSmall,
+        E::Length | E::Version | E::Invalid | E::Options => R::IpInhdr,
+        E::Checksum => R::IpCsum,
+        E::FragmentationUnsupported => R::FragUnsupported,
+        E::ExtensionsUnsupported => R::Ipv6BadExthdr,
+        E::JumbogramsUnsupported => R::PktTooBig,
+        E::VlanUnsupported | E::EtherTypeUnsupported => R::UnhandledProto,
+        E::ProtocolUnsupported => R::IpNoproto,
+        E::Quote => R::IcmpInvalid,
+    }
+}
+
+/// `drop_reason` of an ICMP message `input_icmp_datagram` refused.
+pub fn icmp_drop_reason(error: &Error) -> ntcp::DropReason {
+    use ntcp::DropReason as R;
+    match error {
+        Error::Codec(ntcp_ip::Error::Checksum) => R::IcmpCsum,
+        Error::Codec(ntcp_ip::Error::Truncated) => R::PktTooSmall,
+        Error::Codec(ntcp_ip::Error::FragmentationUnsupported) => R::FragUnsupported,
+        Error::Codec(_) | Error::Unsupported => R::IcmpInvalid,
+        error => drop_reason(error),
+    }
+}
+
 impl From<path::Error> for Error {
     fn from(error: path::Error) -> Self {
         Self::Path(error)
@@ -792,6 +863,8 @@ pub struct Host {
     attached: bool,
     // `ipv4_header_errors`.
     ipv4_header_errors: u64,
+    // What this Host discarded without returning an error, by reason.
+    pub(crate) drops: ntcp::DropRecorder,
 }
 
 /// The IP header plan of output on one path (`Host::header_plan`).
@@ -917,6 +990,7 @@ impl Host {
             timebase,
             attached: false,
             ipv4_header_errors: 0,
+            drops: ntcp::DropRecorder::new(),
         })
     }
     pub fn paths(&self) -> &PathService {
@@ -1046,6 +1120,21 @@ impl Host {
     /// counted. For administrative reporting.
     pub fn ipv4_header_errors(&self) -> u64 {
         self.ipv4_header_errors
+    }
+    /// What this Host discarded itself, by reason: fragments its reassembly
+    /// refused, duplicated or abandoned, UDP datagrams no flow took, ICMP
+    /// messages it discarded after validation and ICMP output it did not
+    /// queue or send. A frame or datagram one of its calls refuses with an
+    /// error is the caller's to record (`drop_reason`).
+    pub fn drop_counts(&self) -> ntcp::DropCounts {
+        self.drops.counts()
+    }
+    /// This Host's discard counts and feed (`ntcp::DropRecorder`).
+    pub fn drops_mut(&mut self) -> &mut ntcp::DropRecorder {
+        &mut self.drops
+    }
+    pub fn drops(&self) -> &ntcp::DropRecorder {
+        &self.drops
     }
     /// The earliest reassembly deadline, at which a `service_changes` pass
     /// discards the expired datagram (and may queue its Time Exceeded) even
@@ -2135,7 +2224,12 @@ impl Host {
                     Ok(Some(processed)) => {
                         self.input_datagram(endpoint, now, processed, metadata, outgoing_dscp)
                     }
-                    Ok(None) => Ok(ntcp::InputDisposition::Dropped),
+                    Ok(None) => {
+                        self.drops.record(ntcp::DropReason::IpInhdr, now, frame.len(), || {
+                            ntcp::DropSubject::of_ip_packet(frame)
+                        });
+                        Ok(ntcp::InputDisposition::Dropped)
+                    }
                     Err(error) => Err(error),
                 }
             }
@@ -2189,6 +2283,17 @@ impl Host {
             self.take_progress(endpoint);
             Ok(disposition)
         } else {
+            let (ip, protocol) = (packet.ip, packet.protocol);
+            self.drops.record_error(
+                ntcp::DropReason::IpNoproto,
+                now,
+                packet.payload.len(),
+                || ntcp::DropSubject::Ip {
+                    source: ip.source,
+                    destination: ip.destination,
+                    protocol,
+                },
+            );
             Err(Error::Unsupported)
         }
     }
@@ -2268,7 +2373,9 @@ impl Host {
             return Err(Error::InvalidContext);
         }
         self.now = self.now.max(now);
-        self.tcp_report(endpoint, now, deferred)
+        let dispatch = self.tcp_report(endpoint, now, deferred)?;
+        self.record_icmp_outcome(now, &dispatch, &[]);
+        Ok(dispatch)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2

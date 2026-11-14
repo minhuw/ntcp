@@ -574,6 +574,10 @@ impl Lan {
             .flatten()
             .fold((0, 0, 0), |(a, b, c), m| {
                 let counters = m.network.counters();
+                assert_eq!(
+                    counters.drops[DropReason::CpuBacklog],
+                    counters.handoffs_dropped
+                );
                 (
                     a + counters.handed_off,
                     b + counters.handoffs_received,
@@ -2632,6 +2636,7 @@ fn syns_beyond_the_held_flows_bound_are_dropped_and_taken_when_sent_again() {
     let counters = lan.network(1).counters();
     assert_eq!((counters.redirected, counters.redirects_dropped), (2, 2));
     assert_eq!(counters.discarded, 2);
+    assert_eq!(counters.drops[DropReason::RedirectTableFull], 2);
     servers[1] = Some(Echo::new(lan.network(1)));
     echo_all(&mut lan, &mut servers, &mut clients, 5 * SECOND);
     lan.assert_no_resets();

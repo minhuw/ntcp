@@ -13,7 +13,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{
-    FastOpenCookiePolicy, Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, RxPacketTimestamps,
+    DropReason, FastOpenCookiePolicy, Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, RxPacketTimestamps,
     RxReadTimestamps, RxTimestampStatus, SendProgress, SourceRoute, TimestampRequest,
     TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     TxTimestampToken,
@@ -525,6 +525,19 @@ impl CrossingSynAuthorization {
 }
 
 // Why passive admission refuses a SYN (`Endpoint::passive_refusal`).
+impl PassiveRefusal {
+    fn reason(self) -> DropReason {
+        match self {
+            PassiveRefusal::TimeWait => DropReason::TcpInvalidSyn,
+            PassiveRefusal::SynQueue => DropReason::TcpSynQueueOverflow,
+            PassiveRefusal::AcceptQueue => DropReason::TcpListenOverflow,
+            PassiveRefusal::Resources => DropReason::TcpConnectionLimit,
+            PassiveRefusal::Memory => DropReason::MemoryRefused,
+            PassiveRefusal::Invalid => DropReason::NotSpecified,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PassiveRefusal {
     // The connection of its tuple may not be reopened: it still owes its
@@ -709,6 +722,8 @@ pub struct Endpoint {
     oversized_control: u64,
     // Scoped stateless replies whose link was gone before they drained.
     undeliverable_control: u64,
+    // Every segment and reply this Endpoint discarded, by reason.
+    drops: crate::DropRecorder,
     passive_errors: VecDeque<Event>,
     control_epoch: Instant,
     control_count: usize,
@@ -773,6 +788,23 @@ fn supported_socket(address: SocketAddr) -> bool {
 
 fn unzoned_link_local(address: IpAddr) -> bool {
     matches!(address, IpAddr::V6(ip) if ip.is_unicast_link_local())
+}
+
+// The subject of a received TCP segment `bytes` between `ip`'s addresses:
+// its ports, when the header holds them.
+fn received_subject(ip: IpMetadata, bytes: &[u8]) -> crate::DropSubject {
+    match bytes.get(..4) {
+        Some(ports) => crate::DropSubject::Transport {
+            protocol: 6,
+            source: SocketAddr::new(ip.source, u16::from_be_bytes([ports[0], ports[1]])),
+            destination: SocketAddr::new(ip.destination, u16::from_be_bytes([ports[2], ports[3]])),
+        },
+        None => crate::DropSubject::Ip {
+            source: ip.source,
+            destination: ip.destination,
+            protocol: 6,
+        },
+    }
 }
 
 fn valid_address(address: IpAddr) -> bool {
@@ -926,6 +958,7 @@ impl Endpoint {
             control_count: 0,
             oversized_control: 0,
             undeliverable_control: 0,
+            drops: crate::DropRecorder::new(),
             control_turn: true,
             budget,
             per_connection_bytes,
@@ -3943,9 +3976,12 @@ impl Endpoint {
             let deadline = record.deadline;
             match record.input(now, segment, &self.config.connection) {
                 crate::time_wait::Input::Reset => self.remove_time_wait(index),
-                crate::time_wait::Input::Kept => {
+                input => {
                     let restarted = self.time_wait.record(index).deadline != deadline;
                     self.time_wait.update(index, restarted);
+                    if let crate::time_wait::Input::Dropped(reason) = input {
+                        self.drop_segment(reason, tuple, segment);
+                    }
                 }
             }
             return Ok(InputDisposition::Processed);
@@ -3957,6 +3993,7 @@ impl Endpoint {
             // reset from tcp_close itself (tcp_send_active_reset) and keeps
             // nothing of the tuple after it.
             if slot.connection.reset_pending() {
+                self.drop_segment(DropReason::TcpClose, tuple, segment);
                 return Ok(InputDisposition::Dropped);
             }
             // Apply freshness to the same connection requests accepted by the
@@ -4009,12 +4046,14 @@ impl Endpoint {
                     segment,
                     metadata,
                     Some(authorization),
-                )?
+                )
             } else {
                 slot.connection
-                    .input_with_metadata(now, traffic_class, segment, metadata)?;
-                false
+                    .input_with_metadata(now, traffic_class, segment, metadata)
+                    .map(|()| false)
             };
+            let dropped = slot.connection.dropped.take();
+            let admitted = admitted?;
             if admitted {
                 slot.fast_open_owner = authority;
             }
@@ -4023,9 +4062,13 @@ impl Endpoint {
             }
             slot.connection.hold_establishment = false;
             // Linux counts it at tcp_v4_syn_recv_sock's exit_overflow.
-            let held = core::mem::take(&mut slot.connection.establishment_held);
-            if held {
-                self.count_listen_drop(true);
+            let mut held = false;
+            if let Some(reason) = dropped {
+                held = reason == DropReason::TcpListenOverflow;
+                if held {
+                    self.count_listen_drop(true);
+                }
+                self.drop_segment(reason, tuple, segment);
             }
             self.refresh(index);
             return Ok(if held {
@@ -4038,6 +4081,7 @@ impl Endpoint {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
             //# An incoming RST should be ignored.  Return.
             if segment.header.flags & RST != 0 {
+                self.drop_segment(DropReason::TcpReset, tuple, segment);
                 return Ok(InputDisposition::Dropped);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
@@ -4046,11 +4090,14 @@ impl Endpoint {
             //# formed for any arriving ACK-bearing segment.
             if segment.header.flags & ACK != 0 {
                 self.reset_for(ip, zone, segment, route);
+                // Linux's tcp_rcv_state_process returns TCP_FLAGS for it.
+                self.drop_segment(DropReason::TcpFlags, tuple, segment);
                 return Ok(InputDisposition::Processed);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
             //# Drop the segment and return.
             if segment.header.flags & SYN == 0 {
+                self.drop_segment(DropReason::TcpFlags, tuple, segment);
                 return Ok(InputDisposition::Dropped);
             }
             if let Some(refusal) = self.passive_refusal(now, None, listener, tuple, segment) {
@@ -4058,6 +4105,7 @@ impl Endpoint {
                     self.count_listen_drop(refusal == PassiveRefusal::AcceptQueue);
                     self.memory_refused_opens += u64::from(refusal == PassiveRefusal::Memory);
                 }
+                self.drop_segment(refusal.reason(), tuple, segment);
                 return Ok(InputDisposition::Dropped);
             }
             let record = self.listeners[listener.slot].as_ref().unwrap();
@@ -4079,6 +4127,7 @@ impl Endpoint {
                 Ok(connection) => connection,
                 Err(Error::NoMemory) => {
                     self.count_listen_drop(false);
+                    self.drop_segment(DropReason::MemoryRefused, tuple, segment);
                     return Ok(InputDisposition::Dropped);
                 }
                 Err(error) => return Err(error.into()),
@@ -4097,13 +4146,37 @@ impl Endpoint {
                 }
                 Err(EndpointError::LimitReached) => {
                     self.count_listen_drop(false);
+                    self.drop_segment(DropReason::TcpConnectionLimit, tuple, segment);
                     return Ok(InputDisposition::Dropped);
                 }
                 Err(error) => return Err(error),
             }
         }
         self.reset_for(ip, zone, segment, route);
+        self.drop_segment(DropReason::NoSocket, tuple, segment);
         Ok(InputDisposition::Dropped)
+    }
+
+    // Record the discard of a received segment `bytes` (`ingress_admission`'s
+    // None).
+    #[cold]
+    #[inline(never)]
+    fn drop_input<T>(&mut self, reason: DropReason, ip: IpMetadata, bytes: &[u8]) -> Option<T> {
+        self.drops
+            .record(reason, self.now, bytes.len(), || received_subject(ip, bytes));
+        None
+    }
+
+    // Record the discard of an admitted segment of `tuple`.
+    #[cold]
+    #[inline(never)]
+    fn drop_segment(&mut self, reason: DropReason, tuple: ScopedTuple, segment: &wire::Segment<'_>) {
+        let len = 20 + segment.raw_options.len() + segment.payload.len();
+        self.drops.record(reason, self.now, len, || crate::DropSubject::Transport {
+            protocol: 6,
+            source: tuple.tuple.remote,
+            destination: tuple.tuple.local,
+        });
     }
 
     /// Non-constructing wire, address and received-route admission shared by
@@ -4129,7 +4202,12 @@ impl Endpoint {
                 || !ip.source.is_ipv4()
                 || !ip.destination.is_ipv4())
         {
-            return Ok(None);
+            let reason = if ip.source.is_ipv4() && ip.destination.is_ipv4() {
+                DropReason::IpSourceRouteRefused
+            } else {
+                DropReason::IpInhdr
+            };
+            return Ok(self.drop_input(reason, ip, bytes));
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
         //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
@@ -4139,8 +4217,13 @@ impl Endpoint {
 
         // Scoped to the required ingress-context policy; no subnet is inferred.
         // Jumbo-link TCP is not supported by this endpoint profile.
-        if bytes.len() > u16::MAX as usize
-            || !valid_address(ip.source)
+        if bytes.len() > u16::MAX as usize {
+            return Ok(self.drop_input(DropReason::PktTooBig, ip, bytes));
+        }
+        if !valid_address(ip.source) {
+            return Ok(self.drop_input(DropReason::IpInvalidSource, ip, bytes));
+        }
+        if
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
             //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
             //# |
@@ -4148,7 +4231,7 @@ impl Endpoint {
             //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
 
             // Scoped to the required ingress-context policy; no subnet is inferred.
-            || !valid_address(ip.destination)
+            !valid_address(ip.destination)
             || ip.source.is_ipv4() != ip.destination.is_ipv4()
             // Managed path authority needs a zone for an IPv6 link-local
             // address (RFC 4007): input without its arrival link is
@@ -4156,18 +4239,21 @@ impl Endpoint {
             || (self.managed_context.is_some()
                 && (unzoned_link_local(ip.source) || unzoned_link_local(ip.destination))
                 && zone.is_none())
-            || !(self.address_policy)(AddressValidation::Incoming {
-                source: ip.source, destination: ip.destination,
-            })
         {
-            return Ok(None);
+            return Ok(self.drop_input(DropReason::IpInvalidDest, ip, bytes));
+        }
+        if !(self.address_policy)(AddressValidation::Incoming {
+            source: ip.source,
+            destination: ip.destination,
+        }) {
+            return Ok(self.drop_input(DropReason::AddressPolicy, ip, bytes));
         }
         let route = match ip.source {
             IpAddr::V4(source) => options.return_route(source),
             _ => None,
         };
         if route.is_some_and(|r| !self.admits_return_route(ip.destination, ip.source, &r)) {
-            return Ok(None);
+            return Ok(self.drop_input(DropReason::IpSourceRouteRefused, ip, bytes));
         }
         let segment = if metadata.tcp_checksum_verified {
             wire::parse_unchecked(ip, bytes)
@@ -4178,7 +4264,17 @@ impl Endpoint {
             Ok(segment) => segment,
             Err(error) => {
                 self.checksum_errors += u64::from(error == wire::WireError::InvalidChecksum);
-                return Ok(None);
+                let reason = match error {
+                    wire::WireError::InvalidChecksum => DropReason::TcpCsum,
+                    wire::WireError::Truncated | wire::WireError::InvalidHeader => {
+                        DropReason::PktTooSmall
+                    }
+                    wire::WireError::InvalidOption => DropReason::TcpInvalidOption,
+                    wire::WireError::AddressFamily => DropReason::IpInvalidDest,
+                    wire::WireError::TooLong => DropReason::PktTooBig,
+                    wire::WireError::OutputTooSmall => DropReason::NotSpecified,
+                };
+                return Ok(self.drop_input(reason, ip, bytes));
             }
         };
         metadata.validate_segment(&segment)?;
@@ -4324,6 +4420,7 @@ impl Endpoint {
             Some(refusal) => {
                 self.count_listen_drop(refusal == PassiveRefusal::AcceptQueue);
                 self.memory_refused_opens += u64::from(refusal == PassiveRefusal::Memory);
+                self.drop_segment(refusal.reason(), scoped, syn);
                 return Ok(Some(InputDisposition::Dropped));
             }
             None => {}
@@ -4338,6 +4435,7 @@ impl Endpoint {
             .is_err()
         {
             self.count_listen_drop(false);
+            self.drop_segment(DropReason::MemoryRefused, scoped, syn);
             return Ok(Some(InputDisposition::Dropped));
         }
         let record = self.listeners[listener.slot].as_ref().unwrap();
@@ -4371,6 +4469,7 @@ impl Endpoint {
             Ok(connection) => connection,
             Err(Error::NoMemory) => {
                 self.count_listen_drop(false);
+                self.drop_segment(DropReason::MemoryRefused, scoped, syn);
                 return Ok(Some(InputDisposition::Dropped));
             }
             Err(error) => return Err(error.into()),
@@ -5731,6 +5830,29 @@ impl Endpoint {
         self.listen_overflows
     }
 
+    /// Every segment and reply this Endpoint discarded, by reason, as Linux
+    /// names each kfree_skb_reason: received segments it refused or whose
+    /// content it did not take (a connection's sequence, PAWS, window and
+    /// flag checks among them, as Linux's tcp_validate_incoming and
+    /// tcp_data_queue drop), and output it prepared and then discarded.
+    /// `checksum_errors` is `TcpCsum`; `listen_drops` is the sum of
+    /// `TcpListenOverflow`, `TcpSynQueueOverflow`, `TcpConnectionLimit`,
+    /// `MemoryRefused` and the listener's share of `IpOutnoroutes`.
+    pub fn drop_counts(&self) -> crate::DropCounts {
+        self.drops.counts()
+    }
+
+    /// This Endpoint's discard counts and feed (`DropRecorder::set_feed`,
+    /// `DropRecorder::take_event`), and whether an error the last call
+    /// returned was recorded (`DropRecorder::take_error_recorded`).
+    pub fn drops_mut(&mut self) -> &mut crate::DropRecorder {
+        &mut self.drops
+    }
+
+    pub fn drops(&self) -> &crate::DropRecorder {
+        &self.drops
+    }
+
     /// Segments discarded because their TCP checksum was wrong (RFC 9293
     /// MUST-3), as Linux counts TCP_MIB_CSUMERRORS (Tcp InCsumErrors) in
     /// tcp_v4_rcv and tcp_v6_rcv. For administrative reporting.
@@ -6419,6 +6541,47 @@ impl Endpoint {
         self.check_reservation_index();
     }
 
+    // Record the discard of reservation `index`'s output: the packet as it
+    // would have left.
+    #[cold]
+    #[inline(never)]
+    fn drop_reserved(&mut self, index: usize, reason: DropReason) {
+        let slot = &self.reservations[index];
+        let Some(r) = slot.current.as_ref() else {
+            return;
+        };
+        let (ip, len) = (r.packet.ip, r.packet.len);
+        let ports = slot.bytes.get(..4).map(|p| {
+            (
+                u16::from_be_bytes([p[0], p[1]]),
+                u16::from_be_bytes([p[2], p[3]]),
+            )
+        });
+        self.drops.record(reason, self.now, len, || match ports {
+            Some((source, destination)) => crate::DropSubject::Transport {
+                protocol: 6,
+                source: SocketAddr::new(ip.source, source),
+                destination: SocketAddr::new(ip.destination, destination),
+            },
+            None => crate::DropSubject::Ip {
+                source: ip.source,
+                destination: ip.destination,
+                protocol: 6,
+            },
+        });
+    }
+
+    // Record the discard of a stateless reply or TIME-WAIT ACK never built.
+    #[cold]
+    #[inline(never)]
+    fn drop_reply(&mut self, reason: DropReason, ip: IpMetadata, header: Header) {
+        self.drops.record(reason, self.now, 20, || crate::DropSubject::Transport {
+            protocol: 6,
+            source: SocketAddr::new(ip.source, header.source_port),
+            destination: SocketAddr::new(ip.destination, header.destination_port),
+        });
+    }
+
     fn clear_reservation(&mut self, index: usize) {
         if let Some(r) = &self.reservations[index].current {
             let owner = r.packet.connection;
@@ -6935,6 +7098,13 @@ impl Endpoint {
             return Ok(false);
         }
         let Some(connection) = r.packet.connection else {
+            // A stateless reply is not built again.
+            let reason = if r.undeliverable {
+                DropReason::IpOutnoroutes
+            } else {
+                DropReason::StaleEgress
+            };
+            self.drop_reserved(index, reason);
             self.clear_reservation(index);
             return Ok(true);
         };
@@ -6990,12 +7160,14 @@ impl Endpoint {
     /// stays outstanding without a departure, for the connection's own loss
     /// recovery, on the same retry clock. `error` is the owner's advice,
     /// recorded as its soft error (RFC 1122 section 4.2.3.9: no abort).
-    /// False only for an attempt that is not the reservation's current one.
+    /// The attempt's discard is recorded with `reason`. False only for an
+    /// attempt that is not the reservation's current one.
     pub fn discard_unsubmitted(
         &mut self,
         now: Instant,
         attempt: crate::TransmitAttempt,
         error: Option<crate::NetworkError>,
+        reason: DropReason,
     ) -> Result<bool, EndpointError> {
         self.clock(now)?;
         let index = attempt.reservation;
@@ -7009,10 +7181,13 @@ impl Endpoint {
         if r.attempt != Some(attempt) {
             return Ok(false);
         }
-        let Some(id) = r.packet.connection else {
+        let owner = r.packet.connection;
+        self.drop_reserved(index, reason);
+        let Some(id) = owner else {
             self.clear_reservation(index);
             return Ok(true);
         };
+        let r = self.reservations[index].current.as_ref().unwrap();
         let flags = self.reservations[index].bytes[13];
         let sequence = flags & (wire::SYN | wire::FIN) != 0
             || r.departure.is_some_and(|d| d.payload != 0)
@@ -7090,6 +7265,7 @@ impl Endpoint {
                     .cancel_transmit(token.stream_range(), source);
             }
         }
+        self.drop_reserved(index, DropReason::BackendRefused);
         self.clear_reservation(index);
         self.refresh(id.slot);
         Ok(true)
@@ -7139,6 +7315,7 @@ impl Endpoint {
         {
             return Ok(false);
         }
+        self.drop_reserved(attempt.reservation, DropReason::SocketClose);
         self.clear_reservation(attempt.reservation);
         self.refresh(id.slot);
         self.rearm_pending_accept(id);
@@ -7164,7 +7341,9 @@ impl Endpoint {
         if r.abandon_attempt != attempt {
             return Ok(false);
         }
-        if let Some(id) = r.packet.connection {
+        let owner = r.packet.connection;
+        self.drop_reserved(index, DropReason::SocketClose);
+        if let Some(id) = owner {
             let slot = self.retained_slot_mut(id)?;
             slot.connection.abandon_reserved_output();
             slot.closed_output_drained = true;
@@ -7229,6 +7408,7 @@ impl Endpoint {
                 record.challenge_pending = false;
                 self.time_wait.update(index, false);
                 self.oversized_control += 1;
+                self.drop_reply(DropReason::PktTooBig, ip, header);
                 return Ok(None);
             }
         }
@@ -7336,6 +7516,7 @@ impl Endpoint {
                         // source route or Segment Routing Header.
                         self.control.pop_front();
                         self.oversized_control += 1;
+                        self.drop_reply(DropReason::PktTooBig, ip, header);
                         continue;
                     }
                     if budget < 32 {
@@ -8884,6 +9065,8 @@ mod endpoint_mtu_update_tests {
         );
         assert!(e.control.is_empty());
         assert_eq!(e.oversized_control_replies(), 1);
+        assert_eq!(e.drop_counts()[DropReason::PktTooBig], 1);
+        assert_eq!(e.drop_counts().total(), 1);
     }
 }
 

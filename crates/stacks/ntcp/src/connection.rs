@@ -4,7 +4,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{mem::MaybeUninit, net::SocketAddr, num::NonZeroU8};
 
 use crate::{
-    RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
+    DropReason, RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
     TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     buffer::{ReceiveBuffer, SendBuffer},
     output_reservation::Departure,
@@ -1048,10 +1048,12 @@ pub(crate) struct Connection {
     pub(crate) accepted_metadata: bool,
     // Set by the Endpoint for the input of an unaccepted passive child whose
     // listener's accept queue is full: the ACK that would complete the
-    // handshake is dropped, `establishment_held` raised, and the child stays
-    // in SYN-RECEIVED to retransmit its SYN-ACK.
+    // handshake is dropped (TcpListenOverflow), and the child stays in
+    // SYN-RECEIVED to retransmit its SYN-ACK.
     pub(crate) hold_establishment: bool,
-    pub(crate) establishment_held: bool,
+    // Why the segment input last took was discarded, for the Endpoint to
+    // take and record: Linux's tcp_rcv_state_process returns its reason.
+    pub(crate) dropped: Option<crate::DropReason>,
     sample: Option<(Seq, Instant)>,
     // Reserved control RTT uses physical departure; sample's time still names
     // the immutable wire TSval for ordinary RTTM echo validation.
@@ -1462,7 +1464,7 @@ impl Connection {
             last_output_ecn: 0,
             accepted_metadata: false,
             hold_establishment: false,
-            establishment_held: false,
+            dropped: None,
             sample: None,
             sample_departure: None,
             rtt_sample_after: None,
@@ -6660,6 +6662,7 @@ impl Connection {
         self.update_time(now)?;
         self.retransmit_burst = None;
         if self.state == State::Closed {
+            self.dropped = Some(DropReason::TcpClose);
             return Ok(());
         }
         let h = segment.header;
@@ -6686,6 +6689,7 @@ impl Connection {
                     self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
                     self.reset_reply = true;
                 }
+                self.dropped = Some(DropReason::TcpInvalidAckSequence);
                 return Ok(());
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
@@ -6695,10 +6699,13 @@ impl Connection {
                     // A validated refusal ends this connection, but alone is not
                     // evidence that the service cannot accept Fast Open.
                     self.terminal(CloseReason::Reset);
+                } else {
+                    self.dropped = Some(DropReason::TcpReset);
                 }
                 return Ok(());
             }
             if h.flags & SYN == 0 {
+                self.dropped = Some(DropReason::TcpFlags);
                 return Ok(());
             }
             // Active-open hardening: a nonzero echo must lie within the
@@ -6716,6 +6723,7 @@ impl Connection {
                 self.pending_rst = Some((ack, false));
                 self.reset_echo = None;
                 self.reset_reply = true;
+                self.dropped = Some(DropReason::TcpRfc7323Paws);
                 return Ok(());
             }
             self.accepted_metadata = true;
@@ -6861,16 +6869,24 @@ impl Connection {
                 // Narrow SHOULD departure: SYN is never accepted; selected RFC5961
                 // MUST challenge wins without admitting data or updating TS state.
                 // Handshake SYNs and RST handling retain their original paths.
-                if h.flags & SYN != 0 && !self.handshake_pending() {
+                let challenged = h.flags & SYN != 0 && !self.handshake_pending();
+                if challenged {
                     self.challenge_ack();
                 }
+                self.dropped = Some(if challenged {
+                    DropReason::TcpInvalidSyn
+                } else {
+                    DropReason::TcpMissingTimestamp
+                });
                 return Ok(());
             };
             if recent_valid && !Seq(value).at_or_after(Seq(self.ts_recent)) {
                 if h.flags & SYN != 0 && !self.handshake_pending() {
                     self.challenge_ack();
+                    self.dropped = Some(DropReason::TcpInvalidSyn);
                 } else {
                     self.immediate_ack();
+                    self.dropped = Some(DropReason::TcpRfc7323Paws);
                 }
                 return Ok(());
             }
@@ -6899,6 +6915,7 @@ impl Connection {
         // Actor/condition: TCP endpoint; selected blind-attack mitigation.
         if h.flags & (SYN | RST) == SYN && !self.handshake_pending() {
             self.challenge_ack();
+            self.dropped = Some(DropReason::TcpInvalidSyn);
             return Ok(());
         }
 
@@ -6935,6 +6952,7 @@ impl Connection {
                     .syn_timestamp_range
                     .is_none_or(|(first, last)| echo.wrapping_sub(first) > last.wrapping_sub(first))
             {
+                self.dropped = Some(DropReason::TcpRfc7323Paws);
                 return Ok(());
             }
             self.accepted_metadata = true;
@@ -7100,12 +7118,27 @@ impl Connection {
                 self.sack_omit = false;
             }
             if h.flags & RST == 0 {
+                // A repeated handshake SYN is answered again, not discarded.
                 if self.handshake_pending() && h.flags & SYN != 0 && self.irs == Some(seq) {
                     self.syn_pending = true;
-                } else {
-                    self.immediate_ack();
+                    return Ok(());
                 }
+                self.immediate_ack();
             }
+            self.dropped = Some(if h.flags & RST != 0 {
+                DropReason::TcpReset
+            } else if window == 0 && seq == next && len != 0 {
+                DropReason::TcpZeroWindow
+            } else if !segment.payload.is_empty() && seq.wrapping_add(len as u32) == next {
+                // A retransmission of text ending at RCV.NXT, which Linux
+                // takes in (tcp_sequence checks against rcv_wup) and drops
+                // in tcp_data_queue.
+                DropReason::TcpOldData
+            } else if next.at_or_after(seq.wrapping_add(len as u32)) {
+                DropReason::TcpOldSequence
+            } else {
+                DropReason::TcpInvalidSequence
+            });
             return Ok(());
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.3
@@ -7136,6 +7169,7 @@ impl Connection {
                 }
             } else {
                 self.challenge_ack();
+                self.dropped = Some(DropReason::TcpReset);
             }
             return Ok(());
         }
@@ -7158,11 +7192,13 @@ impl Connection {
             } else {
                 self.challenge_ack();
             }
+            self.dropped = Some(DropReason::TcpInvalidSyn);
             return Ok(());
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# if the ACK bit is off, drop the segment and return
         if h.flags & ACK == 0 {
+            self.dropped = Some(DropReason::TcpFlags);
             return Ok(());
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
@@ -7212,6 +7248,11 @@ impl Connection {
         //# discarded and an ACK sent back.
         if !self.snd_nxt.at_or_after(ack) || !ack.at_or_after(oldest_ack) {
             self.immediate_ack();
+            self.dropped = Some(if self.snd_nxt.at_or_after(ack) {
+                DropReason::TcpTooOldAck
+            } else {
+                DropReason::TcpAckUnsentData
+            });
             return Ok(());
         }
         // As Linux's tcp_check_req with tcp_abort_on_overflow off, after the
@@ -7220,7 +7261,7 @@ impl Connection {
         // completes it once accept() made room. Nothing of the segment is
         // taken, neither its timestamp nor its data.
         if self.hold_establishment && self.handshake_pending() && ack.after(self.snd_una) {
-            self.establishment_held = true;
+            self.dropped = Some(DropReason::TcpListenOverflow);
             return Ok(());
         }
         // TCP sequence and ACK validation must precede timestamp refresh.
@@ -7285,6 +7326,7 @@ impl Connection {
                 self.pending_rst = Some((ack, false));
                 self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
                 self.reset_reply = true;
+                self.dropped = Some(DropReason::TcpInvalidAckSequence);
                 return Ok(());
             }
             // Active simultaneous open can finish with a plain ACK when the
@@ -8499,6 +8541,17 @@ impl Connection {
             self.state,
             State::Established | State::FinWait1 | State::FinWait2
         ) {
+            // Text after the peer's FIN, or a duplicate of text before it.
+            if !payload.is_empty() {
+                let next = self.receive.next();
+                self.dropped = Some(
+                    if next.at_or_after(seq.wrapping_add(payload.len() as u32)) {
+                        DropReason::TcpOldData
+                    } else {
+                        DropReason::TcpOverWindow
+                    },
+                );
+            }
             return;
         }
         // As Linux's tcp_rcv_established, every segment with a new echo,
@@ -8612,6 +8665,7 @@ impl Connection {
             // Aborted preserves the pending reset until successful output;
             // terminal cancels all ordinary output and timers.
             self.terminal(CloseReason::Aborted);
+            self.dropped = Some(DropReason::TcpAbortOnData);
             return;
         }
         if self.config.adaptive_ack && outcome.new_bytes != 0 && outcome.advanced {
@@ -8671,6 +8725,21 @@ impl Connection {
                             .min(usize::from(u8::MAX)) as u8
                     });
                 self.unacked_segments = self.unacked_segments.saturating_add(segments);
+            } else if !payload.is_empty() {
+                // None of the text was taken (Linux's tcp_data_queue drops).
+                self.dropped = Some(if skip == payload.len() {
+                    DropReason::TcpOldData
+                } else if count == 0 {
+                    if window == 0 {
+                        DropReason::TcpZeroWindow
+                    } else {
+                        DropReason::TcpOverWindow
+                    }
+                } else if self.receive.eof() && !outcome.fin {
+                    DropReason::TcpOverWindow
+                } else {
+                    DropReason::TcpOfoMerge
+                });
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
             //# o A TCP implementation MAY send an ACK segment acknowledging RCV.NXT

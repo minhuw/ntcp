@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 use core::net::IpAddr;
 use ntcp::{
-    EncodedIpv4Options, InputDisposition, Instant, IpMetadata, Ipv4Options, Ipv4Timestamp,
+    DropReason, EncodedIpv4Options, InputDisposition, Instant, IpMetadata, Ipv4Options, Ipv4Timestamp,
     Ipv4TimestampProvider, RxPacketMetadata,
 };
 use ntcp_icmp::{EchoKind, ErrorMessage};
@@ -208,8 +208,9 @@ impl IcmpOutput {
         Some(&mut self.bytes[index * stride..][..stride])
     }
     // Queue the message written to the slot from `free`. In a full queue it
-    // replaces the displaced held message (counted unsent) and moves behind
-    // the others, which keep their relative order.
+    // replaces the displaced held message (counted unsent, and returned)
+    // and moves behind the others, which keep their relative order.
+    #[must_use]
     fn push(
         &mut self,
         ip: IpMetadata,
@@ -217,7 +218,7 @@ impl IcmpOutput {
         len: usize,
         options: Option<EncodedIpv4Options>,
         error: Option<ErrorMessage>,
-    ) {
+    ) -> Option<IpMetadata> {
         let n = self.limits.messages;
         let queued = Queued {
             ip,
@@ -232,12 +233,13 @@ impl IcmpOutput {
         if self.len < n {
             self.entries[(self.head + self.len) % n] = Some(queued);
             self.len += 1;
-            return;
+            return None;
         }
         let Some(mut index) = self.displaced() else {
-            return;
+            return None;
         };
         self.counters.unsent += 1;
+        let displaced = self.entries[index].as_ref().map(|q| q.ip);
         self.entries[index] = Some(queued);
         let tail = (self.head + n - 1) % n;
         while index != tail {
@@ -245,6 +247,7 @@ impl IcmpOutput {
             self.swap(index, next);
             index = next;
         }
+        displaced
     }
     // Exchange two slots, metadata and bytes.
     fn swap(&mut self, a: usize, b: usize) {
@@ -285,10 +288,9 @@ impl IcmpOutput {
     }
     // Remove the message queued as `arrival` unsent (counted), keeping the
     // order of the others.
-    fn discard(&mut self, arrival: u64) {
-        let Some(mut i) = self.position(arrival) else {
-            return;
-        };
+    fn discard(&mut self, arrival: u64) -> Option<IpMetadata> {
+        let mut i = self.position(arrival)?;
+        let ip = self.entries[(self.head + i) % self.limits.messages].as_ref()?.ip;
         let n = self.limits.messages;
         while i > 0 {
             self.swap((self.head + i) % n, (self.head + i - 1) % n);
@@ -296,6 +298,7 @@ impl IcmpOutput {
         }
         self.pop();
         self.counters.unsent += 1;
+        Some(ip)
     }
     // Move the oldest message behind the others, keeping the relative order
     // of the rest; storage stays within the fixed slots.
@@ -605,6 +608,7 @@ impl Host {
             reassembly,
             errors,
             icmp_output,
+            drops,
             ..
         } = self;
         match reassembly.input(now, arrival, piece) {
@@ -629,7 +633,11 @@ impl Host {
                     bytes: out,
                 }))
             }
-            Input::Held | Input::Duplicate => Ok(Received::Held),
+            Input::Held => Ok(Received::Held),
+            Input::Duplicate => {
+                self.drop_fragment(now, crate::reassembly::Discard::Overlap, frame);
+                Ok(Received::Held)
+            }
             Input::Complete(done) => {
                 let len = done.packet.len();
                 let Some(out) = out.get_mut(..len) else {
@@ -654,10 +662,39 @@ impl Host {
                 // fragment; overlap and every IPv4 discard are silent.
                 let fragment = ntcp_ip6::IPV6_HEADER;
                 if let Some(error) = ReassemblyError::for_discard(ipv6, discard, fragment) {
-                    queue_error(errors, icmp_output, now, error, arrival, frame);
+                    queue_error(errors, icmp_output, drops, now, error, arrival, frame);
                 }
+                self.drop_fragment(now, discard, frame);
                 Ok(Received::Discarded)
             }
+        }
+    }
+
+    // Record an arriving fragment `frame` reassembly discarded, or (Overlap)
+    // duplicated, and the held fragments discarded with its assembly.
+    #[cold]
+    #[inline(never)]
+    fn drop_fragment(&mut self, now: Instant, discard: crate::reassembly::Discard, frame: &[u8]) {
+        use crate::reassembly::Discard as D;
+        use ntcp::DropReason as R;
+        let reason = match discard {
+            D::Source => R::IpInvalidSource,
+            D::Overlap | D::Conflict => R::DupFrag,
+            D::Late => R::FragReasmTimeout,
+            D::Capacity | D::Assemblies | D::Fragments | D::Bytes => R::FragReasmCapacity,
+            D::Empty
+            | D::Misaligned
+            | D::Oversize
+            | D::IncompleteHeader
+            | D::Rejected
+            | D::Contradiction
+            | D::Options
+            | D::Ecn => R::FragInvalid,
+        };
+        let subject = || ntcp::DropSubject::of_ip_packet(frame);
+        self.drops.record(reason, now, frame.len(), subject);
+        for _ in 0..self.reassembly.take_abandoned() {
+            self.drops.record(reason, now, 0, subject);
         }
     }
 
@@ -712,6 +749,7 @@ impl Host {
                 .reassembly
                 .rejects(now, arrival, source, destination, fragment.identification)
             {
+                self.drop_fragment(now, crate::reassembly::Discard::Rejected, frame);
                 return Ok(Received::Discarded);
             }
         }
@@ -727,6 +765,7 @@ impl Host {
             reassembly,
             errors,
             icmp_output,
+            drops,
             ..
         } = self;
         let (len, arrival, reassembled) = match reassembly.input(now, arrival, piece) {
@@ -744,7 +783,11 @@ impl Host {
                 out[piece.selector] = piece.protocol;
                 (len, arrival, false)
             }
-            Input::Held | Input::Duplicate => return Ok(Received::Held),
+            Input::Held => return Ok(Received::Held),
+            Input::Duplicate => {
+                self.drop_fragment(now, crate::reassembly::Discard::Overlap, frame);
+                return Ok(Received::Held);
+            }
             Input::Complete(done) => {
                 let len = done.packet.len();
                 out.get_mut(..len)
@@ -754,8 +797,9 @@ impl Host {
             }
             Input::Discarded(discard) => {
                 if let Some(error) = ReassemblyError::for_discard(true, discard, fragment) {
-                    queue_error(errors, icmp_output, now, error, arrival, frame);
+                    queue_error(errors, icmp_output, drops, now, error, arrival, frame);
                 }
+                self.drop_fragment(now, discard, frame);
                 return Ok(Received::Discarded);
             }
         };
@@ -804,6 +848,7 @@ impl Host {
             queue_error(
                 &mut self.errors,
                 &mut self.icmp_output,
+                &mut self.drops,
                 now,
                 error,
                 arrival,
@@ -848,9 +893,10 @@ impl Host {
             icmp_output,
             paths,
             ports,
+            drops,
             ..
         } = self;
-        reassembly.expire(
+        let (timed_out, retired) = reassembly.expire(
             now,
             |link, local| {
                 paths.link(link).is_ok()
@@ -863,6 +909,7 @@ impl Host {
                 queue_error(
                     errors,
                     icmp_output,
+                    drops,
                     now,
                     ReassemblyError::TimeExceeded,
                     expired.arrival,
@@ -870,6 +917,14 @@ impl Host {
                 );
             },
         );
+        for (reason, count) in [
+            (ntcp::DropReason::FragReasmTimeout, timed_out),
+            (ntcp::DropReason::IpInaddrerrors, retired),
+        ] {
+            for _ in 0..count {
+                self.drops.record(reason, now, 0, || ntcp::DropSubject::Unknown);
+            }
+        }
     }
 
     /// A complete datagram another Host context received (`receive`) on a
@@ -1076,6 +1131,28 @@ impl Host {
         now: Instant,
         processed: Processed<'_>,
     ) -> Result<IcmpDispatch, Error> {
+        let dispatch = self.icmp_datagram(endpoint, now, processed)?;
+        self.record_icmp_outcome(now, &dispatch, processed.bytes());
+        Ok(dispatch)
+    }
+
+    // Record the discard of an ICMP message `packet` that `dispatch`
+    // completed without acting on it.
+    pub(crate) fn record_icmp_outcome(&mut self, now: Instant, dispatch: &IcmpDispatch, packet: &[u8]) {
+        if let IcmpDispatch::Completed(outcome) = dispatch
+            && let Some(reason) = crate::icmp_outcome_reason(outcome)
+        {
+            self.drops
+                .record(reason, now, packet.len(), || ntcp::DropSubject::of_ip_packet(packet));
+        }
+    }
+
+    fn icmp_datagram(
+        &mut self,
+        endpoint: &mut ntcp::Endpoint,
+        now: Instant,
+        processed: Processed<'_>,
+    ) -> Result<IcmpDispatch, Error> {
         self.check_endpoint(endpoint)?;
         let packet = self.processed_packet(processed)?;
         if !crate::is_icmp(&packet) {
@@ -1234,7 +1311,9 @@ impl Host {
             len - 8,
         )?;
         output.counters.echo_replies += 1;
-        output.push(reply, context.link, len, options, None);
+        if let Some(displaced) = output.push(reply, context.link, len, options, None) {
+            drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, displaced);
+        }
         Ok(EchoDisposition::Queued)
     }
 
@@ -1292,8 +1371,10 @@ impl Host {
         if self.icmp_output.position(arrival).is_none() {
             return false;
         }
-        if resolved == Some(false) {
-            self.icmp_output.discard(arrival);
+        if resolved == Some(false)
+            && let Some(ip) = self.icmp_output.discard(arrival)
+        {
+            drop_icmp_output(&mut self.drops, self.now, DropReason::NeighFailed, ip);
         }
         true
     }
@@ -1408,6 +1489,7 @@ impl Host {
                 Err(error) => {
                     self.icmp_output.counters.unsent += 1;
                     self.icmp_output.pop();
+                    drop_icmp_output(&mut self.drops, now, DropReason::IpOutnoroutes, queued.ip);
                     return Err(error);
                 }
             };
@@ -1422,6 +1504,7 @@ impl Host {
                 Err(error) => {
                     self.icmp_output.counters.unsent += 1;
                     self.icmp_output.pop();
+                    drop_icmp_output(&mut self.drops, now, DropReason::NeighQueueFull, queued.ip);
                     return Err(error);
                 }
             };
@@ -1461,6 +1544,7 @@ impl Host {
                     // static neighbor, for one): consumed unsent.
                     if outcome == BackendOutcome::NotSubmitted {
                         self.icmp_output.counters.unsent += 1;
+                        drop_icmp_output(&mut self.drops, now, DropReason::BackendRefused, queued.ip);
                     }
                     self.icmp_output.pop();
                 }
@@ -1469,6 +1553,7 @@ impl Host {
             Err(error) => {
                 self.icmp_output.counters.unsent += 1;
                 self.icmp_output.pop();
+                drop_icmp_output(&mut self.drops, now, DropReason::IcmpOutputDropped, queued.ip);
                 Err(match error {
                     DatagramError::Host(error) => error,
                     // No identifier on a route that keeps DF for a message
@@ -1646,13 +1731,17 @@ impl Host {
         let output = &mut self.icmp_output;
         if message.len() > output.limits.message_bytes {
             output.counters.dropped += 1;
+            drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, ip);
             return false;
         }
         let Some(slot) = output.free() else {
+            drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, ip);
             return false;
         };
         slot[..message.len()].copy_from_slice(message);
-        output.push(ip, link, message.len(), options, None);
+        if let Some(displaced) = output.push(ip, link, message.len(), options, None) {
+            drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, displaced);
+        }
         true
     }
 }
@@ -1662,18 +1751,41 @@ impl Host {
 fn queue_error(
     errors: &mut crate::icmp_error::ErrorLimiter,
     icmp_output: &mut IcmpOutput,
+    drops: &mut ntcp::DropRecorder,
     now: Instant,
     error: ReassemblyError,
     arrival: Arrival,
     invoking: &[u8],
 ) {
-    if icmp_output.limits.messages != 0
-        && let Some(slot) = icmp_output.free()
-        && let Some(sent) = originate(errors, now, error, arrival, invoking, slot)
-    {
-        icmp_output.counters.errors += 1;
-        icmp_output.push(sent.ip, sent.link, sent.len, None, Some(sent.kind));
+    if icmp_output.limits.messages == 0 {
+        return;
     }
+    let Some(slot) = icmp_output.free() else {
+        drops.record(DropReason::IcmpOutputDropped, now, 0, || {
+            ntcp::DropSubject::of_ip_packet(invoking)
+        });
+        return;
+    };
+    if let Some(sent) = originate(errors, now, error, arrival, invoking, slot) {
+        icmp_output.counters.errors += 1;
+        if let Some(displaced) =
+            icmp_output.push(sent.ip, sent.link, sent.len, None, Some(sent.kind))
+        {
+            drop_icmp_output(drops, now, DropReason::IcmpOutputDropped, displaced);
+        }
+    }
+}
+
+// Record ICMP output to `ip` this Host discarded.
+#[cold]
+#[inline(never)]
+fn drop_icmp_output(drops: &mut ntcp::DropRecorder, now: Instant, reason: DropReason, ip: IpMetadata) {
+    let protocol = if ip.destination.is_ipv4() { 1 } else { 58 };
+    drops.record(reason, now, 0, || ntcp::DropSubject::Ip {
+        source: ip.source,
+        destination: ip.destination,
+        protocol,
+    });
 }
 
 // The protocols that end an IPv6 header chain this Host processes: the

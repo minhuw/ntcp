@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 
 use crate::{
-    OutgoingIpv4Options,
+    DropReason, OutgoingIpv4Options,
     connection::{
         ConnectionConfig, Instant, PAWS_RECENT_EXPIRY_US, PEER_TS_RECENT_IDLE_US, ScopedTuple,
     },
@@ -53,6 +53,8 @@ pub(crate) struct Record {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Input {
     Kept,
+    // Kept, the segment discarded (answered or not) for this reason.
+    Dropped(DropReason),
     // An acceptable RST ended TIME-WAIT.
     Reset,
 }
@@ -126,8 +128,9 @@ impl Record {
             let Some((value, _)) = segment.options.timestamps else {
                 if h.flags & SYN != 0 {
                     self.challenge(now, config);
+                    return Input::Dropped(DropReason::TcpInvalidSyn);
                 }
-                return Input::Kept;
+                return Input::Dropped(DropReason::TcpMissingTimestamp);
             };
             if recent_valid && !Seq(value).at_or_after(Seq(self.ts_recent)) {
                 if h.flags & SYN != 0 {
@@ -135,7 +138,7 @@ impl Record {
                 } else {
                     self.ack_pending = true;
                 }
-                return Input::Kept;
+                return Input::Dropped(DropReason::TcpRfc7323TwPaws);
             }
         }
         //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
@@ -145,7 +148,7 @@ impl Record {
         //# peer:
         if h.flags & (SYN | RST) == SYN {
             self.challenge(now, config);
-            return Input::Kept;
+            return Input::Dropped(DropReason::TcpInvalidSyn);
         }
         // A duplicate FIN falls just below RCV.NXT after its first receipt.
         if h.flags & (FIN | ACK | RST | SYN) == (FIN | ACK)
@@ -176,10 +179,17 @@ impl Record {
             seq == next && (len == 0 || h.flags & (ACK | URG) != 0)
         };
         if !acceptable {
-            if h.flags & RST == 0 {
-                self.ack_pending = true;
+            if h.flags & RST != 0 {
+                return Input::Dropped(DropReason::TcpReset);
             }
-            return Input::Kept;
+            self.ack_pending = true;
+            return Input::Dropped(
+                if next.at_or_after(seq.wrapping_add(len as u32)) {
+                    DropReason::TcpOldSequence
+                } else {
+                    DropReason::TcpInvalidSequence
+                },
+            );
         }
         //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
         //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
@@ -191,14 +201,18 @@ impl Record {
             return Input::Reset;
         }
         if h.flags & ACK == 0 {
-            return Input::Kept;
+            return Input::Dropped(DropReason::TcpFlags);
         }
         //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
         //= reason=Inclusive lower/upper bounds, adjacent invalid values and modular wrap are explicitly asserted.
         //# The ACK value is considered acceptable only if it is in the range of ((SND.UNA - MAX.SND.WND) <= SEG.ACK <= SND.NXT).
         if !self.snd_nxt.at_or_after(ack) || !ack.at_or_after(self.ack_floor) {
             self.ack_pending = true;
-            return Input::Kept;
+            return Input::Dropped(if self.snd_nxt.at_or_after(ack) {
+                DropReason::TcpTooOldAck
+            } else {
+                DropReason::TcpAckUnsentData
+            });
         }
         if self.timestamps
             && let Some((value, _)) = segment.options.timestamps
@@ -219,7 +233,12 @@ impl Record {
                 self.ts_recent_at = now;
             }
         }
-        Input::Kept
+        // Text beyond the peer's FIN has no window to land in.
+        if segment.payload.is_empty() {
+            Input::Kept
+        } else {
+            Input::Dropped(DropReason::TcpOverWindow)
+        }
     }
 
     // The pure ACK a TIME-WAIT connection sends: SND.NXT, RCV.NXT, a zero
