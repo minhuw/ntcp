@@ -248,6 +248,10 @@ impl Owner {
                 .enable_output_reservations_with_capacity(capacity),
         }
         .map_err(engine)?;
+        // Every backend this runtime drives may refuse a packet
+        // synchronously (TxOutcome::Rejected, as a full qdisc refuses one),
+        // which egress reports with reject_local_output.
+        self.endpoint.set_local_transmit_refusals(true);
         // Retention holds a completed datagram, up to the Host's
         // reassembly capacity (attached before egress is enabled).
         let rx_capacity = packet_capacity.max(self.completed.len());
@@ -1255,15 +1259,17 @@ impl Owner {
     // Held attempts whose Neighbor Discovery ended. A resolved one is
     // retried by its entry at the next poll, through the ordinary egress
     // revalidation of path, link, MTU and mapping. A failed one (RFC 4861
-    // section 7.2.2) was certainly never submitted: the Endpoint withdraws
-    // it without a departure, records the Address Unreachable advice as
-    // the connection's soft error (RFC 1122 section 4.2.3.9) and retries
-    // retransmittable output on its local-failure clock, no earlier than
-    // the RTO; that next attempt resolves the neighbor again (RFC 4861
-    // section 7.3.3). A selection it cannot restore exactly is released as
-    // unsent output for the connection's own loss recovery on that clock:
-    // never held again at once, and never under the reservation deadline
-    // that abandons the connection.
+    // section 7.2.2) was certainly never submitted: the Endpoint records
+    // the Address Unreachable advice as the connection's soft error (RFC
+    // 1122 section 4.2.3.9), accounts a fresh data segment as sent and lost
+    // (Linux's neighbour queue drop) for TLP, RACK or the RTO to repair,
+    // and withdraws other retransmittable output without a departure,
+    // retried on its local-failure clock, no earlier than the RTO; that
+    // next attempt resolves the neighbor again (RFC 4861 section 7.3.3). A
+    // selection it cannot restore exactly is released as unsent output for
+    // the connection's own loss recovery on that clock: never held again
+    // at once, and never under the reservation deadline that abandons the
+    // connection (`Endpoint::discard_unsubmitted`).
     fn release_unresolved(&mut self, egress: &mut Egress, now: u64) -> Result<()> {
         for _ in 0..BUDGET {
             let Some(wake) = self.host.as_mut().and_then(|h| h.neighbor_wake()) else {

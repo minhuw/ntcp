@@ -1054,6 +1054,9 @@ pub(crate) struct Connection {
     // Why the segment input last took was discarded, for the Endpoint to
     // take and record: Linux's tcp_rcv_state_process returns its reason.
     pub(crate) dropped: Option<crate::DropReason>,
+    // `Endpoint::set_local_transmit_refusals`: fresh selections keep what a
+    // synchronous refusal must undo.
+    pub(crate) local_refusals: bool,
     sample: Option<(Seq, Instant)>,
     // Reserved control RTT uses physical departure; sample's time still names
     // the immutable wire TSval for ordinary RTTM echo validation.
@@ -1464,6 +1467,7 @@ impl Connection {
             last_output_ecn: 0,
             accepted_metadata: false,
             hold_establishment: false,
+            local_refusals: false,
             dropped: None,
             sample: None,
             sample_departure: None,
@@ -11143,7 +11147,8 @@ impl Connection {
             && self.prr.is_some_and(|p| p.timer_repair())
         {
             RepairUndo::capture(self, seq, count)
-        } else if reserve
+        } else if self.local_refusals
+            && reserve
             && fresh_data
             && !syn
             && !probe

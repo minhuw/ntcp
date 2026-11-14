@@ -724,6 +724,8 @@ pub struct Endpoint {
     undeliverable_control: u64,
     // Every segment and reply this Endpoint discarded, by reason.
     drops: crate::DropRecorder,
+    // `set_local_transmit_refusals`.
+    local_refusals: bool,
     passive_errors: VecDeque<Event>,
     control_epoch: Instant,
     control_count: usize,
@@ -959,6 +961,7 @@ impl Endpoint {
             oversized_control: 0,
             undeliverable_control: 0,
             drops: crate::DropRecorder::new(),
+            local_refusals: false,
             control_turn: true,
             budget,
             per_connection_bytes,
@@ -2033,10 +2036,11 @@ impl Endpoint {
     // TCP_TW_SYN).
     fn insert(
         &mut self,
-        connection: Box<Connection>,
+        mut connection: Box<Connection>,
         listener: Option<ListenerId>,
         replaces: Option<Target>,
     ) -> Result<ConnectionId, EndpointError> {
+        connection.local_refusals = self.local_refusals;
         let tuple = connection.scoped_tuple();
         let admission = (|| {
             let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
@@ -7143,8 +7147,33 @@ impl Endpoint {
         self.cancel_local_output(attempt, None)
     }
 
+    /// Whether the embedding's backend can refuse output synchronously,
+    /// before anything is queued (`TxOutcome::Rejected`), which it reports
+    /// with `reject_local_output`: Linux's qdisc enqueue refusal
+    /// (NET_XMIT_DROP), after which tcp_transmit_skb fails and the skb is
+    /// not counted sent. Each connection's fresh data then keeps, while
+    /// nothing else is outstanding, what its selection changes, so that a
+    /// refused segment returns to the unsent queue and is tried again on
+    /// the resource-probe clock (Linux's TCP_RESOURCE_PROBE_INTERVAL), as
+    /// if never selected. Off by default: a backend that only blocks
+    /// (WouldBlock) or drops after it took output pays nothing for it.
+    /// Applies to connections opened after the call and to every live one.
+    pub fn set_local_transmit_refusals(&mut self, enabled: bool) {
+        self.local_refusals = enabled;
+        for slot in self.slots.iter_mut().flatten() {
+            slot.connection.local_refusals = enabled;
+        }
+    }
+
+    pub fn local_transmit_refusals(&self) -> bool {
+        self.local_refusals
+    }
+
     // Caller certifies a synchronous local rejection, not a WouldBlock or an
-    // unknown/asynchronous result. Unsupported output keeps its reservation.
+    // unknown/asynchronous result. Fresh data the selection kept for
+    // (`set_local_transmit_refusals`) returns unsent to the resource-probe
+    // clock; a first RACK repair is cancelled. Other output keeps its
+    // reservation (false).
     pub fn reject_local_output(
         &mut self,
         now: Instant,
@@ -7154,11 +7183,17 @@ impl Endpoint {
         self.cancel_local_output(attempt, Some(now))
     }
 
-    /// Withdraw an attempt certified never submitted because its next hop
-    /// could not be resolved (RFC 4861 section 7.2.2), for every segment
-    /// kind, without a departure: no RTT sample, retransmission count,
-    /// backoff step, ledger commit, departure charge or timestamp
-    /// completion. A pure ACK or RST is dropped like any lost control (the
+    /// Dispose of an attempt certified never submitted because its next hop
+    /// could not be resolved (RFC 4861 section 7.2.2), or found no
+    /// neighbour storage. A whole fresh data segment is accounted as sent
+    /// and lost, as Linux accounts a skb its neighbour queue frees
+    /// (neigh_resolve_output queued it and returned success;
+    /// kfree_skb_reason NEIGH_FAILED or NEIGH_QUEUEFULL): its departure is
+    /// taken as if submitted, without PMTU size evidence or transmit
+    /// timestamps, and TLP, RACK or the RTO repairs it on the ordinary
+    /// loss path. Other output is withdrawn without a departure: no RTT
+    /// sample, retransmission count, backoff step, ledger commit,
+    /// departure charge or timestamp completion. A pure ACK or RST is dropped like any lost control (the
     /// peer's own retransmission elicits another). Retransmittable output
     /// (SYN, SYN-ACK, data, FIN) is restored as unselected and retried by
     /// the connection's local-failure retry clock, no earlier than the
@@ -7195,6 +7230,39 @@ impl Endpoint {
             self.clear_reservation(index);
             return Ok(true);
         };
+        if self.lost_fresh(index) {
+            self.lose_unsubmitted(now, index)?;
+        } else {
+            self.withdraw_unsubmitted(now, index, id)?;
+        }
+        if let Some(error) = error
+            && self
+                .retained_slot_mut(id)?
+                .connection
+                .unsubmitted_network_error(now, error)?
+            && self.config.error_reports
+            && let Some(listener) = self.retained_slot(id)?.listener
+            && self.passive_errors.len() < self.config.max_connections
+        {
+            let tuple = self.retained_slot(id)?.connection.tuple();
+            self.passive_errors.push_back(Event::PassiveError {
+                listener,
+                tuple,
+                error,
+            });
+        }
+        self.refresh(id.slot);
+        self.rearm_pending_accept(id);
+        Ok(true)
+    }
+
+    // `discard_unsubmitted` of output other than a whole fresh segment.
+    fn withdraw_unsubmitted(
+        &mut self,
+        now: Instant,
+        index: usize,
+        id: ConnectionId,
+    ) -> Result<(), EndpointError> {
         let r = self.reservations[index].current.as_ref().unwrap();
         let flags = self.reservations[index].bytes[13];
         let sequence = flags & (wire::SYN | wire::FIN) != 0
@@ -7216,25 +7284,63 @@ impl Endpoint {
             }
         }
         self.clear_reservation(index);
-        if let Some(error) = error
-            && self
-                .retained_slot_mut(id)?
-                .connection
-                .unsubmitted_network_error(now, error)?
-            && self.config.error_reports
-            && let Some(listener) = self.retained_slot(id)?.listener
-            && self.passive_errors.len() < self.config.max_connections
-        {
-            let tuple = self.retained_slot(id)?.connection.tuple();
-            self.passive_errors.push_back(Event::PassiveError {
-                listener,
-                tuple,
-                error,
-            });
+        Ok(())
+    }
+
+    // Whether reservation `index` holds a whole fresh data segment of a
+    // connection that no attempt submitted any of: one
+    // `lose_unsubmitted` takes as sent and lost.
+    fn lost_fresh(&self, index: usize) -> bool {
+        self.reservations[index].current.as_ref().is_some_and(|r| {
+            r.packet.connection.is_some()
+                && r.offset == 0
+                && !r.repaired
+                && r.finished
+                && r.discovery.is_none()
+                && r.departure.is_some_and(|d| {
+                    d.fresh_data
+                        && d.payload != 0
+                        && !d.syn
+                        && !d.retransmission
+                        && !d.ptb_repair
+                        && d.segmentation.is_none()
+                })
+        })
+    }
+
+    // Account reservation `index`'s fresh segment (`lost_fresh`), certified
+    // never submitted, as sent and lost: its departure as if submitted, so
+    // that TLP, RACK or the RTO repair it. Linux's tcp_write_xmit counts a
+    // skb sent once tcp_transmit_skb returns (tcp_event_new_data_sent),
+    // which a drop in a qdisc (NET_XMIT_CN), the driver or a neighbour's
+    // queue (neigh_resolve_output, kfree_skb_reason NEIGH_FAILED) does not
+    // change: the skb stays on the retransmit queue and is recovered as a
+    // loss. What never reached the wire leaves no PMTU size evidence and no
+    // transmit timestamp.
+    fn lose_unsubmitted(&mut self, now: Instant, index: usize) -> Result<(), EndpointError> {
+        let r = self.reservations[index].current.as_mut().unwrap();
+        // Never physically submitted: no PMTU size evidence at acceptance
+        // for a selection that deferred it there.
+        if let Some(d) = &mut r.departure {
+            d.deferred_fresh = false;
         }
-        self.refresh(id.slot);
-        self.rearm_pending_accept(id);
-        Ok(true)
+        let (id, timestamp, attempt) = (
+            r.packet.connection.unwrap(),
+            r.packet.tx_timestamp,
+            r.attempt.unwrap(),
+        );
+        let owner = &mut self.retained_slot_mut(id)?.connection;
+        owner.reject_reserved_output();
+        if let Some(token) = timestamp {
+            for source in [TxTimestampSource::Software, TxTimestampSource::Hardware] {
+                owner
+                    .tx_timestamps
+                    .cancel_transmit(token.stream_range(), source);
+            }
+        }
+        let accepted = self.accept_transmit(now, attempt)?;
+        debug_assert!(accepted);
+        Ok(())
     }
 
     fn cancel_local_output(

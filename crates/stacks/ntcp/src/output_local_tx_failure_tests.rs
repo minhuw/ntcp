@@ -329,6 +329,7 @@ fn local_repair_cancel_then_covering_ack_cannot_resurrect_old_retransmission() {
 fn fresh_local_rejection_invalidates_old_tokens_and_preserves_accepted_prefixes() {
     for ipv6 in [false, true] {
         let (mut a, _, id, _) = gso_pair(ipv6, true);
+        a.set_local_transmit_refusals(true);
         a.write(id, &[7; 3500]).unwrap();
         let mut bytes = [0; 2048];
         let (p, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 1).unwrap();

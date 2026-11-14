@@ -91,6 +91,10 @@ struct Run {
     answers: Vec<Vec<u8>>,
     groups: usize,
     received: Vec<u8>,
+    // The client's segment, counted as `from_a`, whose reserved attempt is
+    // disposed of as never submitted (`discard_unsubmitted`), for this
+    // reason, instead of accepted.
+    refuse: Option<(usize, crate::DropReason)>,
 }
 
 impl Run {
@@ -160,6 +164,7 @@ impl Run {
             answers: Vec::new(),
             groups: 0,
             received: Vec::new(),
+            refuse: None,
         }
     }
 
@@ -195,6 +200,18 @@ impl Run {
                 return wire;
             };
             let attempt = attempt.unwrap();
+            if let Some((n, reason)) = self.refuse
+                && n == self.from_a.len() + wire.len()
+            {
+                assert!(
+                    self.a
+                        .discard_unsubmitted(self.now, attempt, None, reason)
+                        .unwrap()
+                );
+                assert!(!self.a.is_output_reserved(self.client));
+                wire.push(out[..p.len].to_vec());
+                continue;
+            }
             if self.output == Output::Grouped
                 && let Some(group) = self.a.prepare_transmit_group(attempt, limits()).unwrap()
             {
@@ -596,4 +613,80 @@ fn an_unsubmitted_retransmission_does_not_count() {
         }
     );
     assert_eq!(run.total_retrans(), 1);
+}
+
+// A fresh segment of `len` octets' transfer, the `nth` the client sends,
+// never sent for want of its next hop: the client accounts it as sent and
+// lost, as Linux accounts a skb its neighbour queue frees, so every segment
+// it sends after, its counters and its state are those of the same segment
+// lost on the wire, and the ordinary loss path delivers every octet,
+// whether or not the backend can also refuse output synchronously.
+// Returns the client's counters.
+fn refused_as_lost(
+    adjust: impl Fn(&mut ConnectionConfig) + Copy,
+    len: usize,
+    nth: usize,
+) -> LossCounters {
+    let mut counters = None;
+    for (reason, refusals) in [
+        (crate::DropReason::NeighFailed, false),
+        (crate::DropReason::NeighQueueFull, false),
+        (crate::DropReason::NeighFailed, true),
+    ] {
+        let mut lost = Run::established(Output::Reserved, adjust);
+        let mut refused = Run::established(Output::Reserved, adjust);
+        lost.a.set_local_transmit_refusals(refusals);
+        refused.a.set_local_transmit_refusals(refusals);
+        let sent = lost.from_a.len();
+        assert_eq!(refused.from_a, lost.from_a);
+        refused.refuse = Some((sent + nth, reason));
+        lost.transfer(len, |n| n == sent + nth, |_| false);
+        refused.transfer(len, |n| n == sent + nth, |_| false);
+        assert_eq!(refused.from_a, lost.from_a, "{reason}");
+        assert_eq!(refused.from_b, lost.from_b, "{reason}");
+        assert_eq!(refused.now, lost.now, "{reason}");
+        assert_eq!(
+            refused.a.loss_counters(),
+            lost.a.loss_counters(),
+            "{reason}"
+        );
+        assert_eq!(
+            std::format!("{:?}", refused.a.transport_info(refused.client).unwrap()),
+            std::format!("{:?}", lost.a.transport_info(lost.client).unwrap()),
+            "{reason}"
+        );
+        assert_eq!(refused.a.drop_counts()[reason], 1);
+        assert_eq!(refused.a.drop_counts().total(), 1);
+        assert_eq!(lost.a.drop_counts().total(), 0);
+        let c = lost.a.loss_counters();
+        assert!(counters.is_none_or(|first| first == c));
+        counters = Some(c);
+    }
+    counters.unwrap()
+}
+
+// The only segment in flight: the tail loss probe resends it.
+#[test]
+fn a_refused_tail_segment_is_repaired_by_the_loss_probe() {
+    let counters = refused_as_lost(|_| {}, SEGMENT, 0);
+    assert_eq!(counters.loss_probes, 1);
+    assert_eq!(counters.timeouts, 0);
+}
+
+// One of a flight: RACK infers its loss from the SACKs of the later ones
+// and loss recovery (with its cwnd reduction) resends it.
+#[test]
+fn a_refused_segment_inside_a_flight_enters_loss_recovery() {
+    let counters = refused_as_lost(|_| {}, 10 * SEGMENT, 3);
+    assert_eq!(counters.sack_recoveries, 1);
+    assert_eq!(counters.timeouts, 0);
+    assert!(counters.retransmitted_segments >= 1);
+}
+
+// Without TLP, the retransmission timeout repairs it.
+#[test]
+fn a_refused_tail_segment_without_tlp_times_out() {
+    let counters = refused_as_lost(|c| c.tlp = false, SEGMENT, 0);
+    assert_eq!(counters.timeouts, 1);
+    assert_eq!(counters.loss_probes, 0);
 }

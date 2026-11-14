@@ -127,6 +127,7 @@ fn actual_idle_restart_returns_to_standard_ss_after_scalar_and_reserved_output()
 #[test]
 fn cancelled_idle_restart_restores_phase_with_the_unsubmitted_window() {
     let (mut a, now) = established_ca(0);
+    a.local_refusals = true;
     let at = now + 2 * a.rto();
     advance_to(&mut a, at - 1);
     a.write(&[8; 20_000]).unwrap();

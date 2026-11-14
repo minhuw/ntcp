@@ -620,9 +620,12 @@ impl<P: PacketIo> Network<P> {
     // Held frames whose resolution ended. A resolved one is retried by the
     // transmit loop, which resolves it again. A failed one was certainly
     // never submitted: as ntcp-socket does for Neighbor Discovery, the
-    // Endpoint withdraws it without a departure, records the Address
-    // Unreachable advice as the connection's soft error and retries
-    // retransmittable output on its own clock, no earlier than the RTO.
+    // Endpoint records the Address Unreachable advice as the connection's
+    // soft error, accounts a fresh data segment as sent and lost (Linux's
+    // neighbour queue drop, NEIGH_FAILED), for TLP, RACK or the RTO to
+    // repair, and withdraws other retransmittable output without a
+    // departure, retried on its own clock no earlier than the RTO
+    // (`Endpoint::discard_unsubmitted`).
     fn release_resolved(&mut self) -> Result<()> {
         while let Some(wake) = self.host.neighbor_wake() {
             let (attempt, advice) = match wake {

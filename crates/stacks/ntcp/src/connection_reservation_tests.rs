@@ -1198,6 +1198,7 @@ fn fresh_local_rejection_restores_sequence_push_and_denies_ack_of_unsent_bytes()
             let mut cfg = config(4096, 100);
             cfg.timebase.units_per_second = 1_000_000 * scale;
             let (mut a, _) = pair(cfg, iss);
+            a.local_refusals = true;
             a.set_application_timeout(Some(3_000_000)).unwrap();
             a.write_with_push(&[7; 250], true).unwrap();
             let una = a.snd_una;
@@ -1262,6 +1263,7 @@ fn fresh_local_rejection_restores_sequence_push_and_denies_ack_of_unsent_bytes()
 #[test]
 fn late_fresh_rejection_cannot_restart_an_expired_application_deadline() {
     let (mut a, _) = pair(config(4096, 100), 0);
+    a.local_refusals = true;
     a.set_application_timeout(Some(100)).unwrap();
     a.write(&[7; 250]).unwrap();
     a.transmit_selected(40, &mut [0; 2048], true)

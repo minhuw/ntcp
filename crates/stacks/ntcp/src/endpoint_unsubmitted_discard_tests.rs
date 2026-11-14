@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Endpoint::discard_unsubmitted: a held attempt whose next hop never
-// resolved is withdrawn without a departure for every segment kind.
+// resolved is withdrawn without a departure for every segment kind but
+// fresh data, which is accounted as sent and lost (the refused_as_lost
+// tests of endpoint_loss_counter_tests).
 extern crate std;
 use super::*;
 
@@ -174,36 +176,11 @@ fn repeatedly_discarded_syn_ends_at_its_deadline_with_the_error() {
 }
 
 #[test]
-fn discarded_fin_and_fresh_data_restore_their_selection() {
-    let (mut a, mut b, id, peer) = established();
+fn a_discarded_fin_restores_its_selection() {
+    let (mut a, _, id, _) = established();
     let mut bytes = [0; 2048];
-    let rto = a.transport_info(id).unwrap().rto_us;
-    // Fresh data with nothing in flight.
-    a.write(id, &[7; 300]).unwrap();
-    let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
-    let (start, _, len) = segment(out.packet.unwrap(), &bytes);
-    assert_eq!(len, 300);
-    assert!(
-        a.discard_unsubmitted(10, token.unwrap(), None, crate::DropReason::NeighFailed)
-            .unwrap()
-    );
-    let info = a.transport_info(id).unwrap();
-    assert_eq!((info.unacked, info.retransmitted, info.rto_backoff), (0, 0, 0));
-    let (out, token) = a.poll_reserved_transmit(10, &mut bytes, 16).unwrap();
-    assert!(out.packet.is_none() && token.is_none());
-    a.on_timeout(10 + rto, 16).unwrap();
-    let (out, token) = a.poll_reserved_transmit(10 + rto, &mut bytes, 16).unwrap();
-    let p = out.packet.unwrap();
-    assert_eq!(segment(p, &bytes), (start, wire::ACK | wire::PSH, 300));
-    assert!(a.accept_transmit(10 + rto, token.unwrap()).unwrap());
-    b.input(10 + rto, p.ip, &bytes[..p.len]).unwrap();
-    let acked = 10 + rto + 500_000;
-    b.on_timeout(acked, 16).unwrap();
-    let ack = b.poll_transmit(acked, &mut bytes, 16).unwrap().packet.unwrap();
-    a.input(acked, ack.ip, &bytes[..ack.len]).unwrap();
-    assert_eq!(b.readable_bytes(peer).unwrap(), 300);
     // A new FIN: discarding it returns the close to ESTABLISHED.
-    let t = acked + 10;
+    let t = 10;
     let rto = a.transport_info(id).unwrap().rto_us;
     a.shutdown(id).unwrap();
     let (out, token) = a.poll_reserved_transmit(t, &mut bytes, 16).unwrap();
@@ -267,68 +244,6 @@ fn discarded_pure_ack_and_reset_are_dropped() {
     assert!(!a.is_output_reserved(id));
     let (out, _) = a.poll_reserved_transmit(t, &mut bytes, 16).unwrap();
     assert!(out.packet.is_none());
-}
-
-// Fresh data selected behind an outstanding flight records no restorable
-// selection state: its failed attempt is released as unsent output, not
-// left reserved (where only abandoning the connection would end it). The
-// advice is recorded, nothing departs or is aborted, and the connection's
-// own loss recovery sends the bytes no earlier than one RTO later.
-#[test]
-fn unrestorable_selection_is_released_as_unsent_output() {
-    let (mut a, mut b, id, peer) = established();
-    let mut bytes = [0; 2048];
-    a.write(id, &[7; 1000]).unwrap();
-    let (out, first) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
-    let p = out.packet.unwrap();
-    assert!(a.accept_transmit(2, first.unwrap()).unwrap());
-    b.input(2, p.ip, &bytes[..p.len]).unwrap();
-    a.write(id, &[8; 1000]).unwrap();
-    let (out, token) = a.poll_reserved_transmit(3, &mut bytes, 16).unwrap();
-    let (second, _, len) = segment(out.packet.unwrap(), &bytes);
-    assert_eq!(len, 1000);
-    let token = token.unwrap();
-    let failed = 3_000_003;
-    assert!(
-        a.discard_unsubmitted(
-            failed,
-            token,
-            Some(crate::NetworkError::SoftUnreachable),
-            crate::DropReason::NeighFailed
-        )
-        .unwrap()
-    );
-    assert!(
-        !a.discard_unsubmitted(failed, token, None, crate::DropReason::NeighFailed)
-            .unwrap()
-    );
-    assert!(!a.accept_transmit(failed, token).unwrap());
-    assert!(!a.is_output_reserved(id));
-    assert!(soft_error(&mut a, id));
-    let rto = a.transport_info(id).unwrap().rto_us;
-    // The peer's ACK of the first segment is processed again.
-    b.on_timeout(failed, 16).unwrap();
-    let ack = b.poll_transmit(failed, &mut bytes, 16).unwrap().packet.unwrap();
-    a.input(failed + 1, ack.ip, &bytes[..ack.len]).unwrap();
-    // No departed packet is unacknowledged: the unsent copy counts none.
-    let info = a.transport_info(id).unwrap();
-    assert_eq!((info.state, info.unacked), (State::Established, 0));
-    let mut now = failed + 1;
-    let (p, token) = loop {
-        a.on_timeout(now, 16).unwrap();
-        let (out, token) = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap();
-        if let Some(p) = out.packet {
-            break (p, token.unwrap());
-        }
-        now = a.next_deadline().unwrap().max(now + 1);
-        assert!(now < failed + 10 * rto);
-    };
-    assert!(now >= failed + rto, "{now}");
-    assert_eq!(segment(p, &bytes), (second, wire::ACK | wire::PSH, 1000));
-    assert!(a.accept_transmit(now, token).unwrap());
-    b.input(now, p.ip, &bytes[..p.len]).unwrap();
-    assert_eq!(b.readable_bytes(peer).unwrap(), 2000);
-    assert_eq!(a.close_reason(id).unwrap(), None);
 }
 
 // A passive open's SYN-ACK whose next hop never resolved: withdrawn
@@ -446,4 +361,51 @@ fn discarded_retransmission_counts_no_retransmission() {
     assert!(a.accept_transmit(now, token).unwrap());
     b.input(now, p.ip, &bytes[..p.len]).unwrap();
     assert_eq!(b.readable_bytes(peer).unwrap(), 600);
+}
+
+// A backend that refuses output synchronously (TxOutcome::Rejected, Linux's
+// NET_XMIT_DROP from a full qdisc) has the fresh segment it refused counted
+// unsent: back in the unsent queue, retried on the resource-probe clock,
+// with no departure and no retransmission. A backend that cannot refuse has
+// nothing kept for it, and its reservation stays for the embedding to
+// retry.
+#[test]
+fn a_synchronous_refusal_of_fresh_data_is_not_counted_sent() {
+    for refusals in [true, false] {
+        let (mut a, _, id, _) = established();
+        a.set_local_transmit_refusals(refusals);
+        assert_eq!(a.local_transmit_refusals(), refusals);
+        let mut bytes = [0; 2048];
+        a.write(id, &[7; 300]).unwrap();
+        let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+        let (start, _, len) = segment(out.packet.unwrap(), &bytes);
+        assert_eq!(len, 300);
+        let token = token.unwrap();
+        assert_eq!(a.reject_local_output(3, token).unwrap(), refusals);
+        let info = a.transport_info(id).unwrap();
+        if !refusals {
+            assert!(a.is_output_reserved(id));
+            assert_eq!(a.drop_counts().total(), 0);
+            continue;
+        }
+        assert!(!a.is_output_reserved(id));
+        assert_eq!(a.drop_counts()[crate::DropReason::BackendRefused], 1);
+        assert_eq!((info.unacked, info.notsent_bytes), (0, 300));
+        assert_eq!((info.retransmitted, info.rto_backoff), (0, 0));
+        let (mut retry, mut sent) = (3, None);
+        for _ in 0..8 {
+            retry = a.next_deadline().unwrap();
+            a.on_timeout(retry, 16).unwrap();
+            let (out, token) = a.poll_reserved_transmit(retry, &mut bytes, 16).unwrap();
+            if let Some(p) = out.packet {
+                sent = Some((p, token.unwrap()));
+                break;
+            }
+        }
+        let (p, token) = sent.unwrap();
+        assert_eq!(a.transport_info(id).unwrap().resource_probes, 1);
+        assert_eq!(segment(p, &bytes), (start, wire::ACK | wire::PSH, 300));
+        assert!(a.accept_transmit(retry, token).unwrap());
+        assert_eq!(a.transport_info(id).unwrap().total_retrans, 0);
+    }
 }
