@@ -79,22 +79,20 @@ impl Station {
     }
     // The reasons the Network recorded for `frames`, once per discard, after
     // checking that `discarded` and the drive's report count them all.
-    fn take(&mut self, frames: Vec<std::result::Result<Vec<u8>, io::ErrorKind>>) -> Vec<DropReason> {
+    fn take(
+        &mut self,
+        frames: Vec<std::result::Result<Vec<u8>, io::ErrorKind>>,
+    ) -> Vec<DropReason> {
         let before = self.network.counters();
         self.incoming.borrow_mut().extend(frames);
         self.now += 100;
         let report = self.network.drive(self.now, BUDGET).unwrap();
         let after = self.network.counters();
         assert_eq!(after.discarded, after.drops.total());
-        assert_eq!(
-            report.discarded as u64,
-            after.discarded - before.discarded
-        );
+        assert_eq!(report.discarded as u64, after.discarded - before.discarded);
         DropReason::ALL
             .iter()
-            .flat_map(|&r| {
-                std::iter::repeat_n(r, (after.drops[r] - before.drops[r]) as usize)
-            })
+            .flat_map(|&r| std::iter::repeat_n(r, (after.drops[r] - before.drops[r]) as usize))
             .collect()
     }
     fn ip(&mut self, packet: Vec<u8>) -> Vec<DropReason> {
@@ -115,7 +113,13 @@ fn checksum(bytes: &[u8]) -> u16 {
 
 // An IPv4 packet, its header checksum filled in. `fragment`: the flags and
 // offset field.
-fn ipv4_with(source: [u8; 4], destination: [u8; 4], protocol: u8, fragment: u16, payload: &[u8]) -> Vec<u8> {
+fn ipv4_with(
+    source: [u8; 4],
+    destination: [u8; 4],
+    protocol: u8,
+    fragment: u16,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut packet = vec![0x45, 0, 0, 0, 0, 7, 0, 0, 64, protocol, 0, 0];
     packet[2..4].copy_from_slice(&(20 + payload.len() as u16).to_be_bytes());
     packet[6..8].copy_from_slice(&fragment.to_be_bytes());
@@ -153,7 +157,9 @@ fn udp(destination: u16, payload: &[u8]) -> Vec<u8> {
 
 // A SYN from the remote end to `port`.
 fn syn(port: u16) -> Vec<u8> {
-    let mut segment = vec![0x9c, 0x40, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0x10, 0, 0, 0, 0, 0];
+    let mut segment = vec![
+        0x9c, 0x40, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0x10, 0, 0, 0, 0, 0,
+    ];
     segment[2..4].copy_from_slice(&port.to_be_bytes());
     transport(6, segment, 16)
 }
@@ -190,7 +196,10 @@ fn the_backend_and_the_ip_layer() {
     let mut bad = ipv4(17, &udp(9, b"x"));
     bad[10] ^= 0xff;
     assert_eq!(s.ip(bad), [DropReason::IpCsum]);
-    assert_eq!(s.ip(ipv4(17, &[])[..12].to_vec()), [DropReason::PktTooSmall]);
+    assert_eq!(
+        s.ip(ipv4(17, &[])[..12].to_vec()),
+        [DropReason::PktTooSmall]
+    );
     assert_eq!(s.network.counters().ip_header_errors, 2);
     let elsewhere = ipv4_with(REMOTE, [192, 0, 2, 99], 17, 0x4000, &udp(9, b"x"));
     assert_eq!(s.ip(elsewhere), [DropReason::IpInaddrerrors]);

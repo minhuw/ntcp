@@ -230,7 +230,9 @@ impl DropCounts {
     }
     /// The reasons with their counts, in `DropReason::ALL` order.
     pub fn iter(&self) -> impl Iterator<Item = (DropReason, u64)> + '_ {
-        DropReason::ALL.iter().map(|&reason| (reason, self.get(reason)))
+        DropReason::ALL
+            .iter()
+            .map(|&reason| (reason, self.get(reason)))
     }
 }
 
@@ -548,7 +550,10 @@ mod tests {
         record(&mut r, DropReason::PktTooSmall, 9);
         assert_eq!(r.take_event().map(|e| e.at), Some(1));
         let last = r.take_event().unwrap();
-        assert_eq!((last.reason, last.at, last.len), (DropReason::PktTooSmall, 9, 40));
+        assert_eq!(
+            (last.reason, last.at, last.len),
+            (DropReason::PktTooSmall, 9, 40)
+        );
         assert_eq!(r.take_event(), None);
         assert_eq!(r.counts().total(), 6);
         // Disabled again, nothing waits and nothing is kept.

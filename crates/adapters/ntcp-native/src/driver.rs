@@ -307,8 +307,7 @@ impl<P: PacketIo> Network<P> {
             }
         }
         if handoffs && receive_work < budget.receive {
-            let (taken, more) =
-                self.take_handoffs(budget.receive - receive_work, completed);
+            let (taken, more) = self.take_handoffs(budget.receive - receive_work, completed);
             receive_work += taken;
             handoffs = more;
         }
@@ -428,8 +427,7 @@ impl<P: PacketIo> Network<P> {
         let Link::Ethernet { local_mac, .. } = self.config.link else {
             return Err(DropReason::UnhandledProto);
         };
-        let frame =
-            ntcp_ethernet::parse_ethernet_arp(bytes).map_err(|_| DropReason::ArpInvalid)?;
+        let frame = ntcp_ethernet::parse_ethernet_arp(bytes).map_err(|_| DropReason::ArpInvalid)?;
         if frame.destination != local_mac && frame.destination != ntcp_ethernet::BROADCAST {
             return Err(DropReason::OtherHost);
         }
@@ -439,7 +437,11 @@ impl<P: PacketIo> Network<P> {
             .receive_arp(self.ingress, self.now, frame.payload)
             .is_ok();
         self.arp_input |= taken;
-        if taken { Ok(()) } else { Err(DropReason::ArpInvalid) }
+        if taken {
+            Ok(())
+        } else {
+            Err(DropReason::ArpInvalid)
+        }
     }
     // ARP's due timers, then held frames whose resolution ended.
     fn service_neighbors(&mut self, now: Instant) -> Result<()> {
@@ -915,11 +917,7 @@ impl<P: PacketIo> Network<P> {
     // more may wait. A drain that stops short found the inbox empty, or
     // its next packet still being copied in, whose handoff wakes the
     // member then.
-    fn take_handoffs(
-        &mut self,
-        limit: usize,
-        completed: &mut [u8],
-    ) -> (usize, bool) {
+    fn take_handoffs(&mut self, limit: usize, completed: &mut [u8]) -> (usize, bool) {
         let Some(inlet) = self.inlet.take() else {
             return (0, false);
         };

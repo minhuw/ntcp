@@ -4,8 +4,8 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{mem::MaybeUninit, net::SocketAddr, num::NonZeroU8};
 
 use crate::{
-    DropReason, RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
-    TxTimestampRequest, TxTimestampSource, TxTimestampStage,
+    DropReason, RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange,
+    TxTimestampClock, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     buffer::{ReceiveBuffer, SendBuffer},
     output_reservation::Departure,
     pacing::Pacer,

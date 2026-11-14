@@ -2225,9 +2225,10 @@ impl Host {
                         self.input_datagram(endpoint, now, processed, metadata, outgoing_dscp)
                     }
                     Ok(None) => {
-                        self.drops.record(ntcp::DropReason::IpInhdr, now, frame.len(), || {
-                            ntcp::DropSubject::of_ip_packet(frame)
-                        });
+                        self.drops
+                            .record(ntcp::DropReason::IpInhdr, now, frame.len(), || {
+                                ntcp::DropSubject::of_ip_packet(frame)
+                            });
                         Ok(ntcp::InputDisposition::Dropped)
                     }
                     Err(error) => Err(error),

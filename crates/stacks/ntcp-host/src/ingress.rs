@@ -16,8 +16,8 @@
 use alloc::vec::Vec;
 use core::net::IpAddr;
 use ntcp::{
-    DropReason, EncodedIpv4Options, InputDisposition, Instant, IpMetadata, Ipv4Options, Ipv4Timestamp,
-    Ipv4TimestampProvider, RxPacketMetadata,
+    DropReason, EncodedIpv4Options, InputDisposition, Instant, IpMetadata, Ipv4Options,
+    Ipv4Timestamp, Ipv4TimestampProvider, RxPacketMetadata,
 };
 use ntcp_icmp::{EchoKind, ErrorMessage};
 use ntcp_path::{Dscp, LinkId, PathStatus, ScopedAddress, SourceId};
@@ -235,9 +235,7 @@ impl IcmpOutput {
             self.len += 1;
             return None;
         }
-        let Some(mut index) = self.displaced() else {
-            return None;
-        };
+        let mut index = self.displaced()?;
         self.counters.unsent += 1;
         let displaced = self.entries[index].as_ref().map(|q| q.ip);
         self.entries[index] = Some(queued);
@@ -290,7 +288,9 @@ impl IcmpOutput {
     // order of the others.
     fn discard(&mut self, arrival: u64) -> Option<IpMetadata> {
         let mut i = self.position(arrival)?;
-        let ip = self.entries[(self.head + i) % self.limits.messages].as_ref()?.ip;
+        let ip = self.entries[(self.head + i) % self.limits.messages]
+            .as_ref()?
+            .ip;
         let n = self.limits.messages;
         while i > 0 {
             self.swap((self.head + i) % n, (self.head + i - 1) % n);
@@ -922,7 +922,8 @@ impl Host {
             (ntcp::DropReason::IpInaddrerrors, retired),
         ] {
             for _ in 0..count {
-                self.drops.record(reason, now, 0, || ntcp::DropSubject::Unknown);
+                self.drops
+                    .record(reason, now, 0, || ntcp::DropSubject::Unknown);
             }
         }
     }
@@ -1138,12 +1139,18 @@ impl Host {
 
     // Record the discard of an ICMP message `packet` that `dispatch`
     // completed without acting on it.
-    pub(crate) fn record_icmp_outcome(&mut self, now: Instant, dispatch: &IcmpDispatch, packet: &[u8]) {
+    pub(crate) fn record_icmp_outcome(
+        &mut self,
+        now: Instant,
+        dispatch: &IcmpDispatch,
+        packet: &[u8],
+    ) {
         if let IcmpDispatch::Completed(outcome) = dispatch
             && let Some(reason) = crate::icmp_outcome_reason(outcome)
         {
-            self.drops
-                .record(reason, now, packet.len(), || ntcp::DropSubject::of_ip_packet(packet));
+            self.drops.record(reason, now, packet.len(), || {
+                ntcp::DropSubject::of_ip_packet(packet)
+            });
         }
     }
 
@@ -1312,7 +1319,12 @@ impl Host {
         )?;
         output.counters.echo_replies += 1;
         if let Some(displaced) = output.push(reply, context.link, len, options, None) {
-            drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, displaced);
+            drop_icmp_output(
+                &mut self.drops,
+                self.now,
+                DropReason::IcmpOutputDropped,
+                displaced,
+            );
         }
         Ok(EchoDisposition::Queued)
     }
@@ -1544,7 +1556,12 @@ impl Host {
                     // static neighbor, for one): consumed unsent.
                     if outcome == BackendOutcome::NotSubmitted {
                         self.icmp_output.counters.unsent += 1;
-                        drop_icmp_output(&mut self.drops, now, DropReason::BackendRefused, queued.ip);
+                        drop_icmp_output(
+                            &mut self.drops,
+                            now,
+                            DropReason::BackendRefused,
+                            queued.ip,
+                        );
                     }
                     self.icmp_output.pop();
                 }
@@ -1553,7 +1570,12 @@ impl Host {
             Err(error) => {
                 self.icmp_output.counters.unsent += 1;
                 self.icmp_output.pop();
-                drop_icmp_output(&mut self.drops, now, DropReason::IcmpOutputDropped, queued.ip);
+                drop_icmp_output(
+                    &mut self.drops,
+                    now,
+                    DropReason::IcmpOutputDropped,
+                    queued.ip,
+                );
                 Err(match error {
                     DatagramError::Host(error) => error,
                     // No identifier on a route that keeps DF for a message
@@ -1740,7 +1762,12 @@ impl Host {
         };
         slot[..message.len()].copy_from_slice(message);
         if let Some(displaced) = output.push(ip, link, message.len(), options, None) {
-            drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, displaced);
+            drop_icmp_output(
+                &mut self.drops,
+                self.now,
+                DropReason::IcmpOutputDropped,
+                displaced,
+            );
         }
         true
     }
@@ -1779,7 +1806,12 @@ fn queue_error(
 // Record ICMP output to `ip` this Host discarded.
 #[cold]
 #[inline(never)]
-fn drop_icmp_output(drops: &mut ntcp::DropRecorder, now: Instant, reason: DropReason, ip: IpMetadata) {
+fn drop_icmp_output(
+    drops: &mut ntcp::DropRecorder,
+    now: Instant,
+    reason: DropReason,
+    ip: IpMetadata,
+) {
     let protocol = if ip.destination.is_ipv4() { 1 } else { 58 };
     drops.record(reason, now, 0, || ntcp::DropSubject::Ip {
         source: ip.source,

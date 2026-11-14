@@ -906,18 +906,19 @@ impl Host {
         ports: Option<(u16, u16)>,
     ) -> InputDisposition {
         let ip = packet.ip;
-        self.drops.record(reason, self.now, packet.payload.len(), || match ports {
-            Some((source, destination)) => ntcp::DropSubject::Transport {
-                protocol: 17,
-                source: SocketAddr::new(ip.source, source),
-                destination: SocketAddr::new(ip.destination, destination),
-            },
-            None => ntcp::DropSubject::Ip {
-                source: ip.source,
-                destination: ip.destination,
-                protocol: 17,
-            },
-        });
+        self.drops
+            .record(reason, self.now, packet.payload.len(), || match ports {
+                Some((source, destination)) => ntcp::DropSubject::Transport {
+                    protocol: 17,
+                    source: SocketAddr::new(ip.source, source),
+                    destination: SocketAddr::new(ip.destination, destination),
+                },
+                None => ntcp::DropSubject::Ip {
+                    source: ip.source,
+                    destination: ip.destination,
+                    protocol: 17,
+                },
+            });
         InputDisposition::Dropped
     }
 

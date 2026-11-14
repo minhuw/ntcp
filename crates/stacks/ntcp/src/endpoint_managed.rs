@@ -718,13 +718,14 @@ impl Endpoint {
             if matches!(result, Err(ManagedError::Provider(_))) {
                 self.count_listen_drop(false);
                 let len = bytes.len();
-                self.drops.record_error(DropReason::IpOutnoroutes, now, len, || {
-                    crate::DropSubject::Transport {
-                        protocol: 6,
-                        source: tuple.remote,
-                        destination: tuple.local,
-                    }
-                });
+                self.drops
+                    .record_error(DropReason::IpOutnoroutes, now, len, || {
+                        crate::DropSubject::Transport {
+                            protocol: 6,
+                            source: tuple.remote,
+                            destination: tuple.local,
+                        }
+                    });
             }
             result
         } else {

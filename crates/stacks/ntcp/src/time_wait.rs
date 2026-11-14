@@ -183,13 +183,11 @@ impl Record {
                 return Input::Dropped(DropReason::TcpReset);
             }
             self.ack_pending = true;
-            return Input::Dropped(
-                if next.at_or_after(seq.wrapping_add(len as u32)) {
-                    DropReason::TcpOldSequence
-                } else {
-                    DropReason::TcpInvalidSequence
-                },
-            );
+            return Input::Dropped(if next.at_or_after(seq.wrapping_add(len as u32)) {
+                DropReason::TcpOldSequence
+            } else {
+                DropReason::TcpInvalidSequence
+            });
         }
         //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
         //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.

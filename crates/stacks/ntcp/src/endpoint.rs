@@ -13,10 +13,10 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{
-    DropReason, FastOpenCookiePolicy, Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, RxPacketTimestamps,
-    RxReadTimestamps, RxTimestampStatus, SendProgress, SourceRoute, TimestampRequest,
-    TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
-    TxTimestampToken,
+    DropReason, FastOpenCookiePolicy, Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options,
+    RxPacketTimestamps, RxReadTimestamps, RxTimestampStatus, SendProgress, SourceRoute,
+    TimestampRequest, TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource,
+    TxTimestampStage, TxTimestampToken,
     buffer::ReceiveBuffer,
     connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple, State, Tuple},
     rx_timestamp::RxTimestamps,
@@ -4162,21 +4162,28 @@ impl Endpoint {
     #[cold]
     #[inline(never)]
     fn drop_input<T>(&mut self, reason: DropReason, ip: IpMetadata, bytes: &[u8]) -> Option<T> {
-        self.drops
-            .record(reason, self.now, bytes.len(), || received_subject(ip, bytes));
+        self.drops.record(reason, self.now, bytes.len(), || {
+            received_subject(ip, bytes)
+        });
         None
     }
 
     // Record the discard of an admitted segment of `tuple`.
     #[cold]
     #[inline(never)]
-    fn drop_segment(&mut self, reason: DropReason, tuple: ScopedTuple, segment: &wire::Segment<'_>) {
+    fn drop_segment(
+        &mut self,
+        reason: DropReason,
+        tuple: ScopedTuple,
+        segment: &wire::Segment<'_>,
+    ) {
         let len = 20 + segment.raw_options.len() + segment.payload.len();
-        self.drops.record(reason, self.now, len, || crate::DropSubject::Transport {
-            protocol: 6,
-            source: tuple.tuple.remote,
-            destination: tuple.tuple.local,
-        });
+        self.drops
+            .record(reason, self.now, len, || crate::DropSubject::Transport {
+                protocol: 6,
+                source: tuple.tuple.remote,
+                destination: tuple.tuple.local,
+            });
     }
 
     /// Non-constructing wire, address and received-route admission shared by
@@ -4224,14 +4231,14 @@ impl Endpoint {
             return Ok(self.drop_input(DropReason::IpInvalidSource, ip, bytes));
         }
         if
-            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
-            //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
-            //# |
-            //# |  A TCP implementation MUST silently discard an incoming SYN segment
-            //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+        //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
+        //# |
+        //# |  A TCP implementation MUST silently discard an incoming SYN segment
+        //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
 
-            // Scoped to the required ingress-context policy; no subnet is inferred.
-            !valid_address(ip.destination)
+        // Scoped to the required ingress-context policy; no subnet is inferred.
+        !valid_address(ip.destination)
             || ip.source.is_ipv4() != ip.destination.is_ipv4()
             // Managed path authority needs a zone for an IPv6 link-local
             // address (RFC 4007): input without its arrival link is
@@ -6575,11 +6582,12 @@ impl Endpoint {
     #[cold]
     #[inline(never)]
     fn drop_reply(&mut self, reason: DropReason, ip: IpMetadata, header: Header) {
-        self.drops.record(reason, self.now, 20, || crate::DropSubject::Transport {
-            protocol: 6,
-            source: SocketAddr::new(ip.source, header.source_port),
-            destination: SocketAddr::new(ip.destination, header.destination_port),
-        });
+        self.drops
+            .record(reason, self.now, 20, || crate::DropSubject::Transport {
+                protocol: 6,
+                source: SocketAddr::new(ip.source, header.source_port),
+                destination: SocketAddr::new(ip.destination, header.destination_port),
+            });
     }
 
     fn clear_reservation(&mut self, index: usize) {

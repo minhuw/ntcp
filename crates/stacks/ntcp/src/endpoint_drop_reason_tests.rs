@@ -92,7 +92,7 @@ fn segment(header: wire::Header, ts: Option<(u32, u32)>, payload: &[u8]) -> Vec<
 
 impl Pair {
     // The reasons the server recorded for `bytes`.
-    fn to_b(&mut self, bytes: &[u8]) -> Vec<DropReason> {
+    fn input_b(&mut self, bytes: &[u8]) -> Vec<DropReason> {
         recorded(&mut self.b, |b| {
             b.input(3_000, ab(), bytes).unwrap();
         })
@@ -101,7 +101,7 @@ impl Pair {
         let mut header = self.next;
         f(&mut header);
         let bytes = segment(header, Some(self.ts), payload);
-        self.to_b(&bytes)
+        self.input_b(&bytes)
     }
 }
 
@@ -115,7 +115,10 @@ fn the_template_segment_is_taken_without_a_discard() {
 #[test]
 fn no_socket() {
     let mut p = pair();
-    assert_eq!(p.with(|h| h.destination_port = 9, &[]), [DropReason::NoSocket]);
+    assert_eq!(
+        p.with(|h| h.destination_port = 9, &[]),
+        [DropReason::NoSocket]
+    );
 }
 
 #[test]
@@ -123,7 +126,7 @@ fn tcp_csum() {
     let mut p = pair();
     let mut bytes = segment(p.next, Some(p.ts), b"x");
     bytes[16] ^= 0xff;
-    assert_eq!(p.to_b(&bytes), [DropReason::TcpCsum]);
+    assert_eq!(p.input_b(&bytes), [DropReason::TcpCsum]);
     assert_eq!(p.b.checksum_errors(), 1);
 }
 
@@ -131,7 +134,7 @@ fn tcp_csum() {
 fn pkt_too_small() {
     let mut p = pair();
     let bytes = segment(p.next, Some(p.ts), &[]);
-    assert_eq!(p.to_b(&bytes[..12]), [DropReason::PktTooSmall]);
+    assert_eq!(p.input_b(&bytes[..12]), [DropReason::PktTooSmall]);
 }
 
 #[test]
@@ -147,8 +150,15 @@ fn tcp_invalid_option() {
         ..Default::default()
     };
     let r = recorded(&mut p.b, |b| {
-        b.input_with_metadata(3_000, ab(), 0, Ipv4Options::default(), &bytes[..len], metadata)
-            .unwrap();
+        b.input_with_metadata(
+            3_000,
+            ab(),
+            0,
+            Ipv4Options::default(),
+            &bytes[..len],
+            metadata,
+        )
+        .unwrap();
     });
     assert_eq!(r, [DropReason::TcpInvalidOption]);
 }
@@ -156,7 +166,7 @@ fn tcp_invalid_option() {
 #[test]
 fn pkt_too_big() {
     let mut p = pair();
-    assert_eq!(p.to_b(&vec![0; 70_000]), [DropReason::PktTooBig]);
+    assert_eq!(p.input_b(&vec![0; 70_000]), [DropReason::PktTooBig]);
 }
 
 #[test]
@@ -230,18 +240,9 @@ fn a_listener_drops_resets_acks_and_segments_without_syn() {
         h.source_port = 41_000;
         h.flags = flags;
     };
-    assert_eq!(
-        p.with(|h| other(h, wire::RST), &[]),
-        [DropReason::TcpReset]
-    );
-    assert_eq!(
-        p.with(|h| other(h, wire::ACK), &[]),
-        [DropReason::TcpFlags]
-    );
-    assert_eq!(
-        p.with(|h| other(h, wire::FIN), &[]),
-        [DropReason::TcpFlags]
-    );
+    assert_eq!(p.with(|h| other(h, wire::RST), &[]), [DropReason::TcpReset]);
+    assert_eq!(p.with(|h| other(h, wire::ACK), &[]), [DropReason::TcpFlags]);
+    assert_eq!(p.with(|h| other(h, wire::FIN), &[]), [DropReason::TcpFlags]);
 }
 
 // SYNs from `count` ports of the client's address, delivered to `b`
@@ -337,9 +338,9 @@ fn tcp_rfc7323_paws_and_missing_timestamp() {
     let mut p = pair();
     let old = (p.ts.0.wrapping_sub(10_000), p.ts.1);
     let bytes = segment(p.next, Some(old), b"x");
-    assert_eq!(p.to_b(&bytes), [DropReason::TcpRfc7323Paws]);
+    assert_eq!(p.input_b(&bytes), [DropReason::TcpRfc7323Paws]);
     let bytes = segment(p.next, None, b"x");
-    assert_eq!(p.to_b(&bytes), [DropReason::TcpMissingTimestamp]);
+    assert_eq!(p.input_b(&bytes), [DropReason::TcpMissingTimestamp]);
 }
 
 #[test]
@@ -448,7 +449,14 @@ fn a_time_wait_record_drops_old_timestamps_and_syns() {
     b.release(server).unwrap();
     assert!(!b.connection_exists(server));
     let (seq, ack) = (h.acknowledgment, h.sequence);
-    let old = tw_segment(ip, h, seq, ack, wire::ACK, Some((ts.wrapping_sub(10_000), 0)));
+    let old = tw_segment(
+        ip,
+        h,
+        seq,
+        ack,
+        wire::ACK,
+        Some((ts.wrapping_sub(10_000), 0)),
+    );
     let r = recorded(&mut b, |b| {
         b.input(4_000, ip, &old).unwrap();
     });
@@ -464,10 +472,9 @@ fn a_time_wait_record_drops_old_timestamps_and_syns() {
 fn reserved(p: &mut Pair) -> (TransmitAttempt, Vec<u8>) {
     p.a.write(p.client, b"tail").unwrap();
     let mut out = [0; 2048];
-    let (poll, attempt) = p
-        .a
-        .poll_reserved_transmit_for(3_000, p.client, &mut out, 16)
-        .unwrap();
+    let (poll, attempt) =
+        p.a.poll_reserved_transmit_for(3_000, p.client, &mut out, 16)
+            .unwrap();
     let packet = poll.packet.unwrap();
     (attempt.unwrap(), out[..packet.len].to_vec())
 }
