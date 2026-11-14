@@ -256,8 +256,24 @@ pub struct PortConfig {
     pub tx_desc: u16,
     /// IP MTU configured on the port.
     pub mtu: u16,
-    /// Mbufs in each queue's pool. Must exceed `rx_desc + tx_desc` (after the
-    /// PMD rounds them) or the pool can be exhausted by the rings alone.
+    /// Mbufs in each queue's pool (default 16383). Must exceed `rx_desc +
+    /// tx_desc` (after the PMD rounds them) or the pool can be exhausted by
+    /// the rings alone. The RX ring keeps `rx_desc` mbufs posted, sent
+    /// frames hold theirs until the device completes them (up to `tx_desc`
+    /// descriptors, an aggregate one mbuf of `mbuf_data_size` per
+    /// descriptor), and each worker lcore's cache holds up to 384 more; the
+    /// rest is what frames held beyond the rings can take.
+    ///
+    /// Each queue's pool is hugepage memory on the device's NUMA socket,
+    /// allocated whole at `Port::start`. With the default `mbuf_data_size`
+    /// an mbuf takes 2368 octets (DPDK 26.03: 64 mempool object header, 128
+    /// rte_mbuf, 128 headroom, 2048 data, no private area or trailer), and
+    /// the pool adds 1.06 MB of per-lcore caches (RTE_MAX_LCORE 128) and its
+    /// ring (8 octets per slot, n + 1 rounded up to a power of two, hence
+    /// 2^n - 1). On 2 MiB pages a queue's pool takes 10.80 MB at 4095 mbufs
+    /// and 40.01 MB at 16383: 43.2 MB and 160.0 MB for a port of 4 queues.
+    /// Without hugepages (`--no-huge`, 4 KiB pages) no object may cross a
+    /// page, so each mbuf takes 4096 octets: 68.3 MB a queue at 16383.
     pub mbufs_per_queue: u32,
     /// Packet bytes per mbuf, excluding DPDK headroom. Frames longer than
     /// this need RX scatter and TX multi-segment support from the device.
@@ -313,8 +329,10 @@ impl PortConfig {
             rx_desc: 1024,
             tx_desc: 1024,
             mtu: 1500,
-            // 2^n - 1 suits the ring mempool driver.
-            mbufs_per_queue: 4095,
+            // 2^n - 1: the ring mempool driver's ring has n + 1 slots,
+            // rounded up to a power of two. About 14,000 mbufs beyond the
+            // default rings for frames held by reference.
+            mbufs_per_queue: 16383,
             // RTE_MBUF_DEFAULT_DATAROOM.
             mbuf_data_size: 2048,
             isolate: false,

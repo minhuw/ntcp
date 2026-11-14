@@ -33,6 +33,22 @@ unsigned ntcp_host_test_pools(unsigned *full) {
     return count.pools;
 }
 
+// The mbufs and object size (mempool header + element + trailer) of the
+// one pool named by the host module.
+static void find_pool(struct rte_mempool *pool, void *arg) {
+    struct rte_mempool **found = arg;
+    if (strncmp(pool->name, "ntcp_p", 6)) return;
+    *found = *found ? (struct rte_mempool *)-1 : pool;
+}
+int ntcp_host_test_pool_geometry(unsigned *size, unsigned *object) {
+    struct rte_mempool *found = NULL;
+    rte_mempool_walk(find_pool, &found);
+    if (!found || found == (struct rte_mempool *)-1) return -1;
+    *size = found->size;
+    *object = found->header_size + found->elt_size + found->trailer_size;
+    return 0;
+}
+
 unsigned ntcp_host_test_lcore(void) { return rte_lcore_id(); }
 
 int ntcp_host_test_port_named(const char *name) {

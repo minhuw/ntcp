@@ -9,6 +9,7 @@ use std::{
 unsafe extern "C" {
     fn ntcp_host_test_cpu() -> i32;
     fn ntcp_host_test_pools(full: *mut u32) -> u32;
+    fn ntcp_host_test_pool_geometry(size: *mut u32, object: *mut u32) -> i32;
     fn ntcp_host_test_lcore() -> u32;
     fn ntcp_host_test_port_named(name: *const c_char) -> i32;
     fn ntcp_host_test_ring_driver() -> *mut c_void;
@@ -77,8 +78,10 @@ fn hosted_ring_ports() {
         "--in-memory".into(),
         format!("--file-prefix=ntcp-host-{}", std::process::id()),
         "--no-telemetry".into(),
+        // The default pools without hugepages take 68.3 MB a queue
+        // (PortConfig::mbufs_per_queue), and rss_ports starts 4 queues.
         "-m".into(),
-        "256".into(),
+        "512".into(),
     ];
 
     // Refused before EAL runs (it would probe every PCI device), so EAL is
@@ -322,7 +325,17 @@ fn device_mac(port: u16) -> [u8; 6] {
 // against ethdev's own view twice, the second time octet by octet against
 // an address of the test's choosing.
 fn mac_addresses(eal: &'static Eal) {
-    let port = Port::start(eal, PortConfig::new("net_null0")).unwrap();
+    let config = PortConfig::new("net_null0");
+    assert_eq!(config.mbufs_per_queue, 16383);
+    let port = Port::start(eal, config).unwrap();
+    // The default pool: 16383 mbufs of 2368 octets, as the field documents.
+    let (mut size, mut object) = (0, 0);
+    // SAFETY: EAL is initialized; outputs are writable.
+    assert_eq!(
+        unsafe { ntcp_host_test_pool_geometry(&mut size, &mut object) },
+        0
+    );
+    assert_eq!((size, object), (16383, 2368));
     assert_eq!(port.driver_name().unwrap(), "net_null");
     let drawn = port.mac_address().unwrap();
     assert_eq!(drawn, device_mac(port.port_id()));

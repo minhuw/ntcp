@@ -38,6 +38,10 @@
 //   back to the process's affinity from before EAL. Unless `--eal` names
 //   the lcores, EAL gets `--lcores=0@C` for the first CPU C of that set, so
 //   EAL starts no worker lcores and leaves lcore ids for rte_thread_register.
+// - How much hugepage memory? Each queue pair's mbuf pool, at the default
+//   `PortConfig::mbufs_per_queue` (16383 mbufs of 2368 octets), takes 40.01
+//   MB of 2 MiB hugepages on the device's NUMA socket: one queue per
+//   `--ip`, or `--members` queues, besides what EAL and the PMD take.
 // - What does a queue receive? Without `--isolate` the port's unmatched
 //   traffic, ARP included, lands on queue 0 and `steer_ipv4` sends each
 //   address to its queue. With `--isolate` (bifurcated mlx5) only what the
