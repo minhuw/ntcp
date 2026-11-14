@@ -4817,7 +4817,7 @@ impl Connection {
         self.rcvq_space = self
             .config
             .receive_capacity
-            .min(10 * usize::from(self.receive_mss()));
+            .min(10 * usize::from(self.advertised_payload_mss()));
         self.fast_open_attempt = false;
         if self.deferred_tfo_push {
             self.deferred_tfo_push = false;
@@ -6203,6 +6203,11 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn receive_rtt_us(&self) -> u32 {
         self.rcv_rtt_us8 >> 3
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receive_space(&self) -> usize {
+        self.rcvq_space
     }
 
     pub(crate) fn receive_tuned(&self) -> bool {
@@ -8835,6 +8840,15 @@ impl Connection {
 
     fn receive_mss(&self) -> u16 {
         self.receive_mss_offer
+    }
+
+    // Linux's tp->advmss once established: the MSS offered, less the
+    // timestamp option every segment then carries (TCPOLEN_TSTAMP_ALIGNED),
+    // the payload of a full-size segment from the peer.
+    fn advertised_payload_mss(&self) -> u16 {
+        self.receive_mss()
+            .saturating_sub(if self.timestamps { 12 } else { 0 })
+            .max(1)
     }
 
     fn window_threshold(&self) -> u32 {

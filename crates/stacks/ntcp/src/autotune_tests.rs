@@ -236,6 +236,34 @@ fn the_window_scale_follows_the_receive_maximum() {
     }
 }
 
+// Linux's tcp_init_buffer_space starts the first DRS measure at
+// min3(rcv_ssthresh, rcv_wnd, TCP_INIT_CWND * advmss), advmss being the
+// MSS offered less the timestamp option once timestamps were negotiated:
+// 10 * 1448 with them, 10 * 1460 without, and the window when smaller.
+#[test]
+fn the_first_drs_measure_is_ten_full_segments_of_payload() {
+    for (timestamps, initial, space) in [
+        (true, 65536, 14_480),
+        (false, 65536, 14_600),
+        (true, 8192, 8192),
+    ] {
+        let mut config = config();
+        config.connection.timestamps = timestamps;
+        config.connection.receive_capacity = initial;
+        config.connection.receive_capacity_min = 4096;
+        config.connection.receive_capacity_max = 32 << 20;
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let mut trace = [Vec::new(), Vec::new()];
+        let (client, server) = connect(&mut a, &mut b, 40000, &mut trace);
+        for (endpoint, id) in [(&a, client), (&b, server)] {
+            assert_eq!(endpoint.transport_info(id).unwrap().advertised_mss, 1460);
+            let connection = &endpoint.slot(id).unwrap().connection;
+            assert_eq!(connection.receive_space(), space, "{timestamps} {initial}");
+        }
+    }
+}
+
 // The packets of a short bulk transfer from a client of `config`.
 fn transfer(config: &EndpointConfig) -> [Vec<Vec<u8>>; 2] {
     let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
