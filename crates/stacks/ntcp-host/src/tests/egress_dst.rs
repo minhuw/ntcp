@@ -252,7 +252,10 @@ fn after_each_change_the_next_packet_built_uses_the_new_state() {
             let context = context.unwrap();
             match event {
                 ShadowRoute | ReplaceRoute => {
-                    assert_eq!(Some(context.binding.snapshot.key().route()), route_id)
+                    assert_eq!(
+                        Some(a.0.egress_snapshot(&context).unwrap().key().route()),
+                        route_id
+                    )
                 }
                 Decrease | LinkMtu => assert!(frame.len() <= mtu as usize, "v6 {v6} {event:?}"),
                 Dscp => {

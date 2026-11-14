@@ -614,12 +614,16 @@ fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
         let held = pending.as_ref().unwrap();
         assert!(b.transmit_attempt_packet(held.attempt).unwrap().connection.is_none());
         let old = held.context.unwrap();
+        let old_key = bhost.host.egress_snapshot(&old).unwrap().key();
         let staged = output[..held.len].to_vec();
-        let route = bhost.host.paths().route(old.binding.snapshot.key().route()).unwrap();
+        let route = bhost.host.paths().route(old_key.route()).unwrap();
         if replace_source {
-            bhost.host.remove_source_owner(old.binding.snapshot.key().source(), bhost.ingress.link()).unwrap();
+            bhost
+                .host
+                .remove_source_owner(old_key.source(), bhost.ingress.link())
+                .unwrap();
         } else {
-            bhost.host.remove_route(old.binding.snapshot.key().route()).unwrap();
+            bhost.host.remove_route(old_key.route()).unwrap();
         }
         backend.blocked = false;
         let calls = backend.attempts;
@@ -627,7 +631,7 @@ fn runtime_held_stateless_reset_recovers_route_and_source_replacement() {
             IP_HEADER, &mut Sample(0), &mut backend).unwrap();
         assert_eq!(backend.attempts, calls);
         assert!(pending.as_ref().unwrap().blocked);
-        assert!(bhost.host.paths().is_dirty(old.binding.client).unwrap());
+        assert!(bhost.host.paths().is_dirty(old.client()).unwrap());
         if replace_source {
             bhost.host.register_source(path::ScopedAddress::new(remote.ip(), None).unwrap(), bhost.ingress.link()).unwrap();
         } else {
@@ -1331,7 +1335,12 @@ fn runtime_retains_source_route_full_header_and_canonical_context_on_retry() {
         after,
     );
     assert_eq!(
-        context.binding.snapshot.key().destination().address(),
+        host.host
+            .egress_snapshot(&context)
+            .unwrap()
+            .key()
+            .destination()
+            .address(),
         remote.ip()
     );
     assert_eq!(
@@ -1676,7 +1685,10 @@ fn routed_placement_survives_a_failed_ticket() {
     let attempt = attempt.unwrap();
     let len = build_frame(&mut output, packet, &mut Sample(0)).unwrap();
     let context = host.host.egress_context(&mut client, attempt).unwrap();
-    let plan = host.host.header_plan(context.binding.snapshot.key()).unwrap();
+    let plan = host
+        .host
+        .header_plan(host.host.egress_snapshot(&context).unwrap().key())
+        .unwrap();
     assert_eq!(plan.len, 80);
     let mut expected = vec![0; plan.len + packet.len];
     expected[plan.len..].copy_from_slice(&output[IPV6_HEADER..len]);

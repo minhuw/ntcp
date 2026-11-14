@@ -362,7 +362,7 @@ impl Host {
         if let Some(mac) = self.cached_neighbor(context, binding) {
             return Ok(NeighborHop::Resolved(mac));
         }
-        let stamp = context.binding.snapshot.stamp();
+        let stamp = context.stamp();
         let port = self.port_slot(context.link)?;
         let ResolvedNextHop::Address(next_hop) = context.next_hop else {
             return Err(Error::Unsupported);
@@ -399,7 +399,7 @@ impl Host {
         let ResolvedNextHop::Address(next_hop) = context.next_hop else {
             return None;
         };
-        if n.stamp != context.binding.snapshot.stamp()
+        if n.stamp != context.stamp()
             || !self.ports[n.port].is_some_and(|p| p.link == context.link)
             || self.neighbor_generation(next_hop.address()) != Some(n.generation)
         {

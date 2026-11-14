@@ -2241,13 +2241,13 @@ fn successive_decreases_during_held_reservation_then_increase_keep_prefix_and_ch
                     break;
                 };
                 let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+                let budget = a.0.egress_snapshot(&context).unwrap().ip_packet_budget();
                 let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
                 let result =
                     a.0.submit(&mut a.1, t, ticket, context, &frame, external, |live| {
-                        assert!(
-                            frame.len() + external
-                                <= live.binding.snapshot.ip_packet_budget().unwrap() as usize
-                        );
+                        // The backend gets the authority checked unchanged.
+                        assert_eq!(live, context);
+                        assert!(frame.len() + external <= budget.unwrap() as usize);
                         BackendOutcome::Submitted
                     })
                     .unwrap();
@@ -2297,11 +2297,19 @@ fn submit_or_repacketize(
     let mut refused = false;
     let mut frames = Vec::new();
     loop {
+        // The live budget, while the context's path is unchanged: only then
+        // does `submit` call the backend.
+        let budget = side
+            .0
+            .egress_snapshot(&context)
+            .ok()
+            .map(|s| s.ip_packet_budget());
         let result = side
             .0
             .submit(&mut side.1, now, ticket, context, &frame, 0, |live| {
+                assert_eq!(live, context);
                 // Never a newly invalid physical submission.
-                assert!(frame.len() <= live.binding.snapshot.ip_packet_budget().unwrap() as usize);
+                assert!(frame.len() <= budget.unwrap().unwrap() as usize);
                 BackendOutcome::Submitted
             });
         match result {

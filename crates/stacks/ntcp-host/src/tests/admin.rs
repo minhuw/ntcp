@@ -1232,14 +1232,14 @@ fn held_stateless_lease_never_blocks_a_restriction_and_is_refused_at_submission(
         let context = a.0.egress_context(&mut a.1, attempt).unwrap();
         let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
         let capability = a.0.administration();
-        let lease_path = context.binding.snapshot.path();
+        let lease_path = context.stamp().path();
         assert!(
             a.0.admin_clients(&capability, &a.1, lease_path)
                 .unwrap()
                 .any(|c| c.client == AdminClient::OutputLease(attempt))
         );
         let route = a.0.binding(tcp).unwrap().snapshot.key().route();
-        assert_eq!(context.binding.snapshot.key().route(), route);
+        assert_eq!(a.0.egress_snapshot(&context).unwrap().key().route(), route);
         let path = a.0.binding(tcp).unwrap().snapshot.path();
         // IPv4: just below the reset; IPv6: a downward set, then a disable.
         let changes: &[AdminPolicy] = if v6 {
@@ -1482,7 +1482,13 @@ fn ipv6_disabled_path_control_segments_are_at_most_1280() {
     assert_ne!(frame[40 + 13] & RST, 0);
     assert!(frame.len() <= 1280);
     let context = a.0.egress_context(&mut a.1, attempt).unwrap();
-    assert_eq!(context.binding.snapshot.ip_packet_budget().unwrap(), 1280);
+    assert_eq!(
+        a.0.egress_snapshot(&context)
+            .unwrap()
+            .ip_packet_budget()
+            .unwrap(),
+        1280
+    );
     let ticket = a.0.submission_ticket(&mut a.1, context).unwrap();
     let submitted = a.0.submit(&mut a.1, now + 3, ticket, context, &frame, 0, |_| BackendOutcome::Submitted);
     assert!(submitted.unwrap() == Submission::Submitted);

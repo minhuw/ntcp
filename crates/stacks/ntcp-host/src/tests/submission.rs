@@ -242,14 +242,14 @@ fn stateless_blocked_retry_revalidates_idempotently_and_seals_once() {
         assert_eq!(sealed[0].evidence.packet_len as usize, frame.len());
         let correlation = b.0.correlate(11, &quote(&frame));
         assert_eq!(correlation.unique, Some(sealed[0]));
-        assert_eq!(correlation.path, Some(context.binding.snapshot.path()));
+        assert_eq!(correlation.path, Some(context.stamp().path()));
         // A path change before a retry is refused before any backend call.
         b.0.collect(&b.1).unwrap();
         input(&mut b.0, &mut b.1, b.2, 20, &syn, 0);
         let (next, _, frame) = selected(&mut b.1, 21).unwrap();
         let context = b.0.egress_context(&mut b.1, next).unwrap();
         let ticket = b.0.submission_ticket(&mut b.1, context).unwrap();
-        let path = context.binding.snapshot.path();
+        let path = context.stamp().path();
         b.0.trusted_decrease(22, path, if v6 { 1280 } else { 1100 })
             .unwrap();
         let refused =

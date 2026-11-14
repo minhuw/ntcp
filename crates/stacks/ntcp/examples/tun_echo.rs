@@ -1640,7 +1640,7 @@ mod linux {
         held: &mut PendingFrame,
         header_len: usize,
     ) -> Result<(), ntcp_host::Error> {
-        let plan = host.header_plan(context.binding.snapshot.key())?;
+        let plan = host.header_plan(host.egress_snapshot(&context)?.key())?;
         if plan.segments.is_empty() {
             return Ok(());
         }

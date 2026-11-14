@@ -389,7 +389,7 @@ fn ipv4_redirect_keeps_restrictions_and_revalidates_held_output() {
         Err(Error::Obsolete)
     );
     let current = a.0.egress_context(&mut a.1, attempt).unwrap();
-    let snapshot = current.binding.snapshot;
+    let snapshot = *a.0.egress_snapshot(&current).unwrap();
     assert_eq!(
         snapshot.key().next_hop(),
         ResolvedNextHop::Address(unscoped(v4("192.0.2.253")))
@@ -488,7 +488,7 @@ fn ipv4_redirect_revalidates_held_shared_and_gso_output() {
     );
     let current = a.0.egress_context(&mut a.1, attempt).unwrap();
     assert_eq!(
-        current.binding.snapshot.key().next_hop(),
+        a.0.egress_snapshot(&current).unwrap().key().next_hop(),
         ResolvedNextHop::Address(unscoped(v4("192.0.2.253")))
     );
     a.0.validate_egress(&mut a.1, current, &frame, payload).unwrap();
@@ -528,7 +528,7 @@ fn ipv4_redirect_revalidates_held_shared_and_gso_output() {
     );
     let current = a.0.egress_context(&mut a.1, held_attempt).unwrap();
     assert_eq!(
-        current.binding.snapshot.key().next_hop(),
+        a.0.egress_snapshot(&current).unwrap().key().next_hop(),
         ResolvedNextHop::Address(unscoped(v4("192.0.2.253")))
     );
     a.0.validate_egress(&mut a.1, current, &held_frame, 0).unwrap();
@@ -1271,7 +1271,10 @@ fn send_routed(side: &mut Side, now: u64) -> Option<([u8; 6], Vec<u8>)> {
     let packet = poll.packet.expect("a segment");
     let attempt = attempt.unwrap();
     let context = side.0.egress_context(&mut side.1, attempt).unwrap();
-    let plan = side.0.header_plan(context.binding.snapshot.key()).unwrap();
+    let plan = side
+        .0
+        .header_plan(side.0.egress_snapshot(&context).unwrap().key())
+        .unwrap();
     let mut frame = vec![0; plan.len + packet.len];
     frame[plan.len..].copy_from_slice(&tcp[..packet.len]);
     ntcp_ip6::encode_tcp_routed(&mut frame, packet, plan.segments, packet.len).unwrap();

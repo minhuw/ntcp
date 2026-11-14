@@ -51,6 +51,13 @@ pub struct ChangeStamp {
     version: u64,
 }
 
+impl ChangeStamp {
+    /// The path incarnation observed.
+    pub const fn path(self) -> PathId {
+        self.path
+    }
+}
+
 /// A detached observation, not perpetual output authorization. Embeddings must
 /// compare its stamp with the live binding before physical submission (T8/T10).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -863,6 +870,10 @@ impl PathService {
     /// The observation `snapshot(client)` would return.
     pub fn stamp(&self, client: ClientId) -> Result<ChangeStamp, Error> {
         Ok(self.client_snapshot(client)?.stamp())
+    }
+    /// `snapshot(client)`, read in place.
+    pub fn snapshot_ref(&self, client: ClientId) -> Result<&PathSnapshot, Error> {
+        self.client_snapshot(client)
     }
     fn client_snapshot(&self, client: ClientId) -> Result<&PathSnapshot, Error> {
         let path = self.clients.get_ref(self.context, client.0)?.path;

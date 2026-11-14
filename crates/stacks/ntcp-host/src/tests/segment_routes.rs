@@ -1075,8 +1075,14 @@ fn routed_frame(side: &mut Side, now: u64) -> Option<(TransmitAttempt, EgressCon
     let packet = poll.packet?;
     let attempt = attempt.unwrap();
     let context = side.0.egress_context(&mut side.1, attempt).unwrap();
-    let plan = side.0.header_plan(context.binding.snapshot.key()).unwrap();
-    assert_eq!(plan.len, context.binding.snapshot.ip_header_len() as usize);
+    let plan = side
+        .0
+        .header_plan(side.0.egress_snapshot(&context).unwrap().key())
+        .unwrap();
+    assert_eq!(
+        plan.len,
+        side.0.egress_snapshot(&context).unwrap().ip_header_len() as usize
+    );
     let mut frame = vec![0; plan.len + packet.len];
     frame[plan.len..].copy_from_slice(&tcp[..packet.len]);
     let n = ntcp_ip6::encode_tcp_routed(&mut frame, packet, plan.segments, packet.len).unwrap();
@@ -1536,7 +1542,9 @@ fn shared_payload_on_a_segment_route_survives_would_block() {
         assert!(payload > 0);
         let header = packet.len - payload;
         let context = a.0.egress_context(&mut a.1, attempt).unwrap();
-        let plan = a.0.header_plan(context.binding.snapshot.key()).unwrap();
+        let plan =
+            a.0.header_plan(a.0.egress_snapshot(&context).unwrap().key())
+                .unwrap();
         assert_eq!(plan.len, H);
         let mut frame = vec![0; H + header];
         frame[H..].copy_from_slice(&tcp[..header]);

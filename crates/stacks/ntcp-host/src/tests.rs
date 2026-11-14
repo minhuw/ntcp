@@ -889,7 +889,10 @@ fn stateless_reply_held_across_a_path_change_is_refused() {
         assert!(packet.connection.is_none());
         assert_eq!(b.0.binding_count(), 0);
         let held = b.0.egress_context(&mut b.1, attempt).unwrap();
-        let old = held.binding;
+        let old = PreparedPath {
+            client: held.client(),
+            snapshot: *b.0.egress_snapshot(&held).unwrap(),
+        };
         assert_eq!(b.0.lease_count(), 1);
         let ticket = b.0.submission_ticket(&mut b.1, held).unwrap();
         if replace_route {
@@ -1215,13 +1218,13 @@ fn revoked_source_pauses_held_output_and_only_live_registered_generation_can_res
         .unwrap();
     let (attempt, _, frame) = selected(&mut endpoint, 1).unwrap();
     let context = host.egress_context(&mut endpoint, attempt).unwrap();
-    let source = context.binding.snapshot.key().source();
+    let source = host.egress_snapshot(&context).unwrap().key().source();
     host.remove_source_owner(source, ingress.link()).unwrap();
     assert!(
         host.validate_egress(&mut endpoint, context, &frame, 0)
             .is_err()
     );
-    assert!(host.paths().is_dirty(context.binding.client).unwrap());
+    assert!(host.paths().is_dirty(context.client()).unwrap());
     let replacement = host
         .register_source(
             ScopedAddress::new(local.ip(), None).unwrap(),
@@ -1230,14 +1233,18 @@ fn revoked_source_pauses_held_output_and_only_live_registered_generation_can_res
         .unwrap();
     assert_ne!(replacement, source);
     let current = host.egress_context(&mut endpoint, attempt).unwrap();
-    assert_ne!(current.binding.client, context.binding.client);
-    assert_ne!(
-        current.binding.snapshot.path(),
-        context.binding.snapshot.path()
+    assert_ne!(current.client(), context.client());
+    assert_ne!(current.stamp().path(), context.stamp().path());
+    let live = *host.egress_snapshot(&current).unwrap();
+    assert_eq!(live.key().source(), replacement);
+    assert_eq!(
+        endpoint.managed_path(id).unwrap().binding,
+        PreparedPath {
+            client: current.client(),
+            snapshot: live,
+        }
     );
-    assert_eq!(current.binding.snapshot.key().source(), replacement);
-    assert_eq!(endpoint.managed_path(id).unwrap().binding, current.binding);
-    assert_eq!(current.binding.snapshot.learned_mtu(), None);
+    assert_eq!(live.learned_mtu(), None);
     assert_eq!(
         host.validate_egress(&mut endpoint, context, &frame, 0),
         Err(Error::Obsolete)
@@ -1245,10 +1252,5 @@ fn revoked_source_pauses_held_output_and_only_live_registered_generation_can_res
     host.validate_egress(&mut endpoint, current, &frame, 0)
         .unwrap();
     assert!(endpoint.accept_transmit(2, attempt).unwrap());
-    assert_eq!(
-        host.paths()
-            .path_pins(context.binding.snapshot.path())
-            .unwrap(),
-        0
-    );
+    assert_eq!(host.paths().path_pins(context.stamp().path()).unwrap(), 0);
 }

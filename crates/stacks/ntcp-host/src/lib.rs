@@ -373,12 +373,33 @@ impl IngressContext {
     }
 }
 
+/// The authority `egress_context` gives one attempt: the link and next hop
+/// its packet leaves through, and the path observation it was granted
+/// under (the path client and its stamp), which every physical attempt
+/// checks. The path's snapshot stays where it lives
+/// (`Host::egress_snapshot`), as Linux's skb holds a reference to its dst.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EgressContext {
     pub link: LinkId,
     pub next_hop: ResolvedNextHop,
-    pub binding: PreparedPath,
     pub attempt: TransmitAttempt,
+    client: path::ClientId,
+    stamp: path::ChangeStamp,
+    // The snapshot granted, for debug builds' check that the live snapshot
+    // of an unchanged stamp is still that one.
+    #[cfg(debug_assertions)]
+    snapshot: PathSnapshot,
+}
+impl EgressContext {
+    /// The path client the attempt's packet leaves through.
+    pub const fn client(&self) -> path::ClientId {
+        self.client
+    }
+    /// The observation of that client's path the authority was granted
+    /// under.
+    pub const fn stamp(&self) -> path::ChangeStamp {
+        self.stamp
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1364,17 +1385,19 @@ impl Host {
         self.check_endpoint(endpoint)?;
         let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
         let current = endpoint.managed_route(owner)?;
-        self.refresh_route(endpoint, owner, index, current)
+        self.refresh_route(endpoint, owner, index, current)?;
+        Ok(self.bindings[index].as_ref().unwrap().prepared)
     }
     // `refresh` of `owner`'s binding record `index`, the connection's route
-    // as the Endpoint reports it now being `current`.
+    // as the Endpoint reports it now being `current`. The record then holds
+    // the refreshed path.
     fn refresh_route(
         &mut self,
         endpoint: &mut Endpoint,
         owner: ConnectionId,
         index: usize,
         current: ManagedRoute,
-    ) -> Result<PreparedPath, Error> {
+    ) -> Result<(), Error> {
         let binding = self.bindings[index].as_ref().unwrap();
         let mut client = binding.prepared.client;
         if current.client != client {
@@ -1387,11 +1410,10 @@ impl Host {
                 Ok(Some(dst.port))
             );
             debug_assert_eq!(self.paths.is_dirty(client), Ok(false));
-            return Ok(binding.prepared);
+            return Ok(());
         }
         if let Some(port) = self.current_checks(endpoint, owner, &binding.prepared, &current)? {
-            let prepared = binding.prepared;
-            let stamp = prepared.snapshot.stamp();
+            let stamp = binding.prepared.snapshot.stamp();
             self.paths.acknowledge(client, stamp)?;
             self.bindings[index].as_mut().unwrap().dst = Some(Dst {
                 stamp,
@@ -1402,7 +1424,7 @@ impl Host {
                 ip_header_len: current.ip_header_len,
                 port,
             });
-            return Ok(prepared);
+            return Ok(());
         }
         let via = scoped(current.forwarding_destination, current.zone)?;
         let mut snapshot = self.paths.snapshot(client)?;
@@ -1440,7 +1462,7 @@ impl Host {
         let now = self.now;
         self.bindings[index].as_mut().unwrap().rebind(prepared, now);
         self.paths.acknowledge(prepared.client, snapshot.stamp())?;
-        Ok(prepared)
+        Ok(())
     }
 
     // `binding`'s egress decision, if it still holds for the connection's
@@ -2737,8 +2759,14 @@ impl Host {
             endpoint.count_undeliverable_reply(attempt);
             return Err(Error::Obsolete);
         }
-        let binding = if let (Some(owner), Some(route)) = (packet.connection, route) {
-            self.authorized_route(endpoint, owner, route, &packet)?
+        // The record that holds the attempt's path: its connection's
+        // binding, or a stateless reply's lease.
+        enum Record {
+            Binding(usize),
+            Lease(usize),
+        }
+        let record = if let (Some(owner), Some(route)) = (packet.connection, route) {
+            Record::Binding(self.authorized_route(endpoint, owner, route, &packet)?)
         } else if let Some(index) = self
             .leases
             .iter()
@@ -2776,7 +2804,7 @@ impl Host {
             };
             self.leases[index].as_mut().unwrap().prepared = prepared;
             self.paths.acknowledge(prepared.client, snapshot.stamp())?;
-            prepared
+            Record::Lease(index)
         } else {
             let index = self
                 .leases
@@ -2796,7 +2824,11 @@ impl Host {
             let (client, snapshot) = self.paths.acquire_resolved(request, via, resolved)?;
             let prepared = PreparedPath { client, snapshot };
             self.leases[index] = Some(Lease { attempt, prepared });
-            prepared
+            Record::Lease(index)
+        };
+        let binding = match record {
+            Record::Binding(index) => &self.bindings[index].as_ref().unwrap().prepared,
+            Record::Lease(index) => &self.leases[index].as_ref().unwrap().prepared,
         };
         // A connection's binding comes from `refresh`, which checked its
         // forwarding; nothing since changed a path or port.
@@ -2828,15 +2860,39 @@ impl Host {
         // authority, before any bytes can reach a backend; validate_egress
         // fills it for each retry. A connection keeps none: ICMP errors
         // about it are checked against its own sequence space.
+        let context = EgressContext {
+            link: binding.snapshot.key().link(),
+            next_hop: binding.snapshot.key().next_hop(),
+            attempt,
+            client: binding.client,
+            stamp: binding.snapshot.stamp(),
+            #[cfg(debug_assertions)]
+            snapshot: binding.snapshot,
+        };
         if packet.connection.is_none() {
             self.reserve_attempt(endpoint, Owner::Stateless, attempt)?;
         }
-        Ok(EgressContext {
-            link: binding.snapshot.key().link(),
-            next_hop: binding.snapshot.key().next_hop(),
-            binding,
-            attempt,
-        })
+        Ok(context)
+    }
+
+    /// The snapshot of the path `context` was granted on, read in place:
+    /// `Obsolete` once that path has changed (its stamp) or its client was
+    /// released, when `submit` refuses the context too.
+    pub fn egress_snapshot(&self, context: &EgressContext) -> Result<&PathSnapshot, Error> {
+        self.granted(context).ok_or(Error::Obsolete)
+    }
+    // The live snapshot of `context`'s path client while its stamp is the
+    // one granted: every change of a snapshot gives it a new stamp, so it is
+    // the snapshot granted, which debug builds check.
+    fn granted(&self, context: &EgressContext) -> Option<&PathSnapshot> {
+        let snapshot = self
+            .paths
+            .snapshot_ref(context.client)
+            .ok()
+            .filter(|s| s.stamp() == context.stamp)?;
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(*snapshot, context.snapshot);
+        Some(snapshot)
     }
     // Refresh a connection's live path and budget authority, never its
     // registration authorization, then admit a planned connection's
@@ -2849,23 +2905,24 @@ impl Host {
         endpoint: &mut Endpoint,
         owner: ConnectionId,
         packet: &Transmit,
-    ) -> Result<PreparedPath, Error> {
+    ) -> Result<(), Error> {
         self.check_endpoint(endpoint)?;
         let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
         let current = endpoint.managed_route(owner)?;
         self.authorized_index(endpoint, owner, index, current, packet)
     }
     // `authorized_refresh` of a connection whose route `egress_context`
-    // read for its packet.
+    // read for its packet; its binding record, which holds the path.
     fn authorized_route(
         &mut self,
         endpoint: &mut Endpoint,
         owner: ConnectionId,
         current: ManagedRoute,
         packet: &Transmit,
-    ) -> Result<PreparedPath, Error> {
+    ) -> Result<usize, Error> {
         let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
-        self.authorized_index(endpoint, owner, index, current, packet)
+        self.authorized_index(endpoint, owner, index, current, packet)?;
+        Ok(index)
     }
     fn authorized_index(
         &mut self,
@@ -2874,7 +2931,7 @@ impl Host {
         index: usize,
         current: ManagedRoute,
         packet: &Transmit,
-    ) -> Result<PreparedPath, Error> {
+    ) -> Result<(), Error> {
         let registration = self.bindings[index]
             .as_ref()
             .unwrap()
@@ -2884,7 +2941,17 @@ impl Host {
             self.refresh_route(endpoint, owner, index, current),
             registration,
         ) {
-            (Ok(live), Some(r)) if live.snapshot.key() != r.authorized => Err(Error::StaleRoute),
+            (Ok(()), Some(r))
+                if self.bindings[index]
+                    .as_ref()
+                    .unwrap()
+                    .prepared
+                    .snapshot
+                    .key()
+                    != r.authorized =>
+            {
+                Err(Error::StaleRoute)
+            }
             (Err(Error::Path(path::Error::NoRoute)), Some(_)) => Err(Error::StaleRoute),
             (result, _) => result,
         }
@@ -3005,7 +3072,7 @@ impl Host {
     /// is the path's `PathSnapshot::ip_header_len`. IPv4 options are the
     /// caller's. Embeddings place an attempt's TCP segment H octets into its
     /// frame and encode the header with `ntcp_ip6::encode_tcp_routed`
-    /// (`EgressContext::binding` names the key).
+    /// (`Host::egress_snapshot` names the key).
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.1
     //= reason=Host path budgets subtract the complete IPv6 header H of the selected path, the 40-octet base header plus, on an owner-configured Segment Routing route of n segments, its 8 + 16(n + 1)-octet Segment Routing Header (Host::header_plan, PathSnapshot::ip_header_len), from the largest IP packet that can be sent: TCP takes H before construction and admission for its MSS, T16's segment quantum and send space, PLPMTUD probes, exact-range repair and retransmission in scalar, shared, reserved and software GSO output, and an indivisible header that no longer fits fails admission. Host UDP flows report MMS_S as the path budget less H and limit Refuse and Probe payloads to EMTU_S - H - 8. When source fragmentation is selected (Host::udp_send_datagram's Fragment mode and the Host's Echo Replies, where a reply to an IPv4 source-routed Echo Request takes the reversed, policy-authorized return route, registers no adjunct demand and is never sized by an adjunct-confirmed bound, while IPv6 Echo Replies use only owner-configured routes) EMTU_S is the receiver's reassembly guarantee (1500 octets for IPv6) or a capability the application states from upper-layer or deployment knowledge, and the Host creates fragments each limited by the connectionless effective size (never above the PMTU) that repeat the unfragmentable part (base header and Segment Routing Header) before the Fragment header; Refuse and Probe modes and TCP keep EMTU_S at the PMTU (TCP never source-fragments). Host::reassembly_capacity states this Host's own EMTU_R and MMS_R, and every managed TCP factory advertises the MSS Host::receive_ip_capability derives from EMTU_R, the largest IPv6 link and the wire limit independently of the send PMTU (T16, 1191-024). Host segment_routes tests (TCP, UDP Refuse/Probe/Fragment, Echo and ICMP errors with exact chains and checksums over the final destination), the native and tun_echo placement tests and the integration/rfc_host srh cases verify it, per embedding: tun_echo's transit-ptb case repairs a transit router's real Packet Too Big quoting its submitted SRH packets and makes TCP progress through a Linux SRv6 endpoint, and the native runtime's endpoint case makes TCP progress through Linux's own SR endpoint processing to the final destination.
     //# MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see "Fragment Header", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.
@@ -3059,7 +3126,7 @@ impl Host {
     /// atomic header with `restore_atomic_header` before the retry.
     pub fn clears_dont_fragment(&self, context: EgressContext) -> bool {
         self.paths
-            .snapshot(context.binding.client)
+            .snapshot_ref(context.client)
             .is_ok_and(|s| s.clears_dont_fragment())
     }
 
@@ -3101,13 +3168,12 @@ impl Host {
         // client, so a frame held across one is refused. A connection's
         // binding is brought up to date first, so that it packetizes its
         // output again for the current path; a stateless reply is dropped.
-        if self.paths.stamp(context.binding.client) != Ok(context.binding.snapshot.stamp()) {
+        let Some(snapshot) = self.granted(&context) else {
             if let Some(owner) = packet.connection {
                 self.authorized_refresh(endpoint, owner, packet)?;
             }
             return Err(Error::Obsolete);
-        }
-        let snapshot = &context.binding.snapshot;
+        };
         let actual = frame
             .len()
             .checked_add(shared_payload_len)
@@ -3131,6 +3197,7 @@ impl Host {
         if packet.connection.is_some() {
             return Ok(context);
         }
+        let path = snapshot.path();
         // A stateless reply's evidence: the quoted fields an ICMP error
         // about it is correlated with.
         let (_, header, total, protocol) = if ipv4 {
@@ -3144,7 +3211,7 @@ impl Host {
             pending,
             Evidence {
                 link: context.link,
-                path: snapshot.path(),
+                path,
                 owner: Owner::Stateless,
                 source: packet.ip.source,
                 destination: packet.ip.destination,
@@ -3340,11 +3407,10 @@ impl Host {
         let view = endpoint.transmit_group(group).ok_or(Error::Obsolete)?;
         let packet = view.packet;
         let owner = packet.connection.ok_or(Error::Obsolete)?;
-        if self.paths.stamp(context.binding.client) != Ok(context.binding.snapshot.stamp()) {
+        let Some(snapshot) = self.granted(&context) else {
             self.authorized_refresh(endpoint, owner, &packet)?;
             return Err(Error::Obsolete);
-        }
-        let snapshot = context.binding.snapshot;
+        };
         // The aggregate is the IP and TCP headers of one segment and the
         // payload of all of them.
         let segment = frame

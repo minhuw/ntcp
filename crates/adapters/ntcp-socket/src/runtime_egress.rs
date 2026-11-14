@@ -545,7 +545,11 @@ impl Owner {
         // these bytes.
         let timestamp = ntcp::Ipv4Timestamp::nonstandard((now / 1000) as u32).wire_value();
         let present = tx.len - shared_len;
-        let key = context.map(|c| c.binding.snapshot.key()).or(bound.map(|s| s.key()));
+        let key = match (&self.host, context) {
+            (Some(host), Some(context)) => host.egress_snapshot(&context).ok().map(|s| s.key()),
+            _ => None,
+        }
+        .or(bound.map(|s| s.key()));
         let plan = match (&self.host, key) {
             (Some(host), Some(key)) => host.header_plan(key).ok(),
             _ => None,

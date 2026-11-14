@@ -159,9 +159,8 @@ fn passive_later_completed_route_changes_actual_wire_output_and_host_key() {
     assert_wire(&frame, addresses(false).0, &[11, 10]);
     let context = b.0.egress_context(&mut b.1, attempt).unwrap();
     assert_eq!(
-        context
-            .binding
-            .snapshot
+        b.0.egress_snapshot(&context)
+            .unwrap()
             .key()
             .forwarding_destination()
             .address(),
@@ -520,15 +519,17 @@ fn changed_return_route_failed_refresh_and_class_rebind_preserve_authority_and_r
         }
         let context = b.0.egress_context(&mut b.1, attempt).unwrap();
         assert_eq!(
-            context
-                .binding
-                .snapshot
+            b.0.egress_snapshot(&context)
+                .unwrap()
                 .key()
                 .forwarding_destination()
                 .address(),
             IpAddr::V4(hop(11))
         );
-        assert_eq!(context.binding.snapshot.key().dscp().value(), 24);
+        assert_eq!(
+            b.0.egress_snapshot(&context).unwrap().key().dscp().value(),
+            24
+        );
         let ticket = b.0.submission_ticket(&mut b.1, context).unwrap();
         let submitted = b.0.submit(&mut b.1, 14, ticket, context, &frame, 0, |_| {
             submissions += 1;

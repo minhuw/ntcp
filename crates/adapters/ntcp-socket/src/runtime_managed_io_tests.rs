@@ -344,15 +344,8 @@ fn managed_scheduled_path_change_refuses_held_attempt_without_phantom_rto_work()
         assert_eq!(a.endpoint.next_deadline(), timer);
     }
     assert_ne!(
-        a.egress
-            .as_ref()
-            .unwrap()
-            .context(cid)
-            .unwrap()
-            .binding
-            .snapshot
-            .stamp(),
-        context.binding.snapshot.stamp()
+        a.egress.as_ref().unwrap().context(cid).unwrap().stamp(),
+        context.stamp()
     );
     wa.lock().unwrap().block = false;
     complete(&mut a, &mut b, &wa, &wb, cid, 300);
