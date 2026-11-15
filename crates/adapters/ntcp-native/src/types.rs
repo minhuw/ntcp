@@ -252,6 +252,14 @@ pub struct DrainReport {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkBudget {
+    /// Packets received: input retained while its connection's output was
+    /// reserved, replayed; packets other members of shared flows handed
+    /// over; frames polled from the backend, together. With 0 a drive
+    /// receives nothing: it does not poll the backend, and retained input
+    /// and handoffs wait, so no data or FIN arrives and no arrival raises
+    /// Readable. Timers and transmission still run, so a timeout can still
+    /// end a connection, and the end of an output reservation can make
+    /// readable what arrived before it.
     pub receive: usize,
     /// Frames handed to the backend, or tried. An aggregate the backend
     /// segments (TCP segmentation offload) is one, as Linux's qdisc quota

@@ -1716,6 +1716,24 @@ impl<P: PacketIo> Network<P> {
             },
         })
     }
+    /// Reads what connection `id` has to read into `out`: its data, then the
+    /// end of the stream (`Eof`), or, for a connection that ended other than
+    /// by a normal close, `ConnectionClosed` with the reason.
+    ///
+    /// A read into a non-empty `out` leaves the connection's Readable queued
+    /// if and only if `readiness(id).readable` would be true as the call
+    /// returns: when data is left to read; when the read took the last data
+    /// and the peer's FIN arrived, so the `Eof` read is still due, whether or
+    /// not an event told of the FIN; and when the connection ended (a reset,
+    /// a timeout), which stays readable as each read reports it. A read that
+    /// leaves nothing to read leaves none queued, also none an arrival
+    /// queued before it. The next `drain_events` gives that Readable (see
+    /// there), so an embedding that drains after each read learns from the
+    /// drain whether to read again, without asking `readiness`.
+    ///
+    /// A read into an empty `out` reads nothing (`EmptyBuffer`) and changes
+    /// no event: after a drain took the connection's Readable, it queues
+    /// none, while data may still wait to be read.
     pub fn try_read(&mut self, id: ConnId, out: &mut [u8]) -> Result<ReadOutcome> {
         let mut drained = false;
         let result = self.read_once(id, out, &mut drained);
@@ -2140,6 +2158,23 @@ impl<P: PacketIo> Network<P> {
         }
         None
     }
+    /// Gives up to `out.len()` events: the network's own first (passive open
+    /// errors, route advice, then NetworkStopped), then at most one per
+    /// connection or listener, oldest change first. A connection gives
+    /// Connected, then Closed, then Readable, then Writable, one a drain:
+    /// one with another left is queued again for a later drain, and `more`
+    /// tells of it. A drain does no protocol work: it neither receives nor
+    /// transmits.
+    ///
+    /// The Readable a `try_read` left queued is the connection's event in the
+    /// next drain that reaches it (one with room in `out`), with no `drive`
+    /// needed in between, unless the connection also has Connected or Closed
+    /// to give, which comes first, the Readable in the drain after. No call
+    /// between the read and the drain takes or replaces it: `try_write`,
+    /// `readiness`, `transport_info`, `send_progress` or `connection_info`
+    /// of this connection or another, nor another's `close`. Another
+    /// `try_read` of the connection decides again, and its `close` or
+    /// `abort` drops it.
     pub fn drain_events(&mut self, out: &mut [Event]) -> DrainReport {
         self.collect_core_events();
         let mut written = 0;

@@ -613,6 +613,8 @@ fn the_inbox_and_the_queue_share_a_drives_receive_budget() {
     assert_eq!(stations[0].network.counters().handed_off, 24);
     queue(&stations[1], 24);
     let second = &mut stations[1];
+    // No receive budget, nothing from either.
+    assert_eq!(receive(second, STEP, 0), (0, 0));
     assert_eq!(receive(second, STEP, 8), (4, 4));
     assert_eq!(receive(second, STEP, 7), (3, 4));
     // One frame left on the queue, 16 in the inbox.

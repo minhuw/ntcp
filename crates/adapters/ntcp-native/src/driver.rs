@@ -83,6 +83,10 @@ impl<P: PacketIo> Network<P> {
     /// therefore pays for every wakeup of another thread sharing its CPU: the
     /// preempted owner stops receiving and acknowledging until it runs again
     /// (for example an application timer thread that wakes once per request).
+    ///
+    /// A drive with `budget.receive` 0 receives nothing
+    /// (`WorkBudget::receive`): run between a `try_read` and the next
+    /// `drain_events`, it adds no arrival to what the read left.
     pub fn drive(&mut self, now: Instant, budget: WorkBudget) -> Result<DriveReport> {
         // The drive's look at the inbox of a member of shared flows begins
         // before anything that can fail: every handoff from here on wakes
