@@ -1751,6 +1751,76 @@ impl<P: PacketIo> Network<P> {
             },
         })
     }
+    /// Writes `bufs` in order as one send, as Linux's sendmsg(2) or
+    /// writev(2) of their iovec does on a TCP socket: the bytes of every
+    /// slice queue as by `try_write`, but only the last byte taken carries
+    /// PUSH, so a slice's end is no segment boundary (`try_write` per slice
+    /// pushes at each slice's end: PSH there, and a TSO group cut there).
+    ///
+    /// Takes what the send buffer admits, slice after slice, and stops at
+    /// the first slice it cannot take whole; the receipt's `accepted` is
+    /// the bytes taken, `range` their stream range, PUSH on its last byte
+    /// whether all or a prefix was taken (Linux's tcp_push after a partial
+    /// copy). Empty slices are skipped; no slices or only empty ones take
+    /// nothing (`accepted` 0, no PUSH), as `try_write` of nothing. Errors
+    /// are `try_write`'s, given only when nothing was taken: a refusal for
+    /// room is `WouldBlock` (the connection becomes Writable when it has
+    /// room); once some bytes are taken, a later refusal or error ends the
+    /// write with them, and the next call reports it, as sendmsg returns
+    /// what it copied. No TX timestamps are requested.
+    pub fn try_write_vectored(
+        &mut self,
+        id: ConnId,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Result<WriteReceipt> {
+        let core = self.writable_core(id)?;
+        let start = self.endpoint.send_progress(core)?.queued_end;
+        let last = bufs.iter().rposition(|b| !b.is_empty());
+        let mut accepted = 0;
+        // Whether the bytes taken end without PUSH: a slice written as
+        // promising more (MSG_MORE) ended the write.
+        let mut unpushed = false;
+        for (index, buf) in bufs.iter().enumerate() {
+            if buf.is_empty() {
+                continue;
+            }
+            let more = Some(index) != last;
+            let result = self.endpoint.write_with_timestamp(
+                core,
+                buf,
+                more,
+                false,
+                None,
+                TxTimestampRequest::default(),
+            );
+            let taken = match result {
+                Ok(n) => n,
+                Err(_) if accepted != 0 => break,
+                Err(EndpointError::Connection(ntcp::Error::WouldBlock)) => {
+                    self.conn_mut(id)?.write_waiting = Some(TxTimestampRequest::default());
+                    return Err(Error::WouldBlock(BlockReason::SendBuffer));
+                }
+                Err(EndpointError::OutputReserved) => {
+                    self.conn_mut(id)?.write_waiting = Some(TxTimestampRequest::default());
+                    return Err(Error::WouldBlock(BlockReason::OutputReserved));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            accepted += taken;
+            unpushed = more;
+            if taken < buf.len() {
+                break;
+            }
+        }
+        let end = start + accepted as u64;
+        if unpushed {
+            self.endpoint.finish_send(core, end, false, false, false)?;
+        }
+        Ok(WriteReceipt {
+            accepted,
+            range: TxStreamRange { start, end },
+        })
+    }
     /// Reads what connection `id` has to read into `out`: its data, then the
     /// end of the stream (`Eof`), or, for a connection that ended other than
     /// by a normal close, `ConnectionClosed` with the reason.
