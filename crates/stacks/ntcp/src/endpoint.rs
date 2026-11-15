@@ -126,9 +126,31 @@ pub struct EndpointConfig {
     pub hop_limit: u8,
     pub dscp: u8,
     pub connection: ConnectionConfig,
+    // The geometry of the owner's timer wheel (`TimerWheel`): how finely it
+    // keeps timers, and how far ahead it reaches. Every timer the
+    // configuration allows must be within its reach; a timer set later
+    // beyond it is refused.
+    pub timer_wheel: crate::TimerWheel,
 }
 
 impl EndpointConfig {
+    /// The timer wheel's geometry in this configuration's timebase, if it
+    /// reaches every timer the configuration allows (InvalidArgument else).
+    pub fn timer_wheel_geometry(&self) -> Result<crate::TimerWheelGeometry, EndpointError> {
+        let geometry = self
+            .timer_wheel
+            .geometry(self.connection.timebase.units_per_second)?;
+        if self
+            .connection
+            .timebase
+            .ticks_from_us(self.connection.longest_timer_us())
+            > geometry.coverage
+        {
+            return Err(Error::InvalidArgument.into());
+        }
+        Ok(geometry)
+    }
+
     pub fn validate(&self) -> Result<(), EndpointError> {
         if !(1..=1_024).contains(&self.max_setup_cache_entries)
             || self.max_route_policies > 1024
@@ -171,6 +193,7 @@ impl EndpointConfig {
             }
         }
         self.preallocation_bytes()?;
+        self.timer_wheel_geometry()?;
         Ok(())
     }
 
@@ -289,6 +312,7 @@ impl Default for EndpointConfig {
             hop_limit: 64,
             dscp: 0,
             connection: ConnectionConfig::default(),
+            timer_wheel: crate::TimerWheel::Internet,
         }
     }
 }
@@ -684,6 +708,8 @@ pub struct Endpoint {
     // their refresh and reclaim.
     ledger_split_refusals: u64,
     deadlines: Deadlines,
+    // The owner's timer wheel geometry: how far ahead a timer may be set.
+    timer_wheel: crate::TimerWheelGeometry,
     reclaimed: u64,
     // The last `max_connections` reclaimed connections, the one counted
     // `n` (from 0) at `n % max_connections`: `reclaimed_since`.
@@ -929,6 +955,7 @@ impl Endpoint {
                 una
             },
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
+            timer_wheel: config.timer_wheel_geometry()?,
             reclaimed: 0,
             reclaims,
             listen_overflows: 0,
@@ -5316,6 +5343,7 @@ impl Endpoint {
         self.slot(id)?
             .connection
             .validate_pmtud_policy(now, policy)?;
+        self.aging_in_reach(policy.search_aging)?;
         self.clock(now)?;
         self.slot_mut(id)?
             .connection
@@ -5343,7 +5371,17 @@ impl Endpoint {
                 ..policy
             },
         )?;
-        Ok(())
+        self.aging_in_reach(aging)
+    }
+
+    // A search aging the timer wheel reaches.
+    fn aging_in_reach(&self, aging: crate::SearchAging) -> Result<(), EndpointError> {
+        match aging {
+            crate::SearchAging::Seconds(seconds) => {
+                self.timer_in_reach(seconds.saturating_mul(1_000_000))
+            }
+            crate::SearchAging::Infinity => Ok(()),
+        }
     }
 
     /// One connection's current PLPMTUD policy; None without PLPMTUD.
@@ -5498,6 +5536,21 @@ impl Endpoint {
         self.refresh(id.slot);
         Ok(())
     }
+    // A timer of `us` microseconds is within the timer wheel's reach:
+    // InvalidArgument for one the wheel could not keep.
+    fn timer_in_reach(&self, us: u64) -> Result<(), EndpointError> {
+        if self.config.connection.timebase.ticks_from_us(us) > self.timer_wheel.coverage {
+            return Err(Error::InvalidArgument.into());
+        }
+        Ok(())
+    }
+
+    /// The timer wheel's geometry (`EndpointConfig::timer_wheel`): no
+    /// timer may be set beyond its `coverage`.
+    pub fn timer_wheel(&self) -> crate::TimerWheelGeometry {
+        self.timer_wheel
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
     //# (d)  An application MUST (MUST-21) be able to set the value for R2
     //# for a particular connection.
@@ -5507,6 +5560,7 @@ impl Endpoint {
         timeout_us: u64,
     ) -> Result<(), EndpointError> {
         self.reject_if_output_reserved(id)?;
+        self.timer_in_reach(timeout_us)?;
         self.slot_mut(id)?.connection.set_user_timeout(timeout_us)?;
         self.refresh(id.slot);
         Ok(())
@@ -5517,6 +5571,7 @@ impl Endpoint {
         timeout_us: Option<u64>,
     ) -> Result<(), EndpointError> {
         self.reject_if_output_reserved(id)?;
+        self.timer_in_reach(timeout_us.unwrap_or(0))?;
         self.slot_mut(id)?
             .connection
             .set_application_timeout(timeout_us)?;
@@ -5577,6 +5632,7 @@ impl Endpoint {
         if timeout_us == Some(0) {
             return Err(Error::InvalidArgument.into());
         }
+        self.timer_in_reach(timeout_us.unwrap_or(0))?;
         self.listeners[id.slot]
             .as_mut()
             .unwrap()
@@ -5596,6 +5652,7 @@ impl Endpoint {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
         //# This interval MUST
         //# be configurable (MUST-27)
+        self.timer_in_reach(keepalive.map_or(0, |k| k.idle_us.max(k.interval_us)))?;
         self.slot_mut(id)?.connection.set_keepalive(keepalive)?;
         self.refresh(id.slot);
         Ok(())

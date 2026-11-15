@@ -8,7 +8,7 @@ use crate::{
 };
 
 const MIN_RTO: u64 = 1_000_000;
-const MAX_RTO: u64 = 60_000_000;
+pub(crate) const MAX_RTO: u64 = 60_000_000;
 const MAX_WINDOW: u32 = 0x7fff_ffff;
 
 #[derive(Clone, Debug)]

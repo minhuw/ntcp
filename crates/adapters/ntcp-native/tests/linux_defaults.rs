@@ -183,14 +183,18 @@ fn defaults_follow_linux_and_stay_configurable() {
         drop_data: Rc::default(),
     };
     assert!(Network::new(config.clone(), wire(), [1; 32], 0).is_ok());
-    // Any positive TIME-WAIT is accepted; only zero, which would end before
-    // the ACK of the peer's FIN left, is refused.
-    for time_wait_us in [1, 1_000, u64::MAX] {
+    // Any positive TIME-WAIT the timer wheel reaches is accepted; zero,
+    // which would end before the ACK of the peer's FIN left, and one beyond
+    // the wheel's reach are refused.
+    let reach = config.tcp.timer_wheel_geometry().unwrap().coverage;
+    for time_wait_us in [1, 1_000, reach] {
         config.tcp.connection.time_wait_us = time_wait_us;
         assert!(Network::new(config.clone(), wire(), [1; 32], 0).is_ok());
     }
-    config.tcp.connection.time_wait_us = 0;
-    assert!(Network::new(config, wire(), [1; 32], 0).is_err());
+    for time_wait_us in [0, reach + 1, u64::MAX] {
+        config.tcp.connection.time_wait_us = time_wait_us;
+        assert!(Network::new(config.clone(), wire(), [1; 32], 0).is_err());
+    }
 }
 
 // The side that closes first waits 60 s, TCP_TIMEWAIT_LEN, before its

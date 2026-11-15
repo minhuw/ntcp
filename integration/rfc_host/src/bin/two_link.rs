@@ -532,6 +532,7 @@ fn config(local: IpAddr, small_mtu: u32) -> EndpointConfig {
         error_reports: true,
         reuse_time_wait: false,
         max_time_wait: EndpointConfig::default().max_time_wait,
+        timer_wheel: ntcp::TimerWheel::Internet,
         connection: ConnectionConfig {
             sack: true,
             timestamps: true,

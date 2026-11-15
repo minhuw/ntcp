@@ -7284,6 +7284,9 @@ fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
 #[path = "endpoint_time_wait_tests.rs"]
 mod time_wait;
 
+#[path = "endpoint_timer_wheel_tests.rs"]
+mod timer_wheel;
+
 #[path = "endpoint_time_wait_record_tests.rs"]
 mod time_wait_record;
 

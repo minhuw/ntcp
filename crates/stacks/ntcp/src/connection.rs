@@ -274,8 +274,9 @@ pub struct ConnectionConfig {
     // after a locally generated reset. The 120 s default lingers 2xMSL only
     // for a 60 s MSL, not RFC 9293's 2 minutes; Linux fixes 60 s
     // (TCP_TIMEWAIT_LEN), which ntcp-native's Linux defaults and the
-    // packetdrill upstream profile configure. Any positive value may be
-    // configured, a shorter one for example for benchmarks. RFC 6191
+    // packetdrill upstream profile configure. Any positive value the
+    // owner's timer wheel reaches may be configured (`EndpointConfig::
+    // timer_wheel`), a shorter one for example for benchmarks. RFC 6191
     // timestamp-based reuse applies within whatever duration is configured.
     pub time_wait_us: u64,
     pub keepalive: Option<KeepaliveConfig>,
@@ -354,6 +355,30 @@ impl ConnectionConfig {
         Ok(())
     }
 
+    // The longest delay any timer of a connection under this configuration
+    // is armed for, in microseconds: what the owner's timer wheel must reach
+    // (`TimerWheelGeometry::coverage`). The retransmission timer, zero-window
+    // probes and the ECN pause back off to 60 s at most; the handshake keeps
+    // the user timeout at 180 s at least; the PLPMTUD search holds 600 s.
+    pub(crate) fn longest_timer_us(&self) -> u64 {
+        let pmtud = self.pmtud.map_or(0, |p| match p.policy.search_aging {
+            crate::SearchAging::Seconds(seconds) => {
+                seconds.saturating_mul(1_000_000).max(600_000_000)
+            }
+            crate::SearchAging::Infinity => 600_000_000,
+        });
+        [
+            crate::recovery::MAX_RTO,
+            self.user_timeout_us.max(180_000_000),
+            self.time_wait_us,
+            self.keepalive.map_or(0, |k| k.idle_us.max(k.interval_us)),
+            pmtud,
+        ]
+        .into_iter()
+        .max()
+        .unwrap()
+    }
+
     pub fn validate(&self, ipv4: bool) -> Result<(), Error> {
         if let Some(p) = self.pmtud {
             p.policy
@@ -407,8 +432,8 @@ impl ConnectionConfig {
             // A zero TIME-WAIT would expire at the instant it begins, where
             // time_wait_valid already fails, and a timer serviced at that
             // instant before output would drop the ACK of the peer's FIN.
-            // Any positive duration outlives that instant; a large one
-            // saturates the deadline in ticks_from_us and saturating_add.
+            // Any positive duration outlives that instant; the endpoint
+            // refuses one its timer wheel does not reach.
             || self.time_wait_us == 0
             || self
                 .keepalive

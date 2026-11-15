@@ -790,6 +790,7 @@ fn config(local: IpAddr) -> EndpointConfig {
         error_reports: true,
         reuse_time_wait: false,
         max_time_wait: EndpointConfig::default().max_time_wait,
+        timer_wheel: ntcp::TimerWheel::Internet,
         connection: ntcp::ConnectionConfig {
             pmtud: Some(ntcp::PmtudConfig::new(MTU as u32)),
             mss: (MTU - header_len - 20) as u16,

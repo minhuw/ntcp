@@ -478,6 +478,7 @@ fn config(local: IpAddr) -> EndpointConfig {
         error_reports: true,
         reuse_time_wait: false,
         max_time_wait: EndpointConfig::default().max_time_wait,
+        timer_wheel: ntcp::TimerWheel::Internet,
         connection: ConnectionConfig {
             sack: true,
             // Each application write is its own segment.

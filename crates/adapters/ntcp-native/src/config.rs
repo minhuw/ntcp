@@ -201,7 +201,11 @@ impl NetworkConfig {
     ///   rises with the congestion window, to twice it, up to 4 MiB, as
     ///   Linux's tcp_wmem[2] = 4 MiB with tcp_sndbuf_expand. The 64 KiB
     ///   start (Linux's tcp_wmem[1] is 16 KiB of memory, about 7 KiB of
-    ///   payload before expansion) keeps a 64 KiB response in one write.
+    ///   payload before expansion) keeps a 64 KiB response in one write;
+    /// - the internet timer wheel (`tcp.timer_wheel`, `TimerWheel`): a
+    ///   microsecond level 0 for pacing and near timers, Linux's 64 buckets
+    ///   per level above it, so a timer runs late by under 12.7% of the
+    ///   time it was set for (Linux's 1/8), never early.
     ///
     /// Each remains a field of `tcp` or `tcp.connection` to change.
     /// `tcp.buffers()` reads the buffer sizes and memory thresholds in
