@@ -863,6 +863,53 @@ fn endpoint_connections_and_listeners_are_configured_without_a_runtime_cap() {
     }
 }
 
+// tcp.timer_wheel picks the owner's timer wheel: a preset, or a custom
+// geometry the endpoint validates against its longest timer.
+#[test]
+fn timer_wheel_presets_and_custom_geometry() {
+    assert_eq!(
+        SocketConfig::parse(BASE).unwrap().tcp.timer_wheel,
+        ntcp::TimerWheel::Internet
+    );
+    for (value, wheel) in [
+        ("datacenter", ntcp::TimerWheel::Datacenter),
+        ("internet", ntcp::TimerWheel::Internet),
+        (
+            "custom:2000,128,10",
+            ntcp::TimerWheel::Custom {
+                tick_ns: 2000,
+                slots: 128,
+                levels: 10,
+            },
+        ),
+    ] {
+        let config = SocketConfig::parse(&format!("{BASE}tcp.timer_wheel={value}\n")).unwrap();
+        assert_eq!(config.tcp.timer_wheel, wheel);
+        assert!(config.validate().is_ok(), "{value}");
+    }
+    for value in [
+        "",
+        "linux",
+        "custom:",
+        "custom:1000,64",
+        "custom:1000,64,9,1",
+        "custom:-1,64,9",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}tcp.timer_wheel={value}\n")).is_err(),
+            "{value}"
+        );
+    }
+    // Well formed, but short of the timers the configuration allows, or
+    // not a geometry the wheel takes: refused as the file is read.
+    for value in ["custom:1000,64,3", "custom:1000,48,12"] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}tcp.timer_wheel={value}\n")).is_err(),
+            "{value}"
+        );
+    }
+}
+
 // tcp.wmem and tcp.rmem take Linux's "min initial max", tcp.mem its
 // "low pressure high" (in bytes); the endpoint reports them as it took them.
 // By default both are tuned up to Linux master's tcp_wmem[2] and

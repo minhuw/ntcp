@@ -694,6 +694,9 @@ impl SocketConfig {
                     config.tcp.buffer_pressure_bytes = Some(pressure);
                     config.tcp.buffer_low_bytes = Some(low);
                 }
+                // The owner's timer wheel (`ntcp::TimerWheel`): datacenter,
+                // internet (the default), or custom:<tick ns>,<slots>,<levels>.
+                "tcp.timer_wheel" => config.tcp.timer_wheel = timer_wheel(value)?,
                 "tcp.advertised_mss" => config.tcp.connection.advertised_mss = Some(number(value)?),
                 "tcp.pacing" => {
                     pacing_enabled = match value {
@@ -993,6 +996,26 @@ fn triple(value: &str) -> io::Result<[usize; 3]> {
 fn buffer_sizes(value: &str) -> io::Result<ntcp::BufferSizes> {
     let [min, initial, max] = triple(value)?;
     Ok(ntcp::BufferSizes { min, initial, max })
+}
+
+fn timer_wheel(value: &str) -> io::Result<ntcp::TimerWheel> {
+    Ok(match value {
+        "datacenter" => ntcp::TimerWheel::Datacenter,
+        "internet" => ntcp::TimerWheel::Internet,
+        _ => {
+            let custom = value.strip_prefix("custom:").ok_or_else(invalid)?;
+            let mut fields = custom.split(',');
+            let wheel = ntcp::TimerWheel::Custom {
+                tick_ns: number(fields.next().ok_or_else(invalid)?)?,
+                slots: number(fields.next().ok_or_else(invalid)?)?,
+                levels: number(fields.next().ok_or_else(invalid)?)?,
+            };
+            if fields.next().is_some() {
+                return Err(invalid());
+            }
+            wheel
+        }
+    })
 }
 
 fn number<T: std::str::FromStr>(value: &str) -> io::Result<T> {
