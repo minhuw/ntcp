@@ -228,6 +228,147 @@ fn reserved_syn_reset_and_timestamp_cancellation() {
     a.accept_transmit(a.now, token.unwrap()).unwrap();
 }
 
+// `segment` with the TSval at `at` replaced by `tsval` and the checksum of
+// `rebuilt`: what a rebuild of `segment` writes with that TSval.
+fn restamped(segment: &[u8], at: usize, tsval: u32, rebuilt: &[u8]) -> std::vec::Vec<u8> {
+    let mut expected = segment.to_vec();
+    expected[at..at + 4].copy_from_slice(&tsval.to_be_bytes());
+    expected[16..18].copy_from_slice(&rebuilt[16..18]);
+    expected
+}
+
+// A held SYN refused and selected again two clock ticks later is written as
+// selection wrote it (MSS, SACK-permitted and TS, NOP and WS), with the
+// TSval of its transmission. The peer's echo of that TSval passes the SYN
+// echo check and samples the handshake RTT, as for a SYN sent as selected.
+#[test]
+fn reserved_syn_rebuilt_later_keeps_its_layout_with_the_current_tsval() {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    a.config.connection.timestamps = true;
+    b.config.connection.timestamps = true;
+    a.enable_output_reservations().unwrap();
+    let local = "192.0.2.1:40000".parse().unwrap();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let id = a.connect(0, local, remote).unwrap();
+    let mut bytes = [0; 2048];
+    let (out, token) = a.poll_reserved_transmit(1_000, &mut bytes, 16).unwrap();
+    let selected = bytes[..out.packet.unwrap().len].to_vec();
+    a.reject_unsubmitted(token.unwrap()).unwrap();
+    let (out, token) = a.poll_reserved_transmit(3_000, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    let connection = &a.slot(id).unwrap().connection;
+    let tsval = connection.timestamp_value(3_000);
+    assert_ne!(tsval, connection.timestamp_value(1_000));
+    let rebuilt = bytes[..p.len].to_vec();
+    assert_eq!(rebuilt, restamped(&selected, 28, tsval, &rebuilt));
+    let s = wire::parse(p.ip, &rebuilt).unwrap();
+    assert_eq!(s.raw_options.len(), 20);
+    assert_eq!(s.raw_options[..2], [2, 4]);
+    assert_eq!(s.raw_options[4..8], [4, 2, 8, 10]);
+    assert_eq!(s.raw_options[16..19], [1, 3, 3]);
+    assert_eq!(s.options.timestamps, Some((tsval, 0)));
+    a.accept_transmit(3_000, token.unwrap()).unwrap();
+    b.input(3_000, p.ip, &rebuilt).unwrap();
+    let p = b
+        .poll_transmit(3_000, &mut bytes, 16)
+        .unwrap()
+        .packet
+        .unwrap();
+    let synack = wire::parse(p.ip, &bytes[..p.len]).unwrap();
+    assert_eq!(synack.options.timestamps.unwrap().1, tsval);
+    a.input(5_000, p.ip, &bytes[..p.len]).unwrap();
+    let info = a.transport_info(id).unwrap();
+    assert_eq!(info.state, State::Established);
+    assert_eq!(info.rtt_us, Some(2_000));
+    let (out, token) = a.poll_reserved_transmit(5_000, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    a.accept_transmit(5_000, token.unwrap()).unwrap();
+    b.input(5_000, p.ip, &bytes[..p.len]).unwrap();
+    assert!(b.accept(listener).is_ok());
+}
+
+// Established output is written again as selected, NOP, NOP, TS then NOP,
+// NOP, SACK, with only TSval (and the checksum) changed.
+#[test]
+fn reserved_data_with_sack_rebuilt_later_differs_only_in_tsval() {
+    let (mut a, mut b, id, server) =
+        configured_pair(None, Some(crate::TimestampGranularity::Milliseconds), false);
+    let mut bytes = [0; 2048];
+    b.write(server, &[5; 2000]).unwrap();
+    // The first segment is lost: the second is out of order.
+    b.poll_transmit(2, &mut bytes, 16).unwrap().packet.unwrap();
+    let p = b.poll_transmit(2, &mut bytes, 16).unwrap().packet.unwrap();
+    a.input(2, p.ip, &bytes[..p.len]).unwrap();
+    a.write(id, b"reply").unwrap();
+    let (out, token) = a.poll_reserved_transmit(3_000, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    let selected = bytes[..p.len].to_vec();
+    let s = wire::parse(p.ip, &selected).unwrap();
+    assert_eq!(s.payload, b"reply");
+    assert!(s.options.sack_blocks[0].is_some());
+    assert_eq!(s.raw_options[..4], [1, 1, 8, 10]);
+    assert_eq!(s.raw_options[12..14], [1, 1]);
+    a.reject_unsubmitted(token.unwrap()).unwrap();
+    let (out, token) = a.poll_reserved_transmit(9_000, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    let tsval = a.slot(id).unwrap().connection.timestamp_value(9_000);
+    assert_ne!(tsval, s.options.timestamps.unwrap().0);
+    let rebuilt = bytes[..p.len].to_vec();
+    assert_eq!(rebuilt, restamped(&selected, 24, tsval, &rebuilt));
+    wire::parse(p.ip, &rebuilt).unwrap();
+    a.accept_transmit(9_000, token.unwrap()).unwrap();
+}
+
+// Bytes rebuilt with a later tick's TSval count against that tick's
+// timestamp credit (the RFC 7323 section 5.4 gate), not the selection's: a
+// segment rebuilt in a fresh tick leaves that tick only the rest of its
+// credit.
+#[test]
+fn reserved_rebuild_charges_its_bytes_to_the_tick_of_its_tsval() {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    for e in [&mut a, &mut b] {
+        e.config.connection.timestamps = true;
+        e.config.connection.timestamp_bytes_per_tick = 1500;
+    }
+    let local = "192.0.2.1:40000".parse().unwrap();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    b.listen(remote, 4).unwrap();
+    let id = a.connect(0, local, remote).unwrap();
+    let mut bytes = [0; 2048];
+    for i in 0..3 {
+        let (src, dst) = if i == 1 {
+            (&mut b, &mut a)
+        } else {
+            (&mut a, &mut b)
+        };
+        let p = src
+            .poll_transmit(1, &mut bytes, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        dst.input(1, p.ip, &bytes[..p.len]).unwrap();
+    }
+    a.enable_output_reservations().unwrap();
+    a.write(id, &[1; 3000]).unwrap();
+    let payload = |a: &mut Endpoint, now, bytes: &mut [u8]| {
+        let (out, token) = a.poll_reserved_transmit(now, bytes, 16).unwrap();
+        let p = out.packet.unwrap();
+        let n = wire::parse(p.ip, &bytes[..p.len]).unwrap().payload.len();
+        (n, token.unwrap())
+    };
+    let (first, token) = payload(&mut a, 1_000, &mut bytes);
+    a.reject_unsubmitted(token).unwrap();
+    let (rebuilt, token) = payload(&mut a, 2_000, &mut bytes);
+    assert_eq!(rebuilt, first);
+    a.accept_transmit(2_000, token).unwrap();
+    let (next, token) = payload(&mut a, 2_000, &mut bytes);
+    assert_eq!(next, 1500 - first);
+    a.accept_transmit(2_000, token).unwrap();
+}
+
 #[test]
 fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
     let (mut a, _, id, _) = pair();
@@ -320,8 +461,13 @@ fn reserved_real_ack_keeps_consumed_dsack() {
     a.accept_transmit(a.now, token.unwrap()).unwrap();
 }
 
+// Rebuilt options keep the aligned layout of selection (NOP, NOP, TS, then
+// NOP, NOP, SACK): at the IPv4 floor a 2-block SACK no longer fits beside the
+// timestamp, so an above-ACK D-SACK, which cannot be split from its containing
+// block, is omitted and the containing block reported, as selection chooses
+// for a one-block budget (ReceiveBuffer::sack_blocks).
 #[test]
-fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
+fn reserved_above_ack_dsack_pair_without_room_reports_its_containing_block() {
     let (mut a, _, id, _) = pair();
     let ip = IpMetadata {
         source: a.tuple(id).unwrap().local.ip(),
@@ -360,22 +506,28 @@ fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
     a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
-    // Too little space for the pair must not silently change its meaning.
+    // No room for one block beside the timestamp: nothing to send.
     assert_eq!(
-        a.reservations[0].fragment(44, &mut bytes),
+        a.reservations[0].fragment(36, &mut bytes, 1),
         Err(EndpointError::ReservationMtuTooSmall)
     );
     assert_eq!(a.reservations[0].current.as_ref().unwrap().sacks, 0);
     let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 16).unwrap();
     let p = out.packet.unwrap();
-    assert_eq!(p.len, 48);
+    assert_eq!(p.len, 44);
     let s = wire::parse(ip, &bytes[..p.len]).unwrap();
-    assert_eq!(s.options.timestamps, Some((1, 1)));
-    assert_eq!(
-        s.options.sack_blocks[..2],
-        [Some((110, 120)), Some((105, 130))]
-    );
+    let tsval = s.options.timestamps.unwrap().0;
+    let mut expected = [0; 24];
+    expected[..4].copy_from_slice(&[1, 1, 8, 10]);
+    expected[4..8].copy_from_slice(&tsval.to_be_bytes());
+    expected[8..12].copy_from_slice(&1u32.to_be_bytes());
+    expected[12..16].copy_from_slice(&[1, 1, 5, 10]);
+    expected[16..20].copy_from_slice(&105u32.to_be_bytes());
+    expected[20..24].copy_from_slice(&130u32.to_be_bytes());
+    assert_eq!(s.raw_options, expected);
+    assert!(a.reservations[0].current.as_ref().unwrap().finished);
     a.accept_transmit(a.now, token.unwrap()).unwrap();
+    assert!(a.reservations[0].current.is_none());
 }
 
 #[test]
@@ -395,11 +547,15 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
         window: 512,
         urgent_pointer: 0,
     };
-    let mut options = [0; 32];
-    options[..12].copy_from_slice(&[1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 1]);
-    options[12..16].copy_from_slice(&[1, 1, 5, 18]);
-    for (i, seq) in [110u32, 120, 105, 130].into_iter().enumerate() {
-        options[16 + i * 4..20 + i * 4].copy_from_slice(&seq.to_be_bytes());
+    // Four blocks, a D-SACK pair first: at the IPv4 floor the first three
+    // fill the option space of an options-only fragment.
+    let mut options = [0; 36];
+    options[..4].copy_from_slice(&[1, 1, 5, 34]);
+    for (i, seq) in [110u32, 120, 105, 130, 140, 150, 160, 170]
+        .into_iter()
+        .enumerate()
+    {
+        options[4 + i * 4..8 + i * 4].copy_from_slice(&seq.to_be_bytes());
     }
     let mut bytes = [0; 200];
     let len = wire::encode(ip, header, &options, &[7; 40], &mut bytes).unwrap();
@@ -437,8 +593,8 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
             assert_eq!(p.ecn, 0);
             assert_eq!(s.header.flags & wire::CWR, 0);
             assert_eq!(
-                s.options.sack_blocks[..2],
-                [Some((110, 120)), Some((105, 130))]
+                s.options.sack_blocks[..3],
+                [Some((110, 120)), Some((105, 130)), Some((140, 150))]
             );
             pure_acks += 1;
         } else {
@@ -2024,6 +2180,49 @@ fn shared_reservation_mtu_repair_retains_original_payload_and_rejects_stale_atte
     }
     assert_eq!(offset, 301);
     assert_eq!(b.read(peer, &mut [0; 301]), Ok(301));
+}
+
+// Every fragment of a shared-payload reservation repeats the selected
+// options, written as selected with the TSval of its transmission.
+#[test]
+fn shared_reservation_fragments_repeat_the_options_with_the_current_tsval() {
+    let (mut a, _, id, _) =
+        configured_pair(None, Some(crate::TimestampGranularity::Milliseconds), false);
+    a.enable_shared_output(4).unwrap();
+    a.write_shared(
+        id,
+        crate::Payload::from_vec(alloc::vec![7; 301]),
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+    let mut bytes = [0; 2048];
+    let mut parts = Vec::with_capacity(4);
+    let (output, attempt) = a
+        .poll_reserved_transmit_shared_for(2_000, id, &mut bytes, &mut parts, 16)
+        .unwrap();
+    let header = output.packet.unwrap().len - parts.iter().map(crate::Payload::len).sum::<usize>();
+    assert_eq!(header, 32);
+    let selected = bytes[..header].to_vec();
+    assert_eq!(selected[20..24], [1, 1, 8, 10]);
+    assert!(a.reject_unsubmitted(attempt.unwrap()).unwrap());
+    a.set_first_hop_mtu(5_000, id, 200).unwrap();
+    let tsval = a.slot(id).unwrap().connection.timestamp_value(5_000);
+    let mut fragments = 0;
+    while a.is_output_reserved(id) {
+        let (output, token) = a
+            .poll_reserved_transmit_shared_for(5_000, id, &mut bytes, &mut parts, 16)
+            .unwrap();
+        output.packet.unwrap();
+        assert_eq!(
+            bytes[20..32],
+            restamped(&selected, 24, tsval, &bytes[..header])[20..32]
+        );
+        assert!(a.accept_transmit(5_000, token.unwrap()).unwrap());
+        fragments += 1;
+    }
+    assert_eq!(fragments, 3); // 148, 148 and 5 bytes.
 }
 
 // The one's complement of the sum of `bytes`: what a device completing a

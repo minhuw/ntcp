@@ -965,6 +965,51 @@ fn full_path_capacity_class_rebind_is_atomic_and_other_class_is_isolated() {
     assert_eq!(host.paths().usage().clients, 2);
 }
 
+// A connection frame held across a change of its path's stamp is refused
+// and its segment selected again (f628595), which writes the options as the
+// first build did (NOP, NOP, TS): byte for byte the held segment but for the
+// TSval, now the clock of the rebuild, and the checksum.
+#[test]
+fn stamp_change_rebuilds_held_segment_with_its_option_layout_and_current_tsval() {
+    for v6 in [false, true] {
+        let cfg = config(4);
+        let (local, remote) = addresses(v6);
+        let mut a = managed(local, 93, cfg.clone());
+        let mut b = managed(remote, 94, cfg.clone());
+        let listener = b.1.listen(remote, 4).unwrap();
+        let id =
+            a.1.connect_with_path_provider(0, local, remote, options(&cfg, 24), &mut a.0)
+                .unwrap();
+        let mut now = 0;
+        pump(&mut a, &mut b, &mut now);
+        b.1.accept(listener).unwrap();
+        a.1.write(id, &[3; 200]).unwrap();
+        let (held, _, frame) = selected(&mut a.1, now + 10).unwrap();
+        let context = a.0.egress_context(&mut a.1, held).unwrap();
+        let path = a.0.binding(id).unwrap().snapshot.path();
+        // Still room for the segment: only the stamp changes.
+        a.0.trusted_decrease(now + 11, path, 1280).unwrap();
+        assert_eq!(
+            a.0.validate_egress(&mut a.1, context, &frame, 0),
+            Err(Error::Obsolete)
+        );
+        a.1.reject_unsubmitted(held).unwrap();
+        let (attempt, _, rebuilt) = selected(&mut a.1, now + 5_010).unwrap();
+        let base = if v6 { 40 } else { 20 };
+        let (held, rebuilt_tcp) = (&frame[base..], &rebuilt[base..]);
+        assert_eq!(held[20..24], [1, 1, 8, 10]);
+        let tsval = |tcp: &[u8]| u32::from_be_bytes(tcp[24..28].try_into().unwrap());
+        assert!((1..=10).contains(&tsval(rebuilt_tcp).wrapping_sub(tsval(held))));
+        let mut expected = held.to_vec();
+        expected[24..28].copy_from_slice(&rebuilt_tcp[24..28]);
+        expected[16..18].copy_from_slice(&rebuilt_tcp[16..18]);
+        assert_eq!(rebuilt_tcp, &expected[..]);
+        let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+        a.0.validate_egress(&mut a.1, context, &rebuilt, 0).unwrap();
+        assert!(a.1.accept_transmit(now + 5_010, attempt).unwrap());
+    }
+}
+
 #[test]
 fn software_gso_physical_segments_preserve_submitted_prefix_through_decrease() {
     for v6 in [false, true] {

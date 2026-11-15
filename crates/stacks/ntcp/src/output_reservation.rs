@@ -130,7 +130,6 @@ pub(crate) struct OutputReservation {
     pub payload: Vec<u8>,
     pub shared: Vec<crate::Payload>,
     shared_header: Option<wire::Header>,
-    shared_options: [u8; 40],
     shared_option_len: usize,
     pub gso: Option<GsoLimits>,
     pub current: Option<ReservedOutput>,
@@ -153,6 +152,9 @@ pub(crate) struct ReservedOutput {
     pub emitted_sacks: usize,
     pub finished: bool,
     pub repaired: bool,
+    // The last fragment carries a TSval other than the selection's: the
+    // owner's state keyed on it follows (`Connection::restamp_reserved`).
+    pub restamped: bool,
     pub departure: Option<Departure>,
     // A PLPMTUD probe's intent, kept beside its departure: copied only
     // for a probe, while every output copies its departure.
@@ -171,7 +173,6 @@ impl OutputReservation {
             payload: Vec::new(),
             shared: Vec::new(),
             shared_header: None,
-            shared_options: [0; 40],
             shared_option_len: 0,
             gso: None,
             current: None,
@@ -230,7 +231,6 @@ impl OutputReservation {
             window: word(14),
             urgent_pointer: word(18),
         });
-        self.shared_options[..n - 20].copy_from_slice(&header[20..n]);
         self.shared_option_len = n - 20;
         self.current = Some(ReservedOutput {
             emitted_packet: *packet,
@@ -244,6 +244,7 @@ impl OutputReservation {
             emitted_sacks: 0,
             finished: true,
             repaired: false,
+            restamped: false,
             departure: None,
             discovery: None,
             zone: None,
@@ -252,11 +253,14 @@ impl OutputReservation {
         Ok(())
     }
 
+    /// `fragment` of a shared-payload reservation: every fragment repeats
+    /// the selected options, written anew with `tsval`.
     pub fn fragment_shared(
         &mut self,
         limit: usize,
         out: &mut [u8],
         payload: &mut Vec<crate::Payload>,
+        tsval: u32,
     ) -> Result<Transmit, EndpointError> {
         payload.clear();
         let r = self.current.as_mut().ok_or(Error::InvalidState)?;
@@ -299,10 +303,17 @@ impl OutputReservation {
                 header.flags &= !wire::URG;
             }
         }
+        let mut set = wire::parse_unchecked(r.packet.ip, &self.bytes[..header_len])
+            .map_err(Error::Wire)?
+            .options;
+        restamp(r, header.flags, &mut set, tsval);
+        let mut options = [0; 40];
+        let used = wire::write_options(&set, &mut options);
+        debug_assert_eq!(used, self.shared_option_len);
         let n = wire::encode_shared_with(
             r.packet.ip,
             header,
-            &self.shared_options[..self.shared_option_len],
+            &options[..used],
             payload,
             out,
             self.checksum_partial,
@@ -336,6 +347,7 @@ impl OutputReservation {
             emitted_sacks: 0,
             finished: true,
             repaired: false,
+            restamped: false,
             departure: None,
             discovery: None,
             zone: None,
@@ -345,7 +357,15 @@ impl OutputReservation {
 
     // Encode only from immutable, already-admitted output. No sender selection or
     // credit accounting occurs here. Buffer space was reserved before selection.
-    pub fn fragment(&mut self, limit: usize, out: &mut [u8]) -> Result<Transmit, EndpointError> {
+    // The options are written anew by `wire::write_options`, as at selection,
+    // with `tsval`, the timestamp clock now, as Linux's tcp_transmit_skb writes
+    // each transmission's options (`restamped`).
+    pub fn fragment(
+        &mut self,
+        limit: usize,
+        out: &mut [u8],
+        tsval: u32,
+    ) -> Result<Transmit, EndpointError> {
         if self.is_shared() {
             return Err(Error::InvalidArgument.into());
         }
@@ -369,64 +389,68 @@ impl OutputReservation {
         if let Some(s) = segmentation {
             header.flags = s.terminal_flags;
         }
-        let mut options = [0; 40];
-        let mut used = 0;
-        let mut sack_data = &[][..];
-        let mut at = 0;
-        while at < original.raw_options.len() {
-            let kind = original.raw_options[at];
-            if kind == 0 {
-                break;
-            }
-            if kind == 1 {
-                at += 1;
-                continue;
-            }
-            let len = original.raw_options[at + 1] as usize;
-            let option = &original.raw_options[at..at + len];
-            if kind == 5 {
-                sack_data = &option[2..];
-            } else {
-                options[used..used + len].copy_from_slice(option);
-                used += len;
-            }
-            at += len;
-        }
-        let remaining_sacks = sack_data.len() / 8 - r.sacks;
         let option_budget = limit.saturating_sub(20).min(40) & !3;
-        let emitted_sacks = remaining_sacks.min(option_budget.saturating_sub(used + 2) / 8);
-        // An above-ACK D-SACK is recognizable only together with its containing
-        // second block. Never turn it into an ordinary SACK by splitting the pair.
-        if r.sacks == 0 && sack_data.len() >= 16 {
-            let word =
-                |offset| u32::from_be_bytes(sack_data[offset..offset + 4].try_into().unwrap());
-            let (left, right, outer_left, outer_right) = (word(0), word(4), word(8), word(12));
-            let contained = left.wrapping_sub(outer_left) < outer_right.wrapping_sub(outer_left)
-                && right.wrapping_sub(outer_left) <= outer_right.wrapping_sub(outer_left);
-            let above_ack = left.wrapping_sub(header.acknowledgment) < 1 << 31;
-            if contained && above_ack && emitted_sacks < 2 {
+        let mut options = [0; 40];
+        let used;
+        let mut emitted_sacks = 0;
+        let mut omitted_sacks = 0;
+        let mut remaining_sacks = 0;
+        let mut rewritten = false;
+        if segmentation.is_some() {
+            // A GSO segment repeats the range's options, SACK blocks and
+            // TSval included (GSO admission excludes a D-SACK), as Linux's
+            // tcp_gso_segment repeats the skb's header on every segment and
+            // as `transmit_group` offers the rest of the range: one
+            // transmission, cut by the device. Until a segment of it departs
+            // (a refused first segment), the range is not transmitted yet:
+            // its options are written anew with `tsval` and kept in the held
+            // bytes, which its later segments and groups repeat.
+            if r.offset == 0 {
+                let mut set = original.options;
+                rewritten = restamp(r, header.flags, &mut set, tsval);
+                used = wire::write_options(&set, &mut options);
+                debug_assert_eq!(used, original.raw_options.len());
+            } else {
+                used = original.raw_options.len();
+                options[..used].copy_from_slice(original.raw_options);
+            }
+            if used > option_budget {
                 return Err(EndpointError::ReservationMtuTooSmall);
             }
-        }
-        if emitted_sacks != 0 {
-            options[used] = 5;
-            options[used + 1] = (2 + emitted_sacks * 8) as u8;
-            let start = r.sacks * 8;
-            options[used + 2..used + 2 + emitted_sacks * 8]
-                .copy_from_slice(&sack_data[start..start + emitted_sacks * 8]);
-            used += 2 + emitted_sacks * 8;
-        }
-        used = (used + 3) & !3;
-        if used > option_budget || remaining_sacks != 0 && emitted_sacks == 0 {
-            return Err(EndpointError::ReservationMtuTooSmall);
-        }
-        if segmentation.is_some() {
-            // Every segment repeats the selected options, SACK blocks included
-            // (GSO admission excludes a D-SACK); preserve negotiated TS padding
-            // and all other option bytes, rather than repacking them.
-            used = original.raw_options.len();
-            options[..used].copy_from_slice(original.raw_options);
-            if used > option_budget {
+        } else {
+            let mut set = original.options;
+            restamp(r, header.flags, &mut set, tsval);
+            let sacks = core::mem::take(&mut set.sack_blocks);
+            let blocks = sacks.iter().map_while(|block| *block).count();
+            remaining_sacks = blocks - r.sacks;
+            let mut first = r.sacks;
+            if remaining_sacks != 0 {
+                let base = wire::write_options(&set, &mut options);
+                let room = option_budget.saturating_sub(base + 4) / 8;
+                emitted_sacks = remaining_sacks.min(room);
+                // An above-ACK D-SACK is recognizable only together with its
+                // containing second block, so the pair is never split into an
+                // ordinary SACK. Without room for both the D-SACK is omitted
+                // and its containing block reported, as a one-block option
+                // is chosen at selection (ReceiveBuffer::sack_blocks).
+                if r.sacks == 0 && blocks >= 2 && emitted_sacks < 2 {
+                    let block = |index: usize| sacks[index].unwrap();
+                    let ((left, right), (outer_left, outer_right)) = (block(0), block(1));
+                    let contained = left.wrapping_sub(outer_left)
+                        < outer_right.wrapping_sub(outer_left)
+                        && right.wrapping_sub(outer_left) <= outer_right.wrapping_sub(outer_left);
+                    let above_ack = left.wrapping_sub(header.acknowledgment) < 1 << 31;
+                    if contained && above_ack {
+                        omitted_sacks = 1;
+                        first = 1;
+                        emitted_sacks = (remaining_sacks - 1).min(room);
+                    }
+                }
+                set.sack_blocks[..emitted_sacks]
+                    .copy_from_slice(&sacks[first..first + emitted_sacks]);
+            }
+            used = wire::write_options(&set, &mut options);
+            if used > option_budget || remaining_sacks != omitted_sacks && emitted_sacks == 0 {
                 return Err(EndpointError::ReservationMtuTooSmall);
             }
         }
@@ -438,7 +462,8 @@ impl OutputReservation {
         if count == 0 && r.offset < payload.len() && emitted_sacks == 0 {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
-        let finished = r.offset + count == payload.len() && emitted_sacks == remaining_sacks;
+        let finished =
+            r.offset + count == payload.len() && omitted_sacks + emitted_sacks == remaining_sacks;
         header.sequence = header.sequence.wrapping_add(r.offset as u32);
         if !finished {
             header.flags &= !(wire::FIN | wire::PSH);
@@ -463,8 +488,11 @@ impl OutputReservation {
             self.checksum_partial,
         )
         .map_err(Error::Wire)?;
+        if rewritten {
+            self.bytes[20..20 + used].copy_from_slice(&options[..used]);
+        }
         r.emitted_bytes = count;
-        r.emitted_sacks = emitted_sacks;
+        r.emitted_sacks = omitted_sacks + emitted_sacks;
         r.finished = finished;
         // A cancelled backend observation must not masquerade as a retry's actual
         // submit timestamp. Scheduled/ACK observations remain owned by the stream.
@@ -481,4 +509,24 @@ impl OutputReservation {
         r.emitted_packet = packet;
         Ok(packet)
     }
+}
+
+// Give a rebuilt segment's Timestamps option `tsval`, the clock at its
+// transmission, unless it is a reset: a reactive one carries 0 (RFC 7323
+// section 5.2), and no reset is timed. A changed TSval becomes the
+// departure's and flags the owner's update (`restamped`); returns whether
+// it changed.
+fn restamp(r: &mut ReservedOutput, flags: u8, options: &mut wire::Options, tsval: u32) -> bool {
+    if flags & wire::RST == 0
+        && let Some((value, _)) = &mut options.timestamps
+        && *value != tsval
+    {
+        *value = tsval;
+        if let Some(d) = &mut r.departure {
+            d.syn_timestamp = Some(tsval);
+        }
+        r.restamped = true;
+        return true;
+    }
+    false
 }

@@ -53,7 +53,9 @@ fn reserved_nonhead_sack_retry_keeps_exhausted_prr_credit_and_recovery_state() {
         let mut departure = a.last_departure.unwrap();
         crate::allocation_tests::fail_after(0, || {
             loop {
-                let p = reservation.fragment(84, &mut bytes).unwrap();
+                let p = reservation
+                    .fragment(84, &mut bytes, a.timestamp_value(400_000))
+                    .unwrap();
                 let s = wire::parse(p.ip, &bytes[..p.len]).unwrap();
                 assert_eq!(s.header.sequence, sequence.wrapping_add(total as u32));
                 assert_eq!(s.payload, &payload[total..total + s.payload.len()]);
@@ -545,7 +547,9 @@ fn gso_wrap_eor_cwr_rack_physical_segments_and_no_hotpath_allocation() {
         reservation.current.as_mut().unwrap().departure = Some(departure);
         crate::allocation_tests::fail_after(0, || {
             for segment in 0..3 {
-                let p = reservation.fragment(120, &mut bytes).unwrap();
+                let p = reservation
+                    .fragment(120, &mut bytes, a.timestamp_value(50))
+                    .unwrap();
                 let parsed = wire::parse(p.ip, &bytes[..p.len]).unwrap();
                 assert_eq!(parsed.header.sequence, start.wrapping_add(segment * 100).0);
                 assert_eq!(parsed.header.flags & CWR != 0, segment == 0);
@@ -984,7 +988,11 @@ fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
     crate::allocation_tests::fail_after(0, || {
         while accepted < total {
             let p = reservation
-                .fragment(if accepted < 2000 { 1020 } else { 520 }, &mut bytes)
+                .fragment(
+                    if accepted < 2000 { 1020 } else { 520 },
+                    &mut bytes,
+                    a.timestamp_value(50),
+                )
                 .unwrap();
             let segment = wire::parse(p.ip, &bytes[..p.len]).unwrap();
             let count = segment.payload.len();
@@ -1327,7 +1335,9 @@ fn gso_matches_scalar(
     reservation.current.as_mut().unwrap().departure = Some(departure);
     let limit = a.path_payload_limit();
     while reservation.current.as_ref().unwrap().offset < s.payload_len {
-        let p = reservation.fragment(limit, &mut bytes).unwrap();
+        let p = reservation
+            .fragment(limit, &mut bytes, scalar.timestamp_value(now))
+            .unwrap();
         let mut expected = [0; 2048];
         let n = scalar.transmit(now, &mut expected).unwrap().unwrap();
         assert_eq!(&bytes[..p.len], &expected[..n]);

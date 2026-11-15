@@ -355,6 +355,64 @@ fn read_options(bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
     walk_options(bytes, outgoing)
 }
 
+/// Write `options` in the one layout every outgoing segment uses, as Linux's
+/// tcp_options_write lays out a struct tcp_out_options on each transmit:
+/// MSS; Timestamps behind SACK-permitted or two NOPs, so TSval and TSecr are
+/// 32-bit aligned (RFC 7323 Appendix A), or else SACK-permitted behind two
+/// NOPs; Window Scale behind a NOP; a Fast Open cookie padded with NOPs; SACK
+/// blocks behind two NOPs, up to the first absent one. Returns the length
+/// written, a multiple of 4. `invalid_window_scale` is input only. The
+/// caller sizes the set: at most 40 bytes.
+pub(crate) fn write_options(options: &Options, out: &mut [u8; 40]) -> usize {
+    let mut n = 0;
+    if let Some(mss) = options.mss {
+        let mss = mss.to_be_bytes();
+        out[..4].copy_from_slice(&[2, 4, mss[0], mss[1]]);
+        n = 4;
+    }
+    if let Some((value, echo)) = options.timestamps {
+        // SACK-permitted replaces timestamp padding on SYN, as in Linux.
+        out[n..n + 4].copy_from_slice(if options.sack_permitted {
+            &[4, 2, 8, 10]
+        } else {
+            &[1, 1, 8, 10]
+        });
+        out[n + 4..n + 8].copy_from_slice(&value.to_be_bytes());
+        out[n + 8..n + 12].copy_from_slice(&echo.to_be_bytes());
+        n += 12;
+    } else if options.sack_permitted {
+        out[n..n + 4].copy_from_slice(&[1, 1, 4, 2]);
+        n += 4;
+    }
+    if let Some(scale) = options.window_scale {
+        out[n..n + 4].copy_from_slice(&[1, 3, 3, scale]);
+        n += 4;
+    }
+    if let Some(cookie) = &options.fast_open {
+        let bytes = cookie.as_bytes();
+        let length = bytes.len() + 2;
+        out[n] = 34;
+        out[n + 1] = length as u8;
+        out[n + 2..n + length].copy_from_slice(bytes);
+        n += length;
+        while n % 4 != 0 {
+            out[n] = 1;
+            n += 1;
+        }
+    }
+    let blocks = options.sack_blocks.iter().map_while(|block| *block).count();
+    if blocks != 0 {
+        out[n..n + 4].copy_from_slice(&[1, 1, 5, (2 + blocks * 8) as u8]);
+        for (index, (left, right)) in options.sack_blocks[..blocks].iter().flatten().enumerate() {
+            let at = n + 4 + index * 8;
+            out[at..at + 4].copy_from_slice(&left.to_be_bytes());
+            out[at + 4..at + 8].copy_from_slice(&right.to_be_bytes());
+        }
+        n += 4 + blocks * 8;
+    }
+    n
+}
+
 pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
     parse_checked(ip, bytes, true)
 }
@@ -814,6 +872,74 @@ mod tests {
             short[12] = offset << 4;
             seal(ip, &mut short);
             parse_error(ip, &short, WireError::Truncated);
+        }
+    }
+
+    // Selection and every rebuild write options through write_options: one
+    // layout per set, TSval and TSecr 32-bit aligned, padding by NOPs.
+    #[test]
+    fn written_options_keep_one_aligned_layout() {
+        let cookie = FastOpenCookie::new(&[9, 8, 7, 6]).unwrap();
+        let cases: [(Options, &[u8]); 5] = [
+            (
+                Options {
+                    mss: Some(1460),
+                    sack_permitted: true,
+                    timestamps: Some((7, 0)),
+                    window_scale: Some(7),
+                    ..Options::default()
+                },
+                &[
+                    2, 4, 5, 180, 4, 2, 8, 10, 0, 0, 0, 7, 0, 0, 0, 0, 1, 3, 3, 7,
+                ],
+            ),
+            (
+                Options {
+                    mss: Some(536),
+                    sack_permitted: true,
+                    window_scale: Some(0),
+                    fast_open: Some(cookie),
+                    ..Options::default()
+                },
+                &[2, 4, 2, 24, 1, 1, 4, 2, 1, 3, 3, 0, 34, 6, 9, 8, 7, 6, 1, 1],
+            ),
+            (
+                Options {
+                    timestamps: Some((1, 2)),
+                    ..Options::default()
+                },
+                &[1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2],
+            ),
+            (
+                Options {
+                    timestamps: Some((1, 2)),
+                    sack_blocks: [Some((10, 20)), Some((30, 40)), Some((50, 60)), None],
+                    ..Options::default()
+                },
+                &[
+                    1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2, 1, 1, 5, 26, 0, 0, 0, 10, 0, 0, 0, 20, 0,
+                    0, 0, 30, 0, 0, 0, 40, 0, 0, 0, 50, 0, 0, 0, 60,
+                ],
+            ),
+            (
+                Options {
+                    sack_blocks: [Some((10, 20)); 4],
+                    ..Options::default()
+                },
+                &[
+                    1, 1, 5, 34, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 10, 0, 0, 0, 20, 0, 0, 0, 10,
+                    0, 0, 0, 20, 0, 0, 0, 10, 0, 0, 0, 20,
+                ],
+            ),
+        ];
+        for (set, layout) in cases {
+            let mut out = [0xff; 40];
+            let n = write_options(&set, &mut out);
+            assert_eq!(&out[..n], layout);
+            assert_eq!(n % 4, 0);
+            // Read back (as on a SYN, which alone may carry them all), the
+            // set is the one written.
+            assert_eq!(walk_options(&out[..n], true).unwrap(), set);
         }
     }
 

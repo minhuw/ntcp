@@ -6818,20 +6818,29 @@ impl Endpoint {
         }
         if let Some(r) = &self.reservations[index].current {
             let connection = r.packet.connection;
-            let limit = self
+            let owner = &self
                 .retained_slot(connection.ok_or(EndpointError::InvalidHandle)?)?
-                .connection
-                .path_payload_limit();
+                .connection;
+            let (limit, tsval) = (owner.path_payload_limit(), owner.timestamp_value(now));
             self.clock(now)?;
             let packet = if self.reservations[index].is_shared() {
                 self.reservations[index].fragment_shared(
                     limit,
                     out,
                     shared.as_deref_mut().ok_or(Error::InvalidArgument)?,
+                    tsval,
                 )?
             } else {
-                self.reservations[index].fragment(limit, out)?
+                self.reservations[index].fragment(limit, out, tsval)?
             };
+            let r = self.reservations[index].current.as_mut().unwrap();
+            if core::mem::take(&mut r.restamped)
+                && let Some(d) = r.departure
+            {
+                self.retained_slot_mut(connection.unwrap())?
+                    .connection
+                    .restamp_reserved(now, &d);
+            }
             let r = self.reservations[index].current.as_ref().unwrap();
             if r.emitted_bytes != 0
                 && let Some(d) = &r.departure

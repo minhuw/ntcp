@@ -4470,7 +4470,7 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
     //# It MUST tick at least once for each 2^31 bytes sent.
-    fn timestamp_value(&self, now: Instant) -> u32 {
+    pub(crate) fn timestamp_value(&self, now: Instant) -> u32 {
         self.timestamp_value_at(
             self.config
                 .timestamp_granularity
@@ -4481,6 +4481,33 @@ impl Connection {
     // TSval at timestamp clock tick `tick`.
     fn timestamp_value_at(&self, tick: u64) -> u32 {
         (tick as u32).wrapping_add(self.timestamp_offset)
+    }
+
+    // Held output `d`, built again at `now` with this tick's TSval, as Linux's
+    // tcp_transmit_skb stamps every transmission. What its selection keyed on
+    // the selection's TSval follows: this tick's TS-bearing byte credit, which
+    // the selection's whole cost is charged to once (within a fresh tick's
+    // credit: the reserved connection selects nothing else), and the pending
+    // RTT sample, which matches the peer's echo against its send time.
+    pub(crate) fn restamp_reserved(&mut self, now: Instant, d: &Departure) {
+        let tick = self
+            .config
+            .timestamp_granularity
+            .tick_in(now, self.config.timebase);
+        if tick != self.timestamp_tick {
+            self.timestamp_tick = tick;
+            self.timestamp_bytes = d.payload as u32 + u32::from(d.syn) + u32::from(d.fin);
+        }
+        let end = Seq(d.start).wrapping_add(if d.syn {
+            1
+        } else {
+            d.payload as u32 + u32::from(d.fin)
+        });
+        if let Some((edge, sent)) = &mut self.sample
+            && *edge == end
+        {
+            *sent = now;
+        }
     }
 
     // Classic RFC 3168 only: setup offers remain binding for receive feedback even
@@ -9601,15 +9628,18 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# where MMS_R is the maximum size for a transport-layer message that
         //# can be received (and reassembled at the IP layer) (MUST-67).
-        let mss = self.receive_mss().to_be_bytes();
         // The timestamp clock's tick at `now`: TSval, this tick's TS-bearing
         // credit and its commit all read it, so it is divided out once.
         let tick = self
             .config
             .timestamp_granularity
             .tick_in(now, self.config.timebase);
-        let mut options = [0; 40];
-        options[..4].copy_from_slice(&[2, 4, mss[0], mss[1]]);
+        // The option set, sized here as it is chosen and written once, by
+        // `wire::write_options`, as every rebuild of the segment writes it.
+        let mut options = wire::Options {
+            mss: syn.then(|| self.receive_mss()),
+            ..wire::Options::default()
+        };
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# TCP implementations SHOULD send an MSS Option in every SYN segment when its
         //# receive MSS differs from the default 536 for IPv4 or 1220 for IPv6 (SHLD-5),
@@ -9703,17 +9733,12 @@ impl Connection {
             timestamp.filter(|_| reset.is_none() || self.path_payload_limit() >= 32)
         {
             // SACK-permitted replaces timestamp padding on SYN, as in Linux.
-            options[option_len..option_len + 4].copy_from_slice(if sack_offer {
-                &[4, 2, 8, 10]
-            } else {
-                &[1, 1, 8, 10]
-            });
-            options[option_len + 4..option_len + 8].copy_from_slice(&value.to_be_bytes());
-            options[option_len + 8..option_len + 12].copy_from_slice(&echo.to_be_bytes());
+            options.timestamps = Some((value, echo));
+            options.sack_permitted = sack_offer;
             option_len += 12;
         }
         if sack_offer && timestamp.is_none() {
-            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 4, 2]);
+            options.sack_permitted = true;
             option_len += 4;
         }
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
@@ -9759,7 +9784,7 @@ impl Connection {
         //= reason=WS emits [NOP,3,3,local_scale], parser only accepts option length 3.
         //# Length: 3 bytes
         if syn && (self.state == State::SynSent || self.scaling) {
-            options[option_len..option_len + 4].copy_from_slice(&[1, 3, 3, self.local_scale]);
+            options.window_scale = Some(self.local_scale);
             option_len += 4;
         }
         //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
@@ -9811,16 +9836,8 @@ impl Connection {
         //= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
         //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
         if let Some(cookie) = fast_open_option {
-            let bytes = cookie.as_bytes();
-            let length = bytes.len() + 2;
-            options[option_len] = 34;
-            options[option_len + 1] = length as u8;
-            options[option_len + 2..option_len + length].copy_from_slice(bytes);
-            option_len += length;
-            while option_len % 4 != 0 {
-                options[option_len] = 1;
-                option_len += 1;
-            }
+            options.fast_open = Some(cookie);
+            option_len = (option_len + cookie.as_bytes().len() + 2 + 3) & !3;
         }
         let mut sack_option_len = 0;
         let mut sack_first = None;
@@ -9864,12 +9881,7 @@ impl Connection {
                     > n;
             if n != 0 {
                 sack_first = blocks[0];
-                options[option_len..option_len + 4].copy_from_slice(&[1, 1, 5, (2 + n * 8) as u8]);
-                for (index, &(left, right)) in blocks.iter().flatten().enumerate() {
-                    let offset = option_len + 4 + index * 8;
-                    options[offset..offset + 4].copy_from_slice(&left.to_be_bytes());
-                    options[offset + 4..offset + 8].copy_from_slice(&right.to_be_bytes());
-                }
+                options.sack_blocks = blocks;
                 sack_option_len = 4 + n * 8;
                 option_len += sack_option_len;
             }
@@ -10885,15 +10897,8 @@ impl Connection {
             let n = blocks.iter().flatten().count();
             sack_first = blocks[0];
             sack_option_len = if n == 0 { 0 } else { 4 + n * 8 };
-            if n != 0 {
-                options[option_len..option_len + 4].copy_from_slice(&[1, 1, 5, (2 + n * 8) as u8]);
-                for (index, &(left, right)) in blocks.iter().flatten().enumerate() {
-                    let offset = option_len + 4 + index * 8;
-                    options[offset..offset + 4].copy_from_slice(&left.to_be_bytes());
-                    options[offset + 4..offset + 8].copy_from_slice(&right.to_be_bytes());
-                }
-                option_len += sack_option_len;
-            }
+            options.sack_blocks = blocks;
+            option_len += sack_option_len;
             sack_limited = false;
         }
         // Data can fill the tick without room for FIN. Commit the data now and
@@ -11222,6 +11227,12 @@ impl Connection {
         if timestamp_cost > timestamp_credit {
             return Err(Error::TimestampBudgetExceeded);
         }
+        let options = {
+            let mut bytes = [0; 40];
+            let written = wire::write_options(&options, &mut bytes);
+            debug_assert_eq!(written, option_len);
+            bytes
+        };
         let mut wire_header = header;
         if let Some(s) = &mut segmentation {
             s.terminal_flags = flags;

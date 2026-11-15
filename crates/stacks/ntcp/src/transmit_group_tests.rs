@@ -358,6 +358,64 @@ fn group_validation_rejection_and_abandonment_leave_tcp_state_unchanged() {
     );
 }
 
+// A GSO range whose first segment is refused has not been transmitted:
+// polled again a tick later, it is written anew in the selection's layout
+// with that tick's TSval, and its later segments, scalar or grouped, repeat
+// that header. Once a segment has departed, the rest of the range keeps the
+// range's TSval when refused and rebuilt later, as Linux's tcp_gso_segment
+// repeats one skb header on every segment.
+#[test]
+fn refused_gso_range_takes_a_current_tsval_until_a_segment_departs() {
+    let (mut a, _, id, _) = pair(false, true, 16_384);
+    a.write(id, &[1; 7000]).unwrap();
+    let mut out = [0; 2048];
+    let (poll, attempt) = a
+        .poll_reserved_transmit_for(1_000, id, &mut out, 1)
+        .unwrap();
+    let selected = out[..poll.packet.unwrap().len].to_vec();
+    assert_eq!(selected[20..24], [1, 1, 8, 10]);
+    assert!(a.reject_unsubmitted(attempt.unwrap()).unwrap());
+    let tsval = a
+        .retained_slot(id)
+        .unwrap()
+        .connection
+        .timestamp_value(3_000);
+    assert_ne!(selected[24..28], tsval.to_be_bytes());
+    let (poll, attempt) = a
+        .poll_reserved_transmit_for(3_000, id, &mut out, 1)
+        .unwrap();
+    let p = poll.packet.unwrap();
+    let rebuilt = out[..p.len].to_vec();
+    let mut expected = selected.clone();
+    expected[24..28].copy_from_slice(&tsval.to_be_bytes());
+    expected[16..18].copy_from_slice(&rebuilt[16..18]);
+    assert_eq!(rebuilt, expected);
+    wire::parse(p.ip, &rebuilt).unwrap();
+    assert!(a.accept_transmit(3_000, attempt.unwrap()).unwrap());
+    // The second segment, refused and rebuilt in a later tick, and the
+    // group of the rest repeat the range's header.
+    let (poll, attempt) = a
+        .poll_reserved_transmit_for(5_000, id, &mut out, 1)
+        .unwrap();
+    assert_eq!(out[20..32], rebuilt[20..32]);
+    assert!(a.reject_unsubmitted(attempt.unwrap()).unwrap());
+    let (poll2, attempt) = a
+        .poll_reserved_transmit_for(7_000, id, &mut out, 1)
+        .unwrap();
+    assert_eq!(poll2.packet.unwrap().len, poll.packet.unwrap().len);
+    assert_eq!(out[20..32], rebuilt[20..32]);
+    let group = a
+        .prepare_transmit_group(attempt.unwrap(), limits())
+        .unwrap()
+        .unwrap();
+    let segments = cut(&a.transmit_group(group).unwrap());
+    assert!(segments.len() >= 2);
+    for segment in &segments {
+        assert_eq!(segment[20..32], rebuilt[20..32]);
+    }
+    assert!(a.accept_transmit_group(7_000, group).unwrap());
+}
+
 #[test]
 fn group_limits_bound_segments_and_decline_psh_cwr_and_options() {
     for timestamps in [false, true] {

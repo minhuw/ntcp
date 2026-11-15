@@ -3121,9 +3121,9 @@ mod linux {
         // with WouldBlock, leaves after the owner re-enables discovery with
         // the atomic header (DF set, Identification 0, valid checksum). The
         // re-enable changes the path's stamp, so the held frame is refused
-        // and the SYN selected and built again (f628595), as the same
-        // segment: its options may be laid out anew (the repair builder
-        // drops NOP padding), so the segment is compared parsed.
+        // and the SYN selected and built again (f628595): the rebuild writes
+        // the options as selection did, and within the same clock tick with
+        // the same TSval, so the segment is the same, byte for byte.
         #[test]
         fn blocked_df_clear_frame_follows_a_reenable() {
             use ntcp_io::{PacketIo, PacketLayer};
@@ -3234,12 +3234,7 @@ mod linux {
             .unwrap();
             assert!(!endpoint.is_output_reserved(id));
             let syn = &backend.submitted[0];
-            let parsed = |frame: &[u8]| {
-                let ip = ntcp_ip::parse(frame, false).unwrap().ip;
-                let tcp = ntcp::wire::parse(ip, &frame[20..]).unwrap();
-                (tcp.header, tcp.options, tcp.payload.to_vec())
-            };
-            assert_eq!(parsed(syn), parsed(&blocked), "the same held segment");
+            assert_eq!(&syn[20..], &blocked[20..], "the same held segment");
             assert_ne!(syn[6] & 0x40, 0, "DF set on the enabled path");
             assert_eq!(u16::from_be_bytes([syn[4], syn[5]]), 0, "atomic Identification");
             assert_eq!(checksum(&syn[..20]), 0);
