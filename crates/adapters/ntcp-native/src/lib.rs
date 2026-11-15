@@ -3,6 +3,8 @@
 mod config;
 mod driver;
 mod flows;
+#[cfg(test)]
+mod handle_tests;
 mod inbox;
 mod shared;
 mod toeplitz;

@@ -21,6 +21,37 @@ pub struct ListenerId {
     pub(crate) generation: u64,
 }
 
+/// The parts of a handle. A handle names one connection or listener of one
+/// Network: two handles are the same exactly when their instance, slot and
+/// generation all are.
+macro_rules! handle_parts {
+    ($id:ident, $table:literal, $limit:literal) => {
+        impl $id {
+            #[doc = concat!("The index of the handle's entry in its Network's ", $table)]
+            #[doc = concat!(" table, below `", $limit, "`: the same for as long")]
+            /// as the handle is valid. Once the handle is released (its close
+            /// or abort carried out, or the Network stopped) the slot may name
+            /// a later handle, with a greater generation: a slot alone tells
+            /// handles apart only among those valid at once, in one Network.
+            pub fn slot(&self) -> usize {
+                self.slot
+            }
+            /// How many handles the slot gave out before this one: each
+            /// reuse of a slot raises it.
+            pub fn generation(&self) -> u64 {
+                self.generation
+            }
+            /// The Network that gave the handle out: each Network of the
+            /// process has its own.
+            pub fn instance(&self) -> u64 {
+                self.instance
+            }
+        }
+    };
+}
+handle_parts!(ConnId, "connection", "tcp.max_connections");
+handle_parts!(ListenerId, "listener", "tcp.max_listeners");
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockReason {
     SendBuffer,
