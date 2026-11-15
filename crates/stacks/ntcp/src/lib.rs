@@ -70,6 +70,8 @@ mod schedule;
 mod seq;
 mod time_wait;
 mod tx_timestamp;
+mod wheel;
+pub use wheel::{TimerWheel, TimerWheelGeometry};
 pub mod wire;
 
 pub use connection::{
