@@ -1376,9 +1376,23 @@ fn time_wait_connections_count_the_connections_waiting() {
     ));
     assert_eq!(pair.a.counters().time_wait_connections, 1);
     assert_eq!(pair.b.counters().time_wait_connections, 0);
-    pair.now += pair.a.config().tcp.connection.time_wait_us;
+    // TIME-WAIT ends once its duration passed: a released connection's
+    // record at its timer wheel bucket's expiry, less than its level's
+    // bound later, one step of the pair at most after that.
+    let config = pair.a.config();
+    let time_wait = config.tcp.connection.time_wait_us;
+    let bound = config
+        .tcp
+        .timer_wheel_geometry()
+        .unwrap()
+        .lateness_bound(time_wait);
+    pair.now += time_wait;
+    let end = pair.now + bound + 10_000;
     pair.step();
-    assert_eq!(pair.a.counters().time_wait_connections, 0);
+    while pair.a.counters().time_wait_connections != 0 {
+        assert!(pair.now < end, "TIME-WAIT outlived its wheel bound");
+        pair.step();
+    }
 }
 
 // Segments lost on the wire are resent, and Network::counters reports what

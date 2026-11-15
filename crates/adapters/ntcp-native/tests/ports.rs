@@ -140,11 +140,23 @@ impl Pair {
         panic!("handshake did not finish");
     }
     // Drives past TIME-WAIT until the client's `id` is reclaimed.
+    // TIME-WAIT ends once its duration passed: a released connection's
+    // record at its timer wheel bucket's expiry, less than its level's
+    // bound later.
     fn reclaim(&mut self, id: ConnId) {
-        self.now += self.client.config().tcp.connection.time_wait_us;
-        for _ in 0..100 {
+        let config = self.client.config();
+        let time_wait = config.tcp.connection.time_wait_us;
+        let bound = config
+            .tcp
+            .timer_wheel_geometry()
+            .unwrap()
+            .lateness_bound(time_wait);
+        self.now += time_wait;
+        for _ in 0..100 + bound / 1000 {
             self.step();
-            if matches!(self.client.connection_info(id), Err(Error::InvalidHandle)) {
+            if matches!(self.client.connection_info(id), Err(Error::InvalidHandle))
+                && self.client.counters().time_wait_connections == 0
+            {
                 return;
             }
         }

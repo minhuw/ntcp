@@ -93,7 +93,16 @@ impl Twins {
     }
 
     fn agree(&mut self, now: u64) {
-        assert_eq!(self.held.next_deadline(), self.record.next_deadline());
+        // The held connection's TIME-WAIT timer is exact; the record's
+        // deadline is the same, its timer filed in the wheel: it runs at its
+        // bucket's expiry, never after its level's bound, and before its
+        // deadline only when a restart moved the deadline later and the
+        // record is filed again then.
+        let (exact, latest) = self.record.reference_next_deadline();
+        assert_eq!(self.held.next_deadline(), exact);
+        let wake = self.record.next_deadline();
+        assert_eq!(wake.is_some(), exact.is_some());
+        assert!(wake <= latest, "{wake:?} {latest:?}");
         assert_eq!(
             self.held.time_wait_connections(),
             self.record.time_wait_connections()
@@ -173,8 +182,10 @@ fn a_time_wait_record_answers_every_segment_as_its_connection() {
                         (ack.flags, ack.sequence, ack.acknowledgment),
                         (ACK, snd, rcv)
                     );
+                    // (The record's timer stays filed for the earlier
+                    // deadline; its bucket's expiry is within the bound.)
                     assert_eq!(
-                        twins.record.next_deadline(),
+                        twins.record.reference_next_deadline().0,
                         Some(4_000 + cfg.connection.time_wait_us)
                     );
                 }
@@ -191,18 +202,35 @@ fn a_time_wait_record_answers_every_segment_as_its_connection() {
                     b"",
                 );
                 twins.input(5_000, &fin);
-                // Every timer up to the restarted TIME-WAIT's end.
+                // Every timer up to the restarted TIME-WAIT's end, where the
+                // held connection's ends; the record's runs at its wheel
+                // bucket's expiry, never before and within its level's bound.
                 let end = 5_000 + cfg.connection.time_wait_us;
-                while let Some(deadline) = twins.record.next_deadline().filter(|&d| d <= end) {
+                let latest = end
+                    + twins
+                        .record
+                        .timer_wheel()
+                        .lateness_bound(cfg.connection.time_wait_us);
+                while let Some(deadline) = twins
+                    .held
+                    .next_deadline()
+                    .into_iter()
+                    .chain(twins.record.next_deadline())
+                    .min()
+                    .filter(|&d| d < latest)
+                {
                     twins.held.on_timeout(deadline, 64).unwrap();
                     twins.record.on_timeout(deadline, 64).unwrap();
-                    twins.agree(deadline);
+                    if deadline < end {
+                        twins.agree(deadline);
+                    }
                     assert_eq!(
                         sent(&mut twins.held, deadline),
                         sent(&mut twins.record, deadline)
                     );
                 }
                 if case == 0 {
+                    assert_eq!(twins.held.time_wait_connections(), 0);
                     assert_eq!(twins.record.time_wait_connections(), 0);
                 }
             }
@@ -391,9 +419,17 @@ fn server_closed_connections_beyond_the_connection_table_within_time_wait() {
         assert_eq!(b.time_wait_connections(), usize::from(i) + 1);
         assert_eq!(b.buffer_bytes(), 0);
     }
-    assert!(b.next_deadline().unwrap() < config().connection.time_wait_us + 1_000);
-    b.on_timeout(19_000 + config().connection.time_wait_us, 64)
-        .unwrap();
+    // The first record's deadline, the earliest; its wheel bucket expires
+    // within its level's bound of it.
+    let time_wait_us = config().connection.time_wait_us;
+    let (exact, latest) = b.reference_next_deadline();
+    assert!(exact.unwrap() < time_wait_us + 1_000);
+    assert!(b.next_deadline() <= latest);
+    let last = 19_000 + time_wait_us;
+    b.on_timeout(last - 1, 64).unwrap();
+    assert!(b.time_wait_connections() >= 1);
+    let end = last + b.timer_wheel().lateness_bound(time_wait_us);
+    b.on_timeout(end, 64).unwrap();
     assert_eq!(b.time_wait_connections(), 0);
 }
 
@@ -498,8 +534,13 @@ fn a_time_wait_record_holds_its_local_port_until_it_ends() {
     b.release(old).unwrap();
     assert!(b.time_wait_holds_port(port));
     assert!(!b.time_wait_holds_port(port + 1));
-    b.on_timeout(3_000 + config().connection.time_wait_us, 64)
-        .unwrap();
+    // The record runs at its wheel bucket's expiry, never before.
+    let expiry = 3_000 + config().connection.time_wait_us;
+    b.on_timeout(expiry - 1, 64).unwrap();
+    assert!(b.time_wait_holds_port(port));
+    let end = b.next_deadline().unwrap();
+    assert!(end >= expiry);
+    b.on_timeout(end, 64).unwrap();
     assert!(!b.time_wait_holds_port(port));
 }
 

@@ -13,6 +13,7 @@ use crate::{
         ConnectionConfig, Instant, PAWS_RECENT_EXPIRY_US, PEER_TS_RECENT_IDLE_US, ScopedTuple,
     },
     seq::Seq,
+    wheel::{TimerLink, TimerLinks, Wheel},
     wire::{ACK, FIN, Header, RST, SYN, Segment, URG},
 };
 
@@ -354,8 +355,8 @@ struct Entry {
     hash: u64,
     // The next record in its bucket's chain.
     next: u32,
-    // Position in the timer heap.
-    timer: u32,
+    // Its place in the owner's timer wheel.
+    timer: TimerLink,
     output: Links,
     queued: bool,
 }
@@ -427,10 +428,9 @@ fn output(entry: &mut Entry) -> &mut Links {
 /// paged in as ports are used. Nothing is allocated before a record is
 /// stored, and only storing one allocates.
 ///
-/// Every record has the same duration, but not every one starts it when it
-/// is stored: a connection whose application released it late joins with an
-/// older deadline than records stored before it. The timers are therefore a
-/// heap of records, not a FIFO.
+/// Each record's timer is filed in the owner's timer wheel (`Wheel`), its
+/// link kept in the record, as Linux's inet_timewait_sock keeps its tw_timer:
+/// the table holds nothing per record for the timer beyond that link.
 pub(crate) struct TimeWaitTable {
     entries: Vec<Stored>,
     free: Vec<u32>,
@@ -440,7 +440,6 @@ pub(crate) struct TimeWaitTable {
     previous: Vec<u32>,
     // The next bucket of `previous` to move.
     moving: usize,
-    timers: Vec<u32>,
     // Records per local port, as Linux keeps TIME-WAIT in a port's bind
     // bucket: a port stays bound while one of its tuples is in TIME-WAIT.
     // Pages of PORT_PAGE ports, empty until a record uses one of them.
@@ -448,6 +447,12 @@ pub(crate) struct TimeWaitTable {
     output: Ends,
     len: usize,
     limit: usize,
+}
+
+impl TimerLinks for TimeWaitTable {
+    fn timer(&mut self, id: u32) -> &mut TimerLink {
+        &mut at(&mut self.entries, id).timer
+    }
 }
 
 const MIN_BUCKETS: usize = 16;
@@ -465,7 +470,6 @@ impl TimeWaitTable {
             buckets: Vec::new(),
             previous: Vec::new(),
             moving: 0,
-            timers: Vec::new(),
             ports: Vec::new(),
             output: Ends::default(),
             len: 0,
@@ -612,9 +616,10 @@ impl TimeWaitTable {
         &mut self.ports[port / PORT_PAGE][port % PORT_PAGE]
     }
 
-    /// Store `record` mapped under `hash`. False at the bound, when storage
-    /// cannot grow, or when its chain is full.
-    pub(crate) fn insert(&mut self, hash: u64, record: Record) -> bool {
+    /// Store `record` mapped under `hash`, its timer filed in `wheel` for
+    /// its deadline. False at the bound, when storage cannot grow, or when
+    /// its chain is full.
+    pub(crate) fn insert(&mut self, hash: u64, record: Record, wheel: &mut Wheel) -> bool {
         let port = record.tuple.tuple.local.port();
         if self.len >= self.limit || !self.grow() || !self.page(port) {
             return false;
@@ -632,7 +637,6 @@ impl TimeWaitTable {
         if length == CHAIN
             || self.free.is_empty()
                 && (self.entries.try_reserve(1).is_err()
-                    || self.timers.try_reserve(1).is_err()
                     || self.free.try_reserve(self.entries.len() + 1).is_err())
         {
             return false;
@@ -641,7 +645,7 @@ impl TimeWaitTable {
             record,
             hash,
             next: self.buckets[bucket],
-            timer: NONE,
+            timer: TimerLink::UNLINKED,
             output: UNLINKED,
             queued: false,
         }) else {
@@ -653,16 +657,16 @@ impl TimeWaitTable {
         });
         self.entries[index as usize] = Some(stored);
         self.buckets[bucket] = index;
-        self.push_timer(index);
+        wheel.arm(self, index, record.deadline);
         *self.port(port) += 1;
         self.len += 1;
         true
     }
 
-    pub(crate) fn remove(&mut self, index: u32) -> Record {
+    pub(crate) fn remove(&mut self, index: u32, wheel: &mut Wheel) -> Record {
         self.unmap(index);
         self.dequeue(index);
-        self.remove_timer(index);
+        wheel.cancel(self, index);
         let [entry] = *self.entries[index as usize].take().unwrap();
         *self.port(entry.record.tuple.tuple.local.port()) -= 1;
         self.free.push(index);
@@ -685,11 +689,13 @@ impl TimeWaitTable {
         &mut at(&mut self.entries, index).record
     }
 
-    // After `record_mut` changed the timer or owed output.
-    pub(crate) fn update(&mut self, index: u32, restarted: bool) {
+    // After `record_mut` changed the timer or owed output. A restarted
+    // timer only moves later, so its filing stays (the wheel's lazy re-arm):
+    // when its bucket expires, `refile` files it for the new deadline.
+    pub(crate) fn update(&mut self, index: u32, restarted: bool, wheel: &mut Wheel) {
         if restarted {
-            let position = self.entry(index).timer as usize;
-            self.sift_down(position);
+            let deadline = self.record(index).deadline;
+            wheel.arm(self, index, deadline);
         }
         let entry = at(&mut self.entries, index);
         if entry.record.owes_output() && !entry.queued {
@@ -707,75 +713,12 @@ impl TimeWaitTable {
         }
     }
 
-    pub(crate) fn first_expiry(&self) -> Option<(Instant, u32)> {
-        let index = *self.timers.first()?;
-        Some((self.record(index).deadline, index))
-    }
-
-    fn key(&self, position: usize) -> (Instant, u32) {
-        let index = self.timers[position];
-        (self.record(index).deadline, index)
-    }
-
-    fn place(&mut self, position: usize, index: u32) {
-        self.timers[position] = index;
-        at(&mut self.entries, index).timer = position as u32;
-    }
-
-    fn swap_timers(&mut self, a: usize, b: usize) {
-        let (first, second) = (self.timers[a], self.timers[b]);
-        self.place(a, second);
-        self.place(b, first);
-    }
-
-    fn sift_up(&mut self, mut position: usize) -> usize {
-        while position != 0 {
-            let parent = (position - 1) / 2;
-            if self.key(parent) <= self.key(position) {
-                break;
-            }
-            self.swap_timers(parent, position);
-            position = parent;
-        }
-        position
-    }
-
-    fn sift_down(&mut self, mut position: usize) {
-        loop {
-            let left = position * 2 + 1;
-            if left >= self.timers.len() {
-                return;
-            }
-            let right = left + 1;
-            let child = if right < self.timers.len() && self.key(right) < self.key(left) {
-                right
-            } else {
-                left
-            };
-            if self.key(position) <= self.key(child) {
-                return;
-            }
-            self.swap_timers(position, child);
-            position = child;
-        }
-    }
-
-    fn push_timer(&mut self, index: u32) {
-        let position = self.timers.len();
-        self.timers.push(index);
-        self.place(position, index);
-        self.sift_up(position);
-    }
-
-    fn remove_timer(&mut self, index: u32) {
-        let position = self.entry(index).timer as usize;
-        let last = self.timers.len() - 1;
-        self.swap_timers(position, last);
-        self.timers.pop();
-        if position < self.timers.len() {
-            let position = self.sift_up(position);
-            self.sift_down(position);
-        }
+    // The timer of the record at `index` ran before its deadline, which a
+    // restart moved later: file it again for that deadline.
+    pub(crate) fn refile(&mut self, index: u32, wheel: &mut Wheel) {
+        let deadline = self.record(index).deadline;
+        wheel.cancel(self, index);
+        wheel.arm(self, index, deadline);
     }
 
     pub(crate) fn first_output(&self) -> Option<u32> {
@@ -796,7 +739,11 @@ impl TimeWaitTable {
 
     // Every record; for rare whole-endpoint events only.
     pub(crate) fn indices(&self) -> impl Iterator<Item = u32> + '_ {
-        self.timers.iter().copied()
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.is_some())
+            .map(|(index, _)| index as u32)
     }
 }
 
@@ -848,10 +795,20 @@ mod tests {
         x ^ (x >> 31)
     }
 
-    // Every stored record is found, in one chain, and the counts agree.
-    fn check(table: &TimeWaitTable, model: &BTreeMap<u32, (u64, u32)>) {
+    fn wheel() -> Wheel {
+        Wheel::new(crate::TimerWheel::Internet.geometry(1_000_000).unwrap()).unwrap()
+    }
+
+    // Every stored record is found, in one chain, and the counts agree;
+    // every record's timer is filed, never before its deadline.
+    fn check(table: &mut TimeWaitTable, wheel: &Wheel, model: &BTreeMap<u32, (u64, u32)>) {
         assert_eq!(table.len(), model.len());
-        assert_eq!(table.timers.len(), model.len());
+        wheel.check(table, model.values().map(|&(_, index)| index));
+        for &(_, index) in model.values() {
+            let filed = wheel.filed(&table.entry(index).timer).unwrap();
+            assert!(filed >= table.record(index).deadline);
+        }
+        assert_eq!(table.indices().count(), model.len());
         for (&peer, &(hash, index)) in model {
             let tuple = table.record(index).tuple;
             assert_eq!(
@@ -884,13 +841,6 @@ mod tests {
         for (offset, &count) in ports.iter().enumerate() {
             assert_eq!(table.holds_port(1000 + offset as u16), count != 0);
         }
-        if let Some((deadline, _)) = table.first_expiry() {
-            assert!(
-                model
-                    .values()
-                    .all(|&(_, index)| table.record(index).deadline >= deadline)
-            );
-        }
     }
 
     #[test]
@@ -909,6 +859,7 @@ mod tests {
     #[test]
     fn records_are_found_while_the_buckets_double() {
         for limit in [1, 5, 16, 100, 3000] {
+            let mut wheel = wheel();
             let mut table = TimeWaitTable::new(limit);
             let mut model = BTreeMap::new();
             let mut colliding = 0;
@@ -918,7 +869,7 @@ mod tests {
                 let peer = (roll % (limit as u64 * 2)) as u32;
                 if let Some((hash, index)) = model.remove(&peer) {
                     colliding -= usize::from(hash & 0xf_ffff == 5);
-                    let removed = table.remove(index);
+                    let removed = table.remove(index, &mut wheel);
                     assert_eq!(
                         removed.tuple,
                         record(peer, removed.tuple.tuple.local.port(), 0).tuple
@@ -934,7 +885,7 @@ mod tests {
                     };
                     let record = record(peer, 1000 + (peer % 8) as u16, roll >> 48);
                     assert_eq!(
-                        table.insert(hash, record),
+                        table.insert(hash, record, &mut wheel),
                         model.len() < limit,
                         "limit {limit} step {step}"
                     );
@@ -948,10 +899,10 @@ mod tests {
                 peak = peak.max(model.len());
                 assert!(table.buckets.len() <= (2 * peak).max(MIN_BUCKETS));
                 if limit <= 100 || step % 101 == 0 {
-                    check(&table, &model);
+                    check(&mut table, &wheel, &model);
                 }
             }
-            check(&table, &model);
+            check(&mut table, &wheel, &model);
         }
     }
 
@@ -959,45 +910,49 @@ mod tests {
     // still stored.
     #[test]
     fn a_full_chain_refuses_a_record() {
+        let mut wheel = wheel();
         let mut table = TimeWaitTable::new(1000);
         let mut model = BTreeMap::new();
         for peer in 0..CHAIN as u32 {
-            assert!(table.insert(9, record(peer, 1000, 1)));
+            assert!(table.insert(9, record(peer, 1000, 1), &mut wheel));
             model.insert(
                 peer,
                 (9, table.find(9, record(peer, 1000, 1).tuple).unwrap()),
             );
         }
-        assert!(!table.insert(9, record(500, 1000, 1)));
-        assert!(table.insert(10, record(501, 1001, 1)));
+        assert!(!table.insert(9, record(500, 1000, 1), &mut wheel));
+        assert!(table.insert(10, record(501, 1001, 1), &mut wheel));
         model.insert(
             501,
             (10, table.find(10, record(501, 1001, 1).tuple).unwrap()),
         );
-        check(&table, &model);
+        check(&mut table, &wheel, &model);
         let (_, index) = model.remove(&3).unwrap();
-        table.remove(index);
-        assert!(table.insert(9, record(500, 1000, 1)));
+        table.remove(index, &mut wheel);
+        assert!(table.insert(9, record(500, 1000, 1), &mut wheel));
         model.insert(500, (9, table.find(9, record(500, 1000, 1).tuple).unwrap()));
-        check(&table, &model);
+        check(&mut table, &wheel, &model);
     }
 
     // A record whose storage cannot be allocated is not stored, and the
     // table stays as it was.
     #[test]
     fn a_failed_allocation_stores_nothing() {
+        let mut wheel = wheel();
         let mut table = TimeWaitTable::new(1000);
         let mut model = BTreeMap::new();
         for peer in 0..200u32 {
             let hash = mix(u64::from(peer));
             let record = record(peer, 1000 + (peer % 8) as u16, u64::from(peer));
             let mut failure = 0;
-            while !crate::allocation_tests::fail_after(failure, || table.insert(hash, record)) {
-                check(&table, &model);
+            while !crate::allocation_tests::fail_after(failure, || {
+                table.insert(hash, record, &mut wheel)
+            }) {
+                check(&mut table, &wheel, &model);
                 failure += 1;
             }
             model.insert(peer, (hash, table.find(hash, record.tuple).unwrap()));
-            check(&table, &model);
+            check(&mut table, &wheel, &model);
         }
     }
 }

@@ -19,9 +19,6 @@
 //
 // Time is the caller's: nothing here reads a clock. Every instant is the
 // `now` the caller passes, in its caller units.
-// Nothing files timers in the wheel yet: TIME-WAIT records move to it next.
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 use core::cell::Cell;
 
@@ -154,7 +151,6 @@ pub(crate) trait TimerLinks {
 }
 
 pub(crate) struct Wheel {
-    geometry: TimerWheelGeometry,
     tick_shift: u32,
     slot_bits: u32,
     levels: u32,
@@ -188,7 +184,6 @@ impl Wheel {
         occupied.try_reserve_exact(words).map_err(|_| ())?;
         occupied.resize(words, 0);
         Ok(Self {
-            geometry,
             tick_shift: geometry.tick.trailing_zeros(),
             slot_bits,
             levels,
@@ -200,15 +195,6 @@ impl Wheel {
             next_bucket: Cell::new(NONE),
             stale: Cell::new(false),
         })
-    }
-
-    pub(crate) fn geometry(&self) -> TimerWheelGeometry {
-        self.geometry
-    }
-
-    /// The table's heap bytes, fixed by the geometry.
-    pub(crate) fn allocation_bytes(&self) -> usize {
-        self.heads.capacity() * 4 + self.occupied.capacity() * 8
     }
 
     fn mask(&self) -> u64 {
@@ -444,6 +430,7 @@ impl Wheel {
     }
 
     /// When the bucket of timer `id` runs (caller units), if it is filed.
+    #[cfg(test)]
     pub(crate) fn filed(&self, link: &TimerLink) -> Option<u64> {
         link.linked().then(|| self.expiry_units(link.bucket))
     }
@@ -457,7 +444,7 @@ impl Wheel {
     // Every bucket's chain links both ways, holds only timers filed in it,
     // and its occupancy bit says so; `ids` are every filed timer; the cached
     // next expiry is the earliest bucket's.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub(crate) fn check(&self, links: &mut impl TimerLinks, ids: impl Iterator<Item = u32>) {
         let mut chained = 0usize;
         for (bucket, &head) in self.heads.iter().enumerate() {

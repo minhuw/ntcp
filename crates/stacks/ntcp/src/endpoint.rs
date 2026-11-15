@@ -710,6 +710,8 @@ pub struct Endpoint {
     deadlines: Deadlines,
     // The owner's timer wheel geometry: how far ahead a timer may be set.
     timer_wheel: crate::TimerWheelGeometry,
+    // The owner's timer wheel: TIME-WAIT records' timers.
+    wheel: crate::wheel::Wheel,
     reclaimed: u64,
     // The last `max_connections` reclaimed connections, the one counted
     // `n` (from 0) at `n % max_connections`: `reclaimed_since`.
@@ -956,6 +958,12 @@ impl Endpoint {
             },
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
             timer_wheel: config.timer_wheel_geometry()?,
+            wheel: {
+                let mut wheel = crate::wheel::Wheel::new(config.timer_wheel_geometry()?)
+                    .map_err(|_| Error::NoMemory)?;
+                wheel.forward(now);
+                wheel
+            },
             reclaimed: 0,
             reclaims,
             listen_overflows: 0,
@@ -3296,13 +3304,14 @@ impl Endpoint {
 
     // The one place TIME-WAIT records are stored.
     fn insert_time_wait(&mut self, hash: u64, record: crate::time_wait::Record) -> bool {
-        self.time_wait.insert(hash, record)
+        self.wheel.forward(self.now);
+        self.time_wait.insert(hash, record, &mut self.wheel)
     }
 
     // The one place TIME-WAIT records end: expiry, an acceptable RST, a
     // reopening SYN, or an ambiguous timestamp clock.
     fn remove_time_wait(&mut self, index: u32) {
-        self.time_wait.remove(index);
+        self.time_wait.remove(index, &mut self.wheel);
     }
 
     /// Released connections closed without TIME-WAIT because
@@ -4009,7 +4018,8 @@ impl Endpoint {
                 crate::time_wait::Input::Reset => self.remove_time_wait(index),
                 input => {
                     let restarted = self.time_wait.record(index).deadline != deadline;
-                    self.time_wait.update(index, restarted);
+                    self.wheel.forward(now);
+                    self.time_wait.update(index, restarted, &mut self.wheel);
                     if let crate::time_wait::Input::Dropped(reason) = input {
                         self.drop_segment(reason, tuple, segment);
                     }
@@ -6024,10 +6034,16 @@ impl Endpoint {
         (exact.into_iter().chain(record).min(), latest)
     }
 
-    // How late a TIME-WAIT record's timer may run.
+    // How late a TIME-WAIT record's timer may run: its wheel level's bound
+    // for the TIME-WAIT duration, filed when it starts or restarts.
     #[cfg(test)]
     fn time_wait_slack(&self) -> Instant {
-        0
+        let duration = self
+            .config
+            .connection
+            .timebase
+            .ticks_from_us(self.config.connection.time_wait_us);
+        self.timer_wheel.lateness_bound(duration)
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -6036,7 +6052,7 @@ impl Endpoint {
             .first()
             .map(|(time, _)| time)
             .into_iter()
-            .chain(self.time_wait.first_expiry().map(|(time, _)| time))
+            .chain(self.wheel.next_expiry())
             .chain(self.unattempted_reservations.iter().filter_map(|index| {
                 let r = self.reservations[index].current.as_ref()?;
                 self.retained_slot(r.packet.connection?)
@@ -6162,18 +6178,22 @@ impl Endpoint {
 
     pub fn on_timeout(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
         self.clock(now)?;
+        let mut drained = false;
         for _ in 0..budget {
             let connection = self
                 .deadlines
                 .first()
                 .filter(|&(deadline, _)| deadline <= now);
-            let record = self
-                .time_wait
-                .first_expiry()
-                .filter(|&(deadline, _)| deadline <= now);
-            if let Some((deadline, index)) = record
-                && connection.is_none_or(|(first, _)| deadline < first)
+            // A TIME-WAIT record's timer runs at its wheel bucket's expiry,
+            // never before its deadline: a record whose deadline a restart
+            // moved later is filed again instead.
+            if let Some((index, expiry)) = self.wheel.due(now)
+                && connection.is_none_or(|(first, _)| expiry < first)
             {
+                if self.time_wait.record(index).deadline > now {
+                    self.time_wait.refile(index, &mut self.wheel);
+                    continue;
+                }
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
                 //# If the time-wait timeout expires on a connection, delete the TCB,
                 //# enter the CLOSED state, and return.
@@ -6181,6 +6201,7 @@ impl Endpoint {
                 continue;
             }
             let Some((_, index)) = connection else {
+                drained = true;
                 break;
             };
             self.deadlines.set(index, None);
@@ -6205,12 +6226,17 @@ impl Endpoint {
             // expiry; unreleased terminal handles retain storage until release.
             self.refresh(index);
         }
+        // Every bucket up to `now` ran: timers filed from now on are placed
+        // against it.
+        if drained {
+            self.wheel.finish(now);
+        }
         Ok(self
             .deadlines
             .first()
             .map(|(deadline, _)| deadline)
             .into_iter()
-            .chain(self.time_wait.first_expiry().map(|(deadline, _)| deadline))
+            .chain(self.wheel.next_expiry())
             .any(|deadline| deadline <= now))
     }
 
@@ -7656,7 +7682,7 @@ impl Endpoint {
                 let record = self.time_wait.record_mut(index);
                 record.ack_pending = false;
                 record.challenge_pending = false;
-                self.time_wait.update(index, false);
+                self.time_wait.update(index, false, &mut self.wheel);
                 self.oversized_control += 1;
                 self.drop_reply(DropReason::PktTooBig, ip, header);
                 return Ok(None);
@@ -7668,7 +7694,7 @@ impl Endpoint {
         self.time_wait
             .record_mut(index)
             .sent(now, &self.config.connection);
-        self.time_wait.update(index, false);
+        self.time_wait.update(index, false, &mut self.wheel);
         self.control_turn = false;
         Ok(Some((
             PollTransmit {

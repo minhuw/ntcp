@@ -3010,6 +3010,13 @@ fn short_time_wait_ends_at_its_configured_deadline() {
             if released {
                 b.release(old).unwrap();
             }
+            // A held connection's timer is exact; a released one's record
+            // ends at its timer wheel bucket's expiry, never before its
+            // deadline and less than its level's bound after.
+            assert_eq!(b.reference_next_deadline().0, Some(expiry));
+            let end = b.next_deadline().unwrap();
+            assert!(end >= expiry && end - expiry < b.timer_wheel().lateness_bound(time_wait_us));
+            assert!(released || end == expiry);
             b.on_timeout(expiry - 1, 64).unwrap();
             // A released connection's TIME-WAIT outlives the connection.
             assert_eq!(b.connection_exists(old), !released);
@@ -3018,11 +3025,11 @@ fn short_time_wait_ends_at_its_configured_deadline() {
                 b.connect(expiry - 1, tuple.local, tuple.remote),
                 Err(EndpointError::AddressInUse)
             );
-            b.on_timeout(expiry, 64).unwrap();
-            assert!(packets(&mut b, expiry).is_empty());
+            b.on_timeout(end, 64).unwrap();
+            assert!(packets(&mut b, end).is_empty());
             assert_eq!(b.connection_exists(old), !released);
             assert_eq!(b.time_wait_connections(), 0);
-            assert!(b.connect(expiry, tuple.local, tuple.remote).is_ok());
+            assert!(b.connect(end, tuple.local, tuple.remote).is_ok());
         }
     }
 }
@@ -4154,10 +4161,19 @@ fn time_wait_connections_follow_entry_release_expiry_and_abort() {
         if released {
             a.release(client).unwrap();
         }
+        // A held connection's timer is exact; a record runs at its timer
+        // wheel bucket's expiry, never before and within its level's bound.
+        assert_eq!(a.reference_next_deadline().0, Some(expiry));
+        let end = a.next_deadline().unwrap();
+        let bound = a
+            .timer_wheel()
+            .lateness_bound(config().connection.time_wait_us);
+        assert!(end >= expiry && end - expiry < bound);
+        assert!(released || end == expiry);
         a.on_timeout(expiry - 1, 64).unwrap();
         assert_eq!(a.time_wait_connections(), 1);
-        a.on_timeout(expiry, 64).unwrap();
-        assert!(packets(&mut a, expiry).is_empty());
+        a.on_timeout(end, 64).unwrap();
+        assert!(packets(&mut a, end).is_empty());
         assert_eq!(a.time_wait_connections(), 0);
         assert_eq!(a.connection_exists(client), !released);
     }
