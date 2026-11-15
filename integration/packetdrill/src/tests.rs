@@ -455,8 +455,9 @@ fn host_bridge_preloaded_process_and_lifecycle() {
     );
     assert!(build.status().unwrap().success());
     assert!(library.exists(), "missing cdylib: {}", library.display());
-    let dir = std::env::temp_dir().join(format!("ntcp-bridge-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch(std::env::temp_dir().join(format!("ntcp-bridge-{}", std::process::id())));
+    let dir = &scratch.0;
+    std::fs::create_dir_all(dir).unwrap();
     let source = dir.join("check.c");
     std::fs::write(&source, r#"
 #define _GNU_SOURCE
@@ -595,7 +596,21 @@ int main(int argc, char **argv) {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// A test's scratch directory under TMPDIR, named by the process id. Removed on
+// drop when the test passes; a failing test keeps it and names it. A test
+// killed outright (SIGKILL, a nextest timeout) runs no drop and leaves it.
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.0.display());
+        } else {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
 }
 
 fn isolated(name: &str) -> bool {

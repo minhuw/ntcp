@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use super::*;
-use crate::ChildTest;
+use crate::{ChildTest, TestDir};
 
 const BASE: &str = "io.interface=ntcp0\nio.address=10.73.0.2\n";
 
@@ -285,7 +285,8 @@ fn parser_and_typed_validation() {
 
 #[test]
 fn bounded_regular_utf8_file() {
-    let path = std::env::temp_dir().join(format!("ntcp-config-{}", std::process::id()));
+    let dir = TestDir::new(&format!("ntcp-config-{}", std::process::id()));
+    let path = dir.join("config");
     std::fs::write(&path, BASE).unwrap();
     assert_eq!(
         format!("{:?}", SocketConfig::from_file(&path).unwrap()),
@@ -324,6 +325,7 @@ fn bounded_regular_utf8_file() {
 fn selection_subprocess() {
     const CHILD: &str = "NTCP_CONFIG_TEST_CHILD";
     let Ok(scenario) = std::env::var(CHILD) else {
+        let dir = TestDir::new(&format!("ntcp-selection-{}", std::process::id()));
         for scenario in [
             "native",
             "typed",
@@ -336,7 +338,7 @@ fn selection_subprocess() {
             "fork",
             "reentrant",
         ] {
-            let path = std::env::temp_dir().join(format!("ntcp-selection-{}", std::process::id()));
+            let path = dir.join("config");
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args([
                 "--exact",

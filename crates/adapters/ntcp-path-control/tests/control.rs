@@ -148,16 +148,41 @@ fn side_with(
     Side { host, endpoint }
 }
 
-// A fresh private (0700) directory for one test's socket.
-fn private_dir(name: &str) -> PathBuf {
+// A fresh private (0700) directory for one test's socket, under TMPDIR and
+// named by the test process's pid. Removed on drop when the test passes; a
+// failing test keeps it and names it. A test killed outright (SIGKILL, a
+// nextest timeout) runs no drop and leaves it behind.
+struct PrivateDir(PathBuf);
+
+impl std::ops::Deref for PrivateDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.0.display());
+        } else {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+}
+
+fn private_dir(name: &str) -> PrivateDir {
     let dir = std::env::temp_dir().join(format!("ntcp-pathctl-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-    dir
+    PrivateDir(dir)
 }
 
-fn serve(side: &mut Side, allow_uids: Vec<u32>, name: &str) -> (Server, PathBuf) {
-    let socket = private_dir(name).join("control");
+// The directory comes first so that it is dropped after the server.
+fn serve(side: &mut Side, allow_uids: Vec<u32>, name: &str) -> (PrivateDir, Server, PathBuf) {
+    let dir = private_dir(name);
+    let socket = dir.join("control");
     let capability = side.host.administration();
     let server = Server::bind(
         &ControlConfig {
@@ -168,7 +193,7 @@ fn serve(side: &mut Side, allow_uids: Vec<u32>, name: &str) -> (Server, PathBuf)
         side.endpoint.caller_timebase(),
     )
     .unwrap();
-    (server, socket)
+    (dir, server, socket)
 }
 
 // Run the real utility as a separate process while the owner loop serves.
@@ -233,7 +258,8 @@ fn field<'a>(line: &'a str, key: &str) -> &'a str {
 fn utility_process_round_trips_both_families() {
     for v6 in [false, true] {
         let mut side = side(v6);
-        let (mut server, socket) = serve(&mut side, Vec::new(), if v6 { "rt6" } else { "rt4" });
+        let (_dir, mut server, socket) =
+            serve(&mut side, Vec::new(), if v6 { "rt6" } else { "rt4" });
         // The socket is 0600 inside the private directory.
         let mode = std::fs::symlink_metadata(&socket)
             .unwrap()
@@ -447,7 +473,7 @@ fn framed(body: &[u8]) -> Vec<u8> {
 #[test]
 fn malformed_unknown_oversized_stale_and_inconsistent_requests_change_nothing() {
     let mut side = side(false);
-    let (mut server, socket) = serve(&mut side, Vec::new(), "negative");
+    let (_dir, mut server, socket) = serve(&mut side, Vec::new(), "negative");
     let cap = side.host.administration();
     let before = side.host.paths().admin_revision();
     let mut s = connect(&socket);
@@ -627,7 +653,7 @@ fn peer_credentials_outside_the_allow_list_are_refused_before_dispatch() {
     let me = unsafe { libc::geteuid() };
     // An allow-list that excludes the connecting uid: no root bypass and no
     // implicit owner when a list is given.
-    let (mut server, socket) = serve(&mut side, vec![me.wrapping_add(1)], "denied");
+    let (_dir, mut server, socket) = serve(&mut side, vec![me.wrapping_add(1)], "denied");
     let cap = side.host.administration();
     let before = side.host.paths().admin_revision();
     let mut s = connect(&socket);
@@ -665,7 +691,7 @@ fn peer_credentials_outside_the_allow_list_are_refused_before_dispatch() {
 #[test]
 fn full_slots_answer_busy_and_deadlines_bound_trickling_blocked_and_idle_peers() {
     let mut side = side(false);
-    let (mut server, socket) = serve(&mut side, Vec::new(), "slots");
+    let (_dir, mut server, socket) = serve(&mut side, Vec::new(), "slots");
     let mut held: Vec<UnixStream> = (0..SLOTS).map(|_| connect(&socket)).collect();
     server.service(&mut side.host, &mut side.endpoint, 0);
     let mut extra = connect(&socket);
@@ -747,15 +773,16 @@ fn socket_pathname_safety() {
     // Relative pathnames and directories with group/other access are refused.
     assert!(bind(PathBuf::from("relative/control")).is_err());
     let open = private_dir("open");
-    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&*open, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
         bind(open.join("control")).err().unwrap().kind(),
         std::io::ErrorKind::PermissionDenied
     );
     // A symbolic link to a private directory is not a private directory.
     let private = private_dir("target");
-    let link = private_dir("link-parent").join("link");
-    std::os::unix::fs::symlink(&private, &link).unwrap();
+    let link_parent = private_dir("link-parent");
+    let link = link_parent.join("link");
+    std::os::unix::fs::symlink(&*private, &link).unwrap();
     assert_eq!(
         bind(link.join("control")).err().unwrap().kind(),
         std::io::ErrorKind::PermissionDenied
@@ -847,7 +874,7 @@ fn listing_revisions_ignore_live_values_but_not_administrative_changes() {
     let cap = side.host.administration();
     let total = side.host.admin_paths(&cap).unwrap().count();
     assert!(total > protocol::PATHS_PER_PAGE, "more than one page");
-    let (mut server, socket) = serve(&mut side, Vec::new(), "pages");
+    let (_dir, mut server, socket) = serve(&mut side, Vec::new(), "pages");
     let mut s = connect(&socket);
     let query = |cursor: u32, revision: u64| {
         protocol::encode_request(&Request::QueryPaths { cursor, revision })
@@ -931,7 +958,7 @@ fn refusals_at_accept_reach_client_call_after_the_server_closed() {
     use ntcp_path_control::client::Client;
     let mut side = side(false);
     let me = unsafe { libc::geteuid() };
-    let (mut server, socket) = serve(&mut side, vec![me.wrapping_add(1)], "refused");
+    let (_dir, mut server, socket) = serve(&mut side, vec![me.wrapping_add(1)], "refused");
     let mut client = Client::connect(&socket).unwrap();
     server.service(&mut side.host, &mut side.endpoint, 0);
     let request = Request::QueryRoutes {
@@ -944,7 +971,7 @@ fn refusals_at_accept_reach_client_call_after_the_server_closed() {
     );
     drop(server);
 
-    let (mut server, socket) = serve(&mut side, Vec::new(), "full");
+    let (_dir, mut server, socket) = serve(&mut side, Vec::new(), "full");
     let held: Vec<UnixStream> = (0..SLOTS).map(|_| connect(&socket)).collect();
     server.service(&mut side.host, &mut side.endpoint, 0);
     let mut client = Client::connect(&socket).unwrap();

@@ -1008,10 +1008,8 @@ mod tests {
         .unwrap();
         let mut endpoint = Endpoint::new(cfg.clone(), [3; 32], 0, |_| true).unwrap();
         host.attach(&mut endpoint).unwrap();
-        let dir = std::env::temp_dir().join(format!("ntcp-control-denied-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        let socket = dir.join("control");
+        let dir = PrivateDir::new();
+        let socket = dir.0.join("control");
         let mut server = Server::bind(
             &ControlConfig {
                 socket: socket.clone(),
@@ -1047,6 +1045,31 @@ mod tests {
             assert_eq!(response.status, Status::Unauthorized);
         }
         drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A private (0700) directory under TMPDIR, named by the process id.
+    // Removed on drop when the test passes; a failing test keeps it and names
+    // it. A test killed outright (SIGKILL, a nextest timeout) runs no drop
+    // and leaves it behind.
+    struct PrivateDir(std::path::PathBuf);
+
+    impl PrivateDir {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("ntcp-control-denied-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for PrivateDir {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("kept {}", self.0.display());
+            } else {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
     }
 }

@@ -7,6 +7,31 @@ use std::time::Duration;
 
 const CHILD: &str = "NTCP_PATHCTL_CHILD_ARGS";
 
+// A private (0700) directory under TMPDIR, named by the process id. Removed on
+// drop when the test passes; a failing test keeps it and names it. A test
+// killed outright (SIGKILL, a nextest timeout) runs no drop and leaves it
+// behind.
+struct PrivateDir(std::path::PathBuf);
+
+impl PrivateDir {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.0.display());
+        } else {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+}
+
 // Runs the utility when re-executed by `pathctl`; otherwise does nothing.
 #[test]
 fn pathctl_child() {
@@ -107,17 +132,15 @@ fn tun_echo_serves_pathctl_processes_and_control_is_opt_in() {
             .unwrap()
             .is_none());
         assert!(control_server(&mut network.host, &endpoint, None, Some("1000".into())).is_err());
-        let dir = std::env::temp_dir().join(format!(
+        let dir = PrivateDir::new(&format!(
             "tun-echo-control-{}-{}",
             std::process::id(),
             u8::from(v6)
         ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         let mut server = control_server(
             &mut network.host,
             &endpoint,
-            Some(dir.join("control").into_os_string()),
+            Some(dir.0.join("control").into_os_string()),
             None,
         )
         .unwrap()
@@ -147,6 +170,6 @@ fn tun_echo_serves_pathctl_processes_and_control_is_opt_in() {
             pathctl(&mut server, &mut network, &mut endpoint, &["set", "route", &token, "0"]);
         assert_eq!((code, stderr.trim()), (1, "status=stale"));
         drop(server);
-        assert!(std::fs::symlink_metadata(dir.join("control")).is_err());
+        assert!(std::fs::symlink_metadata(dir.0.join("control")).is_err());
     }
 }

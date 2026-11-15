@@ -4,8 +4,7 @@
 // utility, running the same `ntcp_path_control::cli`) administer the
 // runtime's Host while its loop runs.
 use super::*;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use crate::TestDir;
 
 const CHILD: &str = "NTCP_PATHCTL_CHILD_ARGS";
 
@@ -67,14 +66,11 @@ fn field<'a>(line: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{key} missing in {line}"))
 }
 
-fn private_socket(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn private_dir(name: &str) -> TestDir {
+    TestDir::new(&format!(
         "ntcp-socket-control-{}-{name}",
         std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-    dir.join("control")
+    ))
 }
 
 // A running native runtime over an external Ethernet fixture with one
@@ -146,7 +142,8 @@ fn runtime_with(
 #[test]
 fn native_runtime_serves_pathctl_processes_from_its_owner_loop() {
     for v6 in [false, true] {
-        let socket = private_socket(if v6 { "v6" } else { "v4" });
+        let dir = private_dir(if v6 { "v6" } else { "v4" });
+        let socket = dir.join("control");
         let running = runtime(
             v6,
             ntcp_path_control::ControlConfig {
@@ -182,7 +179,8 @@ fn native_runtime_serves_pathctl_processes_from_its_owner_loop() {
         assert!(std::fs::symlink_metadata(&socket).is_err());
     }
     // A peer outside the allow-list is refused before dispatch.
-    let socket = private_socket("denied");
+    let dir = private_dir("denied");
+    let socket = dir.join("control");
     let me = unsafe { libc::geteuid() };
     let _running = runtime(
         false,
@@ -203,7 +201,8 @@ fn control_is_served_while_output_is_held() {
         block: true,
         ..Default::default()
     }));
-    let socket = private_socket("held");
+    let dir = private_dir("held");
+    let socket = dir.join("control");
     let _running = runtime_with(
         true,
         ntcp_path_control::ControlConfig {

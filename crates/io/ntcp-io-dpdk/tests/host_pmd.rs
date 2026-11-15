@@ -551,8 +551,10 @@ fn pcap_file(path: &std::path::Path, count: u8) {
 // frames read once mbufs are back arrive. (The ring PMD hands over mbufs
 // its peer allocated and counts no rx_nombuf, mlx5 has no virtual device.)
 fn receive_pool_exhausted(eal: &'static Eal) {
-    let path = std::env::temp_dir().join(format!("ntcp-nombuf-{}.pcap", std::process::id()));
-    pcap_file(&path, 6);
+    let pcap =
+        TempFile(std::env::temp_dir().join(format!("ntcp-nombuf-{}.pcap", std::process::id())));
+    let path = &pcap.0;
+    pcap_file(path, 6);
     let mut config = PortConfig::new(format!("net_pcap0,rx_pcap={}", path.display()));
     config.rx_desc = 64;
     config.tx_desc = 64;
@@ -580,8 +582,23 @@ fn receive_pool_exhausted(eal: &'static Eal) {
     assert_eq!(queue.receive(&mut out).unwrap(), None);
     assert_eq!(queue.device_counters().rx_nombuf, 2);
     drop((port, queue));
-    std::fs::remove_file(&path).unwrap();
+    drop(pcap);
     assert_eq!(pools(), (0, 0));
+}
+
+// A test's scratch file under TMPDIR, named by the process id. Removed on drop
+// when the test passes; a failing test keeps it and names it. A test killed
+// outright (SIGKILL, a nextest timeout) runs no drop and leaves it behind.
+struct TempFile(std::path::PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.0.display());
+        } else {
+            std::fs::remove_file(&self.0).unwrap();
+        }
+    }
 }
 
 // Last: a pool whose mbuf is lost inside the ring PMD is retained, not freed

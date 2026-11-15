@@ -302,6 +302,35 @@ impl ChildTest for std::process::Command {
         output.status.success()
     }
 }
+/// A fresh private (0700) directory `name` under TMPDIR, for one test. Removed on
+/// drop when the test passes; a failing test keeps it and names it. A test killed
+/// outright (SIGKILL, a nextest timeout) runs no drop and leaves it behind, so
+/// callers put the process id in `name`.
+#[cfg(test)]
+struct TestDir(std::path::PathBuf);
+#[cfg(test)]
+impl TestDir {
+    fn new(name: &str) -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        Self(dir)
+    }
+    fn join(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.0.display());
+        } else {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+}
 struct Token {
     slot: Option<usize>,
     id: u64,

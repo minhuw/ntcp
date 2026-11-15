@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -15,7 +16,12 @@
 #include <unistd.h>
 
 int main(void) {
-    char path[] = "/tmp/ntcp-preload-XXXXXX", buffer[16] = {0};
+    // Under TMPDIR when set, else /tmp (as the Rust tests' temp_dir).
+    const char *temporary = getenv("TMPDIR");
+    char path[4096], buffer[16] = {0};
+    int written = snprintf(path, sizeof(path), "%s/ntcp-preload-XXXXXX",
+                           temporary && *temporary ? temporary : "/tmp");
+    assert(written > 0 && (size_t)written < sizeof(path));
     int file = mkstemp(path);
     assert(file >= 0);
     assert(unlink(path) == 0);
