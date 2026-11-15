@@ -119,7 +119,9 @@ fn stream(len: usize, salt: u8) -> Vec<u8> {
 // size, the rest after useful ACK progress. B adopts the shared decrease by
 // budget alone and never retransmits (T10's fanout isolation). A later,
 // smaller PTB for the same original arrives once its prefix is cumulatively
-// acknowledged: it is accepted, not rejected, and repairs nothing twice.
+// acknowledged: its sequence is below SND.UNA, so it is dropped as Linux's
+// tcp_v4_err/tcp_v6_err drop it (OutOfWindowIcmps), changing nothing, and
+// the first report's unrepaired suffix still follows once.
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
 //= type=test
@@ -185,13 +187,20 @@ fn host_ptb_repairs_exact_quoted_range_of_the_quoted_connection_only() {
         );
         // A late, smaller report quoting the partially acknowledged original.
         let lower = if v6 { 1280 } else { 1006 };
-        let (late, _) = tcp_report(
-            a.0.input_icmp(&mut a.1, a.2, now + 9, &ptb(&quoted, lower), None)
-                .unwrap(),
+        let drops = a.0.drop_counts()[ntcp::DropReason::IcmpOutOfWindow];
+        let late =
+            a.0.input_icmp(&mut a.1, a.2, now + 9, &ptb(&quoted, lower), None);
+        assert_eq!(
+            late,
+            Ok(IcmpDispatch::Completed(IcmpOutcome::Discarded(
+                IcmpDiscard::OutOfWindow
+            )))
         );
-        // Below the 1500-octet delivery the peer has now proven: the size waits
-        // for authorization, the drop advice does not.
-        assert_eq!(late, TcpReport::PacketTooBig(PmtuFeedback::Deferred));
+        assert_eq!(
+            a.0.drop_counts()[ntcp::DropReason::IcmpOutOfWindow],
+            drops + 1
+        );
+        assert_eq!(a.1.managed_path(flow_a).unwrap().ordinary_ip_budget, mtu);
         // The unrepaired suffix follows under ordinary admission, once.
         let rest = submit(&mut a, flow_a, now + 10, Held::Scalar).unwrap();
         assert_eq!(
@@ -218,7 +227,7 @@ fn host_ptb_repairs_exact_quoted_range_of_the_quoted_connection_only() {
             (0, 0, false)
         );
         std::println!(
-            "HOST_REPAIR v6={v6} quoted=[{start},+{len}) restart={prefix} suffix={} late={late:?}",
+            "HOST_REPAIR v6={v6} quoted=[{start},+{len}) restart={prefix} suffix={}",
             len - prefix
         );
     }
@@ -568,7 +577,7 @@ impl Flow {
 struct TcpCoverage {
     submissions: usize,
     accepted_reports: usize,
-    partial_ack_quotes: usize,
+    partial_ack_refusals: usize,
     restarts: usize,
     ptb_repairs: usize,
     ordinary_retransmissions: usize,
@@ -716,7 +725,8 @@ fn accepted(f: &mut Flow, quote: &[u8], cov: &mut TcpCoverage) {
     let Some(start) = f.offset(seq) else {
         return;
     };
-    cov.partial_ack_quotes += usize::from(start < f.una && f.una < start + len);
+    // Linux's tcp_v4_err/tcp_v6_err window: never a quote below SND.UNA.
+    assert!(start >= f.una, "accepted a quote below SND.UNA");
     cov.repair_copy_reports += usize::from((start..start + len).any(|i| f.copies[i] > 1));
     let mut added = false;
     for i in start.max(f.una)..(start + len).min(f.high) {
@@ -947,6 +957,20 @@ fn randomized_host_tcp_drop_repair_never_acts_beyond_the_model() {
                     let before = a.1.transport_info(owner).ok();
                     let mut dispatch = a.0.input_icmp(&mut a.1, a.2, now, &report, None).unwrap();
                     unchanged(before, a.1.transport_info(owner).ok());
+                    if matches!(
+                        dispatch,
+                        IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::OutOfWindow))
+                    ) {
+                        // Refused exactly outside [SND.UNA, SND.NXT]; a quote
+                        // starting below SND.UNA is refused even while its
+                        // segment's tail is outstanding.
+                        let f = &flows[index];
+                        let (_, seq, len, _) = segment(&quote);
+                        let start = f.offset(seq);
+                        assert!(start.is_none_or(|s| s < f.una || s > f.high));
+                        cov.partial_ack_refusals +=
+                            usize::from(start.is_some_and(|s| s < f.una && f.una < s + len));
+                    }
                     if let Some(((attempt, frame, external, wire), infos_before)) = held {
                         // Nothing a reserved owner's report could act on is
                         // applied before the reservation resolves.
@@ -1065,7 +1089,7 @@ fn randomized_host_tcp_drop_repair_never_acts_beyond_the_model() {
     let TcpCoverage {
         submissions,
         accepted_reports,
-        partial_ack_quotes,
+        partial_ack_refusals,
         restarts,
         ptb_repairs,
         ordinary_retransmissions,
@@ -1083,7 +1107,10 @@ fn randomized_host_tcp_drop_repair_never_acts_beyond_the_model() {
     for (name, count) in [
         ("submissions", submissions),
         ("accepted reports", accepted_reports),
-        ("partially acknowledged quotes", partial_ack_quotes),
+        (
+            "refused partially acknowledged quotes",
+            partial_ack_refusals,
+        ),
         ("Restarts", restarts),
         ("PTB repairs", ptb_repairs),
         ("ordinary retransmissions", ordinary_retransmissions),

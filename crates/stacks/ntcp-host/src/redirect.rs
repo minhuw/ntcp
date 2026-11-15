@@ -36,6 +36,9 @@ pub enum RedirectRejection {
     /// no exact committed submission of a stateless reply or datagram, or
     /// its matches do not agree on one path incarnation.
     Uncorrelated,
+    /// The quote names a live connection, which refuses its sequence
+    /// (Linux's OutOfWindowIcmps).
+    OutOfWindow,
     /// The quoted traffic's path is no longer the authoritative selection
     /// (a replaced route generation, a changed first hop or link).
     Stale,
@@ -79,7 +82,11 @@ impl Host {
         let zone = matches!(key.source, IpAddr::V6(v) if v.is_unicast_link_local())
             .then_some(context.link);
         let connection = match (endpoint, key.transport) {
-            (Some(endpoint), _) => self.tcp_quote(endpoint, &key, zone).map(|(.., path)| path),
+            (Some(endpoint), _) => match self.tcp_quote(endpoint, &key, zone) {
+                Some(Ok((.., path))) => Some(path),
+                Some(Err(crate::OutOfWindow)) => return Err(OutOfWindow),
+                None => None,
+            },
             (
                 None,
                 QuotedSelector::Tcp {

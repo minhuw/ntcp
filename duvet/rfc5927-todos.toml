@@ -313,6 +313,14 @@ quote = '''
 if (claimedmtu <= MINIMUM_MTU) drop_message();
 '''
 
+# 5927-191
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Selected policy deviation, as Linux's tcp_v4_err and tcp_v6_err (between(seq, snd_una, snd_nxt)): a quoted sequence equal to SND.NXT (a pure ACK or RST) is accepted, not dropped; one below SND.UNA or beyond SND.NXT is dropped, in serial arithmetic (connection_ptb_tests icmp_quote_window_is_linuxs_between_at_every_entry)."
+quote = '''
+if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
+'''
+
 # 5927-193
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"

@@ -282,7 +282,9 @@ fn ipv4_redirect_rejections_change_nothing() {
         RedirectOutcome::Rejected(Uncorrelated)
     );
     // The connection's traffic, but a sequence outside its send window: an
-    // off-link forger that guessed the ports (RFC 5927 section 4.1).
+    // off-link forger that guessed the ports (RFC 5927 section 4.1), dropped
+    // before the Redirect is followed, as Linux's tcp_v4_err drops it
+    // (OutOfWindowIcmps).
     let outside = {
         let mut copy = data.clone();
         copy[24] ^= 0x80;
@@ -290,7 +292,7 @@ fn ipv4_redirect_rejections_change_nothing() {
     };
     assert_eq!(
         dispatch(&mut a, SECOND, &outside),
-        RedirectOutcome::Rejected(Uncorrelated)
+        RedirectOutcome::Rejected(OutOfWindow)
     );
     for off_link in ["203.0.113.1", "192.0.2.1", "255.255.255.255"] {
         assert_eq!(

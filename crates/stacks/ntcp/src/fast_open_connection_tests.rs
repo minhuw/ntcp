@@ -1123,7 +1123,8 @@ fn fast_open_negative_validated_errors_reset_and_local_abort() {
         let mut a = client(100, 12);
         packet(&mut a, 0);
         assert!(!a.network_error(1, 99, error).unwrap());
-        assert!(!a.network_error(2, 113, error).unwrap());
+        // SND.NXT is 113 (SYN and 12 bytes); Linux accepts SND.NXT itself.
+        assert!(!a.network_error(2, 114, error).unwrap());
         assert!(!a.network_error(3, 100, NetworkError::SourceQuench).unwrap());
         assert!(!a.fast_open_negative);
         assert!(a.network_error(4, 100, error).unwrap());

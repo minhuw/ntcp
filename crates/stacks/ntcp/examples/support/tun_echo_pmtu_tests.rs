@@ -1059,6 +1059,16 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
             ptb(&quote, path),
             p.local.ip(),
         ));
+        // The acknowledged SYN's sequence with the full quoted length, whose
+        // span reaches outstanding data: below SND.UNA, which Linux's
+        // tcp_v4_err/tcp_v6_err refuse whatever the span (OutOfWindowIcmps).
+        let mut quote = original.clone();
+        quote[h + 4..h + 8].copy_from_slice(&stale_sequence.to_be_bytes());
+        cases.push((
+            "from the acknowledged SYN into outstanding data",
+            ptb(&quote, path),
+            p.local.ip(),
+        ));
         let mut bad = valid.clone();
         bad[h + 8] ^= 0x10;
         seal_feedback(&mut bad);
@@ -1143,24 +1153,15 @@ fn runtime_dispatch_rejects_uncorrelated_or_malformed_feedback() {
         .unwrap();
         assert_eq!(p.a.path_mtu_info(p.aid).unwrap().unwrap().current_mtu, path);
         // The four-tuple and an in-window sequence are all a quote must keep
-        // (RFC 5927 section 4.1 and Linux tcp_v4_err/tcp_v6_err, the policy
-        // 91e356a adopted): a later sequence of the outstanding segment, or
-        // another quoted length, is the connection's too, each on a fresh
-        // flight. 91e356a also accepts a quote starting before SND.UNA whose
-        // span (its IP payload less the data TCP header) reaches outstanding
-        // data (`Connection::quoted_span`), which Linux refuses.
-        let in_window: [(&str, fn(&mut Vec<u8>, usize, bool)); 3] = [
+        // (RFC 5927 section 4.1 and Linux tcp_v4_err/tcp_v6_err: SND.UNA <=
+        // sequence <= SND.NXT): a later sequence of the outstanding segment,
+        // or another quoted length, is the connection's too, each on a fresh
+        // flight.
+        let in_window: [(&str, fn(&mut Vec<u8>, usize, bool)); 2] = [
             ("later in-window sequence", |quote, h, _| {
                 let sequence = u32::from_be_bytes(quote[h + 4..h + 8].try_into().unwrap());
                 quote[h + 4..h + 8].copy_from_slice(&sequence.wrapping_add(1).to_be_bytes());
             }),
-            (
-                "from the acknowledged SYN into outstanding data",
-                |quote, h, _| {
-                    let sequence = u32::from_be_bytes(quote[h + 4..h + 8].try_into().unwrap());
-                    quote[h + 4..h + 8].copy_from_slice(&sequence.wrapping_sub(1).to_be_bytes());
-                },
-            ),
             ("another quoted length", |quote, _, v6| {
                 let at = if v6 { 4 } else { 2 };
                 let size = u16::from_be_bytes([quote[at], quote[at + 1]]) + 1;

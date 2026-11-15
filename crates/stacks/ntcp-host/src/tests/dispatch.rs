@@ -134,13 +134,16 @@ pub(super) fn quote_key(frame: &[u8]) -> QuoteKey {
 }
 const UNCORRELATED: IcmpDispatch =
     IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::Uncorrelated));
+const OUT_OF_WINDOW: IcmpDispatch =
+    IcmpDispatch::Completed(IcmpOutcome::Discarded(IcmpDiscard::OutOfWindow));
 
 // RFC 5927 section 4.1, as Linux: a router PTB names the connection of its
-// quoted four-tuple whose sent, unacknowledged sequence space holds the
-// quoted sequence. Forgeries with another address or port, an out-of-window
-// sequence, or a context that never sent the segment change nothing; a
-// forgery that keeps the four-tuple and an in-window sequence is accepted
-// like the router's own report.
+// quoted four-tuple, which accepts it only if its sent sequence space
+// [SND.UNA, SND.NXT] holds the quoted sequence. Forgeries with another
+// address or port, an out-of-window sequence (dropped as OutOfWindowIcmps),
+// or a context that never sent the segment change nothing; a forgery that
+// keeps the four-tuple and an in-window sequence is accepted like the
+// router's own report.
 #[test]
 fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
     for v6 in [false, true] {
@@ -155,7 +158,8 @@ fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
         let feedback = ntcp_icmp::decode_icmp(&report).unwrap();
         assert_ne!(feedback.outer.source, remote.ip(), "router, not the peer");
         let before = (current_mtu(&a, id), learned(&a, id));
-        // Wrong address, ports and sequence: no connection's send window.
+        // Wrong address or ports: no connection. The connection's own
+        // four-tuple with a sequence half the space away: outside its window.
         let forgeries = [
             forged(&original, mtu, |f, _| {
                 let at = if v6 { 39 } else { 19 };
@@ -163,11 +167,17 @@ fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
             }),
             forged(&original, mtu, |f, h| f[h + 1] ^= 1),
             forged(&original, mtu, |f, h| f[h + 3] ^= 1),
-            forged(&original, mtu, |f, h| f[h + 4] ^= 0x80),
         ];
         for (n, forgery) in forgeries.iter().enumerate() {
             assert_eq!(dispatch(&mut a, 101, forgery), UNCORRELATED, "forgery {n}");
         }
+        let drops = a.0.drop_counts()[ntcp::DropReason::IcmpOutOfWindow];
+        let outside = forged(&original, mtu, |f, h| f[h + 4] ^= 0x80);
+        assert_eq!(dispatch(&mut a, 101, &outside), OUT_OF_WINDOW);
+        assert_eq!(
+            a.0.drop_counts()[ntcp::DropReason::IcmpOutOfWindow],
+            drops + 1
+        );
         // Another protocol never names the connection.
         let key = quote_key(&original);
         assert!(a.0.tcp_quote(&a.1, &key, None).is_some());
@@ -205,7 +215,10 @@ fn router_ptb_publishes_after_tcp_decrease_and_forgeries_change_nothing() {
                 let len = u16::from_be_bytes([f[at], f[at + 1]]) - 4;
                 f[at..at + 2].copy_from_slice(&len.to_be_bytes());
             }),
-            forged(&original, mtu, |f, h| f[h + 7] ^= 1),
+            forged(&original, mtu, |f, h| {
+                let sequence = u32::from_be_bytes(f[h + 4..h + 8].try_into().unwrap());
+                f[h + 4..h + 8].copy_from_slice(&sequence.wrapping_add(1).to_be_bytes());
+            }),
         ] {
             let (report, _) = tcp_report(dispatch(&mut a, 103, &forgery));
             assert_ne!(report, TcpReport::PacketTooBig(PmtuFeedback::Rejected));
@@ -356,7 +369,7 @@ fn correlated_errors_and_source_quench() {
         seal_ipv4(&mut wrong);
         assert_eq!(
             dispatch(&mut a, 101, &icmp(&wrong, unreachable, 0)),
-            UNCORRELATED
+            OUT_OF_WINDOW
         );
         assert!(drain_events(&mut a.1).is_empty());
         let (report, published) =

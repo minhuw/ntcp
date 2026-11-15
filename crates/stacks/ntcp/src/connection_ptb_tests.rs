@@ -190,10 +190,11 @@ fn every_accepted_class_records_exact_quoted_outstanding_bytes() {
             let partial = s[2].0.wrapping_add(100);
             ack(&mut a, 55, partial, None);
             assert_eq!(pending(&a), [(partial, s[3].1)]);
-            // A partially acknowledged quote is accepted; it adds nothing new.
-            assert_eq!(report(&mut a, 56, s[2], 1450, false).feedback, Unchanged);
+            // A partially acknowledged quote starts below SND.UNA: refused, as
+            // Linux's tcp_v4_err/tcp_v6_err refuse it.
+            assert_eq!(report(&mut a, 56, s[2], 1450, false).feedback, Rejected);
             assert_eq!(pending(&a), [(partial, s[3].1)]);
-            // A wholly acknowledged quote is no notification at all.
+            // A wholly acknowledged quote is no notification either.
             assert_eq!(report(&mut a, 57, s[0], 1300, false).feedback, Rejected);
             ack(&mut a, 58, s[3].1, None);
             assert!(pending(&a).is_empty());
@@ -491,4 +492,149 @@ fn local_label_has_no_repair_or_derived_size_consequence() {
         outcomes.push(outcome.derived_mtu);
     }
     assert_eq!(outcomes[0], outcomes[1]);
+}
+
+// One rule judges the sequence an ICMP error quotes, at every TCP entry
+// (Host arrival through `quoted_span`, network errors, the legacy
+// ring-matched PTB and the Host-correlated PTB): Linux's tcp_v4_err and
+// tcp_v6_err `between(seq, snd_una, snd_nxt)`, both ends included. A quote
+// starting below SND.UNA is refused even while its segment's tail is still
+// outstanding, and so is SND.NXT + 1.
+#[test]
+fn icmp_quote_window_is_linuxs_between_at_every_entry() {
+    for ipv4 in [true, false] {
+        for iss in [0, u32::MAX - 3000] {
+            // Three full segments sent; the peer acknowledged the first 100
+            // bytes of s[0].
+            let setup = || {
+                let (mut a, b, s) = flight(ipv4, iss, 3);
+                ack(&mut a, 50, s[0].0.wrapping_add(100), None);
+                assert_eq!((a.snd_una, a.snd_nxt), (s[0].0.wrapping_add(100), s[2].1));
+                (a, b, s)
+            };
+            let (mut a, _b, s) = setup();
+            let (una, nxt) = (a.snd_una, a.snd_nxt);
+            let ip_payload = 1500 - u32::from(header(&a));
+            let cases = [
+                ("start of a partly acknowledged segment", s[0].0, false),
+                ("SND.UNA - 1", Seq(una.0.wrapping_sub(1)), false),
+                ("SND.UNA", una, true),
+                ("SND.NXT - 1", Seq(nxt.0.wrapping_sub(1)), true),
+                ("SND.NXT", nxt, true),
+                ("SND.NXT + 1", nxt.wrapping_add(1), false),
+            ];
+            for (name, seq, accepted) in cases {
+                assert_eq!(a.quote_in_window(seq), accepted, "{ipv4} {iss}: {name}");
+                assert_eq!(
+                    a.quoted_span(seq.0, ip_payload),
+                    accepted.then_some((seq.0, seq.0.wrapping_add(ip_payload - 20))),
+                    "{ipv4} {iss}: {name}"
+                );
+                assert_eq!(
+                    a.network_error(51, seq.0, NetworkError::SoftUnreachable),
+                    Ok(accepted),
+                    "{ipv4} {iss}: {name}"
+                );
+                assert_eq!(
+                    a.take_events().network_error,
+                    accepted.then_some(NetworkError::SoftUnreachable)
+                );
+            }
+            assert_eq!(a.state(), State::Established);
+
+            // The PTB entries: s[0] is recorded and its tail outstanding,
+            // but it starts below SND.UNA.
+            let (mut a, _b, s) = setup();
+            let h = header(&a);
+            assert!(!a.pmtu_feedback(52, s[0].0.0, 1500, h, 1400).unwrap());
+            assert_eq!(report(&mut a, 52, s[0], 1400, false).feedback, Rejected);
+            assert!(pending(&a).is_empty());
+            assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1500);
+            // s[1] starts inside the window: each entry accepts it.
+            assert_ne!(report(&mut a, 53, s[1], 1400, false).feedback, Rejected);
+            assert_eq!(pending(&a), [(s[1].0, s[1].1)]);
+            assert!(a.pmtu_feedback(54, s[2].0.0, 1500, h, 1300).unwrap());
+            assert_eq!(pending(&a), [(s[1].0, s[2].1)]);
+        }
+    }
+}
+
+// Before the handshake completes, as Linux: SYN-SENT accepts ISS and ISS + 1
+// (SND.UNA..=SND.NXT); a passive open in SYN-RECEIVED without Fast Open is a
+// request socket in Linux, which tcp_req_err accepts only at its ISS (the
+// SYN-ACK), while a Fast Open child keeps the window from its ISS (Linux's
+// snt_isn) to SND.NXT.
+#[test]
+fn handshake_icmp_quotes_follow_linux() {
+    for ipv4 in [true, false] {
+        let tuple = if ipv4 {
+            tuple()
+        } else {
+            Tuple {
+                local: "[2001:db8::1]:1000".parse().unwrap(),
+                remote: "[2001:db8::2]:2000".parse().unwrap(),
+            }
+        };
+        let mut a = Connection::active(tuple, cfg(), 5000, 0).unwrap();
+        // No SYN sent yet: no quote names it (Linux ignores ICMP errors for
+        // a deferred Fast Open connect); `quoted_span` leaves it to policy.
+        assert!(!a.quote_in_window(Seq(5000)));
+        assert!(a.quoted_span(5000, 40).is_some());
+        assert_eq!(
+            a.network_error(0, 5000, NetworkError::SoftUnreachable),
+            Ok(false)
+        );
+        let bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple), &bytes).unwrap();
+        assert_eq!(
+            (a.state(), a.snd_una, a.snd_nxt),
+            (State::SynSent, Seq(5000), Seq(5001))
+        );
+        for (seq, accepted) in [(4999, false), (5000, true), (5001, true), (5002, false)] {
+            assert_eq!(
+                a.quoted_span(seq, 40).is_some(),
+                accepted,
+                "{ipv4}: SYN-SENT {seq}"
+            );
+            assert_eq!(
+                a.network_error(1, seq, NetworkError::SoftUnreachable),
+                Ok(accepted)
+            );
+        }
+        for early in [false, true] {
+            let mut b = Connection::passive_with_receive(
+                reverse(tuple),
+                ConnectionConfig {
+                    pmtud: None,
+                    ..cfg()
+                },
+                900,
+                10,
+                &syn,
+                early,
+                &mut None,
+                RxTimestamps::default(),
+                RxPacketTimestamps::default(),
+            )
+            .unwrap();
+            b.passive_fast_open(None, early);
+            packet(&mut b, 10);
+            assert_eq!(
+                (b.state(), b.snd_una, b.snd_nxt),
+                (State::SynReceived, Seq(900), Seq(901))
+            );
+            for (seq, accepted) in [(899, false), (900, true), (901, early), (902, false)] {
+                assert_eq!(
+                    b.quoted_span(seq, 40).is_some(),
+                    accepted,
+                    "{ipv4}: SYN-RECEIVED early={early} {seq}"
+                );
+                assert_eq!(
+                    b.network_error(11, seq, NetworkError::SoftUnreachable),
+                    Ok(accepted),
+                    "{ipv4}: SYN-RECEIVED early={early} {seq}"
+                );
+            }
+        }
+    }
 }

@@ -322,7 +322,7 @@
       "section": "4.1",
       "quote": "Many TCP implementations have incorporated a validation check such that they react only to those ICMP error messages that appear to relate to segments currently \"in flight\" to the destination system. These implementations check that the TCP sequence number contained in the payload of the ICMP error message is within the range SND.UNA =< SEG.SEQ < SND.NXT. This means that they require that the sequence number be within the range of the data already sent but not yet acknowledged. If an ICMP error message does not pass this check, it is discarded.",
       "status": "covered",
-      "reason": "Informational mitigation selected as policy: live serial send-window validation plus stronger exact recent packet gate; stale/idle and wrapped-sequence quotes tested, not authentication.",
+      "reason": "Informational mitigation selected as policy, as Linux's tcp_v4_err and tcp_v6_err apply it: every TCP entry (Host arrival, network errors, legacy and correlated PTB) accepts a quoted sequence only within SND.UNA =< SEG.SEQ =< SND.NXT in serial arithmetic (Linux's between() also accepts SND.NXT, a quoted pure ACK, which this text excludes), the legacy PTB also needs its exact recent packet; a refused quote is discarded (ICMP_OUT_OF_WINDOW at the Host). Stale/idle, wrapped and boundary quotes tested, not authentication.",
       "evidence": [
         "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
         "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
@@ -1416,13 +1416,9 @@
       "id": "5927-191",
       "section": "7.4",
       "quote": "if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();",
-      "status": "covered",
-      "reason": "Selected live-sequence check uses serial arithmetic for SND.UNA<=seq<SND.NXT; the same stale/idle/wrapped quote test supports 044. Unrelated initialization and reset deviations do not invalidate this branch.",
-      "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.4",
-      "evidence": [
-        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
-      ]
+      "status": "exception",
+      "reason": "Selected policy deviation, as Linux's tcp_v4_err and tcp_v6_err (between(seq, snd_una, snd_nxt)): a quoted sequence equal to SND.NXT (a pure ACK or RST) is accepted, not dropped; one below SND.UNA or beyond SND.NXT is dropped, in serial arithmetic (connection_ptb_tests icmp_quote_window_is_linuxs_between_at_every_entry).",
+      "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
     },
     {
       "id": "5927-192",

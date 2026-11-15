@@ -159,7 +159,11 @@ pub fn icmp_outcome_reason(outcome: &IcmpOutcome) -> Option<ntcp::DropReason> {
     use ntcp::DropReason as R;
     Some(match outcome {
         IcmpOutcome::Discarded(IcmpDiscard::SourceQuench) => R::IcmpSourceQuench,
-        IcmpOutcome::Discarded(IcmpDiscard::Implausible) => R::IcmpOutOfWindow,
+        IcmpOutcome::Discarded(IcmpDiscard::OutOfWindow)
+        | IcmpOutcome::Redirect(RedirectOutcome::Rejected(RedirectRejection::OutOfWindow)) => {
+            R::IcmpOutOfWindow
+        }
+        IcmpOutcome::Discarded(IcmpDiscard::Implausible) => R::IcmpInvalid,
         IcmpOutcome::Discarded(
             IcmpDiscard::Uncorrelated
             | IcmpDiscard::Ambiguous
@@ -538,6 +542,10 @@ pub enum IcmpDiscard {
     SourceQuench,
     /// No live or remembered submission matches the quote.
     Uncorrelated,
+    /// The quote's addresses and ports name a live connection, which
+    /// refuses its sequence (`Endpoint::quoted_segment`): Linux's
+    /// OutOfWindowIcmps.
+    OutOfWindow,
     /// Matches more than one owner generation or submission (tombstones
     /// included), or disagree on the path for a path-level report.
     Ambiguous,
@@ -549,6 +557,10 @@ pub enum IcmpDiscard {
     /// packet it claims to have dropped.
     Implausible,
 }
+
+// The connection a TCP quote names refuses its sequence (`Host::tcp_quote`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OutOfWindow;
 
 /// TCP policy's disposition of a correlated report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2416,11 +2428,17 @@ impl Host {
         let zone = scoped.then_some(context.link);
         let ipv4 = quote.ip.source.is_ipv4();
         // RFC 5927 section 4.1, as Linux: a TCP quote is about the connection
-        // of its scoped tuple whose sent sequence space holds the quoted
-        // sequence, and that connection's policy then judges it. Connections
-        // keep no per-segment evidence; a quote none accepts may still name
-        // a stateless reply in the ledger.
-        if let Some((owner, mut segment, path)) = self.tcp_quote(endpoint, &key, zone) {
+        // of its scoped tuple, which accepts it only if its sent sequence
+        // space holds the quoted sequence; that connection's policy then
+        // judges it. Connections keep no per-segment evidence; a quote whose
+        // tuple names none may still name a stateless reply in the ledger.
+        if let Some(tcp) = self.tcp_quote(endpoint, &key, zone) {
+            // A connection that refuses the quoted sequence drops the message,
+            // as Linux's tcp_v4_err and tcp_v6_err do (OutOfWindowIcmps):
+            // nothing else may correlate it.
+            let Ok((owner, mut segment, path)) = tcp else {
+                return Ok(Completed(Discarded(IcmpDiscard::OutOfWindow)));
+            };
             if !self.quote_authorized(path, packet.payload) {
                 return Ok(Completed(Discarded(IcmpDiscard::Uncorrelated)));
             }
@@ -2620,13 +2638,15 @@ impl Host {
     }
 
     // The managed connection a TCP quote is about (`Endpoint::quoted_segment`),
-    // with the segment it quotes and its binding's current path.
+    // with the segment it quotes and its binding's current path; Err when
+    // that connection refuses the quoted sequence (Linux's
+    // OutOfWindowIcmps).
     pub(crate) fn tcp_quote(
         &self,
         endpoint: &Endpoint,
         key: &QuoteKey,
         zone: Option<LinkId>,
-    ) -> Option<(ConnectionId, CorrelatedSegment, path::PathId)> {
+    ) -> Option<Result<(ConnectionId, CorrelatedSegment, path::PathId), OutOfWindow>> {
         let QuotedSelector::Tcp {
             source_port,
             destination_port,
@@ -2652,7 +2672,11 @@ impl Host {
             u16::try_from(key.header_len).ok()?,
         )?;
         let path = self.binding(owner).ok()?.snapshot.path();
-        Some((owner, segment, path))
+        Some(
+            segment
+                .map(|segment| (owner, segment, path))
+                .ok_or(OutOfWindow),
+        )
     }
 
     // TCP policy for one correlated report, at arrival or at replay: deferred

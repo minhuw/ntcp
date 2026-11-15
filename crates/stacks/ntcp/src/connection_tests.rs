@@ -11878,8 +11878,9 @@ fn network_errors_validate_quote_and_mss_reduction_repacketizes() {
         a.network_error(50, 100, NetworkError::HardUnreachable),
         Ok(false)
     );
+    // SND.NXT is 109: beyond it (Linux's tcp_v4_err accepts SND.NXT itself).
     assert_eq!(
-        a.network_error(50, 109, NetworkError::HardUnreachable),
+        a.network_error(50, 110, NetworkError::HardUnreachable),
         Ok(false)
     );
     assert_eq!(

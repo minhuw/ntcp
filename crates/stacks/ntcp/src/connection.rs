@@ -3009,7 +3009,7 @@ impl Connection {
         //# Quench messages (MUST-55).
         if error == NetworkError::SourceQuench
             || matches!(self.state, State::Closed | State::TimeWait)
-            || Seq(quoted_sequence).in_window(self.snd_una, self.flight()) != Some(true)
+            || !self.quote_in_window(Seq(quoted_sequence))
         {
             return Ok(false);
         }
@@ -3965,7 +3965,7 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc5927#section-4.1
-    //= reason=Informational mitigation selected as policy: live serial send-window validation plus stronger exact recent packet gate; stale/idle and wrapped-sequence quotes tested, not authentication.
+    //= reason=Informational mitigation selected as policy, as Linux's tcp_v4_err and tcp_v6_err apply it: every TCP entry (Host arrival, network errors, legacy and correlated PTB) accepts a quoted sequence only within SND.UNA =< SEG.SEQ =< SND.NXT in serial arithmetic (Linux's between() also accepts SND.NXT, a quoted pure ACK, which this text excludes), the legacy PTB also needs its exact recent packet; a refused quote is discarded (ICMP_OUT_OF_WINDOW at the Host). Stale/idle, wrapped and boundary quotes tested, not authentication.
     //# Many TCP implementations have incorporated a validation check such that they react
     //# only to those ICMP error messages that appear to relate to segments currently "in
     //# flight" to the destination system. These implementations check that the TCP sequence
@@ -3984,9 +3984,6 @@ impl Connection {
     //# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path
     //# MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to improve
     //# segmentation decisions.
-    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
-    //= reason=Selected live-sequence check uses serial arithmetic for SND.UNA<=seq<SND.NXT; the same stale/idle/wrapped quote test supports 044. Unrelated initialization and reset deviations do not invalidate this branch.
-    //# if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
     //= reason=Accepted feedback repairs only the matched Connection's quoted range at once; the family-floor test verifies the repair's sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; exact dropped-range notification and burst non-amplification are audited in 1191-061, 1191-064 and 1191-080.
@@ -4029,11 +4026,13 @@ impl Connection {
         if matches!(self.state, State::Closed | State::TimeWait) {
             return Ok(false);
         }
+        if !self.quote_in_window(Seq(seq)) {
+            return Ok(false);
+        }
         let Some(span) = self
             .pmtud
             .as_ref()
             .and_then(|p| p.quoted_span(Seq(seq), size, header, mtu))
-            .filter(|&(start, end)| self.quoted_outstanding(start, end).is_some())
         else {
             return Ok(false);
         };
@@ -4069,15 +4068,10 @@ impl Connection {
             feedback: crate::PmtuFeedback::Rejected,
             derived_mtu: None,
         };
-        // A sequence-bearing quote must overlap the outstanding window; a pure
-        // ACK/RST quote (empty span) keeps the in-flight start test and
-        // carries no stream work.
-        let live = if start == end {
-            start.in_window(self.snd_una, self.flight()) == Some(true)
-        } else {
-            self.quoted_outstanding(start, end).is_some()
-        };
-        if matches!(self.state, State::Closed | State::TimeWait) || !live {
+        // The Host accepted the quote at arrival by `quote_in_window`; a
+        // replayed report is judged again by the same rule. Repair work is
+        // then the span's outstanding part, none for a pure ACK/RST quote.
+        if matches!(self.state, State::Closed | State::TimeWait) || !self.quote_in_window(start) {
             return Ok(rejected);
         }
         let Some(p) = &mut self.pmtud else {

@@ -337,7 +337,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc5927#section-4.1
 //= type=test
-//= reason=Informational mitigation selected as policy: live serial send-window validation plus stronger exact recent packet gate; stale/idle and wrapped-sequence quotes tested, not authentication.
+//= reason=Informational mitigation selected as policy, as Linux's tcp_v4_err and tcp_v6_err apply it: every TCP entry (Host arrival, network errors, legacy and correlated PTB) accepts a quoted sequence only within SND.UNA =< SEG.SEQ =< SND.NXT in serial arithmetic (Linux's between() also accepts SND.NXT, a quoted pure ACK, which this text excludes), the legacy PTB also needs its exact recent packet; a refused quote is discarded (ICMP_OUT_OF_WINDOW at the Host). Stale/idle, wrapped and boundary quotes tested, not authentication.
 //# Many TCP implementations have incorporated a validation check such that they react only
 //# to those ICMP error messages that appear to relate to segments currently "in flight" to
 //# the destination system. These implementations check that the TCP sequence number
@@ -385,11 +385,6 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 //# connection. During the Path-MTU Update stage, TCP already has knowledge of the
 //# estimated Path-MTU for the given connection. Thus, in this case, these
 //# implementations are more cautious with the errors being reported by the network.
-
-//= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
-//= type=test
-//= reason=Selected live-sequence check uses serial arithmetic for SND.UNA<=seq<SND.NXT; the same stale/idle/wrapped quote test supports 044. Unrelated initialization and reset deviations do not invalidate this branch.
-//# if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
 
 //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
 //= type=test
@@ -762,10 +757,14 @@ fn pmtud_full_stop_r1_halving_and_normal_congestion_response() {
             let (mut a, _) = family_pair(cfg(1500), ipv4, 0);
             a.write(&[7; 1400]).unwrap();
             let original = wire_packet(&mut a, 40, OutgoingIpv4Options::default());
-            // A stale quote cannot explain the current full stop.
+            // A quote beyond SND.NXT cannot explain the current full stop.
             assert!(
-                !a.network_error(41, a.snd_nxt.0, NetworkError::SoftUnreachable)
-                    .unwrap()
+                !a.network_error(
+                    41,
+                    a.snd_nxt.0.wrapping_add(1),
+                    NetworkError::SoftUnreachable
+                )
+                .unwrap()
             );
             let known_mtu = match feedback {
                 1 => {

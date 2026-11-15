@@ -262,11 +262,13 @@ fn ptb_lowers_only_the_link_whose_submission_it_quotes() {
     let arrival = a.0.ingress_context(link).unwrap();
     let wrong = a.0.ingress_context(other).unwrap();
     let report = ptb(&first, 1280);
-    // The same link-local address on the other link did not send it.
+    // The same link-local address on the other link did not send it: the
+    // tuple there names the sibling, which refuses a sequence outside its own
+    // window (as Linux's scoped lookup finds the socket bound to that link).
     assert_eq!(
         a.0.input_icmp(&mut a.1, wrong, now + 12, &report, None),
         Ok(IcmpDispatch::Completed(IcmpOutcome::Discarded(
-            IcmpDiscard::Uncorrelated
+            IcmpDiscard::OutOfWindow
         )))
     );
     let learned = |a: &Peer, id| {

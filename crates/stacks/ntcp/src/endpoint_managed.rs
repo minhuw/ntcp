@@ -220,30 +220,37 @@ impl Endpoint {
         Some((self.id(index), delivered))
     }
 
-    /// The live connection an ICMP error quoting `tuple` and `sequence` is
-    /// about, with the segment it quotes, as RFC 5927 section 4.1 and Linux
-    /// accept one: the scoped tuple's connection, whose sent sequence space
-    /// [SND.UNA, SND.NXT] holds the sequence. The segment's span runs from
-    /// the sequence over the payload the quoted lengths leave after this
-    /// connection's data-segment TCP header (`Connection::quoted_span`).
+    /// The live connection an ICMP error quoting `tuple` is about, as RFC
+    /// 5927 section 4.1 and Linux's tcp_v4_err and tcp_v6_err find it: the
+    /// scoped tuple's connection. With it the segment it quotes, if the
+    /// connection accepts `sequence` as Linux does (SND.UNA <= sequence <=
+    /// SND.NXT; at the ISS only for a passive open in SYN-RECEIVED without
+    /// Fast Open), or None: an out-of-window quote, which Linux counts in
+    /// OutOfWindowIcmps and drops. The segment's span runs from the sequence
+    /// over the payload the quoted lengths leave after this connection's
+    /// data-segment TCP header (`Connection::quoted_span`).
     pub fn quoted_segment(
         &self,
         tuple: ScopedTuple,
         sequence: u32,
         ip_packet_len: u32,
         ip_header_len: u16,
-    ) -> Option<(ConnectionId, CorrelatedSegment)> {
+    ) -> Option<(ConnectionId, Option<CorrelatedSegment>)> {
         let id = self.scoped_connection_id(tuple)?;
         let payload = ip_packet_len.checked_sub(u32::from(ip_header_len))?;
-        let (start, end) = self.slot(id).ok()?.connection.quoted_span(sequence, payload)?;
+        let span = self
+            .slot(id)
+            .ok()?
+            .connection
+            .quoted_span(sequence, payload);
         Some((
             id,
-            CorrelatedSegment {
+            span.map(|(start, end)| CorrelatedSegment {
                 start,
                 end,
                 ip_packet_len,
                 ip_header_len,
-            },
+            }),
         ))
     }
 

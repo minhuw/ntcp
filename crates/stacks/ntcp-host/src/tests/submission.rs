@@ -92,11 +92,12 @@ fn records(host: &Host) -> Vec<Record> {
     host.ledger.records().collect()
 }
 // The connection a quote of `frame` names, with the span it quotes
-// (`Host::tcp_quote`): none once no sent, unacknowledged sequence space holds
-// it.
+// (`Host::tcp_quote`): none once its connection's sent sequence space
+// [SND.UNA, SND.NXT] no longer holds it.
 fn quoted_span(side: &Side, frame: &[u8]) -> Option<(ConnectionId, u32, u32)> {
     side.0
-        .tcp_quote(&side.1, &quote(frame), None)
+        .tcp_quote(&side.1, &quote(frame), None)?
+        .ok()
         .map(|(owner, segment, _)| (owner, segment.start, segment.end))
 }
 
@@ -148,7 +149,7 @@ fn connection_retries_block_and_refuse_without_ledger_evidence() {
             quoted_span(&a, &frame),
             Some((id, start, start.wrapping_add(1000)))
         );
-        let (_, _, path) = a.0.tcp_quote(&a.1, &quote(&frame), None).unwrap();
+        let (_, _, path) = a.0.tcp_quote(&a.1, &quote(&frame), None).unwrap().unwrap();
         assert_eq!(path, a.0.binding(id).unwrap().snapshot.path());
         input(&mut b.0, &mut b.1, b.2, 112, &frame, 0);
         let mut bytes = [0; 2000];

@@ -69,26 +69,48 @@ impl Connection {
         Some((low, low.wrapping_add(count)))
     }
 
-    /// RFC 5927 section 4.1's acceptance of a TCP sequence quoted by an ICMP
-    /// error, as Linux's tcp_v4_err and tcp_v6_err make it: within the sent
-    /// sequence space [SND.UNA, SND.NXT], or the start of a quoted segment
-    /// still partly outstanding. The span the quoted segment consumed is
-    /// `ip_payload` octets (after the IP header) less this connection's
-    /// data-segment TCP header. A quote carries only eight TCP octets, so
-    /// options beyond the timestamps (SACK blocks) make the span end a
-    /// little late, and a quoted FIN is not part of it.
+    /// Whether an ICMP error quoting `sequence` is about this connection's
+    /// sent data (RFC 5927 section 4.1), checked as Linux's tcp_v4_err and
+    /// tcp_v6_err check it: SND.UNA <= sequence <= SND.NXT (`between`,
+    /// both ends included, so a quoted pure ACK at SND.NXT is accepted). A
+    /// passive open still in SYN-RECEIVED without Fast Open is a request
+    /// socket in Linux, which tcp_req_err accepts only at its ISS (the
+    /// SYN-ACK); a Fast Open child's SND.UNA is its ISS until the SYN-ACK is
+    /// acknowledged, the snt_isn Linux checks it against. An active open
+    /// that has sent no SYN yet has nothing a quote could name (Linux
+    /// ignores every ICMP error for a deferred Fast Open connect). Linux
+    /// counts any other refused quote in OutOfWindowIcmps and acts on none
+    /// of it.
+    pub(crate) fn quote_in_window(&self, sequence: Seq) -> bool {
+        match self.state {
+            State::SynReceived if self.passive_open && !self.fast_open_early => {
+                sequence == self.iss
+            }
+            State::SynSent if self.flight() == 0 => false,
+            _ => sequence.distance_from(self.snd_una) <= self.flight(),
+        }
+    }
+
+    /// The span of a segment an ICMP error quotes at `sequence`, if
+    /// `quote_in_window` accepts it: `ip_payload` octets (after the IP
+    /// header) less this connection's data-segment TCP header. A quote
+    /// carries only eight TCP octets, so options beyond the timestamps (SACK
+    /// blocks) make the span end a little late, and a quoted FIN is not part
+    /// of it. Linux ignores a quote about a CLOSE or TIME-WAIT socket, or a
+    /// deferred Fast Open connect, before its window check, counting
+    /// nothing: such a connection's quote is not judged here, and its policy
+    /// then refuses it.
     pub(crate) fn quoted_span(&self, sequence: u32, ip_payload: u32) -> Option<(u32, u32)> {
-        let header = 20 + if self.timestamps { 12 } else { 0 };
-        let (start, end) = (
-            Seq(sequence),
-            Seq(sequence).wrapping_add(ip_payload.saturating_sub(header)),
-        );
-        if start.distance_from(self.snd_una) > self.snd_nxt.distance_from(self.snd_una)
-            && self.quoted_outstanding(start, end).is_none()
-        {
+        let ignored = matches!(self.state, State::Closed | State::TimeWait)
+            || self.state == State::SynSent && self.flight() == 0;
+        if !ignored && !self.quote_in_window(Seq(sequence)) {
             return None;
         }
-        Some((start.0, end.0))
+        let header = 20 + if self.timestamps { 12 } else { 0 };
+        Some((
+            sequence,
+            sequence.wrapping_add(ip_payload.saturating_sub(header)),
+        ))
     }
 
     /// The latest transmission time among what the peer acknowledged: the
