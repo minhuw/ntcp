@@ -10875,14 +10875,19 @@ impl Connection {
                     segments = edge / wire_mss;
                     total = edge;
                 }
-                let last = if !total.is_multiple_of(wire_mss) {
-                    tail
-                } else {
-                    wire_mss
-                };
-                // A PUSH in an intermediate physical segment must not migrate.
-                // Leave such selections scalar, including successive PUSH writes.
-                if segments >= 2 && !self.send.pushed(offset, total - last) {
+                // A PUSH in an intermediate physical segment must not migrate:
+                // the group ends with the first segment holding one, which
+                // takes PSH as its last segment, where scalar selection puts
+                // it (application_push below). The rest are selected after it.
+                if segments >= 2
+                    && let Some(first) =
+                        self.send
+                            .first_pushed_segment(offset, wire_mss, segments - 1)
+                {
+                    segments = first + 1;
+                    total = segments * wire_mss;
+                }
+                if segments >= 2 {
                     count = total;
                     segmentation = Some(crate::TransmitSegmentation {
                         payload_len: total,

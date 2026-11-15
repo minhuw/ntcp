@@ -411,8 +411,9 @@ fn cut(frame: &[u8], mss: usize) -> Vec<Vec<u8>> {
 
 // ntcp-native over the ring port with TSO: aggregates leave as one TSO mbuf
 // chain each (offload metadata checked by the fixture), which the test cuts
-// as a device would for a software peer; the pool's room for a whole
-// aggregate runs out and blocks it until the ring drains. The stream
+// as a device would for a software peer; the pool, held down to room for
+// a scalar segment, has none for the next aggregate, which waits until the
+// mbufs return. The stream
 // arrives whole. Each write of up to 64 KiB asks for Scheduled and
 // Acknowledged observations, as dpdk_echo's requests do: aggregates still
 // form, and each request's arrive once, for its last byte. Real ring
@@ -464,7 +465,7 @@ unsafe fn segmented_network(mut io: Dpdk) {
     let budget = WorkBudget::new(64, 64, 64, 64);
     let (mut server, mut sent, mut received) = (None, 0, Vec::new());
     let (mut frame, mut out) = (vec![0; MAX_PACKET_LEN], vec![0; 65536]);
-    let (mut aggregates, mut blocked) = (0, 0);
+    let (mut aggregates, mut blocked, mut holding) = (0, 0, false);
     let mut backlog = VecDeque::new();
     let (mut writes, mut targets, mut events) = (0u64, Vec::new(), Vec::new());
     let placeholder = TimestampEvent {
@@ -497,6 +498,11 @@ unsafe fn segmented_network(mut io: Dpdk) {
         let pressure = a.counters().backend_backpressure;
         a.drive(now, budget).unwrap();
         blocked += usize::from(a.counters().backend_backpressure > pressure);
+        // Mbufs come back once an aggregate waited for them.
+        if holding && blocked != 0 {
+            unsafe { ntcp_test_release() };
+            holding = false;
+        }
         loop {
             let report = a.drain_timestamps(&mut stamps);
             events.extend(stamps[..report.written].iter().map(|e| e.observation));
@@ -518,6 +524,13 @@ unsafe fn segmented_network(mut io: Dpdk) {
                 assert!(frame.len() > 1514);
                 incoming.borrow_mut().extend(cut(frame, mss as usize));
             }
+        }
+        // Once aggregates flow, the pool keeps room for a scalar segment
+        // (12 mbufs of 128 bytes) but not for the next aggregate, as frames
+        // held elsewhere would: that aggregate waits until mbufs return.
+        if aggregates != 0 && blocked == 0 && !holding {
+            unsafe { ntcp_test_hold(16) };
+            holding = true;
         }
         b.drive(now, budget).unwrap();
         backlog.extend(outgoing.borrow_mut().drain(..));
@@ -553,6 +566,7 @@ unsafe fn segmented_network(mut io: Dpdk) {
             assert!(matches!(event.outcome, TxTimestampOutcome::Recorded { .. }));
         }
     }
+    assert!(!holding);
     // What is left on the rings goes back to the pool.
     for step in 0..4 {
         a.drive(30_000_000 + step, budget).unwrap();

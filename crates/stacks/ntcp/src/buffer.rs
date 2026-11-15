@@ -262,6 +262,36 @@ impl SendBuffer {
         front.iter().chain(back).fold(0, |any, mark| any | mark) & 1 != 0
     }
 
+    // Index of the first of `segments` consecutive `size`-byte ranges from
+    // `offset` holding a PUSH mark. Only the ranges before the one holding
+    // the last mark are scanned, in blocks folded whole (as `pushed` folds),
+    // up to the first block with a mark, which smaller blocks then narrow.
+    pub(crate) fn first_pushed_segment(
+        &self,
+        offset: usize,
+        size: usize,
+        segments: usize,
+    ) -> Option<usize> {
+        let last = self.push_offset().filter(|&last| last >= offset)?;
+        let holding_last = (last - offset) / size;
+        let mut at = 0;
+        for part in self.mark_slices(offset, holding_last.min(segments) * size) {
+            for block in part.chunks(4096) {
+                if block.iter().fold(0, |any, mark| any | mark) & 1 != 0 {
+                    for small in block.chunks(64) {
+                        if small.iter().fold(0, |any, mark| any | mark) & 1 != 0 {
+                            let n = small.iter().position(|mark| mark & 1 != 0).unwrap();
+                            return Some((at + n) / size);
+                        }
+                        at += small.len();
+                    }
+                }
+                at += block.len();
+            }
+        }
+        (holding_last < segments).then_some(holding_last)
+    }
+
     pub(crate) fn collapse_push(&mut self, offset: usize, count: usize) {
         for part in self.mark_slices_mut(offset, count) {
             for mark in part {
@@ -3686,6 +3716,49 @@ mod tests {
                 out[..record]
                     .iter()
                     .eq(tail[..record].iter().map(|byte| &byte.0))
+            );
+        }
+    }
+
+    #[test]
+    fn first_pushed_segment_agrees_with_a_byte_model_across_wrap() {
+        // Segments of queued bytes, the PUSH marks of writes and ACKs that
+        // move the ring's head around it: the first segment holding a mark
+        // is the model's, whichever block of the scan it falls in.
+        let mut send = SendBuffer::new(20_000).unwrap();
+        let mut model: VecDeque<bool> = VecDeque::new();
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        for _ in 0..3000 {
+            if next(3) == 0 && !model.is_empty() {
+                let count = next(model.len() + 1);
+                send.acknowledge(count).unwrap();
+                model.drain(..count);
+            } else {
+                let count = send.write(&[7; 6000][..next(6001)]);
+                model.extend(core::iter::repeat_n(false, count));
+                if count != 0 && next(2) == 0 {
+                    send.mark_push();
+                    *model.back_mut().unwrap() = true;
+                }
+            }
+            let size = 1 + next(1500);
+            let offset = next(model.len() + 1);
+            let segments = next((model.len() - offset) / size + 1);
+            let expected = (0..segments).find(|&n| {
+                model
+                    .range(offset + n * size..offset + (n + 1) * size)
+                    .any(|&push| push)
+            });
+            assert_eq!(
+                send.first_pushed_segment(offset, size, segments),
+                expected,
+                "offset {offset} size {size} segments {segments}"
             );
         }
     }

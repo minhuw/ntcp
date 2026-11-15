@@ -962,6 +962,41 @@ fn short_last_segment_joins_a_group_exactly_when_scalar_selection_sends_it() {
     }
 }
 
+#[test]
+fn group_ends_with_the_first_segment_holding_a_push() {
+    // Pipelined responses as separate pushed writes (24 + 4096 + 24 bytes
+    // each, as an NVMe/TCP target writes a C2H data PDU and its response):
+    // PUSH marks end bytes 23, 4119, 4143, 4167, 8263 and 8287, in 988-byte
+    // segments 0, 4, 4, 4 and the short last one, 8. Each group ends with
+    // the segment holding its first PUSH, which carries PSH there as
+    // scalar selection puts it; segment 0 holds one alone and stays scalar.
+    let write = |e: &mut Endpoint, id| {
+        for _ in 0..2 {
+            for len in [24, 4096, 24] {
+                assert_eq!(e.write(id, &std::vec![7; len]).unwrap(), len);
+            }
+        }
+    };
+    let (mut a, _, id, _) = pair(false, true, 16_384);
+    let (mut b, _, bid, _) = connected(false, true, 16_384);
+    b.enable_output_reservations().unwrap();
+    write(&mut a, id);
+    write(&mut b, bid);
+    let (wire, sizes) = drain(&mut a, id, 2);
+    assert_eq!(sizes, [4, 4]);
+    assert_eq!(wire.len(), 9);
+    // The wire is what selection without GSO sends at that instant.
+    assert_eq!(wire, scalar(&mut b, bid, 2));
+    let psh: Vec<bool> = wire
+        .iter()
+        .map(|p| wire::parse(ip(), p).unwrap().header.flags & wire::PSH != 0)
+        .collect();
+    assert_eq!(
+        psh,
+        [true, false, false, false, true, false, false, false, true]
+    );
+}
+
 // Delivers `wire` to `peer` at `now` and returns its ACKs.
 fn deliver(
     peer: &mut Endpoint,
