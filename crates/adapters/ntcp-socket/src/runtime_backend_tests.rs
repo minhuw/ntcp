@@ -3100,3 +3100,56 @@ fn device_clock_identities_are_not_interface_indices_and_never_repeat() {
     assert_ne!(first, second);
     assert!(second > first);
 }
+
+// The owner samples its transport clock (`Owner::clock`, CLOCK_BOOTTIME,
+// a vDSO call) at fixed points of each pass and each packet. One small
+// request served as an application thread would: its segment arrives, the
+// read and the reply's write come in on the owner's request queue in the
+// same pass, the reply leaves in the next one, then the queue closes. 39
+// samples over the two passes: 11 each pass (2 at its top, a realtime
+// bracket in expire_egress and in poll_backend_timestamps, one each in
+// service_egress, service_discovery, drain_icmp_output, service_control
+// and output_wait), 3 for the arriving segment (input_packet and the
+// bracket of input_segmented), one per request served (execute), and 12
+// for the reply's selection and submission in service_egress. A change of
+// this count is a change of the owner's per-request clock cost.
+#[test]
+fn clock_samples_per_served_request() {
+    let (mut a, mut b, client, server, _) = pair();
+    let state = attach(&mut b, 64);
+    b.enable_egress(64, None).unwrap();
+    a.execute(client, Op::Write(vec![1; 18])).unwrap();
+    let request = poll_packet(&mut a).unwrap();
+    let mut frame = vec![0; (14 + request.len()).max(60)];
+    ntcp_ethernet::encode_ethernet(
+        &mut frame,
+        [4; 6],
+        [2; 6],
+        ntcp_ethernet::ETHERTYPE_IPV4,
+        &request,
+    )
+    .unwrap();
+    state.lock().unwrap().incoming.push_back(Ok(frame));
+    let (tx, rx) = mpsc::sync_channel(2);
+    let mut replies = Vec::new();
+    for op in [Op::Read(100), Op::Write(vec![2; 71])] {
+        let (reply, result) = mpsc::sync_channel(1);
+        tx.send(Request {
+            id: server,
+            op,
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
+        })
+        .unwrap();
+        replies.push(result);
+    }
+    drop(tx);
+    let before = b.clock_reads;
+    b.run(rx, -1, &std::sync::atomic::AtomicBool::new(false));
+    assert_eq!(replies[0].recv().unwrap().unwrap().bytes, [1; 18]);
+    assert_eq!(replies[1].recv().unwrap().unwrap().value, 71);
+    assert_eq!(state.lock().unwrap().sent.len(), 1);
+    assert_eq!(b.clock_reads - before, 39);
+}

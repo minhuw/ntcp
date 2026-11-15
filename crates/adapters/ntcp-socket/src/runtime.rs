@@ -985,6 +985,10 @@ struct Owner {
     started: u64,
     #[cfg(test)]
     test_now: Option<u64>,
+    // Transport clock samples taken (`clock`), for tests that count them
+    // per request.
+    #[cfg(test)]
+    clock_reads: u64,
     // Unit-test owners count from their construction, so fixture schedules
     // stay literal; zero gives the provider's own ticks.
     #[cfg(test)]
@@ -1436,6 +1440,8 @@ impl Owner {
             #[cfg(test)]
             test_now: None,
             #[cfg(test)]
+            clock_reads: 0,
+            #[cfg(test)]
             test_origin,
             #[cfg(test)]
             test_clock_failure: false,
@@ -1765,6 +1771,7 @@ impl Owner {
     fn clock(&mut self) -> Result<u64> {
         #[cfg(test)]
         {
+            self.clock_reads += 1;
             if self.test_clock_failure {
                 return Err(EIO);
             }
