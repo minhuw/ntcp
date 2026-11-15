@@ -5989,6 +5989,47 @@ impl Endpoint {
         self.time_wait_slots + self.time_wait.len()
     }
 
+    // The reference the owner's timers are checked against: every
+    // connection's exact next timer (`Connection::next_deadline`, the
+    // minimum of its timers' exact deadlines), every TIME-WAIT record's
+    // deadline and every held reservation's pacing, found by visiting them
+    // all. The earliest of them, and the latest wake `next_deadline` may
+    // report: the exact deadlines, a TIME-WAIT record's by its wheel level's
+    // bound later (it runs at its bucket's expiry).
+    #[cfg(test)]
+    pub(crate) fn reference_next_deadline(&self) -> (Option<Instant>, Option<Instant>) {
+        let connections = self
+            .occupied
+            .iter()
+            .filter(|&index| !self.is_output_reserved(self.id(index)))
+            .filter_map(|index| self.slots[index].as_ref()?.deadline());
+        let reserved = self.unattempted_reservations.iter().filter_map(|index| {
+            let r = self.reservations[index].current.as_ref()?;
+            self.retained_slot(r.packet.connection?)
+                .ok()?
+                .connection
+                .reserved_pacing_deadline(self.now, r.departure.as_ref()?)
+        });
+        let exact = connections.chain(reserved).min();
+        let record = self
+            .time_wait
+            .indices()
+            .map(|index| self.time_wait.record(index).deadline)
+            .min();
+        let latest = record
+            .map(|deadline| deadline.saturating_add(self.time_wait_slack()))
+            .into_iter()
+            .chain(exact)
+            .min();
+        (exact.into_iter().chain(record).min(), latest)
+    }
+
+    // How late a TIME-WAIT record's timer may run.
+    #[cfg(test)]
+    fn time_wait_slack(&self) -> Instant {
+        0
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         // Only a held slot without a current attempt can wait for pacing.
         self.deadlines

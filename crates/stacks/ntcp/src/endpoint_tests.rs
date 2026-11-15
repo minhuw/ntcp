@@ -7371,6 +7371,13 @@ fn randomized_exchanges_cross_check_refresh_fast_path() {
                     }
                 }
             }
+            // The reported wake is never after the reference's latest.
+            for endpoint in [&a, &b] {
+                let (_, latest) = endpoint.reference_next_deadline();
+                let wake = endpoint.next_deadline();
+                assert_eq!(wake.is_some(), latest.is_some(), "seed {seed}");
+                assert!(wake <= latest, "seed {seed}: {wake:?} {latest:?}");
+            }
             let Some(next) = flights
                 .iter()
                 .map(|f| f.0)
