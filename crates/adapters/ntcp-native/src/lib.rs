@@ -50,6 +50,41 @@ struct Connection {
     arrived: bool,
     write_waiting: Option<TxTimestampRequest>,
 }
+// The events a refresh raises from the core's state.
+struct Raised {
+    connected: bool,
+    closed: bool,
+    // None: the refresh leaves Readable as it is, with no read armed and
+    // nothing arrived, or with the output reserved, which a read waits for.
+    readable: Option<bool>,
+}
+impl Connection {
+    // What a refresh of this connection raises, the core's state now
+    // `state`. Shared by the refresh and its debug-build cross-check.
+    fn raised(&self, endpoint: &Endpoint, state: State) -> Raised {
+        let readable = ((self.read_waiting || self.arrived)
+            && !endpoint.is_output_reserved(self.core))
+        .then(|| {
+            endpoint.readable_bytes(self.core).unwrap_or(0) != 0
+                || endpoint.terminal_readable_bytes(self.core).unwrap_or(0) != 0
+                || matches!(
+                    state,
+                    State::CloseWait
+                        | State::Closing
+                        | State::LastAck
+                        | State::TimeWait
+                        | State::Closed
+                )
+        });
+        Raised {
+            connected: matches!(state, State::Established | State::CloseWait)
+                && matches!(self.state, State::SynSent | State::SynReceived),
+            closed: matches!(state, State::Closed | State::TimeWait)
+                && !matches!(self.state, State::Closed | State::TimeWait),
+            readable,
+        }
+    }
+}
 struct Slot<T> {
     generation: u64,
     value: Option<T>,
@@ -2040,30 +2075,14 @@ impl<P: PacketIo> Network<P> {
             return;
         }
         if let Ok(state) = self.endpoint.state(c.core) {
-            if matches!(state, State::Established | State::CloseWait)
-                && matches!(c.state, State::SynSent | State::SynReceived)
-            {
-                c.connected_event = true;
-            }
-            if matches!(state, State::Closed | State::TimeWait)
-                && !matches!(c.state, State::Closed | State::TimeWait)
-            {
-                c.closed_event = true;
-            }
+            let raised = c.raised(&self.endpoint, state);
+            c.connected_event |= raised.connected;
+            c.closed_event |= raised.closed;
             c.state = state;
             c.reason = self.endpoint.close_reason(c.core).ok().flatten();
-            if (c.read_waiting || c.arrived) && !self.endpoint.is_output_reserved(c.core) {
+            if let Some(readable) = raised.readable {
                 c.arrived = false;
-                c.readable_event = self.endpoint.readable_bytes(c.core).unwrap_or(0) != 0
-                    || self.endpoint.terminal_readable_bytes(c.core).unwrap_or(0) != 0
-                    || matches!(
-                        state,
-                        State::CloseWait
-                            | State::Closing
-                            | State::LastAck
-                            | State::TimeWait
-                            | State::Closed
-                    );
+                c.readable_event = readable;
             }
         }
     }
@@ -2247,7 +2266,7 @@ impl<P: PacketIo> Network<P> {
     }
     // The full-scan form of the ready queue, for debug builds: when a drain
     // leaves nothing queued, no live connection or listener has an event a
-    // refresh would raise.
+    // refresh would raise, save those the core still holds.
     fn check_ready(&self) {
         if !cfg!(debug_assertions) || self.stopped {
             return;
@@ -2267,7 +2286,7 @@ impl<P: PacketIo> Network<P> {
         }
     }
     // Whether refreshing connection `slot` and asking it for an event would
-    // give one, without doing either.
+    // give one the ready queue owes it, without doing either.
     fn unqueued_event(&self, slot: usize) -> bool {
         let c = self.connections[slot].value.as_ref().unwrap();
         if c.released {
@@ -2276,23 +2295,19 @@ impl<P: PacketIo> Network<P> {
         let Ok(state) = self.endpoint.state(c.core) else {
             return false;
         };
-        let connected = matches!(state, State::Established | State::CloseWait)
-            && matches!(c.state, State::SynSent | State::SynReceived);
-        let closed = matches!(state, State::Closed | State::TimeWait)
-            && !matches!(c.state, State::Closed | State::TimeWait);
-        let readable = (c.read_waiting || c.arrived)
-            && !self.endpoint.is_output_reserved(c.core)
-            && (self.endpoint.readable_bytes(c.core).unwrap_or(0) != 0
-                || self.endpoint.terminal_readable_bytes(c.core).unwrap_or(0) != 0
-                || matches!(
-                    state,
-                    State::CloseWait
-                        | State::Closing
-                        | State::LastAck
-                        | State::TimeWait
-                        | State::Closed
-                ));
-        connected || closed || readable || self.connection_has_event(slot)
+        // The core holds a connection's events while its output is reserved
+        // (Endpoint::next_event passes it over), so no refresh is due: the
+        // drive that ends the reservation reports them, which queues the
+        // connection. Until then only the events already raised are due;
+        // Writable is not among them, its admission refused.
+        if self.endpoint.is_output_reserved(c.core) {
+            return self.connection_has_event(slot);
+        }
+        let raised = c.raised(&self.endpoint, state);
+        raised.connected
+            || raised.closed
+            || raised.readable == Some(true)
+            || self.connection_has_event(slot)
     }
     // Whether next_connection_event would give an event, without taking it.
     fn connection_has_event(&self, slot: usize) -> bool {
