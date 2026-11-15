@@ -251,6 +251,21 @@ pub struct DriveReport {
     pub more_work: bool,
     pub tx_blocked: bool,
     pub next_deadline: Option<Instant>,
+    /// Whether `drain_events` has something to give as the drive returns:
+    /// an event queued for it, raised by this drive or by any earlier call
+    /// and not yet drained. False guarantees that `drain_events`, called
+    /// before any other call on this Network, writes nothing and reports no
+    /// more, so a caller that drains only to deliver events may skip it.
+    /// True may still drain nothing: a connection queued by a change can
+    /// turn out to have no event. Calls after the drive (`try_read`,
+    /// `try_write`, `close`, `readiness`, ...) may queue events this flag
+    /// does not show; the next drive's report shows them. It is the state of
+    /// the queues `drain_events` takes from, not a record of what raised
+    /// them, so no event is left out by a cause the drive did not foresee.
+    /// It says nothing of `drain_timestamps`. A drive that fails reports
+    /// nothing: drain then, for `Event::NetworkStopped` and the events it
+    /// raised before it failed.
+    pub events_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

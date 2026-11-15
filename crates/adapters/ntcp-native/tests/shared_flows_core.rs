@@ -801,6 +801,10 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
     }
     assert!(woken, "member 1's descriptor was written");
     assert!(!memory.waiting(1));
+    // Member 1's drives report its writer's event pending until drained.
+    let report = lan.members[1].network.drive(lan.now, BUDGET).unwrap();
+    assert!(report.events_pending);
+    assert!(drained(&mut lan.members[1].network).contains(&Event::Writable(ids[1])));
     // Its writer takes the rest now.
     let receipt = lan.members[1]
         .network

@@ -5749,6 +5749,13 @@ impl Endpoint {
         self.refresh(id.slot);
         Ok(())
     }
+    /// Whether `next_event` may return an event. False guarantees that it
+    /// returns None until another call changes the endpoint. True may still
+    /// give None: a connection queued for events whose output is reserved
+    /// waits, and a queued connection may have nothing left to report.
+    pub fn has_events(&self) -> bool {
+        !self.passive_errors.is_empty() || !self.advice.is_empty() || !self.events.is_empty()
+    }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
     //# There MUST be a mechanism for reporting soft TCP error conditions to
     //# the application (MUST-47).

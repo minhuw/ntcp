@@ -116,7 +116,22 @@ impl<P: PacketIo> Network<P> {
                 other => other,
             });
         }
+        report.events_pending = self.events_pending();
         Ok(report)
+    }
+    // Whether drain_events would give anything now: its queues, and the
+    // endpoint's events it collects first. When it would not, no live
+    // connection or listener holds an event left unqueued (a full scan in
+    // debug builds).
+    fn events_pending(&self) -> bool {
+        let pending = !self.events.is_empty()
+            || self.stopped_event
+            || !self.ready.is_empty()
+            || self.endpoint.has_events();
+        if !pending {
+            self.check_ready();
+        }
+        pending
     }
     // Memory this member returned to the group since the last look wakes
     // the members whose writers wait for it: as each drive ends, and as a
