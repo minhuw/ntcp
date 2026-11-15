@@ -938,7 +938,7 @@ impl Endpoint {
         let dscp = self.config.dscp;
         let mut reply = |ip, zone| provider.reply_header_len(ip, zone, dscp);
         let polled = self.poll_reserved_any(now, out, budget, Some(&mut reply))?;
-        Ok(self.polled(polled))
+        self.polled(polled)
     }
 
     /// `poll_reserved_stateless_transmit` with drain-time reply sizing
@@ -953,7 +953,7 @@ impl Endpoint {
         let dscp = self.config.dscp;
         let mut reply = |ip, zone| provider.reply_header_len(ip, zone, dscp);
         let polled = self.poll_reserved_selected(now, out, budget, None, None, Some(&mut reply))?;
-        Ok(self.polled(polled))
+        self.polled(polled)
     }
 
     /// Metadata for exactly the currently selected physical segment, including

@@ -6188,7 +6188,7 @@ impl Endpoint {
         }
         let polled =
             self.poll_reserved_selected(now, out, budget, Some(id), Some(payload), None)?;
-        Ok(self.polled(polled))
+        self.polled(polled)
     }
 
     pub fn enable_output_reservations(&mut self) -> Result<(), EndpointError> {
@@ -6687,7 +6687,7 @@ impl Endpoint {
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         self.retained_slot(id)?;
         let polled = self.poll_reserved_selected(now, out, budget, Some(id), None, None)?;
-        Ok(self.polled(polled))
+        self.polled(polled)
     }
 
     pub fn poll_reserved_stateless_transmit(
@@ -6697,7 +6697,7 @@ impl Endpoint {
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         let polled = self.poll_reserved_selected(now, out, budget, None, None, None)?;
-        Ok(self.polled(polled))
+        self.polled(polled)
     }
 
     pub fn poll_reserved_transmit(
@@ -6707,7 +6707,7 @@ impl Endpoint {
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         let polled = self.poll_reserved_any(now, out, budget, None)?;
-        Ok(self.polled(polled))
+        self.polled(polled)
     }
 
     pub(crate) fn poll_reserved_any(
@@ -6759,22 +6759,34 @@ impl Endpoint {
     }
 
     // The public form of a reserved poll's result: the attempt's packet,
-    // copied out of its reservation once.
-    pub(crate) fn polled(&self, polled: Polled) -> (PollTransmit, Option<crate::TransmitAttempt>) {
-        let packet = polled.attempt.map(|attempt| {
-            self.reservations[attempt.reservation]
-                .current
-                .as_ref()
-                .unwrap()
-                .emitted_packet
-        });
-        (
+    // copied out of its reservation once, into the caller's result. The
+    // result is built whole, then its packet written in place: a packet
+    // built apart and moved in is copied twice.
+    #[allow(clippy::type_complexity)]
+    #[inline(always)]
+    pub(crate) fn polled(
+        &self,
+        polled: Polled,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        let mut result = Ok((
             PollTransmit {
-                packet,
+                packet: None,
                 more_work: polled.more_work,
             },
             polled.attempt,
-        )
+        ));
+        if let Some(attempt) = polled.attempt
+            && let Ok((poll, _)) = &mut result
+        {
+            poll.packet = Some(
+                self.reservations[attempt.reservation]
+                    .current
+                    .as_ref()
+                    .unwrap()
+                    .emitted_packet,
+            );
+        }
+        result
     }
 
     // Select exactly one owner; None is the independent stateless lane.
