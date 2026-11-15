@@ -338,7 +338,11 @@ impl<P: PacketIo> Network<P> {
             }
             data += 1;
             let index = self.tx_cursor;
-            self.tx_cursor = (index + 1) % self.tx.len();
+            self.tx_cursor = if index + 1 == self.tx.len() {
+                0
+            } else {
+                index + 1
+            };
             // The table is set aside while one slot is served in place: a
             // slot carries its frame's egress context, too large to move out
             // and back for every frame.
