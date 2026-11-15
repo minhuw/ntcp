@@ -1628,6 +1628,18 @@ impl<P: PacketIo> Network<P> {
     pub fn rx_timestamp_status(&self, id: ConnId) -> Result<RxTimestampStatus> {
         Ok(self.endpoint.rx_timestamp_status(self.conn(id)?.core)?)
     }
+    /// Connection `id`'s transport state now (congestion window, flight,
+    /// RTT estimates, queued bytes, buffer use), as Linux's
+    /// getsockopt(TCP_INFO) reports a socket's; the field meanings are
+    /// `TransportInfo`'s. Reading changes nothing. A connection the network
+    /// already reclaimed (after it was released) is `InvalidHandle`.
+    pub fn transport_info(&self, id: ConnId) -> Result<TransportInfo> {
+        let c = self.conn(id)?;
+        if c.released {
+            return Err(Error::InvalidHandle);
+        }
+        Ok(self.endpoint.transport_info(c.core)?)
+    }
     fn writable_core(&self, id: ConnId) -> Result<ntcp::ConnectionId> {
         self.running()?;
         let c = self.conn(id)?;

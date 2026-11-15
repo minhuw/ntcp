@@ -3,8 +3,8 @@ use std::{fmt, io, net::SocketAddr};
 pub use ntcp::{
     CallerTimebase, CloseReason, DropCounts, DropEvent, DropReason, DropSubject, EndpointConfig,
     Instant, Payload, RxReadTimestamps, RxTimestampStatus, SendProgress, State, TimerWheel,
-    TimerWheelGeometry, TimestampClock, TxStreamRange, TxTimestampClock, TxTimestampEvent,
-    TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
+    TimerWheelGeometry, TimestampClock, TransportInfo, TxStreamRange, TxTimestampClock,
+    TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
