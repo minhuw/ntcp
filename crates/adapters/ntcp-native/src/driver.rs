@@ -321,8 +321,12 @@ impl<P: PacketIo> Network<P> {
         // rounded up, before data, so data cannot starve them nor they data.
         let mut control = 0;
         if self.shared_neighbors {
-            control = self.shared_output(now, budget.transmit.div_ceil(2), true, report)?;
-            self.settle_member(now)?;
+            let woken;
+            (control, woken) =
+                self.shared_output(now, budget.transmit.div_ceil(2), true, report)?;
+            if woken {
+                self.settle_member(now)?;
+            }
         } else if !self.control.is_empty() {
             self.service_neighbors(now)?;
             control = self.control_output(now, budget.transmit.div_ceil(2), report)?;
@@ -470,15 +474,17 @@ impl<P: PacketIo> Network<P> {
     // work due and no other member holds it, the port's timers (`timers`)
     // and up to `limit` due ARP frames, sent on this queue through the
     // control slot as `control_output` sends them; returns how many were
-    // tried. A member that finds the table held skips it: the holder is
-    // doing the work, or the next drive of any member will.
+    // tried, and whether the member has wakes to settle (`settle_member`),
+    // read through the same lookup of the member. A member that finds the
+    // table held skips it: the holder is doing the work, or the next drive
+    // of any member will.
     fn shared_output(
         &mut self,
         now: Instant,
         limit: usize,
         timers: bool,
         report: &mut DriveReport,
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         let Self {
             host,
             io,
@@ -487,7 +493,7 @@ impl<P: PacketIo> Network<P> {
             ..
         } = self;
         let Some(member) = super::shared::member(host) else {
-            return Ok(0);
+            return Ok((0, false));
         };
         let (mut sent, mut blocked, mut failure) = (0, false, None);
         let used = member.housekeep(now, limit, timers, |frame| {
@@ -519,14 +525,11 @@ impl<P: PacketIo> Network<P> {
         if let Some(error) = failure {
             return Err(Error::Backend(error));
         }
-        Ok(used.unwrap_or(0))
+        Ok((used.unwrap_or(0), member.woken()))
     }
-    // A member's wakes: the neighbors the port lost are reported to its
-    // Host, and its held frames whose resolution ended are released.
+    // A woken member's wakes: the neighbors the port lost are reported to
+    // its Host, and its held frames whose resolution ended are released.
     fn settle_member(&mut self, now: Instant) -> Result<()> {
-        if !super::shared::member(&mut self.host).is_some_and(|m| m.woken()) {
-            return Ok(());
-        }
         self.host.service_neighbors(now);
         self.release_resolved()?;
         if let Some(member) = super::shared::member(&mut self.host) {
