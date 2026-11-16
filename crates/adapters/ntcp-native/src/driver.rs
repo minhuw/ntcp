@@ -68,6 +68,13 @@ impl<P: PacketIo> Network<P> {
         self.failure = Some(error);
         Error::Backend(returned)
     }
+    // Stops the network for `cause`, an error no drive can get past, and
+    // gives `cause` back for the drive to return; `failure` tells it again.
+    #[cold]
+    fn stop_with_cause(&mut self, cause: Error) -> Error {
+        let _ = self.stop_with_error(io::Error::other(cause.to_string()));
+        cause
+    }
     pub fn stop(&mut self) {
         if !self.stopped {
             let _ = self.stop_with_error(io::Error::new(
@@ -87,6 +94,23 @@ impl<P: PacketIo> Network<P> {
     /// A drive with `budget.receive` 0 receives nothing
     /// (`WorkBudget::receive`): run between a `try_read` and the next
     /// `drain_events`, it adds no arrival to what the read left.
+    ///
+    /// A drive never fails for what passes: a backend without TX room, a
+    /// connection's output held for it (its calls take effect meanwhile), an
+    /// unresolved or unreachable next hop, a full neighbor or path table,
+    /// a peer's Packet Too Big below what a held packet needs (its
+    /// connection alone ends, `Aborted`). Each is retried within the
+    /// network, on TCP's own clocks. The errors it returns:
+    /// - `Stopped`: the network had stopped; nothing was done.
+    /// - `TimeWentBackwards`: `now` is before the network's time; nothing
+    ///   was done and the network runs on, for a drive with a valid `now`.
+    /// - Any other error stops the network first, as `stop` does (every
+    ///   connection Closed, then `NetworkStopped`), with `failure` telling
+    ///   the cause: `Backend`, the backend's own failure (a receive or
+    ///   transmit error, or a submission whose outcome is unknown); a time
+    ///   step so large that the TCP timestamp clock cannot tell it from a
+    ///   wrap (`Tcp(Connection(AmbiguousTimeJump))`); otherwise a broken
+    ///   invariant of the stack, which debug builds assert.
     pub fn drive(&mut self, now: Instant, budget: WorkBudget) -> Result<DriveReport> {
         // The drive's look at the inbox of a member of shared flows begins
         // before anything that can fail: every handoff from here on wakes
@@ -99,7 +123,13 @@ impl<P: PacketIo> Network<P> {
         // After the wake is taken: memory another member returned since
         // wakes this member's waiting writers.
         self.endpoint.poll_shared_memory();
-        self.advance_time(now)?;
+        match self.advance_time(now) {
+            Ok(()) => {}
+            Err(error @ Error::Tcp(EndpointError::Connection(ntcp::Error::AmbiguousTimeJump))) => {
+                return Err(self.stop_with_cause(error));
+            }
+            Err(error) => return Err(error),
+        }
         let mut report = DriveReport::default();
         // Take reusable scratch out of the owner while processed datagrams
         // borrow it. They never survive a call unless copied into the bounded
@@ -117,7 +147,14 @@ impl<P: PacketIo> Network<P> {
         if let Err(error) = result {
             return Err(match error {
                 Error::Backend(error) => self.stop_with_error(error),
-                other => other,
+                // What passes is retried within the drive, so what reaches
+                // here is a broken invariant (c151, every site classified).
+                other => {
+                    if cfg!(debug_assertions) {
+                        panic!("drive: broken invariant: {other}");
+                    }
+                    self.stop_with_cause(other)
+                }
             });
         }
         report.events_pending = self.events_pending();
@@ -1147,6 +1184,13 @@ impl<P: PacketIo> Network<P> {
                     report.tx_blocked = true;
                     return Ok(Some(true));
                 }
+                // A held packet that cannot be cut for its path's budget,
+                // which a Packet Too Big lowered: the poll failed its owner
+                // alone, whose Closed event the drive collects.
+                Err(EndpointError::ReservationMtuTooSmall) => {
+                    report.more_work = true;
+                    return Ok(Some(false));
+                }
                 Err(e) => return Err(e.into()),
             };
             // Held frames' reservations are not output to poll for. On a
@@ -1229,7 +1273,14 @@ impl<P: PacketIo> Network<P> {
                     pending.context = Some(context);
                     context
                 }
-                Err(ntcp_host::Error::Capacity | ntcp_host::Error::Allocation) => {
+                // No path lease is free for a stateless reply's destination
+                // (a full path table, `Path(Capacity)` as the Host's own
+                // Capacity): it waits, as for TX room.
+                Err(
+                    ntcp_host::Error::Capacity
+                    | ntcp_host::Error::Allocation
+                    | ntcp_host::Error::Path(path::Error::Capacity),
+                ) => {
                     report.tx_blocked = true;
                     return Ok(None);
                 }
@@ -1259,9 +1310,10 @@ impl<P: PacketIo> Network<P> {
                     pending.held = true;
                     return Ok(None);
                 }
-                // No neighbor entry or held record is free: the attempt is
-                // withdrawn unsubmitted, retried on TCP's own clock.
-                Err(ntcp_host::Error::Capacity) => {
+                // No neighbor entry or held record is free, or none could
+                // be allocated: the attempt is withdrawn unsubmitted,
+                // retried on TCP's own clock.
+                Err(ntcp_host::Error::Capacity | ntcp_host::Error::Allocation) => {
                     self.endpoint.discard_unsubmitted(
                         self.now,
                         pending.attempt,
@@ -1606,14 +1658,19 @@ impl<P: PacketIo> Network<P> {
                                 None => Some(pending.attempt),
                                 Some(group) => {
                                     self.endpoint.reject_unsubmitted_group(group)?;
-                                    self.endpoint
-                                        .poll_reserved_transmit_for(
-                                            self.now,
-                                            core,
-                                            &mut slot.bytes,
-                                            1,
-                                        )?
-                                        .1
+                                    match self.endpoint.poll_reserved_transmit_for(
+                                        self.now,
+                                        core,
+                                        &mut slot.bytes,
+                                        1,
+                                    ) {
+                                        Ok((_, attempt)) => attempt,
+                                        // Unfit for a path a Packet Too Big
+                                        // lowered: the poll failed the owner
+                                        // and freed its reservation.
+                                        Err(EndpointError::ReservationMtuTooSmall) => None,
+                                        Err(e) => return Err(e.into()),
+                                    }
                                 }
                             };
                             // Every retained frame is certified unsubmitted. The

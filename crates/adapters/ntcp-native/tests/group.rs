@@ -668,6 +668,25 @@ fn zero_work_budget_and_backwards_time_do_not_touch_the_backend() {
     assert_eq!(pair.a.backend().calls.get(), calls);
 }
 
+// c151: drive's error contract. A step of 2^32 timestamp ticks cannot be
+// told from a wrap; no later drive could advance the network, so the drive
+// stops it, as a backend failure does.
+#[test]
+fn an_ambiguous_time_jump_stops_the_network() {
+    let mut pair = Pair::new(false, false);
+    let ticks_per_ms = pair.a.config().tcp.connection.timebase.units_per_second / 1000;
+    let jump = pair.now + ticks_per_ms * (1 << 32);
+    assert!(matches!(
+        pair.a.drive(jump, BUDGET),
+        Err(Error::Tcp(ntcp::EndpointError::Connection(
+            ntcp::Error::AmbiguousTimeJump
+        )))
+    ));
+    assert!(pair.a.is_stopped());
+    assert!(pair.a.failure().is_some());
+    assert!(matches!(pair.a.drive(jump, BUDGET), Err(Error::Stopped)));
+}
+
 #[test]
 fn repeated_write_shutdown_is_idempotent() {
     let mut pair = Pair::new(false, false);
