@@ -393,7 +393,14 @@ fn disabled_ipv6_live_mss_and_failed_reserved_submission_keep_ceiling() {
                     a.next_deadline(),
                     a.buffer_bytes(),
                 );
-                assert_eq!(a.set_user_mss(id, None), Err(EndpointError::OutputReserved));
+                // c151: an MSS change waits; setting it as it is does not.
+                let user_mss = a.user_mss(id).unwrap();
+                assert_eq!(a.set_user_mss(id, user_mss), Ok(()));
+                let other = Some(user_mss.map_or(700, |mss| mss - 1));
+                assert_eq!(
+                    a.set_user_mss(id, other),
+                    Err(EndpointError::OutputReserved)
+                );
                 assert_eq!(a.lower_mss(id, 700), Err(EndpointError::OutputReserved));
                 assert!(a.reject_unsubmitted(token).unwrap());
                 assert!(!a.accept_transmit(now, token).unwrap());

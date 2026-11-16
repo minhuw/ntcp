@@ -1559,6 +1559,24 @@ impl<P: PacketIo> Network<P> {
                 continue;
             };
             let (core, abort, close) = (c.core, c.abort_requested, c.close_requested);
+            if c.shutdown_requested && !(c.released || abort || close) {
+                if self.endpoint.is_output_reserved(core) {
+                    self.maintain.push(index);
+                    continue;
+                }
+                self.connections[index]
+                    .value
+                    .as_mut()
+                    .unwrap()
+                    .shutdown_requested = false;
+                match self.endpoint.shutdown(core) {
+                    // A connection that ended meanwhile has nothing to shut.
+                    Ok(()) | Err(EndpointError::Connection(ntcp::Error::InvalidState)) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                self.ready.push(index);
+                continue;
+            }
             if c.released || !(abort || close) {
                 continue;
             }

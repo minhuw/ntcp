@@ -775,10 +775,6 @@ fn passive_repair_syn_data_requires_physical_ack() {
                         assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
                         if !accept_first {
                             assert_eq!(
-                                endpoint.accept(listener),
-                                Err(EndpointError::OutputReserved)
-                            );
-                            assert_eq!(
                                 endpoint.close_listener(listener),
                                 Err(EndpointError::OutputReserved)
                             );
@@ -994,8 +990,10 @@ fn passive_repair_reserved_rejected_admission_never_sets_syn_data() {
     }
 }
 
+// c151: an early child whose output is reserved is acceptable in its order,
+// once; abandoning its attempt afterwards raises no second Acceptable.
 #[test]
-fn passive_abandon_rearms_consumed_listener_event_after_sibling_accept() {
+fn passive_abandon_after_early_child_accept_raises_no_second_acceptable() {
     for early in [false, true] {
         for consume_event in [false, true] {
             let mut endpoint = endpoint();
@@ -1028,27 +1026,25 @@ fn passive_abandon_rearms_consumed_listener_event_after_sibling_accept() {
             if consume_event {
                 assert_eq!(endpoint.next_event(), Some(Event::Acceptable(listener)));
             }
-            assert_eq!(endpoint.accept(listener).unwrap(), sibling);
-            if consume_event {
-                while let Some(event) = endpoint.next_event() {
-                    assert!(!matches!(event, Event::Acceptable(_)));
-                }
-            }
-            assert_eq!(
-                endpoint.close_listener(listener),
-                Err(EndpointError::OutputReserved)
-            );
-            assert!(endpoint.abandon_transmit(attempt).unwrap());
             if early {
-                assert_eq!(endpoint.next_event(), Some(Event::Acceptable(listener)));
+                assert_eq!(endpoint.accept(listener).unwrap(), held);
+            } else {
+                assert_eq!(
+                    endpoint.close_listener(listener),
+                    Err(EndpointError::OutputReserved)
+                );
             }
+            assert_eq!(endpoint.accept(listener).unwrap(), sibling);
+            while let Some(event) = endpoint.next_event() {
+                assert!(consume_event && !matches!(event, Event::Acceptable(_)) || !consume_event);
+            }
+            assert!(endpoint.abandon_transmit(attempt).unwrap());
             while let Some(event) = endpoint.next_event() {
                 assert!(!matches!(event, Event::Acceptable(_)));
             }
             assert!(!endpoint.abandon_transmit(attempt).unwrap());
             assert_eq!(endpoint.next_event(), None);
             if early {
-                assert_eq!(endpoint.accept(listener).unwrap(), held);
                 assert_eq!(endpoint.state(held).unwrap(), State::Closed);
                 assert_eq!(endpoint.read_terminal(held, &mut bytes).unwrap(), 5);
                 assert_eq!(&bytes[..5], b"early");

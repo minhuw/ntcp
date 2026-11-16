@@ -186,6 +186,15 @@ impl RepairUndo {
 }
 
 impl Connection {
+    // An application call changed the connection while its output was
+    // reserved (`Endpoint::reserved_call`): the selection-time snapshots
+    // would undo that call's changes, so the reserved selection can no
+    // longer be restored, only released or kept.
+    pub(crate) fn forget_reserved_undo(&mut self) {
+        self.repair_undo = None;
+        self.control_undo = None;
+    }
+
     pub(crate) fn cancel_reserved_repair(&mut self) -> bool {
         self.repair_undo.as_ref().is_some_and(|u| u.fresh.is_none()) && self.cancel_reserved_local()
     }

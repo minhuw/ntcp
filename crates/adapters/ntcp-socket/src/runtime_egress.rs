@@ -518,15 +518,14 @@ impl Owner {
             Err(EndpointError::InvalidHandle) if owner.is_some() && existing.is_none() => {
                 return Ok(());
             }
-            Err(EndpointError::ReservationMtuTooSmall) if existing.is_some() => {
-                // An indivisible held SYN/TFO or option header cannot be
-                // suffix-split. Fail only this certainly-unsubmitted owner;
-                // never claim acceptance or roll back a submitted prefix.
-                let attempt = egress.tx[index].entry.as_ref().unwrap().attempt;
-                if !self.endpoint.abandon_transmit(attempt).map_err(engine)? {
-                    return Err(EIO);
+            // An indivisible held SYN/TFO or option header cannot be
+            // suffix-split: the poll failed only this certainly-unsubmitted
+            // owner, whose entry, if any, is freed.
+            Err(EndpointError::ReservationMtuTooSmall) => {
+                if existing.is_some() {
+                    return egress.clear(index, &mut self.host);
                 }
-                return egress.clear(index, &mut self.host);
+                return Ok(());
             }
             Err(error) => return Err(engine(error)),
         };

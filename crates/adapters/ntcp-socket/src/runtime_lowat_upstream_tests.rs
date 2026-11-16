@@ -398,7 +398,6 @@ fn lowat_nonblocking_held_output_returns_prefix_then_finalizes_boundary() {
     assert_eq!(rx.try_recv().unwrap().unwrap().value, 16000);
     assert_eq!(a.endpoint.send_progress(cid).unwrap(), progress);
     assert_eq!(output, retained);
-    assert!(a.sockets[&child].send_finish.is_some());
     assert!(a.sockets[&child].send_batch.is_none());
     assert!(a.endpoint.accept_transmit(10000, token.unwrap()).unwrap());
     // A real software group retains the reservation through every accepted
@@ -412,7 +411,6 @@ fn lowat_nonblocking_held_output_returns_prefix_then_finalizes_boundary() {
         assert!(a.endpoint.accept_transmit(10000, token.unwrap()).unwrap());
     }
     a.events();
-    assert!(a.sockets[&child].send_finish.is_none());
 }
 
 #[test]

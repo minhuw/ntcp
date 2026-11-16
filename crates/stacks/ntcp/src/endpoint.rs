@@ -321,7 +321,25 @@ impl Default for EndpointConfig {
 pub enum EndpointError {
     Connection(Error),
     InvalidHandle,
+    /// The connection's output is reserved (an attempt the embedding holds)
+    /// and the call waits for the reservation's end: input for the
+    /// connection, `abort`, `close`, `release`, `shutdown` in SYN-SENT, a
+    /// listener's close while a child's output is reserved, and what
+    /// changes the MSS or path the reserved packet was cut for
+    /// (`set_user_mss` to another value, `lower_mss`, `set_route_mtu`,
+    /// `set_destination_route`, `pmtu_feedback`, `network_error`). Every
+    /// other call takes effect at once and never returns it, its wire work
+    /// alone waiting, as a Linux socket call does while the device holds
+    /// the skb last sent: read, write and their admission checks, the send
+    /// and receive buffer setters, Nagle, cork, flush, other `shutdown`s,
+    /// `accept`, and the timeout, keepalive, hop limit and DSCP setters.
     OutputReserved,
+    /// A held packet cannot be cut for its path's budget, which a Packet
+    /// Too Big or the administrator lowered after it was built: a SYN
+    /// carrying Fast Open data, or an option header, longer than the
+    /// budget allows. From a reserved poll the connection has failed
+    /// (`Aborted`) and its reservation is freed; from a group's validation
+    /// or acceptance the group is to be rejected and polled again.
     ReservationMtuTooSmall,
     LimitReached,
     AddressInUse,
@@ -2943,7 +2961,7 @@ impl Endpoint {
     /// nor memory pressure changes it. Allocates nothing; the next write
     /// grows the send ring. 0 < `bytes` < 2^30.
     pub fn set_send_buffer(&mut self, id: ConnectionId, bytes: usize) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         Connection::validate_buffer_capacities(bytes, 1)?;
         self.slot_mut(id)?.connection.set_send_buffer(bytes);
         self.refresh(id.slot);
@@ -2961,7 +2979,7 @@ impl Endpoint {
         id: ConnectionId,
         bytes: usize,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         Connection::validate_buffer_capacities(1, bytes)?;
         let old = self.slot(id)?.connection.buffer_charge();
         let max_charge = self.buffer_room().saturating_add(old);
@@ -3673,21 +3691,16 @@ impl Endpoint {
     }
 
     pub fn accept(&mut self, listener: ListenerId) -> Result<ConnectionId, EndpointError> {
-        let pending = &self.listener(listener)?.pending;
-        let position = pending
-            .iter()
-            .position(|&id| !self.is_output_reserved(id))
-            .ok_or(if pending.is_empty() {
-                Error::WouldBlock.into()
-            } else {
-                EndpointError::OutputReserved
-            })?;
+        self.listener(listener)?;
+        // A child whose output is reserved is accepted as any other, as
+        // Linux's accept takes a child whatever its device holds: its
+        // reservation keeps the child's own output.
         let id = self.listeners[listener.slot]
             .as_mut()
             .unwrap()
             .pending
-            .remove(position)
-            .unwrap();
+            .pop_front()
+            .ok_or(Error::WouldBlock)?;
         self.unlink_child(listener, id);
         self.slots[id.slot].as_mut().unwrap().listener = None;
         self.refresh(id.slot);
@@ -4550,7 +4563,7 @@ impl Endpoint {
         lowat: Option<u32>,
         timestamp: Option<TxTimestampRequest>,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         let connection = &self.slot(id)?.connection;
         let own_charge = connection.buffer_charge();
         let available = self
@@ -4850,7 +4863,6 @@ impl Endpoint {
         id: ConnectionId,
         ranges: usize,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
         let old = self.slot(id)?.connection.rx_timestamps.storage_bytes();
         let spare = self.buffer_room();
         self.slot_mut(id)?
@@ -4882,7 +4894,6 @@ impl Endpoint {
         id: ConnectionId,
         phases: usize,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
         let old = self.slot(id)?.connection.tx_timestamps.storage_bytes();
         let spare = self.buffer_room();
         self.slot_mut(id)?
@@ -4902,7 +4913,6 @@ impl Endpoint {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, EndpointError> {
-        self.reject_if_output_reserved(id)?;
         Ok(self
             .slot(id)?
             .connection
@@ -4920,7 +4930,6 @@ impl Endpoint {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, EndpointError> {
-        self.reject_if_output_reserved(id)?;
         let room = self
             .slot(id)?
             .connection
@@ -5022,7 +5031,6 @@ impl Endpoint {
         id: ConnectionId,
         cookie: u64,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
         self.slot_mut(id)?
             .connection
             .tx_timestamps
@@ -5038,7 +5046,7 @@ impl Endpoint {
         id: ConnectionId,
         pending: bool,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         self.slot_mut(id)?
             .connection
             .set_fast_open_write_pending(pending)?;
@@ -5048,7 +5056,6 @@ impl Endpoint {
     /// Record a blocked adapter admission without changing send boundaries.
     /// LOWAT-only exhaustion is not byte-buffer backpressure.
     pub fn record_send_backpressure(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
         self.slot_mut(id)?.connection.record_send_backpressure();
         Ok(())
     }
@@ -5063,7 +5070,7 @@ impl Endpoint {
         end_of_record: bool,
         force: bool,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         self.slot_mut(id)?
             .connection
             .finish_send(end, more, end_of_record, force);
@@ -5086,20 +5093,19 @@ impl Endpoint {
         id: ConnectionId,
         lowat: Option<u32>,
     ) -> Result<usize, EndpointError> {
-        self.reject_if_output_reserved(id)?;
         Ok(self.slot(id)?.connection.send_admission_room(lowat))
     }
 
     /// Hold partial output until uncork, explicit NODELAY, or a 200ms timeout.
     pub fn set_cork(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         self.slot_mut(id)?.connection.set_cork(enabled);
         self.refresh(id.slot);
         Ok(())
     }
 
     pub fn flush(&mut self, id: ConnectionId) -> Result<usize, EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         let count = self.slot_mut(id)?.connection.flush()?;
         self.refresh(id.slot);
         Ok(count)
@@ -5126,7 +5132,7 @@ impl Endpoint {
     }
 
     pub fn read(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         let connection = &mut self.slot_mut(id)?.connection;
         let count = connection.read(out)?;
         if connection.receive_tuned() {
@@ -5192,7 +5198,6 @@ impl Endpoint {
         id: ConnectionId,
         out: &mut [u8],
     ) -> Result<usize, EndpointError> {
-        self.reject_if_output_reserved(id)?;
         Ok(self.slot_mut(id)?.connection.read_terminal(out)?)
     }
 
@@ -5201,8 +5206,17 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.terminal_readable_bytes())
     }
 
+    /// Queues the FIN after the data written, as Linux's tcp_shutdown
+    /// appends it to the write queue (tcp_send_fin). On a connection whose
+    /// output is reserved it is queued at once and leaves once the
+    /// reservation ends. A connection still in SYN-SENT ends instead (RFC
+    /// 9293 section 3.10.4), which, as `abort` and `close` do, waits for
+    /// its reservation to end: `OutputReserved`.
     pub fn shutdown(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        if self.is_output_reserved(id) && self.state(id)? == State::SynSent {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.reserved_call(id)?;
         self.slot_mut(id)?.connection.shutdown()?;
         self.refresh(id.slot);
         Ok(())
@@ -5229,7 +5243,7 @@ impl Endpoint {
         Ok(())
     }
     pub fn set_nagle(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         self.slot_mut(id)?.connection.set_nagle(enabled);
         self.refresh(id.slot);
         Ok(())
@@ -5517,7 +5531,11 @@ impl Endpoint {
         id: ConnectionId,
         mss: Option<u16>,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        // The MSS stays as the reserved selection was built with until the
+        // reservation ends; setting it to what it is changes nothing.
+        if self.is_output_reserved(id) && self.user_mss(id)? != mss {
+            return Err(EndpointError::OutputReserved);
+        }
         self.slot_mut(id)?.connection.set_user_mss(mss)?;
         self.refresh(id.slot);
         Ok(())
@@ -5569,7 +5587,7 @@ impl Endpoint {
         id: ConnectionId,
         timeout_us: u64,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         self.timer_in_reach(timeout_us)?;
         self.slot_mut(id)?.connection.set_user_timeout(timeout_us)?;
         self.refresh(id.slot);
@@ -5580,7 +5598,7 @@ impl Endpoint {
         id: ConnectionId,
         timeout_us: Option<u64>,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         self.timer_in_reach(timeout_us.unwrap_or(0))?;
         self.slot_mut(id)?
             .connection
@@ -5598,7 +5616,7 @@ impl Endpoint {
         id: ConnectionId,
         limit: Option<NonZeroU8>,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         self.slot_mut(id)?
             .connection
             .set_handshake_retransmission_limit(limit);
@@ -5658,7 +5676,7 @@ impl Endpoint {
         id: ConnectionId,
         keepalive: Option<crate::KeepaliveConfig>,
     ) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
+        self.reserved_call(id)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
         //# This interval MUST
         //# be configurable (MUST-27)
@@ -5680,7 +5698,6 @@ impl Endpoint {
     //# Time to Live (TTL):  The TTL value used to send TCP segments MUST be
     //# configurable (MUST-49).
     pub fn set_hop_limit(&mut self, id: ConnectionId, hop_limit: u8) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
         if hop_limit == 0 {
             return Err(Error::InvalidArgument.into());
         }
@@ -5698,7 +5715,6 @@ impl Endpoint {
     //# The application layer MUST be able to specify the Differentiated
     //# Services field for segments that are sent on a connection (MUST-48).
     pub fn set_dscp(&mut self, id: ConnectionId, dscp: u8) -> Result<(), EndpointError> {
-        self.reject_if_output_reserved(id)?;
         if dscp > 63 || self.slot(id)?.connection.managed_path
             .is_some_and(|path| path.snapshot.key().dscp().value() != dscp)
         {
@@ -5818,8 +5834,7 @@ impl Endpoint {
     }
     /// Whether `next_event` may return an event. False guarantees that it
     /// returns None until another call changes the endpoint. True may still
-    /// give None: a connection queued for events whose output is reserved
-    /// waits, and a queued connection may have nothing left to report.
+    /// give None: a queued connection may have nothing left to report.
     pub fn has_events(&self) -> bool {
         !self.passive_errors.is_empty() || !self.advice.is_empty() || !self.events.is_empty()
     }
@@ -5845,23 +5860,14 @@ impl Endpoint {
                 self.slots[index].as_ref().unwrap().connection.tuple(),
             ));
         }
+        // A connection whose output is reserved reports its events as any
+        // other: what they tell of (data to read, room to write, a state
+        // reached) is the application's to act on now, its wire work alone
+        // waiting for the reservation's end.
         loop {
-            let next = self.events.iter().find(|&index| {
-                if index < self.config.max_connections {
-                    return !self.is_output_reserved(self.id(index));
-                }
-                self.listeners[index - self.config.max_connections]
-                    .as_ref()
-                    .is_none_or(|listener| {
-                        listener.closing
-                            || listener.pending.is_empty()
-                            || listener
-                                .pending
-                                .iter()
-                                .any(|&id| !self.is_output_reserved(id))
-                    })
-            });
-            let Some(index) = next else { break };
+            let Some(index) = self.events.iter().next() else {
+                break;
+            };
             self.events.remove(index);
             if index >= self.config.max_connections {
                 let slot = index - self.config.max_connections;
@@ -6795,6 +6801,21 @@ impl Endpoint {
         Ok(())
     }
 
+    // An application call on a connection whose output is reserved takes
+    // effect at once, as a Linux socket call does while the device still
+    // holds the skb last sent: only the wire work it gives waits for the
+    // reservation's end, when the connection is offered output again. The
+    // reserved selection's undo snapshot no longer describes the
+    // connection, so a rejection of the reservation releases its selection
+    // as unsent output (`Connection::release_reserved_unsubmitted`), or
+    // keeps the reservation, instead of restoring that snapshot.
+    fn reserved_call(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
+        if self.is_output_reserved(id) {
+            self.slot_mut(id)?.connection.forget_reserved_undo();
+        }
+        Ok(())
+    }
+
     pub fn ready_connections(&self) -> impl Iterator<Item = ConnectionId> + '_ {
         self.output
             .iter()
@@ -6972,9 +6993,17 @@ impl Endpoint {
                     out,
                     shared.as_deref_mut().ok_or(Error::InvalidArgument)?,
                     tsval,
-                )?
+                )
             } else {
-                self.reservations[index].fragment(limit, out, tsval)?
+                self.reservations[index].fragment(limit, out, tsval)
+            };
+            let packet = match packet {
+                Ok(packet) => packet,
+                Err(EndpointError::ReservationMtuTooSmall) => {
+                    self.abandon_unfit(index);
+                    return Err(EndpointError::ReservationMtuTooSmall);
+                }
+                Err(error) => return Err(error),
             };
             let r = self.reservations[index].current.as_mut().unwrap();
             if core::mem::take(&mut r.restamped)
@@ -7235,22 +7264,6 @@ impl Endpoint {
         }
         if let Some(id) = connection {
             self.refresh(id.slot);
-            // Intermediate fragments must keep the pending child held.
-            if finished {
-                self.rearm_pending_accept(id);
-            }
-        }
-    }
-
-    fn rearm_pending_accept(&mut self, id: ConnectionId) {
-        // A prior Acceptable may have been consumed for an unheld sibling.
-        if let Ok(slot) = self.retained_slot(id)
-            && let Some(parent) = slot.listener
-            && self
-                .listener(parent)
-                .is_ok_and(|listener| listener.pending.contains(&id))
-        {
-            self.events.push(self.config.max_connections + parent.slot);
         }
     }
 
@@ -7414,7 +7427,6 @@ impl Endpoint {
             });
         }
         self.refresh(id.slot);
-        self.rearm_pending_accept(id);
         Ok(true)
     }
 
@@ -7594,8 +7606,28 @@ impl Endpoint {
         self.drop_reserved(attempt.reservation, DropReason::SocketClose);
         self.clear_reservation(attempt.reservation);
         self.refresh(id.slot);
-        self.rearm_pending_accept(id);
         Ok(true)
+    }
+
+    // Reservation `index`'s output, held with no attempt outstanding (so never
+    // submitted past what was accepted), cannot be cut for its owner's path:
+    // an indivisible SYN carrying Fast Open data, or an option header, larger
+    // than a budget a Packet Too Big or the administrator lowered since. Its
+    // owner fails as `abandon_transmit` fails it, and the poll that found it
+    // returns `ReservationMtuTooSmall` for the embedding to free what it kept
+    // for the reservation; other connections on the path continue.
+    #[cold]
+    #[inline(never)]
+    fn abandon_unfit(&mut self, index: usize) {
+        let r = self.reservations[index].current.as_ref().unwrap();
+        debug_assert!(r.attempt.is_none());
+        let id = r.packet.connection.unwrap();
+        self.drop_reserved(index, DropReason::PktTooBig);
+        let slot = self.slots[id.slot].as_mut().unwrap();
+        slot.connection.abandon_reserved_output();
+        slot.closed_output_drained = true;
+        self.clear_reservation(index);
+        self.refresh(id.slot);
     }
 
     // Fail the owner and discard only the remaining reservation. Caller certifies
@@ -7625,7 +7657,6 @@ impl Endpoint {
             slot.closed_output_drained = true;
             self.clear_reservation(index);
             self.refresh(id.slot);
-            self.rearm_pending_accept(id);
         } else {
             self.clear_reservation(index);
         }

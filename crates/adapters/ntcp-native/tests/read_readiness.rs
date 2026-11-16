@@ -351,11 +351,14 @@ fn a_drive_with_no_receive_budget_leaves_retained_input_retained() {
         .try_write(server, b"reserved", WriteOptions::default())
         .unwrap();
     pair.server.drive(pair.now, BUDGET).unwrap();
-    assert!(matches!(
+    // Queued at once under the reservation (c151).
+    assert_eq!(
         pair.server
-            .try_write(server, b"more", WriteOptions::default()),
-        Err(Error::WouldBlock(BlockReason::OutputReserved))
-    ));
+            .try_write(server, b"more", WriteOptions::default())
+            .unwrap()
+            .accepted,
+        4
+    );
     pair.client
         .try_write(client, &[7; 200], WriteOptions::default())
         .unwrap();

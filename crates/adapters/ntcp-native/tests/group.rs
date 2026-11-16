@@ -282,11 +282,13 @@ fn backend_backpressure_retains_received_datagrams_and_retries_without_duplicati
         .unwrap();
     assert_eq!(receipt.accepted, 14);
     pair.a.drive(pair.now, BUDGET).unwrap();
-    assert!(matches!(
-        pair.a
-            .try_write(pair.client, b"suffix", WriteOptions::default()),
-        Err(Error::WouldBlock(BlockReason::OutputReserved))
-    ));
+    // The reservation queues a write as any other (c151): it leaves after
+    // the reserved one.
+    let suffix = pair
+        .a
+        .try_write(pair.client, b" suffix", WriteOptions::default())
+        .unwrap();
+    assert_eq!(suffix.accepted, 7);
     pair.b
         .try_write(pair.server, b"server payload", WriteOptions::default())
         .unwrap();
@@ -309,11 +311,11 @@ fn backend_backpressure_retains_received_datagrams_and_retries_without_duplicati
         if let Ok(ReadOutcome::Data { len, .. }) = pair.b.try_read(pair.server, &mut out) {
             from_a.extend_from_slice(&out[..len]);
         }
-        if from_a.len() == 14 && from_b.len() == 14 {
+        if from_a.len() == 21 && from_b.len() == 14 {
             break;
         }
     }
-    assert_eq!(from_a, b"client payload");
+    assert_eq!(from_a, b"client payload suffix");
     assert_eq!(from_b, b"server payload");
     assert!(pair.a.counters().backend_backpressure > 0);
     assert_eq!(pair.a.counters().retained_input, 0);

@@ -96,47 +96,48 @@ fn accept_request(listener: u64) -> (Request, Receiver<Result<Reply>>) {
     )
 }
 
+// c151: a child whose ACK the backend holds is accepted at once, as Linux
+// accepts a child whatever its device queue holds; the ACK leaves once the
+// backend has room.
 #[test]
-fn held_ack_nonblocking_accept_returns_eagain() {
+fn held_ack_nonblocking_accept_takes_the_held_child() {
     let (mut b, listener, cid, _) = held_child(0, SOCK_NONBLOCK);
     let (mut request, response) = accept_request(listener);
     assert!(b.service(&mut request));
-    assert_eq!(response.recv().unwrap().unwrap_err(), EAGAIN);
+    let accepted = response.recv().unwrap().unwrap().value as u64;
+    assert!(matches!(b.sockets[&accepted].handle, Handle::Connection(id) if id == cid));
+    assert_eq!(b.execute(listener, Op::Accept(0)).unwrap_err(), EAGAIN);
     assert_eq!(b.execute(listener, Op::Ready).unwrap().value & EPOLLIN, 0);
     assert!(b.endpoint.is_output_reserved(cid));
     assert_eq!(engine(EndpointError::OutputReserved), EINVAL);
 }
 
 #[test]
-fn held_ack_blocking_accept_waits_until_resolution() {
+fn held_ack_blocking_accept_returns_without_waiting_for_the_ack() {
     let (mut b, listener, cid, backend) = held_child(0, 0);
     let (mut request, response) = accept_request(listener);
-    for _ in 0..3 {
-        assert!(!b.service(&mut request));
-        assert!(response.try_recv().is_err());
-    }
-    assert_eq!(b.execute(listener, Op::Ready).unwrap().value & EPOLLIN, 0);
+    assert!(b.service(&mut request));
+    let accepted = response.recv().unwrap().unwrap().value as u64;
+    assert!(matches!(b.sockets[&accepted].handle, Handle::Connection(id) if id == cid));
+    assert!(b.endpoint.is_output_reserved(cid));
     backend.lock().unwrap().blocked = false;
     b.test_now = Some(b.now() + 1000);
     b.service_egress().unwrap();
     assert!(!b.endpoint.is_output_reserved(cid));
-    b.events();
-    assert_ne!(b.execute(listener, Op::Ready).unwrap().value & EPOLLIN, 0);
-    assert!(b.service(&mut request));
-    let accepted = response.recv().unwrap().unwrap().value as u64;
-    assert!(matches!(b.sockets[&accepted].handle, Handle::Connection(id) if id == cid));
     assert_eq!(backend.lock().unwrap().attempts, 2);
 }
 
 #[test]
-fn held_ack_accept_skips_to_unheld_sibling() {
+fn held_ack_accept_takes_children_in_order() {
     let (mut b, listener, held, _) = held_child(1, SOCK_NONBLOCK);
     let sibling = b.child_timeouts[1].0;
     assert!(!b.endpoint.is_output_reserved(sibling));
-    let (mut request, response) = accept_request(listener);
-    assert!(b.service(&mut request));
-    let accepted = response.recv().unwrap().unwrap().value as u64;
-    assert!(matches!(b.sockets[&accepted].handle, Handle::Connection(id) if id == sibling));
+    for expected in [held, sibling] {
+        let (mut request, response) = accept_request(listener);
+        assert!(b.service(&mut request));
+        let accepted = response.recv().unwrap().unwrap().value as u64;
+        assert!(matches!(b.sockets[&accepted].handle, Handle::Connection(id) if id == expected));
+    }
     assert!(b.endpoint.is_output_reserved(held));
     assert_eq!(b.execute(listener, Op::Accept(0)).unwrap_err(), EAGAIN);
 }

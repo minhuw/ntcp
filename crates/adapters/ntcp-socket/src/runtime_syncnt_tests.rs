@@ -71,17 +71,7 @@ fn syncnt_active_live_budget_and_held_owner() {
                 .poll_reserved_transmit(a.now(), &mut bytes, BUDGET)
                 .unwrap();
             let attempt = attempt.unwrap();
-            assert_eq!(
-                a.execute(id, Op::Set(IPPROTO_TCP, TCP_SYNCNT, 1))
-                    .unwrap_err(),
-                EAGAIN
-            );
-            // Even a direct dispatch cannot bypass the core owner barrier.
-            assert_eq!(
-                a.dispatch(id, Op::Set(IPPROTO_TCP, TCP_SYNCNT, 1))
-                    .unwrap_err(),
-                EINVAL
-            );
+            assert!(a.endpoint.is_output_reserved(cid));
             assert_eq!(a.sockets[&id].syn_retries, initial);
             assert_eq!(
                 a.endpoint.handshake_retransmission_limit(cid).unwrap(),

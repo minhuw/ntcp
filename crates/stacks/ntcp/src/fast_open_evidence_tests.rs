@@ -1734,7 +1734,8 @@ fn hmac_revocation_preserves_snapshotted_responses_children_and_quota() {
                 before - registry_before
             );
             assert_eq!(&bytes[..tx.len], first);
-            assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
+            // c151: the child is accepted under its reservation.
+            assert_eq!(b.accept(listener), Ok(child));
             assert!(b.reject_unsubmitted(token.unwrap()).unwrap());
             let (out, retry) = b
                 .poll_reserved_transmit_for(0, child, &mut bytes, 64)
@@ -1745,7 +1746,6 @@ fn hmac_revocation_preserves_snapshotted_responses_children_and_quota() {
             assert_eq!(decoded.options, next.options);
             let held_reply = (tx.ip, bytes[..tx.len].to_vec());
             assert!(b.accept_transmit(0, retry.unwrap()).unwrap());
-            assert_eq!(b.accept(listener), Ok(child));
             assert_eq!(b.read(child, &mut [0; 5]), Ok(5));
             let (mut c, _) = peer(3);
             let (local, _) = addresses(v6, 40002);

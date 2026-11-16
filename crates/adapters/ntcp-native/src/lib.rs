@@ -37,6 +37,10 @@ struct Connection {
     reason: Option<CloseReason>,
     close_requested: bool,
     abort_requested: bool,
+    // A write shutdown of a connection still connecting, which ends it,
+    // waits for the connection's reservation to end, as close does
+    // (`maintain_connections`).
+    shutdown_requested: bool,
     released: bool,
     read_cursor: u64,
     trace_count: usize,
@@ -55,16 +59,14 @@ struct Raised {
     connected: bool,
     closed: bool,
     // None: the refresh leaves Readable as it is, with no read armed and
-    // nothing arrived, or with the output reserved, which a read waits for.
+    // nothing arrived.
     readable: Option<bool>,
 }
 impl Connection {
     // What a refresh of this connection raises, the core's state now
     // `state`. Shared by the refresh and its debug-build cross-check.
     fn raised(&self, endpoint: &Endpoint, state: State) -> Raised {
-        let readable = ((self.read_waiting || self.arrived)
-            && !endpoint.is_output_reserved(self.core))
-        .then(|| {
+        let readable = (self.read_waiting || self.arrived).then(|| {
             endpoint.readable_bytes(self.core).unwrap_or(0) != 0
                 || endpoint.terminal_readable_bytes(self.core).unwrap_or(0) != 0
                 || matches!(
@@ -96,6 +98,23 @@ struct Listener {
     acceptable: bool,
 }
 
+/// A TCP/IP network over one `PacketIo` backend.
+///
+/// A connection's output is reserved while the backend holds a packet of
+/// it it has not taken yet (`transmit` returned `WouldBlock`). As a Linux
+/// socket call takes effect under the socket lock while the device holds
+/// the skb last sent, and only its wire work waits for release_sock, no
+/// call refuses for a reservation: `try_write`, `try_write_shared` and
+/// `try_write_vectored` queue data (`WouldBlock(SendBuffer)` only for a
+/// full send buffer); `try_read`, `readiness` and the Readable event show
+/// the data queued, only the ACK and window update wait; `set_nodelay`,
+/// the buffer setters and `shutdown_write` apply at once, and what they
+/// send (held frames pushed, a window update, the FIN) leaves once the
+/// backend takes output again; `close`, `abort` and `close_listener` are
+/// recorded and done by the drive that finds the output free. Their
+/// errors are genuine: `InvalidHandle`, `Stopped`, `NoMemory`,
+/// `InvalidConfig`/`Tcp` for an invalid argument or state, and
+/// `WouldBlock(SendBuffer)`. `drive` states its own error contract.
 // All transport and backend access is confined to the constructing thread.
 // Endpoint's local address-policy callback also makes this owner !Send/!Sync.
 pub struct Network<P: PacketIo> {
@@ -1252,6 +1271,7 @@ impl<P: PacketIo> Network<P> {
             reason: None,
             close_requested: false,
             abort_requested: false,
+            shutdown_requested: false,
             released: false,
             read_cursor: 0,
             trace_count: 0,
@@ -1619,10 +1639,9 @@ impl<P: PacketIo> Network<P> {
         );
         // As refresh_connection raises Readable, and next_connection_event
         // Writable.
-        let readable = !self.endpoint.is_output_reserved(core)
-            && (read_closed
-                || self.endpoint.readable_bytes(core).unwrap_or(0) != 0
-                || self.endpoint.terminal_readable_bytes(core).unwrap_or(0) != 0);
+        let readable = read_closed
+            || self.endpoint.readable_bytes(core).unwrap_or(0) != 0
+            || self.endpoint.terminal_readable_bytes(core).unwrap_or(0) != 0;
         let open = matches!(state, State::Established | State::CloseWait);
         let writable = open
             && self
@@ -1630,8 +1649,6 @@ impl<P: PacketIo> Network<P> {
                 .check_write_admission(core, None, TxTimestampRequest::default())
                 .is_ok_and(|n| n != 0);
         let c = self.conn_mut(id)?;
-        // Data a reserved output keeps from being read is not readable; the
-        // end of the reservation raises Readable only for an armed read.
         if !readable {
             c.read_waiting = true;
         }
@@ -1736,10 +1753,6 @@ impl<P: PacketIo> Network<P> {
                 self.conn_mut(id)?.write_waiting = Some(options.timestamps);
                 return Err(Error::WouldBlock(BlockReason::SendBuffer));
             }
-            Err(EndpointError::OutputReserved) => {
-                self.conn_mut(id)?.write_waiting = Some(options.timestamps);
-                return Err(Error::WouldBlock(BlockReason::OutputReserved));
-            }
             Err(e) => return Err(e.into()),
         };
         self.conn_mut(id)?.trace_count += phases;
@@ -1800,10 +1813,6 @@ impl<P: PacketIo> Network<P> {
                     self.conn_mut(id)?.write_waiting = Some(TxTimestampRequest::default());
                     return Err(Error::WouldBlock(BlockReason::SendBuffer));
                 }
-                Err(EndpointError::OutputReserved) => {
-                    self.conn_mut(id)?.write_waiting = Some(TxTimestampRequest::default());
-                    return Err(Error::WouldBlock(BlockReason::OutputReserved));
-                }
                 Err(e) => return Err(e.into()),
             };
             accepted += taken;
@@ -1839,6 +1848,10 @@ impl<P: PacketIo> Network<P> {
     /// A read into an empty `out` reads nothing (`EmptyBuffer`) and changes
     /// no event: after a drain took the connection's Readable, it queues
     /// none, while data may still wait to be read.
+    ///
+    /// While the connection's output is reserved (see `Network`), the data
+    /// queued stays readable and the rules above hold unchanged; only the
+    /// ACK and window update the read gives wait for the backend.
     pub fn try_read(&mut self, id: ConnId, out: &mut [u8]) -> Result<ReadOutcome> {
         let mut drained = false;
         let result = self.read_once(id, out, &mut drained);
@@ -1876,7 +1889,6 @@ impl<P: PacketIo> Network<P> {
                     && !c.released
                     && self.endpoint.state(c.core) == Ok(State::Established)
                     && self.endpoint.close_reason(c.core) == Ok(c.reason)
-                    && !self.endpoint.is_output_reserved(c.core)
                     && self.endpoint.readable_bytes(c.core) == Ok(0)
                     && self.endpoint.terminal_readable_bytes(c.core) == Ok(0)
         );
@@ -1969,10 +1981,6 @@ impl<P: PacketIo> Network<P> {
             Err(EndpointError::Connection(ntcp::Error::WouldBlock)) => {
                 self.conn_mut(id)?.write_waiting = Some(TxTimestampRequest::default());
                 return Err(Error::WouldBlock(BlockReason::SendBuffer));
-            }
-            Err(EndpointError::OutputReserved) => {
-                self.conn_mut(id)?.write_waiting = Some(TxTimestampRequest::default());
-                return Err(Error::WouldBlock(BlockReason::OutputReserved));
             }
             Err(e) => return Err(e.into()),
         };
@@ -2108,7 +2116,17 @@ impl<P: PacketIo> Network<P> {
         if c.close_requested || c.abort_requested || c.released {
             return Err(Error::InvalidHandle);
         }
-        self.endpoint.shutdown(c.core)?;
+        match self.endpoint.shutdown(c.core) {
+            Ok(()) => {}
+            // Still connecting, the shutdown ends the connection, which
+            // waits for its reservation: done by the drive that finds it
+            // ended, before any input or timer reaches the connection.
+            Err(EndpointError::OutputReserved) => {
+                self.conn_mut(id)?.shutdown_requested = true;
+                self.maintain.push(id.slot);
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
     pub fn close(&mut self, id: ConnId) -> Result<()> {
@@ -2365,14 +2383,6 @@ impl<P: PacketIo> Network<P> {
         let Ok(state) = self.endpoint.state(c.core) else {
             return false;
         };
-        // The core holds a connection's events while its output is reserved
-        // (Endpoint::next_event passes it over), so no refresh is due: the
-        // drive that ends the reservation reports them, which queues the
-        // connection. Until then only the events already raised are due;
-        // Writable is not among them, its admission refused.
-        if self.endpoint.is_output_reserved(c.core) {
-            return self.connection_has_event(slot);
-        }
         let raised = c.raised(&self.endpoint, state);
         raised.connected
             || raised.closed

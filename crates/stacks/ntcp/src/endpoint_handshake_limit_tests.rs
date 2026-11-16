@@ -24,14 +24,11 @@ fn handshake_limit_reserved_selection_rejection_and_acceptance() {
         ));
         let (_, attempt) = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap();
         let attempt = attempt.unwrap();
-        assert_eq!(
-            a.set_handshake_retransmission_limit(client, None),
-            Err(EndpointError::OutputReserved)
-        );
-        assert_eq!(
-            a.handshake_retransmission_limit(client),
-            Ok(NonZeroU8::new(1))
-        );
+        // c151: the limit applies at once under the reservation.
+        assert_eq!(a.set_handshake_retransmission_limit(client, None), Ok(()));
+        assert_eq!(a.handshake_retransmission_limit(client), Ok(None));
+        a.set_handshake_retransmission_limit(client, NonZeroU8::new(1))
+            .unwrap();
         assert!(a.reject_unsubmitted(attempt).unwrap());
         assert!(!a.accept_transmit(now, attempt).unwrap());
         // Repeated polls/rejections retain the same packet, not new retries.

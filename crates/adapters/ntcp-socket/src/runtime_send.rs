@@ -21,15 +21,6 @@ pub(super) struct SendBatch {
     pub end: u64,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct SendFinish {
-    pub connection: ConnectionId,
-    pub end: u64,
-    pub more: bool,
-    pub end_of_record: bool,
-    pub force: bool,
-}
-
 pub(super) fn batch_goal(info: &ntcp::TransportInfo) -> usize {
     let mss = (info.mss as usize).max(1);
     ((info.max_send_window as usize / 2 / mss) * mss)
@@ -39,34 +30,6 @@ pub(super) fn batch_goal(info: &ntcp::TransportInfo) -> usize {
 }
 
 impl Owner {
-    // A nonblocking caller may return while output owns an immutable plan.
-    // Apply only its boundary metadata once that generation is mutable again.
-    // Visits only the sockets that kept one (`FINISHING`).
-    pub(super) fn finish_retained_sends(&mut self) {
-        self.check_list(FINISHING, |s| s.send_finish.is_some(), true);
-        let mut next = self.lists[FINISHING];
-        while let Some(id) = next {
-            let socket = self.sockets.get_mut(&id).unwrap();
-            next = socket.lists[FINISHING].next;
-            let finish = socket.send_finish.unwrap();
-            if self.endpoint.is_output_reserved(finish.connection) {
-                continue;
-            }
-            if matches!(socket.handle, Handle::Connection(cid) if cid == finish.connection) {
-                let _ = self.endpoint.finish_send(
-                    finish.connection,
-                    finish.end,
-                    finish.more,
-                    finish.end_of_record,
-                    finish.force,
-                );
-            }
-            socket.send_finish = None;
-            unlink(&mut self.sockets, &mut self.lists, FINISHING, id);
-            self.touch(id);
-        }
-    }
-
     // Host coalescing batches are separate from TCP's exact byte-quota API.
     // Filling an existing tail may cross lowat; opening another batch may not.
     pub(super) fn send_batch_admission(&self, id: u64, cid: ConnectionId) -> Result<(usize, u64)> {
@@ -534,31 +497,22 @@ impl Owner {
         }
         if let Some(cid) = send.cid {
             let full = !send.done() && self.endpoint.send_admission_room(cid, None) == Ok(0);
-            let finish = SendFinish {
-                connection: cid,
-                end: send.end,
-                more: send.flags & MSG_MORE != 0,
-                end_of_record: send.flags & MSG_EOR != 0,
-                force: full,
-            };
+            let end_of_record = send.flags & MSG_EOR != 0;
+            // The send's boundary applies at once, held output or not (c151):
+            // only a connection gone since fails.
             let result = self.endpoint.finish_send(
                 cid,
-                finish.end,
-                finish.more,
-                finish.end_of_record,
-                finish.force,
+                send.end,
+                send.flags & MSG_MORE != 0,
+                end_of_record,
+                full,
             );
-            if let Some(socket) = self.sockets.get_mut(&id) {
-                if result == Err(ntcp::EndpointError::OutputReserved) {
-                    debug_assert!(socket.send_finish.is_none());
-                    socket.send_finish = Some(finish);
-                }
-                if finish.end_of_record {
-                    socket.send_batch = None;
-                }
-            }
-            if result == Err(ntcp::EndpointError::OutputReserved) {
-                link(&mut self.sockets, &mut self.lists, FINISHING, id);
+            debug_assert!(
+                matches!(result, Ok(()) | Err(ntcp::EndpointError::InvalidHandle)),
+                "{result:?}"
+            );
+            if end_of_record && let Some(socket) = self.sockets.get_mut(&id) {
+                socket.send_batch = None;
             }
         }
         if let Some(cookie) = send.cookie.take() {

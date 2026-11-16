@@ -1441,6 +1441,6 @@ fn passes_visit_only_listed_sockets_among_many_idle() {
     assert_eq!(changed.len(), 1);
     assert_eq!(changed[0].0, target);
     assert_ne!(changed[0].1 & EPOLLHUP, 0);
-    assert!(a.lists[FINISHING].is_none() && a.lists[LEASED].is_none());
+    assert!(a.lists[LEASED].is_none());
     assert!(a.lists[STAMPING].is_none());
 }

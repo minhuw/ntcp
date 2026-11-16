@@ -52,11 +52,14 @@ macro_rules! handle_parts {
 handle_parts!(ConnId, "connection", "tcp.max_connections");
 handle_parts!(ListenerId, "listener", "tcp.max_listeners");
 
+/// Why a call would block. A connection's output held by the backend
+/// (the core's output reservation) is never one: every call takes effect
+/// at once, its wire work waiting for the transmit room, as a Linux socket
+/// call does while its device queue is full.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockReason {
     SendBuffer,
     TimestampCapacity,
-    OutputReserved,
     Receive,
     Accept,
     Connecting,
@@ -123,7 +126,6 @@ impl From<ntcp::EndpointError> for Error {
             ntcp::EndpointError::InvalidHandle => Self::InvalidHandle,
             ntcp::EndpointError::LimitReached => Self::Capacity,
             ntcp::EndpointError::Connection(ntcp::Error::NoMemory) => Self::NoMemory,
-            ntcp::EndpointError::OutputReserved => Self::WouldBlock(BlockReason::OutputReserved),
             ntcp::EndpointError::Connection(ntcp::Error::TimeWentBackwards) => {
                 Self::TimeWentBackwards
             }

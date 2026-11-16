@@ -1115,7 +1115,8 @@ impl ReceiveBuffer {
     // the wrap moves: the wrapped prefix to just past the old end, or the
     // rest to the new end, moving `head`. Sequence and reporting state counts
     // from read_base and stays as it is; a ReceiveOutputUndo, which names a
-    // bitmap byte, must not span a growth (reservations exclude reads). On
+    // bitmap byte, must not span a growth (a read or setter on a connection
+    // whose output is reserved drops it first, `Endpoint::reserved_call`). On
     // failure every slot and all state are as they were: a bitmap or payload
     // that grew before another failed keeps its storage, which storage_bytes
     // counts and the next growth reuses.

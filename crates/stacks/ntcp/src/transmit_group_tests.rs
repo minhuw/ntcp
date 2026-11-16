@@ -315,7 +315,6 @@ fn group_validation_rejection_and_abandonment_leave_tcp_state_unchanged() {
         a.poll_reserved_transmit_for(4, id, &mut out, 1),
         Err(EndpointError::OutputReserved)
     );
-    assert_eq!(a.write(id, b"held"), Err(EndpointError::OutputReserved));
     for now in [0, 1] {
         assert_eq!(
             a.validate_transmit_group(now, group),

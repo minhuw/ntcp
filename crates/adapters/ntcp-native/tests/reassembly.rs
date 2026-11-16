@@ -533,12 +533,15 @@ fn a_reassembled_segment_longer_than_the_mtu_is_retained_under_backpressure() {
         .try_write(server, &reply, WriteOptions::default())
         .unwrap();
     offer(&mut station, &mut now, &[], 1280);
-    assert!(matches!(
+    // Queued at once under the reservation (c151).
+    assert_eq!(
         station
             .network
-            .try_write(server, &reply, WriteOptions::default()),
-        Err(Error::WouldBlock(BlockReason::OutputReserved))
-    ));
+            .try_write(server, &reply, WriteOptions::default())
+            .unwrap()
+            .accepted,
+        5
+    );
     let data = segment((b, a), 40000, numbers, ACK, 1500);
     offer(&mut station, &mut now, &[data], 1280);
     assert_eq!(station.network.counters().retained_input, 1);

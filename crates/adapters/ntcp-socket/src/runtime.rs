@@ -548,7 +548,6 @@ struct Socket {
     mark: u32,
     linger: Linger,
     send_batch: Option<send::SendBatch>,
-    send_finish: Option<send::SendFinish>,
     fast_open_limit: i32,
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_key_lease: Option<ntcp::FastOpenKeyLease>,
@@ -647,7 +646,6 @@ impl Socket {
             mark: 0,
             linger: Linger::DEFAULT,
             send_batch: None,
-            send_finish: None,
             fast_open_limit: 0,
             fast_open_cookie_policy: None,
             fast_open_key_lease: None,
@@ -820,21 +818,19 @@ impl<T: PartialEq> PartialEq for ByConnection<T> {
 // The lists of sockets that passes visit instead of every socket, linked
 // through the sockets as Linux links a socket into a wait queue: joining
 // one never allocates, and a socket leaves one in constant time.
-const LISTS: usize = 4;
+const LISTS: usize = 3;
 // Readiness changes kept for epoll instances to read (`Owner::change_log`):
 // one that has not looked for more than this many rescans its
 // registrations instead.
 const CHANGE_LOG: usize = 4096;
 // Readiness may have changed since the last refresh (`Owner::events`).
 const CHANGED: usize = 0;
-// A finish_send deferred while its output is held (`Socket::send_finish`).
-const FINISHING: usize = 1;
 // Zero-copy leases outstanding (`Socket::zc_leases`).
-const LEASED: usize = 2;
+const LEASED: usize = 1;
 // TX timestamp records at the socket's connection: those its writes
 // requested (`TimestampState::pending`), or any the connection reported
 // ready (`ConnectionEvents::tx_timestamps`).
-const STAMPING: usize = 3;
+const STAMPING: usize = 2;
 #[derive(Clone, Copy, Default)]
 struct Links {
     member: bool,
@@ -1825,7 +1821,6 @@ impl Owner {
         false
     }
     fn service(&mut self, request: &mut Request) -> bool {
-        self.finish_retained_sends();
         // Last-close must give its already-queued FIN/RST a submission turn
         // before waking a caller that may immediately exit the process. This
         // retained generation survives socket removal; other requests progress.
@@ -2367,7 +2362,6 @@ impl Owner {
         result
     }
     fn events(&mut self) {
-        self.finish_retained_sends();
         for _ in 0..BUDGET {
             let Some(event) = self.endpoint.next_event() else {
                 break;
@@ -3558,14 +3552,7 @@ impl Owner {
                 child.user_timeout_ms = s.user_timeout_ms;
                 child.linger = s.linger;
                 let accepted = self.endpoint.accept(listener);
-                if matches!(
-                    accepted,
-                    Err(EndpointError::Connection(Error::WouldBlock)
-                        | EndpointError::OutputReserved)
-                ) {
-                    // All pending children may be held by backend output. Treat
-                    // that accept-only pressure like an empty queue; final child
-                    // resolution restores Acceptable and blocking requests retry.
+                if matches!(accepted, Err(EndpointError::Connection(Error::WouldBlock))) {
                     self.sockets.get_mut(&id).unwrap().acceptable = false;
                     return Err(EAGAIN);
                 }

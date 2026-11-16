@@ -316,7 +316,7 @@ impl Host {
     /// reservation-safe budget application of a trusted PTB decrease, so an
     /// indivisible held reservation larger than the new budget (a SYN
     /// carrying TFO data, a D-SACK pair) fails its owner exactly as after
-    /// that decrease (the native runtime abandons the transmission on
+    /// that decrease (the poll that finds it fails the owner and returns
     /// `ReservationMtuTooSmall`), while other connections on the path
     /// continue. A SYN sized without a peer MSS already fits 576 (IPv4) or
     /// 1280 (IPv6) octets, so only an owner value below its size affects it.

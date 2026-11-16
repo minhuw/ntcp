@@ -91,7 +91,11 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
     let start = parsed.header.sequence;
     assert_eq!(parsed.payload.len(), 300);
     assert_ne!(parsed.header.flags & wire::FIN, 0);
-    assert_eq!(a.write(id, b"x"), Err(EndpointError::OutputReserved));
+    // c151: a write is refused for the shutdown, not the reservation.
+    assert_eq!(
+        a.write(id, b"x"),
+        Err(EndpointError::Connection(Error::InvalidState))
+    );
     assert_eq!(a.abort(id), Err(EndpointError::OutputReserved));
     assert_eq!(a.release(id), Err(EndpointError::OutputReserved));
     // Timers and output now skip only the held owner. Ingress is routed before
@@ -686,11 +690,12 @@ fn reserved_abandon_after_impossible_headers_fails_only_owner_and_reclaims() {
     let token = token.unwrap();
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
+    // c151: the poll that finds the held output unfit fails its owner.
     assert_eq!(
         a.poll_reserved_transmit(2, &mut bytes, 16),
         Err(EndpointError::ReservationMtuTooSmall)
     );
-    assert!(a.abandon_transmit(token).unwrap());
+    assert!(!a.is_output_reserved(id));
     assert!(!a.abandon_transmit(token).unwrap());
     assert_eq!(
         a.close_reason(id).unwrap(),
@@ -718,18 +723,12 @@ fn reserved_abandon_wouldblock_and_stale_handles_and_admission_barrier() {
     let mut bytes = [0; 2048];
     let (_, first) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
     let first = first.unwrap();
-    let mut consumed = false;
-    let admission = a
+    // c151: admission does not wait for the reservation.
+    let room = a
         .check_write_admission(id, None, TxTimestampRequest::default())
-        .map(|_| {
-            consumed = true;
-        });
-    assert_eq!(admission, Err(EndpointError::OutputReserved));
-    assert!(!consumed);
-    assert_eq!(
-        a.send_admission_room(id, None),
-        Err(EndpointError::OutputReserved)
-    );
+        .unwrap();
+    assert!(room != 0);
+    assert_eq!(a.send_admission_room(id, None), Ok(room));
     a.reject_unsubmitted(first).unwrap();
     let (_, second) = a.poll_reserved_transmit(3, &mut bytes, 16).unwrap();
     let second = second.unwrap();
@@ -1234,12 +1233,13 @@ fn pool_full_and_selected_budget_leave_ready_and_tcp_unchanged() {
     assert_eq!(a.send_progress(third).unwrap(), before);
     assert_eq!(a.output.iter().collect::<std::vec::Vec<_>>(), queue);
     assert_eq!(a.next_deadline(), deadline);
-    assert_eq!(a.write(one, b"no"), Err(EndpointError::OutputReserved));
-    assert_eq!(a.read(two, &mut bytes), Err(EndpointError::OutputReserved));
-    assert_eq!(a.set_nagle(two, true), Err(EndpointError::OutputReserved));
-    assert_eq!(
-        a.check_write_admission(two, None, Default::default()),
-        Err(EndpointError::OutputReserved)
+    // c151: the stream calls of a reserved connection take effect at once.
+    assert_eq!(a.write(one, b"no"), Ok(2));
+    assert_eq!(a.read(two, &mut bytes), Err(Error::WouldBlock.into()));
+    assert_eq!(a.set_nagle(two, true), Ok(()));
+    assert!(
+        a.check_write_admission(two, None, Default::default())
+            .is_ok()
     );
     a.accept_transmit(9, second.unwrap()).unwrap();
     let (out, third_attempt) = a
@@ -1578,9 +1578,12 @@ fn check_listener_reservation_readiness(consume_event: bool, repair: bool) {
     if consume_event {
         assert!(matches!(b.next_event(), Some(Event::Acceptable(id)) if id == listener));
     }
-    // The second child can be accepted without modifying or popping the first.
+    // c151: a child whose output is reserved is accepted as any other, in
+    // order, and the listener's Acceptable is not held for it: given once if
+    // taken before the accepts, which leave none to give.
+    assert_eq!(b.accept(listener).unwrap(), held);
     assert_eq!(b.accept(listener).unwrap(), children[1]);
-    assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
+    assert_eq!(b.accept(listener), Err(Error::WouldBlock.into()));
     while let Some(event) = b.next_event() {
         assert!(!matches!(event, Event::Acceptable(_)));
     }
@@ -1588,16 +1591,11 @@ fn check_listener_reservation_readiness(consume_event: bool, repair: bool) {
     if repair {
         b.set_first_hop_mtu(2, held, 100).unwrap();
         assert!(b.reject_unsubmitted(token).unwrap());
-        assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
-        assert_eq!(b.next_event(), None);
         let (_, prefix) = b
             .poll_reserved_transmit_for(2, held, &mut bytes, 1)
             .unwrap();
         assert!(b.accept_transmit(2, prefix.unwrap()).unwrap());
         assert!(b.is_output_reserved(held));
-        assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
-        assert_eq!(b.next_event(), None);
-        assert_eq!(b.next_event(), None);
         let (_, final_fragment) = b
             .poll_reserved_transmit_for(2, held, &mut bytes, 1)
             .unwrap();
@@ -1605,10 +1603,11 @@ fn check_listener_reservation_readiness(consume_event: bool, repair: bool) {
     }
     assert!(b.accept_transmit(2, token).unwrap());
     assert!(!b.is_output_reserved(held));
-    assert!(matches!(b.next_event(), Some(Event::Acceptable(id)) if id == listener));
     assert!(!b.accept_transmit(2, token).unwrap());
-    assert_eq!(b.next_event(), None);
-    assert_eq!(b.accept(listener).unwrap(), held);
+    while let Some(event) = b.next_event() {
+        assert!(!matches!(event, Event::Acceptable(_)));
+    }
+    b.close_listener(listener).unwrap();
 }
 
 fn gso_pair(ipv6: bool, gso: bool) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
@@ -1728,7 +1727,6 @@ fn gso_ipv4_ipv6_exact_scalar_wire_equivalence_and_options() {
                 assert!(s.payload_len / s.segment_payload_len <= 4);
                 assert_eq!(s.tcp_header_len, 32);
                 assert!(s.segment_payload_len < 1000); // TS options consume peer MSS.
-                assert_eq!(a.write(id, b"blocked"), Err(EndpointError::OutputReserved));
             }
             assert!(a.accept_transmit(2, token).unwrap());
             assert!(!a.accept_transmit(2, token).unwrap());
@@ -1948,8 +1946,8 @@ fn adaptive_ack_held_owner_rejection_and_repair_preserve_ack_history() {
         a.input(4, request.ip, &request_bytes),
         Err(EndpointError::OutputReserved)
     );
-    assert_eq!(a.read(id, &mut [0; 32]), Err(EndpointError::OutputReserved));
-    assert_eq!(a.write(id, b"x"), Err(EndpointError::OutputReserved));
+    // c151: the request already taken in is read under the reservation.
+    assert_eq!(a.read(id, &mut [0; 32]), Ok(7));
     assert_eq!(a.close(id), Err(EndpointError::OutputReserved));
     assert_eq!(a.on_timeout(4, 16), Ok(false));
     assert!(
@@ -2005,17 +2003,12 @@ fn fast_open_pending_writer_setter_reservation_and_generation_barriers() {
     a.set_fast_open_write_pending(id, true).unwrap();
     let (_, attempt) = a.poll_reserved_transmit(0, &mut [0; 2048], 16).unwrap();
     let attempt = attempt.unwrap();
+    // c151: the hint applies at once under the reservation.
     for pending in [false, true] {
-        assert_eq!(
-            a.set_fast_open_write_pending(id, pending),
-            Err(EndpointError::OutputReserved)
-        );
+        assert_eq!(a.set_fast_open_write_pending(id, pending), Ok(()));
     }
     a.reject_unsubmitted(attempt).unwrap();
-    assert_eq!(
-        a.set_fast_open_write_pending(id, false),
-        Err(EndpointError::OutputReserved)
-    );
+    assert_eq!(a.set_fast_open_write_pending(id, false), Ok(()));
     let (_, retry) = a.poll_reserved_transmit(0, &mut [0; 2048], 16).unwrap();
     a.accept_transmit(0, retry.unwrap()).unwrap();
     a.set_fast_open_write_pending(id, false).unwrap();

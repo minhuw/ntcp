@@ -820,7 +820,7 @@ fn fast_open_reserved_syn_is_indivisible_after_path_shrink() {
 }
 
 #[test]
-fn fast_open_early_child_reservation_protects_accept_and_listener_close() {
+fn fast_open_early_child_reservation_protects_listener_close_not_accept() {
     for payload in [&b""[..], &b"early"[..]] {
         let (mut a, mut b, listener) = warm(false);
         b.enable_output_reservations().unwrap();
@@ -831,19 +831,18 @@ fn fast_open_early_child_reservation_protects_accept_and_listener_close() {
         let (output, attempt) = b.poll_reserved_transmit(120, &mut bytes, 64).unwrap();
         let child = output.packet.unwrap().connection.unwrap();
         let attempt = attempt.unwrap();
-        assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
         assert_eq!(
             b.close_listener(listener),
             Err(EndpointError::OutputReserved)
         );
+        // c151: the child is accepted under its reservation.
+        assert_eq!(b.accept(listener).unwrap(), child);
         assert!(b.reject_unsubmitted(attempt).unwrap());
-        assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
         let (_, next) = b
             .poll_reserved_transmit_for(130, child, &mut bytes, 64)
             .unwrap();
         assert!(!b.accept_transmit(140, attempt).unwrap());
         assert!(b.accept_transmit(140, next.unwrap()).unwrap());
-        assert_eq!(b.accept(listener).unwrap(), child);
         if payload.is_empty() {
             assert_eq!(b.read(child, &mut bytes), Err(Error::WouldBlock.into()));
         } else {

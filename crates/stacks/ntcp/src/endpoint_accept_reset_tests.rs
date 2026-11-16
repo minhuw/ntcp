@@ -267,14 +267,8 @@ fn output_reservation_preserves_accept_and_reset_ordering() {
             .unwrap();
         assert_eq!(output.packet.unwrap().connection, Some(child));
         let attempt = attempt.unwrap();
-        assert_eq!(
-            p.endpoint.accept(p.listener),
-            Err(EndpointError::OutputReserved)
-        );
-        assert_eq!(
-            p.endpoint.close_listener(p.listener),
-            Err(EndpointError::OutputReserved)
-        );
+        // c151: the child is accepted under its reservation; its reset waits.
+        assert_eq!(p.endpoint.accept(p.listener).unwrap(), child);
         assert_eq!(
             p.input(2, p.header(40000, 111, 0, wire::RST), &[], &[]),
             Err(EndpointError::OutputReserved)
@@ -288,7 +282,6 @@ fn output_reservation_preserves_accept_and_reset_ordering() {
         assert!(!p.endpoint.accept_transmit(4, attempt).unwrap());
         assert!(p.endpoint.accept_transmit(4, retry.unwrap()).unwrap());
         p.reset(40000, 5, 10);
-        assert_eq!(p.endpoint.accept(p.listener).unwrap(), child);
         assert_eq!(p.endpoint.state(child).unwrap(), State::Closed);
         assert_eq!(p.endpoint.read_terminal(child, &mut bytes).unwrap(), 10);
     }
