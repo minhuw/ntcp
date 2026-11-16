@@ -2198,6 +2198,10 @@ fn move_fields(map: &mut [u8], width: usize, from: usize, to: usize, count: usiz
 mod receive_reference;
 
 #[cfg(test)]
+#[path = "buffer_receive_differential.rs"]
+mod receive_differential;
+
+#[cfg(test)]
 mod tests {
     // Every query of the ring that keeps no presence bits for its contiguous
     // prefix answers as the ring that kept them for every byte
