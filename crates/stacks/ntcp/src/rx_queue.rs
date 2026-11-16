@@ -126,6 +126,16 @@ pub(crate) struct RxOutputUndo {
 // empty), length, FIN and PUSH.
 type DeferredSyn = (Option<RxFrame>, usize, bool, bool);
 
+// The received frame an input lends the queue (`Endpoint::input_frame`):
+// the addresses of its bytes, and the frame until the queue takes it, or
+// again once the queue lets it go before the lend ends, so that its bytes,
+// which the segment being processed borrows, outlive that processing.
+struct Lend {
+    bytes: core::ops::Range<usize>,
+    frame: Option<RxFrame>,
+    taken: bool,
+}
+
 pub(crate) struct RxQueue {
     inorder: VecDeque<RxFrame>,
     ofo: BTreeMap<u64, OfoSeg>,
@@ -149,6 +159,7 @@ pub(crate) struct RxQueue {
     // Running sums over held frames: their truesize, and how many.
     frames: usize,
     entries: usize,
+    lend: Option<Lend>,
 }
 
 impl core::fmt::Debug for RxQueue {
@@ -184,6 +195,73 @@ impl RxQueue {
             dsack: None,
             frames: 0,
             entries: 0,
+            lend: None,
+        }
+    }
+
+    // Lends `frame`, the received segment whose payload the next insertions
+    // borrow: the part one of them holds is taken from it, trimmed, in
+    // place of a copy. Until `end_lend`, the queue drops no frame it took
+    // from it.
+    pub(crate) fn lend(&mut self, frame: RxFrame) {
+        debug_assert!(self.lend.is_none());
+        let start = frame.as_ptr() as usize;
+        self.lend = Some(Lend {
+            bytes: start..start + frame.len(),
+            frame: Some(frame),
+            taken: false,
+        });
+    }
+
+    // Ends the lend: the frame if the queue did not take it or has let it
+    // go since, which its lender drops once the segment is processed.
+    pub(crate) fn end_lend(&mut self) -> Option<RxFrame> {
+        self.lend.take().and_then(|lend| lend.frame)
+    }
+
+    // The frame holding bytes `from..to` of `payload`.
+    fn payload_frame(
+        &mut self,
+        payload: RxPayload<'_>,
+        from: usize,
+        to: usize,
+    ) -> Result<RxFrame, ()> {
+        match payload {
+            RxPayload::Borrowed(bytes) => self.frame_of(&bytes[from..to]),
+            owned => owned.into_frame(from, to),
+        }
+    }
+
+    // The frame holding `bytes`, part of the payload being inserted: the
+    // lent frame trimmed to them, or else a heap copy, whose allocation may
+    // be refused.
+    pub(crate) fn frame_of(&mut self, bytes: &[u8]) -> Result<RxFrame, ()> {
+        let at = bytes.as_ptr() as usize;
+        if let Some(lend) = &mut self.lend
+            && !lend.taken
+            && lend.bytes.start <= at
+            && at + bytes.len() <= lend.bytes.end
+        {
+            let mut frame = lend.frame.take().unwrap();
+            lend.taken = true;
+            let offset = at - lend.bytes.start;
+            frame.truncate(offset + bytes.len());
+            frame.advance(offset);
+            return Ok(frame);
+        }
+        heap_copy(bytes)
+    }
+
+    // Drops a frame the queue no longer holds, except the lent one, which
+    // goes back to the lend.
+    fn discard(&mut self, frame: RxFrame) {
+        if let Some(lend) = &mut self.lend
+            && lend.taken
+            && lend.bytes.contains(&(frame.as_ptr() as usize))
+        {
+            lend.frame = Some(frame);
+        } else {
+            drop(frame);
         }
     }
 
@@ -212,6 +290,7 @@ impl RxQueue {
     fn release(&mut self, frame: RxFrame) {
         self.frames -= frame.truesize();
         self.entries -= 1;
+        self.discard(frame);
     }
 
     // std's BTreeMap keeps its root leaf after its last entry is removed:
@@ -256,12 +335,14 @@ impl RxQueue {
     // Only the initial SYN prefix can be staged. No presence/reporting
     // state is published until validated establishment; next() remains
     // IRS+1 throughout. The deque slot promotion needs is taken now, so
-    // that establishment never allocates; a refusal stages nothing.
+    // that establishment never allocates; a refusal stages nothing, and
+    // lets the frame go (`discard`: a lent one goes back to the lend).
     pub(crate) fn defer_syn(&mut self, frame: RxFrame, fin: bool, push: bool) -> Result<(), ()> {
         assert!(!self.has_data() && self.fin_sequence.is_none() && self.deferred_syn.is_none());
         let len = frame.len();
-        if len != 0 {
-            self.inorder.try_reserve(1).map_err(|_| ())?;
+        if len != 0 && self.inorder.try_reserve(1).is_err() {
+            self.discard(frame);
+            return Err(());
         }
         let frame = (len != 0).then_some(frame);
         if let Some(frame) = &frame {
@@ -286,6 +367,18 @@ impl RxQueue {
     }
 
     pub(crate) fn clear(&mut self) {
+        if self.lend.as_ref().is_some_and(|lend| lend.taken) {
+            let inorder = core::mem::take(&mut self.inorder);
+            let ofo = core::mem::take(&mut self.ofo);
+            let syn = self.deferred_syn.take().and_then(|syn| syn.0);
+            for frame in inorder
+                .into_iter()
+                .chain(ofo.into_values().map(|seg| seg.frame))
+                .chain(syn)
+            {
+                self.discard(frame);
+            }
+        }
         self.inorder = VecDeque::new();
         self.ofo = BTreeMap::new();
         self.runs = BTreeMap::new();
@@ -828,11 +921,12 @@ impl RxQueue {
         // kept yet, as below. Its frame and deque slot are taken first: a
         // refusal leaves the queue as it was.
         if len != 0 && !outcome.out_of_order && !had_holes && contiguous + len <= data_limit {
-            let Ok(frame) = payload.into_frame(0, len) else {
+            let Ok(frame) = self.payload_frame(payload, 0, len) else {
                 outcome.refused = true;
                 return outcome;
             };
             if self.inorder.try_reserve(1).is_err() {
+                self.discard(frame);
                 outcome.refused = true;
                 return outcome;
             }
@@ -894,11 +988,14 @@ impl RxQueue {
             let built = if self.ofo.range(from..to).next().is_some() {
                 self.merged_frame(&payload.bytes()[skip..skip + len], from)
             } else {
-                payload.into_frame(skip, skip + len)
+                self.payload_frame(payload, skip, skip + len)
             };
             match built {
                 Ok(held) if self.inorder.try_reserve(promoted).is_ok() => frame = Some(held),
-                _ => {
+                built => {
+                    if let Ok(held) = built {
+                        self.discard(held);
+                    }
                     outcome.refused = true;
                     return outcome;
                 }

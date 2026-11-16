@@ -9,7 +9,7 @@
 
 extern crate alloc;
 
-pub use ntcp_buffer::Payload;
+pub use ntcp_buffer::{Payload, RxFrame};
 
 #[cfg(test)]
 mod allocation_tests;

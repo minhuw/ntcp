@@ -1710,6 +1710,23 @@ impl Connection {
         (old != storage).then_some((old, storage))
     }
 
+    // Lends the receive queue `frame`, the segment the next input borrows,
+    // so that the payload it holds is the frame itself, not a copy
+    // (`Endpoint::input_frame`).
+    pub(crate) fn lend_frame(&mut self, frame: ntcp_buffer::RxFrame) {
+        self.receive.lend(frame);
+    }
+
+    // Ends `lend_frame`'s lend: the frame unless the queue holds it.
+    // `clear` first when the connection is to be dropped before the
+    // segment is processed, so that the queue lets the frame go.
+    pub(crate) fn end_lend(&mut self, clear: bool) -> Option<ntcp_buffer::RxFrame> {
+        if clear {
+            self.receive.clear();
+        }
+        self.receive.end_lend()
+    }
+
     #[cfg(test)]
     pub(crate) fn receive_queue(&self) -> &RxQueue {
         &self.receive
@@ -4704,7 +4721,7 @@ impl Connection {
             if count == 0 && !fin && urgent.is_none() {
                 return false;
             }
-            let Ok(frame) = crate::rx_queue::heap_copy(&syn.payload[..count]) else {
+            let Ok(frame) = self.receive.frame_of(&syn.payload[..count]) else {
                 return true;
             };
             // Conservative RFC 9293 reference ordering: retain ordinary SYN

@@ -13,7 +13,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{
-    DropReason, FastOpenCookiePolicy, Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options,
+    DropReason, FastOpenCookiePolicy, Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, RxFrame,
     RxPacketTimestamps, RxReadTimestamps, RxTimestampStatus, SendProgress, SourceRoute,
     TimestampRequest, TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource,
     TxTimestampStage, TxTimestampToken,
@@ -782,6 +782,11 @@ pub struct Endpoint {
     // ponytail: conservative FIFO loss retention until eviction; add path-qualified
     // aging only when measured deployment behavior warrants it.
     setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
+    // The frame `input_frame` is processing until it lends it to its
+    // connection (`lent`, the slot), or gets it back: the segment borrows its
+    // bytes until that input returns.
+    ingress: Option<RxFrame>,
+    lent: Option<usize>,
 }
 
 // A member of shared buffer memory that goes leaves its group
@@ -1008,6 +1013,8 @@ impl Endpoint {
             local_refusals: false,
             control_turn: true,
             budget,
+            ingress: None,
+            lent: None,
         })
     }
 
@@ -3172,7 +3179,12 @@ impl Endpoint {
     fn reclaim(&mut self, index: usize) {
         let id = self.id(index);
         debug_assert!(!self.is_output_reserved(id));
-        let slot = self.slots[index].take().unwrap();
+        let mut slot = self.slots[index].take().unwrap();
+        // A frame `input_frame` lent it outlives the input.
+        if self.lent == Some(index) {
+            self.lent = None;
+            self.ingress = slot.connection.end_lend(true);
+        }
         self.occupied.remove(index);
         self.budget.close_socket();
         let tuple = slot.connection.scoped_tuple();
@@ -3850,6 +3862,42 @@ impl Endpoint {
         )
     }
 
+    /// Input of a received TCP segment held in `frame` (IP header removed),
+    /// as `input_with_metadata`, except that the payload the connection
+    /// accepts is not copied: the frame itself, trimmed to that payload, is
+    /// held in the receive queue and charged its truesize until it is read
+    /// (Linux queues the skb). A frame nothing is taken from is dropped
+    /// before this returns.
+    pub fn input_frame(
+        &mut self,
+        now: Instant,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Ipv4Options,
+        frame: RxFrame,
+        metadata: crate::RxPacketMetadata,
+    ) -> Result<InputDisposition, EndpointError> {
+        debug_assert!(self.ingress.is_none() && self.lent.is_none());
+        // SAFETY: an RxFrame's bytes stay valid and unchanged until it is
+        // dropped, and moving it does not move them. This one is dropped
+        // only after the input: it stays in `ingress`, or is lent to the
+        // connection's receive queue, which until `end_lend` gives back
+        // every frame it lets go of that is this one, and the lend ends
+        // below or when `reclaim` drops the connection (after a clear that
+        // gives it back). Only a frame the queue still holds after the
+        // input stays with the queue.
+        let bytes = unsafe { core::slice::from_raw_parts(frame.as_ptr(), frame.len()) };
+        self.ingress = Some(frame);
+        let result = self.input_scoped(now, ip, None, traffic_class, options, bytes, metadata);
+        if let Some(index) = self.lent.take()
+            && let Some(slot) = self.slots[index].as_mut()
+        {
+            drop(slot.connection.end_lend(false));
+        }
+        self.ingress = None;
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn input_with_metadata(
         &mut self,
@@ -4018,6 +4066,10 @@ impl Endpoint {
             slot.connection.hold_establishment = hold;
             slot.connection.memory_pressure = self.budget.under_pressure();
             slot.received_dscp = Some(traffic_class >> 2);
+            if let Some(frame) = self.ingress.take() {
+                slot.connection.lend_frame(frame);
+                self.lent = Some(index);
+            }
             let admitted = if let Some(authorization) = authorization {
                 slot.connection.input_with_receive_authorization(
                     now,
@@ -9386,6 +9438,10 @@ mod reset_defense_tests;
 #[cfg(test)]
 #[path = "endpoint_loss_counter_tests.rs"]
 mod loss_counter_tests;
+
+#[cfg(test)]
+#[path = "endpoint_input_frame_tests.rs"]
+mod input_frame_tests;
 
 #[cfg(all(test, feature = "packet-test-controls"))]
 mod timestamp_default_control_tests {
