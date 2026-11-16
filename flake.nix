@@ -11,11 +11,20 @@
     flake = false;
   };
 
+  # Miri needs a nightly toolchain, which nixpkgs does not package: the `miri` dev shell
+  # takes one pinned nightly from rust-overlay (flake.lock pins the overlay, and with it
+  # the nightly's hashes).
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
   outputs =
     {
       self,
       nixpkgs,
       packetdrill,
+      rust-overlay,
     }:
     let
       system = "x86_64-linux";
@@ -201,54 +210,70 @@
       # other tool a script or test runs comes from here, so `nix develop -i` works on a
       # machine with nothing but Nix; sudo, KVM, VFIO, hugepages and user namespaces stay
       # host features.
-      devShells.${system}.default = pkgs.mkShell {
-        NTCP_BPF_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
-        NTCP_BPF_CFLAGS = "-isystem ${pkgs.linuxHeaders}/include";
-        # integration/packetdrill/run.py's default source and runner.
-        NTCP_PACKETDRILL_SOURCE = "${packetdrill}";
-        NTCP_PACKETDRILL_RUNNER = "${packetdrill-runner}/gtests/net/packetdrill/packetdrill";
-        # The duvet scripts' RFC texts, read instead of fetching rfc-editor.org.
-        NTCP_RFC_TEXTS = "${rfc-texts}";
-        packages = [
-          pkgs.pkg-config
-          pkgs.rustc
-          pkgs.cargo
-          pkgs.clippy
-          pkgs.rustfmt
-          # .config/nextest.toml's profiles: one process per test, each test's output kept.
-          pkgs.cargo-nextest
-          # duvet/, integration/ and the crates' Python tests; tomllib needs Python 3.11.
-          pkgs.python3
-          # Source snapshots (rfc_host, check_mac_cost) and operator packetdrill checkouts.
-          pkgs.git
-          # integration/packetdrill/build_runner.py builds an operator checkout's runner.
-          pkgs.bison
-          pkgs.flex
-          # Namespace tests: ip and tc (iproute2); unshare, nsenter, mount (util-linux);
-          # offload control (ethtool); rfc_host's ICMP filters (nftables); the peer's
-          # sysctls in linux_tun.py (procps); host_veth.py's ping (iputils).
-          pkgs.iproute2
-          pkgs.util-linux
-          pkgs.ethtool
-          pkgs.nftables
-          pkgs.procps
-          pkgs.iputils
-          # ntcp-io-af-xdp/tests/run-native.sh pins and attaches its XDP program.
-          pkgs.bpftools
-          # ntcp-socket/tests/redis.py runs redis-server and redis-cli over the preload.
-          pkgs.redis
-          # duvet/rfc-report.sh.
-          duvet
-          # Profiling the stack's cost per request (perf record/stat, callgrind).
-          pkgs.perf
-          pkgs.valgrind
-        ];
-        buildInputs = [
-          dpdk-mlx5
-          pkgs.rdma-core
-          pkgs.libbpf
-        ]
-        ++ dpdkStaticDeps;
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          NTCP_BPF_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          NTCP_BPF_CFLAGS = "-isystem ${pkgs.linuxHeaders}/include";
+          # integration/packetdrill/run.py's default source and runner.
+          NTCP_PACKETDRILL_SOURCE = "${packetdrill}";
+          NTCP_PACKETDRILL_RUNNER = "${packetdrill-runner}/gtests/net/packetdrill/packetdrill";
+          # The duvet scripts' RFC texts, read instead of fetching rfc-editor.org.
+          NTCP_RFC_TEXTS = "${rfc-texts}";
+          packages = [
+            pkgs.pkg-config
+            pkgs.rustc
+            pkgs.cargo
+            pkgs.clippy
+            pkgs.rustfmt
+            # .config/nextest.toml's profiles: one process per test, each test's output kept.
+            pkgs.cargo-nextest
+            # duvet/, integration/ and the crates' Python tests; tomllib needs Python 3.11.
+            pkgs.python3
+            # Source snapshots (rfc_host, check_mac_cost) and operator packetdrill checkouts.
+            pkgs.git
+            # integration/packetdrill/build_runner.py builds an operator checkout's runner.
+            pkgs.bison
+            pkgs.flex
+            # Namespace tests: ip and tc (iproute2); unshare, nsenter, mount (util-linux);
+            # offload control (ethtool); rfc_host's ICMP filters (nftables); the peer's
+            # sysctls in linux_tun.py (procps); host_veth.py's ping (iputils).
+            pkgs.iproute2
+            pkgs.util-linux
+            pkgs.ethtool
+            pkgs.nftables
+            pkgs.procps
+            pkgs.iputils
+            # ntcp-io-af-xdp/tests/run-native.sh pins and attaches its XDP program.
+            pkgs.bpftools
+            # ntcp-socket/tests/redis.py runs redis-server and redis-cli over the preload.
+            pkgs.redis
+            # duvet/rfc-report.sh.
+            duvet
+            # Profiling the stack's cost per request (perf record/stat, callgrind).
+            pkgs.perf
+            pkgs.valgrind
+          ];
+          buildInputs = [
+            dpdk-mlx5
+            pkgs.rdma-core
+            pkgs.libbpf
+          ]
+          ++ dpdkStaticDeps;
+        };
+
+        # `nix develop .#miri --command cargo miri test -p ntcp-buffer`: the crates whose
+        # unsafe code Miri checks (no FFI, no host features). Its nightly replaces the default
+        # shell's stable toolchain, so nothing else builds here.
+        miri = pkgs.mkShell {
+          packages = [
+            ((rust-overlay.lib.mkRustBin { } pkgs).nightly."2026-11-15".minimal.override {
+              extensions = [
+                "miri"
+                "rust-src"
+              ];
+            })
+          ];
+        };
       };
     };
 }

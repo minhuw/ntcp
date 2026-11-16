@@ -4,5 +4,5 @@ version = "0.0.1"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT"
-description = "Immutable shared payload ownership for network transmission"
+description = "Packet buffer ownership for ntcp: shared payloads, received frames, transmit chunks"
 repository = "https://github.com/minhuw/ntcp"

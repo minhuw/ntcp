@@ -1,6 +1,25 @@
+//! Packet buffer ownership: payloads the application shares for
+//! transmission (`Payload`), frames received from a device (`RxFrame`), and
+//! transmit chunks that copying writes fill (`TxChunk`), held through one
+//! owner's `ChunkArena`.
+//!
+//! The arena's stale-handle check is a `debug_assert!` only, by the user's
+//! deliberate choice (D3, 2026-11-15) against a release assert: in a
+//! release build a stale `ChunkRef` is not detected and can put another
+//! connection's bytes on the wire. The safeguards are the debug check,
+//! which runs in every test profile, and the release-path property test of
+//! the arena. `ChunkRef` states the handle invariant.
 #![no_std]
 
 extern crate alloc;
+
+mod arena;
+mod chunk;
+mod frame;
+
+pub use arena::{ChunkArena, ChunkRef};
+pub use chunk::{ChunkSlice, HeapChunkSource, TxChunk, TxChunkSource, TxChunkVtable};
+pub use frame::{RxFrame, RxFrameVtable};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{any::Any, fmt, ops::Range};
@@ -126,6 +145,53 @@ impl Payload {
     }
 }
 
+/// A range of a `Payload`, borrowed for one call, as a packet references
+/// it without taking a reference count: a backend that keeps the bytes past
+/// the call takes its own (`to_payload`).
+#[derive(Clone, Copy)]
+pub struct PayloadSlice<'a> {
+    payload: &'a Payload,
+    offset: usize,
+    len: usize,
+}
+impl<'a> PayloadSlice<'a> {
+    /// `range` of `payload`'s bytes; None outside them.
+    pub fn new(payload: &'a Payload, range: Range<usize>) -> Option<Self> {
+        (range.start <= range.end && range.end <= payload.len()).then(|| Self {
+            payload,
+            offset: range.start,
+            len: range.end - range.start,
+        })
+    }
+    pub fn payload(&self) -> &'a Payload {
+        self.payload
+    }
+    /// The range, in the payload's bytes.
+    pub fn range(&self) -> Range<usize> {
+        self.offset..self.offset + self.len
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn bytes(&self) -> &'a [u8] {
+        &self.payload.as_slice()[self.range()]
+    }
+    /// An owning reference to the same bytes, holding the payload's lease.
+    pub fn to_payload(&self) -> Payload {
+        self.payload.slice(self.range()).unwrap()
+    }
+}
+impl fmt::Debug for PayloadSlice<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PayloadSlice")
+            .field("range", &self.range())
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -188,6 +254,35 @@ mod tests {
         assert_eq!(released.load(Ordering::SeqCst), 0);
         drop(joined);
         assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    // A queue holds frames and chunks inline: keep them five words.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn frames_and_chunks_are_five_words() {
+        assert_eq!(size_of::<RxFrame>(), 40);
+        assert_eq!(size_of::<Option<RxFrame>>(), 40);
+        assert_eq!(size_of::<TxChunk>(), 40);
+        assert_eq!(
+            size_of::<ChunkRef>(),
+            if cfg!(debug_assertions) { 12 } else { 8 }
+        );
+    }
+
+    #[test]
+    fn payload_slices_borrow_a_checked_range() {
+        let base = Payload::from_vec(vec![1, 2, 3, 4, 5, 6])
+            .slice(1..6)
+            .unwrap();
+        let slice = PayloadSlice::new(&base, 1..4).unwrap();
+        assert_eq!(slice.bytes(), &[3, 4, 5]);
+        assert_eq!((slice.range(), slice.len()), (1..4, 3));
+        assert!(core::ptr::eq(slice.payload(), &base));
+        let owned = slice.to_payload();
+        assert_eq!(owned.as_slice(), &[3, 4, 5]);
+        assert_eq!(owned.as_slice().as_ptr(), slice.bytes().as_ptr());
+        assert!(PayloadSlice::new(&base, 5..5).unwrap().is_empty());
+        assert!(PayloadSlice::new(&base, 2..6).is_none());
     }
 
     #[test]
