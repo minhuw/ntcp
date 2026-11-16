@@ -454,14 +454,15 @@ mod packets {
                 assert_eq!(again, full);
                 assert_eq!(close(alias), 0);
             }
-            reset_reuse_then_rto_suppressed_blocking_send(&addr);
+            reset_reuse_then_rto_keeps_fast_open_blocking_send(&addr);
         }
         packet_test::stop();
     }
 
-    // Reuse the reset service with SYN-data; its actual RTO then suppresses the next send.
+    // Reuse the reset service with SYN-data; its RTO leaves Fast Open on for the
+    // next send (Linux 6.12 records no per-destination SYN loss).
     #[cfg(feature = "linux")]
-    unsafe fn reset_reuse_then_rto_suppressed_blocking_send(addr: &sockaddr_in) {
+    unsafe fn reset_reuse_then_rto_keeps_fast_open_blocking_send(addr: &sockaddr_in) {
         unsafe {
             for timeout in [true, false] {
                 let fd = socket();
@@ -487,8 +488,8 @@ mod packets {
                 let syn = capture();
                 let initial = segment(&syn);
                 assert_ne!(initial.header.flags & SYN, 0);
-                assert_eq!(initial.options.fast_open.is_some(), timeout);
-                assert_eq!(!initial.payload.is_empty(), timeout);
+                assert!(initial.options.fast_open.is_some());
+                assert!(!initial.payload.is_empty());
                 assert!(rx.try_recv().is_err());
                 if timeout {
                     // The warmup's unacknowledged FIN can also retransmit.
@@ -572,7 +573,7 @@ mod packets {
                             .0,
                         2000
                     );
-                    let mut received = Vec::new();
+                    let mut received = initial.payload.to_vec();
                     while received.len() < 2000 {
                         // The retained writer now piggybacks the handshake ACK on data.
                         let packet = first.take().unwrap_or_else(capture);

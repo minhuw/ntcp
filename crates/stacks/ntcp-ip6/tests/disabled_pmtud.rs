@@ -637,7 +637,7 @@ fn disabled_ipv6_fast_open_cold_warm_supplied_protected_and_rejected() {
                 assert_eq!(a.transport_info(id).unwrap().advertised_mss, 4096);
                 a.clear_fast_open_client_cache();
                 // Explicit supplied and protected cases below do not need the
-                // credential cache; conservative cold admission remains separate
+                // credential cache; cold admission (the offered MSS) remains separate
                 // from the actual IPv6 peer MSS and ordinary send ceiling.
             }
         }

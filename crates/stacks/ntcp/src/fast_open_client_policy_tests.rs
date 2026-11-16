@@ -209,7 +209,11 @@ fn optionless_handshake_learns_mss_without_unsolicited_credentials() {
 }
 
 #[test]
-fn protected_client_timeout_retries_plain_and_preserves_negative_service() {
+// The retry is a plain SYN without data or option (Linux's tcp_send_syn_data
+// sets cookie.len = -1 for SYN retries and keeps the data in its own skb), and
+// the timeout disables Fast Open for no service: Linux 6.12 records SYN loss
+// per destination only for netlink (syn_loss), never to disable it.
+fn protected_client_timeout_retries_plain_and_keeps_fast_open() {
     for v6 in [false, true] {
         for empty in [false, true] {
             let mut a = client(v6);
@@ -243,7 +247,7 @@ fn protected_client_timeout_retries_plain_and_preserves_negative_service() {
                     FastOpenClientPolicy::ApplicationProtected,
                 )
                 .unwrap();
-            assert_eq!(allowed, empty); // A plain empty SYN was no early-data attempt.
+            assert!(allowed);
             let (_, n) = a
                 .connect_fast_open_with_policy(
                     deadline,
@@ -254,7 +258,7 @@ fn protected_client_timeout_retries_plain_and_preserves_negative_service() {
                     FastOpenClientPolicy::ApplicationProtected,
                 )
                 .unwrap();
-            assert_eq!(n != 0, empty);
+            assert_ne!(n, 0);
             let (local, _) = addresses(v6, 40002);
             assert!(
                 a.can_defer_fast_open_with_policy(
@@ -339,7 +343,10 @@ fn protected_client_reserved_syn_and_real_server_deliver_once() {
 }
 
 #[test]
-fn optionless_syn_only_ack_keeps_failure_separate_from_learned_mss() {
+// A SYN-ACK acknowledging none of the SYN data teaches the MSS and leaves Fast
+// Open on: Linux's tcp_rcv_fastopen_synack retransmits the data and caches
+// syn_drop only after a SYN timeout, which nothing reads to disable Fast Open.
+fn optionless_syn_only_ack_keeps_fast_open_and_learns_mss() {
     for v6 in [false, true] {
         let mut a = client(v6);
         let (local, remote) = addresses(v6, 40000);
@@ -374,7 +381,7 @@ fn optionless_syn_only_ack_keeps_failure_separate_from_learned_mss() {
         assert!(!a.has_fast_open_cookie(10, local.ip(), remote.ip()).unwrap());
         let (other, _) = addresses(v6, 40001);
         assert!(
-            !a.can_defer_fast_open_with_policy(
+            a.can_defer_fast_open_with_policy(
                 10,
                 other.ip(),
                 remote,
@@ -382,17 +389,16 @@ fn optionless_syn_only_ack_keeps_failure_separate_from_learned_mss() {
             )
             .unwrap()
         );
-        let target = SocketAddr::new(remote.ip(), 8081);
         let (_, count) = a
             .connect_fast_open_with_policy(
                 10,
                 other,
-                target,
+                remote,
                 &[7; 1000],
                 options(None),
                 FastOpenClientPolicy::ApplicationProtected,
             )
             .unwrap();
-        assert_eq!(count, 900); // Valid MSS shared by IP pair, suppression by service.
+        assert_eq!(count, 900); // The learned MSS, 940 - 40.
     }
 }

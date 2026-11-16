@@ -295,10 +295,11 @@ fn partial_synack_rtt_repair_and_next_service_admission() {
                         a.has_fast_open_cookie(replied_at, local.ip(), remote.ip())
                             .unwrap()
                     );
-                    assert_eq!(
+                    // Even with none of the data acknowledged, Fast Open stays
+                    // on (Linux's tcp_rcv_fastopen_synack).
+                    assert!(
                         a.can_defer_fast_open(replied_at, local.ip(), remote)
-                            .unwrap(),
-                        acknowledged != 0
+                            .unwrap()
                     );
                     let repair = emit(&mut a, replied_at, id, reserved);
                     let repair = wire::parse(repair.0, &repair.1).unwrap();
@@ -316,12 +317,12 @@ fn partial_synack_rtt_repair_and_next_service_admission() {
                     let (next, n) = a
                         .connect_fast_open(replied_at + scale, next_local, remote, &[0x66; 700])
                         .unwrap();
-                    assert_eq!(n, if acknowledged != 0 { 700 } else { 0 });
+                    assert_eq!(n, 700);
                     let next = emit(&mut a, replied_at + scale, next, reserved);
                     let next = wire::parse(next.0, &next.1).unwrap();
-                    assert_eq!(next.options.fast_open.is_some(), acknowledged != 0);
-                    // A different service isolates the second RTT assertion from
-                    // the first service's negative cache, using the same cookie.
+                    assert!(next.options.fast_open.is_some());
+                    // A different service, with the same cookie, for the second
+                    // RTT assertion.
                     let other_remote = SocketAddr::new(remote.ip(), remote.port() + 1);
                     let (other_local, _) = addresses(v6, 40003);
                     let other_at = replied_at + 2 * scale;
@@ -350,8 +351,11 @@ fn partial_synack_rtt_repair_and_next_service_admission() {
     }
 }
 
+// A partial SYN-ACK neither clears an earlier ICMP error's suppression nor
+// creates one after a SYN timeout (Linux 6.12 records no SYN loss for the
+// destination).
 #[test]
-fn partial_synack_preserves_prior_icmp_and_rto_suppression() {
+fn partial_synack_preserves_prior_icmp_suppression() {
     for v6 in [false, true] {
         for reserved in [false, true] {
             for timed_out in [false, true] {
@@ -382,9 +386,10 @@ fn partial_synack_preserves_prior_icmp_and_rto_suppression() {
                     );
                     110
                 };
-                assert!(
-                    !a.can_defer_fast_open(failure_at, local.ip(), remote)
-                        .unwrap()
+                assert_eq!(
+                    a.can_defer_fast_open(failure_at, local.ip(), remote)
+                        .unwrap(),
+                    timed_out
                 );
                 let replied_at = failure_at + 100;
                 deliver(&mut a, replied_at, &response(&syn, 3));
@@ -396,22 +401,24 @@ fn partial_synack_preserves_prior_icmp_and_rto_suppression() {
                     a.has_fast_open_cookie(replied_at, local.ip(), remote.ip())
                         .unwrap()
                 );
-                assert!(
-                    !a.can_defer_fast_open(replied_at, local.ip(), remote)
-                        .unwrap()
+                assert_eq!(
+                    a.can_defer_fast_open(replied_at, local.ip(), remote)
+                        .unwrap(),
+                    timed_out
                 );
                 let (next_local, _) = addresses(v6, 40002);
                 let (next, accepted) = a
                     .connect_fast_open(replied_at + 1, next_local, remote, &[0x66; 12])
                     .unwrap();
-                assert_eq!(accepted, 0);
+                assert_eq!(accepted, if timed_out { 12 } else { 0 });
                 let next = emit(&mut a, replied_at + 1, next, reserved);
-                assert!(
+                assert_eq!(
                     wire::parse(next.0, &next.1)
                         .unwrap()
                         .options
                         .fast_open
-                        .is_none()
+                        .is_none(),
+                    !timed_out
                 );
             }
         }

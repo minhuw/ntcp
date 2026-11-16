@@ -1915,6 +1915,9 @@ impl Connection {
         self.prepare_fast_open_data(peer_mss, initial, max_charge)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
+    //= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option.
+    //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
     fn prepare_fast_open_data(
         &mut self,
         peer_mss: Option<u16>,
@@ -3007,30 +3010,14 @@ impl Connection {
         self.handshake_retransmission_limit
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
-    //# Negative responses include the server not acknowledging the data in the SYN, ICMP error messages,
-    //# and (most importantly) no response (SYN-ACK) from the server at all, i.e., connection timeout.
-    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
-    //= reason=The first RTO of a physically transmitted request trains the existing per-source/service cooldown once. Local output failures and held reservations do not train it; successful fallback and late cookie/MSS learning cannot erase it, and expiry permits future requests.
-    //# We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.
+    // ICMP errors about a physically transmitted request train the service
+    // cooldown once. A SYN timeout or a SYN-ACK that leaves the SYN data
+    // unacknowledged does not: Linux 6.12 never disables Fast Open for a
+    // destination on SYN loss (see duvet/rfc7413-todos.toml).
     fn report_fast_open_failure(&mut self) {
         if self.handshake_pending() && core::mem::take(&mut self.fast_open_attempt) {
             self.fast_open_negative = true;
             self.refresh_work = true;
-        }
-    }
-
-    // Called after SYN-ACK or active handshake ACK validation. Any acknowledged
-    // SYN payload is positive TFO progress; repair its residue separately
-    // (RFC 7413 4.2.2).
-    // Only SYN-only acknowledgment adds rejection evidence here. Independent
-    // ICMP/RTO evidence is neither consumed nor cleared by partial progress.
-    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-    //= reason=An emitted regular retry followed by a SYN-only acknowledgment without a cookie realizes the loss heuristic and preserves service suppression with ordinary stream progress. Delayed original, spurious, partial and returned-cookie controls keep independent RTO/rejection evidence authoritative. This is a presumption, not proof of intentional physical middlebox loss.
-    //# If the client has timed out and retransmitted only regular SYN packets, it can heuristically detect paths that intentionally drop SYNs with the Fast Open option or data. If the SYN-ACK acknowledges only the initial sequence and does not carry a Fast Open cookie option, presumably it is triggered by a retransmitted (regular) SYN and the original SYN or the corresponding SYN-ACK was lost.
-    fn report_fast_open_syn_rejection(&mut self, ack: Seq) {
-        if self.syn_payload_sent != 0 && ack == self.iss.wrapping_add(1) {
-            self.report_fast_open_failure();
         }
     }
 
@@ -7011,7 +6998,6 @@ impl Connection {
             }
             self.last_received = now;
             if valid_ack {
-                self.report_fast_open_syn_rejection(ack);
                 self.accept_ack(
                     ack,
                     false,
@@ -7220,7 +7206,6 @@ impl Connection {
             self.wl1 = seq;
             self.wl2 = ack;
             self.congestion.on_window_update(now, self.snd_wnd);
-            self.report_fast_open_syn_rejection(ack);
             self.accept_ack(
                 ack,
                 false,
@@ -7582,11 +7567,6 @@ impl Connection {
                 self.reset_reply = true;
                 self.dropped = Some(DropReason::TcpInvalidAckSequence);
                 return Ok(());
-            }
-            // Active simultaneous open can finish with a plain ACK when the
-            // peer receives our SYN-ACK before selecting its own response.
-            if !self.passive_open {
-                self.report_fast_open_syn_rejection(ack);
             }
             // Leave response delivery for the normal ACK/SACK/PRR snapshot below.
             self.accept_ack(
@@ -9934,7 +9914,7 @@ impl Connection {
             padded <= 40 && 20 + padded <= self.path_payload_limit()
         });
         //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-        //= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
+        //= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option. The Fast Open option with the server cookie is included as the quote says; only the 536-byte default is not followed. Erratum 8015 remains Held for Document Update.
         //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
         if let Some(cookie) = fast_open_option {
             options.fast_open = Some(cookie);
@@ -12376,14 +12356,6 @@ impl Connection {
             .chain(self.application_deadline())
             .min();
         if due(terminal_deadline, now) {
-            // Late servicing must not turn an earlier local give-up into SYN loss.
-            if self
-                .rto_deadline
-                .zip(terminal_deadline)
-                .is_some_and(|(rto, terminal)| rto <= terminal)
-            {
-                self.report_fast_open_failure();
-            }
             self.terminal(CloseReason::TimedOut);
             return Ok(());
         }
@@ -12460,11 +12432,6 @@ impl Connection {
             self.refresh_work = true;
             self.growth_dupack_bytes = 0;
             self.congestion.disarm_initial_ack_heuristic();
-            // A genuinely transmitted TFO request that reaches RTO trains the
-            // service cooldown even if its bare retry is locally blocked. The
-            // departure gate and one-shot report prevent unsent attempts or
-            // subsequent retries from creating/renewing failure evidence.
-            self.report_fast_open_failure();
             // Explicit application give-up budget, not the default SYN R2 policy.
             if self.handshake_pending()
                 && self

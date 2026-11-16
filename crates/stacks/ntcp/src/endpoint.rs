@@ -3483,6 +3483,7 @@ impl Endpoint {
     //# determine the maximum amount of data that the client can fit in the SYN packet in subsequent TFO
     //# connections.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
+    //= reason=Exception (duvet/rfc7413-todos.toml, c167): only ICMP errors and packet-too-big reports about a transmitted Fast Open SYN are cached here; a SYN timeout and unacknowledged SYN data are not, as Linux 6.12 caches neither.
     //# The client MUST cache negative responses from the server in order to avoid potential connection
     //# failures.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
@@ -3497,6 +3498,7 @@ impl Endpoint {
     //# to account for those connection requests that have just been reset against the listener's
     //# PendingFastOpenRequests until a timeout period has passed.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-7.1
+    //= reason=Exception (duvet/rfc7413-todos.toml, c167): only ICMP errors and packet-too-big reports about a transmitted Fast Open SYN are cached here; a SYN timeout and unacknowledged SYN data are not, as Linux 6.12 caches neither.
     //# Moreover, the implementation is recommended to negatively cache such incidents to avoid recurring
     //# timeouts.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1

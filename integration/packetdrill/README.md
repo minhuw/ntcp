@@ -182,27 +182,6 @@ same 40 ms delay.
 
 Script: `ioctl/ioctl-siocinq-fin.pkt`.
 
-### Fast Open negative-response caching
-
-When a validated SYN-ACK acknowledges the SYN but none of its data, ntcp caches
-that negative response and temporarily disables Fast Open for the service.
-[RFC 7413 §4.1.3.1](https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1)
-explicitly includes unacknowledged SYN data among the negative responses clients
-MUST cache and recommends temporarily disabling Fast Open after such responses.
-
-ntcp retains the cookie and learned peer MSS, but applies a 60-second cooldown
-keyed by local IP, remote IP, and remote service port, across local ephemeral
-ports. The duration and cache scope are local policy. Successfully retransmitting
-the data after the handshake does not clear this evidence: ordinary TCP delivery
-does not establish that the server or path accepts SYN data. Fast Open becomes
-eligible again when the cooldown expires.
-
-The script expects the next connection to reuse Fast Open immediately. ntcp
-instead sends an ordinary SYN; the nonblocking `MSG_FASTOPEN` call returns
-`EINPROGRESS` without accepting initial data.
-
-Script: `fastopen/client/syn-data-only-syn-acked.pkt`.
-
 ### Soft ICMP errors during a passive handshake
 
 ntcp reports IPv4 host-unreachable as a soft error and retains the pending

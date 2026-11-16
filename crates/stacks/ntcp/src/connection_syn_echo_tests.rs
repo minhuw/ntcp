@@ -145,8 +145,9 @@ fn syn_echo_original_and_retransmitted_bounds_are_inclusive_through_wrap() {
                 );
                 assert_eq!(a.state(), State::Established);
                 assert_eq!(a.receive.readable(), 5);
-                // A successful delayed SYNACK does not erase prior RTO evidence.
-                assert_eq!(a.fast_open_negative, tfo);
+                // Neither the RTO nor the SYN-ACK that leaves the SYN data
+                // unacknowledged is held against the service (Linux 6.12).
+                assert!(!a.fast_open_negative);
             }
         }
     }

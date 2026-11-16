@@ -250,7 +250,7 @@ fn cold(v6: bool) -> i32 {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
+//= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option. The Fast Open option with the server cookie is included as the quote says; only the 536-byte default is not followed. Erratum 8015 remains Held for Document Update.
 //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
 #[test]
 fn native_cold_admission_is_independent_of_family_and_learns_real_mss() {
@@ -359,7 +359,7 @@ fn native_cold_admission_is_independent_of_family_and_learns_real_mss() {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
+//= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option. The Fast Open option with the server cookie is included as the quote says; only the 536-byte default is not followed. Erratum 8015 remains Held for Document Update.
 //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
 #[test]
 fn native_cookie_without_advertised_mss_keeps_all_authorization_modes_cold() {
@@ -474,12 +474,12 @@ fn native_cookie_without_advertised_mss_keeps_all_authorization_modes_cold() {
     }
 }
 
-//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
-//= type=test
-//= reason=The first RTO of a physically transmitted request trains the existing per-source/service cooldown once. Local output failures and held reservations do not train it; successful fallback and late cookie/MSS learning cannot erase it, and expiry permits future requests.
-//# We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.
+// cookie-req-timeout.pkt through the socket API: the cookie request's retry
+// is a plain SYN, and the timeout disables nothing (Linux 6.12 records no
+// per-destination SYN loss). The next TCP_FASTOPEN_CONNECT requests a cookie
+// again or, with the cookie a late original SYN-ACK taught, sends SYN data.
 #[test]
-fn native_first_request_rto_suppresses_service_and_keeps_ordinary_stream() {
+fn native_first_request_rto_keeps_fast_open_and_ordinary_stream() {
     for v6 in [false, true] {
         for reserved in [false, true] {
             for late_original in [false, true] {
@@ -529,35 +529,45 @@ fn native_first_request_rto_suppresses_service_and_keeps_ordinary_stream() {
                 let next = super::tests::new(&mut a, SOCK_NONBLOCK);
                 a.execute(next, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
                     .unwrap();
-                assert_eq!(
-                    a.execute(next, Op::Connect(remote)).unwrap_err(),
-                    EINPROGRESS
-                );
+                let connected = a.execute(next, Op::Connect(remote));
+                let data = b"ordinary";
+                if late_original {
+                    assert_eq!(connected.unwrap().value, 0);
+                    let sent = a
+                        .execute(
+                            next,
+                            Op::Send(vec![(data.as_ptr() as usize, data.len())], 0),
+                        )
+                        .unwrap();
+                    assert_eq!(sent.value, 8);
+                } else {
+                    assert_eq!(connected.unwrap_err(), EINPROGRESS);
+                }
                 let frame = native_output(&mut a, reserved).unwrap();
                 let ip = crate::ip::parse(&frame).unwrap();
                 let syn = wire::parse(ip.ip, ip.payload).unwrap();
-                assert!(syn.options.fast_open.is_none() && syn.payload.is_empty());
+                if late_original {
+                    assert!(
+                        syn.options
+                            .fast_open
+                            .is_some_and(|c| !c.as_bytes().is_empty())
+                    );
+                    assert_eq!(syn.payload, data);
+                } else {
+                    assert_eq!(syn.options.fast_open, Some(FastOpenCookie::request()));
+                    assert!(syn.payload.is_empty());
+                }
                 b.input_ip(&frame, Default::default());
                 native_pump(&mut a, &mut b, reserved);
                 let child = b
                     .execute(listener, Op::Accept(SOCK_NONBLOCK))
                     .unwrap()
                     .value as u64;
-                a.execute(next, Op::Write(b"ordinary".to_vec())).unwrap();
-                native_pump(&mut a, &mut b, reserved);
-                assert_eq!(b.execute(child, Op::Read(32)).unwrap().bytes, b"ordinary");
-                let cookie = Some(FastOpenCookie::request());
-                let expiry = deadline + 60_000_000;
-                assert!(
-                    !a.endpoint
-                        .can_defer_fast_open_with_server_cookie(expiry - 1, a.local, remote, cookie)
-                        .unwrap()
-                );
-                assert!(
-                    a.endpoint
-                        .can_defer_fast_open_with_server_cookie(expiry, a.local, remote, cookie)
-                        .unwrap()
-                );
+                if !late_original {
+                    a.execute(next, Op::Write(data.to_vec())).unwrap();
+                    native_pump(&mut a, &mut b, reserved);
+                }
+                assert_eq!(b.execute(child, Op::Read(32)).unwrap().bytes, data);
             }
         }
     }

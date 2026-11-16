@@ -30,11 +30,11 @@ fn cold(v6: bool) -> usize {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
 //= type=test
-//= reason=Cold SYN admission uses a conservative 536-byte ceiling in both families before option, configuration, path and storage limits; true peer defaults remain 536/1220 and validated learned MSS remains usable.
+//= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option.
 //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
+//= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option. The Fast Open option with the server cookie is included as the quote says; only the 536-byte default is not followed. Erratum 8015 remains Held for Document Update.
 //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
 #[test]
 fn supplied_cookie_cold_limits_options_and_real_mss_learning() {
@@ -209,11 +209,11 @@ fn cold_admission_modes_complete_stream_and_use_learned_mss() {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
 //= type=test
-//= reason=Cold SYN admission uses a conservative 536-byte ceiling in both families before option, configuration, path and storage limits; true peer defaults remain 536/1220 and validated learned MSS remains usable.
+//= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option.
 //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
+//= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option. The Fast Open option with the server cookie is included as the quote says; only the 536-byte default is not followed. Erratum 8015 remains Held for Document Update.
 //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
 #[test]
 fn absent_synack_mss_keeps_cookie_supplied_and_protected_admission_cold() {
@@ -446,10 +446,10 @@ fn supplied_cookie_user_mss_capacity_and_invalid_options_are_transactional() {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
-//= reason=Supplied cookies use the existing first-SYN-only data/option selection; actual timer retry drops both and preserves service failure evidence.
+//= reason=Supplied cookies use the existing first-SYN-only data/option selection; actual timer retry drops both, as Linux's tcp_send_syn_data (cookie.len = -1 for SYN retries, data in its own skb), and records no service failure.
 //# To deal with network or servers dropping SYN packets with payload or unknown options, when the SYN timer fires, the client SHOULD retransmit a SYN packet without data and Fast Open options.
 #[test]
-fn supplied_cookie_timeout_retries_without_option_or_data_and_keeps_negative_cache() {
+fn supplied_cookie_timeout_retries_without_option_or_data_and_keeps_fast_open() {
     for v6 in [false, true] {
         let (mut a, options) = client();
         let (local, remote) = addresses(v6, 49200);
@@ -466,7 +466,7 @@ fn supplied_cookie_timeout_retries_without_option_or_data_and_keeps_negative_cac
         assert!(parsed.payload.is_empty());
         assert_eq!(parsed.options.fast_open, None);
         assert!(
-            !a.can_defer_fast_open_with_server_cookie(1_000_000, local.ip(), remote, Some(zero))
+            a.can_defer_fast_open_with_server_cookie(1_000_000, local.ip(), remote, Some(zero))
                 .unwrap()
         );
         deliver(&mut a, 1_000_010, &cache_reply(&retry, 1460, None));
@@ -485,12 +485,12 @@ fn supplied_cookie_timeout_retries_without_option_or_data_and_keeps_negative_cac
             )
             .unwrap()
             .1,
-            0
+            5
         );
         let ordinary = packet(&mut a, 1_000_020);
         let parsed = wire::parse(ordinary.0, &ordinary.1).unwrap();
-        assert_eq!(parsed.options.fast_open, None);
-        assert!(parsed.payload.is_empty());
+        assert_eq!(parsed.options.fast_open, Some(zero));
+        assert_eq!(parsed.payload, b"later");
         assert!(
             a.can_defer_fast_open_with_server_cookie(61_000_000, local.ip(), remote, Some(zero))
                 .unwrap()

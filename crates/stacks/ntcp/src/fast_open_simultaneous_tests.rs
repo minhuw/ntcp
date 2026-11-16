@@ -384,7 +384,7 @@ fn simultaneous_independent_authorities_complete_both_streams() {
 }
 
 #[test]
-fn simultaneous_plain_final_ack_preserves_rejection_and_positive_progress() {
+fn simultaneous_plain_final_ack_keeps_fast_open_and_positive_progress() {
     let mut policy_mismatches = 0;
     for v6 in [false, true] {
         for reserved in [false, true] {
@@ -522,7 +522,10 @@ fn simultaneous_plain_final_ack_preserves_rejection_and_positive_progress() {
                 let next_syn = wire::parse(next_syn.0, &next_syn.1).unwrap();
                 assert_eq!(next_syn.header.flags & (SYN | ACK), SYN);
                 assert_eq!(next_syn.payload.len(), n);
-                let expected_allowed = accepted_at_b != 0;
+                // A final ACK leaving the SYN data unacknowledged
+                // (accepted_at_b == 0) retransmits it and keeps Fast Open
+                // (Linux's tcp_rcv_fastopen_synack records no failure).
+                let expected_allowed = true;
                 policy_mismatches += usize::from(
                     allowed != expected_allowed
                         || n != if expected_allowed { 4 } else { 0 }
@@ -535,7 +538,7 @@ fn simultaneous_plain_final_ack_preserves_rejection_and_positive_progress() {
             }
         }
     }
-    assert_eq!(policy_mismatches, 0, "validated final ACK must preserve SYN-data rejection evidence");
+    assert_eq!(policy_mismatches, 0, "validated final ACK must not suppress Fast Open");
 }
 
 #[test]

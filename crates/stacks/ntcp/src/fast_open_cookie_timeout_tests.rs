@@ -23,12 +23,12 @@ fn cold(scale: u64, reserved: bool) -> Endpoint {
     endpoint
 }
 
-//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1
-//= type=test
-//= reason=The first RTO of a physically transmitted request trains the existing per-source/service cooldown once. Local output failures and held reservations do not train it; successful fallback and late cookie/MSS learning cannot erase it, and expiry permits future requests.
-//# We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.
+// cookie-req-timeout.pkt: the cookie request's retry is a plain SYN, and the
+// timeout disables nothing (Linux 6.12 tcp_write_timeout records no SYN loss
+// for the destination): the next connect requests a cookie again or, with the
+// cookie a late SYN-ACK taught, sends SYN data.
 #[test]
-fn cookie_request_first_timeout_success_preserves_cooldown() {
+fn cookie_request_timeout_keeps_fast_open() {
     let initial = [0x55; 10_000];
     for v6 in [false, true] {
         for scale in [1, 1000] {
@@ -74,9 +74,7 @@ fn cookie_request_first_timeout_success_preserves_cooldown() {
                             .unwrap();
                         let next = emit(&mut a, next_at, next_id, reserved);
                         let next = wire::parse(next.0, &next.1).unwrap();
-                        // A late original reply can teach cookie/MSS, but cannot
-                        // erase the independent service failure at the first RTO.
-                        assert_eq!(next.options.fast_open.is_some(), !timeout);
+                        assert!(next.options.fast_open.is_some());
                         let learned = if !returned_cookie {
                             0
                         } else if v6 {
@@ -84,7 +82,7 @@ fn cookie_request_first_timeout_success_preserves_cooldown() {
                         } else {
                             1200
                         };
-                        assert_eq!(next_accepted, if timeout { 0 } else { learned });
+                        assert_eq!(next_accepted, learned);
                         assert_eq!(next.payload.len(), next_accepted);
                         let other_service = SocketAddr::new(remote.ip(), remote.port() + 1);
                         let (other_local, _) = addresses(v6, 40002);
@@ -117,12 +115,8 @@ fn cookie_request_first_timeout_success_preserves_cooldown() {
     }
 }
 
-//= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
-//= type=test
-//= reason=An emitted regular retry followed by a SYN-only acknowledgment without a cookie realizes the loss heuristic and preserves service suppression with ordinary stream progress. Delayed original, spurious, partial and returned-cookie controls keep independent RTO/rejection evidence authoritative. This is a presumption, not proof of intentional physical middlebox loss.
-//# If the client has timed out and retransmitted only regular SYN packets, it can heuristically detect paths that intentionally drop SYNs with the Fast Open option or data. If the SYN-ACK acknowledges only the initial sequence and does not carry a Fast Open cookie option, presumably it is triggered by a retransmitted (regular) SYN and the original SYN or the corresponding SYN-ACK was lost.
 #[test]
-fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress() {
+fn cookie_request_fallback_trace_keeps_fast_open_and_stream_progress() {
     for v6 in [false, true] {
         for reserved in [false, true] {
             let mut a = cold(1, reserved);
@@ -143,8 +137,9 @@ fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress() {
             let bare = wire::parse(retry.0, &retry.1).unwrap();
             assert_eq!(bare.header.sequence, initial_seq);
             assert!(bare.options.fast_open.is_none() && bare.payload.is_empty());
-            // Deliver only the regular SYN. This realizes the full heuristic
-            // conjunction without claiming knowledge of a physical middlebox.
+            // Deliver only the regular SYN: the SYN-ACK acknowledges only the
+            // ISN and carries no cookie, Linux's syn_drop case
+            // (tcp_rcv_fastopen_synack), which it records for netlink only.
             deliver(&mut b, timeout + 1, &retry);
             let reply = packet(&mut b, timeout + 2);
             let synack = wire::parse(reply.0, &reply.1).unwrap();
@@ -167,7 +162,7 @@ fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress() {
             assert_eq!(b.read(child, &mut bytes), Ok(15));
             assert_eq!(&bytes[..15], b"fallback stream");
             // A delayed original SYN-ACK is now spurious and cannot teach a
-            // cookie/MSS or erase/extend the independent cooldown.
+            // cookie/MSS.
             deliver(
                 &mut a,
                 timeout + 7,
@@ -186,18 +181,24 @@ fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress() {
                     a.input(timeout + 7, tx.ip, &bytes[..tx.len]).unwrap();
                 }
             }
+            // Nothing disables Fast Open: the next connect requests a cookie.
+            let cookie = Some(wire::FastOpenCookie::request());
+            assert!(
+                a.can_defer_fast_open_with_server_cookie(timeout + 8, local.ip(), remote, cookie)
+                    .unwrap()
+            );
             let (next_local, _) = addresses(v6, 40001);
             let (next, n) = a
                 .connect_fast_open(timeout + 8, next_local, remote, b"ordinary")
                 .unwrap();
             assert_eq!(n, 0);
             let ordinary = emit(&mut a, timeout + 8, next, reserved);
-            assert!(
+            assert_eq!(
                 wire::parse(ordinary.0, &ordinary.1)
                     .unwrap()
                     .options
-                    .fast_open
-                    .is_none()
+                    .fast_open,
+                cookie
             );
             deliver(&mut b, timeout + 9, &ordinary);
             deliver(&mut a, timeout + 11, &packet(&mut b, timeout + 10));
@@ -215,21 +216,10 @@ fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress() {
             );
             assert_eq!(b.read(child, &mut bytes), Ok(8));
             assert_eq!(&bytes[..8], b"ordinary");
-            let expiry = timeout + 60_000_000;
-            let cookie = Some(wire::FastOpenCookie::request());
-            assert!(
-                !a.can_defer_fast_open_with_server_cookie(expiry - 1, local.ip(), remote, cookie)
-                    .unwrap()
-            );
-            assert!(
-                a.can_defer_fast_open_with_server_cookie(expiry, local.ip(), remote, cookie)
-                    .unwrap()
-            );
         }
     }
-    // Controls: full/partial original SYN-data ACKs and returned cookies do
-    // not prove a regular retry caused the reply. RTO evidence stays separate;
-    // without RTO, only SYN-only rejection trains this service's negative cache.
+    // Full, partial and SYN-only acknowledgments of the SYN data, with and
+    // without a returned cookie or an earlier timeout: none disables Fast Open.
     for v6 in [false, true] {
         for reserved in [false, true] {
             for timeout in [false, true] {
@@ -273,15 +263,14 @@ fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress() {
                                 .unwrap(),
                             returned_cookie
                         );
-                        assert_eq!(
+                        assert!(
                             a.can_defer_fast_open_with_server_cookie(
                                 now,
                                 local.ip(),
                                 remote,
                                 Some(wire::FastOpenCookie::request())
                             )
-                            .unwrap(),
-                            !timeout && acked != 0
+                            .unwrap()
                         );
                     }
                 }
@@ -291,7 +280,10 @@ fn cookie_request_fallback_trace_keeps_service_cooldown_and_stream_progress() {
 }
 
 #[test]
-fn cookie_request_repeated_timeout_icmp_and_terminal_keep_suppression() {
+// An ICMP error about the request is a negative response that suppresses the
+// service; repeated SYN timeouts and giving up at the retry limit are not
+// (Linux 6.12 records SYN loss per destination for netlink only).
+fn cookie_request_icmp_suppresses_and_timeouts_do_not() {
     for v6 in [false, true] {
         for scale in [1, 1000] {
             for reserved in [false, true] {
@@ -351,8 +343,7 @@ fn cookie_request_repeated_timeout_icmp_and_terminal_keep_suppression() {
                     if cause == 2 {
                         assert_eq!(a.state(id).unwrap(), State::Closed);
                         a.release(id).unwrap();
-                        // Learn a positive cookie on another service; it must
-                        // not erase the original service's independent failure.
+                        // Learn the cookie on another service.
                         let other = SocketAddr::new(remote.ip(), remote.port() + 1);
                         let (other_local, _) = addresses(v6, 40001);
                         let (warm, _) = a
@@ -377,23 +368,27 @@ fn cookie_request_repeated_timeout_icmp_and_terminal_keep_suppression() {
                         assert_eq!(a.state(id).unwrap(), State::Established);
                         emit(&mut a, now + scale, id, reserved);
                     }
+                    let suppressed = cause == 1 || cause == 3;
                     assert!(
                         a.has_fast_open_cookie(now + 3 * scale, local.ip(), remote.ip())
                             .unwrap()
                     );
-                    assert!(
-                        !a.can_defer_fast_open(now + 3 * scale, local.ip(), remote)
-                            .unwrap()
+                    assert_eq!(
+                        a.can_defer_fast_open(now + 3 * scale, local.ip(), remote)
+                            .unwrap(),
+                        !suppressed
                     );
                     let (next_local, _) = addresses(v6, 40002);
                     let (next, accepted) = a
                         .connect_fast_open(now + 3 * scale, next_local, remote, &[0x55; 10000])
                         .unwrap();
-                    assert_eq!(accepted, 0);
+                    // The learned MSS 1240 less the option space, path bound.
+                    let learned = if v6 { 1180 } else { 1200 };
+                    assert_eq!(accepted, if suppressed { 0 } else { learned });
                     let next = emit(&mut a, now + 3 * scale, next, reserved);
                     let next = wire::parse(next.0, &next.1).unwrap();
-                    assert!(next.options.fast_open.is_none());
-                    assert!(next.payload.is_empty());
+                    assert_eq!(next.options.fast_open.is_none(), suppressed);
+                    assert_eq!(next.payload.len(), accepted);
                 }
             }
         }
@@ -455,9 +450,10 @@ fn cookie_request_local_output_failures_do_not_train_service() {
                     )
                     .unwrap()
                 );
+                // Nor does the transmitted request's timeout (Linux 6.12).
                 a.on_timeout(deadline, 64).unwrap();
                 assert!(
-                    !a.can_defer_fast_open_with_server_cookie(
+                    a.can_defer_fast_open_with_server_cookie(
                         deadline,
                         local.ip(),
                         remote,
@@ -470,8 +466,11 @@ fn cookie_request_local_output_failures_do_not_train_service() {
     }
 }
 
+// A committed request's timeouts, and the reserved retry held by local
+// backpressure, leave Fast Open on: the next connect requests a cookie and
+// learns it.
 #[test]
-fn cookie_request_first_committed_timeout_does_not_wait_for_reserved_retry() {
+fn cookie_request_committed_timeouts_with_reserved_retry_keep_fast_open() {
     for v6 in [false, true] {
         for scale in [1, 1000] {
             let mut a = cold(scale, true);
@@ -480,14 +479,10 @@ fn cookie_request_first_committed_timeout_does_not_wait_for_reserved_retry() {
             emit(&mut a, 0, id, true);
             let first = a.next_deadline().unwrap();
             a.on_timeout(first, 64).unwrap();
+            let request = Some(wire::FastOpenCookie::request());
             assert!(
-                !a.can_defer_fast_open_with_server_cookie(
-                    first,
-                    local.ip(),
-                    remote,
-                    Some(wire::FastOpenCookie::request())
-                )
-                .unwrap()
+                a.can_defer_fast_open_with_server_cookie(first, local.ip(), remote, request)
+                    .unwrap()
             );
             let mut bytes = [0; 2048];
             let (poll, attempt) = a
@@ -501,58 +496,33 @@ fn cookie_request_first_committed_timeout_does_not_wait_for_reserved_retry() {
             assert!(a.accept_transmit(accepted_at, attempt).unwrap());
             let second = a.next_deadline().unwrap();
             assert_eq!(second, 6_000_000 * scale);
+            a.on_timeout(second, 64).unwrap();
+            assert!(
+                a.can_defer_fast_open_with_server_cookie(second, local.ip(), remote, request)
+                    .unwrap()
+            );
             let (other_local, _) = addresses(v6, 40001);
             let (warm, _) = a
-                .connect_fast_open(accepted_at + scale, other_local, remote, &[])
+                .connect_fast_open(second + scale, other_local, remote, &[])
                 .unwrap();
-            let request = emit(&mut a, accepted_at + scale, warm, true);
-            assert!(
-                wire::parse(request.0, &request.1)
-                    .unwrap()
-                    .options
-                    .fast_open
-                    .is_none()
+            let syn = emit(&mut a, second + scale, warm, true);
+            assert_eq!(
+                wire::parse(syn.0, &syn.1).unwrap().options.fast_open,
+                request
             );
             deliver(
                 &mut a,
-                accepted_at + 2 * scale,
-                &cache_reply(&request, 1240, Some(&[7; 8])),
+                second + 2 * scale,
+                &cache_reply(&syn, 1240, Some(&[7; 8])),
             );
-            emit(&mut a, accepted_at + 2 * scale, warm, true);
+            emit(&mut a, second + 2 * scale, warm, true);
             assert!(
-                !a.can_defer_fast_open(accepted_at + 2 * scale, local.ip(), remote)
+                a.has_fast_open_cookie(second + 2 * scale, local.ip(), remote.ip())
                     .unwrap()
             );
-            a.on_timeout(second - 1, 64).unwrap();
             assert!(
-                !a.can_defer_fast_open(second - 1, local.ip(), remote)
+                a.can_defer_fast_open(second + 2 * scale, local.ip(), remote)
                     .unwrap()
-            );
-            a.on_timeout(second, 64).unwrap();
-            assert!(!a.can_defer_fast_open(second, local.ip(), remote).unwrap());
-            // An ordinary suppressed open does not acquire unsolicited cookies.
-            assert!(
-                !a.has_fast_open_cookie(second, local.ip(), remote.ip())
-                    .unwrap()
-            );
-            let expiry = first + 60_000_000 * scale;
-            assert!(
-                !a.can_defer_fast_open_with_server_cookie(
-                    expiry - 1,
-                    local.ip(),
-                    remote,
-                    Some(wire::FastOpenCookie::request())
-                )
-                .unwrap()
-            );
-            assert!(
-                a.can_defer_fast_open_with_server_cookie(
-                    expiry,
-                    local.ip(),
-                    remote,
-                    Some(wire::FastOpenCookie::request())
-                )
-                .unwrap()
             );
         }
     }

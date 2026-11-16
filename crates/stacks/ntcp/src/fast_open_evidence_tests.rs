@@ -1920,23 +1920,15 @@ fn spurious_synacks_cannot_revert_parallel_cookie_mss_or_extend_lifetimes() {
                 drain(&mut a, 100);
             }
             let (local, _) = addresses(v6, 40003);
+            // A SYN-ACK leaving the SYN data unacknowledged ("negative")
+            // disables nothing (Linux's tcp_rcv_fastopen_synack).
             let (_, n) = a.connect_fast_open(101, local, remote, &[7; 1000]).unwrap();
-            assert_eq!(n, if negative { 0 } else { 900 });
+            assert_eq!(n, 900);
             let syn = packet(&mut a, 101);
-            if !negative {
-                assert_eq!(
-                    wire::parse(syn.0, &syn.1).unwrap().options.fast_open,
-                    Some(FastOpenCookie::new(&[2; 8]).unwrap())
-                );
-            }
-            if negative {
-                let expiry = 50 + crate::fast_open::NEGATIVE_LIFETIME_US;
-                assert!(
-                    !a.can_defer_fast_open(expiry - 1, local.ip(), remote)
-                        .unwrap()
-                );
-                assert!(a.can_defer_fast_open(expiry, local.ip(), remote).unwrap());
-            }
+            assert_eq!(
+                wire::parse(syn.0, &syn.1).unwrap().options.fast_open,
+                Some(FastOpenCookie::new(&[2; 8]).unwrap())
+            );
             let expiry = 30 + crate::fast_open::LIFETIME_US;
             assert!(
                 a.has_fast_open_cookie(expiry - 1, local.ip(), remote.ip())

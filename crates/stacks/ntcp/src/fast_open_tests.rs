@@ -314,25 +314,15 @@ fn rfc7413_cookie_request_length_and_both_timeout_fallbacks() {
 
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
 //= type=test
-//# The client MUST cache negative responses from the server in order to avoid potential connection
-//# failures.
-//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
-//= type=test
-//# Negative responses include the server not acknowledging the data in the SYN, ICMP error messages,
-//# and (most importantly) no response (SYN-ACK) from the server at all, i.e., connection timeout.
-//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
-//= type=test
-//= reason=Verified erratum 5373 excludes the source port; subsequent requests change that port and remain suppressed.
+//= reason=Verified erratum 5373 excludes the source port; subsequent requests change that port and remain suppressed. Only ICMP errors are cached as negative responses (duvet/rfc7413-todos.toml).
 //# For any negative responses, the client SHOULD disable Fast Open on the specific path (the source and
 //# destination IP addresses and ports) at least temporarily. Since TFO is enabled on a per-service-port
 //# basis, but cookies are independent of service ports, the client's cache should include remote port
 //# numbers, too.
-//= https://www.rfc-editor.org/rfc/rfc7413#section-7.1
-//= type=test
-//# Moreover, the implementation is recommended to negatively cache such incidents to avoid recurring
-//# timeouts.
+// An ICMP error suppresses the service; a SYN-ACK leaving the SYN data
+// unacknowledged and a SYN timeout do not, as in Linux 6.12.
 #[test]
-fn rfc7413_negative_causes_keep_cookie_and_suppress_service() {
+fn rfc7413_icmp_keeps_cookie_and_suppresses_service() {
     for v6 in [false, true] {
         for cause in 0..3 {
             let (mut a, _, _) = warm(v6);
@@ -373,13 +363,15 @@ fn rfc7413_negative_causes_keep_cookie_and_suppress_service() {
                     deadline
                 }
             };
+            let suppressed = cause == 1;
             assert!(
                 a.has_fast_open_cookie(failed_at, local.ip(), remote.ip())
                     .unwrap()
             );
-            assert!(
-                !a.can_defer_fast_open(failed_at, local.ip(), remote)
-                    .unwrap()
+            assert_eq!(
+                a.can_defer_fast_open(failed_at, local.ip(), remote)
+                    .unwrap(),
+                !suppressed
             );
             let other_service = SocketAddr::new(remote.ip(), remote.port() + 1);
             assert!(
@@ -390,6 +382,10 @@ fn rfc7413_negative_causes_keep_cookie_and_suppress_service() {
             let (_, accepted) = a
                 .connect_fast_open(failed_at, next_local, remote, b"retry")
                 .unwrap();
+            if !suppressed {
+                assert_eq!(accepted, 5);
+                continue;
+            }
             assert_eq!(accepted, 0); // Verified erratum 5373: source port is not a cache key.
             let retry = packet(&mut a, failed_at);
             let retry = wire::parse(retry.0, &retry.1).unwrap();
@@ -1940,8 +1936,10 @@ mod cookie_timeout;
 #[path = "fast_open_partial_synack_tests.rs"]
 mod partial_synack;
 
+// syn-data-only-syn-acked.pkt: a SYN-ACK acknowledging only the SYN gets the
+// data retransmitted and leaves Fast Open on (Linux's tcp_rcv_fastopen_synack).
 #[test]
-fn fast_open_negative_synack_suppresses_next_service_attempt() {
+fn fast_open_syn_only_ack_keeps_next_service_attempt() {
     let (mut a, _, _) = warm(false);
     let (local, remote) = addresses(false, 40001);
     a.connect_fast_open(100, local, remote, b"hello").unwrap();
@@ -1958,11 +1956,14 @@ fn fast_open_negative_synack_suppresses_next_service_attempt() {
     );
     let (local, _) = addresses(false, 40002);
     let (_, accepted) = a.connect_fast_open(120, local, remote, b"retry").unwrap();
-    assert_eq!(accepted, 0);
+    assert_eq!(accepted, 5);
     let syn = packet(&mut a, 120);
     let syn = wire::parse(syn.0, &syn.1).unwrap();
-    assert!(syn.options.fast_open.is_none());
-    assert!(syn.payload.is_empty());
+    assert_eq!(
+        syn.options.fast_open,
+        Some(wire::FastOpenCookie::new(&[9; 8]).unwrap())
+    );
+    assert_eq!(syn.payload, b"retry");
 }
 
 #[test]
@@ -2069,8 +2070,10 @@ fn fast_open_negative_endpoint_clock_expiry_and_repeated_errors() {
     }
 }
 
+// Neither the unsubmitted attempt nor the accepted retry's timeout disables
+// Fast Open (Linux 6.12 records no per-destination SYN loss).
 #[test]
-fn fast_open_negative_reserved_timeout_starts_at_acceptance() {
+fn fast_open_reserved_timeout_keeps_fast_open() {
     let (mut a, _, _) = warm(false);
     a.enable_output_reservations().unwrap();
     let (local, remote) = addresses(false, 40001);
@@ -2098,20 +2101,21 @@ fn fast_open_negative_reserved_timeout_starts_at_acceptance() {
             .unwrap()
     );
     a.on_timeout(deadline, 64).unwrap();
-    assert!(!a.can_defer_fast_open(deadline, local.ip(), remote).unwrap());
+    assert!(a.can_defer_fast_open(deadline, local.ip(), remote).unwrap());
     assert!(
         a.has_fast_open_cookie(deadline, local.ip(), remote.ip())
             .unwrap()
     );
 }
 
+// A local deadline, before or after the RTO it outlasts, disables nothing.
 #[test]
-fn fast_open_negative_local_deadline_does_not_suppress_when_serviced_late() {
+fn fast_open_local_deadline_does_not_suppress() {
     for units in [1_000_000, 1_000_000_000] {
-        for (application_us, service_us, suppressed) in [
-            (100_000, 100_000, false),
-            (100_000, 2_000_000, false),
-            (1_500_000, 2_000_000, true),
+        for (application_us, service_us) in [
+            (100_000, 100_000),
+            (100_000, 2_000_000),
+            (1_500_000, 2_000_000),
         ] {
             let mut cfg = EndpointConfig::default();
             cfg.connection.timebase.units_per_second = units;
@@ -2131,19 +2135,18 @@ fn fast_open_negative_local_deadline_does_not_suppress_when_serviced_late() {
             let now = 2 + timebase.ticks_from_us(service_us);
             a.on_timeout(now, 64).unwrap();
             assert_eq!(a.state(id).unwrap(), State::Closed);
-            assert_eq!(
-                a.can_defer_fast_open(now, local.ip(), remote).unwrap(),
-                !suppressed
-            );
+            assert!(a.can_defer_fast_open(now, local.ip(), remote).unwrap());
             let (local, _) = addresses(false, 40002);
             let (_, accepted) = a.connect_fast_open(now, local, remote, b"retry").unwrap();
-            assert_eq!(accepted, if suppressed { 0 } else { 5 });
+            assert_eq!(accepted, 5);
         }
     }
 }
 
+// The SYN-only acknowledgment gets the 700 bytes retransmitted at once and
+// leaves Fast Open on for the service (Linux's tcp_rcv_fastopen_synack).
 #[test]
-fn inventory_tfo_syn_only_rejection_keeps_cookie_but_suppresses_after_data_ack() {
+fn inventory_tfo_syn_only_rejection_keeps_cookie_and_fast_open() {
     for v6 in [false, true] {
         let config = EndpointConfig {
             max_connections: 16,
@@ -2205,13 +2208,12 @@ fn inventory_tfo_syn_only_rejection_keeps_cookie_but_suppresses_after_data_ack()
             a.has_fast_open_cookie(41_000, local.ip(), remote.ip())
                 .unwrap()
         );
-        assert!(!a.can_defer_fast_open(41_000, local.ip(), remote).unwrap());
+        assert!(a.can_defer_fast_open(41_000, local.ip(), remote).unwrap());
         let (next, _) = addresses(v6, 40002);
         let (_, same_accepted) = a
             .connect_fast_open(42_000, next, remote, &[42; 5000])
             .unwrap();
-        assert_eq!(same_accepted, 0);
-        assert!(!a.can_defer_fast_open(42_000, local.ip(), remote).unwrap());
+        assert_eq!(same_accepted, 1000); // The learned MSS 1040 - 40.
         let mut other = remote;
         other.set_port(remote.port() + 1);
         let (next, _) = addresses(v6, 40003);
@@ -2219,12 +2221,8 @@ fn inventory_tfo_syn_only_rejection_keeps_cookie_but_suppresses_after_data_ack()
             .connect_fast_open(43_000, next, other, &[42; 5000])
             .unwrap();
         assert_eq!(other_accepted, 1000);
-        assert!(
-            a.can_defer_fast_open(60_040_001, local.ip(), remote)
-                .unwrap()
-        );
         std::eprintln!(
-            "TFO_INVENTORY {{\"probe\":\"syn_only_cache\",\"v6\":{v6},\"original_bytes\":700,\"repaired_bytes\":700,\"ordinary_data_acked\":700,\"cookie_retained\":true,\"next_same_service_accepted\":{same_accepted},\"other_service_accepted\":{other_accepted},\"eligible_after_60s\":true}}"
+            "TFO_INVENTORY {{\"probe\":\"syn_only_cache\",\"v6\":{v6},\"original_bytes\":700,\"repaired_bytes\":700,\"ordinary_data_acked\":700,\"cookie_retained\":true,\"next_same_service_accepted\":{same_accepted},\"other_service_accepted\":{other_accepted}}}"
         );
     }
 }

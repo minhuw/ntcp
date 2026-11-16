@@ -25,7 +25,8 @@ pub enum FastOpenClientPolicy {
     #[default]
     RequireCookie,
     /// The target service has independently agreed to protected early data.
-    /// Omit the FO option; retain conservative cold admission and service cooldown.
+    /// Omit the FO option; SYN data admission and negative-response caching
+    /// are the same as with a cookie.
     ApplicationProtected,
 }
 

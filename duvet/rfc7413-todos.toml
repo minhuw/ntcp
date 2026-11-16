@@ -72,7 +72,7 @@ quote = '''
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
-reason = "Scope exception only for explicit FastOpenClientPolicy::ApplicationProtected with independent target-service agreement under section7.3. This user-selected Linux-compatible alternative sends SYN data with no FO option; it does not claim acquisition of a cookie. RequireCookie remains the default and existing supplied/learned credential APIs retain ordinary exchange. Conservative cold536 admission independent of true 536/1220 peer MSS defaults, actual SYN departure/ACK validation, memory limits, retries and negative-response suppression remain authoritative. Native paired-endpoint, mode/default/peer-scoped socket and reserved-departure tests cover the alternative."
+reason = "Scope exception only for explicit FastOpenClientPolicy::ApplicationProtected with independent target-service agreement under section7.3. This user-selected Linux-compatible alternative sends SYN data with no FO option; it does not claim acquisition of a cookie. RequireCookie remains the default and existing supplied/learned credential APIs retain ordinary exchange. SYN data admission (cached MSS, or the offered MSS without one, less the option space; independent of the true 536/1220 peer MSS defaults), actual SYN departure/ACK validation, memory limits, retries and ICMP negative-response suppression remain authoritative. Native paired-endpoint, mode/default/peer-scoped socket and reserved-departure tests cover the alternative."
 quote = '''
 To open a TFO connection, the client MUST have obtained a cookie from the server:
 '''
@@ -180,4 +180,53 @@ target = "https://www.rfc-editor.org/rfc/rfc7413#appendix-A.1"
 reason = "Unselected exact alternative: active deferred opens use Linux TCP_FASTOPEN_CONNECT, while TCP_FASTOPEN controls listener admission. The document presents this TCP_FASTOPEN active API as an optional alternative to the selected MSG_FASTOPEN interface; it is not a mandatory alias."
 quote = '''
 An implementation may prefer not to change the sendmsg() call because TFO is a TCP-specific feature. A solution is to add a new socket option, TCP_FASTOPEN, for TCP sockets. When the option is enabled before a connect() operation, sendmsg() or sendto() will perform a Fast Open operation similar to the MSG_FASTOPEN flag described above. This approach, however, requires an extra setsockopt() system call.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3"
+reason = "Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option."
+quote = '''
+Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1"
+reason = "Deliberate Linux-style deviation (c167): a SYN timeout, giving up on the handshake, and a SYN-ACK acknowledging none of the SYN data are not cached as negative responses. The data is retransmitted after establishment, the SYN retry drops data and option, and the next connection uses Fast Open again (the cached cookie, or a new cookie request). Linux 6.12 records such SYN loss per destination (tcp_fastopen_cache_set syn_loss/last_syn_loss, fed by tcp_rcv_fastopen_synack's syn_drop) only for tcp_metrics netlink reporting and disables Fast Open on it nowhere since commit 7268586baa53 (v4.16); its global blackhole pause (tcp_fastopen_active_detect_blackhole) is off by default (tcp_fastopen_blackhole_timeout 0). ntcp still caches ICMP errors and packet-too-big reports about a transmitted Fast Open SYN for 60 s per source IP and service, which Linux does not."
+quote = '''
+The client MUST cache negative responses from the server in order to avoid potential connection failures.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1"
+reason = "Deliberate Linux-style deviation (c167): a SYN timeout, giving up on the handshake, and a SYN-ACK acknowledging none of the SYN data are not cached as negative responses. The data is retransmitted after establishment, the SYN retry drops data and option, and the next connection uses Fast Open again (the cached cookie, or a new cookie request). Linux 6.12 records such SYN loss per destination (tcp_fastopen_cache_set syn_loss/last_syn_loss, fed by tcp_rcv_fastopen_synack's syn_drop) only for tcp_metrics netlink reporting and disables Fast Open on it nowhere since commit 7268586baa53 (v4.16); its global blackhole pause (tcp_fastopen_active_detect_blackhole) is off by default (tcp_fastopen_blackhole_timeout 0). ntcp still caches ICMP errors and packet-too-big reports about a transmitted Fast Open SYN for 60 s per source IP and service, which Linux does not."
+quote = '''
+Negative responses include the server not acknowledging the data in the SYN, ICMP error messages, and (most importantly) no response (SYN-ACK) from the server at all, i.e., connection timeout.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.1"
+reason = "Deliberate Linux-style deviation (c167): a SYN timeout, giving up on the handshake, and a SYN-ACK acknowledging none of the SYN data are not cached as negative responses. The data is retransmitted after establishment, the SYN retry drops data and option, and the next connection uses Fast Open again (the cached cookie, or a new cookie request). Linux 6.12 records such SYN loss per destination (tcp_fastopen_cache_set syn_loss/last_syn_loss, fed by tcp_rcv_fastopen_synack's syn_drop) only for tcp_metrics netlink reporting and disables Fast Open on it nowhere since commit 7268586baa53 (v4.16); its global blackhole pause (tcp_fastopen_active_detect_blackhole) is off by default (tcp_fastopen_blackhole_timeout 0). ntcp still caches ICMP errors and packet-too-big reports about a transmitted Fast Open SYN for 60 s per source IP and service, which Linux does not."
+quote = '''
+We also RECOMMEND the client to record the set of servers that failed to respond to cookie requests and only attempt another cookie request after a certain period.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
+reason = "Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option. The Fast Open option with the server cookie is included as the quote says; only the 536-byte default is not followed. Erratum 8015 remains Held for Document Update."
+quote = '''
+Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
+reason = "Deliberate Linux-style deviation (c167): a SYN timeout, giving up on the handshake, and a SYN-ACK acknowledging none of the SYN data are not cached as negative responses. The data is retransmitted after establishment, the SYN retry drops data and option, and the next connection uses Fast Open again (the cached cookie, or a new cookie request). Linux 6.12 records such SYN loss per destination (tcp_fastopen_cache_set syn_loss/last_syn_loss, fed by tcp_rcv_fastopen_synack's syn_drop) only for tcp_metrics netlink reporting and disables Fast Open on it nowhere since commit 7268586baa53 (v4.16); its global blackhole pause (tcp_fastopen_active_detect_blackhole) is off by default (tcp_fastopen_blackhole_timeout 0). ntcp still caches ICMP errors and packet-too-big reports about a transmitted Fast Open SYN for 60 s per source IP and service, which Linux does not."
+quote = '''
+If the client has timed out and retransmitted only regular SYN packets, it can heuristically detect paths that intentionally drop SYNs with the Fast Open option or data. If the SYN-ACK acknowledges only the initial sequence and does not carry a Fast Open cookie option, presumably it is triggered by a retransmitted (regular) SYN and the original SYN or the corresponding SYN-ACK was lost.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-7.1"
+reason = "Deliberate Linux-style deviation (c167): a SYN timeout, giving up on the handshake, and a SYN-ACK acknowledging none of the SYN data are not cached as negative responses. The data is retransmitted after establishment, the SYN retry drops data and option, and the next connection uses Fast Open again (the cached cookie, or a new cookie request). Linux 6.12 records such SYN loss per destination (tcp_fastopen_cache_set syn_loss/last_syn_loss, fed by tcp_rcv_fastopen_synack's syn_drop) only for tcp_metrics netlink reporting and disables Fast Open on it nowhere since commit 7268586baa53 (v4.16); its global blackhole pause (tcp_fastopen_active_detect_blackhole) is off by default (tcp_fastopen_blackhole_timeout 0). ntcp still caches ICMP errors and packet-too-big reports about a transmitted Fast Open SYN for 60 s per source IP and service, which Linux does not."
+quote = '''
+Moreover, the implementation is recommended to negatively cache such incidents to avoid recurring timeouts.
 '''

@@ -97,7 +97,9 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
                 Some((Seq(iss), Seq(iss).wrapping_add(1 + acked)))
             );
             assert_eq!(a.state(), State::Established);
-            assert_eq!(a.fast_open_negative, acked == 0);
+            // Unacknowledged SYN data is retransmitted, not held against the
+            // service (Linux's tcp_rcv_fastopen_synack).
+            assert!(!a.fast_open_negative);
             assert_eq!(a.transport_info().syn_data_fully_acked, acked == 12);
             assert_eq!(a.acknowledged, acked as u64);
             assert_eq!(a.send.len(), 12 - acked as usize);
@@ -1092,11 +1094,11 @@ fn fast_open_negative_requires_physical_option_and_reports_once() {
                 commit_reserved(&mut a, 2_000_000);
             }
             assert_eq!(a.fast_open_attempt, option);
+            // A SYN timeout is no negative response: Linux 6.12 records no
+            // per-destination SYN loss that disables Fast Open.
             let timeout = a.rto_deadline.unwrap();
-            a.timeout(timeout - 1).unwrap();
-            assert!(!a.fast_open_negative);
             a.timeout(timeout).unwrap();
-            assert_eq!(core::mem::take(&mut a.fast_open_negative), option);
+            assert!(!a.fast_open_negative);
             let retry = packet(&mut a, timeout);
             assert!(
                 wire::parse(ip(tuple()), &retry)
@@ -1105,8 +1107,12 @@ fn fast_open_negative_requires_physical_option_and_reports_once() {
                     .fast_open
                     .is_none()
             );
-            let timeout = a.rto_deadline.unwrap();
-            a.timeout(timeout).unwrap();
+            // An ICMP error about the transmitted request is one, reported once.
+            a.network_error(timeout + 1, 100, NetworkError::SoftUnreachable)
+                .unwrap();
+            assert_eq!(core::mem::take(&mut a.fast_open_negative), option);
+            a.network_error(timeout + 2, 100, NetworkError::SoftUnreachable)
+                .unwrap();
             assert!(!a.fast_open_negative);
         }
     }
@@ -1153,11 +1159,12 @@ fn fast_open_negative_validated_errors_reset_and_local_abort() {
         assert!(!a.fast_open_negative);
         assert_eq!(a.state() == State::Closed, (101..=113).contains(&ack));
     }
+    // Giving up on the handshake is no negative response either.
     let mut a = client(100, 12);
     packet(&mut a, 0);
     a.timeout(400_000_000).unwrap();
     assert_eq!(a.state(), State::Closed);
-    assert!(a.fast_open_negative);
+    assert!(!a.fast_open_negative);
     let mut a = client(100, 12);
     packet(&mut a, 0);
     a.abort();
@@ -1258,13 +1265,15 @@ fn fast_open_syn_data_drop_retries_the_handshake_in_every_accepted_class() {
 }
 
 #[test]
-fn fast_open_negative_terminal_deadline_precedence_with_late_service() {
+// Neither a local deadline nor an RTO it outlasts is a negative response:
+// Linux 6.12 disables Fast Open for no destination on SYN loss.
+fn fast_open_terminal_deadline_is_no_negative_response() {
     for units in [1_000_000, 1_000_000_000] {
-        for (application_us, service_us, expected) in [
-            (100_000, 100_000, false),
-            (100_000, 2_000_000, false),
-            (1_000_000, 2_000_000, true),
-            (1_500_000, 2_000_000, true),
+        for (application_us, service_us) in [
+            (100_000, 100_000),
+            (100_000, 2_000_000),
+            (1_000_000, 2_000_000),
+            (1_500_000, 2_000_000),
         ] {
             let template = client(100, 12);
             let mut cfg = template.config.clone();
@@ -1279,7 +1288,7 @@ fn fast_open_negative_terminal_deadline_precedence_with_late_service() {
             a.timeout(a.config.timebase.ticks_from_us(service_us))
                 .unwrap();
             assert_eq!(a.state(), State::Closed);
-            assert_eq!(a.fast_open_negative, expected);
+            assert!(!a.fast_open_negative);
         }
     }
 }
@@ -1408,9 +1417,10 @@ fn fast_open_reset_preserves_prior_failure_and_simultaneous_open_validation() {
                 }
                 let mut reset_time = 4;
                 if prior_failure == 2 {
+                    // A SYN timeout records no failure (Linux 6.12).
                     let deadline = a.rto_deadline.unwrap();
                     a.timeout(deadline).unwrap();
-                    assert!(a.fast_open_negative);
+                    assert!(!a.fast_open_negative);
                     reset_time = deadline + 1;
                 } else if prior_failure == 1 {
                     // Soft ICMP retains the handshake while recording independent evidence.
@@ -1444,7 +1454,7 @@ fn fast_open_reset_preserves_prior_failure_and_simultaneous_open_validation() {
                 };
                 a.input(reset_time, &reset).unwrap();
                 assert_eq!(a.state() == State::Closed, valid);
-                assert_eq!(a.fast_open_negative, prior_failure != 0);
+                assert_eq!(a.fast_open_negative, prior_failure == 1);
                 assert!(!a.fast_open_peer_reset); // Active opens do not affect passive admission.
             }
         }
@@ -1491,10 +1501,13 @@ fn fast_open_synack_classification_shared_across_handshake_roles() {
                             a.timeout(deadline).unwrap();
                             now = deadline + 100;
                         }
-                        assert_eq!(a.fast_open_negative, prior_failure != 0);
+                        // Only the ICMP error is a negative response; neither
+                        // the SYN timeout nor a SYN-ACK leaving the data
+                        // unacknowledged is (Linux 6.12).
+                        assert_eq!(a.fast_open_negative, prior_failure == 1);
                         synack(&mut a, acked, now);
                         assert_eq!(a.state(), State::Established);
-                        assert_eq!(a.fast_open_negative, prior_failure != 0 || acked == 0);
+                        assert_eq!(a.fast_open_negative, prior_failure == 1);
                         assert_eq!(a.syn_data_acked, acked != 0);
                         assert_eq!(a.snd_una, Seq(iss.wrapping_add(1 + acked)));
                         assert_eq!(a.send.len(), 12 - acked as usize);

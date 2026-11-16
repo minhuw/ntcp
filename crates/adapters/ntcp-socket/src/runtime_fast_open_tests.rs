@@ -2259,11 +2259,13 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
                 EISCONN
             );
         }
+        // Only the ICMP error suppresses the service; the SYN timeouts and
+        // giving up do not (Linux 6.12 records no per-destination SYN loss).
         assert_eq!(
             a.endpoint
                 .can_defer_fast_open(a.now(), a.local, remote)
                 .unwrap(),
-            !timeout && !suppress
+            !suppress
         );
     }
 }
