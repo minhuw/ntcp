@@ -781,7 +781,7 @@ const PRESENT_BITS: u64 = 0x5555_5555_5555_5555;
 // so that zeroed storage is the empty ring's state for both. A word's bit at
 // the next level up is set exactly when the word has an interesting bit.
 #[derive(Debug)]
-struct ChunkSummary {
+pub(crate) struct ChunkSummary {
     // Level k occupies words[levels[k]..levels[k + 1]]; level 0 holds the
     // chunk bits and the last level a single word, kept in `top` rather
     // than allocated, so a ring of up to 64 chunks allocates nothing here.
@@ -2199,7 +2199,7 @@ mod receive_reference;
 
 #[cfg(test)]
 #[path = "buffer_receive_differential.rs"]
-mod receive_differential;
+pub(crate) mod receive_differential;
 
 #[cfg(test)]
 mod tests {

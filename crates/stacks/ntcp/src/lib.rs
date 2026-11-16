@@ -15,6 +15,9 @@ pub use ntcp_buffer::Payload;
 mod allocation_tests;
 mod buffer;
 mod buffer_sizes;
+// Unwired until the connection receives into it (stage 1 C3).
+#[cfg_attr(not(test), allow(dead_code))]
+mod rx_queue;
 pub use buffer_sizes::{BufferSizes, Buffers};
 mod connection;
 mod cubic;
