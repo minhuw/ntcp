@@ -2099,12 +2099,11 @@ impl Connection {
         // tw_rcv_wnd = tcp_receive_window(tp) and tcp_v4_timewait_ack /
         // tcp_v6_timewait_ack send tw_rcv_wnd >> tw_rcv_wscale.
         debug_assert_eq!(self.last_ack_sent, self.receive.next());
-        let shift = if self.scaling { self.local_scale } else { 0 };
         Some(crate::time_wait::Record {
             tuple: self.scoped_tuple(),
             snd_nxt: self.snd_nxt,
             rcv_nxt: self.receive.next(),
-            window: (self.receive_window() >> shift).min(u32::from(u16::MAX)) as u16,
+            window: self.time_wait_window(),
             ack_floor: self
                 .snd_una
                 .wrapping_add(0u32.wrapping_sub(self.max_snd_wnd)),
@@ -8656,6 +8655,18 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=Once the ACK of the peer's FIN has gone out, every TIME-WAIT ACK, the held connection's as its record's, offers the window frozen then, however much the application reads: Linux's tcp_time_wait keeps tw_rcv_wnd = tcp_receive_window(tp) (tcp_minisocks.c:346) and tcp_v4_timewait_ack / tcp_v6_timewait_ack send tw_rcv_wnd >> tw_rcv_wscale (tcp_ipv4.c:1071, tcp_ipv6.c:1205).
+    //# The only thing that can arrive in this state is a retransmission of the
+    //# remote FIN. Acknowledge it, and restart the 2 MSL timeout.
+    // TIME-WAIT's window field: Linux's tw_rcv_wnd >> tw_rcv_wscale. The
+    // edge only moves forward on ACKs, so it is fixed from the ACK of the
+    // peer's FIN on, as Linux's tw_rcv_wnd.
+    fn time_wait_window(&self) -> u16 {
+        let shift = if self.scaling { self.local_scale } else { 0 };
+        (self.receive_window() >> shift).min(u32::from(u16::MAX)) as u16
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
     //# This should not occur since a FIN has been received from the remote side. Ignore
     //# the segment text.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
@@ -9137,6 +9148,10 @@ impl Connection {
     fn advertised_window(&self, syn: bool) -> u16 {
         if syn {
             return self.syn_window;
+        }
+        // Reads after the ACK of the peer's FIN open no TIME-WAIT window.
+        if self.state == State::TimeWait && self.last_ack_sent == self.receive.next() {
+            return self.time_wait_window();
         }
         // The peer's FIN closes no window: Linux's __tcp_select_window has
         // no FIN case and keeps offering the free space.

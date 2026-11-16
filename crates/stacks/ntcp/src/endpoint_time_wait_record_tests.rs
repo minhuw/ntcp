@@ -321,6 +321,58 @@ fn a_time_wait_record_acks_with_the_window_its_connection_offered() {
     }
 }
 
+// The application reads what the connection still held after TIME-WAIT
+// began: its ACKs keep offering the window of the ACK of the peer's FIN,
+// byte for byte the record's, as Linux answers from the tw_rcv_wnd its
+// tcp_time_wait froze. Unscaled and scaled, IPv4 and IPv6: a retransmitted
+// FIN and an out-of-window segment.
+#[test]
+fn a_held_time_wait_connection_keeps_its_window_after_reads() {
+    use wire::{ACK, FIN};
+    let unread = [5; 600];
+    let v6 = (
+        "[2001:db8::1]:40000".parse().unwrap(),
+        "[2001:db8::2]:8080".parse().unwrap(),
+    );
+    for (local, remote) in [addresses(), v6] {
+        for (capacity, scaled) in [(1024, false), (1 << 20, true)] {
+            let mut cfg = config();
+            cfg.connection.receive_capacity = capacity;
+            let probe = twins_at(&cfg, false, local, remote, &unread);
+            let (rcv, snd, ts) = (probe.h.acknowledgment, probe.h.sequence, probe.ts);
+            let window = probe.h.window;
+            let info = probe.held.transport_info(probe.kept).unwrap();
+            assert_eq!(info.receive_window_scale != 0, scaled);
+            let fresh = Some(ts.wrapping_add(1));
+            let cases: [Case; 2] = [
+                (rcv - 1, snd, FIN | ACK, fresh, b""),
+                (rcv + 100, snd, ACK, fresh, b"late"),
+            ];
+            for (seq, ack, flags, ts, payload) in cases {
+                let mut twins = twins_at(&cfg, false, local, remote, &unread);
+                let mut out = [0; 1024];
+                assert_eq!(twins.held.read(twins.kept, &mut out), Ok(unread.len()));
+                // No window update follows a read after the FIN.
+                assert!(sent(&mut twins.held, 3_500).is_empty());
+                let segment = twins.segment(seq, ack, flags, ts, payload);
+                // Both answer, byte for byte alike.
+                let replies = twins.input(4_000, &segment);
+                assert_eq!(replies.len(), 1);
+                let reply = wire::parse(replies[0].0, &replies[0].1).unwrap().header;
+                assert_eq!(
+                    (
+                        reply.flags,
+                        reply.sequence,
+                        reply.acknowledgment,
+                        reply.window
+                    ),
+                    (ACK, snd, rcv, window)
+                );
+            }
+        }
+    }
+}
+
 // Challenge ACKs keep the connection's budget, carried into the record.
 //= https://www.rfc-editor.org/rfc/rfc5961#section-7
 //= type=test
