@@ -94,6 +94,7 @@ pub(crate) fn departure_snapshot(a: &Connection) -> alloc::string::String {
                 a.now,
                 a.snd_una,
                 a.snd_nxt,
+                a.snd_sml,
                 a.last_sent,
                 a.last_timestamp_sent_at
             ),
@@ -109,6 +110,11 @@ pub(crate) fn departure_snapshot(a: &Connection) -> alloc::string::String {
             a.next_deadline(),
         )
     )
+}
+
+// The end of the last new-data segment sent short (Linux's snd_sml).
+pub(crate) fn snd_sml(a: &Connection) -> Seq {
+    a.snd_sml
 }
 
 // Whether loss or ECN recovery governs the connection's sending.

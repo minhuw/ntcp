@@ -623,15 +623,34 @@ fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
     .unwrap()
     .unwrap();
     assert_eq!(a.last_departure.unwrap().payload, cwnd / 100 * 100);
-    for cork in [false, true] {
+    // Nagle (Minshall's, Linux's tcp_mss_split_point) lets the short tail
+    // join the group when no earlier short segment is unacknowledged; CORK
+    // holds it. The group's short last segment is then the one Nagle waits
+    // for (tcp_minshall_update).
+    for (cork, nagle_waits, expected) in
+        [(false, false, 250), (true, false, 200), (false, true, 200)]
+    {
         let (mut a, _) = pair(config(4096, 100), 0);
         a.set_cork(cork);
+        if nagle_waits {
+            a.write(&[1; 50]).unwrap();
+            gso_select(&mut a, 40, &mut payload, &mut [0; 2048]).unwrap();
+            assert_eq!(a.last_departure.unwrap().payload, 50);
+        }
+        let start = a.snd_nxt;
+        let sml = a.snd_sml;
         a.write(&[1; 250]).unwrap();
         gso_select(&mut a, 40, &mut payload, &mut [0; 2048]).unwrap();
         assert_eq!(
             a.last_departure.unwrap().segmentation.unwrap().payload_len,
-            200
+            expected
         );
+        let sml = if expected == 250 {
+            start.wrapping_add(250)
+        } else {
+            sml
+        };
+        assert_eq!(a.snd_sml, sml);
         assert_eq!(gso_select(&mut a, 41, &mut payload, &mut [0; 2048]), None);
     }
 }
@@ -849,11 +868,13 @@ fn group_preflight_and_same_submit_time_keep_rack_spans_and_first_timer_across_w
 
 #[test]
 fn actual_group_flush_follows_admission_not_a_fixed_segment_count() {
-    for (queued, storage, window) in [
-        (2500, 8000, 16000),
-        (4500, 8000, 16000),
-        (7500, 2500, 16000),
-        (7500, 8000, 2500),
+    // The queue's short tail joins a group that reaches it: no earlier
+    // short segment is unacknowledged (Minshall's Nagle).
+    for (queued, storage, window, tail) in [
+        (2500, 8000, 16000, 500),
+        (4500, 8000, 16000, 0),
+        (7500, 2500, 16000, 0),
+        (7500, 8000, 2500, 0),
     ] {
         let (mut a, _) = pair(
             ConnectionConfig {
@@ -872,7 +893,8 @@ fn actual_group_flush_follows_admission_not_a_fixed_segment_count() {
             .min(window as usize / 1000)
             .min(4)
             .min((a.congestion.cwnd() as usize / 1000 / 2).max(1))
-            * 1000;
+            * 1000
+            + tail;
         let n = crate::allocation_tests::fail_after(0, || {
             gso_select(&mut a, 40, &mut payload, &mut bytes)
         })

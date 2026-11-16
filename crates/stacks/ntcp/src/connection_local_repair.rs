@@ -40,6 +40,7 @@ pub(super) struct RepairUndo {
 #[derive(Clone, Copy)]
 struct FreshState {
     snd_nxt: Seq,
+    snd_sml: Seq,
     iw_epoch: Option<IwEpoch>,
     iw_started: bool,
     iw_fallback: bool,
@@ -98,6 +99,7 @@ impl FreshState {
     fn capture(a: &Connection) -> Self {
         Self {
             snd_nxt: a.snd_nxt,
+            snd_sml: a.snd_sml,
             iw_epoch: a.iw_epoch,
             iw_started: a.iw_started,
             iw_fallback: a.iw_fallback,
@@ -418,6 +420,7 @@ impl Connection {
         self.sack_data_turn = undo.sack_data_turn;
         if let Some(fresh) = undo.fresh {
             self.snd_nxt = fresh.snd_nxt;
+            self.snd_sml = fresh.snd_sml;
             self.iw_epoch = fresh.iw_epoch;
             self.iw_started = fresh.iw_started;
             self.iw_fallback = fresh.iw_fallback;

@@ -209,16 +209,20 @@ fn fast_open_pmtud_profile_exact_quote_fallback_and_bounded_retry() {
                 a.execute(client, Op::Write(b"new".to_vec())).unwrap().value,
                 3
             );
-            tfo_no_output(&mut a); // Ordinary short new write waits for the flight ACK.
-            pmtud_peer_reply(&mut a, &tail, false); // Cumulative ACK covers all 1000 bytes.
-            pmtud_metric_probe(&mut a, client, "repair-acknowledged", 3);
+            // Nagle is Minshall's, as Linux's: the short repair is a
+            // retransmission and SYN data sets no snd_sml either, so no
+            // short new-data segment is unacknowledged and the ordinary
+            // short write leaves at once, ahead of the flight's ACK.
             let new_data = tfo_capture(&mut a);
             assert_eq!(
                 segment(&new_data).header.sequence,
                 bare.header.sequence.wrapping_add(1001)
             );
             assert_eq!(segment(&new_data).payload, b"new");
+            pmtud_peer_reply(&mut a, &tail, false); // Cumulative ACK covers all 1000 bytes.
+            pmtud_metric_probe(&mut a, client, "repair-acknowledged", 3);
             assert_eq!(a.endpoint.transport_info(id).unwrap().send_used, 3);
+            tfo_no_output(&mut a);
             pmtud_peer_reply(&mut a, &new_data, false);
             pmtud_metric_probe(&mut a, client, "new-data-acknowledged", 4);
             assert_eq!(a.endpoint.transport_info(id).unwrap().send_used, 0);

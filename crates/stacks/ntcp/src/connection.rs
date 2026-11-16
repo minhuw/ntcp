@@ -912,6 +912,9 @@ pub(crate) struct Connection {
     pub(crate) fast_open_learned: Option<(Option<wire::FastOpenCookie>, Option<u16>)>,
     snd_una: Seq,
     snd_nxt: Seq,
+    // End of the last new-data segment sent shorter than the MSS (Linux's
+    // snd_sml), for Minshall's Nagle test.
+    snd_sml: Seq,
     send_base: Seq,
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //= reason=Send windows use u32; receive_window derives u32 width from Seq-backed advertised_edge.
@@ -1390,6 +1393,7 @@ impl Connection {
             fast_open_learned: None,
             snd_una: Seq(iss),
             snd_nxt: Seq(iss),
+            snd_sml: Seq(iss),
             send_base: Seq(iss).wrapping_add(1),
             snd_wnd: 0,
             max_snd_wnd: 0,
@@ -4812,6 +4816,13 @@ impl Connection {
         self.snd_nxt.distance_from(self.snd_una)
     }
 
+    // Linux tcp_minshall_check: a short segment sent is not yet wholly
+    // acknowledged. It implies data in flight (tcp_nagle_check's
+    // packets_out), and SND.UNA never passes SND.NXT.
+    fn minshall_check(&self) -> bool {
+        self.snd_sml.after(self.snd_una) && !self.snd_sml.after(self.snd_nxt)
+    }
+
     fn synchronized(&self) -> bool {
         !self.handshake_pending()
             && !matches!(
@@ -8129,8 +8140,8 @@ impl Connection {
         self.receive_text(seq, segment);
         // MSG_MORE is a per-call hint, unlike persistent TCP_CORK. Linux's
         // ACK-driven output uses socket Nagle policy, releasing a MORE tail
-        // without inventing PUSH. Retain our existing Nagle flight rule.
-        if advancing && self.more && !self.cork && (!self.config.nagle || self.flight() == 0) {
+        // without inventing PUSH: once Nagle (Minshall) no longer holds it.
+        if advancing && self.more && !self.cork && (!self.config.nagle || !self.minshall_check()) {
             self.release_corked();
         }
         let probe_packets = self.arm_work();
@@ -10682,14 +10693,17 @@ impl Connection {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
                 //# A TCP implementation SHOULD implement the Nagle algorithm to
                 //# coalesce short segments (SHLD-7).
+                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
+                //# Since there can be problematic interactions between the Nagle
+                //# algorithm and delayed acknowledgments, some implementations use minor
+                //# variations of the Nagle algorithm, such as the one described in
+                //# Appendix A.3.
+                // Minshall's variant, as Linux's tcp_nagle_check: a short
+                // segment waits only while an earlier short one is unacked,
+                // so a short tail after full segments leaves at once.
                 let final_fin =
                     fin_admissible && count == unsent && (count as u32) < timestamp_credit;
-                let nagle_flight = if early_response {
-                    self.data_flight()
-                } else {
-                    self.flight()
-                };
-                let nagle = !flushing && !final_fin && self.config.nagle && nagle_flight != 0;
+                let nagle = !flushing && !final_fin && self.config.nagle && self.minshall_check();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1
                 //# A TCP implementation MUST include a SWS avoidance algorithm in the
                 //# sender (MUST-38).
@@ -10832,6 +10846,8 @@ impl Connection {
                 // it completes a record, or it ends the queue and neither
                 // Nagle, aggregation nor CORK holds it (SWS cannot: it is all
                 // there is). A window- or credit-clipped remainder stays.
+                // The group's full segments leave Minshall's test as it was,
+                // as in Linux's tcp_mss_split_point.
                 let tail = record - full * wire_mss;
                 let sent = full * wire_mss;
                 let flush = flush_credit > sent;
@@ -10845,7 +10861,10 @@ impl Connection {
                 let tail_sendable = credit_left
                     && (record < bounded
                         || record == unsent
-                            && !(self.config.nagle && !flush && !tail_fin)
+                            && !(self.config.nagle
+                                && !flush
+                                && !tail_fin
+                                && self.minshall_check())
                             && (flush
                                 || self.shutdown
                                 || self.sws_override
@@ -11794,6 +11813,18 @@ impl Connection {
             }
             if end.after(self.snd_nxt) {
                 self.snd_nxt = end;
+            }
+            // Linux tcp_minshall_update, for new data only (tcp_write_xmit,
+            // TLP included; not retransmissions, persist probes or PMTU
+            // probes): a segment shorter than the MSS, or a group whose
+            // last segment is (len < tcp_skb_pcount * mss_now).
+            if fresh_data
+                && pmtu_probe.is_none()
+                && segmentation.map_or(count < wire_mss, |s| {
+                    !count.is_multiple_of(s.segment_payload_len)
+                })
+            {
+                self.snd_sml = end;
             }
             // A non-head PTB repair cannot postpone an older head's deadline;
             // a head repair keeps RFC 6298's one-RTO protection, measured

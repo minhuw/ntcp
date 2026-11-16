@@ -1,7 +1,7 @@
 extern crate std;
 use super::*;
 use crate::connection::test_support::{
-    departure_snapshot, probe_size, recovering, timer_recovering,
+    departure_snapshot, probe_size, recovering, snd_sml, timer_recovering,
 };
 use std::vec::Vec;
 
@@ -109,6 +109,10 @@ fn limits() -> crate::TransmitGroupLimits {
         allow_cwr: true,
         allow_options: true,
     }
+}
+
+fn sml(e: &Endpoint, id: ConnectionId) -> crate::seq::Seq {
+    snd_sml(&e.retained_slot(id).unwrap().connection)
 }
 
 fn snapshot(e: &Endpoint, id: ConnectionId) -> std::string::String {
@@ -904,13 +908,14 @@ fn short_last_segment_joins_a_group_exactly_when_scalar_selection_sends_it() {
             },
             &[8],
         ),
-        // Nagle holds them while the full segments are unacknowledged.
+        // So with Nagle, Minshall's as Linux's: no earlier short segment
+        // is unacknowledged.
         (
             true,
             |e, id| {
                 e.write(id, &[1; 7000]).unwrap();
             },
-            &[7],
+            &[8],
         ),
         // A completed record ends its group with its last bytes, even under
         // Nagle; the next record is a group of its own.
@@ -995,6 +1000,116 @@ fn group_ends_with_the_first_segment_holding_a_push() {
         psh,
         [true, false, false, false, true, false, false, false, true]
     );
+}
+
+// A group's short last segment is the short segment Minshall's Nagle waits
+// for (Linux tcp_minshall_update: len < tcp_skb_pcount * mss): the next
+// write's short tail stays until it is acknowledged, then leaves alone,
+// exactly as scalar selection sends them.
+#[test]
+fn a_groups_short_last_segment_holds_the_next_short_tail_under_nagle() {
+    let (mut a, mut peer, id, _) = pair(false, true, 16_384);
+    let (mut b, _, bid, _) = connected(false, true, 16_384);
+    b.enable_output_reservations().unwrap();
+    for (e, id) in [(&mut a, id), (&mut b, bid)] {
+        e.set_nagle(id, true).unwrap();
+        e.write(id, &[1; 2 * 988 + 84]).unwrap();
+    }
+    // snd_sml starts at the ISS, the data one past it.
+    let iss = sml(&a, id);
+    let (mut wire, groups) = drain(&mut a, id, 2);
+    assert_eq!(groups, [3]);
+    assert_eq!(sml(&a, id), iss.wrapping_add(1 + 2 * 988 + 84));
+    assert_eq!(wire, scalar(&mut b, bid, 2));
+    assert_eq!(sml(&a, id), sml(&b, bid));
+    for (e, id) in [(&mut a, id), (&mut b, bid)] {
+        e.write(id, &[2; 2 * 988 + 84]).unwrap();
+    }
+    let (more, groups) = drain(&mut a, id, 2);
+    assert_eq!(groups, [2]);
+    assert_eq!(sml(&a, id), iss.wrapping_add(1 + 2 * 988 + 84));
+    assert_eq!(more, scalar(&mut b, bid, 2));
+    assert_eq!(sml(&a, id), sml(&b, bid));
+    wire.extend(more);
+    for (ip, ack) in deliver(&mut peer, &wire, 3) {
+        a.input(4, ip, &ack).unwrap();
+        b.input(4, ip, &ack).unwrap();
+    }
+    let (tail, groups) = drain(&mut a, id, 4);
+    assert!(groups.is_empty());
+    assert_eq!(tail, scalar(&mut b, bid, 4));
+    assert_eq!(
+        tail.iter()
+            .map(|p| wire::parse(ip(), p).unwrap().payload.len())
+            .collect::<Vec<_>>(),
+        [84]
+    );
+    assert_eq!(sml(&a, id), sml(&b, bid));
+}
+
+// Groups that end with their first PUSH segment under Nagle (Minshall's):
+// the pipelined responses of group_ends_with_the_first_segment_holding_a_push
+// send their short last segment in the last group when no earlier short
+// segment is unacknowledged, which then sets snd_sml; after an unacknowledged
+// short write, the last group ends before it, and it leaves alone on the
+// ACK. The wire is scalar selection's throughout.
+#[test]
+fn groups_ending_at_a_push_follow_minshall() {
+    for short_first in [false, true] {
+        let (mut a, mut peer, id, _) = pair(false, true, 16_384);
+        let (mut b, _, bid, _) = connected(false, true, 16_384);
+        b.enable_output_reservations().unwrap();
+        let mut wire = Vec::new();
+        // snd_sml starts at the ISS, the data one past it.
+        let iss = sml(&a, id);
+        for (e, id) in [(&mut a, id), (&mut b, bid)] {
+            e.set_nagle(id, true).unwrap();
+            if short_first {
+                e.write(id, &[9; 100]).unwrap();
+            }
+        }
+        if short_first {
+            let (first, groups) = drain(&mut a, id, 2);
+            assert!(groups.is_empty());
+            assert_eq!(first, scalar(&mut b, bid, 2));
+            wire.extend(first);
+        }
+        let base = iss.wrapping_add(1 + if short_first { 100 } else { 0 });
+        for (e, id) in [(&mut a, id), (&mut b, bid)] {
+            for _ in 0..2 {
+                for len in [24, 4096, 24] {
+                    assert_eq!(e.write(id, &std::vec![7; len]).unwrap(), len);
+                }
+            }
+        }
+        let (sent, groups) = drain(&mut a, id, 2);
+        assert_eq!(sent, scalar(&mut b, bid, 2));
+        assert_eq!(sml(&a, id), sml(&b, bid));
+        if short_first {
+            // Segment 8, the short one, waits for the 100 bytes' ACK.
+            assert_eq!(groups, [4, 3]);
+            assert_eq!(sent.len(), 8);
+            assert_eq!(sml(&a, id), base);
+        } else {
+            assert_eq!(groups, [4, 4]);
+            assert_eq!(sent.len(), 9);
+            assert_eq!(sml(&a, id), base.wrapping_add(8288));
+        }
+        wire.extend(sent);
+        for (ip, ack) in deliver(&mut peer, &wire, 3) {
+            a.input(4, ip, &ack).unwrap();
+            b.input(4, ip, &ack).unwrap();
+        }
+        let (tail, groups) = drain(&mut a, id, 4);
+        assert!(groups.is_empty());
+        assert_eq!(tail, scalar(&mut b, bid, 4));
+        let lens: Vec<usize> = tail
+            .iter()
+            .map(|p| wire::parse(ip(), p).unwrap().payload.len())
+            .collect();
+        assert_eq!(lens, [384].repeat(usize::from(short_first)));
+        assert_eq!(sml(&a, id), base.wrapping_add(8288));
+    }
 }
 
 // Delivers `wire` to `peer` at `now` and returns its ACKs.

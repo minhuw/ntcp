@@ -10,6 +10,16 @@ if the send window is zero, in order to "probe" the window.
 '''
 
 [[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4"
+reason = "Deliberate Linux-style deviation: Nagle follows Minshall's variant (Appendix A.3, draft-minshall-nagle-01), as Linux's tcp_nagle_check and tcp_minshall_check do. A segment shorter than the MSS waits only while an earlier short new-data segment is unacknowledged: the connection keeps SND.SML, the end of the last new-data segment sent shorter than the MSS (a segmentation-offload group counts when its last segment is short, Linux's tcp_minshall_update), and holds a short segment while SND.UNA < SND.SML <= SND.NXT. Retransmissions, window probes and PMTU probes do not move SND.SML. So a short write after full segments leaves at once with data unacknowledged, which the quoted rule buffers. TCP_CORK still holds every short segment, NODELAY turns Nagle off, and urgent data, a final FIN, a completed record and an explicit flush are not held, as before."
+quote = '''
+If there is unacknowledged data (i.e., SND.NXT > SND.UNA), then the
+sending TCP endpoint buffers all user data (regardless of the PSH
+bit) until the outstanding data has been acknowledged or until the
+TCP endpoint can send a full-sized segment (Eff.snd.MSS bytes).
+'''
+
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
 reason = "Deliberate Linux-style deviation: TIME-WAIT lasts ConnectionConfig::time_wait_us, 120 s by default, which lingers 2xMSL only for an MSL of 60 s, not the 2 minutes of section 3.4.2 that CallerTimebase::max_segment_lifetime_us keeps. Any positive value the owner's timer wheel reaches (EndpointConfig::timer_wheel) may be configured, for example for benchmarks; Linux fixes 60 s (TCP_TIMEWAIT_LEN), and ntcp_native::NetworkConfig::new, which keeps Linux's TCP defaults, and the packetdrill upstream profile configure it; zero is refused because TIME-WAIT must outlive the instant it begins for the ACK of the peer's FIN to be sent. A released connection's TIME-WAIT record ends when its timer's wheel bucket expires: never before time_wait_us, late by less than one granule of the level its duration selects, under 8/(slots-1) of it (at 60 s under 2.1 s with either preset wheel; Linux's tw_timer on its own non-cascading wheel, up to 4.1 s at HZ=1000), so the linger is never shortened. RFC 6191 timestamp-based TIME-WAIT reuse is unchanged."
 quote = '''

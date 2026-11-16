@@ -1463,7 +1463,11 @@ fn counters_report_retransmissions_through_real_loss() {
         (1, 1, 0, 0)
     );
     // A flight whose first segment is lost: the SACKs of the rest start
-    // recovery.
+    // recovery. Nagle (Minshall's) lets the 1104-byte tail go before the
+    // loss is found, and recovery's byte credit, the 1104 bytes its SACK
+    // delivered, sends the 1448-byte repair as 1104 + 344 bytes: two
+    // retransmitted segments (Linux's PRR credit is in packets and would
+    // send it whole).
     transfer(&mut a, &mut b, 4000, 0);
     let counters = a.counters();
     assert_eq!(
@@ -1475,7 +1479,7 @@ fn counters_report_retransmissions_through_real_loss() {
             counters.sack_recoveries,
             counters.reno_recoveries
         ),
-        (2, 0, 1, 0, 1, 0)
+        (3, 0, 1, 0, 1, 0)
     );
     assert_eq!(b.counters().retransmitted_segments, 0);
 }

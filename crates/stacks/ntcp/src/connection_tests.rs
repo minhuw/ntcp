@@ -10421,12 +10421,15 @@ fn handshake_data_backpressure_partial_reads_and_sequence_wrap() {
 //# second full-sized segment to arrive.
 fn delayed_ack_nagle_and_override_deadlines() {
     let (mut a, mut b) = pair(config(64, 4), 100);
-    a.write(b"abcde").unwrap();
+    a.write(b"abcd").unwrap();
     deliver(&mut a, &mut b, 40);
     assert_eq!(a.transmit(50, &mut [0; 64]), Ok(None));
     assert_eq!(b.transmit(50, &mut [0; 64]), Ok(None));
     b.timeout(200_040).unwrap();
     deliver(&mut b, &mut a, 200_040);
+    // A short segment unacked holds the next one (Minshall's Nagle: a
+    // short write behind full segments alone would leave at once).
+    a.write(b"e").unwrap();
     deliver(&mut a, &mut b, 200_050);
     a.write(b"f").unwrap();
     assert_eq!(a.transmit(200_060, &mut [0; 64]), Ok(None));
@@ -19817,6 +19820,8 @@ fn cubic_receiver_limited_ack_does_not_grow_previous_full_flight() {
 
 #[path = "connection_advertised_mss_tests.rs"]
 mod advertised_mss;
+#[path = "connection_nagle_tests.rs"]
+mod nagle;
 #[path = "connection_output_tests.rs"]
 mod output_policy;
 #[path = "connection_reservation_tests.rs"]

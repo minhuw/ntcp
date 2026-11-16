@@ -77,8 +77,6 @@ fn transport_info_follows_a_write_through_flight_and_acknowledgment() {
         assert!(now < 100 * MS, "no connection");
     };
     drive(&mut client, now);
-    // No Nagle hold on the short last segment: the test is of the report.
-    client.set_nodelay(id, true).unwrap();
 
     let idle = client.transport_info(id).unwrap();
     assert_eq!(idle.state, State::Established);
@@ -102,7 +100,9 @@ fn transport_info_follows_a_write_through_flight_and_acknowledgment() {
     assert_eq!(client.transport_info(id).unwrap(), queued);
     assert!(b.borrow().is_empty());
 
-    // Sent, not yet acknowledged: three segments in flight.
+    // Sent, not yet acknowledged: three segments in flight. Nagle is on,
+    // and Minshall's rule (Linux's) sends the short last one with the full
+    // ones: no earlier short segment is unacknowledged.
     now += MS;
     drive(&mut client, now);
     let flight = client.transport_info(id).unwrap();
