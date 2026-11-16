@@ -1770,6 +1770,21 @@ impl Host {
         Ok(report)
     }
 
+    /// Whether `service_changes` has work queued that a connection's next
+    /// output selection must see: dirty path clients (a PMTU decrease, a
+    /// route, source or link change), owners yet to adopt a search aging
+    /// change, and connections' results waiting to be published. An
+    /// embedding that selects one connection's output between passes (a
+    /// push) runs `service_changes` first only when this is true; the rest
+    /// of the pass (collection, reassembly expiry, neighbor confirmations
+    /// from progress) feeds no output selection and waits for the next
+    /// pass. A result the endpoint produced since the last pass is taken
+    /// by the next pass, not seen here: its own connection already applied
+    /// it.
+    pub fn output_changes_pending(&self) -> bool {
+        self.paths.queued_dirty() != 0 || self.unaged.len() != 0 || self.unpublished.len() != 0
+    }
+
     // Each result is taken exactly once; a stale one publishes nothing.
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.2
     //= reason=PathService keeps per-host learned estimates keyed by the path, created on first use with the current route's first hop, and never changes forwarding routes. Host ICMP dispatch derives the estimate from a nonzero Next-Hop MTU or the RFC1191 section 5 plateau below the quoted length, corrected against the Host's shared path estimate, RFC 1191 section 5's current PMTU estimate, never the connection's estimate, requires a correlated quote (for a TCP connection, its four-tuple and an in-window quoted sequence, RFC 5927 section 4.1 as Linux checks it, about the connection's current path; otherwise committed submission evidence of a stateless reply or datagram) and lowers the per-host record only when lower. A correlated TCP report about the connection's current path at or above its proven delivery lowers the record at once (the larger of the Host and TCP estimates) and otherwise restarts its hold. One below proven delivery is deferred whatever the connection's loss-inferred estimate and changes nothing shared (no decrease, hold restart or notification) until the connection applies exactly that report at the quoted data's timeout; Host::service_changes then publishes the larger of the Host estimate and the report's own policy-derived size, so a loss-inferred value never leaks. Cumulative progress past the quoted data refutes it, and released owners, rebound paths and subsumed results publish nothing. Stale or evicted path incarnations are never resurrected or changed. Dual-family Host tests (including legacy IPv4 reports without a Next-Hop MTU, compared with and without prior black-hole loss inference: identical derived size, deferral and publication) and real router PTBs in the isolated namespace gate verify it.
