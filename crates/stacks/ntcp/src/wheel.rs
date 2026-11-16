@@ -28,17 +28,16 @@ const LEVEL_SHIFT: u32 = 3;
 
 /// The geometry of an owner's timer wheel (`EndpointConfig::timer_wheel`).
 /// Every preset has a level 0 of one microsecond, fine enough to pace
-/// packets and to wake for the next timestamp tick; they differ in how
-/// precisely the coarser levels keep longer timers.
+/// packets and to wake for the next timestamp tick, and Linux's 64 buckets
+/// per level above it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TimerWheel {
-    /// 256 buckets per level, 12 levels: a timer is late by under 3.2% of
-    /// the time it had left (a 40 ms delayed ACK by under 0.52 ms, a 200 ms
-    /// RTO by under 4.1 ms), covering 25.4 days.
+    /// The same geometry as `Internet`, kept as its own name so that a
+    /// configuration records which deployment it was chosen for.
     Datacenter,
-    /// Linux's geometry, 64 buckets per level, 13 levels: late by under
-    /// 12.7% (a 200 ms RTO by under 4.1 ms, a 40 ms delayed ACK by under
-    /// 4.1 ms), covering 50.1 days, in a quarter of the memory.
+    /// Linux's geometry, 64 buckets per level, 13 levels: a timer is late
+    /// by under 12.7% of the time it had left (a 200 ms RTO by under
+    /// 4.1 ms, a 40 ms delayed ACK by under 4.1 ms), covering 50.1 days.
     #[default]
     Internet,
     /// `tick_ns` rounded up to a power of two of caller units, `slots` a
@@ -67,8 +66,7 @@ impl TimerWheel {
     /// InvalidArgument for a custom geometry out of range.
     pub fn geometry(self, units_per_second: u64) -> Result<TimerWheelGeometry, crate::Error> {
         let (tick_ns, slots, levels) = match self {
-            Self::Datacenter => (1_000, 256, 12),
-            Self::Internet => (1_000, 64, 13),
+            Self::Datacenter | Self::Internet => (1_000, 64, 13),
             Self::Custom {
                 tick_ns,
                 slots,
@@ -505,7 +503,13 @@ mod tests {
 
     fn geometries() -> [TimerWheelGeometry; 4] {
         [
-            TimerWheel::Datacenter.geometry(1_000_000).unwrap(),
+            TimerWheel::Custom {
+                tick_ns: 1_000,
+                slots: 256,
+                levels: 12,
+            }
+            .geometry(1_000_000)
+            .unwrap(),
             TimerWheel::Internet.geometry(1_000_000).unwrap(),
             TimerWheel::Internet.geometry(1_000_000_000).unwrap(),
             TimerWheel::Custom {
@@ -520,23 +524,27 @@ mod tests {
 
     #[test]
     fn presets_resolve_to_the_documented_geometry() {
-        let dc = TimerWheel::Datacenter.geometry(1_000_000).unwrap();
-        assert_eq!((dc.tick, dc.slots, dc.levels), (1, 256, 12));
-        assert_eq!(dc.coverage, 255 << 33);
         let int = TimerWheel::Internet.geometry(1_000_000).unwrap();
         assert_eq!((int.tick, int.slots, int.levels), (1, 64, 13));
         assert_eq!(int.coverage, 63 << 36);
+        let dc = TimerWheel::Datacenter.geometry(1_000_000).unwrap();
+        assert_eq!(dc, int);
         // A microsecond in nanoseconds rounds up to 1024.
         let ns = TimerWheel::Internet.geometry(1_000_000_000).unwrap();
         assert_eq!((ns.tick, ns.coverage), (1024, (63 << 36) * 1024));
-        // Both cover Linux's longest TCP_USER_TIMEOUT, INT_MAX ms.
-        for g in [dc, int] {
-            assert!(g.coverage >= i32::MAX as u64 * 1_000);
+        // 13 levels cover Linux's longest TCP_USER_TIMEOUT, INT_MAX ms; 12
+        // would not.
+        assert!(int.coverage >= i32::MAX as u64 * 1_000);
+        let twelve = TimerWheel::Custom {
+            tick_ns: 1_000,
+            slots: 64,
+            levels: 12,
         }
+        .geometry(1_000_000)
+        .unwrap();
+        assert!(twelve.coverage < i32::MAX as u64 * 1_000);
         // A 40 ms delayed ACK, a 200 ms RTO.
-        assert_eq!(dc.lateness_bound(40_000), 512);
         assert_eq!(int.lateness_bound(40_000), 4_096);
-        assert_eq!(dc.lateness_bound(200_000), 4_096);
         assert_eq!(int.lateness_bound(200_000), 4_096);
         for (tick_ns, slots, levels) in [
             (0, 64, 4),

@@ -695,7 +695,8 @@ impl SocketConfig {
                     config.tcp.buffer_low_bytes = Some(low);
                 }
                 // The owner's timer wheel (`ntcp::TimerWheel`): datacenter,
-                // internet (the default), or custom:<tick ns>,<slots>,<levels>.
+                // internet (the default; both Linux's 64 buckets per level),
+                // or custom:<tick ns>,<slots>,<levels>.
                 "tcp.timer_wheel" => config.tcp.timer_wheel = timer_wheel(value)?,
                 "tcp.advertised_mss" => config.tcp.connection.advertised_mss = Some(number(value)?),
                 "tcp.pacing" => {
