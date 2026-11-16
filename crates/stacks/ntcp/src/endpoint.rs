@@ -10348,6 +10348,40 @@ mod memory_wait_tests {
         assert_eq!(a.write(writer, &data[room..]), Ok(data.len() - room));
     }
 
+    // A waiting writer whose own write finds memory another member returned,
+    // before its member's poll woke it, ends its wait with that write as
+    // the wake would have: the room it was held from is writable, so an
+    // embedding that was told it was not writable hears of it.
+    #[test]
+    fn a_waiting_writers_own_growth_ends_its_wait_as_a_wake() {
+        let (mut a, mut b, listener) = endpoints();
+        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        writable(&mut a, writer);
+        b.charge(10_000);
+        let base = a.buffer_bytes() + b.buffer_bytes();
+        let memory = crate::BufferMemory {
+            low: 0,
+            pressure: base,
+            high: base,
+        };
+        let group = crate::SharedBufferMemory::new(2, Some(memory), 1).unwrap();
+        a.share_buffer_memory(&group, 0).unwrap();
+        b.share_buffer_memory(&group, 1).unwrap();
+        let data = long_data();
+        let room = held(&a, writer);
+        assert_eq!(a.write(writer, &data), Ok(room));
+        assert_eq!(a.send_admission_room(writer, None), Ok(0));
+        assert!(!writable(&mut a, writer));
+        b.uncharge(10_000);
+        assert!(group.waiting(0));
+        assert_eq!(a.write(writer, &data[room..room + 1]), Ok(1));
+        assert!(!group.waiting(0));
+        assert!(a.memory_waiters.is_empty());
+        assert!(a.send_admission_room(writer, None).unwrap() > 0);
+        assert!(writable(&mut a, writer));
+    }
+
     // A member that leaves publishes its reserve and takes its whole charge
     // and connections out of the group; the group leaves pressure if what
     // it holds is then at most low (__sk_mem_reduce_allocated), and the

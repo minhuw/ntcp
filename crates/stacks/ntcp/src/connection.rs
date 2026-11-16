@@ -5870,7 +5870,10 @@ impl Connection {
         }
         let live = self.send.len().saturating_add(accepted);
         let Err(wanted) = self.grow_send_storage(live, max_charge) else {
-            self.send_memory_wanted = None;
+            // A writer waiting for memory found it before any wake: its
+            // wait ends as with one, and the room beyond the allocated
+            // storage it was held to is writable.
+            self.memory_released();
             return Ok(None);
         };
         // As tcp_sendmsg copies skb by skb until sk_wmem_schedule refuses,

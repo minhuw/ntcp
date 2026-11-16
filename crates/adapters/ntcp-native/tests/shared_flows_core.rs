@@ -907,6 +907,69 @@ fn a_member_that_goes_returns_its_memory_and_wakes_the_others() {
     assert_eq!(lan.members[0].network.counters().memory_throttled_writes, 1);
 }
 
+// A writer waiting for memory whose own next write finds the room another
+// member returned, before any drive of its member woke it, ends its wait
+// with that write as a wake would: the room beyond the write gives the
+// Writable its application, told the connection was not writable, waits
+// for. Debug builds also check at each drain that no connection is left
+// with an event unqueued.
+#[test]
+fn a_waiting_writer_whose_own_write_finds_returned_memory_is_writable() {
+    let data = vec![5u8; 2896];
+    let (mut lan, flows, ids) = shared_memory_lan(1 << 30);
+    let charged = flows.buffer_memory().unwrap().buffer_bytes();
+    lan.members[0]
+        .network
+        .try_write(ids[0], &data, WriteOptions::default())
+        .unwrap();
+    let write = flows.buffer_memory().unwrap().buffer_bytes() - charged;
+    drop((lan, flows));
+    // A fixed cap with room for one such write and a half.
+    let high = charged + write * 3 / 2;
+    let fixed = ntcp::BufferMemory {
+        low: charged / 2,
+        pressure: high,
+        high,
+    };
+    let (mut lan, flows, ids) = shared_memory_lan_with(1 << 30, Some(fixed));
+    let memory = flows.buffer_memory().unwrap().clone();
+    let receipt = lan.members[0]
+        .network
+        .try_write(ids[0], &data, WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, data.len());
+    let taken = match lan.members[1]
+        .network
+        .try_write(ids[1], &data, WriteOptions::default())
+    {
+        Ok(receipt) => receipt.accepted,
+        Err(error) => {
+            assert!(matches!(error, Error::WouldBlock(_)), "{error:?}");
+            0
+        }
+    };
+    assert!(taken < data.len());
+    assert!(memory.waiting(1));
+    lan.step();
+    drained(&mut lan.members[1].network);
+    assert!(!lan.members[1].network.readiness(ids[1]).unwrap().writable);
+    // Member 0 goes; member 1 has not driven since.
+    drop(lan.members.remove(0));
+    assert!(memory.waiting(1));
+    let receipt = lan.members[0]
+        .network
+        .try_write(ids[1], &data[taken..taken + 1], WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, 1);
+    assert!(lan.members[0].network.readiness(ids[1]).unwrap().writable);
+    assert!(drained(&mut lan.members[0].network).contains(&Event::Writable(ids[1])));
+    let receipt = lan.members[0]
+        .network
+        .try_write(ids[1], &data[taken + 1..], WriteOptions::default())
+        .unwrap();
+    assert_eq!(receipt.accepted, data.len() - taken - 1);
+}
+
 // Two members of shared memory at batch 1, with `memory` as the group's
 // thresholds: member 0 keeps receive timestamps for more ranges than any
 // budget holds and has no connection; member 1, whose send ring is 256 KiB,
