@@ -162,7 +162,25 @@ instead: ntcp sets 2 MSS where the script expects 7 (see
 [Loss response](#loss-response)). Both differences come from the loss-response
 choice.
 
-Script: `cubic/cubic-rto-ss-ca-cwnd-bump.pkt`.
+In `tcp_info/tcp-info-rwnd-limited.pkt`, the SYN-ACK gives a 10 ms SRTT, so
+ntcp's RTO is 200 ms. ntcp sends a zero-window probe 200 ms after the write,
+before the scripted window update arrives at that time. Linux's first probe
+fires at about 211 ms, after the update, and the script expects no probe.
+
+Scripts: `cubic/cubic-rto-ss-ca-cwnd-bump.pkt`,
+`tcp_info/tcp-info-rwnd-limited.pkt`.
+
+### Delayed ACK of data with FIN
+
+When a segment carrying data and FIN moves an established connection to
+CLOSE-WAIT, ntcp delays the ACK by the delayed-ACK timeout (40 ms), as Linux
+6.12 does. Linux's `tcp_fin` enters ping-pong mode, expecting the application's
+reply to carry the ACK. While the segment's data is unread,
+`__tcp_ack_snd_check` does not send the ACK at once. The script, written in
+2019, expects an immediate ACK. Linux 6.12 fails the same assertion with the
+same 40 ms delay.
+
+Script: `ioctl/ioctl-siocinq-fin.pkt`.
 
 ### Fast Open negative-response caching
 
