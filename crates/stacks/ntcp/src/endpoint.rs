@@ -9443,6 +9443,10 @@ mod loss_counter_tests;
 #[path = "endpoint_input_frame_tests.rs"]
 mod input_frame_tests;
 
+#[cfg(test)]
+#[path = "receive_window_model_tests.rs"]
+mod receive_window_model_tests;
+
 #[cfg(all(test, feature = "packet-test-controls"))]
 mod timestamp_default_control_tests {
     use super::*;

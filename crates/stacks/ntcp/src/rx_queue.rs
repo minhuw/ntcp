@@ -30,6 +30,10 @@ pub(crate) struct ReceiveOutcome {
     // The allocator refused the memory to hold the new text: nothing of the
     // segment was taken, and the queue is as it was.
     pub refused: bool,
+    // The truesize of the frame the insertion took, 0 if none: the skb
+    // truesize Linux's receive window rules weigh (scaling_ratio, check #2
+    // of tcp_grow_window), less RX_ENTRY_TRUESIZE.
+    pub truesize: usize,
 }
 
 // Accepted payload: borrowed from the segment, copied into a heap frame
@@ -105,10 +109,15 @@ const RUN_PAIR: usize = 2 * size_of::<u64>();
 const ANCHOR_PAIR: usize = size_of::<u64>();
 
 // The truesize every held entry adds to its frame's (`rmem`), as Linux's
-// SKB_TRUESIZE adds struct sk_buff: an in-order slot, plus an out-of-order
-// node's share at minimum occupancy, rounded to a cache line. Constant, so
-// that the window never depends on the deque's or the map's allocation
-// history.
+// SKB_TRUESIZE adds struct sk_buff and skb_shared_info (256 + 320 B on
+// x86_64): an in-order deque slot (size_of RxFrame, 40 B), plus an
+// out-of-order map node's share at minimum occupancy (an internal node of
+// 11 (u64, OfoSeg) pairs and 12 edges, 728 B, over 5 entries: 146 B),
+// rounded up to a cache line: 192 B. It leaves out the runs and anchors
+// maps' shares (at most one of each per entry: 58 and 40 B) and the
+// allocator's per-frame header; storage() charges the maps as allocated.
+// Constant, so that the window never depends on the deque's or the map's
+// allocation history.
 pub(crate) const RX_ENTRY_TRUESIZE: usize =
     (size_of::<RxFrame>() + node_bytes(OFO_PAIR).div_ceil(5)).next_multiple_of(64);
 
@@ -904,6 +913,7 @@ impl RxQueue {
             fin: false,
             out_of_order: (len != 0 || fin) && sequence != previous_next,
             refused: false,
+            truesize: 0,
         };
         if self.eof || (len == 0 && !fin) {
             return outcome;
@@ -931,6 +941,7 @@ impl RxQueue {
                 return outcome;
             }
             self.hold(&frame);
+            outcome.truesize = frame.truesize();
             self.inorder.push_back(frame);
             let end = contiguous + len;
             accepted(contiguous, end);
@@ -1028,6 +1039,7 @@ impl RxQueue {
         debug_assert_eq!(stored, span);
         if let (Some((from, to)), Some(frame)) = (stored, frame) {
             new_anchor = Some(self.seq(from));
+            outcome.truesize = frame.truesize();
             self.hold_run(frame, from, to);
             self.ofo_bytes += outcome.new_bytes;
         }
@@ -1105,6 +1117,23 @@ impl RxQueue {
             }
         }
         outcome
+    }
+}
+
+#[cfg(test)]
+impl RxQueue {
+    // Every held frame: its stream offset, length and truesize.
+    pub(crate) fn held_frames(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
+        let mut at = self.read;
+        let mut held = alloc::vec::Vec::new();
+        for frame in &self.inorder {
+            held.push((at, frame.len(), frame.truesize()));
+            at += frame.len() as u64;
+        }
+        for (&start, seg) in &self.ofo {
+            held.push((start, seg.frame.len(), seg.frame.truesize()));
+        }
+        held
     }
 }
 

@@ -1,6 +1,11 @@
-//! Endpoint::input_frame against the copying input: the same traces, the
+//! Endpoint::input_frame against the copying input: the same streams, the
 //! frame itself held in place of a copy, and no frame released while the
 //! input that brought it still borrows its bytes.
+//!
+//! Every test here fits one Miri run (`nix develop .#miri`). All but the
+//! stream trials:
+//! `cargo miri test -p ntcp --lib input_frame_tests:: -- --skip trial_`;
+//! each trial by its name.
 extern crate std;
 
 use super::*;
@@ -270,22 +275,63 @@ fn faulty_duplex(trial: u64, mode: Mode) -> Vec<Step> {
     trace
 }
 
-// The frame and the copying input paths give the same traces (the window
-// rule counts bytes, not truesize), and every frame is released by the
-// time its endpoint is dropped.
-#[test]
-fn frame_and_copy_inputs_give_identical_traces() {
-    for trial in 1..=4 {
-        let copy = faulty_duplex(trial, Mode::Copy);
-        assert_eq!(copy.last(), Some(&Step::Done(true)));
-        for spare in [0, 2304 - 64 - 52] {
-            let framed = faulty_duplex(trial, Mode::Frame(spare));
-            assert_eq!(LIVE.get(), 0, "trial {trial}: frames leaked");
-            for (at, (x, y)) in copy.iter().zip(&framed).enumerate() {
-                assert_eq!(x, y, "trial {trial} spare {spare}: step {at}");
-            }
-            assert_eq!(framed.len(), copy.len(), "trial {trial} spare {spare}");
+// Both directions' bytes as read, in order.
+fn streams(trace: &[Step]) -> (Vec<u8>, Vec<u8>) {
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for step in trace {
+        if let Step::Read(a_side, bytes) = step {
+            if *a_side { &mut a } else { &mut b }.extend_from_slice(bytes);
         }
+    }
+    (a, b)
+}
+
+// The frame and the copying input paths deliver the same streams and
+// both complete; every frame is released by the time its endpoint is
+// dropped. The traces themselves differ: the window counts each held
+// frame's truesize (Linux tcp_space), and a frame holds the segment's
+// header and spare room too, a copy only the payload; the window the
+// frames give is checked against the Linux model in
+// receive_window_model_tests. One trial per test, so that each fits a Miri
+// run (the four take half an hour under Stacked Borrows).
+fn deliver_the_same_streams(trial: u64) {
+    let copy = faulty_duplex(trial, Mode::Copy);
+    assert_eq!(copy.last(), Some(&Step::Done(true)));
+    for spare in [0, 2304 - 64 - 52] {
+        let framed = faulty_duplex(trial, Mode::Frame(spare));
+        assert_eq!(LIVE.get(), 0, "trial {trial}: frames leaked");
+        assert_eq!(
+            framed.last(),
+            Some(&Step::Done(true)),
+            "trial {trial} spare {spare}"
+        );
+        assert_eq!(
+            streams(&framed),
+            streams(&copy),
+            "trial {trial} spare {spare}"
+        );
+    }
+}
+
+mod frame_and_copy_inputs_deliver_the_same_streams {
+    #[test]
+    fn trial_1() {
+        super::deliver_the_same_streams(1);
+    }
+
+    #[test]
+    fn trial_2() {
+        super::deliver_the_same_streams(2);
+    }
+
+    #[test]
+    fn trial_3() {
+        super::deliver_the_same_streams(3);
+    }
+
+    #[test]
+    fn trial_4() {
+        super::deliver_the_same_streams(4);
     }
 }
 

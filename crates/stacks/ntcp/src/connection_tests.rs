@@ -10440,10 +10440,18 @@ fn handshake_data_backpressure_partial_reads_and_sequence_wrap() {
     assert!(!b.ack_pending); // SWS: wait for four bytes of credit.
     assert_eq!(b.read(&mut out[..2]), Ok(2));
     assert_eq!(&out[..2], b"cd");
+    // Window by truesize (Linux tcp_space): each 4-byte frame takes 4 +
+    // RX_ENTRY_TRUESIZE of the 8-byte buffer at the initial 1:1 ratio (no
+    // segment above the 4-byte receive MSS estimate measured one), so the
+    // window stays closed until the last held frame is read.
+    assert!(!b.ack_pending);
+    assert_eq!(b.read(&mut out[..4]), Ok(4));
+    assert_eq!(&out[..4], b"efgh");
+    assert!(b.ack_pending);
     deliver(&mut b, &mut a, 70);
     deliver(&mut a, &mut b, 80);
-    assert_eq!(b.read(&mut out), Ok(8));
-    assert_eq!(&out, b"efghijkl");
+    assert_eq!(b.read(&mut out), Ok(4));
+    assert_eq!(&out[..4], b"ijkl");
     assert_eq!(b.received_total, 12);
 }
 
@@ -12193,21 +12201,31 @@ fn read_credit_scaled_waits_for_encodable_sws_credit() {
         };
         let (_, mut b) = pair(cfg, u32::MAX - 2048);
         assert_eq!(b.local_scale, 8);
-        let next = b.receive.next();
         let ack = b.snd_una;
-        let count = if mss == 1000 { 1000 } else { 2048 };
-        inject(&mut b, 40, next, ack, ACK, 20000, &vec![1; count]);
+        // Credit comes back as held frames are read to their end (Linux
+        // frees an skb's truesize at tcp_eat_recv_skb), so the reads below
+        // release whole frames: 1000 bytes in one frame, or eight frames
+        // of 736 bytes (5888, a whole number of scale units), each at the
+        // ratio its first one measured (736 / (736 + RX_ENTRY_TRUESIZE)),
+        // so each costs exactly its 736 bytes of window.
+        let (size, frames) = if mss == 1000 { (1000, 1) } else { (736, 8) };
+        for _ in 0..frames {
+            let next = b.receive.next();
+            inject(&mut b, 40, next, ack, ACK, 20000, &vec![1; size]);
+        }
         packet(&mut b, 40);
+        while b.transmit(40, &mut [0; 64]).unwrap().is_some() {}
         let promised = b.advertised_edge;
-        assert_eq!(b.read(&mut [0; 1000]), Ok(1000));
+        assert_eq!(b.read(&mut vec![0; size]), Ok(size));
         if mss == 1460 {
             assert!(!b.ack_pending);
             assert_eq!(b.transmit(41, &mut [0; 64]), Ok(None));
-            // Raw freed credit meets MSS, but floor(1460 / 256) does not.
-            assert_eq!(b.read(&mut [0; 460]), Ok(460));
+            // Raw freed credit (1472) meets MSS, but floor(1472 / 256) does
+            // not.
+            assert_eq!(b.read(&mut [0; 736]), Ok(736));
             assert!(!b.ack_pending);
             assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
-            assert_eq!(b.read(&mut [0; 76]), Ok(76));
+            assert_eq!(b.read(&mut [0; 736]), Ok(736));
         }
         // The eager opt-out sends the first encodable one-MSS update.
         assert!(b.ack_pending);
@@ -12215,7 +12233,8 @@ fn read_credit_scaled_waits_for_encodable_sws_credit() {
         let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
         let encoded_edge = Seq(segment.header.acknowledgment)
             .wrapping_add(u32::from(segment.header.window) << b.local_scale);
-        let credit = if mss == 1000 { 1024 } else { 1536 };
+        // 2208 bytes freed: eight units.
+        let credit = if mss == 1000 { 1024 } else { 2048 };
         assert_eq!(encoded_edge.distance_from(promised), credit);
         assert_eq!(b.advertised_edge, encoded_edge);
         assert!(window_bound(&b, b.config.receive_capacity).at_or_after(encoded_edge));
@@ -12243,9 +12262,14 @@ fn coalesced_read_credit_is_bounded_and_commits_only_on_output() {
             packet(&mut b, 40);
             let ack = b.snd_una;
             let count = usize::from(mss);
+            // Uniform frames of a quarter (at most 32768 bytes), whose
+            // first one measures the ratio each then costs exactly its
+            // length at, and whose reads below release whole frames: a
+            // frame stays charged until read to its end (Linux
+            // tcp_eat_recv_skb).
             let mut remaining = capacity * 3 / 4;
             while remaining != 0 {
-                let received = remaining.min(32768);
+                let received = remaining.min(32768).min(capacity / 4);
                 let next = b.receive.next();
                 inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; received]);
                 packet(&mut b, 41);
@@ -12276,8 +12300,13 @@ fn coalesced_read_credit_is_bounded_and_commits_only_on_output() {
             assert!(window_bound(&b, b.config.receive_capacity).at_or_after(edge));
             assert_eq!(b.transmit(45, &mut [0; 64]), Ok(None));
 
-            // Continued incoming traffic carries one-MSS read credit on
-            // its ordinary ACK, without waiting for window doubling.
+            // Continued incoming traffic carries the read credit on its
+            // ordinary ACK, without waiting for window doubling, once it
+            // passes the SWS threshold: the model's verdict, applied to the
+            // held frames. By truesize (Linux tcp_space) an
+            // MSS frame below the measured ratio's frame size costs more
+            // than its length (count + RX_ENTRY_TRUESIZE at u / (u +
+            // RX_ENTRY_TRUESIZE)): the model's free space decides.
             let next = b.receive.next();
             inject(&mut b, 46, next, ack, ACK, 20000, &vec![1; count]);
             packet(&mut b, 46);
@@ -12287,8 +12316,19 @@ fn coalesced_read_credit_is_bounded_and_commits_only_on_output() {
             let next = b.receive.next();
             inject(&mut b, 47, next, ack, ACK, 20000, &vec![2; count]);
             assert!(b.ack_pending);
+            let u = (capacity / 4).min(32768);
+            let e = crate::rx_queue::RX_ENTRY_TRUESIZE;
+            let rmem: usize = b.receive.held_frames().iter().map(|f| f.2 + e).sum();
+            let free = capacity - rmem * u / (u + e);
+            let old = b.receive_window() as usize;
+            let candidate = (free.max(old) >> b.local_scale).min(65535) << b.local_scale;
+            let advances = candidate.saturating_sub(old) >= b.window_threshold() as usize;
+            // In every case here the MSS frames cost more window than the
+            // read frees beyond the old edge: no advance (byte rule: one
+            // MSS of credit). The randomized model test covers advances.
+            assert!(!advances, "{capacity} {mss}");
             packet(&mut b, 47);
-            assert!(b.advertised_edge.after(promised));
+            assert_eq!(b.advertised_edge.after(promised), advances);
             assert!(window_bound(&b, b.config.receive_capacity).at_or_after(b.advertised_edge));
             assert_eq!(b.read(&mut vec![0; count]), Ok(count));
         }
@@ -12496,15 +12536,19 @@ fn coalesced_read_credit_reopens_scaled_zero_with_retained_promise() {
     b.immediate_ack();
     packet(&mut b, 40);
     let ack = b.snd_una;
-    for count in [32768, 32767] {
+    // Three uniform frames of 21845 bytes (65535): the first measures the
+    // ratio each then costs exactly its length at.
+    for _ in 0..3 {
         let next = b.receive.next();
-        inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; count]);
+        inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; 21845]);
         packet(&mut b, 41);
     }
     assert_eq!(b.receive_window(), 1); // Retained acceptance promise.
     assert_eq!(b.advertised_window(false), 0); // Sender is stalled.
     let promised = b.advertised_edge;
-    let count = usize::from(b.config.mss) + (1 << b.local_scale);
+    // A frame read to its end gives its window back (tcp_eat_recv_skb):
+    // more than one MSS and one scale unit.
+    let count = 21845;
     assert_eq!(b.read(&mut vec![0; count]), Ok(count));
     assert_eq!(b.read_window_threshold(), b.window_threshold());
     assert!(b.ack_pending);
@@ -12538,10 +12582,18 @@ fn coalesced_read_credit_small_capacity_and_validation() {
         inject(&mut b, 40, next, ack, ACK, 20000, &vec![1; capacity]);
         packet(&mut b, 40);
         assert_eq!(b.receive_window(), 0);
-        assert_eq!(b.read(&mut vec![0; threshold]), Ok(threshold));
+        // The frame stays charged until read to its end (Linux
+        // tcp_eat_recv_skb): a partial read, the SWS threshold included,
+        // gives no credit; the last byte gives the whole window back.
+        if threshold < capacity {
+            assert_eq!(b.read(&mut vec![0; threshold]), Ok(threshold));
+            assert!(!b.ack_pending);
+        }
+        let rest = capacity - if threshold < capacity { threshold } else { 0 };
+        assert_eq!(b.read(&mut vec![0; rest]), Ok(rest));
         assert!(b.ack_pending);
         packet(&mut b, 41);
-        assert_eq!(b.receive_window(), threshold as u32);
+        assert_eq!(b.receive_window(), capacity as u32);
     }
     for (capacity, mss) in [(0, 8), ((65535usize << 14) + 1, 8), (64, 0), (64, 65496)] {
         let cfg = ConnectionConfig {
@@ -12568,11 +12620,16 @@ fn coalesced_read_credit_small_capacity_and_validation() {
 
 #[test]
 fn read_credit_reopens_zero_window_at_sws_threshold() {
-    for (capacity, mss, coalesce) in [
-        (64, 32, false),
-        (65536, 1460, false),
-        (64, 32, true),
-        (65536, 1460, true),
+    // Frames: 64 bytes in one (a smaller one stays below the 32-byte
+    // receive MSS estimate, unmeasured, and would cost 192 bytes more than
+    // the buffer); 65536 bytes in 64 frames of 1024. The first frame
+    // measures the ratio each then costs exactly its length at. A frame
+    // gives its window back when read to its end (Linux tcp_eat_recv_skb).
+    for (capacity, mss, coalesce, size) in [
+        (64, 32, false, 64),
+        (65536, 1460, false, 1024),
+        (64, 32, true, 64),
+        (65536, 1460, true, 1024),
     ] {
         let cfg = ConnectionConfig {
             delayed_ack_us: 0,
@@ -12585,21 +12642,30 @@ fn read_credit_reopens_zero_window_at_sws_threshold() {
         let ack = b.snd_una;
         let mut remaining = capacity;
         while remaining != 0 {
-            let count = remaining.min(32768);
+            let count = remaining.min(size);
             let next = b.receive.next();
             inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; count]);
-            packet(&mut b, 41);
+            while b.transmit(41, &mut [0; 64]).unwrap().is_some() {}
             remaining -= count;
         }
         assert_eq!(b.receive_window(), 0);
         assert_eq!(b.advertised_window(false), 0);
         let promised = b.advertised_edge;
         let threshold = b.window_threshold() as usize;
-        assert_eq!(b.read(&mut vec![0; threshold - 1]), Ok(threshold - 1));
+        // Below the SWS threshold: no update. A partial frame frees
+        // nothing; whole frames free less than the threshold.
+        let below = if size >= threshold {
+            threshold - 1
+        } else {
+            size
+        };
+        assert_eq!(b.read(&mut vec![0; below]), Ok(below));
         assert!(!b.ack_pending);
         assert_eq!(b.advertised_window(false), 0);
         assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
-        assert_eq!(b.read(&mut [0; 1]), Ok(1));
+        // At or past it: the frames read to their end.
+        let credit = threshold.next_multiple_of(size);
+        assert_eq!(b.read(&mut vec![0; credit - below]), Ok(credit - below));
         assert!(b.ack_pending);
         assert_eq!(b.transmit(43, &mut [0; 19]), Err(Error::OutputTooSmall));
         assert_eq!(b.receive_window(), 0);
@@ -12609,9 +12675,9 @@ fn read_credit_reopens_zero_window_at_sws_threshold() {
         let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
         assert_eq!(
             u32::from(segment.header.window) << b.local_scale,
-            threshold as u32
+            credit as u32
         );
-        assert_eq!(b.advertised_edge.distance_from(promised), threshold as u32);
+        assert_eq!(b.advertised_edge.distance_from(promised), credit as u32);
         assert_eq!(b.transmit(44, &mut [0; 64]), Ok(None));
     }
 }

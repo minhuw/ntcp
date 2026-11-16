@@ -14,7 +14,7 @@ use crate::{
     recovery::{
         Congestion, CongestionAlgorithm, InitialWindow, Prr, RecoveryAlgorithm, RttEstimator,
     },
-    rx_queue::{RxPayload, RxQueue},
+    rx_queue::{RX_ENTRY_TRUESIZE, RxPayload, RxQueue},
     rx_timestamp::RxTimestamps,
     sack::Scoreboard,
     seq::Seq,
@@ -1173,6 +1173,12 @@ pub(crate) struct Connection {
     // (`grow_window`) toward window_clamp, the limit DRS raises: here
     // config.receive_capacity. u32::MAX for a fixed or locked direction.
     rcv_ssthresh: u32,
+    // Linux's scaling_ratio, as an exact ratio (payload, truesize) of the
+    // last in-order segment that changed the receive MSS estimate
+    // (tcp_measure_rcv_mss): how much window the receive memory backs.
+    // 1:1 until then (Linux starts at 1:2, TCP_DEFAULT_SCALING_RATIO: n0bw
+    // decision Q2, as buffer sizes are configured in window bytes, D2).
+    rcv_scaling: (u32, u32),
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1537,6 +1543,7 @@ impl Connection {
             } else {
                 u32::MAX
             },
+            rcv_scaling: (1, 1),
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -6460,36 +6467,116 @@ impl Connection {
         self.config.receive_capacity = target;
     }
 
+    // Linux's tcp_win_from_space: the window `space` bytes of receive
+    // memory back at the scaling ratio (floor). Exact: a stream of uniform
+    // segments is offered window_clamp less exactly its unread bytes.
+    fn win_from_space(&self, space: usize) -> usize {
+        let (len, truesize) = self.rcv_scaling;
+        (space as u64 * u64::from(len) / u64::from(truesize)) as usize
+    }
+
+    // Linux's tcp_space: the window the receive memory not yet used backs,
+    // window_clamp less what the held frames (in order or beyond a gap,
+    // each with its RX_ENTRY_TRUESIZE) take at the scaling ratio. The
+    // window_clamp is configured in window bytes (n0bw D2), so this is
+    // win_from_space(sk_rcvbuf - sk_rmem_alloc) without double rounding.
+    fn receive_free(&self) -> usize {
+        self.config
+            .receive_capacity
+            .saturating_sub(self.win_from_space(self.receive.rmem()))
+    }
+
+    // Linux's tcp_measure_rcv_mss scaling_ratio update, for an in-order
+    // segment of `size` bytes (the GSO size of an aggregate) whose `len`
+    // accepted bytes were held in a frame of `truesize`: when the segment is
+    // at least the receive MSS estimate and differs from it, the ratio
+    // becomes this segment's. The window_clamp stays (D2); the limit moves.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-7
+    //= reason=The window the receive memory backs follows the measured payload-to-truesize ratio of full-size in-order segments, as Linux's scaling_ratio, so a window offered is a window the memory can hold. Deliberate deviation from Linux (n0bw Q2): the ratio starts at 1:1, not Linux's 1:2 (TCP_DEFAULT_SCALING_RATIO = 128/256), because receive sizes are configured in window bytes (n0bw D2), so the configured window is offered in full before the first measurement; held frames still count RX_ENTRY_TRUESIZE each.
+    //# Hence, implementers should take care to not open the TCP window
+    //# drastically beyond the requirements of the connection.
+    fn measure_receive_scaling(&mut self, size: usize, len: usize, truesize: usize) {
+        let rcv_mss = usize::from(self.received_mss.value(self.receive_mss()));
+        if size > rcv_mss && len != 0 && truesize != 0 {
+            self.rcv_scaling = (len as u32, (truesize + RX_ENTRY_TRUESIZE) as u32);
+        }
+    }
+
     // Linux's tcp_grow_window, for a tuned receive direction, after `len`
-    // new bytes were taken: in order (tcp_event_data_recv, from 128 bytes)
-    // or, with SACK, beyond a gap (tcp_data_queue_ofo). Outside memory
-    // pressure (check #1), rcv_ssthresh rises by twice the payload of a
-    // full-size segment (advmss), or twice `len` if more, at most to
-    // min(window_clamp, free space). Linux's check #2 and its slow part
-    // (__tcp_grow_window) give a segment whose truesize overhead would not
-    // fit the buffer at that window 2 * rcv_mss instead, or nothing; the
-    // free space here is still counted in payload bytes, so every segment
-    // passes check #2. Under pressure Linux also lowers rcv_ssthresh to
+    // new bytes were taken in a frame of `truesize`: in order
+    // (tcp_event_data_recv, from 128 bytes) or, with SACK, beyond a gap
+    // (tcp_data_queue_ofo). Outside memory pressure (check #1), a segment
+    // whose truesize the window would back (check #2: win_from_space of its
+    // truesize at most its payload) raises rcv_ssthresh by twice the
+    // payload of a full-size segment (advmss); one with more overhead by
+    // __tcp_grow_window's 2 * rcv_mss, or nothing; twice `len` if more; at
+    // most to min(window_clamp, free space). Under D2 Linux's
+    // tcp_win_from_space(tcp_rmem[2]) is receive_max. Linux's
+    // truesize_adjust (a GRO head's share) has no counterpart: a frame has
+    // no head/frag split. Under pressure Linux also lowers rcv_ssthresh to
     // 4 * advmss (tcp_adjust_rcv_ssthresh); here pressure only stops the
     // growth. Linux also grants one quick ACK (icsk_ack.quick |= 1), which
     // ntcp's ACK policy does not have; the ACK is sent as it would be.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7
-    //= reason=A tuned receive window opens past its initial size only as full-size data arrives (rcv_ssthresh), up to the limit DRS set from what the application reads per RTT; received data is held, and charged, only as it arrives.
+    //= reason=A tuned receive window opens past its initial size only as full-size data arrives (rcv_ssthresh), and only for segments whose memory the window would back (Linux's check #2), up to the limit DRS set from what the application reads per RTT.
     //# Hence, implementers should take care to not open the TCP window
     //# drastically beyond the requirements of the connection.
     #[inline(never)]
-    fn grow_window(&mut self, len: usize) {
-        let space = self
-            .config
-            .receive_capacity
-            .saturating_sub(self.receive_used)
-            .min(u32::MAX as usize) as u32;
+    fn grow_window(&mut self, len: usize, truesize: usize) {
+        let space = self.receive_free().min(u32::MAX as usize) as u32;
         let room = space.saturating_sub(self.rcv_ssthresh);
         if room == 0 || self.memory_pressure {
             return;
         }
-        let increment = (2 * u32::from(self.advertised_payload_mss())).max(2 * len as u32);
-        self.rcv_ssthresh += room.min(increment);
+        let truesize = truesize + RX_ENTRY_TRUESIZE;
+        let increment = if self.win_from_space(truesize) <= len {
+            2 * u32::from(self.advertised_payload_mss())
+        } else {
+            self.grow_window_slow(len, truesize)
+        };
+        if increment != 0 {
+            self.rcv_ssthresh += room.min(increment.max(2 * len as u32));
+        }
+    }
+
+    // Linux's __tcp_grow_window: halve the segment's window cost and the
+    // largest window together while rcv_ssthresh is within that window; a
+    // segment whose halved cost fits its payload earns 2 * rcv_mss.
+    fn grow_window_slow(&self, len: usize, truesize: usize) -> u32 {
+        let mut truesize = self.win_from_space(truesize) >> 1;
+        let mut window = (self.receive_max.min(u32::MAX as usize) as u32) >> 1;
+        while self.rcv_ssthresh <= window {
+            if truesize <= len {
+                return 2 * u32::from(self.received_mss.value(self.receive_mss()));
+            }
+            truesize >>= 1;
+            window >>= 1;
+        }
+        0
+    }
+
+    // What the receive window model (receive_window_model_tests) reads:
+    // the state the Linux formulas take as input, never their result.
+    #[cfg(test)]
+    pub(crate) fn receive_model_view(&self) -> ReceiveModelView {
+        ReceiveModelView {
+            next: self.receive.next(),
+            occupied: self.receive.occupied(),
+            window: self.receive_window(),
+            rcv_mss: usize::from(self.received_mss.value(self.receive_mss())),
+            advmss: u32::from(self.advertised_payload_mss()),
+            clamp: self.config.receive_capacity,
+            receive_max: self.receive_max,
+            rcv_ssthresh: self.rcv_ssthresh,
+            tuned: self.receive_tuned,
+            pressure: self.memory_pressure,
+            sack: self.sack_send,
+            shift: if self.scaling { self.local_scale } else { 0 },
+            threshold: self.window_threshold(),
+            held: self.receive.held_frames(),
+            ofo_held: self.receive.out_of_order_end().is_some(),
+            state: self.state,
+        }
     }
 
     #[cfg(test)]
@@ -8778,6 +8865,15 @@ impl Connection {
         if self.receive_tuned && offset == 0 && count != 0 && outcome.advanced {
             self.rcv_rtt_measure();
         }
+        // In-order data measures the scaling ratio first, as Linux's
+        // tcp_event_data_recv runs tcp_measure_rcv_mss before
+        // tcp_grow_window.
+        if offset == 0 && count != 0 && outcome.advanced {
+            let size = self
+                .input_segment_size
+                .map_or(payload.len(), |s| usize::from(s.get()));
+            self.measure_receive_scaling(size, outcome.new_bytes, outcome.truesize);
+        }
         if self.receive_tuned
             && outcome.new_bytes != 0
             && if offset == 0 && outcome.advanced {
@@ -8786,7 +8882,7 @@ impl Connection {
                 self.sack_send
             }
         {
-            self.grow_window(count);
+            self.grow_window(count, outcome.truesize);
         }
         if outcome.new_bytes != 0 {
             self.last_data_received = self.now;
@@ -9072,13 +9168,10 @@ impl Connection {
         // no FIN case and keeps offering the free space.
         let shift = if self.scaling { self.local_scale } else { 0 };
         let unit = 1u32 << shift;
-        // Linux's __tcp_select_window: the free space, at most rcv_ssthresh
-        // (u32::MAX for a fixed or locked direction).
-        let quota = (self
-            .config
-            .receive_capacity
-            .saturating_sub(self.receive.readable()) as u32)
-            .min(self.rcv_ssthresh);
+        // Linux's __tcp_select_window: the free space (tcp_space, counting
+        // the truesize of every held frame, beyond a gap too), at most
+        // rcv_ssthresh (u32::MAX for a fixed or locked direction).
+        let quota = (self.receive_free().min(u32::MAX as usize) as u32).min(self.rcv_ssthresh);
         // Never retract credit already offered to the peer on shrink.
         let available = quota.max(self.receive_window());
         let old = self.receive_window();
@@ -12489,6 +12582,27 @@ impl Connection {
 #[cfg(test)]
 #[path = "connection_test_support.rs"]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct ReceiveModelView {
+    pub next: Seq,
+    pub occupied: usize,
+    pub window: u32,
+    pub rcv_mss: usize,
+    pub advmss: u32,
+    pub clamp: usize,
+    pub receive_max: usize,
+    pub rcv_ssthresh: u32,
+    pub tuned: bool,
+    pub pressure: bool,
+    pub sack: bool,
+    pub shift: u8,
+    pub threshold: u32,
+    pub held: alloc::vec::Vec<(u64, usize, usize)>,
+    pub ofo_held: bool,
+    pub state: State,
+}
 
 #[cfg(test)]
 #[path = "connection_tests.rs"]

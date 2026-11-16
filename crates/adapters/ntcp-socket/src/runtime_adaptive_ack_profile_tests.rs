@@ -676,20 +676,12 @@ fn upstream_inq_server_read_window_ack_and_fin_schedules() {
             recvmsg(&mut a, server, 2000, 8000);
             snapshot(&a, server, coalesce, schedule, "after-2k-read");
             if schedule == "after-each-read" {
+                // The 10000 bytes are one frame, charged until read to its
+                // end (Linux frees an skb's truesize at tcp_eat_recv_skb):
+                // reading 2000 frees no window, so not even the eager
+                // schedule sends an update.
                 let updates = output(&mut a, coalesce, schedule, "after-2k-read");
-                assert_eq!(updates.len(), usize::from(!coalesce));
-                if !coalesce {
-                    assert_eq!(updates[0].acknowledgment, 10001);
-                    let advanced = updates[0].acknowledgment + (u32::from(updates[0].window) << 8);
-                    assert!(advanced > edge);
-                    assert_eq!(advanced - edge, 2048);
-                    assert_eq!(updates[0].window, 32736);
-                    // The prior floor withheld 240 bytes; the new floor withholds
-                    // 192, so freeing 2000 safely advances the edge by 2048.
-                    assert_eq!((8 * 1024 * 1024 - 10000) % 256, 240);
-                    assert_eq!((8 * 1024 * 1024 - 8000) % 256, 192);
-                    assert!(advanced <= 10001 + 8 * 1024 * 1024 - 8000);
-                }
+                assert!(updates.is_empty());
             }
             recvmsg(&mut a, server, 8000, 0);
             snapshot(&a, server, coalesce, schedule, "after-8k-read");
@@ -698,6 +690,11 @@ fn upstream_inq_server_read_window_ack_and_fin_schedules() {
                 assert_eq!(updates.len(), usize::from(!coalesce));
                 if !coalesce {
                     assert_eq!(updates[0].acknowledgment, 10001);
+                    // The frame read to its end frees all 10000: the floor
+                    // withheld 240 bytes before, none now.
+                    let advanced = updates[0].acknowledgment + (u32::from(updates[0].window) << 8);
+                    assert_eq!(advanced - edge, 10240);
+                    assert_eq!((8 * 1024 * 1024 - 10000) % 256, 240);
                 }
             }
             let reserved = if schedule == "reserved-before-fin" {

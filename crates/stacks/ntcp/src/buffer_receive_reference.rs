@@ -972,6 +972,8 @@ impl ReferenceReceiveBuffer {
             fin: false,
             out_of_order: (!payload.is_empty() || fin) && sequence != previous_next,
             refused: false,
+            // The per-byte ring holds no frames.
+            truesize: 0,
         };
         if self.eof || (payload.is_empty() && !fin) {
             return outcome;
