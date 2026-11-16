@@ -107,12 +107,60 @@ exception.
 
 Script: `cubic/cubic-rack-reo-timeout-retrans-failed-incoming-data.pkt`.
 
+### Loss response
+
+ntcp's response to loss follows RFC 5681, RFC 6298 and RFC 9937 rather than
+Linux. This is a deliberate choice, not a gap awaiting a port.
+
+- The slow-start threshold is computed from FlightSize, as
+  [RFC 5681 §3.1](https://www.rfc-editor.org/rfc/rfc5681#section-3.1) equation (4)
+  specifies, on SACK and RACK loss recovery and on a retransmission timeout. CUBIC
+  applies its β of 0.7 to FlightSize
+  ([RFC 9438 §4.6](https://www.rfc-editor.org/rfc/rfc9438#section-4.6)). Linux
+  computes it from the congestion window (`tcp_recalc_ssthresh`; CUBIC's
+  `max(cwnd × β, 2)`). Linux also shrinks a window an application left unused
+  for an RTO (`tcp_cwnd_application_limited`: cwnd becomes the mean of cwnd and
+  the window used). ntcp implements neither, nor RFC 7661's window validation.
+  CUBIC does not grow its window while application-limited
+  ([RFC 9438 §5.8](https://www.rfc-editor.org/rfc/rfc9438#section-5.8)). CUBIC's
+  reductions for non-SACK fast retransmit and ECN use the window as their base,
+  as RFC 9438 §4.6 permits under that condition.
+- PRR divides by RecoverFS, the flight that the target was taken from
+  ([RFC 9937 §6.1](https://www.rfc-editor.org/rfc/rfc9937#section-6.1)). Linux
+  divides by the window before recovery (`prior_cwnd`).
+- The RTO is `SRTT + max(G, 4 × RTTVAR)`, rounded up to a 200 ms floor
+  ([RFC 6298 §2.3–2.4](https://www.rfc-editor.org/rfc/rfc6298#section-2), with
+  Linux's `TCP_RTO_MIN` replacing the 1 s floor). Linux applies the floor to the
+  variance term instead (`rttvar = max(mdev, rto_min)`), so its RTO is at least
+  SRTT + 200 ms. With a 10 ms SRTT, ntcp's RTO is 200 ms and Linux's is about
+  210 ms.
+
+An application-limited flow therefore leaves recovery with a smaller window than
+under Linux. Take a CUBIC flow whose window is 20 MSS but which has only 8 MSS in
+flight when SACK recovery starts. ntcp sets ssthresh to 0.7 × 8 = 5.6 MSS and
+leaves recovery at that window. Linux sets 0.7 × 20 = 14 MSS. If the flow has been
+application-limited for a whole RTO, Linux first reduces the window to
+(20 + 10) / 2 = 15 MSS, where 10 is the initial window, and sets ssthresh to 10
+MSS. The same rule applies after a timeout with one 1000-byte segment
+outstanding and a 10-MSS window: ntcp's ssthresh is 2 MSS (0.7 × 1, raised to
+the 2-MSS minimum), and Linux's is 7.
+
 ### RTO and tail-loss probe timing
 
-ntcp calculates RTO using [RFC 6298 §2.3](https://www.rfc-editor.org/rfc/rfc6298#section-2)
-and caps the tail-loss probe deadline at RTO, as specified by
-[RFC 8985 §7.2](https://www.rfc-editor.org/rfc/rfc8985#section-7.2). Differences
-from Linux's RTT-variation estimator can therefore change probe timing.
+ntcp calculates RTO as described under [Loss response](#loss-response) and caps
+the tail-loss probe deadline at RTO, as specified by
+[RFC 8985 §7.2](https://www.rfc-editor.org/rfc/rfc8985#section-7.2). Linux floors
+the RTT-variation term, not the RTO, so ntcp's RTO is shorter by up to SRTT.
+This changes when tail-loss probes, retransmission timeouts and zero-window
+probes fire. Like Linux, ntcp sends the first zero-window probe one RTO after
+the window closes
+([RFC 9293 §3.8.6.1](https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1)).
+
+`cubic/cubic-rto-ss-ca-cwnd-bump.pkt` first fails on the tail-loss probe's
+timing. With Linux's RTO it would fail on the ssthresh after the timeout
+instead: ntcp sets 2 MSS where the script expects 7 (see
+[Loss response](#loss-response)). Both differences come from the loss-response
+choice.
 
 Script: `cubic/cubic-rto-ss-ca-cwnd-bump.pkt`.
 
